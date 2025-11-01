@@ -45,20 +45,47 @@ git remote -v # Should show: https://github.com/snnn1/QTSW2.git
 
 ---
 
-## 📋 Standard Commits (QTSW2)
+## 📋 Standard Workflow (QTSW2)
+
+### Default Branch: **dev**
+
+**Always work on `dev` branch for new features and changes.**
 
 ```bash
 # Make sure you're in QTSW2
 cd C:\Users\jakej\QTSW2
 
+# Verify you're on dev branch
+git branch
+# Should show: * dev
+
 # Stage changes
 git add <files>
 
-# Commit
+# Commit to dev
 git commit -m "Description"
 
-# Push to QTSW2
+# Push to dev branch
+git push origin dev
+```
+
+### Merge to main (when feature is done and tested):
+
+```bash
+# Switch to main
+git checkout main
+
+# Pull latest main
+git pull origin main
+
+# Merge dev into main
+git merge dev
+
+# Push to main
 git push origin main
+
+# Switch back to dev for continued work
+git checkout dev
 ```
 
 ---
@@ -84,9 +111,17 @@ git push origin main
 
 Before committing, verify:
 - [ ] You're in `C:\Users\jakej\QTSW2` directory
+- [ ] You're on `dev` branch (check with `git branch`)
 - [ ] `git remote -v` shows QTSW2 repository
 - [ ] Files being committed belong to QTSW2 project
 - [ ] No QTSW files are staged
+
+## 🔀 Branch Strategy
+
+- **`dev`**: Development branch - all new work happens here
+- **`main`**: Production branch - only merge tested features from `dev`
+
+**Rule:** When asked to choose between main or dev, always choose **dev**.
 
 ---
 
