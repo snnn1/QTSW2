@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# Data files - exclude all data files (too large for git)
+# Exclude all CSV, parquet, and data files in data directories
+data/raw/**/*.csv
+data/raw/**/*.txt
+data/raw/**/*.dat
+data/processed/**/*.parquet
+data/processed/**/*.csv
+
+# Also exclude data files at root level or other locations
+*.parquet
+*.csv
+
+# But keep the .gitkeep files so folder structure is preserved
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+automation/logs/*.log
+
+# But keep log directory structure if needed
+!automation/logs/.gitkeep
+
