@@ -26,6 +26,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 import json
+import uuid
 
 # Third-party imports
 try:
@@ -64,6 +65,55 @@ LOG_FILE = LOGS_DIR / f"pipeline_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 # Timezone - Chicago (America/Chicago)
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+# Structured event logging
+EVENT_LOG_PATH = os.getenv("PIPELINE_EVENT_LOG", None)
+
+
+# ============================================================
+# Structured Event Logging
+# ============================================================
+
+def emit_event(
+    run_id: str,
+    stage: str,
+    event: str,
+    msg: Optional[str] = None,
+    data: Optional[Dict] = None
+):
+    """
+    Emit a structured event to the event log file (if configured).
+    
+    Args:
+        run_id: Unique identifier for this pipeline run
+        stage: Current pipeline stage (translator, analyzer, sequential, audit, etc.)
+        event: Event type (start, metric, success, failure, log)
+        msg: Optional message
+        data: Optional data dictionary (for metrics, file counts, etc.)
+    """
+    if EVENT_LOG_PATH is None:
+        return
+    
+    event_obj = {
+        "run_id": run_id,
+        "stage": stage,
+        "event": event,
+        "timestamp": datetime.now(CHICAGO_TZ).isoformat()
+    }
+    
+    if msg is not None:
+        event_obj["msg"] = msg
+    
+    if data is not None:
+        event_obj["data"] = data
+    
+    try:
+        with open(EVENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_obj) + "\n")
+            f.flush()
+    except Exception as e:
+        # Don't fail pipeline if event logging fails
+        print(f"Warning: Failed to write event log: {e}")
 
 
 # ============================================================
@@ -224,8 +274,9 @@ class NinjaTraderController:
 class PipelineOrchestrator:
     """Orchestrates the complete data processing pipeline."""
     
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, run_id: str):
         self.logger = logger
+        self.run_id = run_id
         self.stage_results: Dict[str, bool] = {}
         
     def run_translator(self) -> bool:
@@ -234,14 +285,18 @@ class PipelineOrchestrator:
         self.logger.info("STAGE 1: Data Translator")
         self.logger.info("=" * 60)
         
+        emit_event(self.run_id, "translator", "start", "Starting data translator stage")
+        
         try:
             # Check if raw files exist
             raw_files = list(DATA_RAW.glob("*.csv"))
             if not raw_files:
                 self.logger.warning("No raw CSV files found in data_raw/")
+                emit_event(self.run_id, "translator", "failure", "No raw CSV files found")
                 return False
             
             self.logger.info(f"Found {len(raw_files)} raw file(s) to process")
+            emit_event(self.run_id, "translator", "metric", "Files found", {"raw_file_count": len(raw_files)})
             
             # Run translator via CLI (non-interactive)
             # Note: This assumes you have a CLI version or can run translator headless
@@ -266,20 +321,32 @@ class PipelineOrchestrator:
             if result.returncode == 0:
                 self.logger.info("✓ Translator completed successfully")
                 self.logger.info(result.stdout[-500:])  # Last 500 chars
+                
+                # Count processed files
+                processed_files = list(DATA_PROCESSED.glob("*.parquet"))
+                processed_files.extend(DATA_PROCESSED.glob("*.csv"))
+                emit_event(self.run_id, "translator", "metric", "Translation complete", {
+                    "processed_file_count": len(processed_files)
+                })
+                emit_event(self.run_id, "translator", "success", "Translator completed successfully")
+                
                 self.stage_results["translator"] = True
                 return True
             else:
                 self.logger.error(f"✗ Translator failed (code: {result.returncode})")
                 self.logger.error(result.stderr)
+                emit_event(self.run_id, "translator", "failure", f"Translator failed with code {result.returncode}")
                 self.stage_results["translator"] = False
                 return False
                 
         except subprocess.TimeoutExpired:
             self.logger.error("✗ Translator timed out after 1 hour")
+            emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
             self.stage_results["translator"] = False
             return False
         except Exception as e:
             self.logger.error(f"✗ Translator exception: {e}")
+            emit_event(self.run_id, "translator", "failure", f"Translator exception: {str(e)}")
             self.stage_results["translator"] = False
             return False
     
@@ -289,8 +356,15 @@ class PipelineOrchestrator:
         self.logger.info("STAGE 2: Breakout Analyzer")
         self.logger.info("=" * 60)
         
+        emit_event(self.run_id, "analyzer", "start", "Starting analyzer stage")
+        
         if instruments is None:
             instruments = ["ES", "NQ", "YM", "CL", "NG", "GC"]
+        
+        emit_event(self.run_id, "analyzer", "metric", "Analyzer started", {
+            "instrument_count": len(instruments),
+            "instruments": instruments
+        })
         
         success_count = 0
         for instrument in instruments:
@@ -304,6 +378,8 @@ class PipelineOrchestrator:
                 ]
                 
                 self.logger.info(f"Running analyzer for {instrument}...")
+                emit_event(self.run_id, "analyzer", "log", f"Running analyzer for {instrument}")
+                
                 result = subprocess.run(
                     analyzer_cmd,
                     cwd=str(QTSW_ROOT),
@@ -314,16 +390,32 @@ class PipelineOrchestrator:
                 
                 if result.returncode == 0:
                     self.logger.info(f"✓ {instrument} analysis completed")
+                    emit_event(self.run_id, "analyzer", "metric", f"{instrument} completed", {
+                        "instrument": instrument,
+                        "status": "success"
+                    })
                     success_count += 1
                 else:
                     self.logger.error(f"✗ {instrument} analysis failed")
                     self.logger.error(result.stderr[-500:])
+                    emit_event(self.run_id, "analyzer", "failure", f"{instrument} analysis failed", {
+                        "instrument": instrument
+                    })
                     
             except Exception as e:
                 self.logger.error(f"✗ {instrument} analyzer exception: {e}")
+                emit_event(self.run_id, "analyzer", "failure", f"{instrument} exception: {str(e)}", {
+                    "instrument": instrument
+                })
         
         success = success_count > 0
         self.stage_results["analyzer"] = success
+        
+        if success:
+            emit_event(self.run_id, "analyzer", "success", f"Analyzer completed: {success_count}/{len(instruments)} instruments")
+        else:
+            emit_event(self.run_id, "analyzer", "failure", f"Analyzer failed: {success_count}/{len(instruments)} instruments")
+        
         self.logger.info(f"Analyzer completed: {success_count}/{len(instruments)} instruments")
         return success
     
@@ -333,14 +425,20 @@ class PipelineOrchestrator:
         self.logger.info("STAGE 3: Sequential Processor (Optional)")
         self.logger.info("=" * 60)
         
+        emit_event(self.run_id, "sequential", "start", "Starting sequential processor stage")
+        
         # This is typically interactive, so we might skip or implement differently
         self.logger.info("Sequential processor typically requires manual configuration")
         self.logger.info("Skipping automatic execution (can be added if CLI interface exists)")
+        emit_event(self.run_id, "sequential", "log", "Sequential processor skipped (requires manual configuration)")
+        emit_event(self.run_id, "sequential", "success", "Sequential processor skipped")
         self.stage_results["sequential_processor"] = True  # Mark as skipped but not failed
         return True
     
     def generate_audit_report(self) -> Dict:
         """Generate audit report of pipeline execution."""
+        emit_event(self.run_id, "audit", "start", "Generating audit report")
+        
         report = {
             "timestamp": datetime.now(CHICAGO_TZ).isoformat(),
             "stages": self.stage_results,
@@ -352,6 +450,12 @@ class PipelineOrchestrator:
         report_file = LOGS_DIR / f"pipeline_report_{datetime.now().strftime('%Y%m%d')}.json"
         with open(report_file, 'w') as f:
             json.dump(report, f, indent=2)
+        
+        emit_event(self.run_id, "audit", "metric", "Audit report generated", {
+            "success": report["success"],
+            "stages": self.stage_results
+        })
+        emit_event(self.run_id, "audit", "success", "Pipeline complete" if report["success"] else "Pipeline completed with failures")
         
         return report
 
@@ -373,23 +477,36 @@ class DailyPipelineScheduler:
         self.logger = setup_logging(LOG_FILE)
         self.schedule_time = schedule_time
         self.nt_controller = NinjaTraderController(self.logger)
-        self.orchestrator = PipelineOrchestrator(self.logger)
+        self.orchestrator: Optional[PipelineOrchestrator] = None
         
     def run_now(self) -> bool:
         """Execute pipeline immediately (for testing or manual runs)."""
+        run_id = str(uuid.uuid4())
         self.logger.info("=" * 60)
         self.logger.info("DAILY DATA PIPELINE - MANUAL RUN")
+        self.logger.info(f"Run ID: {run_id}")
         self.logger.info("=" * 60)
         
+        emit_event(run_id, "pipeline", "start", "Pipeline run started")
+        
+        # Create orchestrator with run_id
+        self.orchestrator = PipelineOrchestrator(self.logger, run_id)
+        
         # Launch NinjaTrader
+        emit_event(run_id, "pipeline", "log", "Launching NinjaTrader")
         if not self.nt_controller.launch():
             self.logger.error("Failed to launch NinjaTrader - aborting")
+            emit_event(run_id, "pipeline", "failure", "Failed to launch NinjaTrader")
             return False
         
         # Wait for export
+        emit_event(run_id, "pipeline", "log", "Waiting for data export")
         if not self.nt_controller.wait_for_export(timeout_minutes=60):
             self.logger.error("Export timeout - aborting pipeline")
+            emit_event(run_id, "pipeline", "failure", "Export timeout")
             return False
+        
+        emit_event(run_id, "pipeline", "log", "Data export detected, starting processing")
         
         # Run pipeline stages
         success = True
