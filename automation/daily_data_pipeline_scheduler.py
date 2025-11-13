@@ -49,7 +49,9 @@ NINJATRADER_EXE = Path(r"C:\Program Files\NinjaTrader 8\bin\NinjaTrader.exe")
 NINJATRADER_WORKSPACE = Path(r"C:\Users\jakej\Documents\NinjaTrader 8\workspaces\DataExport.ntworkspace")  # Adjust to your workspace name
 
 # Data directories
-DATA_RAW = QTSW_ROOT / "data_raw"
+# Note: DATA_RAW matches DataExporter output path (QTSW2/data/raw)
+DATA_RAW = QTSW2_ROOT / "data" / "raw"
+DATA_RAW_LOGS = DATA_RAW / "logs"  # Signal files are stored in logs subfolder
 DATA_PROCESSED = QTSW_ROOT / "data_processed"
 ANALYZER_RUNS = QTSW_ROOT / "analyzer_runs"
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
@@ -200,22 +202,35 @@ class NinjaTraderController:
             return False
         return self.process.poll() is None
     
-    def wait_for_export(self, timeout_minutes: int = 60) -> bool:
+    def wait_for_export(self, timeout_minutes: int = 60, run_id: Optional[str] = None) -> bool:
         """
         Wait for data export to complete by monitoring data_raw directory.
+        
+        Enhanced detection:
+        - Checks for completion signal files (export_complete_*.json)
+        - Monitors progress files (export_progress_*.json)
+        - Falls back to file modification time detection
+        - Detects stalled exports (file not growing)
         
         Args:
             timeout_minutes: Maximum time to wait (default 60 minutes)
             
         Returns:
-            True if export detected, False if timeout
+            True if export detected and completed, False if timeout
         """
-        self.logger.info(f"Monitoring {DATA_RAW} for new exports (timeout: {timeout_minutes} min)")
+        self.logger.info(f"Monitoring {DATA_RAW} for exports (timeout: {timeout_minutes} min)")
         
-        # Get initial file list and timestamps
+        # Get initial state
         initial_files = self._get_csv_files()
         initial_count = len(initial_files)
         initial_times = {f: f.stat().st_mtime for f in initial_files}
+        initial_sizes = {f: f.stat().st_size for f in initial_files}
+        
+        # Get initial completion signals (from logs subfolder)
+        initial_completion_signals = set(DATA_RAW_LOGS.glob("export_complete_*.json")) if DATA_RAW_LOGS.exists() else set()
+        
+        # Get initial start signals to detect new exports (from logs subfolder)
+        initial_start_signals = set(DATA_RAW_LOGS.glob("export_start_*.json")) if DATA_RAW_LOGS.exists() else set()
         
         self.logger.info(f"Initial file count: {initial_count}")
         if initial_count > 0:
@@ -223,21 +238,140 @@ class NinjaTraderController:
         
         start_time = time.time()
         timeout_seconds = timeout_minutes * 60
-        check_interval = 30  # Check every 30 seconds
+        check_interval = 10  # Check every 10 seconds (more frequent for better detection)
+        last_size_check = {}  # Track file sizes to detect stalled exports
+        stalled_check_interval = 300  # Check for stalled exports every 5 minutes
+        last_progress_emission = {}  # Track last progress emission to avoid spam
+        export_started_emitted = False
         
         while (time.time() - start_time) < timeout_seconds:
+            # Check for start signals (export beginning) - from logs subfolder
+            current_start_signals = set(DATA_RAW_LOGS.glob("export_start_*.json")) if DATA_RAW_LOGS.exists() else set()
+            new_start_signals = current_start_signals - initial_start_signals
+            
+            if new_start_signals and not export_started_emitted and run_id:
+                export_started_emitted = True
+                for signal_file in new_start_signals:
+                    try:
+                        with open(signal_file, "r") as f:
+                            start_data = json.load(f)
+                            instrument = start_data.get('instrument', 'unknown')
+                            data_type = start_data.get('dataType', 'unknown')
+                            emit_event(run_id, "export", "start", f"Export started for {instrument} ({data_type})", {
+                                "instrument": instrument,
+                                "dataType": data_type
+                            })
+                            self.logger.info(f"Export start signal detected: {instrument} ({data_type})")
+                    except Exception as e:
+                        self.logger.warning(f"Could not read start signal {signal_file.name}: {e}")
+            
+            # Check for completion signals first (most reliable) - from logs subfolder
+            current_completion_signals = set(DATA_RAW_LOGS.glob("export_complete_*.json")) if DATA_RAW_LOGS.exists() else set()
+            new_completion_signals = current_completion_signals - initial_completion_signals
+            
+            if new_completion_signals:
+                for signal_file in new_completion_signals:
+                    try:
+                        with open(signal_file, "r") as f:
+                            signal_data = json.load(f)
+                            self.logger.info(f"Export completion signal detected: {signal_data.get('fileName', 'unknown')}")
+                            self.logger.info(f"  Instrument: {signal_data.get('instrument', 'unknown')}")
+                            self.logger.info(f"  Records: {signal_data.get('totalBarsProcessed', 0):,}")
+                            self.logger.info(f"  File size: {signal_data.get('fileSizeMB', 0):.2f} MB")
+                            
+                            # Emit completion event
+                            if run_id:
+                                emit_event(run_id, "export", "success", 
+                                    f"Export completed: {signal_data.get('totalBarsProcessed', 0):,} records, {signal_data.get('fileSizeMB', 0):.2f} MB",
+                                    {
+                                        "instrument": signal_data.get('instrument', 'unknown'),
+                                        "dataType": signal_data.get('dataType', 'unknown'),
+                                        "totalBarsProcessed": signal_data.get('totalBarsProcessed', 0),
+                                        "fileSizeMB": signal_data.get('fileSizeMB', 0),
+                                        "gapsDetected": signal_data.get('gapsDetected', 0),
+                                        "invalidDataSkipped": signal_data.get('invalidDataSkipped', 0),
+                                        "fileName": signal_data.get('fileName', 'unknown')
+                                    })
+                    except Exception as e:
+                        self.logger.warning(f"Could not read completion signal {signal_file.name}: {e}")
+                
+                return True
+            
+            # Check for progress files (export in progress) - from logs subfolder
+            progress_files = list(DATA_RAW_LOGS.glob("export_progress_*.json")) if DATA_RAW_LOGS.exists() else []
+            if progress_files:
+                # Read most recent progress file
+                latest_progress = max(progress_files, key=lambda p: p.stat().st_mtime)
+                try:
+                    with open(latest_progress, "r") as f:
+                        progress_data = json.load(f)
+                        records = progress_data.get("totalBarsProcessed", 0)
+                        file_size_mb = progress_data.get("fileSizeMB", 0)
+                        instrument = progress_data.get("instrument", "unknown")
+                        
+                        # Emit progress event (throttle to avoid spam - only every 30 seconds per file)
+                        if run_id:
+                            progress_key = str(latest_progress)
+                            last_emit_time = last_progress_emission.get(progress_key, 0)
+                            current_time = time.time()
+                            
+                            if current_time - last_emit_time >= 30:  # Emit at most every 30 seconds
+                                last_progress_emission[progress_key] = current_time
+                                
+                                # Count files
+                                csv_files = self._get_csv_files()
+                                file_count = len(csv_files)
+                                
+                                emit_event(run_id, "export", "metric",
+                                    f"Export in progress: {records:,} records, {file_size_mb:.2f} MB",
+                                    {
+                                        "instrument": instrument,
+                                        "dataType": progress_data.get("dataType", "unknown"),
+                                        "totalBarsProcessed": records,
+                                        "fileSizeMB": file_size_mb,
+                                        "fileCount": file_count,
+                                        "gapsDetected": progress_data.get("gapsDetected", 0),
+                                        "invalidDataSkipped": progress_data.get("invalidDataSkipped", 0)
+                                    })
+                        
+                        self.logger.info(f"Export in progress: {records:,} records, {file_size_mb:.2f} MB")
+                except Exception as e:
+                    pass  # Ignore read errors
+            
+            # Check for new CSV files
             current_files = self._get_csv_files()
             current_count = len(current_files)
             
-            # Check for new files
             new_files = set(current_files) - set(initial_files)
             if new_files:
-                self.logger.info(f"New export detected: {len(new_files)} file(s)")
+                self.logger.info(f"New export file detected: {len(new_files)} file(s)")
                 for new_file in new_files:
-                    self.logger.info(f"  - {new_file.name} ({new_file.stat().st_size / 1024 / 1024:.2f} MB)")
-                return True
+                    file_size_mb = new_file.stat().st_size / 1024 / 1024
+                    self.logger.info(f"  - {new_file.name} ({file_size_mb:.2f} MB)")
+                    last_size_check[new_file] = new_file.stat().st_size
+                
+                # Wait a bit to see if file is still being written
+                time.sleep(5)
+                # Check if file is still growing (export in progress)
+                for new_file in new_files:
+                    current_size = new_file.stat().st_size
+                    if current_size > last_size_check.get(new_file, 0):
+                        self.logger.info(f"  {new_file.name} is still being written, waiting for completion...")
+                        last_size_check[new_file] = current_size
+                    else:
+                        # File stopped growing, might be complete
+                        # Check for completion signal (in logs subfolder)
+                        completion_pattern = f"export_complete_{new_file.stem}.json"
+                        completion_signal = DATA_RAW_LOGS / completion_pattern
+                        if completion_signal.exists():
+                            self.logger.info(f"Export complete: {new_file.name}")
+                            return True
+                        else:
+                            # File exists but no completion signal - might still be writing
+                            # Continue monitoring
+                            pass
             
-            # Check if existing files were modified recently (within last 2 minutes)
+            # Check if existing files were modified recently
             for file_path in current_files:
                 if file_path not in initial_files or file_path.stat().st_mtime > initial_times.get(file_path, 0):
                     mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
@@ -245,15 +379,50 @@ class NinjaTraderController:
                     
                     if time_since_mod < 120:  # Modified within last 2 minutes
                         self.logger.info(f"Export file recently modified: {file_path.name}")
-                        return True
+                        # Check for completion signal (in logs subfolder)
+                        completion_pattern = f"export_complete_{file_path.stem}.json"
+                        completion_signal = DATA_RAW_LOGS / completion_pattern
+                        if completion_signal.exists():
+                            return True
+                        return True  # File modified, assume export in progress
             
+            # Check for stalled exports (file not growing)
             elapsed = int(time.time() - start_time)
+            if elapsed % stalled_check_interval == 0 and last_size_check:
+                for file_path, last_size in list(last_size_check.items()):
+                    if file_path.exists():
+                        current_size = file_path.stat().st_size
+                        if current_size == last_size:
+                            # File hasn't grown - check if there's a completion signal (in logs subfolder)
+                            completion_pattern = f"export_complete_{file_path.stem}.json"
+                            completion_signal = DATA_RAW_LOGS / completion_pattern
+                            if completion_signal.exists():
+                                self.logger.info(f"Export completed: {file_path.name}")
+                                return True
+                            else:
+                                # File stalled but no completion signal - might be an error
+                                self.logger.warning(f"Export may have stalled: {file_path.name} (no growth in 5 min)")
+                                if run_id:
+                                    emit_event(run_id, "export", "failure",
+                                        f"Export may have stalled: {file_path.name} (no growth in 5 minutes)",
+                                        {
+                                            "fileName": file_path.name,
+                                            "fileSizeMB": file_path.stat().st_size / (1024 * 1024)
+                                        })
+                        else:
+                            last_size_check[file_path] = current_size
+            
+            # Log progress
             if elapsed % 300 == 0:  # Log every 5 minutes
                 self.logger.info(f"Still waiting... ({elapsed // 60} min elapsed)")
             
             time.sleep(check_interval)
         
-        self.logger.warning(f"Timeout reached ({timeout_minutes} min) - no new exports detected")
+        self.logger.warning(f"Timeout reached ({timeout_minutes} min) - no export completion detected")
+        if run_id:
+            emit_event(run_id, "export", "failure",
+                f"Export timeout: no completion detected after {timeout_minutes} minutes",
+                {"timeoutMinutes": timeout_minutes})
         return False
     
     def _get_csv_files(self) -> List[Path]:
@@ -499,14 +668,28 @@ class DailyPipelineScheduler:
             emit_event(run_id, "pipeline", "failure", "Failed to launch NinjaTrader")
             return False
         
+        # 🔧 Create trigger file to signal DataExporter to start
+        emit_event(run_id, "pipeline", "log", "Creating export trigger for DataExporter")
+        trigger_file = DATA_RAW / "export_trigger.txt"
+        try:
+            # Write run_id to trigger file so DataExporter knows which run this is
+            with open(trigger_file, "w") as f:
+                f.write(run_id)
+            self.logger.info(f"Export trigger file created: {trigger_file}")
+            emit_event(run_id, "export", "log", "Export trigger sent to DataExporter")
+        except Exception as e:
+            self.logger.warning(f"Could not create export trigger file: {e}")
+            # Continue anyway - DataExporter might still auto-trigger
+        
         # Wait for export
         emit_event(run_id, "pipeline", "log", "Waiting for data export")
-        if not self.nt_controller.wait_for_export(timeout_minutes=60):
+        
+        if not self.nt_controller.wait_for_export(timeout_minutes=60, run_id=run_id):
             self.logger.error("Export timeout - aborting pipeline")
             emit_event(run_id, "pipeline", "failure", "Export timeout")
             return False
         
-        emit_event(run_id, "pipeline", "log", "Data export detected, starting processing")
+        emit_event(run_id, "pipeline", "log", "Data export completed, starting processing")
         
         # Run pipeline stages
         success = True

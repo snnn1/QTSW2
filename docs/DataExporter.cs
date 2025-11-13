@@ -2,6 +2,7 @@
 using System;
 using System.IO;
 using System.Globalization;
+using System.Text;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.Data;
 #endregion
@@ -22,7 +23,8 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool isMinuteChart = false;
         
         // Export control flags
-        private static bool exportInProgress = false;  // Static to prevent multiple instances
+        private bool exportInProgress = false;  // Instance flag - each chart exports independently
+        private bool exportCompleted = false;  // Track if export has completed for this instance
         private static bool autoExportTriggered = false;  // Static to ensure one auto-export per session
         private static DateTime lastAutoExportDate = DateTime.MinValue;  // Track last auto-export date
         private bool exportStarted = false;  // Instance flag to track if export was initiated
@@ -31,6 +33,9 @@ namespace NinjaTrader.NinjaScript.Indicators
         // Property for manual export trigger (accessible via indicator properties)
         private bool manualExportTrigger = false;
         private bool lastManualExportTrigger = false;
+        
+        // Property for trigger on open (starts export immediately when indicator loads)
+        private bool triggerOnOpen = true;
 
         protected override void OnStateChange()
         {
@@ -39,8 +44,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Name = "DataExporter";
                 Calculate = Calculate.OnBarClose;
                 IsOverlay = false;
-                Description = "Exports minute OR tick data to CSV with validation, gap detection, auto-trigger at 07:00 CT, and manual export trigger";
+                Description = "Exports minute OR tick data to CSV with validation, gap detection, auto-trigger at 07:00 CT, trigger on open, and manual export trigger";
                 ManualExportTrigger = false;
+                TriggerOnOpen = true;
             }
             else if (State == State.Configure)
             {
@@ -58,7 +64,15 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Active)
             {
-                Print("DataExporter initialized. Auto-export will trigger at 07:00 CT.");
+                Print("DataExporter initialized.");
+                if (TriggerOnOpen)
+                {
+                    Print("Trigger On Open: ENABLED - Export will start automatically when historical data loads.");
+                }
+                else
+                {
+                    Print("Auto-export will trigger at 07:00 CT.");
+                }
                 Print("To manually trigger export:");
                 Print("  1. Right-click indicator → Properties");
                 Print("  2. Check 'Manual Export Trigger' checkbox");
@@ -77,8 +91,22 @@ namespace NinjaTrader.NinjaScript.Indicators
                     return;
                 }
                 
-                // Check for auto-trigger at 07:00 CT (only if not already triggered this session)
-                CheckAutoExportTrigger();
+                // Check for trigger on open first (if enabled)
+                // Only trigger if export hasn't completed yet (prevents duplicate exports on data refresh)
+                if (TriggerOnOpen && !exportInProgress && !exportCompleted)
+                {
+                    Print("Trigger On Open: Starting export immediately...");
+                    StartExport();
+                }
+                else if (!TriggerOnOpen && !exportCompleted)
+                {
+                    // Check for auto-trigger at 07:00 CT (only if not already triggered this session)
+                    CheckAutoExportTrigger();
+                }
+                else if (exportCompleted)
+                {
+                    Print("Export already completed for this session - skipping trigger.");
+                }
             }
             else if (State == State.Terminated)
             {
@@ -100,10 +128,66 @@ namespace NinjaTrader.NinjaScript.Indicators
                         Print($"Export completed successfully!");
                         
                         // Report final file size
+                        long finalFileSize = 0;
                         if (File.Exists(filePath))
                         {
                             FileInfo fileInfo = new FileInfo(filePath);
-                            Print($"Final file size: {fileInfo.Length / (1024 * 1024):F1} MB");
+                            finalFileSize = fileInfo.Length;
+                            Print($"Final file size: {finalFileSize / (1024 * 1024):F1} MB");
+                        }
+                        
+                        // 🔧 Create completion signal file for pipeline conductor (in logs subfolder)
+                        try
+                        {
+                            string logsPath = Path.Combine(Path.GetDirectoryName(filePath), "logs");
+                            Directory.CreateDirectory(logsPath); // Ensure logs folder exists
+                            string completionSignalPath = Path.Combine(logsPath, 
+                                $"export_complete_{Path.GetFileNameWithoutExtension(filePath)}.json");
+                            
+                            string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                            string completionDataType = isTickChart ? "Tick" : "Minute";
+                            string fileName = Path.GetFileName(filePath);
+                            string completedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+                            double fileSizeMB = finalFileSize / (1024.0 * 1024.0);
+                            
+                            // Write simple JSON manually (no external library needed)
+                            StringBuilder json = new StringBuilder();
+                            json.AppendLine("{");
+                            json.AppendLine($"  \"status\": \"complete\",");
+                            json.AppendLine($"  \"filePath\": \"{EscapeJsonString(filePath)}\",");
+                            json.AppendLine($"  \"fileName\": \"{EscapeJsonString(fileName)}\",");
+                            json.AppendLine($"  \"dataType\": \"{completionDataType}\",");
+                            json.AppendLine($"  \"instrument\": \"{EscapeJsonString(instrument)}\",");
+                            json.AppendLine($"  \"totalBarsProcessed\": {totalBarsProcessed},");
+                            json.AppendLine($"  \"gapsDetected\": {gapsDetected},");
+                            json.AppendLine($"  \"invalidDataSkipped\": {invalidDataSkipped},");
+                            json.AppendLine($"  \"fileSizeBytes\": {finalFileSize},");
+                            json.AppendLine($"  \"fileSizeMB\": {fileSizeMB:F2},");
+                            json.AppendLine($"  \"completedAt\": \"{completedAt}\"");
+                            json.AppendLine("}");
+                            
+                            File.WriteAllText(completionSignalPath, json.ToString());
+                            Print($"Completion signal created: {completionSignalPath}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Print($"WARNING: Could not create completion signal: {ex.Message}");
+                        }
+                        
+                        // Remove progress file if it exists (from logs subfolder)
+                        try
+                        {
+                            string logsPath = Path.Combine(Path.GetDirectoryName(filePath), "logs");
+                            string progressFilePath = Path.Combine(logsPath, 
+                                $"export_progress_{Path.GetFileNameWithoutExtension(filePath)}.json");
+                            if (File.Exists(progressFilePath))
+                            {
+                                File.Delete(progressFilePath);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Print($"WARNING: Could not remove progress file: {ex.Message}");
                         }
                     }
                     catch (Exception ex)
@@ -112,11 +196,57 @@ namespace NinjaTrader.NinjaScript.Indicators
                     }
                     finally
                     {
-                        // Reset export flags
+                        // Reset export flags (instance-level, so each chart resets independently)
                         exportInProgress = false;
                         exportStarted = false;
+                        exportCompleted = true;  // Mark as completed to prevent re-triggering on data refresh
                     }
                 }
+            }
+        }
+        
+        // 🔧 Check for external trigger file from conductor
+        private void CheckExternalTrigger()
+        {
+            try
+            {
+                string qtsw2Path = @"C:\Users\jakej\QTSW2\data\raw";
+                string triggerFile = Path.Combine(qtsw2Path, "export_trigger.txt");
+                
+                if (File.Exists(triggerFile))
+                {
+                    // Read trigger file to get run_id
+                    string triggerContent = File.ReadAllText(triggerFile).Trim();
+                    
+                    // Delete trigger file immediately to prevent re-triggering
+                    try
+                    {
+                        File.Delete(triggerFile);
+                    }
+                    catch (Exception ex)
+                    {
+                        Print($"WARNING: Could not delete trigger file: {ex.Message}");
+                    }
+                    
+                    // Trigger export
+                    if (!exportInProgress && State == State.Historical)
+                    {
+                        Print($"External trigger detected (Run ID: {triggerContent}). Starting export...");
+                        StartExport();
+                    }
+                    else if (exportInProgress)
+                    {
+                        Print("External trigger detected but export already in progress - ignoring.");
+                    }
+                    else
+                    {
+                        Print("External trigger detected but not in historical state - export will start when historical data loads.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"WARNING: Error checking external trigger: {ex.Message}");
             }
         }
         
@@ -160,6 +290,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
         
+        // Helper method to escape JSON strings
+        private string EscapeJsonString(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+                return "";
+            
+            return input.Replace("\\", "\\\\")
+                       .Replace("\"", "\\\"")
+                       .Replace("\n", "\\n")
+                       .Replace("\r", "\\r")
+                       .Replace("\t", "\\t");
+        }
+        
         // Manual export trigger from button click
         private void TriggerManualExport()
         {
@@ -197,6 +340,55 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
             }
             
+            // Check for recently created files or in-progress exports for this instrument (prevent duplicates on chart reload)
+            string instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            if (instrumentName.Contains(" "))
+            {
+                instrumentName = instrumentName.Split(' ')[0];
+            }
+            
+            string qtsw2Path = @"C:\Users\jakej\QTSW2\data\raw";
+            string logsPath = Path.Combine(qtsw2Path, "logs");
+            
+            // First check for progress files (export currently in progress)
+            if (Directory.Exists(logsPath))
+            {
+                string progressPattern = $"export_progress_DataExport_{instrumentName}_*.json";
+                var progressFiles = Directory.GetFiles(logsPath, progressPattern);
+                if (progressFiles.Length > 0)
+                {
+                    // Check if progress file was updated recently (within last 5 minutes)
+                    foreach (string progressFile in progressFiles)
+                    {
+                        FileInfo progressInfo = new FileInfo(progressFile);
+                        TimeSpan timeSinceUpdate = DateTime.Now - progressInfo.LastWriteTime;
+                        
+                        if (timeSinceUpdate.TotalSeconds < 300) // Less than 5 minutes since last update
+                        {
+                            Print($"Export already in progress for {instrumentName} (progress file updated {timeSinceUpdate.TotalSeconds:F0} seconds ago) - skipping duplicate export.");
+                            return; // Skip export if one is already running
+                        }
+                    }
+                }
+            }
+            
+            // Check if a CSV file was created in the last 2 minutes (120 seconds)
+            string pattern = $"DataExport_{instrumentName}_*.csv";
+            var existingFiles = Directory.GetFiles(qtsw2Path, pattern);
+            
+            foreach (string existingFile in existingFiles)
+            {
+                FileInfo fileInfo = new FileInfo(existingFile);
+                TimeSpan timeSinceCreation = DateTime.Now - fileInfo.CreationTime;
+                
+                if (timeSinceCreation.TotalSeconds < 120) // Less than 2 minutes old
+                {
+                    Print($"Recent export file found for {instrumentName} (created {timeSinceCreation.TotalSeconds:F0} seconds ago) - skipping duplicate export.");
+                    Print($"Existing file: {fileInfo.Name}");
+                    return; // Skip export if file was created recently
+                }
+            }
+            
             exportInProgress = true;
             exportStarted = true;
             
@@ -208,24 +400,44 @@ namespace NinjaTrader.NinjaScript.Indicators
             invalidDataSkipped = 0;
             
             // 🔧 Export to QTSW2 raw_data folder for pipeline integration
-            string qtsw2Path = @"C:\Users\jakej\QTSW2\data\raw";
+            // (qtsw2Path and logsPath already declared above)
             Directory.CreateDirectory(qtsw2Path); // Ensure folder exists (creates if doesn't exist)
+            Directory.CreateDirectory(logsPath); // Ensure logs folder exists
             
-            string instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-            // Extract root symbol if instrument name contains contract info
-            if (instrumentName.Contains(" "))
+            // 🔧 Create export start signal file
+            string startDataType = isTickChart ? "Tick" : "Minute";
+            try
             {
-                instrumentName = instrumentName.Split(' ')[0];
+                string startSignalPath = Path.Combine(logsPath, $"export_start_{DateTime.Now:yyyyMMdd_HHmmss}.json");
+                string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                string startedAt = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+                
+                // Write simple JSON manually (no external library needed)
+                StringBuilder json = new StringBuilder();
+                json.AppendLine("{");
+                json.AppendLine($"  \"status\": \"started\",");
+                json.AppendLine($"  \"instrument\": \"{EscapeJsonString(instrument)}\",");
+                json.AppendLine($"  \"dataType\": \"{startDataType}\",");
+                json.AppendLine($"  \"startedAt\": \"{startedAt}\"");
+                json.AppendLine("}");
+                
+                File.WriteAllText(startSignalPath, json.ToString());
+            }
+            catch (Exception ex)
+            {
+                Print($"WARNING: Could not create start signal: {ex.Message}");
             }
             
-            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            string dataType = isTickChart ? "Tick" : "Minute";
+            // (instrumentName already declared and processed above)
             
-            filePath = Path.Combine(qtsw2Path, $"{dataType}DataExport_{instrumentName}_{timestamp}_UTC.csv");
+            string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string exportDataType = isTickChart ? "Tick" : "Minute";
+            
+            filePath = Path.Combine(qtsw2Path, $"DataExport_{instrumentName}_{timestamp}_UTC.csv");
             
             Print($"Starting export to: {filePath}");
             Print($"Instrument: {instrumentName}");
-            Print($"Data Type: {dataType}");
+            Print($"Data Type: {exportDataType}");
             Print($"Data Range: {Bars.GetTime(0)} to {Bars.GetTime(Count-1)}");
             
             // Create file with exception handling
@@ -254,9 +466,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 return;
 
             // Check for manual export trigger (property-based)
+            // Manual trigger bypasses exportCompleted check (allows user to force re-export)
             if (ManualExportTrigger && !lastManualExportTrigger && !exportInProgress)
             {
                 Print("Manual export triggered by user (via Properties).");
+                exportCompleted = false;  // Reset completed flag to allow manual re-export
                 TriggerManualExport();
                 lastManualExportTrigger = true;
             }
@@ -264,6 +478,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 lastManualExportTrigger = false;  // Reset when unchecked
             }
+
+            // 🔧 Check for external trigger file from conductor (on every bar update)
+            CheckExternalTrigger();
 
             // Safety validation: ensure export was started
             if (!exportStarted)
@@ -473,7 +690,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
             }
 
-            // Check file size periodically
+            // Check file size periodically and update progress file
             if (totalBarsProcessed % 100000 == 0)
             {
                 try
@@ -484,6 +701,47 @@ namespace NinjaTrader.NinjaScript.Indicators
                         if (fileInfo.Length > maxFileSize)
                         {
                             Print($"WARNING: File size approaching limit: {fileInfo.Length / (1024*1024):F1}MB");
+                        }
+                        
+                        // 🔧 Update progress file for pipeline conductor (in logs subfolder)
+                        try
+                        {
+                            string logsPath = Path.Combine(Path.GetDirectoryName(filePath), "logs");
+                            Directory.CreateDirectory(logsPath); // Ensure logs folder exists
+                            string progressFilePath = Path.Combine(logsPath, 
+                                $"export_progress_{Path.GetFileNameWithoutExtension(filePath)}.json");
+                            
+                            string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                            string progressDataType = isTickChart ? "Tick" : "Minute";
+                            string fileName = Path.GetFileName(filePath);
+                            string lastUpdateTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+                            string lastBarTime = Time[0].ToString("yyyy-MM-ddTHH:mm:ss");
+                            long fileSizeBytes = fileInfo.Length;
+                            double fileSizeMB = fileSizeBytes / (1024.0 * 1024.0);
+                            
+                            // Write simple JSON manually (no external library needed)
+                            StringBuilder json = new StringBuilder();
+                            json.AppendLine("{");
+                            json.AppendLine($"  \"status\": \"in_progress\",");
+                            json.AppendLine($"  \"filePath\": \"{EscapeJsonString(filePath)}\",");
+                            json.AppendLine($"  \"fileName\": \"{EscapeJsonString(fileName)}\",");
+                            json.AppendLine($"  \"dataType\": \"{progressDataType}\",");
+                            json.AppendLine($"  \"instrument\": \"{EscapeJsonString(instrument)}\",");
+                            json.AppendLine($"  \"totalBarsProcessed\": {totalBarsProcessed},");
+                            json.AppendLine($"  \"gapsDetected\": {gapsDetected},");
+                            json.AppendLine($"  \"invalidDataSkipped\": {invalidDataSkipped},");
+                            json.AppendLine($"  \"fileSizeBytes\": {fileSizeBytes},");
+                            json.AppendLine($"  \"fileSizeMB\": {fileSizeMB:F2},");
+                            json.AppendLine($"  \"lastUpdateTime\": \"{lastUpdateTime}\",");
+                            json.AppendLine($"  \"lastBarTime\": \"{lastBarTime}\"");
+                            json.AppendLine("}");
+                            
+                            File.WriteAllText(progressFilePath, json.ToString());
+                        }
+                        catch (Exception ex)
+                        {
+                            // Don't fail export if progress file write fails
+                            Print($"WARNING: Could not update progress file: {ex.Message}");
                         }
                     }
                 }
@@ -520,6 +778,16 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             get { return manualExportTrigger; }
             set { manualExportTrigger = value; }
+        }
+        
+        // Public property for trigger on open (appears in indicator Properties dialog)
+        // Right-click indicator → Properties → find "Trigger On Open" checkbox
+        // When enabled, export starts automatically when indicator loads and historical data is available
+        [NinjaScriptProperty]
+        public bool TriggerOnOpen
+        {
+            get { return triggerOnOpen; }
+            set { triggerOnOpen = value; }
         }
 
         // Optional: Add method to handle real-time data if needed
