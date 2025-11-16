@@ -106,12 +106,18 @@ class PriceTracker:
             )
             
             if self.debug_manager.is_debug_enabled():
-                print(f"\n🚀 EXECUTING TRADE: {direction} ${entry_price:.2f} at {entry_time}")
+                try:
+                    print(f"\nEXECUTING TRADE: {direction} ${entry_price:.2f} at {entry_time}")
+                except Exception:
+                    pass
                 print(f"   Entry time breakdown:")
                 print(f"     Chicago: {entry_time}")
                 print(f"     UTC: {entry_time.tz_convert('UTC') if entry_time.tz else 'N/A'}")
                 print(f"     Hour: {entry_time.hour:02d}:{entry_time.minute:02d}")
-                print(f"   🛑 Stop Loss: ${stop_loss:.2f}")
+                try:
+                    print(f"   Stop Loss: ${stop_loss:.2f}")
+                except Exception:
+                    pass
             
             # Get trigger threshold (always 65% of target)
             t1_threshold = self._get_trigger_threshold(target_pts, instrument)
@@ -175,15 +181,18 @@ class PriceTracker:
                     last_bar = mfe_bars.iloc[-1]['timestamp'] if len(mfe_bars) > 0 else None
                     self.debug_manager.print_mfe_debug(entry_time, mfe_end_time, len(mfe_bars), first_bar, last_bar)
                     
-                    # Additional debug: Show data availability
-                    print(f"\n📊 DATA AVAILABILITY CHECK:")
-                    print(f"   📅 Data Range: {df['timestamp'].min()} → {df['timestamp'].max()}")
-                    print(f"   📈 Data after entry: {len(after)} bars")
-                    print(f"   📊 MFE bars selected: {len(mfe_bars)} bars")
-                    if len(mfe_bars) > 0:
-                        print(f"   📅 MFE bars range: {mfe_bars['timestamp'].min()} → {mfe_bars['timestamp'].max()}")
-                    print(f"   🕐 Expected MFE end: {mfe_end_time}")
-                    print(f"   📊 Data contains Monday bars: {len(df[df['timestamp'].dt.date == mfe_end_time.date()])} bars")
+                    # Additional debug: Show data availability (no emojis to avoid Windows encoding errors)
+                    try:
+                        print(f"\nDATA AVAILABILITY CHECK:")
+                        print(f"   Data Range: {df['timestamp'].min()} -> {df['timestamp'].max()}")
+                        print(f"   Data after entry: {len(after)} bars")
+                        print(f"   MFE bars selected: {len(mfe_bars)} bars")
+                        if len(mfe_bars) > 0:
+                            print(f"   MFE bars range: {mfe_bars['timestamp'].min()} -> {mfe_bars['timestamp'].max()}")
+                        print(f"   Expected MFE end: {mfe_end_time}")
+                        print(f"   Data contains Monday bars: {len(df[df['timestamp'].dt.date == mfe_end_time.date()])} bars")
+                    except Exception:
+                        pass
             else:
                 mfe_bars = after.copy()
                 debug_info.mfe_bars_count = len(mfe_bars)
@@ -231,7 +240,10 @@ class PriceTracker:
                     max_favorable_execution = current_favorable
             
             if self.debug_manager.is_debug_enabled():
-                print(f"🔍 MAX FAVORABLE EXECUTION: {max_favorable_execution:.2f} (Target: {target_pts:.2f})")
+                try:
+                    print(f"MAX FAVORABLE EXECUTION: {max_favorable_execution:.2f} (Target: {target_pts:.2f})")
+                except Exception:
+                    pass
                 print(f"   Target Hit: {max_favorable_execution >= target_pts}")
             
             # Now process trade execution using the regular after bars
@@ -244,7 +256,10 @@ class PriceTracker:
                 current_favorable = self._calculate_favorable_movement(high, low, entry_price, direction)
                 
                 if self.debug_manager.is_debug_enabled() and current_favorable >= 40:  # Debug when close to target
-                    print(f"🔍 FAVORABLE MOVEMENT: {current_favorable:.2f} at {bar['timestamp']}")
+                    try:
+                        print(f"FAVORABLE MOVEMENT: {current_favorable:.2f} at {bar['timestamp']}")
+                    except Exception:
+                        pass
                     print(f"   Entry: {entry_price}, Direction: {direction}")
                     print(f"   High: {high}, Low: {low}")
                     print(f"   Target: {target_pts}")
@@ -268,10 +283,13 @@ class PriceTracker:
                 target_hit_by_movement = max_favorable >= target_pts
                 
                 if self.debug_manager.is_debug_enabled() and target_hit_by_movement:
-                    print(f"🎯 TARGET HIT BY MOVEMENT: {current_favorable:.2f} >= {target_pts:.2f} at {bar['timestamp']}")
-                    print(f"   Entry: {entry_price}, Direction: {direction}")
-                    print(f"   Target Level: {target_level}")
-                    print(f"   Current Favorable: {current_favorable}")
+                    try:
+                        print(f"TARGET HIT BY MOVEMENT: {current_favorable:.2f} >= {target_pts:.2f} at {bar['timestamp']}")
+                        print(f"   Entry: {entry_price}, Direction: {direction}")
+                        print(f"   Target Level: {target_level}")
+                        print(f"   Current Favorable: {current_favorable}")
+                    except Exception:
+                        pass
                 
                 # Check what gets hit first: target or stop loss using realistic execution analysis
                 target_hit_first = False
@@ -289,13 +307,22 @@ class PriceTracker:
                     
                     if self.debug_manager.is_debug_enabled():
                         if target_hit_first:
-                            print(f"🎯 TARGET HIT FIRST: {execution_result['exit_price']}")
+                            try:
+                                print(f"TARGET HIT FIRST: {execution_result['exit_price']}")
+                            except Exception:
+                                pass
                         elif stop_hit_first:
-                            print(f"🛑 STOP HIT FIRST: {execution_result['exit_price']}")
+                            try:
+                                print(f"STOP HIT FIRST: {execution_result['exit_price']}")
+                            except Exception:
+                                pass
                 else:
                     # No execution in this bar - continue tracking
                     if self.debug_manager.is_debug_enabled():
-                        print(f"📊 NO EXECUTION: Continuing price tracking")
+                        try:
+                            print(f"NO EXECUTION: Continuing price tracking")
+                        except Exception:
+                            pass
                 
                 if target_hit_first:
                     # Target hit first - exit with full profit
@@ -661,10 +688,13 @@ class PriceTracker:
         peak_price = entry_price
         
         if debug_info and self.debug_manager.is_debug_enabled():
-            print(f"\n📊 MFE CALCULATION STARTING:")
-            print(f"   📈 Processing {len(mfe_bars)} bars for MFE calculation")
-            print(f"   📊 Entry: ${entry_price:.2f}, Direction: {direction}")
-            print(f"   🛑 Original stop loss: ${original_stop_loss:.2f}")
+            try:
+                print(f"\nMFE CALCULATION STARTING:")
+                print(f"   Processing {len(mfe_bars)} bars for MFE calculation")
+                print(f"   Entry: ${entry_price:.2f}, Direction: {direction}")
+                print(f"   Original stop loss: ${original_stop_loss:.2f}")
+            except Exception:
+                pass
         
         for _, bar in mfe_bars.iterrows():
             high, low = float(bar["high"]), float(bar["low"])
@@ -676,7 +706,10 @@ class PriceTracker:
                         debug_info.stop_loss_hit = True
                         debug_info.stop_loss_hit_time = bar['timestamp']
                     if debug_info and self.debug_manager.is_debug_enabled():
-                        print(f"   🛑 STOP LOSS HIT: {bar['timestamp']}, low: ${low:.2f}")
+                        try:
+                            print(f"   STOP LOSS HIT: {bar['timestamp']}, low: ${low:.2f}")
+                        except Exception:
+                            pass
                     break  # Stop MFE tracking when original stop loss hit
             else:
                 if high >= original_stop_loss:
@@ -684,7 +717,10 @@ class PriceTracker:
                         debug_info.stop_loss_hit = True
                         debug_info.stop_loss_hit_time = bar['timestamp']
                     if debug_info and self.debug_manager.is_debug_enabled():
-                        print(f"   🛑 STOP LOSS HIT: {bar['timestamp']}, high: ${high:.2f}")
+                        try:
+                            print(f"   STOP LOSS HIT: {bar['timestamp']}, high: ${high:.2f}")
+                        except Exception:
+                            pass
                     break  # Stop MFE tracking when original stop loss hit
             
             # Calculate favorable movement for this bar
@@ -1354,14 +1390,20 @@ class PriceTracker:
                         direction: str = "Long", t1_removed: bool = False) -> str:
         """Classify trade result based on trigger and exit reason"""
         if self.debug_manager.is_debug_enabled():
-            print(f"\n🔍 TRADE CLASSIFICATION:")
-            print(f"   ✅ T1 Triggered: {t1_triggered}")
-            print(f"   📊 Exit reason: {exit_reason}, Target hit: {target_hit}")
+            try:
+                print(f"\nTRADE CLASSIFICATION:")
+                print(f"   T1 Triggered: {t1_triggered}")
+                print(f"   Exit reason: {exit_reason}, Target hit: {target_hit}")
+            except Exception:
+                pass
         
         # Check if target was hit first - this overrides everything
         if target_hit:
             if self.debug_manager.is_debug_enabled():
-                print(f"   🎯 -> WIN (target hit)")
+                try:
+                    print(f"   -> WIN (target hit)")
+                except Exception:
+                    pass
             return "Win"  # Full target reached = Full profit
         
         # If exit_reason is "Win" but target_hit is False, check triggers to determine correct classification
@@ -1408,11 +1450,14 @@ class PriceTracker:
             be_price = entry_price + 0.25  # -1 tick under entry
         
         if self.debug_manager.is_debug_enabled():
-            print(f"\n🎯 POST-6.5 TRACKING:")
-            print(f"  Entry: {entry_price}, Direction: {direction}")
-            print(f"  Target Price: {target_price} (10.0 points)")
-            print(f"  BE Price: {be_price} (-1 tick)")
-            print(f"  Tracking {len(post_exit_data)} bars after exit")
+            try:
+                print(f"\nPOST-6.5 TRACKING:")
+                print(f"  Entry: {entry_price}, Direction: {direction}")
+                print(f"  Target Price: {target_price} (10.0 points)")
+                print(f"  BE Price: {be_price} (-1 tick)")
+                print(f"  Tracking {len(post_exit_data)} bars after exit")
+            except Exception:
+                pass
         
         # Track price movement after exit
         for _, bar in post_exit_data.iterrows():
@@ -1432,19 +1477,31 @@ class PriceTracker:
                     
                     if target_distance <= be_distance:
                         if self.debug_manager.is_debug_enabled():
-                            print(f"  ✅ WIN: Both hit, close closer to target at {close}")
+                            try:
+                                print(f"  WIN: Both hit, close closer to target at {close}")
+                            except Exception:
+                                pass
                         return "Win"
                     else:
                         if self.debug_manager.is_debug_enabled():
-                            print(f"  🛑 BE: Both hit, close closer to BE at {close}")
+                            try:
+                                print(f"  BE: Both hit, close closer to BE at {close}")
+                            except Exception:
+                                pass
                         return "BE"
                 elif target_hit:
                     if self.debug_manager.is_debug_enabled():
-                        print(f"  ✅ WIN: Price reached 10.0 target at {high}")
+                        try:
+                            print(f"  WIN: Price reached 10.0 target at {high}")
+                        except Exception:
+                            pass
                     return "Win"
                 elif be_hit:
                     if self.debug_manager.is_debug_enabled():
-                        print(f"  🛑 BE: Price went to -1 tick under entry at {low}")
+                        try:
+                            print(f"  BE: Price went to -1 tick under entry at {low}")
+                        except Exception:
+                            pass
                     return "BE"
             else:  # Short
                 # Check if both conditions are possible in this bar
@@ -1459,23 +1516,38 @@ class PriceTracker:
                     
                     if target_distance <= be_distance:
                         if self.debug_manager.is_debug_enabled():
-                            print(f"  ✅ WIN: Both hit, close closer to target at {close}")
+                            try:
+                                print(f"  WIN: Both hit, close closer to target at {close}")
+                            except Exception:
+                                pass
                         return "Win"
                     else:
                         if self.debug_manager.is_debug_enabled():
-                            print(f"  🛑 BE: Both hit, close closer to BE at {close}")
+                            try:
+                                print(f"  BE: Both hit, close closer to BE at {close}")
+                            except Exception:
+                                pass
                         return "BE"
                 elif target_hit:
                     if self.debug_manager.is_debug_enabled():
-                        print(f"  ✅ WIN: Price reached 10.0 target at {low}")
+                        try:
+                            print(f"  WIN: Price reached 10.0 target at {low}")
+                        except Exception:
+                            pass
                     return "Win"
                 elif be_hit:
                     if self.debug_manager.is_debug_enabled():
-                        print(f"  🛑 BE: Price went to -1 tick under entry at {high}")
+                        try:
+                            print(f"  BE: Price went to -1 tick under entry at {high}")
+                        except Exception:
+                            pass
                     return "BE"
         
         if self.debug_manager.is_debug_enabled():
-            print(f"  ➡️ No 10.0 or -1 tick reached, defaulting to Win")
+            try:
+                print(f"  No 10.0 or -1 tick reached, defaulting to Win")
+            except Exception:
+                pass
         
         return "Win"  # Default to Win if neither level reached
     

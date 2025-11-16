@@ -611,7 +611,11 @@ def main():
         
         parquet_path = out_dir / f"{desc_filename}.parquet"
         csv_path = out_dir / f"{desc_filename}.csv"
-        summary_path = out_dir / f"{desc_filename}_SUMMARY.txt"
+        
+        # Save summary in summaries subfolder
+        summaries_dir = out_dir / "summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = summaries_dir / f"{desc_filename}_SUMMARY.txt"
 
         print(f"💾 Saving results to files...")
         
@@ -840,8 +844,10 @@ def main():
                 csv_path = Path("data/analyzer_runs") / f"{filename}.csv"
                 final.to_csv(csv_path, index=False)
                 
-                # Save summary
-                summary_path = Path("data/analyzer_runs") / f"{filename}_SUMMARY.txt"
+                # Save summary in summaries subfolder
+                summaries_dir = Path("data/analyzer_runs/summaries")
+                summaries_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = summaries_dir / f"{filename}_SUMMARY.txt"
                 with open(summary_path, 'w') as f:
                     f.write(f"Analysis Summary - {timestamp}\n")
                     f.write("=" * 50 + "\n")

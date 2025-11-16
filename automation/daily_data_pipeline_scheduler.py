@@ -52,14 +52,19 @@ NINJATRADER_WORKSPACE = Path(r"C:\Users\jakej\Documents\NinjaTrader 8\workspaces
 # Note: DATA_RAW matches DataExporter output path (QTSW2/data/raw)
 DATA_RAW = QTSW2_ROOT / "data" / "raw"
 DATA_RAW_LOGS = DATA_RAW / "logs"  # Signal files are stored in logs subfolder
-DATA_PROCESSED = QTSW_ROOT / "data_processed"
-ANALYZER_RUNS = QTSW_ROOT / "analyzer_runs"
+DATA_RAW_ARCHIVED = DATA_RAW / "archived"  # Archive folder for raw CSV files after processing
+DATA_PROCESSED = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
+DATA_PROCESSED_ARCHIVED = DATA_PROCESSED / "archived"  # Archive folder for processed files after analysis
+ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzer_runs"  # QTSW2/data/analyzer_runs
+ANALYZER_RUNS_ARCHIVED = ANALYZER_RUNS / "archived"  # Archive folder for analyzer run files
+SEQUENCER_RUNS = QTSW2_ROOT / "data" / "sequencer_runs"  # QTSW2/data/sequencer_runs
+SEQUENCER_RUNS_ARCHIVED = SEQUENCER_RUNS / "archived"  # Archive folder for sequencer run files
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 
 # Pipeline scripts (adjust paths as needed)
 TRANSLATOR_SCRIPT = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
-ANALYZER_SCRIPT = QTSW_ROOT / "scripts" / "breakout_analyzer" / "scripts" / "run_data_processed.py"
-SEQUENTIAL_PROCESSOR_SCRIPT = QTSW_ROOT / "sequential_processor" / "sequential_processor_app.py"
+ANALYZER_SCRIPT = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "scripts" / "run_data_processed.py"
+SEQUENTIAL_PROCESSOR_SCRIPT = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
 
 # Logging configuration
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,8 +127,14 @@ def emit_event(
 # Logging Setup
 # ============================================================
 
-def setup_logging(log_file: Path) -> logging.Logger:
-    """Configure structured logging with file and console output."""
+def setup_logging(log_file: Path, debug_window=None) -> logging.Logger:
+    """
+    Configure structured logging with file, console, and optional debug window output.
+    
+    Args:
+        log_file: Path to log file
+        debug_window: Optional DebugLogWindow instance for GUI logging
+    """
     logger = logging.getLogger("PipelineScheduler")
     logger.setLevel(logging.INFO)
     
@@ -149,6 +160,26 @@ def setup_logging(log_file: Path) -> logging.Logger:
     
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+    
+    # Debug window handler (if provided)
+    if debug_window:
+        try:
+            import sys
+            from pathlib import Path
+            # Add automation directory to path for import
+            automation_dir = Path(__file__).parent
+            if str(automation_dir) not in sys.path:
+                sys.path.insert(0, str(automation_dir))
+            from debug_log_window import DebugLogHandler
+            debug_handler = DebugLogHandler(debug_window)
+            debug_handler.setLevel(logging.INFO)
+            debug_formatter = logging.Formatter(
+                '%(message)s'
+            )
+            debug_handler.setFormatter(debug_formatter)
+            logger.addHandler(debug_handler)
+        except Exception as e:
+            print(f"Warning: Could not add debug window handler: {e}")
     
     return logger
 
@@ -430,9 +461,12 @@ class NinjaTraderController:
         if not DATA_RAW.exists():
             return []
         
-        # Look for MinuteDataExport_* or TickDataExport_* pattern
+        # Look for all CSV export patterns (MinuteDataExport, TickDataExport, DataExport)
         files = list(DATA_RAW.glob("MinuteDataExport_*.csv"))
         files.extend(DATA_RAW.glob("TickDataExport_*.csv"))
+        files.extend(DATA_RAW.glob("DataExport_*.csv"))
+        # Exclude files in subdirectories (like logs folder)
+        files = [f for f in files if f.parent == DATA_RAW]
         return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
 
 
@@ -459,6 +493,8 @@ class PipelineOrchestrator:
         try:
             # Check if raw files exist
             raw_files = list(DATA_RAW.glob("*.csv"))
+            # Exclude files in subdirectories (like logs folder)
+            raw_files = [f for f in raw_files if f.parent == DATA_RAW]
             if not raw_files:
                 self.logger.warning("No raw CSV files found in data_raw/")
                 emit_event(self.run_id, "translator", "failure", "No raw CSV files found")
@@ -470,22 +506,63 @@ class PipelineOrchestrator:
             # Run translator via CLI (non-interactive)
             # Note: This assumes you have a CLI version or can run translator headless
             # Adjust this to match your actual translator interface
+            # Ensure paths are absolute and exist
+            input_path = DATA_RAW.resolve()
+            output_path = Path(DATA_PROCESSED).resolve()
+            
+            if not input_path.exists():
+                self.logger.error(f"Input folder does not exist: {input_path}")
+                emit_event(self.run_id, "translator", "failure", f"Input folder does not exist: {input_path}")
+                return False
+            
             translator_cmd = [
                 sys.executable,
                 str(QTSW2_ROOT / "tools" / "translate_raw.py"),
-                "--input", str(DATA_RAW),
-                "--output", str(DATA_PROCESSED),
-                "--separate-years"
+                "--input", str(input_path),
+                "--output", str(output_path),
+                "--separate-years",
+                "--no-merge"  # Process each file separately
             ]
             
             self.logger.info(f"Executing: {' '.join(translator_cmd)}")
-            result = subprocess.run(
-                translator_cmd,
-                cwd=str(QTSW2_ROOT),
-                capture_output=True,
-                text=True,
-                timeout=3600  # 1 hour timeout
-            )
+            emit_event(self.run_id, "translator", "log", f"Starting translation of {len(raw_files)} file(s)")
+            
+            # Run translator with timeout and capture output
+            try:
+                result = subprocess.run(
+                    translator_cmd,
+                    cwd=str(QTSW2_ROOT),
+                    capture_output=True,
+                    text=True,
+                    timeout=3600  # 1 hour timeout
+                )
+                
+                # Log output for debugging
+                if result.stdout:
+                    self.logger.info("Translator output:")
+                    for line in result.stdout.split('\n'):
+                        if line.strip():
+                            self.logger.info(f"  {line}")
+                            # Emit progress events for key milestones
+                            if any(keyword in line for keyword in ["Processing:", "Loaded:", "Saving", "rows", "completed"]):
+                                emit_event(self.run_id, "translator", "log", line.strip())
+                
+                if result.stderr:
+                    self.logger.warning("Translator warnings/errors:")
+                    for line in result.stderr.split('\n'):
+                        if line.strip():
+                            self.logger.warning(f"  {line}")
+                            
+            except subprocess.TimeoutExpired:
+                self.logger.error("✗ Translator timed out after 1 hour")
+                emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
+                self.stage_results["translator"] = False
+                return False
+            except Exception as e:
+                self.logger.error(f"✗ Translator exception: {e}")
+                emit_event(self.run_id, "translator", "failure", f"Translator exception: {str(e)}")
+                self.stage_results["translator"] = False
+                return False
             
             if result.returncode == 0:
                 self.logger.info("✓ Translator completed successfully")
@@ -497,27 +574,143 @@ class PipelineOrchestrator:
                 emit_event(self.run_id, "translator", "metric", "Translation complete", {
                     "processed_file_count": len(processed_files)
                 })
+                
+                # Archive processed raw CSV files to data/raw/archived
+                archived_count = self._archive_raw_files(raw_files)
+                if archived_count > 0:
+                    self.logger.info(f"✓ Archived {archived_count} raw CSV file(s) to {DATA_RAW_ARCHIVED}")
+                    emit_event(self.run_id, "translator", "metric", "Raw files archived", {
+                        "archived_file_count": archived_count
+                    })
+                
                 emit_event(self.run_id, "translator", "success", "Translator completed successfully")
                 
                 self.stage_results["translator"] = True
                 return True
             else:
                 self.logger.error(f"✗ Translator failed (code: {result.returncode})")
-                self.logger.error(result.stderr)
+                if result.stderr:
+                    self.logger.error(f"Error output: {result.stderr}")
                 emit_event(self.run_id, "translator", "failure", f"Translator failed with code {result.returncode}")
                 self.stage_results["translator"] = False
                 return False
                 
-        except subprocess.TimeoutExpired:
-            self.logger.error("✗ Translator timed out after 1 hour")
-            emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
-            self.stage_results["translator"] = False
-            return False
         except Exception as e:
+            # This catches any other exceptions not caught above
             self.logger.error(f"✗ Translator exception: {e}")
             emit_event(self.run_id, "translator", "failure", f"Translator exception: {str(e)}")
             self.stage_results["translator"] = False
             return False
+    
+    def _archive_raw_files(self, raw_files: List[Path]) -> int:
+        """Move processed raw CSV files to data/raw/archived folder."""
+        try:
+            # Create archive folder if it doesn't exist
+            DATA_RAW_ARCHIVED.mkdir(parents=True, exist_ok=True)
+            
+            archived_count = 0
+            for raw_file in raw_files:
+                try:
+                    # Move file to archive folder
+                    archive_path = DATA_RAW_ARCHIVED / raw_file.name
+                    
+                    # If file already exists in archive, add timestamp to avoid overwrite
+                    if archive_path.exists():
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        name_parts = raw_file.stem.rsplit('_', 1)  # Split on last underscore
+                        if len(name_parts) == 2:
+                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{raw_file.suffix}"
+                        else:
+                            new_name = f"{raw_file.stem}_archived_{timestamp}{raw_file.suffix}"
+                        archive_path = DATA_RAW_ARCHIVED / new_name
+                    
+                    raw_file.rename(archive_path)
+                    archived_count += 1
+                    self.logger.info(f"  Archived: {raw_file.name} → {archive_path.name}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"  Failed to archive {raw_file.name}: {e}")
+                    # Continue with other files
+            
+            return archived_count
+            
+        except Exception as e:
+            self.logger.error(f"Error archiving raw files: {e}")
+            return 0
+    
+    def _archive_processed_files(self, processed_files: List[Path]) -> int:
+        """Move analyzed processed files to data/processed/archived folder."""
+        try:
+            # Create archive folder if it doesn't exist
+            DATA_PROCESSED_ARCHIVED.mkdir(parents=True, exist_ok=True)
+            
+            archived_count = 0
+            for proc_file in processed_files:
+                try:
+                    # Move file to archive folder
+                    archive_path = DATA_PROCESSED_ARCHIVED / proc_file.name
+                    
+                    # If file already exists in archive, add timestamp to avoid overwrite
+                    if archive_path.exists():
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        name_parts = proc_file.stem.rsplit('_', 1)  # Split on last underscore
+                        if len(name_parts) == 2:
+                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{proc_file.suffix}"
+                        else:
+                            new_name = f"{proc_file.stem}_archived_{timestamp}{proc_file.suffix}"
+                        archive_path = DATA_PROCESSED_ARCHIVED / new_name
+                    
+                    # Move (not copy) file to archive - preserves original timestamp
+                    proc_file.rename(archive_path)
+                    archived_count += 1
+                    self.logger.info(f"  Archived: {proc_file.name} → {archive_path.name}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"  Failed to archive {proc_file.name}: {e}")
+                    # Continue with other files
+            
+            return archived_count
+            
+        except Exception as e:
+            self.logger.error(f"Error archiving processed files: {e}")
+            return 0
+    
+    def _archive_analyzer_files(self, analyzer_files: List[Path]) -> int:
+        """Move analyzed files to data/analyzer_runs/archived folder."""
+        try:
+            # Create archive folder if it doesn't exist
+            ANALYZER_RUNS_ARCHIVED.mkdir(parents=True, exist_ok=True)
+            
+            archived_count = 0
+            for analyzer_file in analyzer_files:
+                try:
+                    # Move file to archive folder
+                    archive_path = ANALYZER_RUNS_ARCHIVED / analyzer_file.name
+                    
+                    # If file already exists in archive, add timestamp to avoid overwrite
+                    if archive_path.exists():
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        name_parts = analyzer_file.stem.rsplit('_', 1)  # Split on last underscore
+                        if len(name_parts) == 2:
+                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{analyzer_file.suffix}"
+                        else:
+                            new_name = f"{analyzer_file.stem}_archived_{timestamp}{analyzer_file.suffix}"
+                        archive_path = ANALYZER_RUNS_ARCHIVED / new_name
+                    
+                    # Move (not copy) file to archive - preserves original timestamp
+                    analyzer_file.rename(archive_path)
+                    archived_count += 1
+                    self.logger.info(f"  Archived: {analyzer_file.name} → {archive_path.name}")
+                    
+                except Exception as e:
+                    self.logger.warning(f"  Failed to archive {analyzer_file.name}: {e}")
+                    # Continue with other files
+            
+            return archived_count
+            
+        except Exception as e:
+            self.logger.error(f"Error archiving analyzer files: {e}")
+            return 0
     
     def run_analyzer(self, instruments: List[str] = None) -> bool:
         """Stage 2: Run breakout analyzer on processed data."""
@@ -538,47 +731,158 @@ class PipelineOrchestrator:
         success_count = 0
         for instrument in instruments:
             try:
+                # Build command with all available time slots for both sessions
+                # S1 slots: 07:30, 08:00, 09:00
+                # S2 slots: 09:30, 10:00, 10:30, 11:00
                 analyzer_cmd = [
                     sys.executable,
                     str(ANALYZER_SCRIPT),
                     "--folder", str(DATA_PROCESSED),
                     "--instrument", instrument,
-                    "--sessions", "S1", "S2"
+                    "--sessions", "S1", "S2",
+                    "--slots", 
+                    "S1:07:30", "S1:08:00", "S1:09:00",  # All S1 slots
+                    "S2:09:30", "S2:10:00", "S2:10:30", "S2:11:00",  # All S2 slots
+                    "--debug"  # Enable debug output to diagnose issues
                 ]
                 
                 self.logger.info(f"Running analyzer for {instrument}...")
+                self.logger.info(f"  Command: {' '.join(analyzer_cmd)}")
+                self.logger.info(f"  Working directory: {QTSW2_ROOT}")
+                self.logger.info(f"  Data folder: {DATA_PROCESSED}")
+                self.logger.info(f"  Data folder exists: {DATA_PROCESSED.exists()}")
+                # Force flush to ensure output appears immediately (skip handlers that don't support it)
+                for handler in self.logger.handlers:
+                    try:
+                        handler.flush()
+                    except (OSError, AttributeError):
+                        # Some handlers (like debug window) don't support flush
+                        pass
+                
+                if DATA_PROCESSED.exists():
+                    parquet_files = list(DATA_PROCESSED.glob("*.parquet"))
+                    self.logger.info(f"  Parquet files found: {len(parquet_files)}")
+                    if parquet_files:
+                        self.logger.info(f"  Sample files: {[f.name for f in parquet_files[:3]]}")
+                    # Force flush (skip handlers that don't support it)
+                    for handler in self.logger.handlers:
+                        try:
+                            handler.flush()
+                        except (OSError, AttributeError):
+                            # Some handlers (like debug window) don't support flush
+                            pass
                 emit_event(self.run_id, "analyzer", "log", f"Running analyzer for {instrument}")
                 
                 result = subprocess.run(
                     analyzer_cmd,
-                    cwd=str(QTSW_ROOT),
+                    cwd=str(QTSW2_ROOT),  # Use QTSW2_ROOT since analyzer script and data are here
                     capture_output=True,
                     text=True,
                     timeout=7200  # 2 hour timeout per instrument
                 )
                 
+                # Log analyzer output - all important lines at INFO level
+                if result.stdout:
+                    self.logger.info(f"  Analyzer output for {instrument}:")
+                    for line in result.stdout.split('\n'):
+                        if line.strip():
+                            # Log all lines, but highlight important ones
+                            if any(keyword in line.lower() for keyword in ['available instruments', 'rows matching', 'no results', 'wrote', 'error', 'loaded', 'date range', 'data details']):
+                                self.logger.info(f"    >>> {line}")
+                            else:
+                                self.logger.info(f"    {line}")
+                    # Force flush after output (skip handlers that don't support it)
+                    for handler in self.logger.handlers:
+                        try:
+                            handler.flush()
+                        except (OSError, AttributeError):
+                            # Some handlers (like debug window) don't support flush
+                            pass
+                
+                if result.stderr:
+                    self.logger.warning(f"  Analyzer stderr for {instrument}:")
+                    for line in result.stderr.split('\n'):
+                        if line.strip():
+                            self.logger.warning(f"    {line}")
+                
                 if result.returncode == 0:
-                    self.logger.info(f"✓ {instrument} analysis completed")
-                    emit_event(self.run_id, "analyzer", "metric", f"{instrument} completed", {
-                        "instrument": instrument,
-                        "status": "success"
-                    })
+                    # Check if results were actually generated
+                    output_lines = result.stdout.split('\n') if result.stdout else []
+                    has_results = any('rows to' in line.lower() or 'wrote' in line.lower() for line in output_lines)
+                    no_results = any('no results' in line.lower() or 'warning: no results' in line.lower() for line in output_lines)
+                    
+                    if no_results:
+                        self.logger.warning(f"⚠ {instrument} analysis completed but generated NO RESULTS")
+                        self.logger.warning(f"  Check analyzer output above for details")
+                        emit_event(self.run_id, "analyzer", "metric", f"{instrument} completed (no results)", {
+                            "instrument": instrument,
+                            "status": "success_no_results"
+                        })
+                    elif has_results:
+                        self.logger.info(f"✓ {instrument} analysis completed with results")
+                        emit_event(self.run_id, "analyzer", "metric", f"{instrument} completed", {
+                            "instrument": instrument,
+                            "status": "success"
+                        })
+                    else:
+                        self.logger.info(f"✓ {instrument} analysis completed")
+                        emit_event(self.run_id, "analyzer", "metric", f"{instrument} completed", {
+                            "instrument": instrument,
+                            "status": "success"
+                        })
                     success_count += 1
                 else:
-                    self.logger.error(f"✗ {instrument} analysis failed")
-                    self.logger.error(result.stderr[-500:])
-                    emit_event(self.run_id, "analyzer", "failure", f"{instrument} analysis failed", {
-                        "instrument": instrument
+                    self.logger.error(f"✗ {instrument} analysis failed (code: {result.returncode})")
+                    self.logger.error(f"  Command: {' '.join(analyzer_cmd)}")
+                    if result.stdout:
+                        self.logger.error(f"  Output (last 1000 chars): {result.stdout[-1000:]}")
+                    if result.stderr:
+                        self.logger.error(f"  Error output: {result.stderr[:500]}")
+                    emit_event(self.run_id, "analyzer", "failure", f"{instrument} analysis failed (code: {result.returncode})", {
+                        "instrument": instrument,
+                        "return_code": result.returncode,
+                        "error": result.stderr[:500] if result.stderr else None
                     })
                     
             except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
                 self.logger.error(f"✗ {instrument} analyzer exception: {e}")
+                self.logger.error(f"  Exception details:\n{error_details}")
                 emit_event(self.run_id, "analyzer", "failure", f"{instrument} exception: {str(e)}", {
-                    "instrument": instrument
+                    "instrument": instrument,
+                    "error_details": str(e),
+                    "traceback": error_details[-500:] if len(error_details) > 500 else error_details
                 })
         
         success = success_count > 0
         self.stage_results["analyzer"] = success
+        
+        # Archive processed files after successful analysis
+        if success:
+            # Get list of processed files that match the analyzed instruments
+            processed_files_to_archive = []
+            if DATA_PROCESSED.exists():
+                all_processed = list(DATA_PROCESSED.glob("*.parquet"))
+                all_processed.extend(list(DATA_PROCESSED.glob("*.csv")))
+                
+                # Filter files that match analyzed instruments
+                for proc_file in all_processed:
+                    # Check if file name contains any of the analyzed instruments
+                    file_name_upper = proc_file.name.upper()
+                    for instrument in instruments:
+                        if instrument.upper() in file_name_upper:
+                            processed_files_to_archive.append(proc_file)
+                            break
+            
+            # Archive the processed files
+            if processed_files_to_archive:
+                archived_count = self._archive_processed_files(processed_files_to_archive)
+                if archived_count > 0:
+                    self.logger.info(f"✓ Archived {archived_count} processed file(s) to {DATA_PROCESSED_ARCHIVED}")
+                    emit_event(self.run_id, "analyzer", "metric", "Processed files archived", {
+                        "archived_file_count": archived_count
+                    })
         
         if success:
             emit_event(self.run_id, "analyzer", "success", f"Analyzer completed: {success_count}/{len(instruments)} instruments")
@@ -599,6 +903,26 @@ class PipelineOrchestrator:
         # This is typically interactive, so we might skip or implement differently
         self.logger.info("Sequential processor typically requires manual configuration")
         self.logger.info("Skipping automatic execution (can be added if CLI interface exists)")
+        
+        # Archive analyzed files after sequential processor (if it ran)
+        # For now, we'll archive analyzed files when sequential processor stage completes
+        # This ensures files move through the pipeline properly
+        analyzer_files_to_archive = []
+        if ANALYZER_RUNS.exists():
+            analyzer_files = list(ANALYZER_RUNS.glob("*.parquet"))
+            analyzer_files.extend(list(ANALYZER_RUNS.glob("*.csv")))
+            analyzer_files.extend(list(ANALYZER_RUNS.glob("*_SUMMARY.txt")))
+            # Exclude files already in archived folder
+            analyzer_files_to_archive = [f for f in analyzer_files if f.parent == ANALYZER_RUNS]
+        
+        if analyzer_files_to_archive:
+            archived_count = self._archive_analyzer_files(analyzer_files_to_archive)
+            if archived_count > 0:
+                self.logger.info(f"✓ Archived {archived_count} analyzer file(s) to {ANALYZER_RUNS_ARCHIVED}")
+                emit_event(self.run_id, "sequential", "metric", "Analyzer files archived", {
+                    "archived_file_count": archived_count
+                })
+        
         emit_event(self.run_id, "sequential", "log", "Sequential processor skipped (requires manual configuration)")
         emit_event(self.run_id, "sequential", "success", "Sequential processor skipped")
         self.stage_results["sequential_processor"] = True  # Mark as skipped but not failed
@@ -636,20 +960,40 @@ class PipelineOrchestrator:
 class DailyPipelineScheduler:
     """Main scheduler class for daily automated pipeline."""
     
-    def __init__(self, schedule_time: str = "07:30"):
+    def __init__(self, schedule_time: str = "07:30", debug_window=None):
         """
         Initialize scheduler.
         
         Args:
             schedule_time: Time in HH:MM format (Chicago time, 24-hour)
+            debug_window: Optional DebugLogWindow instance for GUI logging
         """
-        self.logger = setup_logging(LOG_FILE)
+        self.debug_window = debug_window
+        self.logger = setup_logging(LOG_FILE, debug_window=debug_window)
         self.schedule_time = schedule_time
         self.nt_controller = NinjaTraderController(self.logger)
         self.orchestrator: Optional[PipelineOrchestrator] = None
         
-    def run_now(self) -> bool:
-        """Execute pipeline immediately (for testing or manual runs)."""
+        # Update debug window periodically if it exists
+        if self.debug_window:
+            import threading
+            def update_window():
+                while self.debug_window and not self.debug_window.closed:
+                    try:
+                        self.debug_window.update()
+                        time.sleep(0.1)
+                    except:
+                        break
+            threading.Thread(target=update_window, daemon=True).start()
+        
+    def run_now(self, wait_for_export: bool = False, launch_ninjatrader: bool = False) -> bool:
+        """
+        Execute pipeline immediately (for testing or manual runs).
+        
+        Args:
+            wait_for_export: If True, wait for new exports before processing
+            launch_ninjatrader: If True, launch NinjaTrader before waiting for exports
+        """
         run_id = str(uuid.uuid4())
         self.logger.info("=" * 60)
         self.logger.info("DAILY DATA PIPELINE - MANUAL RUN")
@@ -661,44 +1005,95 @@ class DailyPipelineScheduler:
         # Create orchestrator with run_id
         self.orchestrator = PipelineOrchestrator(self.logger, run_id)
         
-        # Launch NinjaTrader
-        emit_event(run_id, "pipeline", "log", "Launching NinjaTrader")
-        if not self.nt_controller.launch():
-            self.logger.error("Failed to launch NinjaTrader - aborting")
-            emit_event(run_id, "pipeline", "failure", "Failed to launch NinjaTrader")
-            return False
+        # Optionally launch NinjaTrader and wait for exports
+        if launch_ninjatrader:
+            self.logger.info("Launching NinjaTrader...")
+            if not self.nt_controller.launch():
+                self.logger.error("Failed to launch NinjaTrader - aborting pipeline")
+                emit_event(run_id, "pipeline", "failure", "Failed to launch NinjaTrader")
+                return False
         
-        # 🔧 Create trigger file to signal DataExporter to start
-        emit_event(run_id, "pipeline", "log", "Creating export trigger for DataExporter")
-        trigger_file = DATA_RAW / "export_trigger.txt"
-        try:
-            # Write run_id to trigger file so DataExporter knows which run this is
-            with open(trigger_file, "w") as f:
-                f.write(run_id)
-            self.logger.info(f"Export trigger file created: {trigger_file}")
-            emit_event(run_id, "export", "log", "Export trigger sent to DataExporter")
-        except Exception as e:
-            self.logger.warning(f"Could not create export trigger file: {e}")
-            # Continue anyway - DataExporter might still auto-trigger
+        if wait_for_export:
+            self.logger.info("Waiting for exports to complete...")
+            emit_event(run_id, "pipeline", "log", "Waiting for exports to complete")
+            if not self.nt_controller.wait_for_export(timeout_minutes=60, run_id=run_id):
+                self.logger.error("Export timeout or failure - aborting pipeline")
+                emit_event(run_id, "pipeline", "failure", "Export timeout or failure")
+                return False
+            self.logger.info("Exports detected - proceeding to translator")
+            emit_event(run_id, "pipeline", "log", "Exports detected - proceeding to translator")
         
-        # Wait for export
-        emit_event(run_id, "pipeline", "log", "Waiting for data export")
+        # Check for existing CSV files in data/raw
+        emit_event(run_id, "pipeline", "log", "Checking for CSV files in data/raw")
+        raw_files = list(DATA_RAW.glob("*.csv"))
+        # Exclude files in subdirectories (like logs folder)
+        raw_files = [f for f in raw_files if f.parent == DATA_RAW]
         
-        if not self.nt_controller.wait_for_export(timeout_minutes=60, run_id=run_id):
-            self.logger.error("Export timeout - aborting pipeline")
-            emit_event(run_id, "pipeline", "failure", "Export timeout")
-            return False
+        # Check for processed files in data/processed
+        processed_files = []
+        if DATA_PROCESSED.exists():
+            processed_files = list(DATA_PROCESSED.glob("*.parquet"))
+            processed_files.extend(list(DATA_PROCESSED.glob("*.csv")))
         
-        emit_event(run_id, "pipeline", "log", "Data export completed, starting processing")
+        # Determine which stages to run
+        run_translator_stage = len(raw_files) > 0
+        run_analyzer_stage = len(processed_files) > 0
+        
+        if not run_translator_stage and not run_analyzer_stage:
+            self.logger.warning("No CSV files found in data/raw/ and no processed files found - nothing to process")
+            emit_event(run_id, "pipeline", "log", "No files found - skipping all stages")
+            emit_event(run_id, "pipeline", "success", "Pipeline complete (no files to process)")
+            return True
+        
+        # Log what we found
+        if run_translator_stage:
+            self.logger.info(f"Found {len(raw_files)} CSV file(s) to process:")
+            for raw_file in raw_files:
+                file_size_mb = raw_file.stat().st_size / (1024 * 1024)
+                self.logger.info(f"  - {raw_file.name} ({file_size_mb:.2f} MB)")
+            emit_event(run_id, "pipeline", "log", f"Found {len(raw_files)} CSV file(s), starting translator")
+        
+        if run_analyzer_stage:
+            self.logger.info(f"Found {len(processed_files)} processed file(s) ready for analysis:")
+            for proc_file in processed_files[:5]:  # Show first 5
+                file_size_mb = proc_file.stat().st_size / (1024 * 1024)
+                self.logger.info(f"  - {proc_file.name} ({file_size_mb:.2f} MB)")
+            if len(processed_files) > 5:
+                self.logger.info(f"  ... and {len(processed_files) - 5} more")
+            emit_event(run_id, "pipeline", "log", f"Found {len(processed_files)} processed file(s), will run analyzer")
         
         # Run pipeline stages
         success = True
-        if not self.orchestrator.run_translator():
-            self.logger.error("Translator failed - aborting pipeline")
-            success = False
-        elif not self.orchestrator.run_analyzer():
-            self.logger.error("Analyzer failed - continuing anyway")
-            success = False  # Non-fatal
+        
+        # Stage 1: Translator (only if raw files exist)
+        if run_translator_stage:
+            if not self.orchestrator.run_translator():
+                self.logger.error("Translator failed - aborting pipeline")
+                success = False
+                # Don't run analyzer if translator failed (unless we already have processed files)
+                if not run_analyzer_stage:
+                    return False
+            else:
+                # Translator succeeded, refresh processed files list
+                if DATA_PROCESSED.exists():
+                    processed_files = list(DATA_PROCESSED.glob("*.parquet"))
+                    processed_files.extend(list(DATA_PROCESSED.glob("*.csv")))
+                    run_analyzer_stage = len(processed_files) > 0
+        
+        # Stage 2: Analyzer (if processed files exist)
+        if run_analyzer_stage and success:
+            if not self.orchestrator.run_analyzer():
+                self.logger.error("Analyzer failed - continuing anyway")
+                success = False  # Non-fatal
+        elif not run_analyzer_stage and run_translator_stage:
+            # Translator ran but no processed files were created
+            self.logger.warning("Translator completed but no processed files found - skipping analyzer")
+            emit_event(run_id, "analyzer", "log", "Skipped: No processed files available")
+        
+        # Stage 3: Sequential Processor (always run to archive analyzed files)
+        # This stage archives analyzed files even if sequential processor itself is skipped
+        if success:
+            self.orchestrator.run_sequential_processor()
         
         # Generate audit report
         report = self.orchestrator.generate_audit_report()
@@ -731,8 +1126,8 @@ class DailyPipelineScheduler:
             
             time.sleep(wait_seconds)
             
-            # Execute pipeline
-            self.run_now()
+            # Execute pipeline with NinjaTrader launch and export waiting
+            self.run_now(wait_for_export=True, launch_ninjatrader=True)
             
             # Wait a bit before scheduling next run (avoid tight loops)
             time.sleep(60)
@@ -759,14 +1154,52 @@ def main():
         help="Execute pipeline immediately instead of waiting for schedule"
     )
     parser.add_argument(
+        "--wait-for-export",
+        action="store_true",
+        help="Wait for new exports to complete before processing (use with --now)"
+    )
+    parser.add_argument(
+        "--launch-ninjatrader",
+        action="store_true",
+        help="Launch NinjaTrader before waiting for exports (use with --now and --wait-for-export)"
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Test mode: check configuration without executing"
     )
+    parser.add_argument(
+        "--no-debug-window",
+        action="store_true",
+        help="Disable debug log window (run headless)"
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        choices=["translator", "analyzer", "sequential"],
+        help="Run only a specific pipeline stage (translator, analyzer, or sequential)"
+    )
     
     args = parser.parse_args()
     
-    scheduler = DailyPipelineScheduler(schedule_time=args.schedule)
+    # Create debug window (unless disabled)
+    debug_window = None
+    if not args.no_debug_window:
+        try:
+            import sys
+            from pathlib import Path
+            # Add automation directory to path for import
+            automation_dir = Path(__file__).parent
+            if str(automation_dir) not in sys.path:
+                sys.path.insert(0, str(automation_dir))
+            from debug_log_window import create_debug_window
+            debug_window = create_debug_window(enabled=True)
+            if debug_window:
+                print("Debug log window opened")
+        except Exception as e:
+            print(f"Warning: Could not create debug window: {e}")
+    
+    scheduler = DailyPipelineScheduler(schedule_time=args.schedule, debug_window=debug_window)
     
     if args.test:
         scheduler.logger.info("TEST MODE: Configuration check")
@@ -776,8 +1209,39 @@ def main():
         scheduler.logger.info(f"Data processed dir exists: {DATA_PROCESSED.exists()}")
         return
     
-    if args.now:
-        success = scheduler.run_now()
+    if args.stage:
+        # Run only a specific stage
+        run_id = str(uuid.uuid4())
+        scheduler.logger.info("=" * 60)
+        scheduler.logger.info(f"RUNNING SINGLE STAGE: {args.stage.upper()}")
+        scheduler.logger.info(f"Run ID: {run_id}")
+        scheduler.logger.info("=" * 60)
+        
+        emit_event(run_id, "pipeline", "start", f"Running {args.stage} stage only")
+        
+        orchestrator = PipelineOrchestrator(scheduler.logger, run_id)
+        success = False
+        
+        if args.stage == "translator":
+            success = orchestrator.run_translator()
+        elif args.stage == "analyzer":
+            success = orchestrator.run_analyzer()
+        elif args.stage == "sequential":
+            success = orchestrator.run_sequential_processor()
+        
+        if success:
+            emit_event(run_id, args.stage, "success", f"{args.stage} stage completed successfully")
+            scheduler.logger.info(f"✓ {args.stage.upper()} stage completed successfully")
+        else:
+            emit_event(run_id, args.stage, "failure", f"{args.stage} stage failed")
+            scheduler.logger.error(f"✗ {args.stage.upper()} stage failed")
+        
+        sys.exit(0 if success else 1)
+    elif args.now:
+        success = scheduler.run_now(
+            wait_for_export=args.wait_for_export,
+            launch_ninjatrader=args.launch_ninjatrader
+        )
         sys.exit(0 if success else 1)
     else:
         scheduler.wait_for_schedule()
