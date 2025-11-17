@@ -57,7 +57,8 @@ def process_data(
     separate_years: bool,
     output_format: str,
     selected_files: Optional[List[str]] = None,
-    selected_years: Optional[List[int]] = None
+    selected_years: Optional[List[int]] = None,
+    process_separately: bool = True  # Default to True - always process separately
 ) -> tuple[bool, Optional[pd.DataFrame]]:
     """
     Main data processing function
@@ -69,6 +70,7 @@ def process_data(
         output_format: "parquet", "csv", or "both"
         selected_files: List of filenames to process (None = all files)
         selected_years: List of years to process (None = all years)
+        process_separately: If True, process each file individually without merging
         
     Returns:
         Tuple of (success: bool, result_dataframe: Optional[DataFrame])
@@ -92,6 +94,12 @@ def process_data(
                 raise ValueError("No selected files found")
         else:
             data_files = all_data_files
+        
+        # Process files separately if requested
+        if process_separately:
+            return _process_files_separately(
+                data_files, output_folder, separate_years, output_format, selected_years
+            )
         
         # Load selected files
         dfs = []
@@ -208,6 +216,129 @@ def process_data(
                 print(f"Saved: {complete_csv}")
         
         print("Processing complete!")
+        return True, combined_df
+        
+    except Exception as e:
+        print(f"Processing error: {e}")
+        return False, None
+
+
+def _process_files_separately(
+    data_files: List[Path],
+    output_folder: str,
+    separate_years: bool,
+    output_format: str,
+    selected_years: Optional[List[int]] = None
+) -> tuple[bool, Optional[pd.DataFrame]]:
+    """
+    Process each file separately without merging.
+    
+    Args:
+        data_files: List of file paths to process
+        output_folder: Folder to save processed files
+        separate_years: Whether to create separate files per year
+        output_format: "parquet", "csv", or "both"
+        selected_years: List of years to process (None = all years)
+        
+    Returns:
+        Tuple of (success: bool, result_dataframe: Optional[DataFrame])
+    """
+    try:
+        from .file_loader import load_single_file
+        
+        # Create output folder
+        output_path = Path(output_folder)
+        output_path.mkdir(exist_ok=True)
+        
+        print(f"Processing {len(data_files)} files separately (no merging)...")
+        print(f"Output format: {output_format}")
+        print(f"Separate years: {separate_years}")
+        
+        all_dfs = []
+        
+        for filepath in data_files:
+            try:
+                print(f"\nProcessing: {filepath.name}")
+                df = load_single_file(filepath)
+                
+                if df is None or len(df) == 0:
+                    print(f"  Skipping {filepath.name}: No data loaded")
+                    continue
+                
+                # Get instrument from filename
+                instrument = root_symbol(infer_contract_from_filename(filepath))
+                
+                # Ensure instrument column matches filename
+                if 'instrument' in df.columns:
+                    df['instrument'] = instrument
+                
+                if separate_years:
+                    # Separate by year for this file
+                    df['year'] = df['timestamp'].dt.year
+                    years = sorted(df['year'].unique())
+                    
+                    # Filter by selected_years if provided
+                    if selected_years:
+                        years = [y for y in years if y in selected_years]
+                    
+                    print(f"  Processing years: {years}, output_format: {output_format}")
+                    
+                    for year in years:
+                        year_data = df[df['year'] == year].copy()
+                        year_data = year_data.drop(columns=['year'])
+                        
+                        if len(year_data) == 0:
+                            continue
+                        
+                        # Create filename with original file stem
+                        file_stem = filepath.stem
+                        
+                        if output_format in ["parquet", "both"]:
+                            parquet_file = output_path / f"{instrument}_{year}_{file_stem}.parquet"
+                            year_data.to_parquet(parquet_file, index=False)
+                            print(f"  Saved PARQUET: {parquet_file.name} ({len(year_data):,} rows)")
+                        
+                        if output_format in ["csv", "both"]:
+                            csv_file = output_path / f"{instrument}_{year}_{file_stem}.csv"
+                            try:
+                                year_data.to_csv(csv_file, index=False, encoding='utf-8')
+                                print(f"  Saved CSV: {csv_file.name} ({len(year_data):,} rows)")
+                            except Exception as e:
+                                print(f"  ERROR saving CSV {csv_file.name}: {e}")
+                                raise
+                        
+                        all_dfs.append(year_data)
+                else:
+                    # Save file as-is
+                    file_stem = filepath.stem
+                    print(f"  Not separating by year, output_format: {output_format}")
+                    
+                    if output_format in ["parquet", "both"]:
+                        parquet_file = output_path / f"{instrument}_{file_stem}.parquet"
+                        df.to_parquet(parquet_file, index=False)
+                        print(f"  Saved PARQUET: {parquet_file.name} ({len(df):,} rows)")
+                    
+                    if output_format in ["csv", "both"]:
+                        csv_file = output_path / f"{instrument}_{file_stem}.csv"
+                        try:
+                            df.to_csv(csv_file, index=False, encoding='utf-8')
+                            print(f"  Saved CSV: {csv_file.name} ({len(df):,} rows)")
+                        except Exception as e:
+                            print(f"  ERROR saving CSV {csv_file.name}: {e}")
+                            raise
+                    
+                    all_dfs.append(df)
+                    
+            except Exception as e:
+                print(f"  Error processing {filepath.name}: {e}")
+                continue
+        
+        if not all_dfs:
+            raise ValueError("No files could be processed successfully")
+        
+        # Return combined dataframe for display (but files were saved separately)
+        combined_df = pd.concat(all_dfs, ignore_index=True) if all_dfs else None
+        print("\nProcessing complete!")
         return True, combined_df
         
     except Exception as e:

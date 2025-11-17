@@ -128,13 +128,12 @@ class RangeDetector:
             return None
     
     def calculate_breakout_levels(self, range_result: RangeResult, 
-                                level_class: float = 1.0, tick_size: float = 0.25) -> Tuple[float, float]:
+                                tick_size: float = 0.25) -> Tuple[float, float]:
         """
-        Calculate breakout levels based on range
+        Calculate breakout levels based on range (always 1 tick above/below)
         
         Args:
             range_result: Range calculation result
-            level_class: Level scaling factor (1.0 for Level 1, 1.5 for Level 2, etc.)
             tick_size: Tick size for the instrument
             
         Returns:
@@ -143,9 +142,9 @@ class RangeDetector:
         if not range_result:
             return None, None
         
-        # Calculate breakout levels
-        brk_long = range_result.range_high + (tick_size * level_class)  # Add tick
-        brk_short = range_result.range_low - (tick_size * level_class)  # Subtract tick
+        # Calculate breakout levels (always 1 tick above/below range)
+        brk_long = range_result.range_high + tick_size
+        brk_short = range_result.range_low - tick_size
         
         return brk_long, brk_short
     

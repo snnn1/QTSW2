@@ -44,13 +44,13 @@ def main():
     
     input_folder = st.sidebar.text_input(
         "📁 Input Folder", 
-        value="data_raw",
+        value="data/raw",
         help="Folder containing raw data files"
     )
     
     output_folder = st.sidebar.text_input(
         "📁 Output Folder", 
-        value="data_processed",
+        value="data/processed",
         help="Folder where processed files will be saved"
     )
     
@@ -63,16 +63,28 @@ def main():
     data_files = get_data_files(input_folder) if Path(input_folder).exists() else []
     file_names = [f.name for f in data_files] if data_files else []
     
+    # Bulk process option
+    process_all = st.sidebar.checkbox(
+        "⚡ Process All Files (Bulk Mode)",
+        value=False,
+        help="Process all files in the folder automatically. When enabled, all files will be processed regardless of selection."
+    )
+    
     if file_names:
-        selected_files = st.sidebar.multiselect(
-            "📄 Select Files to Process",
-            options=file_names,
-            default=[],
-            help="Choose which files to translate. Select at least one file to process."
-        )
-        
-        if not selected_files:
-            st.sidebar.warning("⚠️ No files selected. Please select files to process.")
+        if process_all:
+            # In bulk mode, select all files automatically
+            selected_files = file_names
+            st.sidebar.success(f"✅ Bulk mode: {len(file_names)} file(s) will be processed")
+        else:
+            selected_files = st.sidebar.multiselect(
+                "📄 Select Files to Process",
+                options=file_names,
+                default=[],
+                help="Choose which files to translate. Select at least one file to process, or enable 'Process All Files' above."
+            )
+            
+            if not selected_files:
+                st.sidebar.warning("⚠️ No files selected. Please select files to process or enable 'Process All Files'.")
     else:
         selected_files = []
         st.sidebar.info("📁 No files found in input folder")
@@ -241,20 +253,33 @@ def main():
     with col2:
         st.header("🚀 Processing")
         
+        # Show bulk mode indicator
+        if process_all and file_names:
+            st.info(f"⚡ **Bulk Mode Active**: {len(file_names)} file(s) will be processed")
+        
         # Processing button
-        if st.button("▶️ Start Processing", type="primary", use_container_width=True):
+        button_label = "⚡ Process All Files" if process_all and file_names else "▶️ Start Processing"
+        if st.button(button_label, type="primary", use_container_width=True):
             if not selected_files:
-                st.error("No files selected for processing")
-            else:
+                if process_all and file_names:
+                    # Process all files even if multiselect is empty
+                    selected_files = file_names
+                else:
+                    st.error("No files selected for processing. Select files or enable 'Process All Files'.")
+                    selected_files = []
+            
+            if selected_files:
                 with st.spinner("Processing data..."):
                     # Call backend processing function
+                    # Always process files separately (never merge)
                     success, result_df = process_data(
                         input_folder, 
                         output_folder, 
                         separate_years, 
                         output_format, 
                         selected_files,
-                        year_options
+                        year_options,
+                        process_separately=True  # Always process separately, never merge
                     )
                 
                 if success:
@@ -284,7 +309,8 @@ def main():
     # ==========================================
     st.markdown("---")
     st.markdown("**💡 Tips:**")
-    st.markdown("- **File Selection**: Choose specific files in the sidebar to process only what you need")
+    st.markdown("- **⚡ Bulk Process**: Enable 'Process All Files' checkbox to automatically process everything in the folder")
+    st.markdown("- **File Selection**: Choose specific files in the sidebar to process only what you need, or use bulk mode for all files")
     st.markdown("- **Year Selection**: Select specific years for individual files only, or leave empty to process all years and create merged file")
     st.markdown("- **File Naming**: Files are named by instrument and year (e.g., `ES_2024.parquet`, `NQ_2024.parquet`)")
     st.markdown("- **Merged Files**: Only created when no specific years are selected (e.g., `ES_NQ_2024-2025.parquet`)")

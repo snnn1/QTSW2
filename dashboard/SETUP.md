@@ -129,3 +129,8 @@ Events are written as newline-separated JSON:
 3. Watch real-time events appear
 4. Update scheduled time as needed
 
+
+
+
+
+

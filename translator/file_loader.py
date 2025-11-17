@@ -233,9 +233,38 @@ def load_single_file(filepath: Path, auto_detect_frequency: bool = True) -> Opti
             df.drop(columns=["raw_dt"], inplace=True)
             df["instrument"] = "ES"  # Default
         
-        # Timezone conversion: UTC -> Chicago
+        # Determine timezone from filename
+        # Check if filename indicates UTC (e.g., DataExport_ES_*_UTC.csv)
+        filename_lower = filepath.name.lower()
+        is_utc_data = "_utc" in filename_lower
+        
+        # Ensure timestamp is timezone-aware
         if df["timestamp"].dt.tz is None:
-            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Chicago")
+            if is_utc_data:
+                # Data is labeled as UTC - convert to Chicago time
+                # Note: Fixed DataExporter now properly exports UTC, but we keep detection
+                # for old files that may have been exported incorrectly
+                sample_timestamps = df["timestamp"].head(10)
+                
+                # Quick check: if timestamps are in early morning (0-6) and converting from UTC
+                # would shift them to previous day, they might be mislabeled Central Time
+                # This handles old exports before the DataExporter fix
+                test_utc = pd.DatetimeIndex(sample_timestamps.iloc[:5]).tz_localize("UTC")
+                test_chicago = test_utc.tz_convert("America/Chicago")
+                original_dates = pd.DatetimeIndex(sample_timestamps.iloc[:5]).date
+                converted_dates = pd.DatetimeIndex(test_chicago).date
+                
+                # If dates shift backwards, likely mislabeled Central Time (old export bug)
+                if (original_dates > converted_dates).any():
+                    print(f"  WARNING: Detected old export format - timestamps appear to be Central Time, not UTC")
+                    print(f"  Treating as Central Time (compatibility with old exports)")
+                    df["timestamp"] = df["timestamp"].dt.tz_localize("America/Chicago")
+                else:
+                    # Properly exported UTC data - convert to Chicago time
+                    df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Chicago")
+            else:
+                # Assume data is already in Chicago time (local trading timezone)
+                df["timestamp"] = df["timestamp"].dt.tz_localize("America/Chicago")
         
         # Convert numeric columns
         numeric_cols = ["open", "high", "low", "close", "volume"]

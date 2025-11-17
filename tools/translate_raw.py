@@ -5,6 +5,15 @@ Processes raw NinjaTrader data exports into clean, timezone-corrected format
 """
 
 import sys
+import os
+# Set UTF-8 encoding for Windows console compatibility
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+    except:
+        pass  # Python < 3.7 or reconfigure not available
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -16,7 +25,21 @@ import re
 def root_symbol(contract: str) -> str:
     """Extract root instrument from contract name."""
     # Handle different filename formats
-    if "MinuteDataExport_ES" in contract:
+    # DataExport_CL_*, DataExport_ES_*, etc.
+    if "DataExport_CL" in contract or "_CL_" in contract:
+        return "CL"
+    elif "DataExport_ES" in contract or "_ES_" in contract:
+        return "ES"
+    elif "DataExport_NQ" in contract or "_NQ_" in contract:
+        return "NQ"
+    elif "DataExport_YM" in contract or "_YM_" in contract:
+        return "YM"
+    elif "DataExport_NG" in contract or "_NG_" in contract:
+        return "NG"
+    elif "DataExport_GC" in contract or "_GC_" in contract:
+        return "GC"
+    # MinuteDataExport format
+    elif "MinuteDataExport_ES" in contract:
         return "ES"
     elif "MinuteDataExport_NQ" in contract:
         return "NQ"
@@ -29,9 +52,17 @@ def root_symbol(contract: str) -> str:
     elif "MinuteDataExport_GC" in contract:
         return "GC"
     else:
-        # Fallback to original logic
-        match = re.match(r"([A-Za-z]+)", contract)
-        return match.group(1).upper() if match else contract.upper()
+        # Try to extract instrument from filename pattern: DataExport_INSTRUMENT_*
+        match = re.search(r"DataExport_([A-Z]{2})_", contract)
+        if match:
+            return match.group(1)
+        # Fallback: try to find 2-letter code
+        match = re.search(r"_([A-Z]{2})_", contract)
+        if match:
+            return match.group(1)
+        # Last resort: first 2 uppercase letters
+        match = re.match(r"([A-Z]{2})", contract)
+        return match.group(1) if match else contract.upper()
 
 
 def infer_contract_from_filename(filepath: Path) -> str:
@@ -108,10 +139,21 @@ def load_single_file(filepath: Path) -> pd.DataFrame:
             df.drop(columns=["raw_dt"], inplace=True)
             df["instrument"] = "ES"  # Default for no-header format
         
-        # Ensure timestamp is timezone-aware (convert from UTC to Chicago time)
+        # Determine timezone from filename
+        # Check if filename indicates UTC (e.g., DataExport_ES_*_UTC.csv)
+        filename_lower = filepath.name.lower()
+        is_utc_data = "_utc" in filename_lower
+        
+        # Ensure timestamp is timezone-aware
         if df["timestamp"].dt.tz is None:
-            # Data is in UTC, convert to Chicago time
-            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Chicago")
+            if is_utc_data:
+                # Data is in UTC, convert to Chicago time
+                df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Chicago")
+                print(f"  Detected UTC data (from filename), converted to Chicago time")
+            else:
+                # Assume data is already in Chicago time (local trading timezone)
+                df["timestamp"] = df["timestamp"].dt.tz_localize("America/Chicago")
+                print(f"  Detected Chicago time data (no _UTC in filename), kept as Chicago time")
         
         # Convert numeric columns
         numeric_cols = ["open", "high", "low", "close", "volume"]
@@ -124,7 +166,11 @@ def load_single_file(filepath: Path) -> pd.DataFrame:
         # Add contract and instrument info
         contract = infer_contract_from_filename(filepath)
         df["contract"] = contract
-        df["instrument"] = root_symbol(contract)
+        instrument = root_symbol(contract)
+        # ALWAYS override instrument column with filename-derived value (more reliable)
+        # The CSV Instrument column often has "DATAEXPORT" or other incorrect values
+        df["instrument"] = instrument
+        print(f"  Set instrument to: {instrument} (from filename: {filepath.name})")
         
         # Sort by timestamp
         df = df.sort_values("timestamp").reset_index(drop=True)
@@ -139,9 +185,9 @@ def load_single_file(filepath: Path) -> pd.DataFrame:
 
 def load_folder(folder_path: str) -> pd.DataFrame:
     """Load all data files from a folder."""
-    folder = Path(folder_path)
+    folder = Path(folder_path).resolve()  # Resolve to absolute path
     if not folder.exists():
-        raise FileNotFoundError(f"Folder not found: {folder_path}")
+        raise FileNotFoundError(f"Folder not found: {folder_path} (resolved to: {folder})")
     
     print(f"Loading data from: {folder_path}")
     
@@ -231,45 +277,149 @@ def separate_by_year(df: pd.DataFrame, output_folder: str) -> None:
     complete_data.to_csv(complete_csv, index=False)
 
 
+def process_files_separately(input_path: Path, output_path: Path, separate_years: bool, output_format: str):
+    """Process each file separately without merging."""
+    # Ensure output directory exists
+    output_path.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_path}")
+    print(f"Output directory exists: {output_path.exists()}")
+    
+    # Find all data files
+    data_files = []
+    for ext in ["*.csv", "*.txt", "*.dat"]:
+        data_files.extend(sorted(input_path.glob(ext)))
+    
+    if not data_files:
+        raise RuntimeError(f"No data files found in {input_path}")
+    
+    print(f"Processing {len(data_files)} files separately (no merging)...")
+    print(f"Separate years: {separate_years}, Output format: {output_format}")
+    
+    for filepath in data_files:
+        try:
+            print(f"\nProcessing: {filepath.name}")
+            df = load_single_file(filepath)
+            
+            if separate_years:
+                # Separate by year for this file
+                df['year'] = df['timestamp'].dt.year
+                years = sorted(df['year'].unique())
+                
+                for year in years:
+                    year_data = df[df['year'] == year].copy()
+                    year_data = year_data.drop(columns=['year'])
+                    
+                    # Get instrument from filename (more reliable than data column)
+                    instrument = root_symbol(infer_contract_from_filename(filepath))
+                    # Verify instrument is valid
+                    if instrument not in ['CL', 'ES', 'NQ', 'YM', 'NG', 'GC']:
+                        # Fallback to data column
+                        if len(year_data) > 0 and 'instrument' in year_data.columns:
+                            instrument = year_data['instrument'].iloc[0]
+                        else:
+                            instrument = "UNKNOWN"
+                    # Ensure instrument column in data matches filename-derived instrument
+                    if 'instrument' in year_data.columns:
+                        year_data['instrument'] = instrument
+                    
+                    if output_format in ["parquet", "both"]:
+                        parquet_file = output_path / f"{instrument}_{year}_{filepath.stem}.parquet"
+                        print(f"  Saving to: {parquet_file}")
+                        year_data.to_parquet(parquet_file, index=False)
+                        print(f"  Saved: {parquet_file.name} ({len(year_data):,} rows)")
+                    
+                    if output_format in ["csv", "both"]:
+                        csv_file = output_path / f"{instrument}_{year}_{filepath.stem}.csv"
+                        print(f"  Saving to: {csv_file}")
+                        year_data.to_csv(csv_file, index=False)
+                        print(f"  Saved: {csv_file.name} ({len(year_data):,} rows)")
+            else:
+                # Save file as-is
+                # Get instrument from filename (more reliable than data column)
+                instrument = root_symbol(infer_contract_from_filename(filepath))
+                # Verify instrument is valid
+                if instrument not in ['CL', 'ES', 'NQ', 'YM', 'NG', 'GC']:
+                    # Fallback to data column
+                    if len(df) > 0 and 'instrument' in df.columns:
+                        instrument = df['instrument'].iloc[0]
+                    else:
+                        instrument = "UNKNOWN"
+                
+                if output_format in ["parquet", "both"]:
+                    parquet_file = output_path / f"{instrument}_{filepath.stem}.parquet"
+                    print(f"  Saving to: {parquet_file}")
+                    df.to_parquet(parquet_file, index=False)
+                    print(f"  Saved: {parquet_file.name} ({len(df):,} rows)")
+                
+                if output_format in ["csv", "both"]:
+                    csv_file = output_path / f"{instrument}_{filepath.stem}.csv"
+                    print(f"  Saving to: {csv_file}")
+                    df.to_csv(csv_file, index=False)
+                    print(f"  Saved: {csv_file.name} ({len(df):,} rows)")
+                    
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] Failed to process {filepath.name}: {e}")
+            print(f"[ERROR] Traceback: {traceback.format_exc()}")
+            continue
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fixed Data Translation Script")
     parser.add_argument("--input", "-i", required=True, help="Input folder path")
     parser.add_argument("--output", "-o", default="data_processed", help="Output folder path")
     parser.add_argument("--separate-years", action="store_true", help="Separate data into yearly files")
+    parser.add_argument("--no-merge", action="store_true", help="Process each file separately without merging")
     parser.add_argument("--format", choices=["parquet", "csv", "both"], default="parquet", help="Output format")
     
     args = parser.parse_args()
     
     try:
-        # Load data
-        df = load_folder(args.input)
+        # Resolve input path to absolute
+        input_path = Path(args.input).resolve()
+        if not input_path.exists():
+            print(f"[ERROR] Input folder does not exist: {input_path}")
+            print(f"   Checked path: {input_path}")
+            sys.exit(1)
         
-        # Create output folder
-        output_path = Path(args.output)
-        output_path.mkdir(exist_ok=True)
+        # Create output folder (resolve to absolute)
+        output_path = Path(args.output).resolve()
+        output_path.mkdir(parents=True, exist_ok=True)
         
-        # Save data
-        if args.separate_years:
-            separate_by_year(df, args.output)
+        # Process files separately if requested
+        if args.no_merge:
+            process_files_separately(input_path, output_path, args.separate_years, args.format)
+            print("\n[SUCCESS] Data translation completed successfully!")
+            print("[INFO] Files processed separately (no merging)")
         else:
-            # Save complete dataset
-            if args.format in ["parquet", "both"]:
-                parquet_file = output_path / "merged.parquet"
-                df.to_parquet(parquet_file, index=False)
-                print(f"Saved: {parquet_file}")
+            # Load and merge all data
+            df = load_folder(str(input_path))
             
-            if args.format in ["csv", "both"]:
-                csv_file = output_path / "merged.csv"
-                df.to_csv(csv_file, index=False)
-                print(f"Saved: {csv_file}")
-        
-        print("\n✅ Data translation completed successfully!")
-        print(f"📊 Total rows: {len(df):,}")
-        print(f"📅 Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
-        print(f"🏷️  Instruments: {sorted(df['instrument'].unique())}")
+            # Save data
+            if args.separate_years:
+                separate_by_year(df, str(output_path))
+            else:
+                # Save complete dataset
+                if args.format in ["parquet", "both"]:
+                    parquet_file = output_path / "merged.parquet"
+                    df.to_parquet(parquet_file, index=False)
+                    print(f"Saved: {parquet_file}")
+                
+                if args.format in ["csv", "both"]:
+                    csv_file = output_path / "merged.csv"
+                    df.to_csv(csv_file, index=False)
+                    print(f"Saved: {csv_file}")
+            
+            # Use ASCII-safe characters for Windows console compatibility
+            print("\n[SUCCESS] Data translation completed successfully!")
+            print(f"[INFO] Total rows: {len(df):,}")
+            print(f"[INFO] Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
+            print(f"[INFO] Instruments: {sorted(df['instrument'].unique())}")
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"[ERROR] Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

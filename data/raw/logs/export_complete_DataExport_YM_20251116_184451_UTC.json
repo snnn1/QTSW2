@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "filePath": "C:\\Users\\jakej\\QTSW2\\data\\raw\\DataExport_YM_20251116_184451_UTC.csv",
+  "fileName": "DataExport_YM_20251116_184451_UTC.csv",
+  "dataType": "Minute",
+  "instrument": "YM",
+  "totalBarsProcessed": 1316,
+  "gapsDetected": 3,
+  "invalidDataSkipped": 0,
+  "fileSizeBytes": 85877,
+  "fileSizeMB": 0.08,
+  "completedAt": "2025-11-16T18:44:53.367Z"
+}

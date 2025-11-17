@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "filePath": "C:\\Users\\jakej\\QTSW2\\data\\raw\\DataExport_CL_20251113_212632_UTC.csv",
+  "fileName": "DataExport_CL_20251113_212632_UTC.csv",
+  "dataType": "Minute",
+  "instrument": "CL",
+  "totalBarsProcessed": 3677,
+  "gapsDetected": 62,
+  "invalidDataSkipped": 0,
+  "fileSizeBytes": 195511,
+  "fileSizeMB": 0.19,
+  "completedAt": "2025-11-13T21:26:34.045Z"
+}

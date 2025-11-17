@@ -63,7 +63,6 @@ def main():
     ap.add_argument("--instrument", required=True, choices=["ES","NQ","YM","CL","NG","GC","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"])
     ap.add_argument("--sessions", nargs="*", default=["S1","S2"], choices=["S1","S2"])
     ap.add_argument("--slots", nargs="*", default=[], help="Tokens like S1:07:30 S1:08:00 S2:09:30 ...")
-    ap.add_argument("--levels", nargs="*", type=int, default=[1], help="Levels 1..7 (L1..L7)")
     ap.add_argument("--days", nargs="*", default=["Mon","Tue","Wed","Thu","Fri"], choices=["Mon","Tue","Wed","Thu","Fri"])
     ap.add_argument("--priority", default="STOP_FIRST", choices=["STOP_FIRST","TP_FIRST"])
     ap.add_argument("--write-setup", action="store_true")

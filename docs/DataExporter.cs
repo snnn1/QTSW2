@@ -28,7 +28,6 @@ namespace NinjaTrader.NinjaScript.Indicators
         private static bool autoExportTriggered = false;  // Static to ensure one auto-export per session
         private static DateTime lastAutoExportDate = DateTime.MinValue;  // Track last auto-export date
         private bool exportStarted = false;  // Instance flag to track if export was initiated
-        private TimeZoneInfo centralTimeZone;
         
         // Property for manual export trigger (accessible via indicator properties)
         private bool manualExportTrigger = false;
@@ -50,17 +49,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Configure)
             {
-                // Initialize Central Time timezone
-                try
-                {
-                    centralTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-                }
-                catch (Exception ex)
-                {
-                    Print($"WARNING: Could not find Central Standard Time timezone: {ex.Message}");
-                    Print("Using system local timezone as fallback.");
-                    centralTimeZone = TimeZoneInfo.Local;
-                }
+                // No timezone initialization needed - export timestamps as-is
             }
             else if (State == State.Active)
             {
@@ -100,8 +89,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 else if (!TriggerOnOpen && !exportCompleted)
                 {
-                    // Check for auto-trigger at 07:00 CT (only if not already triggered this session)
-                    CheckAutoExportTrigger();
+                // Check for auto-trigger at 07:00 CT (only if not already triggered this session)
+                CheckAutoExportTrigger();
                 }
                 else if (exportCompleted)
                 {
@@ -255,32 +244,31 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             try
             {
-                // Get current time in Central Time
-                DateTime nowUtc = DateTime.UtcNow;
-                DateTime nowCentral = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, centralTimeZone);
+                // Get current local time
+                DateTime now = DateTime.Now;
                 
                 // Reset flag if it's a new day
-                if (lastAutoExportDate.Date != nowCentral.Date)
+                if (lastAutoExportDate.Date != now.Date)
                 {
                     autoExportTriggered = false;
-                    lastAutoExportDate = nowCentral.Date;
+                    lastAutoExportDate = now.Date;
                 }
                 
                 // Check if already triggered today
-                if (autoExportTriggered && lastAutoExportDate.Date == nowCentral.Date)
+                if (autoExportTriggered && lastAutoExportDate.Date == now.Date)
                 {
                     return; // Already triggered today
                 }
                 
-                TimeSpan currentTime = nowCentral.TimeOfDay;
+                TimeSpan currentTime = now.TimeOfDay;
                 TimeSpan triggerStart = new TimeSpan(7, 0, 0);  // 07:00:00
                 TimeSpan triggerEnd = new TimeSpan(7, 5, 0);    // 07:05:00
                 
                 if (currentTime >= triggerStart && currentTime <= triggerEnd)
                 {
-                    Print($"Auto export starting at 07:00 CT... (Current CT time: {nowCentral:yyyy-MM-dd HH:mm:ss})");
+                    Print($"Auto export starting at 07:00... (Current time: {now:yyyy-MM-dd HH:mm:ss})");
                     autoExportTriggered = true;  // Set flag to prevent multiple triggers today
-                    lastAutoExportDate = nowCentral.Date;
+                    lastAutoExportDate = now.Date;
                     StartExport();
                 }
             }
@@ -582,66 +570,27 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
             }
 
-            // Smart timezone conversion + Bar Time Convention Fix (for minute bars only)
+            // Bar Time Convention Fix (for minute bars only)
+            // Export timestamp exactly as it appears from NinjaTrader, treated as UTC
             DateTime exportTime;
-            try
+            
+            // Minute bars: use bar open time (1 minute before close time)
+            // Tick data: use tick timestamp directly
+            // Treat as UTC directly - no timezone conversion
+            if (isMinuteChart)
             {
-                if (isMinuteChart)
-                {
-                    // CRITICAL: NinjaTrader timestamps bars with CLOSE time, but most platforms use OPEN time
-                    // We need to subtract 1 minute to get the bar's OPEN time
-                    DateTime barOpenTime = Time[0].AddMinutes(-1);
-                    
-                    // Check if Time[0] is already timezone-aware
-                    if (Time[0].Kind == DateTimeKind.Utc)
-                    {
-                        // Already UTC, use as-is
-                        exportTime = barOpenTime;
-                    }
-                    else if (Time[0].Kind == DateTimeKind.Local)
-                    {
-                        // Convert from Central Time to UTC
-                        TimeZoneInfo centralTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-                        exportTime = TimeZoneInfo.ConvertTimeToUtc(barOpenTime, centralTimeZone);
-                    }
-                    else
-                    {
-                        // Unspecified - assume it's Central Time and convert to UTC
-                        TimeZoneInfo centralTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-                        exportTime = TimeZoneInfo.ConvertTimeToUtc(barOpenTime, centralTimeZone);
-                    }
-                    
-                    // Log the time conversion for first few bars to verify
-                    if (totalBarsProcessed < 5)
-                    {
-                        Print($"Bar Time Fix: NT Close={Time[0]:HH:mm:ss} -> Export Open UTC={exportTime:HH:mm:ss}");
-                    }
-                }
-                else // Tick chart - no time fix needed, use actual trade time
-                {
-                    // For tick data, use the actual trade time (no need to subtract)
-                    if (Time[0].Kind == DateTimeKind.Utc)
-                    {
-                        exportTime = Time[0];
-                    }
-                    else if (Time[0].Kind == DateTimeKind.Local)
-                    {
-                        // Convert from Central Time to UTC
-                        TimeZoneInfo centralTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-                        exportTime = TimeZoneInfo.ConvertTimeToUtc(Time[0], centralTimeZone);
-                    }
-                    else
-                    {
-                        // Unspecified - assume it's Central Time and convert to UTC
-                        TimeZoneInfo centralTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-                        exportTime = TimeZoneInfo.ConvertTimeToUtc(Time[0], centralTimeZone);
-                    }
-                }
+                exportTime = DateTime.SpecifyKind(Time[0].AddMinutes(-1), DateTimeKind.Utc);
             }
-            catch (Exception ex)
+            else
             {
-                Print($"WARNING: Timezone conversion failed at {Time[0]}: {ex.Message}. Using original time.");
-                exportTime = Time[0];
+                exportTime = DateTime.SpecifyKind(Time[0], DateTimeKind.Utc);
+            }
+            
+            // Log for first few bars
+            if (totalBarsProcessed < 5)
+            {
+                string timeType = isMinuteChart ? "Bar Open" : "Tick";
+                Print($"{timeType}: NT={Time[0]:HH:mm:ss} -> Export UTC={exportTime:yyyy-MM-dd HH:mm:ss} UTC");
             }
 
             // Get instrument name safely
@@ -757,18 +706,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             // When historical data processing completes, the export will finish in OnStateChange(Terminated)
         }
         
-        // Helper method to get current Central Time
-        private DateTime GetCurrentCentralTime()
+        // Helper method to get current time
+        private DateTime GetCurrentTime()
         {
-            try
-            {
-                DateTime nowUtc = DateTime.UtcNow;
-                return TimeZoneInfo.ConvertTimeFromUtc(nowUtc, centralTimeZone);
-            }
-            catch
-            {
-                return DateTime.Now; // Fallback to local time
-            }
+            return DateTime.Now;
         }
         
         // Public property for manual export trigger (appears in indicator Properties dialog)

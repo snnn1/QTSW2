@@ -1,0 +1,4 @@
+streamlit
+pandas
+numpy
+# scipy  # Optional - for advanced Brownian Bridge simulation

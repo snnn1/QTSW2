@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "filePath": "C:\\Users\\jakej\\QTSW2\\data\\raw\\DataExport_NQ_20251116_150511_UTC.csv",
+  "fileName": "DataExport_NQ_20251116_150511_UTC.csv",
+  "dataType": "Minute",
+  "instrument": "NQ",
+  "totalBarsProcessed": 0,
+  "gapsDetected": 0,
+  "invalidDataSkipped": 0,
+  "fileSizeBytes": 0,
+  "fileSizeMB": 0.00,
+  "completedAt": "2025-11-16T15:05:13.751Z"
+}

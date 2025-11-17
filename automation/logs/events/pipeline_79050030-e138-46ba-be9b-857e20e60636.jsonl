@@ -1,0 +1,18 @@
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "pipeline", "event": "start", "timestamp": "2025-11-16T12:41:16.988197-06:00", "msg": "Running analyzer stage only"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "start", "timestamp": "2025-11-16T12:41:16.988866-06:00", "msg": "Starting analyzer stage"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:16.989138-06:00", "msg": "Analyzer started", "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"]}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:16.989763-06:00", "msg": "Running analyzer for ES"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:18.550953-06:00", "msg": "ES completed", "data": {"instrument": "ES", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:18.551476-06:00", "msg": "Running analyzer for NQ"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:19.983513-06:00", "msg": "NQ completed", "data": {"instrument": "NQ", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:19.984040-06:00", "msg": "Running analyzer for YM"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:21.385652-06:00", "msg": "YM completed", "data": {"instrument": "YM", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:21.386156-06:00", "msg": "Running analyzer for CL"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:22.808246-06:00", "msg": "CL completed", "data": {"instrument": "CL", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:22.808759-06:00", "msg": "Running analyzer for NG"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:24.223023-06:00", "msg": "NG completed", "data": {"instrument": "NG", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "log", "timestamp": "2025-11-16T12:41:24.223550-06:00", "msg": "Running analyzer for GC"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:25.632079-06:00", "msg": "GC completed", "data": {"instrument": "GC", "status": "success"}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:41:25.648668-06:00", "msg": "Processed files archived", "data": {"archived_file_count": 24}}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "success", "timestamp": "2025-11-16T12:41:25.649006-06:00", "msg": "Analyzer completed: 6/6 instruments"}
+{"run_id": "a57ab9ec-7edd-419c-b611-16df5ead65fb", "stage": "analyzer", "event": "success", "timestamp": "2025-11-16T12:41:25.649399-06:00", "msg": "analyzer stage completed successfully"}

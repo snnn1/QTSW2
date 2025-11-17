@@ -1,0 +1,11 @@
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "pipeline", "event": "start", "timestamp": "2025-11-16T12:54:16.710219-06:00", "msg": "Running analyzer stage only"}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "start", "timestamp": "2025-11-16T12:54:16.710829-06:00", "msg": "Starting analyzer stage"}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-16T12:54:16.711095-06:00", "msg": "Analyzer started", "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"]}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.712043-06:00", "msg": "ES exception: [Errno 22] Invalid argument", "data": {"instrument": "ES"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.712714-06:00", "msg": "NQ exception: [Errno 22] Invalid argument", "data": {"instrument": "NQ"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.713409-06:00", "msg": "YM exception: [Errno 22] Invalid argument", "data": {"instrument": "YM"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.714065-06:00", "msg": "CL exception: [Errno 22] Invalid argument", "data": {"instrument": "CL"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.714712-06:00", "msg": "NG exception: [Errno 22] Invalid argument", "data": {"instrument": "NG"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.715429-06:00", "msg": "GC exception: [Errno 22] Invalid argument", "data": {"instrument": "GC"}}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.715706-06:00", "msg": "Analyzer failed: 0/6 instruments"}
+{"run_id": "be1036c7-212d-4ae1-a933-20b7542b45c2", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-16T12:54:16.716113-06:00", "msg": "analyzer stage failed"}
