@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Sequential Target Change and Time Change Processor V2
-Processes historical data line by line with real-time logic application
+Sequential Time Change Processor V2
+Processes historical data line by line with real-time time change logic application
 """
 
 import pandas as pd
@@ -11,10 +11,23 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 class SequentialProcessorV2:
-    def __init__(self, data_file: str, start_time: str = "08:00", time_mode: str = "normal", exclude_days_of_week: list = None, exclude_days_of_month: list = None, loss_recovery_mode: bool = False):
-        """Initialize with historical data file"""
-        self.data = pd.read_parquet(data_file)
+    def __init__(self, data_file: str, start_time: str = "08:00", time_mode: str = "normal", exclude_days_of_week: list = None, exclude_days_of_month: list = None, loss_recovery_mode: bool = False, data_files: list = None):
+        """Initialize with historical data file(s)"""
+        # If multiple files provided, load and concatenate them
+        if data_files and len(data_files) > 1:
+            dataframes = []
+            for file_path in data_files:
+                df = pd.read_parquet(file_path)
+                dataframes.append(df)
+            self.data = pd.concat(dataframes, ignore_index=True)
+            print(f"Loaded {len(data_files)} files and combined into {len(self.data)} rows")
+        else:
+            # Single file (backward compatible)
+            self.data = pd.read_parquet(data_file)
+        
         self.data['Date'] = pd.to_datetime(self.data['Date'])
+        # Sort by date to ensure chronological order
+        self.data = self.data.sort_values('Date').reset_index(drop=True)
         
         # Validate start_time is available in data
         available_times = sorted([str(t) for t in self.data['Time'].unique()])
@@ -99,7 +112,7 @@ class SequentialProcessorV2:
             return "YM"  # YM typically has 100, 150, 200, etc.
         else:
             # Default fallback - try to detect from filename or use ES
-            print("⚠️ Could not auto-detect instrument from targets, defaulting to ES")
+            print("Could not auto-detect instrument from targets, defaulting to ES")
             return "ES"
     
     def _get_session_for_time(self, time_str: str) -> str:
@@ -109,297 +122,6 @@ class SequentialProcessorV2:
                 return session
         # Default to S1 if not found (shouldn't happen with correct configuration)
         return "S1"
-        
-    def get_ladder(self, base: float) -> List[float]:
-        """Get target ladder for instrument with invisible cap rung"""
-        return [base * (1 + 0.5 * i) for i in range(8)]  # 8 rungs instead of 7
-    
-    def round_down_to_tick(self, value: float, tick: float) -> float:
-        """Round down to nearest tick"""
-        return (value // tick) * tick
-    
-    def round_down_to_nearest_increment(self, value: float, instrument: str = "ES") -> float:
-        """Round down to nearest increment based on instrument"""
-        # Define rounding increments for each instrument
-        increments = {
-            "ES": 5,      # ES targets: 10, 15, 20, 25, 30, 35, 40
-            "NQ": 25,     # NQ targets: 50, 75, 100, 125, 150, 175, 200
-            "YM": 50,     # YM targets: 100, 150, 200, 250, 300, 350, 400
-            "CL": 0.25,   # CL targets: 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0
-            "GC": 2.5,    # GC targets: 5, 7.5, 10, 12.5, 15, 17.5, 20
-            "NG": 0.025,  # NG targets: 0.05, 0.075, 0.1, 0.125, 0.15
-        }
-        
-        increment = increments.get(instrument, 25)  # Default to 25 for unknown instruments
-        return (value // increment) * increment
-    
-    def calculate_rolling_median_target(self, peak: float, instrument: str = "ES") -> Tuple[float, str]:
-        """
-        Calculate rolling median target based on last 13 peaks
-        
-        Args:
-            peak: Current trade peak
-            instrument: Trading instrument to get base target
-            
-        Returns:
-            Tuple of (target, reason)
-        """
-        # Get base target for this instrument
-        base_target = self.BASE_TARGETS.get(instrument, 10)
-        
-        if peak == 'NO DATA':
-            # No valid data - don't modify window or flag
-            # Return current target to maintain progression, not base target
-            current = self.rolling_median_target if hasattr(self, 'rolling_median_target') else base_target
-            return current, "NO DATA - No target change"
-        
-        # Valid peak data (including 0 for no-trade days) - proceed with calculation
-        
-        # Add peak to rolling window (keep last 13)
-        self.rolling_median_window.append(peak)
-        if len(self.rolling_median_window) > 13:
-            self.rolling_median_window.pop(0)
-        
-        # Calculate median
-        if len(self.rolling_median_window) < 13:
-            # Startup phase - use instrument-specific base target
-            median = float(base_target)
-            reason = f"Startup ({len(self.rolling_median_window)}/13 peaks) - using base {base_target}"
-        else:
-            # Calculate median position value of last 13 peaks
-            median = self.get_median_position_value(self.rolling_median_window)
-            reason = f"Rolling median (position {self.median_position}): {median:.1f} (last 13 peaks)"
-        
-        # Round down to nearest increment based on instrument
-        rounded_target = self.round_down_to_nearest_increment(median, instrument)
-        
-        # If rounded target is below base target, use base target
-        if rounded_target < base_target:
-            rounded_target = base_target
-            reason += f" - using base target (rounded < base={base_target})"
-        
-        # Cap based on instrument and max multiplier
-        max_multiplier = self.max_target_percentage / 100.0  # Convert percentage to multiplier
-        max_target = base_target * max_multiplier
-        
-        if rounded_target > max_target:
-            rounded_target = max_target
-            reason += f" - capped at {max_target} ({max_multiplier*100:.0f}% of base)"
-        
-        # Check for no-trade condition (use instrument-specific base)
-        # This sets the no-trade flag for the NEXT day
-        if self.enable_no_trade_on_low_median and median < base_target:
-            self.next_day_no_trade = True
-            reason += f" - NO TRADE NEXT DAY (median < base={base_target})"
-        else:
-            self.next_day_no_trade = False
-        
-        return rounded_target, reason
-    
-    def get_median_position_value(self, values: List[float]) -> float:
-        """Get the value at the specified position in sorted list (1-13)"""
-        if not values:
-            return 0.0
-        
-        sorted_values = sorted(values)
-        n = len(sorted_values)
-        
-        # Clamp position to available range
-        position = max(1, min(self.median_position, n))
-        
-        # Convert 1-based position to 0-based index
-        index = position - 1
-        return sorted_values[index]
-    
-    def get_median_ladder_steps(self, base: float, instrument: str = "ES") -> List[float]:
-        """Get median ladder steps for instrument"""
-        # Create ladder steps: base, base*1.5, base*2, base*2.5, base*3, base*3.5, base*4, etc.
-        # But use instrument-specific increments for better granularity
-        if instrument == "NQ":
-            # NQ: 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        elif instrument == "ES":
-            # ES: 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        elif instrument == "YM":
-            # YM: 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        elif instrument == "CL":
-            # CL: 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        elif instrument == "GC":
-            # GC: 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        elif instrument == "NG":
-            # NG: 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400
-            return [base * (1 + 0.5 * i) for i in range(15)]
-        else:
-            # Default: use standard ladder
-            return [base * (1 + 0.5 * i) for i in range(15)]
-    
-    def calculate_median_ladder_target(self, peak: float, instrument: str = "ES") -> Tuple[float, str]:
-        """
-        Calculate median ladder target based on last 13 peaks with progressive ladder steps
-        
-        Args:
-            peak: Current trade peak
-            instrument: Trading instrument to get base target
-            
-        Returns:
-            Tuple of (target, reason)
-        """
-        # Get base target for this instrument
-        base_target = self.BASE_TARGETS.get(instrument, 10)
-        
-        if peak == 'NO DATA':
-            # No valid data - don't modify window or flag
-            # Return current target to maintain progression, not base target
-            current = self.median_ladder_target if hasattr(self, 'median_ladder_target') else base_target
-            return current, "NO DATA - No target change"
-        
-        # Valid peak data (including 0 for no-trade days) - proceed with calculation
-        
-        # Add peak to rolling window (keep last 13)
-        self.median_ladder_window.append(peak)
-        if len(self.median_ladder_window) > 13:
-            self.median_ladder_window.pop(0)
-        
-        # Calculate median
-        if len(self.median_ladder_window) < 13:
-            # Startup phase - use instrument-specific base target
-            median = float(base_target)
-            reason = f"Startup ({len(self.median_ladder_window)}/13 peaks) - using base {base_target}"
-            target = base_target
-            # Increment days counter during startup phase
-            self.median_ladder_days_at_level += 1
-        else:
-            # Calculate median position value of last 13 peaks
-            median = self.get_median_position_value(self.median_ladder_window)
-            
-            # Get ladder steps for this instrument
-            ladder_steps = self.get_median_ladder_steps(base_target, instrument)
-            
-            # Find which step the median should map to
-            target_step_index = 0
-            for i, step_value in enumerate(ladder_steps):
-                if median >= step_value:
-                    target_step_index = i
-                else:
-                    break
-            
-            # Determine target based on current position and median
-            current_step_index = self.median_ladder_current_step
-            current_target = ladder_steps[current_step_index] if current_step_index < len(ladder_steps) else ladder_steps[-1]
-            
-            # Check for promotion (median suggests higher step)
-            if target_step_index > current_step_index:
-                # Check if we've been at current level long enough
-                if self.median_ladder_days_at_level >= self.median_ladder_promotion_days:
-                    # Promote to next step
-                    new_step_index = current_step_index + 1
-                    if new_step_index < len(ladder_steps):
-                        target = ladder_steps[new_step_index]
-                        self.median_ladder_current_step = new_step_index
-                        self.median_ladder_days_at_level = 1  # Reset counter
-                        reason = f"Promotion → {target} (median={median:.1f}, {self.median_ladder_promotion_days} days at {current_target})"
-                    else:
-                        target = current_target
-                        reason = f"At max step (median={median:.1f})"
-                else:
-                    # Not enough days yet - increment counter and stay at current level
-                    target = current_target
-                    self.median_ladder_days_at_level += 1
-                    reason = f"Median={median:.1f} suggests step {target_step_index}, need {self.median_ladder_promotion_days - self.median_ladder_days_at_level} more days at {current_target} (day {self.median_ladder_days_at_level})"
-            # Check for demotion (median suggests lower step)
-            elif target_step_index < current_step_index:
-                # Immediate demotion
-                target = ladder_steps[target_step_index]
-                self.median_ladder_current_step = target_step_index
-                self.median_ladder_days_at_level = 1  # Reset counter
-                reason = f"Demotion → {target} (median={median:.1f} suggests step {target_step_index})"
-            else:
-                # Same step level - increment days counter
-                target = current_target
-                self.median_ladder_days_at_level += 1
-                reason = f"Median={median:.1f} at step {target_step_index}, day {self.median_ladder_days_at_level}"
-        
-        # Cap based on instrument and max multiplier
-        max_multiplier = self.max_target_percentage / 100.0  # Convert percentage to multiplier
-        max_target = base_target * max_multiplier
-        
-        if target > max_target:
-            target = max_target
-            reason += f" - capped at {max_target} ({max_multiplier*100:.0f}% of base)"
-        
-        # Check for no-trade condition (median < base target)
-        # This sets the no-trade flag for the NEXT day
-        if self.enable_no_trade_on_low_median and len(self.median_ladder_window) >= 13:
-            median = self.get_median_position_value(self.median_ladder_window)
-            if median < base_target:
-                self.median_ladder_next_day_no_trade = True
-                reason += f" - NO TRADE NEXT DAY (median={median:.1f} < base={base_target})"
-            else:
-                self.median_ladder_next_day_no_trade = False
-        else:
-            self.median_ladder_next_day_no_trade = False
-        
-        return target, reason
-    
-    def get_rolling_median_display(self, instrument: str = "ES") -> str:
-        """
-        Get the rolling median display string - shows exact median value
-        
-        Args:
-            instrument: Trading instrument to get base target
-            
-        Returns:
-            Display string for Rolling Median column
-        """
-        if self.enable_rolling_median_mode:
-            # In rolling median mode, show the actual median position value
-            if len(self.rolling_median_window) >= 13:
-                median = self.get_median_position_value(self.rolling_median_window)
-                return f"{median:.1f}"
-            else:
-                # Show instrument-specific base target during startup
-                base_target = self.BASE_TARGETS.get(instrument, 10)
-                return f"{base_target:.1f}"
-        elif self.enable_median_ladder_mode:
-            # In median ladder mode, show the actual median position value
-            if len(self.median_ladder_window) >= 13:
-                median = self.get_median_position_value(self.median_ladder_window)
-                return f"{median:.1f}"
-            else:
-                # Show instrument-specific base target during startup
-                base_target = self.BASE_TARGETS.get(instrument, 10)
-                return f"{base_target:.1f}"
-        else:
-            # Normal mode - show empty
-            return ""
-    
-    
-    def get_target_change_display(self, old_target: float, target_reason: str, instrument: str = "ES") -> str:
-        """
-        Get the target change display string
-        
-        Args:
-            old_target: Previous target
-            target_reason: Reason for target change
-            instrument: Trading instrument to get base target
-            
-        Returns:
-            Display string for Target Change column
-        """
-        if self.enable_rolling_median_mode:
-            # In rolling median mode, show the rolling median target for NEXT day
-            return f"{self.rolling_median_target:.0f}"
-        elif self.enable_median_ladder_mode:
-            # In median ladder mode, show the median ladder target for NEXT day
-            return f"{self.median_ladder_target:.0f}"
-        else:
-            # Normal mode - show target change
-            return f"{old_target}→{self.current_target}" if old_target != self.current_target else ""
-    
     
     def get_next_data(self, time: str, session: str) -> Optional[Dict]:
         """Get next day's data for time/session combination"""
@@ -500,150 +222,7 @@ class SequentialProcessorV2:
             'Session': data_row['Session'],
             'Profit': data_row['Profit'],
             'Time Change': data_row.get('Time Change', ''),
-            'Target Change': data_row.get('Target Change', '')
         }
-    
-    def update_target_change(self, peak: float, instrument: str = "ES", current_date = None) -> Tuple[int, str]:
-        """Apply target change logic and return new target and reason"""
-        if peak == 'NO DATA' or peak == 'NO DATA':
-            return self.current_target, "NO DATA - No target change"
-        
-        # Check for consecutive target changes if enabled
-        if self.no_consecutive_target_changes and self.last_target_change_date is not None and current_date is not None:
-            # Check if current date is consecutive to last target change date
-            if hasattr(self, 'last_processed_date') and self.last_processed_date is not None:
-                days_diff = (self.last_processed_date - self.last_target_change_date).days
-                if days_diff == 1:  # Consecutive day
-                    return self.current_target, f"No consecutive change (last change: {self.last_target_change_date.strftime('%Y-%m-%d')})"
-        
-        base = self.BASE_TARGETS[instrument]
-        tick = self.TICK_SIZE[instrument]
-        ladder = self.get_ladder(base)
-        
-        # Round peak to tick
-        peak = self.round_down_to_tick(peak, tick)
-        ignore_threshold = self.round_down_to_tick(base * 0.95, tick)
-        
-        # Ignore rule
-        if peak < ignore_threshold:
-            return self.current_target, f"Ignored (<95% base={ignore_threshold})"
-        
-        # Add to rolling window if enabled
-        if self.enable_rolling_mode:
-            self.rolling_window.append(peak)
-            # Keep only last 3 peaks
-            if len(self.rolling_window) > 3:
-                self.rolling_window = self.rolling_window[-3:]
-        
-        # Startup rule (ONLY when at base)
-        if self.current_target == base:
-            if peak >= 2 * base:
-                self.target_streak += 1
-                if self.target_streak >= 3:
-                    # Find next target in ladder
-                    try:
-                        current_idx = ladder.index(self.current_target)
-                        if current_idx + 1 < len(ladder):
-                            new_target = int(ladder[current_idx + 1])
-                            self.target_streak = 0
-                            self.current_target = new_target
-                            return new_target, f"Startup promotion → {new_target}"
-                    except ValueError:
-                        pass
-                return self.current_target, f"Startup streak {self.target_streak}/3"
-            else:
-                self.target_streak = 0
-                return self.current_target, f"Reset streak (<2× base)"
-        
-        # Demotion rule - check if peak is less than next rung
-        try:
-            current_idx = ladder.index(self.current_target)
-            
-            # Determine the threshold for demotion
-            if current_idx + 1 < len(ladder):
-                # Not at top rung - use next rung as threshold
-                next_rung = ladder[current_idx + 1]
-                demotion_threshold = next_rung
-            else:
-                # At top rung - use current rung as threshold (any peak < current should demote)
-                demotion_threshold = self.current_target
-            
-            if peak < demotion_threshold:
-                if peak < 2 * base:
-                    # Demote to base
-                    self.target_streak = 0
-                    self.current_target = base
-                    return base, f"Demotion to base (peak < 2×base)"
-                else:
-                    # Demote one level
-                    if current_idx > 0:
-                        new_target = int(ladder[current_idx - 1])
-                    else:
-                        new_target = base
-                    self.target_streak = 0
-                    self.current_target = new_target
-                    return new_target, f"Demotion → {new_target}"
-        except ValueError:
-            pass
-        
-        # Promotion rule
-        try:
-            current_idx = ladder.index(self.current_target)
-            
-            # Check if we're at the max target percentage cap
-            max_target = base * (self.max_target_percentage / 100.0)
-            if self.current_target >= max_target:
-                self.target_streak = 0
-                return self.current_target, f"At max cap ({self.max_target_percentage}% = {max_target})"
-            
-            # Check if we're at the cap (second to last rung - invisible rung is last)
-            if current_idx >= len(ladder) - 2:
-                self.target_streak = 0
-                return self.current_target, f"At cap (no promotion)"
-            
-            if current_idx + 1 < len(ladder):
-                next_rung = ladder[current_idx + 1]
-                # Need 3 peaks ≥ two rungs above current (next_rung + 1)
-                if current_idx + 2 < len(ladder):
-                    required_peak = ladder[current_idx + 2]  # Two rungs above current
-                else:
-                    required_peak = next_rung  # If only one rung above, use that
-                
-                # Check if next rung would exceed max target percentage cap
-                if int(next_rung) > max_target:
-                    self.target_streak = 0
-                    return self.current_target, f"Next rung {int(next_rung)} exceeds max cap ({self.max_target_percentage}% = {max_target})"
-                
-                if self.enable_rolling_mode:
-                    # Rolling mode: check if all 3 peaks in window meet requirement
-                    if len(self.rolling_window) >= 3:
-                        qualifying_peaks = [p for p in self.rolling_window if p >= required_peak]
-                        if len(qualifying_peaks) >= 3:
-                            self.target_streak = 0
-                            self.current_target = int(next_rung)
-                            return int(next_rung), f"Rolling promotion → {int(next_rung)} (3/3 peaks ≥ {int(required_peak)})"
-                        else:
-                            return self.current_target, f"Rolling window: {len(qualifying_peaks)}/3 peaks ≥ {int(required_peak)}"
-                    else:
-                        return self.current_target, f"Rolling window: {len(self.rolling_window)}/3 peaks collected"
-                else:
-                    # Standard mode: individual streak
-                    if peak >= required_peak:
-                        self.target_streak += 1
-                        if self.target_streak >= 3:
-                            self.target_streak = 0
-                            self.current_target = int(next_rung)
-                            return int(next_rung), f"Promotion → {int(next_rung)}"
-                        return self.current_target, f"Streak {self.target_streak}/3 (need ≥ {int(required_peak)})"
-                    else:
-                        self.target_streak = 0
-                        return self.current_target, f"Reset streak (< {int(required_peak)})"
-            else:
-                self.target_streak = 0
-                return self.current_target, f"At cap (no promotion)"
-        except ValueError:
-            self.target_streak = 0
-            return self.current_target, f"Error in ladder lookup"
     
     def update_time_change(self, result: str) -> Tuple[str, str]:
         """Apply time change logic using 13-trade rolling points system"""
@@ -665,72 +244,56 @@ class SequentialProcessorV2:
         if len(self.time_slot_histories[self.current_time]) > 13:
             self.time_slot_histories[self.current_time] = self.time_slot_histories[self.current_time][-13:]
         
-        # Calculate rolling sums for all time slots
-        current_sum = sum(self.time_slot_histories[self.current_time])
+        # Calculate rolling sums for all time slots BEFORE adding today's result
+        # This ensures fair comparison - we compare historical performance, then add today's result
+        current_sum_before = sum(self.time_slot_histories[self.current_time])
+        current_sum_after = current_sum_before + current_score  # After adding today's result
         
         # Find the best performing "other" time slot (highest rolling sum among non-current slots)
-        other_times = [t for t in self.available_times if t != self.current_time]
-        if not other_times:
-            # Only one time slot available, no time change possible
-            return self.current_time, f"Stay {self.current_time} (only one time slot available)"
+        # IMPORTANT: Only consider time slots in the SAME SESSION
+        current_session = self.current_session
+        session_times = self.SLOT_ENDS.get(current_session, [])
+        other_times = [t for t in self.available_times if t != self.current_time and t in session_times]
         
-        # Get the best other time slot
+        if not other_times:
+            # Only one time slot available in this session, no time change possible
+            return self.current_time, f"Stay {self.current_time} (only one time slot in {current_session})"
+        
+        # Get the best other time slot (using historical sums only, before adding today)
         other_time_sums = {t: sum(self.time_slot_histories.get(t, [])) for t in other_times}
         other_time = max(other_time_sums, key=other_time_sums.get)
-        other_sum = other_time_sums[other_time]
+        other_sum_before = other_time_sums[other_time]
         
-        # Update time slot tracking for current time
-        self.time_slot_points[self.current_time] = current_score
-        self.time_slot_rolling[self.current_time] = current_sum
-        
-        # Debug output for CL data after 2020 - disabled once issue is resolved
-        # if hasattr(self, 'last_processed_date') and self.last_processed_date and self.last_processed_date >= pd.Timestamp('2021-01-01'):
-        #     print(f"   🎯 Time Change - Current slot {self.current_time} updated:")
-        #     print(f"      Result: {result}")
-        #     print(f"      Score: {current_score}")
-        #     print(f"      Rolling sum: {current_sum}")
-        #     print(f"      Points set to: {current_score}")
-        
-        # Update tracking for all other time slots
-        for t in other_times:
-            self.time_slot_rolling[t] = other_time_sums[t]
-        
-        # For the best other time slot, get the SAME DATE data (like the main analyzer does)
-        # This gives us a proper comparison of performance on the same date
+        # For the best other time slot, get the SAME DATE data to calculate today's result
         current_date = self.last_processed_date
-        # Determine the correct session for the other time slot
         other_session = self._get_session_for_time(other_time)
         other_data = self.get_data_for_date_and_time(current_date, other_time, other_session)
         
         if other_data and other_data['Date'] != 'NO DATA':
-            # Use actual other time slot data
+            # Use actual other time slot data for today
             other_result = other_data['Result']
             other_score = self._calculate_time_score(other_result)
-            
-            # Add to other time slot's history
-            self.time_slot_histories[other_time].append(other_score)
-            
-            # Keep only last 13 trades for other slot
-            if len(self.time_slot_histories[other_time]) > 13:
-                self.time_slot_histories[other_time] = self.time_slot_histories[other_time][-13:]
-            
-            # Recalculate other slot's rolling sum
-            other_sum = sum(self.time_slot_histories[other_time])
-            self.time_slot_rolling[other_time] = other_sum
-            self.time_slot_points[other_time] = other_score
-            
-            # Debug output for CL data after 2020 - disabled once issue is resolved
-            # if hasattr(self, 'last_processed_date') and self.last_processed_date and self.last_processed_date >= pd.Timestamp('2021-01-01'):
-            #     print(f"   ✅ Time Change - Other slot {other_time} calculated:")
-            #     print(f"      Result: {other_result}")
-            #     print(f"      Score: {other_score}")
-            #     print(f"      Rolling sum: {other_sum}")
-            #     print(f"      Points set to: {other_score}")
+            # Calculate other slot's sum AFTER adding today's result (for fair comparison)
+            other_sum_after = other_sum_before + other_score
         else:
-            # No data for other time slot - keep current score
-            other_sum = sum(self.time_slot_histories[other_time]) if other_time in self.time_slot_histories else 0
-            self.time_slot_rolling[other_time] = other_sum
-            # print(f"   ❌ No data found for other time slot - keeping rolling sum: {other_sum}")
+            # No data for other time slot today - use historical sum only
+            other_score = 0
+            other_sum_after = other_sum_before
+        
+        # Update time slot tracking for current time (AFTER adding today's result)
+        self.time_slot_points[self.current_time] = current_score
+        self.time_slot_rolling[self.current_time] = current_sum_after
+        
+        # Update tracking for all other time slots (using historical sums, today will be added in process_sequential)
+        for t in other_times:
+            self.time_slot_rolling[t] = other_time_sums[t]
+        
+        # Update the best other slot's points (but don't add to history yet - that happens in process_sequential)
+        self.time_slot_points[other_time] = other_score
+        
+        # Use the "after" sums for comparison (both slots include today's result)
+        current_sum = current_sum_after
+        other_sum = other_sum_after
         
         # Time change rules (only switch on Loss)
         if result.upper() == 'LOSS':
@@ -764,117 +327,6 @@ class SequentialProcessorV2:
         else:
             return 0
     
-    def _calculate_target_adjusted_score(self, result: str, time_slot: str) -> float:
-        """Calculate target-adjusted score for time change logic"""
-        # Get base result score
-        base_score = self._calculate_time_score(result)
-        
-        # Get current target for this time slot
-        current_target = self.time_slot_targets[time_slot]
-        base_target = self.BASE_TARGETS.get("ES", 10)
-        
-        # Calculate target multiplier
-        target_multiplier = current_target / base_target
-        
-        # Return adjusted score
-        return base_score * target_multiplier
-    
-    def update_time_slot_target(self, time_slot: str, peak: float) -> Tuple[int, str]:
-        """Update target for a specific time slot (for target_adjusted mode)"""
-        if time_slot not in self.time_slot_targets:
-            return self.time_slot_targets[time_slot], "Invalid time slot"
-        
-        base = self.BASE_TARGETS.get("ES", 10)
-        tick = self.TICK_SIZE.get("ES", 0.25)
-        ladder = self.get_ladder(base)
-        
-        # Round peak to tick
-        peak = self.round_down_to_tick(peak, tick)
-        ignore_threshold = self.round_down_to_tick(base * 0.95, tick)
-        
-        current_target = self.time_slot_targets[time_slot]
-        current_streak = self.time_slot_streaks[time_slot]
-        
-        # Ignore rule
-        if peak < ignore_threshold:
-            return current_target, f"Ignored (<95% base={ignore_threshold})"
-        
-        # Startup rule (ONLY when at base)
-        if current_target == base:
-            if peak >= 2 * base:
-                current_streak += 1
-                if current_streak >= 3:
-                    try:
-                        current_idx = ladder.index(current_target)
-                        if current_idx + 1 < len(ladder):
-                            new_target = int(ladder[current_idx + 1])
-                            current_streak = 0
-                            self.time_slot_targets[time_slot] = new_target
-                            self.time_slot_streaks[time_slot] = 0
-                            return new_target, f"Startup promotion → {new_target}"
-                    except ValueError:
-                        pass
-                self.time_slot_streaks[time_slot] = current_streak
-                return current_target, f"Startup streak {current_streak}/3"
-            else:
-                self.time_slot_streaks[time_slot] = 0
-                return current_target, f"Reset streak (<2× base)"
-        
-        # Demotion rule
-        try:
-            current_idx = ladder.index(current_target)
-            if current_idx + 1 < len(ladder):
-                next_rung = ladder[current_idx + 1]
-                if peak < next_rung:
-                    if peak < 2 * base:
-                        # Demote to base
-                        self.time_slot_streaks[time_slot] = 0
-                        self.time_slot_targets[time_slot] = base
-                        return base, f"Demotion to base (peak < 2×base)"
-                    else:
-                        # Demote one level
-                        if current_idx > 0:
-                            new_target = int(ladder[current_idx - 1])
-                        else:
-                            new_target = base
-                        self.time_slot_streaks[time_slot] = 0
-                        self.time_slot_targets[time_slot] = new_target
-                        return new_target, f"Demotion → {new_target}"
-        except ValueError:
-            pass
-        
-        # Promotion rule
-        try:
-            current_idx = ladder.index(current_target)
-            if current_idx >= len(ladder) - 2:
-                self.time_slot_streaks[time_slot] = 0
-                return current_target, f"At cap (no promotion)"
-            
-            if current_idx + 1 < len(ladder):
-                next_rung = ladder[current_idx + 1]
-                if current_idx + 2 < len(ladder):
-                    required_peak = ladder[current_idx + 2]
-                else:
-                    required_peak = next_rung
-                
-                if peak >= required_peak:
-                    current_streak += 1
-                    if current_streak >= 3:
-                        self.time_slot_streaks[time_slot] = 0
-                        self.time_slot_targets[time_slot] = int(next_rung)
-                        return int(next_rung), f"Promotion → {int(next_rung)}"
-                    self.time_slot_streaks[time_slot] = current_streak
-                    return current_target, f"Streak {current_streak}/3 (need ≥ {int(required_peak)})"
-                else:
-                    self.time_slot_streaks[time_slot] = 0
-                    return current_target, f"Reset streak (< {int(required_peak)})"
-            else:
-                self.time_slot_streaks[time_slot] = 0
-                return current_target, f"At cap (no promotion)"
-        except ValueError:
-            self.time_slot_streaks[time_slot] = 0
-            return current_target, f"Error in ladder lookup"
-    
     def get_time_slot_columns(self) -> Dict[str, str]:
         """Get dynamic time slot columns for all available time slots"""
         columns = {}
@@ -903,13 +355,12 @@ class SequentialProcessorV2:
         
         return columns
     
-    def process_sequential(self, max_days: int = 10000, enable_time_change: bool = True):
-        """Process data sequentially with time change logic"""
+    def process_sequential(self, max_days: int = 10000):
+        """Process data sequentially with time change logic (always enabled)"""
         print("=" * 100)
         print("SEQUENTIAL TIME CHANGE PROCESSOR")
         print("=" * 100)
         print(f"Starting with: Time={self.current_time}")
-        print(f"Time Change Mode: {'ENABLED' if enable_time_change else 'DISABLED'}")
         print(f"Max Days: {'ALL AVAILABLE DATA' if max_days >= 10000 else max_days}")
         print("=" * 100)
         
@@ -928,23 +379,23 @@ class SequentialProcessorV2:
             
             # Check if we've run out of data
             if data_row['Date'] == 'NO DATA':
-                print(f"⚠️ No more data available. Stopping at day {day-1}")
+                print(f"No more data available. Stopping at day {day-1}")
                 break
             
             # Store current state before changes
             old_time = self.current_time
             
-            # Apply time change logic
-            if enable_time_change and data_row['Result'] != 'NO DATA':
+            # Apply time change logic (always enabled)
+            if data_row['Result'] != 'NO DATA':
                 new_time, time_reason = self.update_time_change(data_row['Result'])
                 if new_time != old_time:
                     self.current_time = new_time
                     self.current_session = self._get_session_for_time(new_time)  # Update session to match new time
-                    print(f"⏰ TIME CHANGE: {old_time} → {new_time} ({time_reason})")
+                    print(f"TIME CHANGE: {old_time} → {new_time} ({time_reason})")
                 else:
-                    print(f"⏰ Time: {time_reason}")
+                    print(f"Time: {time_reason}")
             else:
-                time_reason = "Time change disabled"
+                time_reason = "NO DATA - No time change"
                 print(f"⏰ Time: {time_reason}")
             
             # Update all time slot points to show actual daily win/loss for each time slot (AFTER time change logic)
@@ -1174,8 +625,6 @@ def main():
     parser.add_argument('--data-file', default="time_target_change_data/ES_2025-01-02_to_2025-09-19_2604trades_38winrate_2897profit_20250920_101405.parquet", help='Path to data file')
     parser.add_argument('--start-time', default="08:00", help='Starting time slot (will be validated against available times in data)')
     parser.add_argument('--max-days', type=int, default=10000, help='Maximum days to process (set to 10000 to process all data)')
-    parser.add_argument('--time-change', action='store_true', default=True, help='Enable time change mode')
-    parser.add_argument('--no-time-change', action='store_true', help='Disable time change mode')
     parser.add_argument('--output-folder', default="data/sequencer_runs", help='Output folder for results (default: data/sequencer_runs)')
     
     args = parser.parse_args()
@@ -1191,13 +640,9 @@ def main():
         args.start_time
     )
     
-    # Determine modes
-    enable_time_change = args.time_change and not args.no_time_change
-    
-    # Process with specified modes
+    # Process with time change always enabled
     results = processor.process_sequential(
-        max_days=args.max_days, 
-        enable_time_change=enable_time_change
+        max_days=args.max_days
     )
     
     print("\n" + "=" * 100)
@@ -1226,15 +671,28 @@ def main():
     pd.reset_option('display.max_colwidth')
     pd.reset_option('display.expand_frame_repr')
     
-    # Save results with timestamp
+    # Save results with timestamp to sequencer_temp with date-based folder structure
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'{args.output_folder}/sequential_run_{timestamp}.csv'
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # Use sequencer_temp if default output folder, otherwise use custom
+    if args.output_folder == "data/sequencer_runs":
+        output_folder = f'data/sequencer_temp/{today}'
+    else:
+        output_folder = args.output_folder
     
     # Ensure directory exists
-    os.makedirs(args.output_folder, exist_ok=True)
+    os.makedirs(output_folder, exist_ok=True)
     
-    results.to_csv(filename, index=False)
-    print(f"\nResults saved to: {filename}")
+    # Save as Parquet (primary format, like analyzer)
+    parquet_filename = f'{output_folder}/sequential_run_{timestamp}.parquet'
+    results.to_parquet(parquet_filename, index=False, compression='snappy')
+    print(f"\nResults saved to: {parquet_filename}")
+    
+    # Also save as CSV for compatibility
+    csv_filename = f'{output_folder}/sequential_run_{timestamp}.csv'
+    results.to_csv(csv_filename, index=False)
+    print(f"Results also saved to: {csv_filename}")
     
     # Show summary
     print("\n" + "=" * 50)

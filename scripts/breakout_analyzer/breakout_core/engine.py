@@ -207,11 +207,13 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
 
     ranges = range_detector.build_slot_ranges(df, rp, debug)
     
-    if debug:
-        print(f"DEBUG: Found {len(ranges)} slot ranges")
-        if len(ranges) == 0:
-            print(f"DEBUG: No ranges found - this is why no results will be generated")
-            print(f"DEBUG: Check if data contains valid trading days and session times")
+    print(f"Found {len(ranges)} slot ranges")
+    if len(ranges) == 0:
+        print(f"ERROR: No ranges found - this is why no results will be generated")
+        print(f"  Check if data contains valid trading days and session times")
+        return pd.DataFrame(columns=["Date","Time","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
+    
+    print(f"Starting trade execution for {len(ranges)} ranges...")
     
     # Determine active slots for each session if slot switching is enabled
     active_slots = {}
@@ -250,9 +252,20 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
     
     rows: List[Dict[str,object]] = []
     
+    ranges_processed = 0
+    last_progress_log = 0
+    progress_interval = 500  # Log every 500 ranges
     
-
     for R in ranges:
+        ranges_processed += 1
+        
+        # Log progress periodically
+        if ranges_processed == 1 or ranges_processed % progress_interval == 0 or ranges_processed == len(ranges):
+            print(f"Processing range {ranges_processed}/{len(ranges)}: {len(rows)} trades generated")
+        
+        # Also log every 1000 ranges for very large datasets
+        if ranges_processed % 1000 == 0:
+            print(f"Progress: {ranges_processed}/{len(ranges)} ranges ({ranges_processed*100//len(ranges)}%), {len(rows)} trades")
         sess = R.session
         stream = streamS1 if sess=="S1" else streamS2
         time_label = R.end_label
@@ -424,5 +437,7 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
     # Print performance summary if debug enabled
     if debug:
         debug_manager.print_performance_summary()
+    
+    print(f"Trade execution completed: {len(results_df)} trades generated from {len(ranges)} ranges")
     
     return results_df

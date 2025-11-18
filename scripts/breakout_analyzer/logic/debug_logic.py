@@ -72,50 +72,9 @@ class DebugManager:
     
     def print_trade_debug(self, trade_info: DebugInfo):
         """Print debug information for a trade"""
-        if not self.debug_enabled:
-            return
-            
-        try:
-            print(f"\n{'='*60}")
-            print(f"TRADE EXECUTION SUMMARY")
-            print(f"{'='*60}")
-            print(f"Trade ID: {trade_info.trade_id}")
-            print(f"Entry: {trade_info.entry_time} at ${trade_info.entry_price:.2f} ({trade_info.direction})")
-            print(f"Stop Loss: ${trade_info.stop_loss:.2f}")
-            print(f"Target: {trade_info.target_pts} points")
-            print(f"")
-            print(f"MFE ANALYSIS:")
-            print(f"   - MFE Period: {trade_info.entry_time} -> {trade_info.mfe_end_time}")
-            print(f"   - Bars Analyzed: {trade_info.mfe_bars_count}")
-            print(f"   - Peak Movement: {trade_info.peak_value:.2f} points at {trade_info.peak_time}")
-            print(f"")
-            print(f"STOP LOSS STATUS:")
-            if trade_info.stop_loss_hit:
-                print(f"   [X] HIT at {trade_info.stop_loss_hit_time}")
-            else:
-                print(f"   [OK] NOT HIT")
-            print(f"{'='*60}")
-        except UnicodeEncodeError:
-            # Fallback without emojis
-            print(f"\n{'='*60}")
-            print(f"TRADE EXECUTION SUMMARY")
-            print(f"{'='*60}")
-            print(f"Trade ID: {trade_info.trade_id}")
-            print(f"Entry: {trade_info.entry_time} at ${trade_info.entry_price:.2f} ({trade_info.direction})")
-            print(f"Stop Loss: ${trade_info.stop_loss:.2f}")
-            print(f"Target: {trade_info.target_pts} points")
-            print(f"")
-            print(f"MFE ANALYSIS:")
-            print(f"   - MFE Period: {trade_info.entry_time} -> {trade_info.mfe_end_time}")
-            print(f"   - Bars Analyzed: {trade_info.mfe_bars_count}")
-            print(f"   - Peak Movement: {trade_info.peak_value:.2f} points at {trade_info.peak_time}")
-            print(f"")
-            print(f"STOP LOSS STATUS:")
-            if trade_info.stop_loss_hit:
-                print(f"   [X] HIT at {trade_info.stop_loss_hit_time}")
-            else:
-                print(f"   [OK] NOT HIT")
-            print(f"{'='*60}")
+        # Trade execution summaries disabled - too verbose for production
+        # Only enable for detailed debugging if needed
+        return
     
     def print_mfe_debug(self, entry_time: pd.Timestamp, mfe_end_time: pd.Timestamp, 
                        mfe_bars_count: int, first_bar: Optional[pd.Timestamp] = None,

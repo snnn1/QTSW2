@@ -14,6 +14,9 @@ function App() {
   const [alert, setAlert] = useState(null)
   const [isRunning, setIsRunning] = useState(false)
   const [chicagoTime, setChicagoTime] = useState('')
+  const [stageStartTime, setStageStartTime] = useState(null)
+  const [stageElapsedTime, setStageElapsedTime] = useState(0)
+  const [currentProcessingItem, setCurrentProcessingItem] = useState('')
   
   // Export stage state
   const [exportStatus, setExportStatus] = useState('not_started') // not_started, active, complete, failed
@@ -22,9 +25,22 @@ function App() {
   const [exportPercent, setExportPercent] = useState(0)
   const [exportInstrument, setExportInstrument] = useState('')
   const [exportDataType, setExportDataType] = useState('')
+  const [mergerRunning, setMergerRunning] = useState(false)
+  const [mergerStatus, setMergerStatus] = useState(null)
   
   const wsRef = useRef(null)
   const reconnectTimeoutRef = useRef(null)
+  const isRunningRef = useRef(false)
+  const currentRunIdRef = useRef(null)
+  
+  // Keep refs in sync with state
+  useEffect(() => {
+    isRunningRef.current = isRunning
+  }, [isRunning])
+  
+  useEffect(() => {
+    currentRunIdRef.current = currentRunId
+  }, [currentRunId])
   
   // Update Chicago time every second
   useEffect(() => {
@@ -62,9 +78,39 @@ function App() {
     // Poll pipeline status every 10 seconds to detect completion
     const statusInterval = setInterval(checkPipelineStatus, 10000)
     
+    // Update elapsed time every second when running
+    const elapsedInterval = setInterval(() => {
+      if (isRunning) {
+        if (stageStartTime) {
+          const elapsed = Math.floor((Date.now() - stageStartTime) / 1000)
+          // Only update if elapsed is positive (prevents showing 0s when timer hasn't started)
+          if (elapsed >= 0) {
+            if (elapsed !== stageElapsedTime) {
+              console.log('[DEBUG] Timer update:', {
+                elapsed,
+                stageStartTime: new Date(stageStartTime).toISOString(),
+                currentStage,
+                now: new Date().toISOString()
+              })
+            }
+            setStageElapsedTime(elapsed)
+          }
+        } else if (currentStage !== 'idle') {
+          // If we're running but don't have a start time, initialize it now
+          // This handles cases where we reconnect mid-run and don't get historical events
+          console.log('[DEBUG] Initializing stageStartTime from timer interval (no start time, stage:', currentStage, ')')
+          setStageStartTime(Date.now())
+          setStageElapsedTime(0)
+        } else {
+          console.log('[DEBUG] Timer interval: isRunning but no stageStartTime and stage is idle')
+        }
+      }
+    }, 1000)
+    
     return () => {
       clearInterval(fileCountInterval)
       clearInterval(statusInterval)
+      clearInterval(elapsedInterval)
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current)
       }
@@ -128,14 +174,28 @@ function App() {
       const data = await response.json()
       // Only connect to existing runs, don't auto-start new ones
       if (data.active) {
+        console.log('[DEBUG] checkPipelineStatus - active run:', {
+          run_id: data.run_id,
+          stage: data.stage,
+          currentRunId,
+          currentStage,
+          stageStartTime: stageStartTime ? new Date(stageStartTime).toISOString() : null
+        })
         // Only update if we don't already have this run_id, or if stage changed
         if (!currentRunId || currentRunId !== data.run_id) {
+          console.log('[DEBUG] New run detected, connecting WebSocket')
           setCurrentRunId(data.run_id)
           setCurrentStage(data.stage)
           setIsRunning(true)
+          // Don't set stageStartTime here - let events set it with actual timestamps
+          // This prevents resetting the timer when reconnecting to an already-running stage
+          setStageElapsedTime(0)
           connectWebSocket(data.run_id)
         } else if (data.stage !== currentStage) {
+          console.log('[DEBUG] Stage changed in status check:', currentStage, '->', data.stage)
           setCurrentStage(data.stage)
+          // Don't reset timer here either - let events set it with actual timestamps
+          setStageElapsedTime(0)
         }
       } else {
         // Reset state if no active run
@@ -174,6 +234,9 @@ function App() {
       setCurrentRunId(data.run_id)
       setIsRunning(true)
       setCurrentStage('starting')
+      setStageStartTime(Date.now())
+      setStageElapsedTime(0)
+      setCurrentProcessingItem('')
       setEvents([])
       
       // Reset export stage state
@@ -200,6 +263,9 @@ function App() {
       setCurrentRunId(data.run_id)
       setIsRunning(true)
       setCurrentStage(stageName)
+      setStageStartTime(Date.now())
+      setStageElapsedTime(0)
+      setCurrentProcessingItem('')
       setEvents([])
       
       // Reset export stage state
@@ -214,6 +280,30 @@ function App() {
       showAlert(`${stageName.charAt(0).toUpperCase() + stageName.slice(1)} stage started`, 'success')
     } catch (error) {
       showAlert(`Failed to start ${stageName} stage`, 'error')
+    }
+  }
+
+  const runDataMerger = async () => {
+    setMergerRunning(true)
+    setMergerStatus(null)
+    try {
+      const response = await fetch(`${API_BASE}/merger/run`, {
+        method: 'POST'
+      })
+      const data = await response.json()
+      setMergerStatus(data)
+      
+      if (data.status === 'success') {
+        showAlert('Data merger completed successfully', 'success')
+        loadFileCounts() // Refresh file counts
+      } else {
+        showAlert(`Data merger ${data.status}: ${data.message}`, 'error')
+      }
+    } catch (error) {
+      showAlert('Failed to run data merger', 'error')
+      setMergerStatus({ status: 'error', message: error.message })
+    } finally {
+      setMergerRunning(false)
     }
   }
 
@@ -266,17 +356,43 @@ function App() {
     
     ws.onclose = (event) => {
       console.log('WebSocket disconnected:', event.code, event.reason)
-      // Only log disconnect if it's unexpected (not a normal close)
-      if (event.code !== 1000 && event.code !== 1001) {
+      // Code 1005 means "No Status Received" - connection closed without proper close frame
+      // This can happen when:
+      // - Server restarts/reloads (common in development)
+      // - Network issues
+      // - Backend crashes
+      // - Connection times out
+      if (event.code === 1005) {
+        // This is usually not a critical error - just log it
+        console.log('WebSocket closed without status (1005) - likely server restart or network issue')
+        // If we have an active run, try to reconnect after a short delay
+        if (isRunningRef.current && currentRunIdRef.current) {
+          console.log('Attempting to reconnect WebSocket for active run...')
+          setTimeout(() => {
+            // Check if still running and reconnect
+            if (isRunningRef.current && currentRunIdRef.current) {
+              connectWebSocket(currentRunIdRef.current)
+            }
+          }, 2000) // Wait 2 seconds for server to restart
+        }
+      } else if (event.code !== 1000 && event.code !== 1001) {
+        // Log other unexpected disconnects
         setEvents(prev => [...prev, {
           timestamp: new Date().toISOString(),
           stage: 'system',
           event: 'log',
-          msg: `WebSocket disconnected (code: ${event.code})`
+          msg: `WebSocket disconnected (code: ${event.code}${event.reason ? ': ' + event.reason : ''})`
         }])
+        // Try to reconnect if we have an active run
+        if (isRunningRef.current && currentRunIdRef.current) {
+          setTimeout(() => {
+            if (isRunningRef.current && currentRunIdRef.current) {
+              connectWebSocket(currentRunIdRef.current)
+            }
+          }, 2000)
+        }
       }
-      // Don't auto-reconnect - let status polling handle it
-      // This prevents infinite reconnection loops
+      // Status polling (every 10 seconds) will also handle reconnection as a backup
     }
     
     wsRef.current = ws
@@ -289,13 +405,101 @@ function App() {
     }
   }
 
+  const formatElapsedTime = (seconds) => {
+    const hours = Math.floor(seconds / 3600)
+    const minutes = Math.floor((seconds % 3600) / 60)
+    const secs = seconds % 60
+    if (hours > 0) {
+      return `${hours}h ${minutes}m ${secs}s`
+    } else if (minutes > 0) {
+      return `${minutes}m ${secs}s`
+    } else {
+      return `${secs}s`
+    }
+  }
+
   const handleEvent = (event) => {
+    console.log('[DEBUG] handleEvent:', {
+      stage: event.stage,
+      event: event.event,
+      timestamp: event.timestamp,
+      msg: event.msg?.substring(0, 50),
+      currentStage,
+      stageStartTime,
+      stageElapsedTime
+    })
+    
     // Add event to list
     setEvents(prev => [...prev, event].slice(-100)) // Keep last 100 events
     
-    // Update stage
-    if (event.stage) {
+    // Update stage and set timer based on event timestamp (not current time)
+    if (event.stage && event.stage !== currentStage) {
+      console.log('[DEBUG] Stage changed:', currentStage, '->', event.stage)
       setCurrentStage(event.stage)
+      // Use event timestamp to calculate actual stage start time
+      if (event.timestamp) {
+        const eventTime = new Date(event.timestamp).getTime()
+        console.log('[DEBUG] Setting stageStartTime from new stage event:', new Date(eventTime).toISOString())
+        setStageStartTime(eventTime)
+        setStageElapsedTime(0)
+      } else {
+        // Fallback to current time if no timestamp
+        console.log('[DEBUG] No timestamp in event, using current time')
+        setStageStartTime(Date.now())
+        setStageElapsedTime(0)
+      }
+    } else if (event.stage === currentStage) {
+      // If we're already in this stage, check for start event or use first event timestamp
+      if (event.event === 'start' && event.timestamp) {
+        // Use start event timestamp as the definitive start time
+        const eventTime = new Date(event.timestamp).getTime()
+        console.log('[DEBUG] Setting stageStartTime from start event:', new Date(eventTime).toISOString())
+        setStageStartTime(eventTime)
+      } else if (!stageStartTime) {
+        // If we don't have a start time yet, try to get it from event timestamp
+        if (event.timestamp) {
+          const eventTime = new Date(event.timestamp).getTime()
+          console.log('[DEBUG] Setting stageStartTime from event timestamp (no start time yet):', new Date(eventTime).toISOString())
+          setStageStartTime(eventTime)
+        } else {
+          // Fallback: if no timestamp, use current time (we'll adjust with progress updates)
+          console.log('[DEBUG] No timestamp, using current time as fallback')
+          setStageStartTime(Date.now())
+        }
+      }
+    }
+    
+    // Track current processing item
+    if (event.stage === 'analyzer' && event.event === 'log') {
+      // Extract instrument name from log messages like "Running analyzer for ES"
+      const match = event.msg?.match(/Running analyzer for (\w+)/i)
+      if (match) {
+        setCurrentProcessingItem(match[1])
+      }
+    } else if (event.stage === 'analyzer' && event.data?.instrument) {
+      setCurrentProcessingItem(event.data.instrument)
+    } else if (event.stage === 'translator' && event.event === 'log') {
+      // Extract file info from translator logs
+      const match = event.msg?.match(/Processing (.+)/i)
+      if (match) {
+        setCurrentProcessingItem(match[1])
+      }
+    }
+    
+    // Handle progress updates from analyzer - use elapsed_minutes if available
+    if (event.stage === 'analyzer' && event.event === 'metric' && event.data?.elapsed_minutes) {
+      // Update elapsed time based on backend's reported elapsed time
+      const elapsedSeconds = event.data.elapsed_minutes * 60
+      console.log('[DEBUG] Progress update from analyzer:', {
+        elapsed_minutes: event.data.elapsed_minutes,
+        elapsedSeconds,
+        currentStageElapsedTime: stageElapsedTime
+      })
+      setStageElapsedTime(elapsedSeconds)
+      // Adjust start time to match backend's elapsed time (so timer continues correctly)
+      const adjustedStartTime = Date.now() - (elapsedSeconds * 1000)
+      console.log('[DEBUG] Adjusting stageStartTime to:', new Date(adjustedStartTime).toISOString())
+      setStageStartTime(adjustedStartTime)
     }
     
     // Handle export stage events
@@ -463,6 +667,49 @@ function App() {
           </div>
         </div>
 
+        {/* Data Merger Section */}
+        <div className="bg-gray-800 rounded-lg p-6 mb-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-xl font-semibold mb-2">Data Merger / Consolidator</h2>
+              <p className="text-sm text-gray-400">
+                Merge daily analyzer and sequencer files into monthly Parquet files
+              </p>
+            </div>
+            <button
+              onClick={runDataMerger}
+              disabled={mergerRunning || isRunning}
+              className={`px-6 py-3 rounded font-medium ${
+                mergerRunning || isRunning
+                  ? 'bg-gray-600 cursor-not-allowed text-gray-400'
+                  : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+              }`}
+            >
+              {mergerRunning ? 'Running...' : 'Run Merger'}
+            </button>
+          </div>
+          {mergerStatus && (
+            <div className={`mt-4 p-4 rounded ${
+              mergerStatus.status === 'success' 
+                ? 'bg-green-900/30 border border-green-600' 
+                : 'bg-red-900/30 border border-red-600'
+            }`}>
+              <div className="text-sm font-medium mb-2">
+                {mergerStatus.status === 'success' ? '✓ Success' : '✗ Error'}
+              </div>
+              <div className="text-sm text-gray-300">{mergerStatus.message}</div>
+              {mergerStatus.output && (
+                <details className="mt-2">
+                  <summary className="text-xs text-gray-400 cursor-pointer">Show output</summary>
+                  <pre className="mt-2 text-xs bg-gray-900 p-2 rounded overflow-auto max-h-40">
+                    {mergerStatus.output}
+                  </pre>
+                </details>
+              )}
+            </div>
+          )}
+        </div>
+
         {/* Metrics Section */}
         <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
           <div className="bg-gray-800 rounded-lg p-4">
@@ -473,7 +720,23 @@ function App() {
           </div>
           <div className="bg-gray-800 rounded-lg p-4">
             <div className="text-sm text-gray-400 mb-1">Current Stage</div>
-            <div className="text-lg font-semibold capitalize">{currentStage}</div>
+            <div className="text-lg font-semibold capitalize mb-2">{currentStage}</div>
+            {isRunning && (
+              <>
+                <div className="text-xs text-gray-500 mb-1">Elapsed Time</div>
+                {stageStartTime ? (
+                  <div className="text-sm font-mono text-gray-300">{formatElapsedTime(stageElapsedTime)}</div>
+                ) : (
+                  <div className="text-sm font-mono text-gray-500">Initializing...</div>
+                )}
+                {currentProcessingItem && (
+                  <>
+                    <div className="text-xs text-gray-500 mt-2 mb-1">Processing</div>
+                    <div className="text-sm font-semibold text-blue-400">{currentProcessingItem}</div>
+                  </>
+                )}
+              </>
+            )}
           </div>
           <div className="bg-gray-800 rounded-lg p-4">
             <div className="text-sm text-gray-400 mb-1">Raw Files</div>

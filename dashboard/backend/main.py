@@ -7,6 +7,7 @@ import os
 import json
 import subprocess
 import asyncio
+import time
 from pathlib import Path
 from typing import Optional, Dict
 from datetime import datetime
@@ -16,10 +17,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import logging
 
 # Configuration
 QTSW2_ROOT = Path(__file__).parent.parent.parent
 SCHEDULER_SCRIPT = QTSW2_ROOT / "automation" / "daily_data_pipeline_scheduler.py"
+DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -27,6 +30,9 @@ EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "automation" / "schedule_config.json"
 
 app = FastAPI(title="Pipeline Dashboard API")
+
+# Configure logging to reduce verbosity for routine polling
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # CORS middleware for React frontend
 app.add_middleware(
@@ -183,6 +189,52 @@ async def run_stage(stage_name: str):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start {stage_name} stage: {str(e)}")
+
+
+@app.post("/api/merger/run")
+async def run_data_merger():
+    """
+    Run the data merger/consolidator to merge daily files into monthly files.
+    """
+    try:
+        # Launch data merger as separate process
+        cmd = ["python", str(DATA_MERGER_SCRIPT)]
+        
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(QTSW2_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Wait for process to complete (with timeout)
+        try:
+            stdout, stderr = process.communicate(timeout=300)  # 5 minute timeout
+            return_code = process.returncode
+            
+            if return_code == 0:
+                return {
+                    "status": "success",
+                    "message": "Data merger completed successfully",
+                    "output": stdout[-1000:] if stdout else ""  # Last 1000 chars
+                }
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Data merger failed with return code {return_code}",
+                    "output": stderr[-1000:] if stderr else stdout[-1000:] if stdout else ""
+                }
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return {
+                "status": "timeout",
+                "message": "Data merger timed out after 5 minutes",
+                "output": ""
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to run data merger: {str(e)}")
 
 
 @app.get("/api/pipeline/status")
@@ -347,75 +399,140 @@ class ConnectionManager:
             with open(path, "r", encoding="utf-8") as f:
                 existing_lines = f.readlines()
                 print(f"Found {len(existing_lines)} existing lines in event log")
-                for line in existing_lines:
-                    if line.strip():
-                        try:
-                            event = json.loads(line)
-                            print(f"Broadcasting existing event: {event.get('stage', 'unknown')}/{event.get('event', 'unknown')}")
-                            await self.broadcast(event)
-                        except json.JSONDecodeError as e:
-                            print(f"Failed to parse line: {line[:100]}, error: {e}")
-                            pass
-                        except Exception as e:
-                            print(f"Error broadcasting existing event: {e}")
-                            # Don't break - continue with other events
-                last_position = f.tell()
+                if existing_lines:
+                    for line in existing_lines:
+                        if line.strip():
+                            try:
+                                event = json.loads(line)
+                                print(f"Broadcasting existing event: {event.get('stage', 'unknown')}/{event.get('event', 'unknown')}")
+                                await self.broadcast(event)
+                            except json.JSONDecodeError as e:
+                                print(f"Failed to parse line: {line[:100]}, error: {e}")
+                                pass
+                            except Exception as e:
+                                print(f"Error broadcasting existing event: {e}")
+                                # Don't break - continue with other events
+                    last_position = f.tell()
+                else:
+                    # Empty file - wait for events to be written
+                    print(f"Event log file is empty, waiting for events...")
+                    last_position = 0
+                    # Send a status message to client that we're waiting
+                    try:
+                        await self.broadcast({
+                            "stage": "system",
+                            "event": "log",
+                            "msg": "Waiting for pipeline events...",
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    except Exception:
+                        pass  # Ignore if no connections
         except Exception as e:
             print(f"Error reading existing content: {e}")
             import traceback
             traceback.print_exc()
             last_position = 0
         
-        # Poll for new lines
+        # Poll for new lines - keep tailing even if there are temporary errors
+        consecutive_errors = 0
+        max_consecutive_errors = 20  # Allow more errors before giving up
+        last_successful_read = time.time()
+        
         while True:
             try:
                 # Check if we still have active connections
                 if not self.active_connections:
                     print(f"No active connections, stopping tail for {path}")
+                    # Clean up task reference
+                    if event_log_path in self.tail_tasks:
+                        self.tail_tasks.pop(event_log_path)
                     break
                 
+                # Check if file exists
                 if not path.exists():
-                    await asyncio.sleep(0.5)
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"File still doesn't exist after {max_consecutive_errors} checks, stopping tail")
+                        break
+                    await asyncio.sleep(1)  # Wait longer if file doesn't exist
                     continue
                 
-                with open(path, "r", encoding="utf-8") as f:
-                    f.seek(last_position)
-                    new_lines = f.readlines()
-                    last_position = f.tell()
-                    
-                    for line in new_lines:
-                        if line.strip():
-                            try:
-                                event = json.loads(line)
-                                # Only broadcast if we still have connections
-                                if self.active_connections:
-                                    await self.broadcast(event)
-                            except json.JSONDecodeError as e:
-                                print(f"Failed to parse JSON line: {e}")
-                                pass
-                            except Exception as e:
-                                error_msg = str(e)
-                                # Don't log expected errors (connection closed, etc.)
-                                if "websocket.close" not in error_msg.lower() and "response already completed" not in error_msg.lower():
-                                    print(f"Error broadcasting new event: {e}")
-                                # Break if no connections left
-                                if not self.active_connections:
-                                    break
-                                pass
+                # Try to read new lines
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        f.seek(last_position)
+                        new_lines = f.readlines()
+                        last_position = f.tell()
+                        last_successful_read = time.time()
+                        
+                        # Process new lines
+                        for line in new_lines:
+                            if line.strip():
+                                try:
+                                    event = json.loads(line)
+                                    # Only broadcast if we still have connections
+                                    if self.active_connections:
+                                        await self.broadcast(event)
+                                    consecutive_errors = 0  # Reset error counter on success
+                                except json.JSONDecodeError as e:
+                                    consecutive_errors += 1
+                                    print(f"Failed to parse JSON line (error {consecutive_errors}/{max_consecutive_errors}): {e}")
+                                    if consecutive_errors >= max_consecutive_errors:
+                                        print(f"Too many JSON parse errors, but continuing to tail...")
+                                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    consecutive_errors += 1
+                                    # Don't log expected errors (connection closed, etc.)
+                                    if "websocket.close" not in error_msg.lower() and "response already completed" not in error_msg.lower():
+                                        print(f"Error broadcasting new event (error {consecutive_errors}/{max_consecutive_errors}): {e}")
+                                    # Don't break - keep trying
+                                    if consecutive_errors >= max_consecutive_errors:
+                                        print(f"Too many broadcast errors, but continuing to tail...")
+                                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
+                except (IOError, OSError, PermissionError) as e:
+                    # File might be locked or temporarily unavailable
+                    consecutive_errors += 1
+                    print(f"File read error (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
+                    if consecutive_errors < max_consecutive_errors:
+                        await asyncio.sleep(1)  # Wait longer on file errors
+                        continue
+                    else:
+                        print(f"Too many file read errors, but continuing to tail...")
+                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
+                        await asyncio.sleep(2)
+                        continue
                 
                 await asyncio.sleep(0.5)  # Poll every 500ms
                 
             except FileNotFoundError:
                 # File deleted or moved - wait a bit and check again
-                await asyncio.sleep(1)
-                if not path.exists():
-                    # File is gone, stop tailing
-                    break
+                consecutive_errors += 1
+                print(f"File not found (attempt {consecutive_errors}/{max_consecutive_errors})")
+                if consecutive_errors < max_consecutive_errors:
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    print(f"File still not found after {max_consecutive_errors} attempts, but continuing to tail...")
+                    consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
+                    await asyncio.sleep(2)
+                    continue
+            except asyncio.CancelledError:
+                print(f"Tailing task cancelled for {path}")
+                break
             except Exception as e:
-                print(f"Error tailing file {event_log_path}: {e}")
+                consecutive_errors += 1
+                print(f"Unexpected error in tail loop (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
                 import traceback
                 traceback.print_exc()
-                await asyncio.sleep(1)
+                if consecutive_errors < max_consecutive_errors:
+                    await asyncio.sleep(1)  # Wait before retrying
+                    continue
+                else:
+                    print(f"Too many errors, but continuing to tail...")
+                    consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
+                    await asyncio.sleep(2)
+                    continue
         
         # Clean up
         if event_log_path in self.tail_tasks:
@@ -476,7 +593,7 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                     break
                     
                 # Wait for client messages (ping/pong or requests)
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)  # Increased timeout
                 # Echo back or handle commands
                 if data == "ping":
                     try:
@@ -485,13 +602,18 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                         print(f"Error sending pong: {e}")
                         break
             except asyncio.TimeoutError:
-                # Send keepalive
+                # Send keepalive to prevent connection timeout
                 try:
                     if websocket in manager.active_connections:
-                        await websocket.send_json({"type": "keepalive"})
+                        await websocket.send_json({"type": "keepalive", "timestamp": datetime.now().isoformat()})
                 except Exception as e:
+                    error_msg = str(e)
+                    # If connection is closed, break the loop
+                    if "websocket.close" in error_msg.lower() or "response already completed" in error_msg.lower():
+                        print("WebSocket closed during keepalive")
+                        break
                     print(f"Error sending keepalive: {e}")
-                    break
+                    # Don't break on keepalive errors - connection might still be valid
             except WebSocketDisconnect:
                 print("WebSocket disconnect detected in receive loop")
                 break
@@ -504,12 +626,24 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
     except WebSocketDisconnect:
         print("WebSocket disconnected normally")
         manager.disconnect(websocket)
+        # Stop tailing when connection closes
+        if run_id:
+            event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
+            if str(event_log_path) in manager.tail_tasks:
+                task = manager.tail_tasks.pop(str(event_log_path))
+                task.cancel()
     except Exception as e:
         print(f"WebSocket error: {e}")
         import traceback
         traceback.print_exc()
         try:
             manager.disconnect(websocket)
+            # Stop tailing on error
+            if run_id:
+                event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
+                if str(event_log_path) in manager.tail_tasks:
+                    task = manager.tail_tasks.pop(str(event_log_path))
+                    task.cancel()
         except:
             pass
 
@@ -535,9 +669,7 @@ async def get_file_counts():
     data_processed = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
     data_processed_archived = data_processed / "archived"  # Archive folder for processed files
     analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
-    analyzer_runs_archived = analyzer_runs / "archived"  # Archive folder for analyzer runs
     sequencer_runs = QTSW2_ROOT / "data" / "sequencer_runs"  # Sequencer output folder
-    sequencer_runs_archived = sequencer_runs / "archived"  # Archive folder for sequencer runs
     
     # Count raw CSV files (exclude subdirectories like logs and archived folders)
     raw_count = 0
@@ -553,26 +685,22 @@ async def get_file_counts():
         # Exclude files in archived subfolder
         processed_count = len([f for f in processed_files if f.parent == data_processed])
     
-    # Count archived files from all archive locations
+    # Count archived files from raw and processed archive locations only
+    # (analyzer/sequencer archiving removed - handled by data merger)
     archived_count = 0
     if data_raw_archived.exists():
         archived_count += len(list(data_raw_archived.glob("*.csv")))
     if data_processed_archived.exists():
         archived_count += len(list(data_processed_archived.glob("*.parquet")))
         archived_count += len(list(data_processed_archived.glob("*.csv")))
-    if analyzer_runs_archived.exists():
-        archived_count += len(list(analyzer_runs_archived.glob("*.parquet")))
-        archived_count += len(list(analyzer_runs_archived.glob("*.csv")))
-        archived_count += len(list(analyzer_runs_archived.glob("*.txt")))  # Summary files
-    if sequencer_runs_archived.exists():
-        archived_count += len(list(sequencer_runs_archived.glob("*")))  # All files
     
-    # Count analyzed files (parquet files from analyzer, exclude archived folder)
+    # Count analyzed files (monthly consolidated files in instrument/year folders)
     analyzed_count = 0
     if analyzer_runs.exists():
-        analyzed_files = list(analyzer_runs.glob("*.parquet"))
-        # Exclude files in archived subfolder
-        analyzed_count = len([f for f in analyzed_files if f.parent == analyzer_runs])
+        # Count monthly parquet files in instrument/year subfolders
+        analyzed_files = list(analyzer_runs.rglob("*.parquet"))
+        # Exclude files in summaries folder
+        analyzed_count = len([f for f in analyzed_files if "summaries" not in str(f)])
     
     return {
         "raw_files": raw_count,
@@ -583,5 +711,5 @@ async def get_file_counts():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
 

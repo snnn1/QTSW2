@@ -283,3 +283,4 @@ class SequencerStateManager:
             return True
         return False
 
+

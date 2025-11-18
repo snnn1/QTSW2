@@ -22,6 +22,7 @@ import time
 import logging
 import subprocess
 import argparse
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
@@ -56,9 +57,7 @@ DATA_RAW_ARCHIVED = DATA_RAW / "archived"  # Archive folder for raw CSV files af
 DATA_PROCESSED = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
 DATA_PROCESSED_ARCHIVED = DATA_PROCESSED / "archived"  # Archive folder for processed files after analysis
 ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzer_runs"  # QTSW2/data/analyzer_runs
-ANALYZER_RUNS_ARCHIVED = ANALYZER_RUNS / "archived"  # Archive folder for analyzer run files
 SEQUENCER_RUNS = QTSW2_ROOT / "data" / "sequencer_runs"  # QTSW2/data/sequencer_runs
-SEQUENCER_RUNS_ARCHIVED = SEQUENCER_RUNS / "archived"  # Archive folder for sequencer run files
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 
 # Pipeline scripts (adjust paths as needed)
@@ -546,6 +545,22 @@ class PipelineOrchestrator:
                             # Emit progress events for key milestones
                             if any(keyword in line for keyword in ["Processing:", "Loaded:", "Saving", "rows", "completed"]):
                                 emit_event(self.run_id, "translator", "log", line.strip())
+                            # Emit event when a year file is written
+                            if "Saved:" in line or "Saved PARQUET:" in line or "Saved CSV:" in line:
+                                # Extract file info from line like "Saved: ES_2024.parquet" or "Saved PARQUET: ES_2024_file.parquet (1,234 rows)"
+                                emit_event(self.run_id, "translator", "log", f"File written: {line.strip()}")
+                                # Also emit as metric for tracking
+                                if ".parquet" in line:
+                                    # Try to extract year and instrument from filename
+                                    match = re.search(r'([A-Z]+)_(\d{4})', line)
+                                    if match:
+                                        instrument = match.group(1)
+                                        year = match.group(2)
+                                        emit_event(self.run_id, "translator", "metric", f"Wrote {instrument} {year} file", {
+                                            "instrument": instrument,
+                                            "year": year,
+                                            "file_type": "parquet"
+                                        })
                 
                 if result.stderr:
                     self.logger.warning("Translator warnings/errors:")
@@ -675,42 +690,6 @@ class PipelineOrchestrator:
             self.logger.error(f"Error archiving processed files: {e}")
             return 0
     
-    def _archive_analyzer_files(self, analyzer_files: List[Path]) -> int:
-        """Move analyzed files to data/analyzer_runs/archived folder."""
-        try:
-            # Create archive folder if it doesn't exist
-            ANALYZER_RUNS_ARCHIVED.mkdir(parents=True, exist_ok=True)
-            
-            archived_count = 0
-            for analyzer_file in analyzer_files:
-                try:
-                    # Move file to archive folder
-                    archive_path = ANALYZER_RUNS_ARCHIVED / analyzer_file.name
-                    
-                    # If file already exists in archive, add timestamp to avoid overwrite
-                    if archive_path.exists():
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        name_parts = analyzer_file.stem.rsplit('_', 1)  # Split on last underscore
-                        if len(name_parts) == 2:
-                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{analyzer_file.suffix}"
-                        else:
-                            new_name = f"{analyzer_file.stem}_archived_{timestamp}{analyzer_file.suffix}"
-                        archive_path = ANALYZER_RUNS_ARCHIVED / new_name
-                    
-                    # Move (not copy) file to archive - preserves original timestamp
-                    analyzer_file.rename(archive_path)
-                    archived_count += 1
-                    self.logger.info(f"  Archived: {analyzer_file.name} → {archive_path.name}")
-                    
-                except Exception as e:
-                    self.logger.warning(f"  Failed to archive {analyzer_file.name}: {e}")
-                    # Continue with other files
-            
-            return archived_count
-            
-        except Exception as e:
-            self.logger.error(f"Error archiving analyzer files: {e}")
-            return 0
     
     def run_analyzer(self, instruments: List[str] = None) -> bool:
         """Stage 2: Run breakout analyzer on processed data."""
@@ -718,19 +697,55 @@ class PipelineOrchestrator:
         self.logger.info("STAGE 2: Breakout Analyzer")
         self.logger.info("=" * 60)
         
+        # Check if processed files exist
+        processed_files = []
+        if DATA_PROCESSED.exists():
+            processed_files = list(DATA_PROCESSED.glob("*.parquet"))
+            processed_files.extend(list(DATA_PROCESSED.glob("*.csv")))
+        
+        if not processed_files:
+            self.logger.warning("No processed files found in data/processed - cannot run analyzer")
+            self.logger.info(f"  Checked directory: {DATA_PROCESSED}")
+            self.logger.info(f"  Directory exists: {DATA_PROCESSED.exists()}")
+            emit_event(self.run_id, "analyzer", "failure", "No processed files found in data/processed", {
+                "data_folder": str(DATA_PROCESSED),
+                "folder_exists": DATA_PROCESSED.exists()
+            })
+            return False
+        
+        self.logger.info(f"Found {len(processed_files)} processed file(s) in {DATA_PROCESSED}")
+        file_list_msg = f"Found {len(processed_files)} processed file(s) ready for analysis:\n"
+        for i, proc_file in enumerate(processed_files[:10], 1):  # Show first 10 files
+            file_size_mb = proc_file.stat().st_size / (1024 * 1024)
+            self.logger.info(f"  [{i}] {proc_file.name} ({file_size_mb:.2f} MB)")
+            file_list_msg += f"  [{i}] {proc_file.name} ({file_size_mb:.2f} MB)\n"
+        if len(processed_files) > 10:
+            self.logger.info(f"  ... and {len(processed_files) - 10} more file(s)")
+            file_list_msg += f"  ... and {len(processed_files) - 10} more file(s)\n"
+        
         emit_event(self.run_id, "analyzer", "start", "Starting analyzer stage")
+        emit_event(self.run_id, "analyzer", "log", file_list_msg.strip())
         
         if instruments is None:
             instruments = ["ES", "NQ", "YM", "CL", "NG", "GC"]
         
         emit_event(self.run_id, "analyzer", "metric", "Analyzer started", {
             "instrument_count": len(instruments),
-            "instruments": instruments
+            "instruments": instruments,
+            "processed_file_count": len(processed_files)
         })
         
         success_count = 0
-        for instrument in instruments:
+        self.logger.info(f"Starting analyzer for {len(instruments)} instrument(s): {', '.join(instruments)}")
+        emit_event(self.run_id, "analyzer", "log", f"Processing {len(instruments)} instrument(s): {', '.join(instruments)}")
+        
+        for i, instrument in enumerate(instruments, 1):
             try:
+                self.logger.info(f"=" * 60)
+                self.logger.info(f"Starting analyzer for {instrument} ({i}/{len(instruments)})")
+                self.logger.info(f"=" * 60)
+                emit_event(self.run_id, "analyzer", "log", f"Starting {instrument} ({i}/{len(instruments)})")
+                
                 # Build command with all available time slots for both sessions
                 # S1 slots: 07:30, 08:00, 09:00
                 # S2 slots: 09:30, 10:00, 10:30, 11:00
@@ -751,6 +766,7 @@ class PipelineOrchestrator:
                 self.logger.info(f"  Working directory: {QTSW2_ROOT}")
                 self.logger.info(f"  Data folder: {DATA_PROCESSED}")
                 self.logger.info(f"  Data folder exists: {DATA_PROCESSED.exists()}")
+                emit_event(self.run_id, "analyzer", "log", f"Starting analyzer process for {instrument}")
                 # Force flush to ensure output appears immediately (skip handlers that don't support it)
                 for handler in self.logger.handlers:
                     try:
@@ -761,9 +777,20 @@ class PipelineOrchestrator:
                 
                 if DATA_PROCESSED.exists():
                     parquet_files = list(DATA_PROCESSED.glob("*.parquet"))
-                    self.logger.info(f"  Parquet files found: {len(parquet_files)}")
+                    csv_files = list(DATA_PROCESSED.glob("*.csv"))
+                    total_files = len(parquet_files) + len(csv_files)
+                    self.logger.info(f"  Files available for {instrument}: {total_files} total ({len(parquet_files)} parquet, {len(csv_files)} csv)")
                     if parquet_files:
-                        self.logger.info(f"  Sample files: {[f.name for f in parquet_files[:3]]}")
+                        self.logger.info(f"  Parquet files: {[f.name for f in parquet_files[:5]]}")
+                        if len(parquet_files) > 5:
+                            self.logger.info(f"    ... and {len(parquet_files) - 5} more parquet files")
+                    if csv_files:
+                        self.logger.info(f"  CSV files: {[f.name for f in csv_files[:5]]}")
+                        if len(csv_files) > 5:
+                            self.logger.info(f"    ... and {len(csv_files) - 5} more csv files")
+                    # Emit event with file details
+                    emit_event(self.run_id, "analyzer", "log", 
+                        f"Files available for {instrument}: {total_files} total ({len(parquet_files)} parquet, {len(csv_files)} csv)")
                     # Force flush (skip handlers that don't support it)
                     for handler in self.logger.handlers:
                         try:
@@ -771,15 +798,139 @@ class PipelineOrchestrator:
                         except (OSError, AttributeError):
                             # Some handlers (like debug window) don't support flush
                             pass
+                else:
+                    self.logger.warning(f"  WARNING: Data folder {DATA_PROCESSED} does not exist!")
+                    emit_event(self.run_id, "analyzer", "log", f"WARNING: Data folder {DATA_PROCESSED} does not exist!")
+                
                 emit_event(self.run_id, "analyzer", "log", f"Running analyzer for {instrument}")
                 
-                result = subprocess.run(
-                    analyzer_cmd,
-                    cwd=str(QTSW2_ROOT),  # Use QTSW2_ROOT since analyzer script and data are here
-                    capture_output=True,
-                    text=True,
-                    timeout=7200  # 2 hour timeout per instrument
+                # For large files, use Popen to stream output instead of capturing everything in memory
+                # This prevents memory issues with very large files
+                try:
+                    process = subprocess.Popen(
+                        analyzer_cmd,
+                        cwd=str(QTSW2_ROOT),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1  # Line buffered
+                    )
+                    # Process started - no need to log PID unless debugging
+                except Exception as e:
+                    self.logger.error(f"[{instrument}] Failed to start analyzer process: {e}")
+                    emit_event(self.run_id, "analyzer", "failure", f"[{instrument}] Failed to start analyzer: {str(e)}")
+                    raise
+                
+                # Stream output in real-time and collect last portion for error reporting
+                stdout_lines = []
+                stderr_lines = []
+                max_lines_to_keep = 100  # Keep last 100 lines of output
+                
+                # Read output streams
+                def read_stream(stream, lines_list, stream_name):
+                    try:
+                        for line in iter(stream.readline, ''):
+                            if line:
+                                lines_list.append(line.rstrip())
+                                # Keep only last N lines to prevent memory issues
+                                if len(lines_list) > max_lines_to_keep:
+                                    lines_list.pop(0)
+                                
+                                # Log only key milestones - reduce verbosity
+                                line_upper = line.upper()
+                                line_stripped = line.rstrip()
+                                
+                                # Only log critical information - key milestones only
+                                # Skip trade execution summaries - too verbose
+                                if 'TRADE EXECUTION SUMMARY' in line_upper:
+                                    continue  # Skip these messages
+                                
+                                # Log progress messages
+                                if any(keyword in line_upper for keyword in [
+                                    'ERROR', 'WARNING', 'COMPLETED', 'WRITTEN', 'WROTE',
+                                    'FOUND', 'PROCESSING DATE', 'PROCESSING RANGE', 'PROGRESS:',
+                                    'STARTING TRADE EXECUTION', 'TRADE EXECUTION COMPLETED',
+                                    'RESULTS', 'SUMMARY', 'COMPLETED IN', 'RANGES FOUND'
+                                ]):
+                                    self.logger.info(f"[{instrument}] {line_stripped}")
+                                    # Also emit as event for dashboard
+                                    emit_event(self.run_id, "analyzer", "log", f"[{instrument}] {line_stripped}")
+                    except Exception as e:
+                        self.logger.error(f"Error reading {stream_name} stream: {e}")
+                
+                import threading
+                stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines, "stdout"), daemon=True)
+                stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines, "stderr"), daemon=True)
+                stdout_thread.start()
+                stderr_thread.start()
+                
+                # Wait for process with extended timeout for large files
+                # Use polling to implement timeout since Popen.wait() doesn't support timeout
+                import time
+                start_time = time.time()
+                timeout_seconds = 21600  # 6 hour timeout per instrument for very large files
+                last_progress_log = 0
+                progress_interval = 300  # Log progress every 5 minutes
+                
+                while process.poll() is None:
+                    elapsed = time.time() - start_time
+                    
+                    # Log progress periodically for long-running operations
+                    if elapsed - last_progress_log >= progress_interval:
+                        elapsed_minutes = int(elapsed / 60)
+                        self.logger.info(f"[{instrument}] Analyzer still running... ({elapsed_minutes} minutes elapsed)")
+                        emit_event(self.run_id, "analyzer", "metric", f"{instrument} analyzer running ({elapsed_minutes} min)", {
+                            "instrument": instrument,
+                            "elapsed_minutes": elapsed_minutes
+                        })
+                        last_progress_log = elapsed
+                    
+                    if elapsed > timeout_seconds:
+                        self.logger.error(f"✗ {instrument} analyzer timed out after 6 hours")
+                        emit_event(self.run_id, "analyzer", "failure", f"{instrument} analyzer timed out after 6 hours", {
+                            "instrument": instrument
+                        })
+                        process.kill()
+                        process.wait()
+                        returncode = -1
+                        stderr_lines.append("Process timed out after 6 hours")
+                        break
+                    time.sleep(1)  # Check every second
+                else:
+                    returncode = process.returncode
+                    elapsed_minutes = int((time.time() - start_time) / 60)
+                    if elapsed_minutes > 1:  # Only log if it took more than 1 minute
+                        self.logger.info(f"[{instrument}] Analyzer completed in {elapsed_minutes} minutes")
+                
+                # Wait for output threads to finish
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                
+                # Only log summary if there's an issue
+                if returncode != 0 or (not stdout_lines and not stderr_lines):
+                    self.logger.warning(f"[{instrument}] Analyzer output summary:")
+                    self.logger.warning(f"[{instrument}]   Captured {len(stdout_lines)} stdout lines, {len(stderr_lines)} stderr lines")
+                
+                # Create result-like object
+                class Result:
+                    def __init__(self, returncode, stdout, stderr):
+                        self.returncode = returncode
+                        self.stdout = stdout
+                        self.stderr = stderr
+                
+                result = Result(
+                    returncode=returncode,
+                    stdout='\n'.join(stdout_lines[-500:]) if stdout_lines else '',  # Last 500 lines
+                    stderr='\n'.join(stderr_lines[-1000:]) if stderr_lines else ''  # Last 1000 lines
                 )
+                
+                # Log full output if process failed or returned no output
+                if returncode != 0 or (not stdout_lines and not stderr_lines):
+                    self.logger.warning(f"[{instrument}] Analyzer returned code {returncode} with no output captured")
+                    if result.stdout:
+                        self.logger.info(f"[{instrument}] Full stdout:\n{result.stdout}")
+                    if result.stderr:
+                        self.logger.info(f"[{instrument}] Full stderr:\n{result.stderr}")
                 
                 # Log analyzer output - all important lines at INFO level
                 if result.stdout:
@@ -831,6 +982,8 @@ class PipelineOrchestrator:
                             "status": "success"
                         })
                     success_count += 1
+                    self.logger.info(f"✓ {instrument} completed successfully ({success_count}/{len(instruments)} instruments done)")
+                    emit_event(self.run_id, "analyzer", "log", f"{instrument} completed ({success_count}/{len(instruments)} instruments done)")
                 else:
                     self.logger.error(f"✗ {instrument} analysis failed (code: {result.returncode})")
                     self.logger.error(f"  Command: {' '.join(analyzer_cmd)}")
@@ -854,7 +1007,16 @@ class PipelineOrchestrator:
                     "error_details": str(e),
                     "traceback": error_details[-500:] if len(error_details) > 500 else error_details
                 })
+            
+            # Log that we're moving to next instrument (or done)
+            if i < len(instruments):
+                next_instrument = instruments[i]
+                self.logger.info(f"Moving to next instrument: {next_instrument}")
+                emit_event(self.run_id, "analyzer", "log", f"Moving to next instrument: {next_instrument}")
         
+        self.logger.info(f"=" * 60)
+        self.logger.info(f"All instruments processed: {success_count}/{len(instruments)} successful")
+        self.logger.info(f"=" * 60)
         success = success_count > 0
         self.stage_results["analyzer"] = success
         
@@ -904,24 +1066,8 @@ class PipelineOrchestrator:
         self.logger.info("Sequential processor typically requires manual configuration")
         self.logger.info("Skipping automatic execution (can be added if CLI interface exists)")
         
-        # Archive analyzed files after sequential processor (if it ran)
-        # For now, we'll archive analyzed files when sequential processor stage completes
-        # This ensures files move through the pipeline properly
-        analyzer_files_to_archive = []
-        if ANALYZER_RUNS.exists():
-            analyzer_files = list(ANALYZER_RUNS.glob("*.parquet"))
-            analyzer_files.extend(list(ANALYZER_RUNS.glob("*.csv")))
-            analyzer_files.extend(list(ANALYZER_RUNS.glob("*_SUMMARY.txt")))
-            # Exclude files already in archived folder
-            analyzer_files_to_archive = [f for f in analyzer_files if f.parent == ANALYZER_RUNS]
-        
-        if analyzer_files_to_archive:
-            archived_count = self._archive_analyzer_files(analyzer_files_to_archive)
-            if archived_count > 0:
-                self.logger.info(f"✓ Archived {archived_count} analyzer file(s) to {ANALYZER_RUNS_ARCHIVED}")
-                emit_event(self.run_id, "sequential", "metric", "Analyzer files archived", {
-                    "archived_file_count": archived_count
-                })
+        # Note: Analyzer and sequencer files are now handled by the data merger
+        # which consolidates daily files into monthly files. No archiving needed.
         
         emit_event(self.run_id, "sequential", "log", "Sequential processor skipped (requires manual configuration)")
         emit_event(self.run_id, "sequential", "success", "Sequential processor skipped")

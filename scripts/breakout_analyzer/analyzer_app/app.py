@@ -123,6 +123,20 @@ def main():
     # Show session info - Hidden for now
     # st.info("📋 **Session Definitions:**\n- **S1**: 02:00-09:00 (slots: 07:30, 08:00, 09:00)\n- **S2**: 08:00-11:00 (slots: 09:30, 10:00, 10:30, 11:00)")
     
+    # Initialize session state for Select All
+    if "select_all_slots" not in st.session_state:
+        st.session_state.select_all_slots = False
+    
+    # Handle Select All checkbox
+    select_all = st.checkbox("Select All Times", value=st.session_state.select_all_slots, key="select_all_checkbox")
+    
+    # If Select All was toggled, update all slot checkboxes
+    if select_all != st.session_state.select_all_slots:
+        st.session_state.select_all_slots = select_all
+        # Update all individual slot checkboxes
+        for slot in ALL_SLOTS:
+            st.session_state[f"slot_{slot}"] = select_all
+    
     # Select slots with session context
     selected_slots = []
     selected_s1_slots = []
@@ -133,33 +147,23 @@ def main():
         # Determine which session this slot belongs to
         session = "S1" if slot in ["07:30", "08:00", "09:00"] else "S2" if slot in ["09:30", "10:00", "10:30", "11:00"] else "Unknown"
         
-        if cols[i].checkbox(f"{slot} ({session})", value=False, key=f"slot_{slot}"):
+        # Get current state of individual checkbox
+        slot_value = st.session_state.get(f"slot_{slot}", False)
+        
+        if cols[i].checkbox(f"{slot} ({session})", value=slot_value, key=f"slot_{slot}"):
             selected_slots.append(slot)
             if session == "S1":
                 selected_s1_slots.append(slot)
             elif session == "S2":
                 selected_s2_slots.append(slot)
     
-    # Show selected slots status
-    if len(selected_slots) >= 1:
-        st.success(f"📌 **Selected Slots:** {', '.join(selected_slots)}")
-    else:
-        st.warning("⚠️ **No slots selected**")
+    # Check if all slots are selected - if not, uncheck Select All
+    all_selected = all(st.session_state.get(f"slot_{slot}", False) for slot in ALL_SLOTS)
+    if not all_selected and st.session_state.select_all_slots:
+        st.session_state.select_all_slots = False
     
-    # Show session breakdown
-    st.write("**Session Breakdown:**")
-    col1, col2 = st.columns(2)
-    with col1:
-        if selected_s1_slots:
-            st.write(f"• **S1**: {', '.join(selected_s1_slots)}")
-        else:
-            st.write("• **S1**: No slots selected")
-    
-    with col2:
-        if selected_s2_slots:
-            st.write(f"• **S2**: {', '.join(selected_s2_slots)}")
-        else:
-            st.write("• **S2**: No slots selected")
+    # Selected slots status display removed
+    # Session breakdown display removed
 
     st.header("Target Configuration")
 
@@ -200,6 +204,7 @@ def main():
         inspect_time_obj = pd.to_datetime(inspect_time).time()
         
         if st.button("Show Data"):
+            
             df_inspect = pd.read_parquet(in_file)
             # Data is already in correct timezone from NinjaTrader export with bar time fix
             df_inspect['date'] = df_inspect['timestamp'].dt.date
@@ -593,9 +598,10 @@ def main():
 
 
         # -----------------------------------------------------------
-        # Save with descriptive filename into data/analyzer_runs/
+        # Save with descriptive filename into data/analyzer_temp/YYYY-MM-DD/
         # -----------------------------------------------------------
-        out_dir = Path("data/analyzer_runs")
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        out_dir = Path(f"data/analyzer_temp/{today}")
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -732,12 +738,12 @@ def main():
 
         print(f"🎉 Analysis completed successfully!")
         print(f"📈 Performance: {total_trades} trades, {win_rate:.1f}% win rate, ${total_profit:,.2f} profit")
-        print(f"📁 Files saved to data/analyzer_runs/ folder")
+        print(f"📁 Files saved to data/analyzer_temp/{today}/ folder")
         print("=" * 60)
         
         st.success(f"✅ Analysis completed successfully!")
-        st.info(f"📁 Files saved to analyzer_runs folder")
-        st.success(f"💾 Parquet file saved to analyzer_runs: {parquet_path.name}")
+        st.info(f"📁 Files saved to analyzer_temp/{today}/ folder")
+        st.success(f"💾 Parquet file saved to analyzer_temp/{today}/: {parquet_path.name}")
         
         if save_csv:
             st.success(f"📄 CSV saved to analyzer_runs: {csv_path.name}")
@@ -835,16 +841,20 @@ def main():
                 # Create filename
                 filename = f"{instrument}_{total_trades}trades_{int(win_rate)}winrate_{int(total_profit)}profit_{timestamp}"
                 
+                # Save to analyzer_temp with date-based folder structure
+                today = datetime.datetime.now().strftime("%Y-%m-%d")
+                temp_dir = Path(f"data/analyzer_temp/{today}")
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                
                 # Save as parquet
-                parquet_path = Path("data/analyzer_runs") / f"{filename}.parquet"
-                parquet_path.parent.mkdir(parents=True, exist_ok=True)
+                parquet_path = temp_dir / f"{filename}.parquet"
                 final.to_parquet(parquet_path, index=False)
                 
                 # Save as CSV
-                csv_path = Path("data/analyzer_runs") / f"{filename}.csv"
+                csv_path = temp_dir / f"{filename}.csv"
                 final.to_csv(csv_path, index=False)
                 
-                # Save summary in summaries subfolder
+                # Save summary in summaries subfolder (keep in analyzer_runs for now)
                 summaries_dir = Path("data/analyzer_runs/summaries")
                 summaries_dir.mkdir(parents=True, exist_ok=True)
                 summary_path = summaries_dir / f"{filename}_SUMMARY.txt"
@@ -881,7 +891,7 @@ def main():
                     f.write(f"- {csv_path}\n")
                     f.write(f"- {summary_path}\n")
                 
-                st.success(f"✅ Results saved to analyzer_runs folder!")
+                st.success(f"✅ Results saved to analyzer_temp/{today}/ folder!")
                 st.info(f"📁 Files created:\n- {parquet_path.name}\n- {csv_path.name}\n- {summary_path.name}")
                 
             except Exception as e:

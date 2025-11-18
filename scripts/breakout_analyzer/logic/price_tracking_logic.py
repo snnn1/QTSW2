@@ -164,10 +164,22 @@ class PriceTracker:
                 data_end_time = df['timestamp'].max()
                 if data_end_time < mfe_end_time:
                     # Data doesn't extend to MFE end time - use all available data
+                    # This is expected behavior when data doesn't extend to exact minute boundaries
                     mfe_bars = df[(df["timestamp"] >= entry_time)].copy()
-                    if self.debug_manager.is_debug_enabled():
-                        print(f"MFE WARNING: Data ends at {data_end_time}, but MFE should track until {mfe_end_time}")
-                        print(f"MFE WARNING: Using all available data from {entry_time} to {data_end_time}")
+                    # Log MFE data gap warnings - this is expected but useful to see in debug terminal
+                    # Use logging instead of print so it shows up in debug window
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    time_diff = (mfe_end_time - data_end_time).total_seconds() / 60
+                    if time_diff <= 1:
+                        # Very small gap (1 minute or less) - just a note
+                        logger.debug(f"MFE: Data ends {time_diff:.1f} min before expected (using available data)")
+                    elif time_diff <= 5:
+                        # Small gap (1-5 minutes) - info level
+                        logger.info(f"MFE: Data ends {time_diff:.1f} min before expected end time (using available data)")
+                    else:
+                        # Larger gap (>5 minutes) - warning level
+                        logger.warning(f"MFE: Data ends {time_diff:.1f} min before expected end time (using available data)")
                 else:
                     # Data extends to MFE end time - use normal filtering
                     mfe_bars = df[(df["timestamp"] >= entry_time) & (df["timestamp"] < mfe_end_time)].copy()
@@ -350,7 +362,7 @@ class PriceTracker:
                         if mfe_peak == 0.0 and max_favorable_execution > 0.0:
                             max_favorable = max_favorable_execution
                             if self.debug_manager.is_debug_enabled():
-                                print(f"🔧 PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                                print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
                         else:
                             max_favorable = mfe_peak
                     
@@ -406,7 +418,7 @@ class PriceTracker:
                         if mfe_peak == 0.0 and max_favorable_execution > 0.0:
                             max_favorable = max_favorable_execution
                             if self.debug_manager.is_debug_enabled():
-                                print(f"🔧 PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                                print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
                         else:
                             max_favorable = mfe_peak
                     
@@ -460,7 +472,7 @@ class PriceTracker:
                         if mfe_peak == 0.0 and max_favorable_execution > 0.0:
                             max_favorable = max_favorable_execution
                             if self.debug_manager.is_debug_enabled():
-                                print(f"🔧 PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                                print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
                         else:
                             max_favorable = mfe_peak
                     
@@ -497,7 +509,7 @@ class PriceTracker:
                 if mfe_peak == 0.0 and max_favorable_execution > 0.0:
                     max_favorable = max_favorable_execution
                     if self.debug_manager.is_debug_enabled():
-                        print(f"🔧 PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                        print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
                 else:
                     max_favorable = mfe_peak
             

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Streamlit App for Sequential Target Change and Time Change Processor
+Streamlit App for Sequential Time Change Processor
 """
 
 import streamlit as st
@@ -8,6 +8,7 @@ import pandas as pd
 import os
 from datetime import datetime
 import sys
+import io
 
 # Get the script directory and project root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,101 +30,288 @@ if 'previous_data_file' in st.session_state:
         if 'processor' in st.session_state:
             del st.session_state['processor']
 
-def create_auto_sized_dataframe(data, use_container_width=True):
+def create_auto_sized_dataframe(data, width='stretch'):
     """Create a dataframe with automatic column sizing based on content"""
+    # Convert object columns to string to avoid Arrow serialization errors
+    if not data.empty:
+        data = data.copy()  # Make a copy to avoid modifying original
+        for col in data.columns:
+            if data[col].dtype == 'object':
+                # Try to convert to string, handling any errors
+                try:
+                    data[col] = data[col].astype(str)
+                except Exception:
+                    # If conversion fails, replace with string representation
+                    data[col] = data[col].apply(lambda x: str(x) if pd.notna(x) else '')
+    
     if data.empty:
-        return st.dataframe(data, use_container_width=use_container_width, hide_index=True)
+        return st.dataframe(data, width=width, hide_index=True)
     
     # Use Streamlit's built-in auto-sizing without forcing column widths
     # This allows Streamlit to automatically size columns based on content
     return st.dataframe(
         data, 
-        use_container_width=False,  # Let columns size themselves
+        width='content',  # Let columns size themselves
         hide_index=True
     )
 
 def main():
     st.set_page_config(
         page_title="Sequential Processor App",
-        page_icon="🎯",
+        page_icon=None,
         layout="wide"
     )
     
-    st.title("🎯 Sequential Target Change & Time Change Processor")
+    st.title("Sequential Time Change Processor")
     st.markdown("---")
     
     # Sidebar for configuration
-    st.sidebar.header("⚙️ Configuration")
+    st.sidebar.header("Configuration")
     
     # Data file selection
-    # Try multiple possible paths for the data folder
+    # Try multiple possible paths for analyzer_runs folder
     possible_paths = [
         os.path.join(PROJECT_ROOT, "data", "analyzer_runs"),  # Absolute from project root
         os.path.join(os.getcwd(), "data", "analyzer_runs"),   # Relative to current working directory
         "data/analyzer_runs",                                  # Simple relative path
     ]
     
-    data_folder = None
+    analyzer_runs_folder = None
     for path in possible_paths:
         abs_path = os.path.abspath(path)
         if os.path.exists(abs_path):
-            data_folder = abs_path
+            analyzer_runs_folder = abs_path
             break
     
     # Initialize variables
     data_path = None
     selected_file = "Not selected"
+    selected_files_list = []  # List of all selected file paths for multi-file processing
     
     # Debug: Show what folder we're looking in
-    if st.sidebar.checkbox("Show Debug Info", value=False, key="debug_info_paths"):
+    show_debug = st.sidebar.checkbox("Show Debug Info", value=False, key="debug_info_paths")
+    if show_debug:
         st.sidebar.write(f"**Project Root:** `{PROJECT_ROOT}`")
         st.sidebar.write(f"**Current Working Dir:** `{os.getcwd()}`")
-        st.sidebar.write(f"**Looking in:** `{data_folder}`")
-        st.sidebar.write(f"**Folder exists:** {os.path.exists(data_folder) if data_folder else False}")
+        st.sidebar.write(f"**Looking in:** `{analyzer_runs_folder}`")
+        st.sidebar.write(f"**Folder exists:** {os.path.exists(analyzer_runs_folder) if analyzer_runs_folder else False}")
         st.sidebar.write(f"**Tried paths:**")
         for path in possible_paths:
             abs_path = os.path.abspath(path)
             exists = os.path.exists(abs_path)
-            st.sidebar.write(f"  - `{abs_path}` {'✅' if exists else '❌'}")
-        if data_folder and os.path.exists(data_folder):
-            try:
-                contents = os.listdir(data_folder)
-                st.sidebar.write(f"**Contents:** {contents[:10]}...")  # Show first 10 items
-            except:
-                st.sidebar.write(f"**Contents:** (error reading)")
+            st.sidebar.write(f"  - `{abs_path}` {'Found' if exists else 'Not Found'}")
     
-    if data_folder and os.path.exists(data_folder):
-        # Search for parquet files only in the main folder (not subfolders)
-        data_files = []
-        for file in os.listdir(data_folder):
-            if file.endswith('.parquet') and os.path.isfile(os.path.join(data_folder, file)):
-                data_files.append(file)
+    if analyzer_runs_folder and os.path.exists(analyzer_runs_folder):
+        # Get instrument folders (directories only)
+        instrument_folders = []
+        try:
+            for item in os.listdir(analyzer_runs_folder):
+                item_path = os.path.join(analyzer_runs_folder, item)
+                if os.path.isdir(item_path):
+                    instrument_folders.append(item)
+        except Exception as e:
+            st.sidebar.error(f"Error reading analyzer_runs folder: {e}")
+            instrument_folders = []
         
-        if data_files:
-            # Prefer files with multiple time slots (5439trades) over single time slot files (259trades)
-            # This fixes the CL time advancement issue
-            preferred_index = 0
-            for i, file in enumerate(data_files):
-                if '5439trades' in file:  # Files with multiple time slots
-                    preferred_index = i
-                    break
+        if instrument_folders:
+            # Sort instrument folders for consistent display
+            instrument_folders.sort()
             
-            selected_file = st.sidebar.selectbox(
-                "Select Data File:",
-                data_files,
-                index=preferred_index
+            # Let user select instrument folder
+            selected_instrument = st.sidebar.selectbox(
+                "Select Instrument Folder:",
+                instrument_folders,
+                help="Select the instrument folder to search for parquet files"
             )
-            # Use full path (selected_file is just the filename)
-            data_path = os.path.join(data_folder, selected_file)
             
-            # Track file changes to clear cached state
-            st.session_state['previous_data_file'] = st.session_state.get('current_data_file', None)
-            st.session_state['current_data_file'] = selected_file
+            instrument_folder_path = os.path.join(analyzer_runs_folder, selected_instrument)
+            
+            # Search mode selection
+            st.sidebar.markdown("---")
+            search_mode = st.sidebar.radio(
+                "Search Mode:",
+                ["Full Search", "Search by Year"],
+                index=0,  # Default to Full Search
+                key=f"search_mode_{selected_instrument}",  # Unique key per instrument
+                help="Full Search: Show ALL files recursively from all years/months. Search by Year: Filter files by year."
+            )
+            
+            selected_year = None
+            if search_mode == "Search by Year":
+                # Get available years from filenames and folder names (search recursively)
+                try:
+                    import re
+                    available_years = set()
+                    
+                    # Search recursively for years in both filenames and folder names
+                    for root, dirs, files in os.walk(instrument_folder_path):
+                        # Check folder names for years
+                        folder_name = os.path.basename(root)
+                        folder_year_matches = re.findall(r'\b(20\d{2})\b', folder_name)
+                        if folder_year_matches:
+                            available_years.add(int(folder_year_matches[0]))
+                        
+                        # Check filenames for years
+                        for file in files:
+                            if file.endswith('.parquet'):
+                                year_matches = re.findall(r'\b(20\d{2})\b', file)  # Match years 2000-2099
+                                if year_matches:
+                                    available_years.add(int(year_matches[0]))
+                    
+                    if available_years:
+                        available_years = sorted(list(available_years), reverse=True)  # Most recent first
+                        selected_year = st.sidebar.selectbox(
+                            "Select Year:",
+                            available_years,
+                            key=f"year_select_{selected_instrument}",  # Unique key per instrument
+                            help="Filter files by year (checks both filenames and folder names)"
+                        )
+                    else:
+                        st.sidebar.warning("No years detected. Showing all files.")
+                        search_mode = "Full Search"  # Fallback to full search if no years found
+                        selected_year = None
+                except Exception as e:
+                    st.sidebar.error(f"Error detecting years: {e}")
+                    selected_year = None
+            
+            # Search for parquet files in the selected instrument folder (including subfolders)
+            data_files = []
+            file_paths = {}  # Map display name to full path
+            
+            try:
+                # Search recursively in the instrument folder and its subfolders
+                # Count files found for debugging
+                total_files_scanned = 0
+                files_filtered_out = 0
+                
+                for root, dirs, files in os.walk(instrument_folder_path):
+                    for file in files:
+                        if file.endswith('.parquet'):
+                            total_files_scanned += 1
+                            
+                            # Only filter if we're in "Search by Year" mode AND a year is selected
+                            if search_mode == "Search by Year" and selected_year is not None:
+                                # Check if filename contains the selected year OR if we're in a folder with that year name
+                                folder_name = os.path.basename(root)
+                                file_has_year = str(selected_year) in file
+                                folder_has_year = str(selected_year) in folder_name
+                                if not (file_has_year or folder_has_year):
+                                    files_filtered_out += 1
+                                    continue  # Skip this file if it doesn't match the year
+                            
+                            # Include this file (either Full Search mode, or it passed the year filter)
+                            # Create display name with relative path if in subfolder
+                            full_path = os.path.join(root, file)
+                            rel_path = os.path.relpath(full_path, instrument_folder_path)
+                            
+                            # Use relative path as display name if in subfolder, otherwise just filename
+                            if os.path.dirname(rel_path):
+                                display_name = rel_path.replace('\\', '/')  # Use forward slashes for display
+                            else:
+                                display_name = file
+                            
+                            data_files.append(display_name)
+                            file_paths[display_name] = full_path
+                
+                # Debug output
+                if show_debug:
+                    st.sidebar.write(f"**Search Stats:**")
+                    st.sidebar.write(f"  - Total files scanned: {total_files_scanned}")
+                    st.sidebar.write(f"  - Files filtered out: {files_filtered_out}")
+                    st.sidebar.write(f"  - Files included: {len(data_files)}")
+                    st.sidebar.write(f"  - Search path: `{instrument_folder_path}`")
+            except Exception as e:
+                st.sidebar.error(f"Error reading instrument folder: {e}")
+                import traceback
+                st.sidebar.error(f"Traceback: {traceback.format_exc()}")
+                data_files = []
+            
+            if data_files:
+                # Debug: Show file list if debug enabled
+                if show_debug:
+                    st.sidebar.write(f"**Search Mode:** {search_mode}")
+                    st.sidebar.write(f"**Selected Year:** {selected_year if selected_year else 'None (Full Search)'}")
+                    st.sidebar.write(f"**Files found:**")
+                    for i, file in enumerate(data_files[:20]):  # Show first 20
+                        st.sidebar.write(f"  {i+1}. `{file}`")
+                    if len(data_files) > 20:
+                        st.sidebar.write(f"  ... and {len(data_files) - 20} more")
+                
+                # Sort files for consistent display
+                data_files.sort()
+                
+                # When Full Search is enabled, automatically select all files
+                if search_mode == "Full Search":
+                    # Full Search automatically selects all files - no manual selection needed
+                    selected_files = data_files  # Automatically select all files
+                    selected_files_list = [file_paths[f] for f in selected_files]  # Get full paths
+                    selected_file = f"{len(selected_files)} files"
+                    data_path = selected_files_list[0] if selected_files_list else None  # For backward compatibility
+                    
+                    if len(selected_files) == 0:
+                        selected_file = "No file selected"
+                        data_path = None
+                        selected_files_list = []
+                else:
+                    # Single select for "Search by Year" mode
+                    preferred_index = 0
+                    for i, file in enumerate(data_files):
+                        if '5439trades' in file:  # Files with multiple time slots
+                            preferred_index = i
+                            break
+                    
+                    selected_file = st.sidebar.selectbox(
+                        "Select Data File:",
+                        data_files,
+                        index=preferred_index
+                    )
+                    # Use full path from the mapping
+                    data_path = file_paths[selected_file]
+                    selected_files_list = [data_path]  # Single file for Search by Year mode
+                
+                # Track file changes to clear cached state
+                if selected_file != "No file selected":
+                    st.session_state['previous_data_file'] = st.session_state.get('current_data_file', None)
+                    st.session_state['current_data_file'] = selected_file
+            else:
+                # No files found in selected instrument folder
+                st.sidebar.warning(f"No parquet files found in `{selected_instrument}` folder")
+                st.sidebar.info(f"**Searched in:** `{instrument_folder_path}`")
+                st.sidebar.markdown("**Or enter a custom file path:**")
+                custom_path = st.sidebar.text_input(
+                    "Custom Data File Path:",
+                    value="",
+                    help="Enter the full path to a parquet file, or a relative path from the project root"
+                )
+                
+                if custom_path:
+                    # Handle both absolute and relative paths
+                    if os.path.isabs(custom_path):
+                        data_path = custom_path
+                    else:
+                        # Try relative to project root first, then current working directory
+                        if os.path.exists(os.path.join(PROJECT_ROOT, custom_path)):
+                            data_path = os.path.join(PROJECT_ROOT, custom_path)
+                        elif os.path.exists(custom_path):
+                            data_path = os.path.abspath(custom_path)
+                        else:
+                            data_path = custom_path  # Will be validated when loading
+                    
+                    if not os.path.exists(data_path):
+                        st.sidebar.error(f"File not found: `{data_path}`")
+                        data_path = None
+                        selected_file = "Invalid path"
+                    else:
+                        st.sidebar.success(f"Using: `{data_path}`")
+                        selected_file = os.path.basename(data_path)
+                else:
+                    data_path = None
+                    selected_file = "No file selected"
         else:
-            # No files found - allow manual path entry
-            st.sidebar.warning("⚠️ No parquet files found in analyzer_runs folder")
-            st.sidebar.info(f"**Searched in:** `{data_folder}`")
-            st.sidebar.markdown("**Or enter a custom file path:**")
+            # No instrument folders found
+            st.sidebar.warning("No instrument folders found in analyzer_runs")
+            st.sidebar.info(f"**Searched in:** `{analyzer_runs_folder}`")
+            st.sidebar.markdown("**Enter a custom file path:**")
             custom_path = st.sidebar.text_input(
                 "Custom Data File Path:",
                 value="",
@@ -155,7 +343,7 @@ def main():
                 selected_file = "No file selected"
     else:
         # Folder doesn't exist - allow manual path entry
-        st.sidebar.warning("⚠️ analyzer_runs folder not found")
+        st.sidebar.warning("analyzer_runs folder not found")
         st.sidebar.info(f"**Tried looking in:**\n- `{os.path.join(PROJECT_ROOT, 'data', 'analyzer_runs')}`\n- `{os.path.join(os.getcwd(), 'data', 'analyzer_runs')}`\n- `data/analyzer_runs`")
         st.sidebar.markdown("**Enter a custom file path:**")
         custom_path = st.sidebar.text_input(
@@ -189,81 +377,8 @@ def main():
             data_path = None
             selected_file = "No file selected"
     
-    # Mode selection
-    st.sidebar.subheader("🎛️ Mode Selection")
-    enable_target_change = st.sidebar.checkbox("Target Change Mode", value=True, help="Enable dynamic target progression")
-    enable_time_change = st.sidebar.checkbox("Time Change Mode", value=True, help="Enable time slot switching")
-    
-    # Rolling median mode
-    enable_rolling_median_mode = st.sidebar.checkbox(
-        "Rolling Median Mode", 
-        value=False, 
-        help="Use rolling median of last 13 peaks for target changes. Target Change column shows median value rounded down to nearest 25. No trade when median < 50."
-    )
-    
-    # Median ladder mode
-    enable_median_ladder_mode = st.sidebar.checkbox(
-        "Median Ladder Mode", 
-        value=False, 
-        help="Use rolling median with progressive ladder steps. Calculates median of last 13 peaks and maps to ladder steps (75, 100, 125, etc.). Progressive promotion with configurable days required. No trade when median < base target."
-    )
-    
-    # Median ladder promotion days (show when median ladder mode is enabled)
-    median_ladder_promotion_days = 2  # Default value
-    if enable_median_ladder_mode:
-        median_ladder_promotion_days = st.sidebar.selectbox(
-            "Median Ladder Promotion Days",
-            options=[1, 2, 3, 4, 5],
-            index=1,  # Default to 2 days
-            help="Days required at current level before promoting to next step"
-        )
-    
-    # Median position selection (show when any median mode is enabled)
-    median_position = 7  # Default value
-    if enable_rolling_median_mode or enable_median_ladder_mode:
-        median_position = st.sidebar.selectbox(
-            "Median Position",
-            options=list(range(1, 14)),
-            index=6,  # Default to 7 (true median)
-            help="Position in sorted 13-peak window: 1=lowest, 7=median, 13=highest"
-        )
-    
-    # No-trade on low median toggle (show when median mode is enabled)
-    enable_no_trade_on_low_median = True  # Default value
-    if enable_rolling_median_mode or enable_median_ladder_mode:
-        enable_no_trade_on_low_median = st.sidebar.checkbox(
-            "Enable No-Trade on Low Median",
-            value=True,
-            help="When enabled, no trades are taken when the median is below the base target. Uncheck to trade even when median is low."
-        )
-    
-    # Max target change percentage (show when any target change mode is enabled)
-    if enable_target_change or enable_rolling_median_mode or enable_median_ladder_mode:
-        max_target_percentage = st.sidebar.selectbox(
-            "Max Target Change (%)",
-            options=[50, 100, 150, 200, 250, 300, 400, 500],
-            index=6,  # Default to 400%
-            help="Maximum percentage of base target for Target Change column. ES base=10, NQ base=50, etc."
-        )
-    else:
-        max_target_percentage = 400  # Default value when neither mode is enabled
-    
-    # Target sharing option
-    st.sidebar.subheader("🎯 Target Configuration")
-    share_targets = st.sidebar.checkbox("Share Targets Between Time Slots", value=True, help="When enabled, both time slots use the same target. When disabled, each time slot has independent target progression.")
-    
-    # Rolling mode - always enabled
-    enable_rolling_mode = True
-    
-    # No consecutive target changes option
-    no_consecutive_target_changes = st.sidebar.checkbox(
-        "No Consecutive Target Changes", 
-        value=False, 
-        help="Prevent target changes on consecutive days (e.g., if target changes Monday, it cannot change Tuesday)"
-    )
-    
     # Day filtering options
-    st.sidebar.subheader("📅 Day Filtering")
+    st.sidebar.subheader("Day Filtering")
     
     # Day of week filtering
     st.sidebar.markdown("**Exclude Days of Week:**")
@@ -292,17 +407,43 @@ def main():
     )
     
     # Processing options
-    st.sidebar.subheader("📊 Processing Options")
+    st.sidebar.subheader("Processing Options")
     # Process all available data by default
     max_days = 10000  # Effectively unlimited
     
     # Starting configuration - dynamically set based on selected data file
-    st.sidebar.subheader("🎯 Starting Configuration")
+    st.sidebar.subheader("Starting Configuration")
+    
+    # Initialize variables
+    instrument = "ES"  # Default
+    available_times = ["08:00", "09:00"]
+    start_time = "08:00"
+    sample_data = None
     
     # Load data to detect instrument and available options
-    if data_path and os.path.exists(data_path):
+    # If multiple files selected, load and combine them for detection
+    if 'selected_files_list' in locals() and selected_files_list and len(selected_files_list) > 1:
+        try:
+            dataframes = []
+            for file_path in selected_files_list:
+                if os.path.exists(file_path):
+                    df = pd.read_parquet(file_path)
+                    dataframes.append(df)
+            if dataframes:
+                sample_data = pd.concat(dataframes, ignore_index=True)
+        except Exception as e:
+            st.sidebar.error(f"Error loading multiple files: {e}")
+            sample_data = None
+    elif data_path and os.path.exists(data_path):
         try:
             sample_data = pd.read_parquet(data_path)
+        except Exception as e:
+            st.sidebar.error(f"Error loading data: {e}")
+            sample_data = None
+    
+    # Process sample_data if available
+    if sample_data is not None and len(sample_data) > 0:
+        try:
             # Ensure times are strings for proper comparison
             available_times = sorted([str(t) for t in sample_data['Time'].unique()])
             available_targets = sorted(sample_data['Target'].unique().tolist())
@@ -335,43 +476,19 @@ def main():
             default_time = available_times[0] if available_times else "08:00"
             start_time = st.sidebar.selectbox("Start Time", available_times, index=0, help="Time slot to start processing from")
             
-            # Set appropriate default target based on instrument
-            base_targets = {"ES": 10, "NQ": 50, "YM": 100, "CL": 0.5, "NG": 0.05, "GC": 5}
-            default_target = base_targets.get(instrument, 10)
-            
-            # Find the closest available target to the default
-            if available_targets:
-                closest_target = min(available_targets, key=lambda x: abs(x - default_target))
-                default_index = available_targets.index(closest_target)
-            else:
-                default_index = 0
-                
-            # Force index 0 for CL to ensure we get 0.5, not 2.0
-            if instrument == "CL":
-                forced_index = 0
-            else:
-                forced_index = default_index
-                
-            # Use a key that changes when file changes to force selectbox reset
-            selectbox_key = f"target_select_{os.path.basename(data_path)}_{instrument}_{forced_index}"
-            start_target = st.sidebar.selectbox("Start Target", available_targets, index=forced_index, key=selectbox_key, help="Target level to start processing from")
-            
-            # Show detected instrument and configuration
-            st.sidebar.info(f"🔍 **Detected Instrument: {instrument}**")
-            st.sidebar.info(f"🎯 **Start Target: {start_target}**")
+            # Show detected instrument
+            st.sidebar.info(f"**Detected Instrument: {instrument}**")
             
         except Exception as e:
-            st.sidebar.error(f"Error loading data: {e}")
+            st.sidebar.error(f"Error processing data: {e}")
             # Fallback to ES defaults
             start_time = st.sidebar.selectbox("Start Time", ["08:00", "09:00"], index=0)
-            start_target = st.sidebar.selectbox("Start Target", [10, 15, 20, 25, 30, 35, 40], index=0)
             instrument = "ES"
             available_times = ["08:00", "09:00"]
-            available_targets = [10, 15, 20, 25, 30, 35, 40]
     else:
         # No data file available - use default settings
-        st.sidebar.info("📋 **Using default settings (no data file)**")
-        st.sidebar.info("🔧 **Select instrument manually below**")
+        st.sidebar.info("**Using default settings (no data file)**")
+        st.sidebar.info("**Select instrument manually below**")
         
         # Let user select instrument
         instrument = st.sidebar.selectbox(
@@ -382,15 +499,12 @@ def main():
         )
         
         # Set defaults based on selected instrument
-        base_targets = {"ES": 10, "NQ": 50, "YM": 100, "CL": 0.5, "NG": 0.05, "GC": 5}
         available_times = ["08:00", "09:00"]
-        available_targets = [10, 15, 20, 25, 30, 35, 40]  # Standard ES targets
         
         start_time = st.sidebar.selectbox("Start Time", available_times, index=0, help="Time slot to start processing from")
-        start_target = st.sidebar.selectbox("Start Target", available_targets, index=0, help="Target level to start processing from")
     
     # Show info about processing all data
-    st.sidebar.info("🔄 **Processing ALL available data**")
+    st.sidebar.info("**Processing ALL available data**")
     
     # Display current settings
     st.sidebar.markdown("---")
@@ -400,37 +514,29 @@ def main():
         st.sidebar.markdown(f"• Data Path: `{data_path}`")
     else:
         st.sidebar.markdown(f"• Data File: `{selected_file}`")
-        st.sidebar.warning("⚠️ Please select a data file to continue")
+        st.sidebar.warning("Please select a data file to continue")
     st.sidebar.markdown(f"• Instrument: `{instrument}`")
     st.sidebar.markdown(f"• Start Time: `{start_time}`")
-    st.sidebar.markdown(f"• Start Target: `{start_target}`")
     st.sidebar.markdown(f"• Available Times: {available_times if 'available_times' in locals() else 'N/A'}")
-    st.sidebar.markdown(f"• Available Targets: {available_targets if 'available_targets' in locals() else 'N/A'}")
-    st.sidebar.markdown(f"• Target Change: {'✅ ON' if enable_target_change else '❌ OFF'}")
-    st.sidebar.markdown(f"• Time Change: {'✅ ON' if enable_time_change else '❌ OFF'}")
-    st.sidebar.markdown(f"• Share Targets: {'✅ ON' if share_targets else '❌ OFF'}")
-    st.sidebar.markdown(f"• Rolling Mode: **✅ ALWAYS ON**")
-    st.sidebar.markdown(f"• Rolling Median Mode: {'✅ ON' if enable_rolling_median_mode else '❌ OFF'}")
-    st.sidebar.markdown(f"• Median Ladder Mode: {'✅ ON' if enable_median_ladder_mode else '❌ OFF'}")
-    if enable_median_ladder_mode:
-        st.sidebar.markdown(f"• Median Ladder Promotion Days: **{median_ladder_promotion_days}**")
-    st.sidebar.markdown(f"• No Consecutive Changes: {'✅ ON' if no_consecutive_target_changes else '❌ OFF'}")
+    st.sidebar.markdown(f"• Time Change: **ALWAYS ON**")
     st.sidebar.markdown(f"• Excluded Days of Week: {exclude_days_of_week if exclude_days_of_week else 'None'}")
     st.sidebar.markdown(f"• Excluded Days of Month: {exclude_days_of_month if exclude_days_of_month else 'None'}")
-    st.sidebar.markdown(f"• Loss Recovery Mode: {'✅ ON' if loss_recovery_mode else '❌ OFF'}")
-    if enable_target_change or enable_rolling_median_mode or enable_median_ladder_mode:
-        st.sidebar.markdown(f"• Max Target Change: **{max_target_percentage}%**")
+    st.sidebar.markdown(f"• Loss Recovery Mode: {'ON' if loss_recovery_mode else 'OFF'}")
     st.sidebar.markdown(f"• Processing: **ALL DATA**")
     
     # Output folder selection (global for all tabs)
     st.markdown("---")
-    st.subheader("📁 Output Folder")
+    st.subheader("Output Folder")
     
     col_folder1, col_folder2 = st.columns([2, 1])
     
     with col_folder1:
+        # Get today's date for temp folder structure
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        
         output_folder_options = {
-            "Default (data/sequencer_runs/)": "data/sequencer_runs",
+            f"Default (data/sequencer_temp/{today}/)": "data/sequencer_temp",
             "Custom Folder": "custom"
         }
         
@@ -441,7 +547,8 @@ def main():
         )
         
         custom_folder = None
-        if output_folder_options[selected_output_option] == "custom":
+        selected_value = output_folder_options.get(selected_output_option, "data/sequencer_temp")
+        if selected_value == "custom":
             custom_folder = st.text_input(
                 "Custom folder path:",
                 value="my_sequential_runs",
@@ -451,11 +558,14 @@ def main():
         # Determine final output folder (use absolute path)
         if custom_folder:
             output_folder = os.path.join(PROJECT_ROOT, custom_folder)
+        elif selected_value == "data/sequencer_temp":
+            # Use date-based temp folder structure
+            output_folder = os.path.join(PROJECT_ROOT, f"data/sequencer_temp/{today}")
         else:
-            output_folder = os.path.join(PROJECT_ROOT, output_folder_options[selected_output_option])
+            output_folder = os.path.join(PROJECT_ROOT, selected_value)
     
     with col_folder2:
-        st.info(f"📁 **Current folder:**\n`{output_folder}/`")
+        st.info(f"**Current folder:**\n`{output_folder}/`")
     
     st.markdown("---")
     
@@ -463,17 +573,36 @@ def main():
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.subheader("🚀 Run Processor")
+        st.subheader("Run Processor")
         
-        if st.button("▶️ Start Processing", type="primary"):
-            if not data_path or not os.path.exists(data_path):
-                st.error("❌ Please select a valid data file first!")
+        if st.button("Start Processing", type="primary"):
+            # Check if we have files to process
+            if selected_files_list and len(selected_files_list) > 1:
+                # Multiple files selected - validate all exist
+                missing_files = [f for f in selected_files_list if not os.path.exists(f)]
+                if missing_files:
+                    st.error(f"Some selected files not found: {missing_files}")
+                    st.stop()
+            elif not data_path or not os.path.exists(data_path):
+                st.error("Please select a valid data file first!")
                 st.stop()
             
             with st.spinner("Processing..."):
                 try:
                     # Validate start_time is compatible with the data before processing
-                    validation_data = pd.read_parquet(data_path)
+                    # Load all selected files for validation
+                    if selected_files_list and len(selected_files_list) > 1:
+                        validation_dataframes = []
+                        for file_path in selected_files_list:
+                            if os.path.exists(file_path):
+                                df = pd.read_parquet(file_path)
+                                validation_dataframes.append(df)
+                        if validation_dataframes:
+                            validation_data = pd.concat(validation_dataframes, ignore_index=True)
+                        else:
+                            validation_data = None
+                    else:
+                        validation_data = pd.read_parquet(data_path)
                     # Ensure times are strings for proper comparison
                     validation_times = sorted([str(t) for t in validation_data['Time'].unique()])
                     
@@ -481,59 +610,50 @@ def main():
                     start_time_str = str(start_time)
                     
                     if start_time_str not in validation_times:
-                        st.error(f"❌ Start time '{start_time_str}' is not available in the selected data file.")
-                        st.info(f"📋 Available time slots: {validation_times}")
-                        st.warning("💡 **Solution:** Please select a different data file or change the start time to one of the available slots.")
+                        st.error(f"Start time '{start_time_str}' is not available in the selected data file.")
+                        st.info(f"Available time slots: {validation_times}")
+                        st.warning("**Solution:** Please select a different data file or change the start time to one of the available slots.")
                         st.stop()
                     
                     # Initialize processor with auto-detected settings
+                    # Use selected_files_list if multiple files selected, otherwise use single data_path
+                    files_to_load = selected_files_list if selected_files_list and len(selected_files_list) > 1 else [data_path]
+                    
                     processor = SequentialProcessorV2(
-                        data_path, 
+                        data_path,  # Still required for backward compatibility
                         start_time_str, 
-                        start_target, 
                         "normal", 
-                        share_targets, 
-                        enable_rolling_mode, 
-                        no_consecutive_target_changes, 
                         exclude_days_of_week, 
                         exclude_days_of_month, 
-                        loss_recovery_mode, 
-                        enable_rolling_median_mode, 
-                        max_target_percentage,
-                        enable_median_ladder_mode,
-                        median_ladder_promotion_days,
-                        median_position,
-                        enable_no_trade_on_low_median
+                        loss_recovery_mode,
+                        data_files=files_to_load if len(files_to_load) > 1 else None  # Only pass if multiple files
                     )
                     
-                    # Process data
+                    # Process data (time change is always enabled)
                     results = processor.process_sequential(
-                        max_days=max_days,
-                        enable_target_change=enable_target_change,
-                        enable_time_change=enable_time_change
+                        max_days=max_days
                     )
                     
                     # Store results in session state
                     st.session_state['results'] = results
                     st.session_state['processor'] = processor
                     
-                    st.success("✅ Processing completed!")
+                    st.success("Processing completed!")
                     
                 except Exception as e:
-                    st.error(f"❌ Error during processing: {str(e)}")
+                    st.error(f"Error during processing: {str(e)}")
                     # Show more details for debugging
                     import traceback
-                    with st.expander("🔍 Show detailed error information"):
+                    with st.expander("Show detailed error information"):
                         st.code(traceback.format_exc())
     
     with col2:
-        st.subheader("📈 Quick Stats")
+        st.subheader("Quick Stats")
         if 'results' in st.session_state:
             results = st.session_state['results']
             
             # Calculate stats
             total_days = len(results)
-            target_changes = len(results[results.get('Target Change', '') != '']) if 'Target Change' in results.columns else 0
             time_changes = len(results[results.get('Time Change', '') != '']) if 'Time Change' in results.columns else 0
             
             # Calculate revised win rate and profit (excluding filtered days) - with safe column access
@@ -749,7 +869,6 @@ def main():
                 st.metric("Break-Even", break_even)
             
             with col3:
-                st.metric("Target Changes", target_changes)
                 st.metric("Time Changes", time_changes)
                 if total_days > 0:
                     final_row = results.iloc[-1]
@@ -771,12 +890,12 @@ def main():
     # Results section
     if 'results' in st.session_state:
         st.markdown("---")
-        st.header("📊 Results")
+        st.header("Results")
         
         results = st.session_state['results']
         
         # Tabs for different views
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📋 Full Results", "🎯 Target Changes", "⏰ Time Changes", "📊 Revised Summary", "📈 Summary", "📅 Day of Week Analysis", "📅 Day of Month Pivot", "📅 Yearly Profit"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["Full Results", "Time Changes", "Revised Summary", "Summary", "Day of Week Analysis", "Day of Month Pivot", "Yearly Profit"])
         
         with tab1:
             st.subheader("Complete Results")
@@ -786,13 +905,7 @@ def main():
             with col1:
                 # Set default columns based on what's available
                 default_cols = []
-                base_columns = ['Date', 'Day of Week', 'Stream', 'Time', 'Target', 'Range', 'SL', 'Profit', 'Peak', 'Direction', 'Result', 'Revised Score', 'Target Change', 'Time Change', 'Profit ($)', 'Revised Profit ($)']
-                
-                # Add Rolling Median to default columns if rolling median mode or median ladder mode is enabled
-                if (enable_rolling_median_mode or enable_median_ladder_mode) and 'Rolling Median' in results.columns:
-                    # Insert Rolling Median before Target Change
-                    target_change_index = base_columns.index('Target Change')
-                    base_columns.insert(target_change_index, 'Rolling Median')
+                base_columns = ['Date', 'Day of Week', 'Stream', 'Time', 'Target', 'Range', 'SL', 'Profit', 'Peak', 'Direction', 'Result', 'Revised Score', 'Time Change', 'Profit ($)', 'Revised Profit ($)']
                 
                 for col in base_columns:
                     if col in results.columns:
@@ -822,7 +935,7 @@ def main():
                 st.info("No results to display. Please run the processor first.")
             
             # Monthly Profit Summary
-            st.subheader("📊 Monthly Profit Summary")
+            st.subheader("Monthly Profit Summary")
             
             if len(results) > 0 and 'Date' in results.columns and 'Profit' in results.columns:
                 # Convert Date to datetime for proper grouping
@@ -852,64 +965,61 @@ def main():
                     st.metric("Total Profit (Points)", f"{total_profit:.2f}")
                     st.metric("Total Profit ($)", f"${total_profit_dollars:,.2f}")
                 
-                # Download button
-                csv = results.to_csv(index=False)
+                # Download buttons
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 
-                st.download_button(
-                    label="📥 Download Full Results as CSV",
-                    data=csv,
-                    file_name=f"sequential_run_{timestamp}.csv",
-                    mime="text/csv"
-                )
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    csv = results.to_csv(index=False)
+                    st.download_button(
+                        label="Download as CSV",
+                        data=csv,
+                        file_name=f"sequential_run_{timestamp}.csv",
+                        mime="text/csv"
+                    )
+                
+                with col_dl2:
+                    # Convert DataFrame to Parquet bytes for download
+                    parquet_buffer = io.BytesIO()
+                    results.to_parquet(parquet_buffer, index=False, compression='snappy')
+                    parquet_buffer.seek(0)
+                    st.download_button(
+                        label="Download as Parquet",
+                        data=parquet_buffer.getvalue(),
+                        file_name=f"sequential_run_{timestamp}.parquet",
+                        mime="application/octet-stream"
+                    )
                 
                 # Save button
                 st.markdown("---")
-                st.subheader("💾 Save Results")
+                st.subheader("Save Results")
                 
-                if st.button("💾 Save Results", type="primary", help="Save current results to selected folder"):
+                if st.button("Save Results", type="primary", help="Save current results to selected folder"):
                     # Ensure output folder exists
                     os.makedirs(output_folder, exist_ok=True)
                     
-                    # Save the results
-                    filename = f"{output_folder}/sequential_run_{timestamp}.csv"
-                    results.to_csv(filename, index=False)
+                    # Save as Parquet (primary format, like analyzer)
+                    parquet_filename = f"{output_folder}/sequential_run_{timestamp}.parquet"
+                    results.to_parquet(parquet_filename, index=False, compression='snappy')
                     
-                    st.success(f"✅ Results saved to: `{filename}`")
+                    # Also save as CSV for compatibility
+                    csv_filename = f"{output_folder}/sequential_run_{timestamp}.csv"
+                    results.to_csv(csv_filename, index=False)
+                    
+                    st.success(f"Results saved to:")
+                    st.info(f"Parquet: `{parquet_filename}`")
+                    st.info(f"CSV: `{csv_filename}`")
                     st.balloons()
                 
                 # Show save location info
-                st.info(f"💾 Results will be saved to: `{output_folder}/sequential_run_{timestamp}.csv`")
+                if selected_value == "data/sequencer_temp":
+                    st.info(f"Results will be saved to:\nParquet: `data/sequencer_temp/{today}/sequential_run_{timestamp}.parquet`\nCSV: `data/sequencer_temp/{today}/sequential_run_{timestamp}.csv`")
+                else:
+                    st.info(f"Results will be saved to:\nParquet: `{output_folder}/sequential_run_{timestamp}.parquet`\nCSV: `{output_folder}/sequential_run_{timestamp}.csv`")
             else:
                 st.info("Date and Profit columns required for monthly analysis")
         
         with tab2:
-            st.subheader("Target Change Events")
-            
-            target_changes = results[results.get('Target Change', '') != ''] if 'Target Change' in results.columns else pd.DataFrame()
-            if len(target_changes) > 0:
-                # Select available columns for target changes
-                available_cols = []
-                for col in ['Date', 'Target Change', 'Peak', 'Result', 'Target Reason']:
-                    if col in target_changes.columns:
-                        available_cols.append(col)
-                
-                st.dataframe(
-                    target_changes[available_cols],
-                    use_container_width=True
-                )
-                
-                # Target change chart - with safe column access
-                st.subheader("Target Progression")
-                if 'Date' in results.columns and 'Target' in results.columns:
-                    target_progression = results[['Date', 'Target']].copy()
-                    st.line_chart(target_progression.set_index('Date'))
-                else:
-                    st.info("Date and Target columns not available for target progression chart")
-            else:
-                st.info("No target changes occurred")
-        
-        with tab3:
             st.subheader("Time Change Events")
             
             time_changes = results[results.get('Time Change', '') != ''] if 'Time Change' in results.columns else pd.DataFrame()
@@ -922,13 +1032,13 @@ def main():
                 
                 st.dataframe(
                     time_changes[available_cols],
-                    use_container_width=True
+                    width='stretch'
                 )
             else:
                 st.info("No time changes occurred")
         
-        with tab4:
-            st.subheader("📊 Revised Summary (Excluding Filtered Days)")
+        with tab3:
+            st.subheader("Revised Summary (Excluding Filtered Days)")
             
             if len(results) > 0 and 'Revised Score' in results.columns and 'Revised Profit ($)' in results.columns:
                 # Calculate revised statistics
@@ -983,7 +1093,7 @@ def main():
                     st.metric("Trade Count Difference", trade_diff)
                 
                 # Revised monthly summary
-                st.subheader("📊 Revised Monthly Profit Summary")
+                st.subheader("Revised Monthly Profit Summary")
                 
                 # Convert Date to datetime for proper grouping
                 results_copy = results.copy()
@@ -1007,19 +1117,22 @@ def main():
                 # Download revised summary
                 revised_summary_data = {
                     'Metric': ['Total Profit (Points)', 'Total Profit ($)', 'Trade Count', 'Win Rate (%)', 'Wins', 'Losses'],
-                    'Original': [f"{original_total_profit:.2f}", f"${original_total_profit_dollars:,.2f}", original_trade_count, f"{win_rate:.1f}", wins, losses],
-                    'Revised': [f"{revised_total_profit:.2f}", f"${revised_total_profit_dollars:,.2f}", revised_trade_count, f"{revised_win_rate:.1f}", revised_wins, revised_losses],
-                    'Difference': [f"{revised_total_profit - original_total_profit:.2f}", f"${profit_diff:,.2f}", trade_diff, f"{revised_win_rate - win_rate:.1f}", revised_wins - wins, revised_losses - losses]
+                    'Original': [f"{original_total_profit:.2f}", f"${original_total_profit_dollars:,.2f}", str(original_trade_count), f"{win_rate:.1f}", str(wins), str(losses)],
+                    'Revised': [f"{revised_total_profit:.2f}", f"${revised_total_profit_dollars:,.2f}", str(revised_trade_count), f"{revised_win_rate:.1f}", str(revised_wins), str(revised_losses)],
+                    'Difference': [f"{revised_total_profit - original_total_profit:.2f}", f"${profit_diff:,.2f}", str(trade_diff), f"{revised_win_rate - win_rate:.1f}", str(revised_wins - wins), str(revised_losses - losses)]
                 }
                 revised_summary_df = pd.DataFrame(revised_summary_data)
+                # Ensure all columns are strings to avoid Arrow serialization errors
+                for col in revised_summary_df.columns:
+                    revised_summary_df[col] = revised_summary_df[col].astype(str)
                 
-                st.subheader("📋 Original vs Revised Comparison")
+                st.subheader("Original vs Revised Comparison")
                 create_auto_sized_dataframe(revised_summary_df)
                 
                 # Download button
                 csv = revised_summary_df.to_csv(index=False)
                 st.download_button(
-                    label="📥 Download Revised Summary as CSV",
+                    label="Download Revised Summary as CSV",
                     data=csv,
                     file_name=f"{output_folder}/revised_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
@@ -1028,17 +1141,15 @@ def main():
             else:
                 st.info("Revised Score and Revised Profit ($) columns required for revised summary")
         
-        with tab5:
-            st.subheader("Processing Summary")
+        with tab4:
+            st.subheader("Summary")
             
             # Summary statistics
             col1, col2, col3 = st.columns(3)
             
             with col1:
                 st.metric("Total Days Processed", len(results))
-                target_changes_count = len(results[results.get('Target Change', '') != '']) if 'Target Change' in results.columns else 0
                 time_changes_count = len(results[results.get('Time Change', '') != '']) if 'Time Change' in results.columns else 0
-                st.metric("Target Changes", target_changes_count)
                 st.metric("Time Changes", time_changes_count)
                 
                 # Calculate Sharpe ratio for summary
@@ -1171,8 +1282,8 @@ def main():
             else:
                 st.info("Time and Target columns not available for usage summary")
         
-        with tab6:
-            st.subheader("📅 Day of Week Profit Analysis")
+        with tab5:
+            st.subheader("Day of Week Profit Analysis")
             
             # Get day of week analysis from processor
             if 'processor' in st.session_state:
@@ -1202,13 +1313,13 @@ def main():
                     day_df.rename(columns={'index': 'Day of Week'}, inplace=True)
                     
                     # Display the day-of-week table
-                    st.subheader("📊 Day of Week Statistics")
+                    st.subheader("Day of Week Statistics")
                     create_auto_sized_dataframe(day_df)
                     
                     # ========== REVISED VERSION ==========
                     if 'Revised Score' in results.columns and 'Revised Profit ($)' in results.columns:
                         st.markdown("---")
-                        st.subheader("📊 **REVISED** Day of Week Statistics (Excluding Filtered Days)")
+                        st.subheader("**REVISED** Day of Week Statistics (Excluding Filtered Days)")
                         
                         # Calculate revised day-of-week analysis using Revised Profit ($)
                         revised_results = results[results['Revised Score'] != ''].copy()
@@ -1248,7 +1359,7 @@ def main():
                         st.markdown("---")
                     
                     # Create profit chart
-                    st.subheader("📈 Profit by Day of Week")
+                    st.subheader("Profit by Day of Week")
                     
                     # Prepare data for chart
                     chart_data = day_df[['Day of Week', 'Total_Profit_Dollars']].copy()
@@ -1258,14 +1369,14 @@ def main():
                     st.bar_chart(chart_data)
                     
                     # Create win rate chart
-                    st.subheader("🎯 Win Rate by Day of Week")
+                    st.subheader("Win Rate by Day of Week")
                     win_rate_data = day_df[['Day of Week', 'Win_Rate']].copy()
                     win_rate_data = win_rate_data.set_index('Day of Week')
                     
                     st.bar_chart(win_rate_data)
                     
                     # Detailed breakdown
-                    st.subheader("📋 Detailed Breakdown")
+                    st.subheader("Detailed Breakdown")
                     
                     # Create a more detailed table with all metrics
                     detailed_df = day_df.copy()
@@ -1284,7 +1395,7 @@ def main():
                     # Download day-of-week analysis
                     csv = detailed_df.to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Day of Week Analysis as CSV",
+                        label="Download Day of Week Analysis as CSV",
                         data=csv,
                         file_name=f"{output_folder}/day_of_week_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv"
@@ -1295,8 +1406,8 @@ def main():
             else:
                 st.warning("No processor data available. Please run the processor first.")
 
-        with tab7:
-            st.subheader("📅 Day of Month Profit Pivot")
+        with tab6:
+            st.subheader("Day of Month Profit Pivot")
             if len(results) > 0 and 'Date' in results.columns and 'Profit' in results.columns:
                 df_dom = results.copy()
                 df_dom['Date'] = pd.to_datetime(df_dom['Date'], errors='coerce')
@@ -1306,6 +1417,8 @@ def main():
                 else:
                     df_dom['DayOfMonth'] = df_dom['Date'].dt.day
                     pivot = df_dom.groupby('DayOfMonth')['Profit'].sum().reset_index()
+                    # Rename column for better display
+                    pivot.rename(columns={'DayOfMonth': 'Day of Month'}, inplace=True)
                     # Determine contract value using processor if available
                     contract_values = {"ES": 50, "NQ": 10, "YM": 5, "CL": 1000, "NG": 10000, "GC": 100}  # Correct contract values
                     instrument = 'ES'
@@ -1323,12 +1436,12 @@ def main():
                     contract_value = contract_values.get(instrument, 50)
                     pivot['Profit ($)'] = pivot['Profit'] * contract_value
                     # Display table
-                    st.dataframe(pivot.sort_values('DayOfMonth'), use_container_width=True)
+                    st.dataframe(pivot.sort_values('Day of Month'), width='stretch')
                     
                     # ========== REVISED VERSION ==========
                     if 'Revised Score' in results.columns and 'Revised Profit ($)' in results.columns:
                         st.markdown("---")
-                        st.subheader("📊 **REVISED** Day of Month Profit Pivot (Excluding Filtered Days)")
+                        st.subheader("**REVISED** Day of Month Profit Pivot (Excluding Filtered Days)")
                         
                         # Calculate revised day-of-month pivot using filtered results
                         revised_results = results[results['Revised Score'] != ''].copy()
@@ -1340,20 +1453,22 @@ def main():
                             if len(revised_df_dom) > 0:
                                 revised_df_dom['DayOfMonth'] = revised_df_dom['Date'].dt.day
                                 revised_pivot = revised_df_dom.groupby('DayOfMonth')['Profit'].sum().reset_index()
+                                # Rename column for better display
+                                revised_pivot.rename(columns={'DayOfMonth': 'Day of Month'}, inplace=True)
                                 revised_pivot['Profit ($)'] = revised_pivot['Profit'] * contract_value
                                 
                                 # Display revised table
-                                st.dataframe(revised_pivot.sort_values('DayOfMonth'), use_container_width=True)
+                                st.dataframe(revised_pivot.sort_values('Day of Month'), width='stretch')
                         st.markdown("---")
                     
                     # Chart
-                    chart_data = pivot.set_index('DayOfMonth')[['Profit']]
-                    st.subheader("📈 Profit (Points) by Day of Month")
+                    chart_data = pivot.set_index('Day of Month')[['Profit']]
+                    st.subheader("Profit (Points) by Day of Month")
                     st.bar_chart(chart_data)
                     # Download
-                    csv = pivot.sort_values('DayOfMonth').to_csv(index=False)
+                    csv = pivot.sort_values('Day of Month').to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Day of Month Pivot as CSV",
+                        label="Download Day of Month Pivot as CSV",
                         data=csv,
                         file_name=f"{output_folder}/day_of_month_pivot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv"
@@ -1361,8 +1476,8 @@ def main():
             else:
                 st.info("Date and Profit columns required for day-of-month pivot")
 
-        with tab8:
-            st.subheader("📅 Yearly Profit")
+        with tab7:
+            st.subheader("Yearly Profit")
             if len(results) > 0 and 'Date' in results.columns and 'Profit' in results.columns:
                 df_y = results.copy()
                 df_y['Date'] = pd.to_datetime(df_y['Date'], errors='coerce')
@@ -1389,12 +1504,12 @@ def main():
                     contract_value = contract_values.get(instrument, 50)
                     yearly['Profit ($)'] = yearly['Profit'] * contract_value
                     # Display table
-                    st.dataframe(yearly.sort_values('Year'), use_container_width=True)
+                    st.dataframe(yearly.sort_values('Year'), width='stretch')
                     
                     # ========== REVISED VERSION ==========
                     if 'Revised Score' in results.columns and 'Revised Profit ($)' in results.columns:
                         st.markdown("---")
-                        st.subheader("📊 **REVISED** Yearly Profit (Excluding Filtered Days)")
+                        st.subheader("**REVISED** Yearly Profit (Excluding Filtered Days)")
                         
                         # Calculate revised yearly profit using filtered results
                         revised_results = results[results['Revised Score'] != ''].copy()
@@ -1409,17 +1524,17 @@ def main():
                                 revised_yearly['Profit ($)'] = revised_yearly['Profit'] * contract_value
                                 
                                 # Display revised table
-                                st.dataframe(revised_yearly.sort_values('Year'), use_container_width=True)
+                                st.dataframe(revised_yearly.sort_values('Year'), width='stretch')
                         st.markdown("---")
                     
                     # Chart
                     chart_data = yearly.set_index('Year')[['Profit']]
-                    st.subheader("📈 Profit (Points) by Year")
+                    st.subheader("Profit (Points) by Year")
                     st.bar_chart(chart_data)
                     # Download
                     csv = yearly.sort_values('Year').to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Yearly Profit as CSV",
+                        label="Download Yearly Profit as CSV",
                         data=csv,
                         file_name=f"{output_folder}/yearly_profit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv"
@@ -1438,7 +1553,7 @@ def main():
         st.sidebar.markdown("**Debug Information:**")
         st.sidebar.markdown(f"• Python version: {os.sys.version}")
         st.sidebar.markdown(f"• Working directory: {os.getcwd()}")
-        st.sidebar.markdown(f"• Data folder exists: {os.path.exists(data_folder)}")
+        st.sidebar.markdown(f"• Analyzer runs folder exists: {os.path.exists(analyzer_runs_folder) if analyzer_runs_folder else False}")
 
 if __name__ == "__main__":
     main()

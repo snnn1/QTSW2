@@ -206,6 +206,9 @@ class RangeDetector:
         dates_processed = 0
         dates_skipped_not_trading_day = 0
         
+        total_dates = len(unique_dates)
+        print(f"Processing {total_dates} unique dates...")
+        
         for date_str in unique_dates:
             # Convert date string back to timestamp (preserve timezone from original data)
             if df["timestamp"].dt.tz is not None:
@@ -227,6 +230,10 @@ class RangeDetector:
                 continue
             
             dates_processed += 1
+            
+            # Show progress every 100 dates or on first/last
+            if dates_processed == 1 or dates_processed % 100 == 0 or dates_processed == total_dates:
+                print(f"Processing date {dates_processed}/{total_dates}: {date_str}")
             
             # Process each enabled session
             for sess in rp.enabled_sessions:

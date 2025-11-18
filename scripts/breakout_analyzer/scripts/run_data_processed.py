@@ -41,13 +41,41 @@ def load_folder(folder: str) -> pd.DataFrame:
     if not p.exists() or not p.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
     parts = []
-    for f in sorted(p.rglob("*")):
-        if f.suffix.lower() == ".parquet":
-            df = pd.read_parquet(f)
-            parts.append(df)
-    if not parts:
+    parquet_files = sorted([f for f in p.rglob("*") if f.suffix.lower() == ".parquet"])
+    
+    if not parquet_files:
         raise SystemExit(f"No CSV/Parquet files found under {folder}")
-    df = pd.concat(parts, ignore_index=True)
+    
+    print(f"Found {len(parquet_files)} parquet file(s) to load")
+    
+    total_size_mb = 0
+    for i, f in enumerate(parquet_files, 1):
+        file_size_mb = f.stat().st_size / (1024 * 1024)
+        total_size_mb += file_size_mb
+        print(f"Loading file {i}/{len(parquet_files)}: {f.name} ({file_size_mb:.1f} MB)")
+        try:
+            df = pd.read_parquet(f)
+            print(f"  Loaded {len(df):,} rows from {f.name}")
+            parts.append(df)
+        except Exception as e:
+            print(f"  ERROR loading {f.name}: {e}")
+            raise
+    
+    print(f"Total data size: {total_size_mb:.1f} MB across {len(parquet_files)} file(s)")
+    print(f"Concatenating {len(parts)} dataframes...")
+    
+    try:
+        df = pd.concat(parts, ignore_index=True)
+        print(f"Concatenated dataframe: {len(df):,} rows, {len(df.columns)} columns")
+        print(f"Memory usage: {df.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
+    except MemoryError as e:
+        print(f"ERROR: Out of memory while concatenating dataframes")
+        print(f"  Total rows across files: {sum(len(p) for p in parts):,}")
+        print(f"  Total size: {total_size_mb:.1f} MB")
+        raise SystemExit(f"Memory error: {e}. Consider processing files in smaller batches.")
+    except Exception as e:
+        print(f"ERROR concatenating dataframes: {e}")
+        raise
     # Ensure required columns
     req = {"timestamp","open","high","low","close","instrument"}
     missing = req - set(df.columns)
@@ -140,10 +168,43 @@ def main():
             if not matching_days:
                 print(f"  WARNING: No data for requested trade days!")
     
-    res = run_strategy(df, rp, debug=args.debug)
+    print(f"\n{'='*60}")
+    print(f"Starting strategy execution for {args.instrument}")
+    print(f"  Data rows: {len(df):,}")
+    print(f"  Instrument rows: {len(instrument_data):,}")
+    print(f"  Sessions: {', '.join(args.sessions)}")
+    print(f"  Time slots: {len([s for slots in rp.enabled_slots.values() for s in slots])} total")
+    print(f"{'='*60}\n")
     
-    if args.debug:
-        print(f"Strategy returned {len(res)} results")
+    import time
+    strategy_start_time = time.time()
+    
+    try:
+        res = run_strategy(df, rp, debug=args.debug)
+        strategy_elapsed = time.time() - strategy_start_time
+        
+        print(f"\n{'='*60}")
+        print(f"Strategy execution completed in {strategy_elapsed:.1f} seconds ({strategy_elapsed/60:.1f} minutes)")
+        print(f"  Results generated: {len(res)}")
+        print(f"{'='*60}\n")
+        
+        if args.debug:
+            print(f"Strategy returned {len(res)} results")
+    except MemoryError as e:
+        print(f"\n{'='*60}")
+        print(f"ERROR: Out of memory during strategy execution")
+        print(f"  Data rows: {len(df):,}")
+        print(f"  Memory usage: {df.memory_usage(deep=True).sum() / (1024**2):.1f} MB")
+        print(f"  Error: {e}")
+        print(f"{'='*60}\n")
+        raise SystemExit(f"Memory error during strategy execution: {e}")
+    except Exception as e:
+        print(f"\n{'='*60}")
+        print(f"ERROR during strategy execution: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+        raise
 
     # Handle empty results
     if len(res) == 0:
@@ -172,8 +233,13 @@ def main():
         if args.out:
             out_path = args.out
         else:
+            # Save to analyzer_temp with date-based folder structure (for data merger)
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+            analyzer_temp_dir.mkdir(parents=True, exist_ok=True)
+            
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = f"data/analyzer_runs/breakout_{args.instrument}_no_results_{timestamp}.parquet"
+            out_path = analyzer_temp_dir / f"breakout_{args.instrument}_no_results_{timestamp}.parquet"
         
         pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         
@@ -181,7 +247,7 @@ def main():
         res.to_parquet(out_path, index=False, compression='snappy')
         print(f"Empty results saved to {out_path}")
         
-        # Create summary file in summaries subfolder
+        # Create summary file in summaries subfolder (keep in analyzer_runs for summaries)
         summaries_dir = pathlib.Path("data/analyzer_runs/summaries")
         summaries_dir.mkdir(parents=True, exist_ok=True)
         summary_filename = pathlib.Path(out_path).stem + "_SUMMARY.txt"
@@ -214,9 +280,14 @@ def main():
     if args.out:
         out_path = args.out
     else:
+        # Save to analyzer_temp with date-based folder structure (for data merger)
+        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+        analyzer_temp_dir.mkdir(parents=True, exist_ok=True)
+        
         # Create descriptive filename like the GUI app
         desc_filename = f"breakout_{args.instrument}_{date_range}_{total_trades}trades_{win_rate:.0f}winrate_{total_profit:.0f}profit"
-        out_path = f"data/analyzer_runs/{desc_filename}.parquet"
+        out_path = analyzer_temp_dir / f"{desc_filename}.parquet"
     
     pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     
