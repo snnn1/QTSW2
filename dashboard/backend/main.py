@@ -9,7 +9,7 @@ import subprocess
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from datetime import datetime
 import uuid
 
@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import logging
+import pandas as pd
+import numpy as np
 
 # Configuration
 QTSW2_ROOT = Path(__file__).parent.parent.parent
@@ -25,6 +27,16 @@ SCHEDULER_SCRIPT = QTSW2_ROOT / "automation" / "daily_data_pipeline_scheduler.py
 DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Streamlit app scripts
+TRANSLATOR_APP = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
+ANALYZER_APP = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "analyzer_app" / "app.py"
+SEQUENTIAL_APP = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
+
+# Master Matrix and Timetable Engine scripts
+MASTER_MATRIX_SCRIPT = QTSW2_ROOT / "run_matrix_and_timetable.py"
+MASTER_MATRIX_MODULE = QTSW2_ROOT / "master_matrix" / "master_matrix.py"
+TIMETABLE_MODULE = QTSW2_ROOT / "timetable_engine" / "timetable_engine.py"
 
 # Schedule config file
 SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "automation" / "schedule_config.json"
@@ -37,7 +49,7 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],  # Vite default port
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],  # Vite default ports
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -665,49 +677,392 @@ async def get_file_counts():
     # These paths should match your actual data directories
     # Using the same paths as in the scheduler
     data_raw = QTSW2_ROOT / "data" / "raw"  # Fixed: QTSW2/data/raw (where DataExporter writes)
-    data_raw_archived = data_raw / "archived"  # Archive folder for raw files
     data_processed = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
-    data_processed_archived = data_processed / "archived"  # Archive folder for processed files
     analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
     sequencer_runs = QTSW2_ROOT / "data" / "sequencer_runs"  # Sequencer output folder
     
-    # Count raw CSV files (exclude subdirectories like logs and archived folders)
+    # Count raw CSV files (exclude subdirectories like logs folder)
     raw_count = 0
     if data_raw.exists():
         raw_files = list(data_raw.glob("*.csv"))
         raw_count = len([f for f in raw_files if f.parent == data_raw])
     
-    # Count processed files (exclude archived folder)
+    # Count processed files
     processed_count = 0
     if data_processed.exists():
         processed_files = list(data_processed.glob("*.parquet"))
         processed_files.extend(list(data_processed.glob("*.csv")))
-        # Exclude files in archived subfolder
         processed_count = len([f for f in processed_files if f.parent == data_processed])
-    
-    # Count archived files from raw and processed archive locations only
-    # (analyzer/sequencer archiving removed - handled by data merger)
-    archived_count = 0
-    if data_raw_archived.exists():
-        archived_count += len(list(data_raw_archived.glob("*.csv")))
-    if data_processed_archived.exists():
-        archived_count += len(list(data_processed_archived.glob("*.parquet")))
-        archived_count += len(list(data_processed_archived.glob("*.csv")))
     
     # Count analyzed files (monthly consolidated files in instrument/year folders)
     analyzed_count = 0
     if analyzer_runs.exists():
         # Count monthly parquet files in instrument/year subfolders
         analyzed_files = list(analyzer_runs.rglob("*.parquet"))
-        # Exclude files in summaries folder
-        analyzed_count = len([f for f in analyzed_files if "summaries" not in str(f)])
+        analyzed_count = len(analyzed_files)
     
     return {
         "raw_files": raw_count,
         "processed_files": processed_count,
-        "archived_files": archived_count,
         "analyzed_files": analyzed_count
     }
+
+
+# ============================================================
+# Streamlit App Launchers
+# ============================================================
+
+@app.post("/api/apps/translator/start")
+async def start_translator_app():
+    """Start the Translator Streamlit app."""
+    try:
+        # Check if already running by checking if port 8501 is in use
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('localhost', 8501))
+        sock.close()
+        
+        if result == 0:
+            return {"status": "already_running", "url": "http://localhost:8501"}
+        
+        # Start Streamlit app in new console window (Windows)
+        if os.name == 'nt':
+            # Use start command to open in new window
+            # Verify we're using the correct translator app
+            translator_path = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
+            app_path = str(translator_path).replace('/', '\\')
+            subprocess.Popen(
+                f'start "Translator App" cmd /k "streamlit run \"{app_path}\" --server.port 8501"',
+                shell=True,
+                cwd=str(QTSW2_ROOT)
+            )
+        else:
+            # Linux/Mac
+            subprocess.Popen(
+                ["streamlit", "run", str(TRANSLATOR_APP), "--server.port", "8501"],
+                cwd=str(QTSW2_ROOT)
+            )
+        
+        # Wait a moment for the app to start
+        await asyncio.sleep(3)
+        
+        return {"status": "started", "url": "http://localhost:8501"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start translator app: {str(e)}")
+
+
+@app.post("/api/apps/analyzer/start")
+async def start_analyzer_app():
+    """Start the Analyzer Streamlit app."""
+    try:
+        # Check if already running
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('localhost', 8502))
+        sock.close()
+        
+        if result == 0:
+            return {"status": "already_running", "url": "http://localhost:8502"}
+        
+        # Start Streamlit app in new console window (Windows)
+        if os.name == 'nt':
+            # Use start command to open in new window
+            # Verify we're using the correct analyzer app
+            analyzer_path = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "analyzer_app" / "app.py"
+            app_path = str(analyzer_path).replace('/', '\\')
+            subprocess.Popen(
+                f'start "Analyzer App" cmd /k "streamlit run \"{app_path}\" --server.port 8502"',
+                shell=True,
+                cwd=str(QTSW2_ROOT)
+            )
+        else:
+            # Linux/Mac
+            subprocess.Popen(
+                ["streamlit", "run", str(ANALYZER_APP), "--server.port", "8502"],
+                cwd=str(QTSW2_ROOT)
+            )
+        
+        # Wait a moment for the app to start
+        await asyncio.sleep(3)
+        
+        return {"status": "started", "url": "http://localhost:8502"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start analyzer app: {str(e)}")
+
+
+@app.post("/api/apps/sequential/start")
+async def start_sequential_app():
+    """Start the Sequential Processor Streamlit app."""
+    try:
+        # Check if already running
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('localhost', 8503))
+        sock.close()
+        
+        if result == 0:
+            return {"status": "already_running", "url": "http://localhost:8503"}
+        
+        # Start Streamlit app in new console window (Windows)
+        if os.name == 'nt':
+            # Use start command to open in new window
+            # Verify we're using the correct sequential processor app
+            sequential_path = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
+            app_path = str(sequential_path).replace('/', '\\')
+            subprocess.Popen(
+                f'start "Sequential Processor App" cmd /k "streamlit run \"{app_path}\" --server.port 8503"',
+                shell=True,
+                cwd=str(QTSW2_ROOT)
+            )
+        else:
+            # Linux/Mac
+            subprocess.Popen(
+                ["streamlit", "run", str(SEQUENTIAL_APP), "--server.port", "8503"],
+                cwd=str(QTSW2_ROOT)
+            )
+        
+        # Wait a moment for the app to start
+        await asyncio.sleep(3)
+        
+        return {"status": "started", "url": "http://localhost:8503"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start sequential app: {str(e)}")
+
+
+# ============================================================
+# Master Matrix & Timetable Engine API
+# ============================================================
+
+class StreamFilterConfig(BaseModel):
+    exclude_days_of_week: List[str] = []  # e.g., ["Wednesday", "Friday"]
+    exclude_days_of_month: List[int] = []  # e.g., [4, 16, 30]
+    exclude_times: List[str] = []  # e.g., ["07:30", "08:00"]
+
+
+class MatrixBuildRequest(BaseModel):
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    specific_date: Optional[str] = None
+    sequencer_runs_dir: str = "data/sequencer_runs"
+    output_dir: str = "data/master_matrix"
+    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
+
+
+class TimetableRequest(BaseModel):
+    date: Optional[str] = None
+    scf_threshold: float = 0.5
+    analyzer_runs_dir: str = "data/analyzer_runs"
+    output_dir: str = "data/timetable"
+
+
+@app.post("/api/matrix/build")
+async def build_master_matrix(request: MatrixBuildRequest):
+    """Build master matrix from all streams."""
+    try:
+        import sys
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from master_matrix.master_matrix import MasterMatrix
+        
+        # Convert stream_filters from Pydantic models to dicts
+        stream_filters_dict = None
+        if request.stream_filters:
+            stream_filters_dict = {
+                stream_id: {
+                    "exclude_days_of_week": filter_config.exclude_days_of_week,
+                    "exclude_days_of_month": filter_config.exclude_days_of_month,
+                    "exclude_times": filter_config.exclude_times
+                }
+                for stream_id, filter_config in request.stream_filters.items()
+            }
+        
+        matrix = MasterMatrix(
+            sequencer_runs_dir=request.sequencer_runs_dir,
+            stream_filters=stream_filters_dict
+        )
+        master_df = matrix.build_master_matrix(
+            start_date=request.start_date,
+            end_date=request.end_date,
+            specific_date=request.specific_date,
+            output_dir=request.output_dir,
+            stream_filters=stream_filters_dict,
+            sequencer_runs_dir=request.sequencer_runs_dir
+        )
+        
+        if master_df.empty:
+            return {
+                "status": "success",
+                "message": "Master matrix built but is empty",
+                "trades": 0,
+                "streams": [],
+                "instruments": []
+            }
+        
+        return {
+            "status": "success",
+            "message": "Master matrix built successfully",
+            "trades": len(master_df),
+            "date_range": {
+                "start": str(master_df['trade_date'].min()),
+                "end": str(master_df['trade_date'].max())
+            },
+            "streams": sorted(master_df['Stream'].unique().tolist()),
+            "instruments": sorted(master_df['Instrument'].unique().tolist()),
+            "allowed_trades": int(master_df['final_allowed'].sum())
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
+
+
+@app.post("/api/timetable/generate")
+async def generate_timetable(request: TimetableRequest):
+    """Generate timetable for a trading day."""
+    try:
+        import sys
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from timetable_engine.timetable_engine import TimetableEngine
+        
+        engine = TimetableEngine(
+            master_matrix_dir="data/master_matrix",
+            analyzer_runs_dir=request.analyzer_runs_dir
+        )
+        engine.scf_threshold = request.scf_threshold
+        
+        timetable_df = engine.generate_timetable(trade_date=request.date)
+        
+        if timetable_df.empty:
+            return {
+                "status": "success",
+                "message": "Timetable generated but is empty",
+                "entries": [],
+                "allowed": 0
+            }
+        
+        # Save timetable
+        parquet_file, json_file = engine.save_timetable(timetable_df, request.output_dir)
+        
+        # Convert DataFrame to list of dicts for JSON response
+        entries = timetable_df.to_dict('records')
+        
+        return {
+            "status": "success",
+            "message": "Timetable generated successfully",
+            "date": timetable_df['trade_date'].iloc[0] if not timetable_df.empty else None,
+            "entries": entries,
+            "total_entries": len(timetable_df),
+            "allowed_trades": int(timetable_df['allowed'].sum()),
+            "files": {
+                "parquet": str(parquet_file),
+                "json": str(json_file)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate timetable: {str(e)}")
+
+
+@app.get("/api/matrix/files")
+async def list_matrix_files():
+    """List available master matrix files."""
+    try:
+        matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        if not matrix_dir.exists():
+            return {"files": []}
+        
+        files = []
+        for file_path in sorted(matrix_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True):
+            files.append({
+                "name": file_path.name,
+                "path": str(file_path),
+                "size": file_path.stat().st_size,
+                "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+            })
+        
+        return {"files": files[:20]}  # Return last 20 files
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list matrix files: {str(e)}")
+
+
+@app.get("/api/matrix/data")
+async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
+    """Get master matrix data from the most recent file or specified file."""
+    try:
+        import pandas as pd
+        
+        matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        matrix_dir.mkdir(parents=True, exist_ok=True)
+        
+        if file_path:
+            # Use specified file
+            file_to_load = Path(file_path)
+            if not file_to_load.exists():
+                return {"data": [], "total": 0, "file": None, "error": f"File not found: {file_path}"}
+        else:
+            # Find most recent file
+            parquet_files = sorted(matrix_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not parquet_files:
+                return {"data": [], "total": 0, "file": None, "error": "No master matrix files found. Build the matrix first."}
+            file_to_load = parquet_files[0]
+        
+        # Load parquet file
+        try:
+            df = pd.read_parquet(file_to_load)
+        except Exception as e:
+            return {"data": [], "total": 0, "file": file_to_load.name, "error": f"Failed to read file: {str(e)}"}
+        
+        if df.empty:
+            return {"data": [], "total": 0, "file": file_to_load.name, "error": "File is empty"}
+        
+        # Convert to records (limit rows)
+        records = df.head(limit).to_dict('records')
+        
+        # Convert dates and other types to strings for JSON
+        for record in records:
+            for key, value in record.items():
+                if pd.isna(value):
+                    record[key] = None
+                elif isinstance(value, (pd.Timestamp, datetime)):
+                    if hasattr(value, 'isoformat'):
+                        record[key] = value.isoformat()
+                    else:
+                        record[key] = str(value)
+                elif str(type(value)) == "<class 'pandas._libs.tslibs.nattype.NaTType'>":
+                    record[key] = None
+                elif isinstance(value, (int, float)) and pd.isna(value):
+                    record[key] = None
+                elif isinstance(value, (np.integer, np.floating)):
+                    record[key] = float(value) if isinstance(value, np.floating) else int(value)
+        
+        return {
+            "data": records,
+            "total": len(df),
+            "file": file_to_load.name,
+            "loaded": len(records)
+        }
+    except Exception as e:
+        import traceback
+        error_detail = f"Failed to load matrix data: {str(e)}\n{traceback.format_exc()}"
+        raise HTTPException(status_code=500, detail=error_detail)
+
+
+@app.get("/api/timetable/files")
+async def list_timetable_files():
+    """List available timetable files."""
+    try:
+        timetable_dir = QTSW2_ROOT / "data" / "timetable"
+        if not timetable_dir.exists():
+            return {"files": []}
+        
+        files = []
+        for file_path in sorted(timetable_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True):
+            files.append({
+                "name": file_path.name,
+                "path": str(file_path),
+                "size": file_path.stat().st_size,
+                "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+            })
+        
+        return {"files": files[:20]}  # Return last 20 files
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list timetable files: {str(e)}")
 
 
 if __name__ == "__main__":

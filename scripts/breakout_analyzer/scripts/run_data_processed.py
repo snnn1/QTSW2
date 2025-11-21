@@ -41,7 +41,8 @@ def load_folder(folder: str) -> pd.DataFrame:
     if not p.exists() or not p.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
     parts = []
-    parquet_files = sorted([f for f in p.rglob("*") if f.suffix.lower() == ".parquet"])
+    # Only get files from immediate directory (exclude any subdirectories)
+    parquet_files = sorted([f for f in p.glob("*.parquet") if f.parent == p])
     
     if not parquet_files:
         raise SystemExit(f"No CSV/Parquet files found under {folder}")
@@ -233,9 +234,15 @@ def main():
         if args.out:
             out_path = args.out
         else:
-            # Save to analyzer_temp with date-based folder structure (for data merger)
+            # Determine output folder: manual runs go to manual_analyzer_runs, automatic runs go to analyzer_temp
             today = datetime.datetime.now().strftime("%Y-%m-%d")
-            analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+            is_pipeline_run = os.getenv("PIPELINE_RUN", "0") == "1"
+            if is_pipeline_run:
+                # Automatic pipeline run - use analyzer_temp (for data merger)
+                analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+            else:
+                # Manual run - use manual_analyzer_runs folder
+                analyzer_temp_dir = pathlib.Path(f"data/manual_analyzer_runs/{today}")
             analyzer_temp_dir.mkdir(parents=True, exist_ok=True)
             
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -246,28 +253,6 @@ def main():
         # Save empty DataFrame with correct schema
         res.to_parquet(out_path, index=False, compression='snappy')
         print(f"Empty results saved to {out_path}")
-        
-        # Create summary file in summaries subfolder (keep in analyzer_runs for summaries)
-        summaries_dir = pathlib.Path("data/analyzer_runs/summaries")
-        summaries_dir.mkdir(parents=True, exist_ok=True)
-        summary_filename = pathlib.Path(out_path).stem + "_SUMMARY.txt"
-        summary_path = summaries_dir / summary_filename
-        with open(summary_path, 'w') as f:
-            f.write("BREAKOUT ANALYZER RESULTS SUMMARY\n")
-            f.write("=" * 50 + "\n\n")
-            f.write(f"Run Information:\n")
-            f.write(f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"  Instrument: {args.instrument}\n")
-            f.write(f"  Sessions: {', '.join(args.sessions)}\n")
-            f.write(f"  Time Slots: {', '.join(args.slots) if args.slots else 'Default'}\n")
-            f.write(f"  Target: Base level only\n")
-            f.write(f"  Trade Days: {', '.join(args.days)}\n")
-            f.write(f"\nPerformance Summary:\n")
-            f.write(f"  Total Trades: 0\n")
-            f.write(f"  Status: No results generated\n")
-            f.write(f"  Note: Check data availability and strategy parameters\n")
-        
-        print(f"Summary saved to {summary_path}")
         return
 
     # Calculate statistics
@@ -280,9 +265,15 @@ def main():
     if args.out:
         out_path = args.out
     else:
-        # Save to analyzer_temp with date-based folder structure (for data merger)
+        # Determine output folder: manual runs go to manual_analyzer_runs, automatic runs go to analyzer_temp
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+        is_pipeline_run = os.getenv("PIPELINE_RUN", "0") == "1"
+        if is_pipeline_run:
+            # Automatic pipeline run - use analyzer_temp (for data merger)
+            analyzer_temp_dir = pathlib.Path(f"data/analyzer_temp/{today}")
+        else:
+            # Manual run - use manual_analyzer_runs folder
+            analyzer_temp_dir = pathlib.Path(f"data/manual_analyzer_runs/{today}")
         analyzer_temp_dir.mkdir(parents=True, exist_ok=True)
         
         # Create descriptive filename like the GUI app
@@ -295,38 +286,6 @@ def main():
     res.to_parquet(out_path, index=False, compression='snappy')
     
     print(f"Wrote {len(res)} rows to {out_path}")
-    
-    # Also create a summary file in summaries subfolder
-    summaries_dir = pathlib.Path("data/analyzer_runs/summaries")
-    summaries_dir.mkdir(parents=True, exist_ok=True)
-    summary_filename = pathlib.Path(out_path).stem + "_SUMMARY.txt"
-    summary_path = summaries_dir / summary_filename
-    with open(summary_path, 'w') as f:
-        f.write("BREAKOUT ANALYZER RESULTS SUMMARY\n")
-        f.write("=" * 50 + "\n\n")
-        f.write(f"Run Information:\n")
-        f.write(f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"  Instrument: {args.instrument}\n")
-        f.write(f"  Date Range: {res['Date'].min()} to {res['Date'].max()}\n")
-        f.write(f"  Sessions: {', '.join(args.sessions)}\n")
-        f.write(f"  Time Slots: {', '.join(args.slots) if args.slots else 'Default'}\n")
-        f.write(f"  Target: Base level only\n")
-        f.write(f"  Trade Days: {', '.join(args.days)}\n")
-        
-        f.write(f"Performance Summary:\n")
-        f.write(f"  Total Trades: {len(res):,}\n")
-        f.write(f"  Wins: {len(res[res['Result'] == 'Win']):,}\n")
-        f.write(f"  Losses: {len(res[res['Result'] == 'Loss']):,}\n")
-        f.write(f"  Break-Even: {len(res[res['Result'] == 'BE']):,}\n")
-        f.write(f"  No Trades: {len(res[res['Result'] == 'NoTrade']):,}\n")
-        f.write(f"  Win Rate: {win_rate:.1f}%\n")
-        f.write(f"  Total Profit: ${total_profit:,.2f}\n")
-        if total_trades > 0:
-            f.write(f"  Average Profit per Trade: ${total_profit/total_trades:,.2f}\n")
-        else:
-            f.write(f"  Average Profit per Trade: N/A (no trades)\n")
-    
-    print(f"Summary saved to {summary_path}")
     
 
 if __name__ == "__main__":

@@ -36,6 +36,12 @@ except ImportError:
     print("ERROR: pytz not installed. Install with: pip install pytz")
     sys.exit(1)
 
+try:
+    import pandas as pd
+except ImportError:
+    print("ERROR: pandas not installed. Install with: pip install pandas")
+    sys.exit(1)
+
 
 # ============================================================
 # Configuration & Paths
@@ -53,9 +59,7 @@ NINJATRADER_WORKSPACE = Path(r"C:\Users\jakej\Documents\NinjaTrader 8\workspaces
 # Note: DATA_RAW matches DataExporter output path (QTSW2/data/raw)
 DATA_RAW = QTSW2_ROOT / "data" / "raw"
 DATA_RAW_LOGS = DATA_RAW / "logs"  # Signal files are stored in logs subfolder
-DATA_RAW_ARCHIVED = DATA_RAW / "archived"  # Archive folder for raw CSV files after processing
 DATA_PROCESSED = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
-DATA_PROCESSED_ARCHIVED = DATA_PROCESSED / "archived"  # Archive folder for processed files after analysis
 ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzer_runs"  # QTSW2/data/analyzer_runs
 SEQUENCER_RUNS = QTSW2_ROOT / "data" / "sequencer_runs"  # QTSW2/data/sequencer_runs
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
@@ -63,7 +67,8 @@ LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 # Pipeline scripts (adjust paths as needed)
 TRANSLATOR_SCRIPT = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
 ANALYZER_SCRIPT = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "scripts" / "run_data_processed.py"
-SEQUENTIAL_PROCESSOR_SCRIPT = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
+DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
+SEQUENTIAL_PROCESSOR_SCRIPT = QTSW2_ROOT / "sequential_processor" / "sequential_processor.py"
 
 # Logging configuration
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -544,7 +549,9 @@ class PipelineOrchestrator:
                             self.logger.info(f"  {line}")
                             # Emit progress events for key milestones
                             if any(keyword in line for keyword in ["Processing:", "Loaded:", "Saving", "rows", "completed"]):
-                                emit_event(self.run_id, "translator", "log", line.strip())
+                                # Only emit if line has content
+                                if line.strip():
+                                    emit_event(self.run_id, "translator", "log", line.strip())
                             # Emit event when a year file is written
                             if "Saved:" in line or "Saved PARQUET:" in line or "Saved CSV:" in line:
                                 # Extract file info from line like "Saved: ES_2024.parquet" or "Saved PARQUET: ES_2024_file.parquet (1,234 rows)"
@@ -590,12 +597,12 @@ class PipelineOrchestrator:
                     "processed_file_count": len(processed_files)
                 })
                 
-                # Archive processed raw CSV files to data/raw/archived
-                archived_count = self._archive_raw_files(raw_files)
-                if archived_count > 0:
-                    self.logger.info(f"✓ Archived {archived_count} raw CSV file(s) to {DATA_RAW_ARCHIVED}")
-                    emit_event(self.run_id, "translator", "metric", "Raw files archived", {
-                        "archived_file_count": archived_count
+                # Delete processed raw CSV files
+                deleted_count = self._delete_raw_files(raw_files)
+                if deleted_count > 0:
+                    self.logger.info(f"✓ Deleted {deleted_count} raw CSV file(s)")
+                    emit_event(self.run_id, "translator", "metric", "Raw files deleted", {
+                        "deleted_file_count": deleted_count
                     })
                 
                 emit_event(self.run_id, "translator", "success", "Translator completed successfully")
@@ -617,78 +624,33 @@ class PipelineOrchestrator:
             self.stage_results["translator"] = False
             return False
     
-    def _archive_raw_files(self, raw_files: List[Path]) -> int:
-        """Move processed raw CSV files to data/raw/archived folder."""
-        try:
-            # Create archive folder if it doesn't exist
-            DATA_RAW_ARCHIVED.mkdir(parents=True, exist_ok=True)
-            
-            archived_count = 0
-            for raw_file in raw_files:
-                try:
-                    # Move file to archive folder
-                    archive_path = DATA_RAW_ARCHIVED / raw_file.name
-                    
-                    # If file already exists in archive, add timestamp to avoid overwrite
-                    if archive_path.exists():
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        name_parts = raw_file.stem.rsplit('_', 1)  # Split on last underscore
-                        if len(name_parts) == 2:
-                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{raw_file.suffix}"
-                        else:
-                            new_name = f"{raw_file.stem}_archived_{timestamp}{raw_file.suffix}"
-                        archive_path = DATA_RAW_ARCHIVED / new_name
-                    
-                    raw_file.rename(archive_path)
-                    archived_count += 1
-                    self.logger.info(f"  Archived: {raw_file.name} → {archive_path.name}")
-                    
-                except Exception as e:
-                    self.logger.warning(f"  Failed to archive {raw_file.name}: {e}")
-                    # Continue with other files
-            
-            return archived_count
-            
-        except Exception as e:
-            self.logger.error(f"Error archiving raw files: {e}")
-            return 0
+    def _delete_raw_files(self, raw_files: List[Path]) -> int:
+        """Delete processed raw CSV files."""
+        deleted_count = 0
+        for raw_file in raw_files:
+            try:
+                raw_file.unlink()
+                deleted_count += 1
+                self.logger.info(f"  Deleted: {raw_file.name}")
+            except Exception as e:
+                self.logger.warning(f"  Failed to delete {raw_file.name}: {e}")
+                # Continue with other files
+        
+        return deleted_count
     
-    def _archive_processed_files(self, processed_files: List[Path]) -> int:
-        """Move analyzed processed files to data/processed/archived folder."""
-        try:
-            # Create archive folder if it doesn't exist
-            DATA_PROCESSED_ARCHIVED.mkdir(parents=True, exist_ok=True)
-            
-            archived_count = 0
-            for proc_file in processed_files:
-                try:
-                    # Move file to archive folder
-                    archive_path = DATA_PROCESSED_ARCHIVED / proc_file.name
-                    
-                    # If file already exists in archive, add timestamp to avoid overwrite
-                    if archive_path.exists():
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        name_parts = proc_file.stem.rsplit('_', 1)  # Split on last underscore
-                        if len(name_parts) == 2:
-                            new_name = f"{name_parts[0]}_archived_{timestamp}_{name_parts[1]}{proc_file.suffix}"
-                        else:
-                            new_name = f"{proc_file.stem}_archived_{timestamp}{proc_file.suffix}"
-                        archive_path = DATA_PROCESSED_ARCHIVED / new_name
-                    
-                    # Move (not copy) file to archive - preserves original timestamp
-                    proc_file.rename(archive_path)
-                    archived_count += 1
-                    self.logger.info(f"  Archived: {proc_file.name} → {archive_path.name}")
-                    
-                except Exception as e:
-                    self.logger.warning(f"  Failed to archive {proc_file.name}: {e}")
-                    # Continue with other files
-            
-            return archived_count
-            
-        except Exception as e:
-            self.logger.error(f"Error archiving processed files: {e}")
-            return 0
+    def _delete_processed_files(self, processed_files: List[Path]) -> int:
+        """Delete analyzed processed files."""
+        deleted_count = 0
+        for proc_file in processed_files:
+            try:
+                proc_file.unlink()
+                deleted_count += 1
+                self.logger.info(f"  Deleted: {proc_file.name}")
+            except Exception as e:
+                self.logger.warning(f"  Failed to delete {proc_file.name}: {e}")
+                # Continue with other files
+        
+        return deleted_count
     
     
     def run_analyzer(self, instruments: List[str] = None) -> bool:
@@ -807,13 +769,18 @@ class PipelineOrchestrator:
                 # For large files, use Popen to stream output instead of capturing everything in memory
                 # This prevents memory issues with very large files
                 try:
+                    # Set environment variable to indicate this is an automatic pipeline run
+                    env = os.environ.copy()
+                    env["PIPELINE_RUN"] = "1"
+                    
                     process = subprocess.Popen(
                         analyzer_cmd,
                         cwd=str(QTSW2_ROOT),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True,
-                        bufsize=1  # Line buffered
+                        bufsize=1,  # Line buffered
+                        env=env  # Pass environment with PIPELINE_RUN flag
                     )
                     # Process started - no need to log PID unless debugging
                 except Exception as e:
@@ -836,25 +803,47 @@ class PipelineOrchestrator:
                                 if len(lines_list) > max_lines_to_keep:
                                     lines_list.pop(0)
                                 
-                                # Log only key milestones - reduce verbosity
+                                # Log only critical milestones - minimal verbosity
                                 line_upper = line.upper()
                                 line_stripped = line.rstrip()
                                 
-                                # Only log critical information - key milestones only
-                                # Skip trade execution summaries - too verbose
-                                if 'TRADE EXECUTION SUMMARY' in line_upper:
-                                    continue  # Skip these messages
+                                # Skip verbose messages
+                                skip_patterns = [
+                                    'TRADE EXECUTION SUMMARY',
+                                    'PROCESSING RANGE',
+                                    'PROGRESS:',
+                                    'LOADING FILE',
+                                    'LOADED',
+                                    'CONCATENATING',
+                                    'CONCATENATED',
+                                    'MEMORY USAGE',
+                                    'PROCESSING DATE',  # Only log completion, not processing start
+                                    'STARTING TRADE EXECUTION',
+                                    'RANGES FOUND',
+                                    'PROCESSING RANGE'
+                                ]
                                 
-                                # Log progress messages
+                                if any(pattern in line_upper for pattern in skip_patterns):
+                                    continue  # Skip verbose messages
+                                
+                                # Only log critical information - errors, warnings, and completion
+                                # Skip "Found X parquet file(s) to load" type messages
+                                if 'FOUND' in line_upper and ('TO LOAD' in line_upper or 'PARQUET FILE' in line_upper):
+                                    continue
+                                
+                                # Log only essential messages
                                 if any(keyword in line_upper for keyword in [
-                                    'ERROR', 'WARNING', 'COMPLETED', 'WRITTEN', 'WROTE',
-                                    'FOUND', 'PROCESSING DATE', 'PROCESSING RANGE', 'PROGRESS:',
-                                    'STARTING TRADE EXECUTION', 'TRADE EXECUTION COMPLETED',
-                                    'RESULTS', 'SUMMARY', 'COMPLETED IN', 'RANGES FOUND'
+                                    'ERROR',
+                                    'WARNING', 
+                                    'COMPLETED',  # Completion messages
+                                    'WRITTEN',    # File written confirmation
+                                    'WROTE',      # File written confirmation
                                 ]):
                                     self.logger.info(f"[{instrument}] {line_stripped}")
                                     # Also emit as event for dashboard
-                                    emit_event(self.run_id, "analyzer", "log", f"[{instrument}] {line_stripped}")
+                                    # Only emit if line is not empty after stripping
+                                    if line_stripped and line_stripped.strip():
+                                        emit_event(self.run_id, "analyzer", "log", f"[{instrument}] {line_stripped}")
                     except Exception as e:
                         self.logger.error(f"Error reading {stream_name} stream: {e}")
                 
@@ -1020,10 +1009,10 @@ class PipelineOrchestrator:
         success = success_count > 0
         self.stage_results["analyzer"] = success
         
-        # Archive processed files after successful analysis
+        # Delete processed files after successful analysis
         if success:
             # Get list of processed files that match the analyzed instruments
-            processed_files_to_archive = []
+            processed_files_to_delete = []
             if DATA_PROCESSED.exists():
                 all_processed = list(DATA_PROCESSED.glob("*.parquet"))
                 all_processed.extend(list(DATA_PROCESSED.glob("*.csv")))
@@ -1034,17 +1023,17 @@ class PipelineOrchestrator:
                     file_name_upper = proc_file.name.upper()
                     for instrument in instruments:
                         if instrument.upper() in file_name_upper:
-                            processed_files_to_archive.append(proc_file)
+                            processed_files_to_delete.append(proc_file)
                             break
-            
-            # Archive the processed files
-            if processed_files_to_archive:
-                archived_count = self._archive_processed_files(processed_files_to_archive)
-                if archived_count > 0:
-                    self.logger.info(f"✓ Archived {archived_count} processed file(s) to {DATA_PROCESSED_ARCHIVED}")
-                    emit_event(self.run_id, "analyzer", "metric", "Processed files archived", {
-                        "archived_file_count": archived_count
-                    })
+                
+                # Delete the processed files
+                if processed_files_to_delete:
+                    deleted_count = self._delete_processed_files(processed_files_to_delete)
+                    if deleted_count > 0:
+                        self.logger.info(f"✓ Deleted {deleted_count} processed file(s)")
+                        emit_event(self.run_id, "analyzer", "metric", "Processed files deleted", {
+                            "deleted_file_count": deleted_count
+                        })
         
         if success:
             emit_event(self.run_id, "analyzer", "success", f"Analyzer completed: {success_count}/{len(instruments)} instruments")
@@ -1054,25 +1043,299 @@ class PipelineOrchestrator:
         self.logger.info(f"Analyzer completed: {success_count}/{len(instruments)} instruments")
         return success
     
-    def run_sequential_processor(self) -> bool:
-        """Stage 3: Run sequential processor (optional)."""
+    def run_data_merger(self) -> bool:
+        """Run data merger to consolidate daily files into monthly files."""
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 3: Sequential Processor (Optional)")
+        self.logger.info("DATA MERGER: Consolidating daily files into monthly files")
+        self.logger.info("=" * 60)
+        
+        emit_event(self.run_id, "merger", "start", "Starting data merger")
+        
+        # Build command
+        merger_cmd = [
+            sys.executable,
+            str(DATA_MERGER_SCRIPT)
+        ]
+        
+        self.logger.info(f"Running data merger...")
+        self.logger.info(f"  Command: {' '.join(merger_cmd)}")
+        self.logger.info(f"  Working directory: {QTSW2_ROOT}")
+        
+        # Run data merger with timeout
+        try:
+            result = subprocess.run(
+                merger_cmd,
+                cwd=str(QTSW2_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute timeout
+            )
+            
+            # Log output
+            if result.stdout:
+                self.logger.info("Data merger output:")
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        self.logger.info(f"  {line}")
+                        # Emit key milestones
+                        if any(keyword in line.upper() for keyword in ["MERGED", "PROCESSED", "COMPLETE", "ERROR", "FAILED"]):
+                            emit_event(self.run_id, "merger", "log", line.strip())
+            
+            if result.stderr:
+                self.logger.warning("Data merger stderr:")
+                for line in result.stderr.split('\n'):
+                    if line.strip():
+                        self.logger.warning(f"  {line}")
+                        if "ERROR" in line.upper() or "FAILED" in line.upper():
+                            emit_event(self.run_id, "merger", "log", f"ERROR: {line.strip()}")
+            
+            if result.returncode == 0:
+                self.logger.info("✓ Data merger completed successfully")
+                emit_event(self.run_id, "merger", "success", "Data merger completed successfully")
+                self.stage_results["merger"] = True
+                return True
+            else:
+                self.logger.error(f"✗ Data merger failed with return code {result.returncode}")
+                emit_event(self.run_id, "merger", "failure", f"Data merger failed with code {result.returncode}")
+                self.stage_results["merger"] = False
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("✗ Data merger timed out after 30 minutes")
+            emit_event(self.run_id, "merger", "failure", "Data merger timed out after 30 minutes")
+            self.stage_results["merger"] = False
+            return False
+        except Exception as e:
+            self.logger.error(f"✗ Failed to run data merger: {e}")
+            emit_event(self.run_id, "merger", "failure", f"Data merger exception: {str(e)}")
+            self.stage_results["merger"] = False
+            return False
+    
+    def run_sequential_processor(self, instruments: List[str] = None) -> bool:
+        """Stage 3: Run sequential processor on analyzer output files."""
+        self.logger.info("=" * 60)
+        self.logger.info("STAGE 3: Sequential Processor")
         self.logger.info("=" * 60)
         
         emit_event(self.run_id, "sequential", "start", "Starting sequential processor stage")
         
-        # This is typically interactive, so we might skip or implement differently
-        self.logger.info("Sequential processor typically requires manual configuration")
-        self.logger.info("Skipping automatic execution (can be added if CLI interface exists)")
+        # Find analyzer output files from analyzer_runs (merged monthly files)
+        # Look for files in analyzer_runs/<instrument><session>/<year>/ folders
+        analyzer_runs_dir = QTSW2_ROOT / "data" / "analyzer_runs"
         
-        # Note: Analyzer and sequencer files are now handled by the data merger
-        # which consolidates daily files into monthly files. No archiving needed.
+        if not analyzer_runs_dir.exists():
+            self.logger.warning(f"No analyzer_runs directory found: {analyzer_runs_dir}")
+            self.logger.info("Sequential processor requires merged analyzer files")
+            emit_event(self.run_id, "sequential", "log", f"No analyzer_runs directory found: {analyzer_runs_dir}")
+            emit_event(self.run_id, "sequential", "success", "Sequential processor skipped (no analyzer_runs directory)")
+            self.stage_results["sequential_processor"] = True  # Mark as skipped but not failed
+            return True
         
-        emit_event(self.run_id, "sequential", "log", "Sequential processor skipped (requires manual configuration)")
-        emit_event(self.run_id, "sequential", "success", "Sequential processor skipped")
-        self.stage_results["sequential_processor"] = True  # Mark as skipped but not failed
-        return True
+        # Find analyzer files grouped by instrument-session (ES1, ES2, NQ1, NQ2, etc.)
+        # Pattern: analyzer_runs/<instrument><session>/<year>/*.parquet
+        # Example: analyzer_runs/ES1/2025/ES1_an_2025_11.parquet
+        instrument_session_files = {}  # Key: "ES1", "ES2", etc. Value: list of files
+        
+        # Common instruments and sessions
+        instruments_list = ["ES", "NQ", "YM", "CL", "NG", "GC"]
+        sessions = ["1", "2"]  # S1 -> 1, S2 -> 2
+        
+        for instrument in instruments_list:
+            for session in sessions:
+                instrument_session = f"{instrument}{session}"
+                instrument_dir = analyzer_runs_dir / instrument_session
+                
+                if instrument_dir.exists():
+                    # Look for parquet files in year subdirectories - collect ALL monthly files
+                    session_files = []
+                    for year_dir in instrument_dir.iterdir():
+                        if year_dir.is_dir() and year_dir.name.isdigit():
+                            year_files = list(year_dir.glob("*.parquet"))
+                            # Add ALL monthly files, not just the most recent
+                            session_files.extend(year_files)
+                    
+                    if session_files:
+                        # Sort files by path to ensure consistent ordering (by year/month)
+                        session_files = sorted(session_files)
+                        # Store ALL files for this instrument-session combination
+                        instrument_session_files[instrument_session] = session_files
+        
+        if not instrument_session_files:
+            self.logger.warning(f"No analyzer parquet files found in {analyzer_runs_dir}")
+            emit_event(self.run_id, "sequential", "log", f"No analyzer parquet files found in {analyzer_runs_dir}")
+            emit_event(self.run_id, "sequential", "success", "Sequential processor skipped (no analyzer files)")
+            self.stage_results["sequential_processor"] = True
+            return True
+        
+        # Get list of instrument-session combinations to process
+        instrument_sessions = sorted(instrument_session_files.keys())
+        total_count = len(instrument_sessions)
+        
+        self.logger.info(f"Found {total_count} instrument-session combination(s) to process: {', '.join(instrument_sessions)}")
+        emit_event(self.run_id, "sequential", "log", f"Found {total_count} stream(s) to process: {', '.join(instrument_sessions)}")
+        emit_event(self.run_id, "sequential", "metric", "Sequential processor started", {
+            "stream_count": total_count,
+            "streams": instrument_sessions
+        })
+        
+        success_count = 0
+        for i, instrument_session in enumerate(instrument_sessions, 1):
+            # Extract instrument and session from key (e.g., "ES1" -> "ES", "1")
+            instrument = instrument_session[:-1]  # Remove last character (session number)
+            session_num = instrument_session[-1]  # Get session number
+            
+            # Get ALL files for this instrument-session (all monthly files across all years)
+            session_files = instrument_session_files[instrument_session]
+            
+            self.logger.info(f"=" * 60)
+            self.logger.info(f"Starting sequential processor for {instrument_session} ({i}/{total_count})")
+            self.logger.info(f"  Processing {len(session_files)} monthly file(s) for {instrument_session}")
+            emit_event(self.run_id, "sequential", "log", f"Starting {instrument_session} ({i}/{total_count})")
+            emit_event(self.run_id, "sequential", "log", f"Processing {len(session_files)} monthly file(s)")
+            
+            # Log all files being processed
+            for file_idx, data_file in enumerate(session_files, 1):
+                self.logger.info(f"    [{file_idx}/{len(session_files)}] {data_file.name}")
+            
+            # Determine start time based on session: S1 uses 08:00, S2 uses 09:30
+            start_time = "08:00" if session_num == "1" else "09:30"
+            
+            self.logger.info(f"  Stream: {instrument_session}, Session: S{session_num}, Start time: {start_time}")
+            emit_event(self.run_id, "sequential", "log", f"Stream: {instrument_session}, Start time: {start_time}")
+            
+            # Build command - pass ALL files to process complete dataset
+            # The sequential processor script needs to be updated to accept multiple files
+            # For now, we'll create a temporary combined file or pass files as a comma-separated list
+            # Check if sequential processor supports multiple files via CLI
+            if len(session_files) == 1:
+                # Single file - use existing --data-file argument
+                sequential_cmd = [
+                    sys.executable,
+                    str(SEQUENTIAL_PROCESSOR_SCRIPT),
+                    "--data-file", str(session_files[0]),
+                    "--start-time", start_time,
+                    "--max-days", "10000",
+                    "--output-folder", "data/sequencer_runs"
+                ]
+            else:
+                # Multiple files - need to combine them or pass as list
+                # For now, combine all files into a temporary file
+                import tempfile
+                temp_combined_file = tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.parquet', delete=False,
+                    dir=str(QTSW2_ROOT / "data" / "temp")
+                )
+                temp_combined_path = Path(temp_combined_file.name)
+                temp_combined_file.close()
+                
+                # Ensure temp directory exists
+                temp_combined_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Load and combine all files
+                self.logger.info(f"  Combining {len(session_files)} files into temporary file...")
+                combined_dfs = []
+                for data_file in session_files:
+                    df = pd.read_parquet(data_file)
+                    combined_dfs.append(df)
+                
+                combined_df = pd.concat(combined_dfs, ignore_index=True)
+                combined_df = combined_df.sort_values('Date').reset_index(drop=True)
+                combined_df.to_parquet(temp_combined_path, index=False, compression='snappy')
+                
+                self.logger.info(f"  Combined {len(combined_df):,} rows from {len(session_files)} file(s)")
+                emit_event(self.run_id, "sequential", "log", f"Combined {len(combined_df):,} rows from {len(session_files)} file(s)")
+                
+                sequential_cmd = [
+                    sys.executable,
+                    str(SEQUENTIAL_PROCESSOR_SCRIPT),
+                    "--data-file", str(temp_combined_path),
+                    "--start-time", start_time,
+                    "--max-days", "10000",
+                    "--output-folder", "data/sequencer_runs"
+                ]
+            
+            self.logger.info(f"Running sequential processor for {instrument_session}...")
+            self.logger.info(f"  Command: {' '.join(sequential_cmd)}")
+            self.logger.info(f"  Working directory: {QTSW2_ROOT}")
+            
+            # Track temporary file for cleanup
+            temp_combined_path = None
+            if len(session_files) > 1:
+                # Find the temp_combined_path from the command
+                temp_combined_path = Path(sequential_cmd[sequential_cmd.index("--data-file") + 1])
+            
+            # Run sequential processor with timeout
+            try:
+                # Set environment variables
+                env = os.environ.copy()
+                env["PIPELINE_RUN"] = "1"
+                # Set UTF-8 encoding for Windows console to handle Unicode characters
+                env["PYTHONIOENCODING"] = "utf-8"
+                
+                result = subprocess.run(
+                    sequential_cmd,
+                    cwd=str(QTSW2_ROOT),
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',  # Explicit UTF-8 encoding
+                    errors='replace',  # Replace problematic characters instead of failing
+                    timeout=3600,  # 1 hour timeout
+                    env=env
+                )
+                
+                # Log output for debugging
+                if result.stdout:
+                    self.logger.info(f"[{instrument_session}] Sequential processor output:")
+                    for line in result.stdout.split('\n'):
+                        if line.strip():
+                            self.logger.info(f"  {line}")
+                            # Emit key milestones
+                            if any(keyword in line.upper() for keyword in ["SAVED", "RESULTS", "COMPLETE", "ERROR"]):
+                                if line.strip():
+                                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] {line.strip()}")
+                
+                if result.stderr:
+                    self.logger.warning(f"[{instrument_session}] Sequential processor stderr:")
+                    for line in result.stderr.split('\n'):
+                        if line.strip():
+                            self.logger.warning(f"  {line}")
+                            if "ERROR" in line.upper() or "FAILED" in line.upper():
+                                emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] ERROR: {line.strip()}")
+                
+                if result.returncode == 0:
+                    self.logger.info(f"✓ [{instrument_session}] Sequential processor completed successfully")
+                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] Completed successfully")
+                    success_count += 1
+                else:
+                    self.logger.error(f"✗ [{instrument_session}] Sequential processor failed with return code {result.returncode}")
+                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] Failed with return code {result.returncode}")
+                    
+            except subprocess.TimeoutExpired:
+                self.logger.error(f"✗ [{instrument_session}] Sequential processor timed out after 1 hour")
+                emit_event(self.run_id, "sequential", "failure", f"[{instrument_session}] Timed out after 1 hour")
+            except Exception as e:
+                self.logger.error(f"✗ [{instrument_session}] Failed to run sequential processor: {e}")
+                emit_event(self.run_id, "sequential", "failure", f"[{instrument_session}] Failed: {str(e)}")
+            finally:
+                # Clean up temporary combined file if it was created
+                if temp_combined_path and temp_combined_path.exists():
+                    try:
+                        temp_combined_path.unlink()
+                        self.logger.info(f"  Cleaned up temporary combined file: {temp_combined_path.name}")
+                    except Exception as e:
+                        self.logger.warning(f"  Failed to clean up temporary file {temp_combined_path.name}: {e}")
+        
+        # Summary
+        all_success = success_count == total_count
+        if all_success:
+            self.logger.info(f"✓ Sequential processor completed for all {success_count} stream(s)")
+            emit_event(self.run_id, "sequential", "success", f"Completed for all {success_count} stream(s)")
+        else:
+            self.logger.warning(f"Sequential processor completed for {success_count}/{total_count} stream(s)")
+            emit_event(self.run_id, "sequential", "log", f"Completed for {success_count}/{total_count} stream(s)")
+        
+        self.stage_results["sequential_processor"] = all_success
+        return all_success
     
     def generate_audit_report(self) -> Dict:
         """Generate audit report of pipeline execution."""
@@ -1236,10 +1499,17 @@ class DailyPipelineScheduler:
             self.logger.warning("Translator completed but no processed files found - skipping analyzer")
             emit_event(run_id, "analyzer", "log", "Skipped: No processed files available")
         
-        # Stage 3: Sequential Processor (always run to archive analyzed files)
-        # This stage archives analyzed files even if sequential processor itself is skipped
+        # Stage 2.5: Data Merger (merge analyzer files into monthly files)
+        if success and run_analyzer_stage:
+            self.orchestrator.run_data_merger()
+        
+        # Stage 3: Sequential Processor (runs on merged analyzer files)
         if success:
             self.orchestrator.run_sequential_processor()
+        
+        # Stage 3.5: Data Merger (merge sequencer files into monthly files)
+        if success:
+            self.orchestrator.run_data_merger()
         
         # Generate audit report
         report = self.orchestrator.generate_audit_report()

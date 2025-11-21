@@ -147,10 +147,12 @@ def main():
         # Determine which session this slot belongs to
         session = "S1" if slot in ["07:30", "08:00", "09:00"] else "S2" if slot in ["09:30", "10:00", "10:30", "11:00"] else "Unknown"
         
-        # Get current state of individual checkbox
-        slot_value = st.session_state.get(f"slot_{slot}", False)
+        # Initialize session state if not exists (for first render)
+        if f"slot_{slot}" not in st.session_state:
+            st.session_state[f"slot_{slot}"] = False
         
-        if cols[i].checkbox(f"{slot} ({session})", value=slot_value, key=f"slot_{slot}"):
+        # Create checkbox - Streamlit manages value via key, don't pass value= to avoid conflict
+        if cols[i].checkbox(f"{slot} ({session})", key=f"slot_{slot}"):
             selected_slots.append(slot)
             if session == "S1":
                 selected_s1_slots.append(slot)
@@ -193,9 +195,6 @@ def main():
     
     with col1:
         save_csv = st.checkbox("Save CSV File", value=False, help="Generate CSV file with results")
-    
-    with col2:
-        save_summary = st.checkbox("Save Summary File", value=False, help="Generate summary text file with statistics")
     
     if inspect_data:
         st.subheader("Data Inspection")
@@ -598,10 +597,11 @@ def main():
 
 
         # -----------------------------------------------------------
-        # Save with descriptive filename into data/analyzer_temp/YYYY-MM-DD/
+        # Save with descriptive filename - manual runs go to manual_analyzer_runs, automatic runs go to analyzer_temp
         # -----------------------------------------------------------
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        out_dir = Path(f"data/analyzer_temp/{today}")
+        # GUI app is always manual run, so use manual_analyzer_runs folder
+        out_dir = Path(f"data/manual_analyzer_runs/{today}")
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -617,19 +617,11 @@ def main():
         
         parquet_path = out_dir / f"{desc_filename}.parquet"
         csv_path = out_dir / f"{desc_filename}.csv"
-        
-        # Save summary in summaries subfolder
-        summaries_dir = out_dir / "summaries"
-        summaries_dir.mkdir(parents=True, exist_ok=True)
-        summary_path = summaries_dir / f"{desc_filename}_SUMMARY.txt"
 
         print(f"💾 Saving results to files...")
         
         if save_csv:
             print(f"   📄 CSV: {csv_path.name}")
-        
-        if save_summary:
-            print(f"   📋 Summary: {summary_path.name}")
         
         # Save parquet file - ensure proper data types
         # Convert string columns to proper types to avoid PyArrow conversion issues
@@ -671,32 +663,6 @@ def main():
                 
                 # Write the actual data
                 final.to_csv(f, index=False, encoding='utf-8')
-        
-        # Create summary file (only if requested)
-        if save_summary:
-            with open(summary_path, 'w') as f:
-                f.write("BREAKOUT ANALYZER RESULTS SUMMARY\n")
-                f.write("=" * 50 + "\n\n")
-                f.write(f"Run Information:\n")
-                f.write(f"  Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"  Instruments: {instruments}\n")
-                f.write(f"  Date Range: {date_range}\n")
-                f.write(f"  Sessions: {', '.join(rp.enabled_sessions)}\n")
-                f.write(f"  Time Slots: {', '.join([f'{sess}:{time}' for sess in rp.enabled_sessions for time in rp.enabled_slots.get(sess, [])])}\n")
-                f.write(f"  Trade Days: {', '.join([['Mon','Tue','Wed','Thu','Fri'][d] for d in rp.trade_days])}\n")
-                
-                f.write(f"\nConfiguration Settings:\n")
-                f.write(f"  Debug Mode: {debug_mode}\n")
-                f.write(f"  T1 Trigger: 65% of base target (fixed)\n")
-                f.write(f"  Use Optimizations: {use_optimizations}\n")
-                f.write(f"  Show Performance Metrics: {show_performance}\n")
-                
-                # Add year filter info if applied
-                if selected_years:
-                    f.write(f"\nYear Filter:\n")
-                    f.write(f"  Selected Years: {', '.join(map(str, selected_years))}\n")
-                
-                # Add performance metrics if available
                 if metrics:
                     f.write(f"\nPerformance Metrics:\n")
                     f.write(f"  Data Loading Time: {metrics.data_loading_time:.2f} seconds\n")
@@ -738,18 +704,15 @@ def main():
 
         print(f"🎉 Analysis completed successfully!")
         print(f"📈 Performance: {total_trades} trades, {win_rate:.1f}% win rate, ${total_profit:,.2f} profit")
-        print(f"📁 Files saved to data/analyzer_temp/{today}/ folder")
+        print(f"📁 Files saved to data/manual_analyzer_runs/{today}/ folder")
         print("=" * 60)
         
         st.success(f"✅ Analysis completed successfully!")
-        st.info(f"📁 Files saved to analyzer_temp/{today}/ folder")
-        st.success(f"💾 Parquet file saved to analyzer_temp/{today}/: {parquet_path.name}")
+        st.info(f"📁 Files saved to manual_analyzer_runs/{today}/ folder")
+        st.success(f"💾 Parquet file saved to manual_analyzer_runs/{today}/: {parquet_path.name}")
         
         if save_csv:
             st.success(f"📄 CSV saved to analyzer_runs: {csv_path.name}")
-        
-        if save_summary:
-            st.success(f"📋 Summary saved to analyzer_runs: {summary_path.name}")
         
         
         
@@ -841,9 +804,9 @@ def main():
                 # Create filename
                 filename = f"{instrument}_{total_trades}trades_{int(win_rate)}winrate_{int(total_profit)}profit_{timestamp}"
                 
-                # Save to analyzer_temp with date-based folder structure
+                # Save to manual_analyzer_runs with date-based folder structure (GUI app is always manual)
                 today = datetime.datetime.now().strftime("%Y-%m-%d")
-                temp_dir = Path(f"data/analyzer_temp/{today}")
+                temp_dir = Path(f"data/manual_analyzer_runs/{today}")
                 temp_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Save as parquet
@@ -854,45 +817,8 @@ def main():
                 csv_path = temp_dir / f"{filename}.csv"
                 final.to_csv(csv_path, index=False)
                 
-                # Save summary in summaries subfolder (keep in analyzer_runs for now)
-                summaries_dir = Path("data/analyzer_runs/summaries")
-                summaries_dir.mkdir(parents=True, exist_ok=True)
-                summary_path = summaries_dir / f"{filename}_SUMMARY.txt"
-                with open(summary_path, 'w') as f:
-                    f.write(f"Analysis Summary - {timestamp}\n")
-                    f.write("=" * 50 + "\n")
-                    f.write(f"Instrument: {instrument}\n")
-                    f.write(f"Total Trades: {total_trades}\n")
-                    f.write(f"Win Rate: {win_rate:.1f}%\n")
-                    f.write(f"Total Profit: {total_profit:.1f} points\n")
-                    f.write(f"Average Profit: {total_profit/total_trades if total_trades > 0 else 0:.1f} points\n")
-                    
-                    f.write(f"\nConfiguration Settings:\n")
-                    f.write(f"  Debug Mode: {debug_mode}\n")
-                    f.write(f"  T1 Trigger: 65% of base target (fixed)\n")
-                    f.write(f"  Use Optimizations: {use_optimizations}\n")
-                    f.write(f"  Show Performance Metrics: {show_performance}\n")
-                    
-                    # Add year filter info if applied
-                    if selected_years:
-                        f.write(f"\nYear Filter:\n")
-                        f.write(f"  Selected Years: {', '.join(map(str, selected_years))}\n")
-                    
-                    # Add performance metrics if available
-                    if metrics:
-                        f.write(f"\nPerformance Metrics:\n")
-                        f.write(f"  Data Loading Time: {metrics.data_loading_time:.2f} seconds\n")
-                        f.write(f"  Processing Time: {metrics.processing_time:.2f} seconds\n")
-                        f.write(f"  Total Execution Time: {metrics.total_time:.2f} seconds\n")
-                        f.write(f"  Memory Usage: {metrics.memory_usage_mb:.1f} MB\n")
-                    
-                    f.write(f"\nFiles saved:\n")
-                    f.write(f"- {parquet_path}\n")
-                    f.write(f"- {csv_path}\n")
-                    f.write(f"- {summary_path}\n")
-                
-                st.success(f"✅ Results saved to analyzer_temp/{today}/ folder!")
-                st.info(f"📁 Files created:\n- {parquet_path.name}\n- {csv_path.name}\n- {summary_path.name}")
+                st.success(f"✅ Results saved to manual_analyzer_runs/{today}/ folder!")
+                st.info(f"📁 Files created:\n- {parquet_path.name}\n- {csv_path.name}")
                 
             except Exception as e:
                 st.error(f"❌ Error saving files: {str(e)}")

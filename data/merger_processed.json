@@ -1,6 +1,10 @@
 {
   "analyzer": [
-    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-11-18"
+    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-11-18",
+    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-11-19",
+    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-11-20"
   ],
-  "sequencer": []
+  "sequencer": [
+    "C:\\Users\\jakej\\QTSW2\\data\\sequencer_temp\\2025-11-21"
+  ]
 }

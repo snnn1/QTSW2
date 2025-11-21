@@ -4,7 +4,7 @@ Handles trade result classification and output formatting
 """
 
 import pandas as pd
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 
 @dataclass
@@ -53,7 +53,7 @@ class ResultProcessor:
         """
         from breakout_core.utils import hhmm_to_sort_int
         
-        return {
+        row = {
             "Date": date.date().isoformat(),
             "Time": time_label,
             "Target": target,
@@ -67,6 +67,8 @@ class ResultProcessor:
             "Profit": profit,
             "_sortTime": hhmm_to_sort_int(time_label)
         }
+        
+        return row
     
     def process_results(self, rows: List[Dict[str, object]]) -> pd.DataFrame:
         """
@@ -78,9 +80,31 @@ class ResultProcessor:
         Returns:
             Processed DataFrame sorted by Date and Time (earliest first)
         """
-        out = pd.DataFrame(rows, columns=["Date","Time","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","_sortTime"])
+        # Define base columns (always present)
+        base_columns = ["Date","Time","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","_sortTime"]
+        
+        if rows:
+            # Create DataFrame
+            out = pd.DataFrame(rows)
+            
+            # Remove any ONR or SCF columns that might exist (from old data or cached rows)
+            old_columns_to_remove = ['onr_high', 'onr_low', 'onr', 'onr_q1', 'onr_q2', 'onr_q3', 'onr_bucket', 'ONR Q',
+                                     'scf_s1', 'scf_s2', 'SCF',
+                                     'prewindow_high_s1', 'prewindow_low_s1', 'prewindow_range_s1',
+                                     'session_high_s1', 'session_low_s1', 'session_range_s1',
+                                     'prewindow_high_s2', 'prewindow_low_s2', 'prewindow_range_s2',
+                                     'session_high_s2', 'session_low_s2', 'session_range_s2']
+            for col in old_columns_to_remove:
+                if col in out.columns:
+                    out = out.drop(columns=[col])
+        else:
+            # Empty DataFrame
+            out = pd.DataFrame(columns=base_columns)
+        
         if out.empty:
-            return out.drop(columns=["_sortTime"])
+            # Drop _sortTime if present
+            cols_to_drop = ["_sortTime"]
+            return out.drop(columns=[c for c in cols_to_drop if c in out.columns])
         
         # Convert Date to datetime for proper sorting
         out["Date"] = pd.to_datetime(out["Date"])

@@ -1,6 +1,6 @@
-# 📊 Raw Data Translator - What It Does
+# Raw Data Translator - What It Does
 
-## 🎯 **Purpose**
+## **Purpose**
 
 The Raw Data Translator converts **messy, raw trading data files** (from NinjaTrader or other sources) into **clean, organized, standardized files** that your trading system can use.
 
@@ -8,7 +8,7 @@ Think of it as a **data cleaning and organizing tool** - it takes whatever forma
 
 ---
 
-## 📥 **INPUT: What You Give It**
+## **INPUT: What You Give It**
 
 ### Raw Data Files (from `data_raw/` folder):
 - **CSV files** (.csv) with trading data exports
@@ -37,12 +37,12 @@ Date,Time,Open,High,Low,Close,Volume,Instrument
 
 ---
 
-## 🔄 **PROCESSING: What It Does**
+## **PROCESSING: What It Does**
 
 ### Step 1: **Auto-Detection**
-- ✅ Detects if file has headers or not
-- ✅ Detects separator type (comma, semicolon, etc.)
-- ✅ Automatically handles different formats
+- Detects if file has headers or not
+- Detects separator type (comma, semicolon, etc.)
+- Automatically handles different formats
 
 ### Step 2: **Data Loading**
 - Reads all files from your input folder
@@ -55,10 +55,10 @@ Date,Time,Open,High,Low,Close,Volume,Instrument
 - Critical for accurate trading session calculations
 
 ### Step 4: **Data Cleaning**
-- ✅ Removes duplicate rows
-- ✅ Validates numeric columns (open, high, low, close, volume)
-- ✅ Filters out invalid timestamps
-- ✅ Standardizes column names (Open → open, High → high, etc.)
+- Removes duplicate rows
+- Validates numeric columns (open, high, low, close, volume)
+- Filters out invalid timestamps
+- Standardizes column names (Open → open, High → high, etc.)
 
 ### Step 5: **Instrument Detection**
 - Extracts instrument symbol from filename or data
@@ -72,7 +72,7 @@ Sorts by timestamp and groups by instrument
 
 ---
 
-## 📤 **OUTPUT: What You Get**
+## **OUTPUT: What You Get**
 
 ### Standardized Data Format:
 Every output file has this structure:
@@ -108,25 +108,25 @@ data_processed/
 
 ---
 
-## 🎯 **Why This Matters**
+## **Why This Matters**
 
 ### Before Translation:
-- ❌ Files in different formats
-- ❌ Mixed timezones (UTC, local, etc.)
-- ❌ Inconsistent column names
-- ❌ Duplicate data
-- ❌ Hard to process programmatically
+- Files in different formats
+- Mixed timezones (UTC, local, etc.)
+- Inconsistent column names
+- Duplicate data
+- Hard to process programmatically
 
 ### After Translation:
-- ✅ All files in same format
-- ✅ All timestamps in Chicago time
-- ✅ Standardized column names
-- ✅ No duplicates
-- ✅ Ready for your trading system to use
+- All files in same format
+- All timestamps in Chicago time
+- Standardized column names
+- No duplicates
+- Ready for your trading system to use
 
 ---
 
-## 📊 **Real-World Example**
+## **Real-World Example**
 
 ### Scenario:
 You export 5 years of ES futures data from NinjaTrader in 3 different formats:
@@ -151,7 +151,7 @@ Your trading system can now easily:
 
 ---
 
-## 🔧 **Features**
+## **Features**
 
 ### 1. **Smart Format Detection**
 - No need to specify format - it figures it out automatically
@@ -177,7 +177,7 @@ Your trading system can now easily:
 
 ---
 
-## 🚀 **Two Ways to Use It**
+## **Two Ways to Use It**
 
 ### Method 1: **GUI App** (Easiest)
 1. Double-click `Data Translator App.bat`
@@ -192,15 +192,15 @@ python tools/translate_raw.py --input data_raw --output data_processed --separat
 
 ---
 
-## 📋 **Summary**
+## **Summary**
 
 **The Raw Data Translator:**
-- 🔄 Converts raw trading data → clean, organized files
-- 🌍 Fixes timezone issues (UTC → Chicago)
-- 🧹 Removes duplicates and invalid data
-- 📊 Standardizes format across all files
-- 📁 Organizes by instrument and year
-- ✅ Makes data ready for your trading system
+- Converts raw trading data → clean, organized files
+- Fixes timezone issues (UTC → Chicago)
+- Removes duplicates and invalid data
+- Standardizes format across all files
+- Organizes by instrument and year
+- Makes data ready for your trading system
 
 **It's the first step** in your data pipeline - preparing raw exports for analysis and backtesting.
 

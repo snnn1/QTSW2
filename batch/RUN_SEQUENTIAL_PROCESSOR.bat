@@ -15,7 +15,7 @@ echo.
 echo ================================================
 echo Sequential Processor App starting!
 echo Browser will open automatically at:
-echo    http://localhost:8501
+echo    http://localhost:8503
 echo.
 echo To stop the app, press Ctrl+C in this window.
 echo ================================================
@@ -23,7 +23,7 @@ echo.
 
 REM Run Streamlit in the same window (no new window)
 REM Streamlit will automatically open the browser
-streamlit run sequential_processor\sequential_processor_app.py --server.headless false
+streamlit run sequential_processor\sequential_processor_app.py --server.port 8503 --server.headless false
 
 
 

@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Sequential Time Change Processor V2
 Processes historical data line by line with real-time time change logic application
 """
+
+import sys
+import io
+# Set UTF-8 encoding for stdout/stderr to handle Unicode characters
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import pandas as pd
 import numpy as np
@@ -11,16 +19,101 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 class SequentialProcessorV2:
-    def __init__(self, data_file: str, start_time: str = "08:00", time_mode: str = "normal", exclude_days_of_week: list = None, exclude_days_of_month: list = None, loss_recovery_mode: bool = False, data_files: list = None):
+    def __init__(self, data_file: str, start_time: str = "08:00", time_mode: str = "normal", exclude_days_of_week: list = None, exclude_days_of_month: list = None, exclude_times: list = None, loss_recovery_mode: bool = False, data_files: list = None, rolling_sum_threshold: float = None, enable_5_point_bypass: bool = False, bypass_point_threshold: float = 5.0):
         """Initialize with historical data file(s)"""
         # If multiple files provided, load and concatenate them
         if data_files and len(data_files) > 1:
             dataframes = []
+            instruments_found = set()
+            file_instrument_map = {}  # Track which instrument each file contains
+            
+            print(f"Loading {len(data_files)} files...")
             for file_path in data_files:
                 df = pd.read_parquet(file_path)
+                file_name = os.path.basename(file_path)
+                
+                # Detect instrument from this file
+                file_instruments = set()
+                if 'Instrument' in df.columns:
+                    file_instruments_raw = df['Instrument'].unique()
+                    file_instruments = {str(inst).upper() for inst in file_instruments_raw if pd.notna(inst)}
+                    instruments_found.update(file_instruments)
+                elif 'Stream' in df.columns:
+                    # Try to detect from Stream column
+                    streams = df['Stream'].unique()
+                    for stream in streams:
+                        if pd.notna(stream) and isinstance(stream, str):
+                            if stream.startswith('ES'):
+                                file_instruments.add('ES')
+                                instruments_found.add('ES')
+                            elif stream.startswith('CL'):
+                                file_instruments.add('CL')
+                                instruments_found.add('CL')
+                            elif stream.startswith('NQ'):
+                                file_instruments.add('NQ')
+                                instruments_found.add('NQ')
+                            elif stream.startswith('NG'):
+                                file_instruments.add('NG')
+                                instruments_found.add('NG')
+                
+                file_instrument_map[file_name] = sorted(file_instruments) if file_instruments else ["UNKNOWN"]
                 dataframes.append(df)
+                print(f"  - {file_name}: {sorted(file_instruments) if file_instruments else ['UNKNOWN']}")
+            
+            # Validate all files contain the same instrument(s)
+            if len(instruments_found) > 1:
+                # Find the most common instrument (expected instrument)
+                instrument_counts = {}
+                for file_name, insts in file_instrument_map.items():
+                    for inst in insts:
+                        instrument_counts[inst] = instrument_counts.get(inst, 0) + 1
+                
+                expected_instrument = max(instrument_counts, key=instrument_counts.get)
+                mismatched_files = [fname for fname, insts in file_instrument_map.items() 
+                                   if expected_instrument not in insts]
+                
+                error_msg = f"\nERROR: Mixed instruments detected in files!\n"
+                error_msg += f"Expected instrument: {expected_instrument} (found in {instrument_counts[expected_instrument]} files)\n"
+                error_msg += f"Found instruments: {sorted(instruments_found)}\n\n"
+                
+                if mismatched_files:
+                    error_msg += f"Files with mismatched instruments (will be skipped):\n"
+                    for file_name in mismatched_files:
+                        error_msg += f"  - {file_name}: {file_instrument_map[file_name]}\n"
+                    error_msg += f"\nThese files contain different instrument data and will be excluded from processing.\n"
+                    error_msg += f"Please verify these files are correct or remove them from the selection.\n\n"
+                
+                error_msg += "Files and their instruments:\n"
+                for file_name, insts in file_instrument_map.items():
+                    marker = " [SKIPPED]" if file_name in mismatched_files else ""
+                    error_msg += f"  - {file_name}: {insts}{marker}\n"
+                
+                # Filter out mismatched files and continue with matching ones
+                print(error_msg)
+                print(f"\nFiltering out {len(mismatched_files)} mismatched file(s) and continuing with {len(data_files) - len(mismatched_files)} file(s)...")
+                
+                # Rebuild dataframes list without mismatched files
+                filtered_dataframes = []
+                filtered_file_paths = []
+                for i, file_path in enumerate(data_files):
+                    file_name = os.path.basename(file_path)
+                    if file_name not in mismatched_files:
+                        filtered_dataframes.append(dataframes[i])
+                        filtered_file_paths.append(file_path)
+                
+                if not filtered_dataframes:
+                    raise ValueError(f"ERROR: All files were filtered out due to instrument mismatches! "
+                                   f"Please check your file selection.")
+                
+                dataframes = filtered_dataframes
+                instruments_found = {expected_instrument}  # Reset to only expected instrument
+                print(f"Continuing with {len(filtered_dataframes)} file(s) containing {expected_instrument} data.")
+            
             self.data = pd.concat(dataframes, ignore_index=True)
-            print(f"Loaded {len(data_files)} files and combined into {len(self.data)} rows")
+            detected_instrument = list(instruments_found)[0] if instruments_found else "UNKNOWN"
+            files_loaded = len(dataframes)  # Use filtered count if filtering occurred
+            print(f"\nSuccessfully loaded {files_loaded} file(s) and combined into {len(self.data)} rows")
+            print(f"Detected instrument in all files: {detected_instrument}")
         else:
             # Single file (backward compatible)
             self.data = pd.read_parquet(data_file)
@@ -36,6 +129,19 @@ class SequentialProcessorV2:
         
         # Store available times for dynamic initialization
         self.available_times = available_times
+        
+        # Filter out excluded time slots
+        self.exclude_times = exclude_times or []
+        if self.exclude_times:
+            # Convert to strings for comparison
+            exclude_times_str = [str(t) for t in self.exclude_times]
+            self.available_times = [t for t in self.available_times if str(t) not in exclude_times_str]
+            if not self.available_times:
+                raise ValueError(f"All time slots are excluded. Cannot proceed with processing.")
+            # If start_time is excluded, use first available time
+            if start_time in exclude_times_str:
+                start_time = self.available_times[0]
+                print(f"Warning: Start time was excluded. Using first available time: {start_time}")
         
         # Auto-detect instrument from data file
         self.instrument = self._detect_instrument_from_data()
@@ -59,6 +165,14 @@ class SequentialProcessorV2:
         
         # Track loss recovery mode state
         self.last_result_was_win = True  # Start assuming we can count trades
+        
+        # Rolling sum threshold for revised calculations
+        self.rolling_sum_threshold = rolling_sum_threshold  # None = disabled, otherwise minimum rolling sum required
+        self.skip_revised_calc_today = False  # Flag to skip revised profit/score calculation for today (set based on yesterday's rolling sums)
+        
+        # 5-point bypass rule
+        self.enable_5_point_bypass = enable_5_point_bypass  # If enabled, switch to any time slot that is X+ points higher, bypassing all other rules
+        self.bypass_point_threshold = bypass_point_threshold  # Minimum point difference required to trigger bypass (default: 5.0)
         
         # Data tracking
         self.processed_days = 0
@@ -235,7 +349,9 @@ class SequentialProcessorV2:
         
         # Calculate score for current time slot
         current_score = self._calculate_time_score(result)
-            
+        
+        # Calculate rolling sum BEFORE adding today's result (for fair comparison)
+        current_sum_before = sum(self.time_slot_histories[self.current_time])
         
         # Add current trade to history
         self.time_slot_histories[self.current_time].append(current_score)
@@ -244,16 +360,46 @@ class SequentialProcessorV2:
         if len(self.time_slot_histories[self.current_time]) > 13:
             self.time_slot_histories[self.current_time] = self.time_slot_histories[self.current_time][-13:]
         
-        # Calculate rolling sums for all time slots BEFORE adding today's result
-        # This ensures fair comparison - we compare historical performance, then add today's result
-        current_sum_before = sum(self.time_slot_histories[self.current_time])
-        current_sum_after = current_sum_before + current_score  # After adding today's result
+        # Calculate rolling sum AFTER adding today's result
+        current_sum_after = sum(self.time_slot_histories[self.current_time])
         
         # Find the best performing "other" time slot (highest rolling sum among non-current slots)
-        # IMPORTANT: Only consider time slots in the SAME SESSION
+        # IMPORTANT: Only consider time slots in the SAME SESSION and NOT excluded
         current_session = self.current_session
         session_times = self.SLOT_ENDS.get(current_session, [])
-        other_times = [t for t in self.available_times if t != self.current_time and t in session_times]
+        exclude_times_str = [str(t) for t in self.exclude_times] if self.exclude_times else []
+        other_times = [t for t in self.available_times if t != self.current_time and t in session_times and str(t) not in exclude_times_str]
+        
+        # 5-POINT BYPASS RULE: Check if any time slot is 5+ points higher (bypasses all other rules)
+        if self.enable_5_point_bypass and other_times:
+            current_date = self.last_processed_date
+            
+            # Calculate rolling sums for all other time slots (including today's result)
+            other_slots_with_sums = []
+            for t in other_times:
+                t_sum_before = sum(self.time_slot_histories.get(t, []))
+                # Get today's result for this other slot
+                t_session = self._get_session_for_time(t)
+                t_data = self.get_data_for_date_and_time(current_date, t, t_session)
+                if t_data and t_data['Date'] != 'NO DATA':
+                    t_score = self._calculate_time_score(t_data['Result'])
+                    t_sum_after = t_sum_before + t_score
+                else:
+                    t_sum_after = t_sum_before
+                
+                # Check if this slot is X+ points higher than current (where X is bypass_point_threshold)
+                if t_sum_after >= current_sum_after + self.bypass_point_threshold:
+                    other_slots_with_sums.append((t, t_sum_after))
+            
+            # If any slots are X+ points higher, switch to the highest one (or earliest if tied)
+            if other_slots_with_sums:
+                # Sort by sum (descending), then by time (ascending for earliest)
+                other_slots_with_sums.sort(key=lambda x: (-x[1], x[0]))
+                best_time, best_sum = other_slots_with_sums[0]
+                
+                self.current_time = best_time
+                self.current_session = self._get_session_for_time(best_time)
+                return self.current_time, f"Time change → {self.current_time} ({self.bypass_point_threshold:.1f}-point bypass: {best_sum:.2f} vs {current_sum_after:.2f}, bypasses all rules)"
         
         if not other_times:
             # Only one time slot available in this session, no time change possible
@@ -295,6 +441,20 @@ class SequentialProcessorV2:
         current_sum = current_sum_after
         other_sum = other_sum_after
         
+        # Build display string showing all other slots for clarity
+        other_slots_display = []
+        for t in sorted(other_times):
+            t_sum_before = other_time_sums.get(t, 0)
+            # Get today's result for this other slot
+            t_data = self.get_data_for_date_and_time(current_date, t, self._get_session_for_time(t))
+            if t_data and t_data['Date'] != 'NO DATA':
+                t_score = self._calculate_time_score(t_data['Result'])
+                t_sum_after = t_sum_before + t_score
+            else:
+                t_sum_after = t_sum_before
+            other_slots_display.append(f"{t}={t_sum_after:.2f}")
+        other_display = ", ".join(other_slots_display) if other_slots_display else "none"
+        
         # Time change rules (only switch on Loss)
         if result.upper() == 'LOSS':
             # Rule 1: Switch if other slot has higher rolling sum
@@ -309,7 +469,7 @@ class SequentialProcessorV2:
                 self.current_session = self._get_session_for_time(other_time)  # Update session to match new time
                 return self.current_time, f"Time change → {self.current_time} (other slot ≥5 higher: {other_sum:.2f} vs {current_sum:.2f})"
         
-        return self.current_time, f"Stay {self.current_time} (current: {current_sum:.2f}, other: {other_sum:.2f})"
+        return self.current_time, f"Stay {self.current_time} (current: {current_sum:.2f}, others: {other_display})"
     
     def _calculate_time_score(self, result: str) -> int:
         """Calculate score for time change logic (normal mode)"""
@@ -371,6 +531,21 @@ class SequentialProcessorV2:
         for day in range(1, max_days + 1):
             print(f"\n--- DAY {day} ---")
             
+            # Check if current time is excluded
+            exclude_times_str = [str(t) for t in self.exclude_times] if self.exclude_times else []
+            if str(self.current_time) in exclude_times_str:
+                # Current time is excluded - skip to next available time in same session
+                current_session = self.current_session
+                session_times = self.SLOT_ENDS.get(current_session, [])
+                available_in_session = [t for t in self.available_times if t in session_times and str(t) not in exclude_times_str]
+                if available_in_session:
+                    self.current_time = available_in_session[0]
+                    self.current_session = self._get_session_for_time(self.current_time)
+                    print(f"Current time was excluded. Switched to: {self.current_time}")
+                else:
+                    print(f"Warning: All times in {current_session} are excluded. Skipping day.")
+                    continue
+            
             # Get data for current time/session combination
             data_row = self.get_next_data(self.current_time, self.current_session)
             
@@ -385,9 +560,14 @@ class SequentialProcessorV2:
             # Store current state before changes
             old_time = self.current_time
             
+            # Track which slot's history was already updated in update_time_change
+            slot_already_updated = None
+            
             # Apply time change logic (always enabled)
             if data_row['Result'] != 'NO DATA':
                 new_time, time_reason = self.update_time_change(data_row['Result'])
+                # The slot that was current when update_time_change ran has already been added to history
+                slot_already_updated = old_time
                 if new_time != old_time:
                     self.current_time = new_time
                     self.current_session = self._get_session_for_time(new_time)  # Update session to match new time
@@ -396,15 +576,20 @@ class SequentialProcessorV2:
                     print(f"Time: {time_reason}")
             else:
                 time_reason = "NO DATA - No time change"
-                print(f"⏰ Time: {time_reason}")
+                print(f"Time: {time_reason}")
             
             # Update all time slot points to show actual daily win/loss for each time slot (AFTER time change logic)
             if data_row['Result'] != 'NO DATA':
                 current_date = data_row['Date']
                 
                 # Update ALL time slot points, histories, and rolling sums to show their actual daily results
+                # Skip excluded time slots
+                exclude_times_str = [str(t) for t in self.exclude_times] if self.exclude_times else []
                 debug_points_updates = []
                 for time_slot in self.available_times:
+                    # Skip excluded time slots
+                    if str(time_slot) in exclude_times_str:
+                        continue
                     time_str = str(time_slot)
                     session = self._get_session_for_time(time_str)
                     slot_data = self.get_data_for_date_and_time(current_date, time_str, session)
@@ -417,8 +602,8 @@ class SequentialProcessorV2:
                         # Update points
                         self.time_slot_points[time_str] = slot_score
                         
-                        # Only add to history if this is NOT the current time slot (current slot history already updated in time change logic)
-                        if time_str != str(self.current_time):
+                        # Only add to history if this slot's history was NOT already updated in update_time_change
+                        if time_str != str(slot_already_updated):
                             # Initialize history if not exists
                             if time_str not in self.time_slot_histories:
                                 self.time_slot_histories[time_str] = []
@@ -480,6 +665,11 @@ class SequentialProcessorV2:
             # Check if this day should be excluded
             if data_row['Date'] != 'NO DATA':
                 try:
+                    # Check rolling sum threshold first (applies to day after threshold check)
+                    if self.skip_revised_calc_today:
+                        revised_result = ""
+                        revised_profit_dollars = 0
+                    
                     # Check day of week exclusion
                     day_name = data_row['Date'].strftime('%A')
                     if day_name in self.exclude_days_of_week:
@@ -520,6 +710,10 @@ class SequentialProcessorV2:
                 if data_row['Range'] != 'NO DATA' and isinstance(data_row['Range'], (int, float)) and data_row['Range'] > 0:
                     sl_value = min(sl_value, data_row['Range'])
 
+            # Get instrument and session from data_row or processor
+            instrument = data_row.get('Instrument', self.instrument if hasattr(self, 'instrument') else 'UNKNOWN')
+            session = data_row.get('Session', self.current_session if hasattr(self, 'current_session') else 'UNKNOWN')
+            
             result_row = {
                 'Date': data_row['Date'].strftime('%Y-%m-%d') if data_row['Date'] != 'NO DATA' else 'NO DATA',
                 'Day of Week': day_of_week,
@@ -537,13 +731,40 @@ class SequentialProcessorV2:
                 'Time Reason': time_reason,
                 'Time Change': f"{old_time}→{self.current_time}" if old_time != self.current_time else "",
                 'Profit ($)': round(profit_dollars, 2),
-                'Revised Profit ($)': round(revised_profit_dollars, 2)
+                'Revised Profit ($)': round(revised_profit_dollars, 2),
+                'Instrument': instrument,
+                'Session': session
             }
             
             # Add dynamic time slot columns
             result_row.update(time_slot_columns)
             
             self.results.append(result_row)
+            
+            # Check rolling sum threshold for NEXT day (after all rolling sums are updated and result is stored)
+            # This check happens at the END of processing day N, and sets the flag for day N+1
+            if self.rolling_sum_threshold is not None and data_row['Result'] != 'NO DATA':
+                # Get all rolling sums (excluding excluded time slots)
+                all_rolling_sums = []
+                exclude_times_str = [str(t) for t in self.exclude_times] if self.exclude_times else []
+                for time_slot in self.available_times:
+                    if str(time_slot) not in exclude_times_str:
+                        time_str = str(time_slot)
+                        rolling_sum = self.time_slot_rolling.get(time_str, 0)
+                        all_rolling_sums.append(rolling_sum)
+                
+                # Check if ALL rolling sums are BELOW threshold
+                # If ALL are below, skip revised calc. If at least ONE is above/equal, allow revised calc.
+                if all_rolling_sums and all(rs < self.rolling_sum_threshold for rs in all_rolling_sums):
+                    # ALL time slots are below threshold - skip revised calc for NEXT day
+                    self.skip_revised_calc_today = True
+                    print(f"Rolling sum threshold check: ALL time slots below {self.rolling_sum_threshold}. Skipping revised calc for next day. Rolling sums: {all_rolling_sums}")
+                else:
+                    # At least one time slot is above/equal to threshold - allow revised calc for NEXT day
+                    self.skip_revised_calc_today = False
+                    if all_rolling_sums:
+                        above_threshold = [rs for rs in all_rolling_sums if rs >= self.rolling_sum_threshold]
+                        print(f"Rolling sum threshold check: At least one time slot >= {self.rolling_sum_threshold}. Revised calc enabled for next day. Above threshold: {above_threshold}")
             
             print(f"Next day will use: Time={self.current_time}")
         
@@ -671,26 +892,122 @@ def main():
     pd.reset_option('display.max_colwidth')
     pd.reset_option('display.expand_frame_repr')
     
-    # Save results with timestamp to sequencer_temp with date-based folder structure
+    # Save results with timestamp - manual runs go to manual_sequencer_runs, automatic runs go to sequencer_temp
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     today = datetime.now().strftime('%Y-%m-%d')
     
+    # Determine output folder based on whether it's a pipeline run or manual run
+    is_pipeline_run = os.getenv("PIPELINE_RUN", "0") == "1"
+    
     # Use sequencer_temp if default output folder, otherwise use custom
     if args.output_folder == "data/sequencer_runs":
-        output_folder = f'data/sequencer_temp/{today}'
+        if is_pipeline_run:
+            # Automatic pipeline run - use sequencer_temp (for data merger)
+            output_folder = f'data/sequencer_temp/{today}'
+        else:
+            # Manual run - use manual_sequencer_runs folder
+            output_folder = f'data/manual_sequencer_runs/{today}'
     else:
         output_folder = args.output_folder
     
     # Ensure directory exists
     os.makedirs(output_folder, exist_ok=True)
     
+    # Extract instrument and session from input filename first (most reliable)
+    # Pattern: CL2_an_2025_09.parquet -> CL, S2
+    import re
+    input_filename = os.path.basename(args.data_file)
+    filename_match = re.match(r'^([A-Z]{2})([12])_', input_filename)
+    if filename_match:
+        instrument = filename_match.group(1).upper()
+        session = 'S1' if filename_match.group(2) == '1' else 'S2'
+        print(f"Detected instrument '{instrument}' and session '{session}' from input filename: {input_filename}")
+    else:
+        instrument = "UNKNOWN"
+        session = "UNKNOWN"
+        
+        # Try to get instrument from results DataFrame
+        if 'Instrument' in results.columns:
+            instruments = results['Instrument'].dropna().unique()
+            if len(instruments) > 0:
+                instrument = str(instruments[0]).upper().strip()
+        
+        # Try to get session from results DataFrame
+        if 'Session' in results.columns:
+            sessions = results['Session'].dropna().unique()
+            if len(sessions) > 0:
+                session_str = str(sessions[0]).strip().upper()
+                if session_str in ['S1', 'S2']:
+                    session = session_str
+        
+        # Try to extract from Stream column (e.g., "ES1", "GC2")
+        if (instrument == "UNKNOWN" or session == "UNKNOWN") and 'Stream' in results.columns and len(results) > 0:
+            stream_value = str(results['Stream'].iloc[0]).strip()
+            # Pattern: ES1, GC2, CL1, etc.
+            stream_match = re.match(r'^([A-Z]{2})([12])', stream_value)
+            if stream_match:
+                if instrument == "UNKNOWN":
+                    instrument = stream_match.group(1).upper()
+                if session == "UNKNOWN":
+                    session = 'S1' if stream_match.group(2) == '1' else 'S2'
+        
+        # Infer session from Time column if Session column doesn't exist
+        if session == "UNKNOWN" and 'Time' in results.columns and len(results) > 0:
+            time_slots_s1 = ['07:30', '08:00', '09:00']
+            time_slots_s2 = ['09:30', '10:00', '10:30', '11:00']
+            first_time = str(results['Time'].iloc[0]).strip()
+            if first_time in time_slots_s1:
+                session = 'S1'
+            elif first_time in time_slots_s2:
+                session = 'S2'
+        
+        # Fallback: try to get from processor if available
+        if instrument == "UNKNOWN" and hasattr(processor, 'instrument'):
+            instrument = processor.instrument.upper()
+        if session == "UNKNOWN" and hasattr(processor, 'current_session'):
+            session = processor.current_session
+        
+        # Final fallback: try to extract from input data file
+        if instrument == "UNKNOWN" or session == "UNKNOWN":
+            try:
+                # Load input data to check for Instrument/Session columns
+                input_df = pd.read_parquet(args.data_file)
+                if instrument == "UNKNOWN" and 'Instrument' in input_df.columns:
+                    instruments = input_df['Instrument'].dropna().unique()
+                    if len(instruments) > 0:
+                        instrument = str(instruments[0]).upper().strip()
+                if session == "UNKNOWN" and 'Session' in input_df.columns:
+                    sessions = input_df['Session'].dropna().unique()
+                    if len(sessions) > 0:
+                        session_str = str(sessions[0]).strip().upper()
+                        if session_str in ['S1', 'S2']:
+                            session = session_str
+            except:
+                pass
+    
+    # Convert session to suffix: S1 -> 1, S2 -> 2
+    session_suffix = "1" if session == "S1" else "2" if session == "S2" else ""
+    
+    # Build filename with instrument and session
+    if instrument != "UNKNOWN" and session_suffix:
+        filename_base = f'{instrument}{session_suffix}_seq_{timestamp}'
+    else:
+        # Fallback to old naming if we can't determine instrument/session
+        filename_base = f'sequential_run_{timestamp}'
+        if instrument != "UNKNOWN":
+            print(f"Warning: Could not determine session, using fallback filename")
+        elif session_suffix:
+            print(f"Warning: Could not determine instrument, using fallback filename")
+        else:
+            print(f"Warning: Could not determine instrument or session, using fallback filename")
+    
     # Save as Parquet (primary format, like analyzer)
-    parquet_filename = f'{output_folder}/sequential_run_{timestamp}.parquet'
+    parquet_filename = f'{output_folder}/{filename_base}.parquet'
     results.to_parquet(parquet_filename, index=False, compression='snappy')
     print(f"\nResults saved to: {parquet_filename}")
     
     # Also save as CSV for compatibility
-    csv_filename = f'{output_folder}/sequential_run_{timestamp}.csv'
+    csv_filename = f'{output_folder}/{filename_base}.csv'
     results.to_csv(csv_filename, index=False)
     print(f"Results also saved to: {csv_filename}")
     

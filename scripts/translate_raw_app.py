@@ -25,8 +25,8 @@ from translator import (
 
 # Page config
 st.set_page_config(
-    page_title="📊 Raw Data Translator",
-    page_icon="📊",
+    page_title="Raw Data Translator",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -34,22 +34,22 @@ st.set_page_config(
 
 def main():
     """Main UI function - Frontend only"""
-    st.title("📊 Raw Data Translator")
+    st.title("Raw Data Translator")
     st.markdown("Convert raw trading data exports into clean, organized files")
     
     # ==========================================
     # SIDEBAR - Configuration
     # ==========================================
-    st.sidebar.header("⚙️ Configuration")
+    st.sidebar.header("Configuration")
     
     input_folder = st.sidebar.text_input(
-        "📁 Input Folder", 
+        "Input Folder", 
         value="data/raw",
         help="Folder containing raw data files"
     )
     
     output_folder = st.sidebar.text_input(
-        "📁 Output Folder", 
+        "Output Folder", 
         value="data/processed",
         help="Folder where processed files will be saved"
     )
@@ -57,7 +57,7 @@ def main():
     # ==========================================
     # SIDEBAR - File Selection
     # ==========================================
-    st.sidebar.header("📁 File Selection")
+    st.sidebar.header("File Selection")
     
     # Get available files
     data_files = get_data_files(input_folder) if Path(input_folder).exists() else []
@@ -65,7 +65,7 @@ def main():
     
     # Bulk process option
     process_all = st.sidebar.checkbox(
-        "⚡ Process All Files (Bulk Mode)",
+        "Process All Files (Bulk Mode)",
         value=False,
         help="Process all files in the folder automatically. When enabled, all files will be processed regardless of selection."
     )
@@ -74,28 +74,28 @@ def main():
         if process_all:
             # In bulk mode, select all files automatically
             selected_files = file_names
-            st.sidebar.success(f"✅ Bulk mode: {len(file_names)} file(s) will be processed")
+            st.sidebar.success(f"Bulk mode: {len(file_names)} file(s) will be processed")
         else:
             selected_files = st.sidebar.multiselect(
-                "📄 Select Files to Process",
+                "Select Files to Process",
                 options=file_names,
                 default=[],
                 help="Choose which files to translate. Select at least one file to process, or enable 'Process All Files' above."
             )
             
             if not selected_files:
-                st.sidebar.warning("⚠️ No files selected. Please select files to process or enable 'Process All Files'.")
+                st.sidebar.warning("No files selected. Please select files to process or enable 'Process All Files'.")
     else:
         selected_files = []
-        st.sidebar.info("📁 No files found in input folder")
+        st.sidebar.info("No files found in input folder")
     
     # ==========================================
     # SIDEBAR - Processing Options
     # ==========================================
-    st.sidebar.header("🔧 Processing Options")
+    st.sidebar.header("Processing Options")
     
     separate_years = st.sidebar.checkbox(
-        "📅 Separate by years",
+        "Separate by years",
         value=True,
         help="Create individual files for each instrument and year (e.g., ES_2024.parquet, NQ_2024.parquet)"
     )
@@ -107,7 +107,7 @@ def main():
             # Create a progress container for year scanning
             progress_container = st.sidebar.container()
             with progress_container:
-                st.write("🔍 Scanning files for years...")
+                st.write("Scanning files for years...")
                 progress_bar = st.progress(0)
                 status_text = st.empty()
             
@@ -129,19 +129,19 @@ def main():
         
         if available_years:
             year_options = st.sidebar.multiselect(
-                "📆 Select Years (leave empty for all)",
+                "Select Years (leave empty for all)",
                 options=available_years,
                 default=[],
                 help=f"Available years in selected files: {available_years}. Leave empty to process all years and create merged file."
             )
         else:
             year_options = []
-            st.sidebar.info("📆 No years detected in selected files")
+            st.sidebar.info("No years detected in selected files")
     else:
         year_options = None
     
     output_format = st.sidebar.selectbox(
-        "💾 Output Format",
+        "Output Format",
         options=["parquet", "csv", "both"],
         index=0,
         help="File format for output"
@@ -153,28 +153,28 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("📊 Data Preview")
+        st.header("Data Preview")
         
         # Check if input folder exists
         if not Path(input_folder).exists():
-            st.warning(f"⚠️ Input folder '{input_folder}' does not exist")
+            st.warning(f"Input folder '{input_folder}' does not exist")
             st.info("Please create the folder and add your raw data files")
         else:
             # Get data files
             data_files = get_data_files(input_folder)
             
             if not data_files:
-                st.warning(f"⚠️ No data files found in '{input_folder}'")
+                st.warning(f"No data files found in '{input_folder}'")
                 st.info("Supported formats: .csv, .txt, .dat")
             else:
-                st.success(f"✅ Found {len(data_files)} data files")
+                st.success(f"Found {len(data_files)} data files")
                 
                 # Show file list
-                st.subheader("📄 Files Found")
+                st.subheader("Files Found")
                 file_info = []
                 for filepath in data_files:
                     size_mb = filepath.stat().st_size / (1024 * 1024)
-                    is_selected = "✅" if filepath.name in selected_files else "❌"
+                    is_selected = "Selected" if filepath.name in selected_files else "Not Selected"
                     file_info.append({
                         "Status": is_selected,
                         "File": filepath.name,
@@ -185,7 +185,7 @@ def main():
                 st.dataframe(pd.DataFrame(file_info), use_container_width=True)
                 
                 # Show selection summary
-                st.subheader("📊 Selection Summary")
+                st.subheader("Selection Summary")
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
                     st.metric("Total Files", len(data_files))
@@ -210,7 +210,7 @@ def main():
                 
                 # Preview selected files
                 if selected_files:
-                    st.subheader("🔍 Data Preview")
+                    st.subheader("Data Preview")
                     # Show preview from first selected file
                     first_selected_file = next((f for f in data_files if f.name in selected_files), None)
                     if first_selected_file:
@@ -219,7 +219,7 @@ def main():
                             st.dataframe(preview_df.head(10), use_container_width=True)
                             
                             # Data summary
-                            st.subheader("📈 Data Summary")
+                            st.subheader("Data Summary")
                             col_a, col_b, col_c, col_d = st.columns(4)
                             with col_a:
                                 st.metric("Rows (Preview)", f"{len(preview_df):,}")
@@ -235,7 +235,7 @@ def main():
                                 st.metric("Data Type", freq_label, help=f"Frequency: {freq_value}")
                     
                     # Show selected files list with years
-                    st.subheader("✅ Selected Files")
+                    st.subheader("Selected Files")
                     for i, filename in enumerate(selected_files, 1):
                         filepath = next((f for f in data_files if f.name == filename), None)
                         if filepath:
@@ -251,14 +251,14 @@ def main():
                     st.info("Select files in the sidebar to see preview")
     
     with col2:
-        st.header("🚀 Processing")
+        st.header("Processing")
         
         # Show bulk mode indicator
         if process_all and file_names:
-            st.info(f"⚡ **Bulk Mode Active**: {len(file_names)} file(s) will be processed")
+            st.info(f"**Bulk Mode Active**: {len(file_names)} file(s) will be processed")
         
         # Processing button
-        button_label = "⚡ Process All Files" if process_all and file_names else "▶️ Start Processing"
+        button_label = "Process All Files" if process_all and file_names else "Start Processing"
         if st.button(button_label, type="primary", use_container_width=True):
             if not selected_files:
                 if process_all and file_names:
@@ -283,11 +283,11 @@ def main():
                     )
                 
                 if success:
-                    st.success("✅ Processing completed successfully!")
+                    st.success("Processing completed successfully!")
                     
                     # Show results
                     if result_df is not None:
-                        st.subheader("📊 Results")
+                        st.subheader("Results")
                         st.metric("Total Rows", f"{len(result_df):,}")
                         st.metric("Date Range", f"{result_df['timestamp'].min().strftime('%Y-%m-%d')} to {result_df['timestamp'].max().strftime('%Y-%m-%d')}")
                         st.metric("Instruments", ", ".join(sorted(result_df['instrument'].unique())))
@@ -297,19 +297,19 @@ def main():
                         if output_path.exists():
                             output_files = list(output_path.glob("*"))
                             if output_files:
-                                st.subheader("📁 Output Files")
+                                st.subheader("Output Files")
                                 for file_path in sorted(output_files):
                                     size_mb = file_path.stat().st_size / (1024 * 1024)
-                                    st.write(f"📄 {file_path.name} ({size_mb:.2f} MB)")
+                                    st.write(f"{file_path.name} ({size_mb:.2f} MB)")
                 else:
-                    st.error("❌ Processing failed")
+                    st.error("Processing failed")
     
     # ==========================================
     # FOOTER
     # ==========================================
     st.markdown("---")
-    st.markdown("**💡 Tips:**")
-    st.markdown("- **⚡ Bulk Process**: Enable 'Process All Files' checkbox to automatically process everything in the folder")
+    st.markdown("**Tips:**")
+    st.markdown("- **Bulk Process**: Enable 'Process All Files' checkbox to automatically process everything in the folder")
     st.markdown("- **File Selection**: Choose specific files in the sidebar to process only what you need, or use bulk mode for all files")
     st.markdown("- **Year Selection**: Select specific years for individual files only, or leave empty to process all years and create merged file")
     st.markdown("- **File Naming**: Files are named by instrument and year (e.g., `ES_2024.parquet`, `NQ_2024.parquet`)")

@@ -154,7 +154,7 @@ function App() {
       const response = await fetch(`${API_BASE}/metrics/files`)
       if (!response.ok) {
         console.error(`Failed to load file counts: ${response.status} ${response.statusText}`)
-        setFileCounts({ raw_files: -1, processed_files: -1, archived_files: -1, analyzed_files: -1 })
+        setFileCounts({ raw_files: -1, processed_files: -1, analyzed_files: -1 })
         return
       }
       const data = await response.json()
@@ -164,7 +164,7 @@ function App() {
     } catch (error) {
       console.error('Failed to load file counts:', error)
       // Show error in UI
-      setFileCounts({ raw_files: -1, processed_files: -1, archived_files: -1, analyzed_files: -1 })
+      setFileCounts({ raw_files: -1, processed_files: -1, analyzed_files: -1 })
     }
   }
 
@@ -429,6 +429,16 @@ function App() {
       stageElapsedTime
     })
     
+    // Only add events that have meaningful content (message, data, or are critical events)
+    const hasMessage = event.msg && event.msg.trim().length > 0
+    const hasData = event.data && Object.keys(event.data).length > 0
+    const isCriticalEvent = event.event === 'failure' || event.event === 'success' || event.event === 'start'
+    
+    // Skip blank events unless they're critical
+    if (!hasMessage && !hasData && !isCriticalEvent) {
+      return // Skip blank events
+    }
+    
     // Add event to list
     setEvents(prev => [...prev, event].slice(-100)) // Keep last 100 events
     
@@ -550,7 +560,7 @@ function App() {
     
     // Update metrics
     if (event.event === 'metric' && event.data) {
-      if (event.data.processed_file_count !== undefined || event.data.archived_file_count !== undefined) {
+      if (event.data.processed_file_count !== undefined || event.data.deleted_file_count !== undefined) {
         loadFileCounts() // Refresh file counts
       }
       if (event.data.rows_per_min !== undefined) {
@@ -612,7 +622,62 @@ function App() {
       )}
 
       <div className="container mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold mb-8">Pipeline Dashboard</h1>
+        <div className="flex items-center justify-between mb-8">
+          <h1 className="text-3xl font-bold">Pipeline Dashboard</h1>
+          <div className="flex gap-2">
+            <button
+              onClick={async () => {
+                try {
+                  const response = await fetch(`${API_BASE}/apps/translator/start`, { method: 'POST' })
+                  const data = await response.json()
+                  if (data.url) {
+                    window.open(data.url, '_blank')
+                  }
+                } catch (error) {
+                  console.error('Failed to start translator app:', error)
+                }
+              }}
+              className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded font-medium text-sm"
+              title="Start and Open Translator App"
+            >
+              Translator
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  const response = await fetch(`${API_BASE}/apps/analyzer/start`, { method: 'POST' })
+                  const data = await response.json()
+                  if (data.url) {
+                    window.open(data.url, '_blank')
+                  }
+                } catch (error) {
+                  console.error('Failed to start analyzer app:', error)
+                }
+              }}
+              className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded font-medium text-sm"
+              title="Start and Open Analyzer App"
+            >
+              Analyzer
+            </button>
+            <button
+              onClick={async () => {
+                try {
+                  const response = await fetch(`${API_BASE}/apps/sequential/start`, { method: 'POST' })
+                  const data = await response.json()
+                  if (data.url) {
+                    window.open(data.url, '_blank')
+                  }
+                } catch (error) {
+                  console.error('Failed to start sequential app:', error)
+                }
+              }}
+              className="px-4 py-2 bg-orange-600 hover:bg-orange-700 rounded font-medium text-sm"
+              title="Start and Open Sequential Processor App"
+            >
+              Sequential
+            </button>
+          </div>
+        </div>
 
         {/* Controls Section */}
         <div className="bg-gray-800 rounded-lg p-6 mb-6">
@@ -720,23 +785,7 @@ function App() {
           </div>
           <div className="bg-gray-800 rounded-lg p-4">
             <div className="text-sm text-gray-400 mb-1">Current Stage</div>
-            <div className="text-lg font-semibold capitalize mb-2">{currentStage}</div>
-            {isRunning && (
-              <>
-                <div className="text-xs text-gray-500 mb-1">Elapsed Time</div>
-                {stageStartTime ? (
-                  <div className="text-sm font-mono text-gray-300">{formatElapsedTime(stageElapsedTime)}</div>
-                ) : (
-                  <div className="text-sm font-mono text-gray-500">Initializing...</div>
-                )}
-                {currentProcessingItem && (
-                  <>
-                    <div className="text-xs text-gray-500 mt-2 mb-1">Processing</div>
-                    <div className="text-sm font-semibold text-blue-400">{currentProcessingItem}</div>
-                  </>
-                )}
-              </>
-            )}
+            <div className="text-lg font-semibold capitalize">{currentStage}</div>
           </div>
           <div className="bg-gray-800 rounded-lg p-4">
             <div className="text-sm text-gray-400 mb-1">Raw Files</div>

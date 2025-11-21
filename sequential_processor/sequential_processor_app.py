@@ -5,6 +5,7 @@ Streamlit App for Sequential Time Change Processor
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import os
 from datetime import datetime
 import sys
@@ -136,7 +137,7 @@ def main():
                 help="Full Search: Show ALL files recursively from all years/months. Search by Year: Filter files by year."
             )
             
-            selected_year = None
+            selected_years = None
             if search_mode == "Search by Year":
                 # Get available years from filenames and folder names (search recursively)
                 try:
@@ -160,19 +161,23 @@ def main():
                     
                     if available_years:
                         available_years = sorted(list(available_years), reverse=True)  # Most recent first
-                        selected_year = st.sidebar.selectbox(
-                            "Select Year:",
+                        selected_years = st.sidebar.multiselect(
+                            "Select Year(s):",
                             available_years,
+                            default=available_years[:1] if available_years else [],  # Default to most recent year
                             key=f"year_select_{selected_instrument}",  # Unique key per instrument
-                            help="Filter files by year (checks both filenames and folder names)"
+                            help="Filter files by year(s) - select multiple years to include files from all selected years (checks both filenames and folder names)"
                         )
+                        if not selected_years:
+                            st.sidebar.warning("Please select at least one year.")
+                            selected_years = None
                     else:
                         st.sidebar.warning("No years detected. Showing all files.")
                         search_mode = "Full Search"  # Fallback to full search if no years found
-                        selected_year = None
+                        selected_years = None
                 except Exception as e:
                     st.sidebar.error(f"Error detecting years: {e}")
-                    selected_year = None
+                    selected_years = None
             
             # Search for parquet files in the selected instrument folder (including subfolders)
             data_files = []
@@ -189,15 +194,15 @@ def main():
                         if file.endswith('.parquet'):
                             total_files_scanned += 1
                             
-                            # Only filter if we're in "Search by Year" mode AND a year is selected
-                            if search_mode == "Search by Year" and selected_year is not None:
-                                # Check if filename contains the selected year OR if we're in a folder with that year name
+                            # Only filter if we're in "Search by Year" mode AND years are selected
+                            if search_mode == "Search by Year" and selected_years is not None and len(selected_years) > 0:
+                                # Check if filename contains ANY of the selected years OR if we're in a folder with any of those year names
                                 folder_name = os.path.basename(root)
-                                file_has_year = str(selected_year) in file
-                                folder_has_year = str(selected_year) in folder_name
-                                if not (file_has_year or folder_has_year):
+                                file_matches_year = any(str(year) in file for year in selected_years)
+                                folder_matches_year = any(str(year) in folder_name for year in selected_years)
+                                if not (file_matches_year or folder_matches_year):
                                     files_filtered_out += 1
-                                    continue  # Skip this file if it doesn't match the year
+                                    continue  # Skip this file if it doesn't match any of the selected years
                             
                             # Include this file (either Full Search mode, or it passed the year filter)
                             # Create display name with relative path if in subfolder
@@ -230,7 +235,11 @@ def main():
                 # Debug: Show file list if debug enabled
                 if show_debug:
                     st.sidebar.write(f"**Search Mode:** {search_mode}")
-                    st.sidebar.write(f"**Selected Year:** {selected_year if selected_year else 'None (Full Search)'}")
+                    if selected_years:
+                        years_display = ", ".join(str(y) for y in sorted(selected_years))
+                        st.sidebar.write(f"**Selected Year(s):** {years_display}")
+                    else:
+                        st.sidebar.write(f"**Selected Year(s):** None (Full Search)")
                     st.sidebar.write(f"**Files found:**")
                     for i, file in enumerate(data_files[:20]):  # Show first 20
                         st.sidebar.write(f"  {i+1}. `{file}`")
@@ -240,7 +249,35 @@ def main():
                 # Sort files for consistent display
                 data_files.sort()
                 
-                # When Full Search is enabled, automatically select all files
+                # Validate that all files are actually in the selected instrument folder
+                # This prevents loading files from wrong folders
+                validated_files = []
+                validated_file_paths = {}
+                for display_name, full_path in file_paths.items():
+                    # Ensure the file path is within the instrument folder path
+                    try:
+                        # Normalize paths for comparison
+                        full_path_normalized = os.path.normpath(full_path)
+                        instrument_folder_normalized = os.path.normpath(instrument_folder_path)
+                        
+                        # Check if the file path starts with the instrument folder path
+                        if full_path_normalized.startswith(instrument_folder_normalized):
+                            validated_files.append(display_name)
+                            validated_file_paths[display_name] = full_path
+                        else:
+                            # Debug: log files that don't match
+                            st.sidebar.warning(f"Warning: File {display_name} is outside instrument folder {selected_instrument}")
+                    except Exception as e:
+                        # If validation fails, include the file but warn
+                        st.sidebar.warning(f"Warning: Could not validate file {display_name}: {e}")
+                        validated_files.append(display_name)
+                        validated_file_paths[display_name] = full_path
+                
+                # Use validated files
+                data_files = validated_files
+                file_paths = validated_file_paths
+                
+                # When Full Search or Search by Year is enabled, automatically select all matching files
                 if search_mode == "Full Search":
                     # Full Search automatically selects all files - no manual selection needed
                     selected_files = data_files  # Automatically select all files
@@ -252,8 +289,20 @@ def main():
                         selected_file = "No file selected"
                         data_path = None
                         selected_files_list = []
+                elif search_mode == "Search by Year" and selected_years:
+                    # "Search by Year" mode - automatically select all files matching selected year(s)
+                    selected_files = data_files  # Automatically select all files that match the year filter
+                    selected_files_list = [file_paths[f] for f in selected_files]  # Get full paths
+                    years_display = ", ".join(str(y) for y in sorted(selected_years))
+                    selected_file = f"{len(selected_files)} files ({years_display})"
+                    data_path = selected_files_list[0] if selected_files_list else None  # For backward compatibility
+                    
+                    if len(selected_files) == 0:
+                        selected_file = "No file selected"
+                        data_path = None
+                        selected_files_list = []
                 else:
-                    # Single select for "Search by Year" mode
+                    # Fallback: no search mode selected or no years selected - show manual selection
                     preferred_index = 0
                     for i, file in enumerate(data_files):
                         if '5439trades' in file:  # Files with multiple time slots
@@ -267,7 +316,18 @@ def main():
                     )
                     # Use full path from the mapping
                     data_path = file_paths[selected_file]
-                    selected_files_list = [data_path]  # Single file for Search by Year mode
+                    selected_files_list = [data_path]  # Single file for manual selection
+                
+                # Debug: Show which files are being loaded
+                if selected_files_list:
+                    st.sidebar.markdown("---")
+                    st.sidebar.markdown("**Files to Load:**")
+                    for i, file_path in enumerate(selected_files_list[:5]):  # Show first 5
+                        file_name = os.path.basename(file_path)
+                        folder_name = os.path.basename(os.path.dirname(file_path))
+                        st.sidebar.markdown(f"{i+1}. `{file_name}` (from `{folder_name}`)")
+                    if len(selected_files_list) > 5:
+                        st.sidebar.markdown(f"... and {len(selected_files_list) - 5} more files")
                 
                 # Track file changes to clear cached state
                 if selected_file != "No file selected":
@@ -398,6 +458,25 @@ def main():
         help="Selected days of month will be excluded from Revised Score and Revised Profit calculations"
     )
     
+    # Time slot filtering
+    st.sidebar.markdown("**Exclude Time Slots:**")
+    # Get available times from data if available, otherwise use common times
+    if data_path and os.path.exists(data_path):
+        try:
+            sample_data = pd.read_parquet(data_path, nrows=100)
+            available_times_for_exclusion = sorted([str(t) for t in sample_data['Time'].unique()])
+        except:
+            available_times_for_exclusion = ["07:30", "08:00", "09:00", "09:30", "10:00", "10:30", "11:00"]
+    else:
+        available_times_for_exclusion = ["07:30", "08:00", "09:00", "09:30", "10:00", "10:30", "11:00"]
+    
+    exclude_times = st.sidebar.multiselect(
+        "Select time slots to exclude:",
+        available_times_for_exclusion,
+        default=[],
+        help="Selected time slots will be excluded from processing and time change logic. The sequencer will not switch to or use excluded time slots."
+    )
+    
     # Loss recovery mode
     st.sidebar.markdown("**Loss Recovery Mode:**")
     loss_recovery_mode = st.sidebar.checkbox(
@@ -405,6 +484,42 @@ def main():
         value=False, 
         help="Only count trades after wins, BE, NO TRADE, or TIME results (exclude trades following losses until next non-loss). Helps analyze 'winning streak' performance only."
     )
+    
+    # Rolling sum threshold
+    st.sidebar.markdown("**Rolling Sum Threshold:**")
+    rolling_sum_threshold_enabled = st.sidebar.checkbox(
+        "Enable Rolling Sum Threshold",
+        value=False,
+        help="Skip revised profit/score calculation if ALL time slots' rolling sums are below the threshold. If at least one is above/equal, revised calc is allowed. Applies to the day AFTER the threshold check."
+    )
+    rolling_sum_threshold = None
+    if rolling_sum_threshold_enabled:
+        rolling_sum_threshold = st.sidebar.number_input(
+            "Minimum Rolling Sum",
+            min_value=-50.0,
+            max_value=50.0,
+            value=0.0,
+            step=0.5,
+            help="If ALL time slots have rolling sums below this value, revised profit/score will be skipped for the next day. If at least one is above/equal, revised calc is allowed."
+        )
+    
+    # 5-point bypass rule
+    st.sidebar.markdown("**5-Point Bypass Rule:**")
+    enable_5_point_bypass = st.sidebar.checkbox(
+        "Enable 5-Point Bypass",
+        value=False,
+        help="If any time slot in the same session is performing X+ points higher than the current time slot, immediately switch to that time slot, bypassing all other time change rules. Works on every trade (win/loss/BE)."
+    )
+    bypass_point_threshold = 5.0  # Default value
+    if enable_5_point_bypass:
+        bypass_point_threshold = st.sidebar.number_input(
+            "Bypass Point Threshold",
+            min_value=0.0,
+            max_value=50.0,
+            value=5.0,
+            step=0.5,
+            help="Minimum point difference required to trigger bypass. If any time slot is this many points higher than current, switch immediately."
+        )
     
     # Processing options
     st.sidebar.subheader("Processing Options")
@@ -454,14 +569,24 @@ def main():
                 stream_values = sample_data['Stream'].unique()
                 for stream in stream_values:
                     if isinstance(stream, str):
-                        if stream.startswith('ES'):
+                        stream_upper = stream.upper()
+                        if stream_upper.startswith('ES'):
                             instrument = 'ES'
                             break
-                        elif stream.startswith('NQ'):
+                        elif stream_upper.startswith('NQ'):
                             instrument = 'NQ'
                             break
-                        elif stream.startswith('CL'):
+                        elif stream_upper.startswith('YM'):
+                            instrument = 'YM'
+                            break
+                        elif stream_upper.startswith('CL'):
                             instrument = 'CL'
+                            break
+                        elif stream_upper.startswith('NG'):
+                            instrument = 'NG'
+                            break
+                        elif stream_upper.startswith('GC'):
+                            instrument = 'GC'
                             break
             elif 'Instrument' in sample_data.columns:
                 inst_values = sample_data['Instrument'].unique()
@@ -471,6 +596,24 @@ def main():
                         if inst_upper in ['ES', 'NQ', 'YM', 'CL', 'NG', 'GC']:
                             instrument = inst_upper
                             break
+            
+            # Verify detected instrument matches selected instrument folder
+            if 'selected_instrument' in locals() and selected_instrument:
+                # Extract base instrument from folder name (e.g., "ES1" -> "ES", "CL2" -> "CL")
+                selected_base = selected_instrument.upper()
+                # Remove session numbers (1, 2) if present
+                if selected_base.endswith('1') or selected_base.endswith('2'):
+                    selected_base = selected_base[:-1]
+                
+                detected_base = instrument.upper()
+                
+                # Check if they match (accounting for session numbers)
+                if selected_base != detected_base:
+                    st.sidebar.error(f"⚠️ **MISMATCH DETECTED!**")
+                    st.sidebar.error(f"Selected folder: `{selected_instrument}` (expected instrument: `{selected_base}`)")
+                    st.sidebar.error(f"Detected from data: `{instrument}`")
+                    st.sidebar.error(f"**This may indicate wrong files are being loaded!**")
+                    st.sidebar.error(f"Please verify the files in the `{selected_instrument}` folder are correct.")
             
             # Set appropriate default time (use first available)
             default_time = available_times[0] if available_times else "08:00"
@@ -521,7 +664,10 @@ def main():
     st.sidebar.markdown(f"• Time Change: **ALWAYS ON**")
     st.sidebar.markdown(f"• Excluded Days of Week: {exclude_days_of_week if exclude_days_of_week else 'None'}")
     st.sidebar.markdown(f"• Excluded Days of Month: {exclude_days_of_month if exclude_days_of_month else 'None'}")
+    st.sidebar.markdown(f"• Excluded Time Slots: {', '.join(exclude_times) if exclude_times else 'None'}")
     st.sidebar.markdown(f"• Loss Recovery Mode: {'ON' if loss_recovery_mode else 'OFF'}")
+    st.sidebar.markdown(f"• Rolling Sum Threshold: {f'{rolling_sum_threshold:.1f}' if rolling_sum_threshold_enabled and rolling_sum_threshold is not None else 'OFF'}")
+    st.sidebar.markdown(f"• 5-Point Bypass: {'ON' if enable_5_point_bypass else 'OFF'}{f' (threshold: {bypass_point_threshold:.1f})' if enable_5_point_bypass else ''}")
     st.sidebar.markdown(f"• Processing: **ALL DATA**")
     
     # Output folder selection (global for all tabs)
@@ -535,8 +681,10 @@ def main():
         from datetime import datetime
         today = datetime.now().strftime('%Y-%m-%d')
         
+        # GUI app is always manual run, so default to manual_sequencer_runs
         output_folder_options = {
-            f"Default (data/sequencer_temp/{today}/)": "data/sequencer_temp",
+            f"Default (data/manual_sequencer_runs/{today}/)": "data/manual_sequencer_runs",
+            f"Automatic Pipeline (data/sequencer_temp/{today}/)": "data/sequencer_temp",
             "Custom Folder": "custom"
         }
         
@@ -547,7 +695,7 @@ def main():
         )
         
         custom_folder = None
-        selected_value = output_folder_options.get(selected_output_option, "data/sequencer_temp")
+        selected_value = output_folder_options.get(selected_output_option, "data/manual_sequencer_runs")
         if selected_value == "custom":
             custom_folder = st.text_input(
                 "Custom folder path:",
@@ -558,8 +706,11 @@ def main():
         # Determine final output folder (use absolute path)
         if custom_folder:
             output_folder = os.path.join(PROJECT_ROOT, custom_folder)
+        elif selected_value == "data/manual_sequencer_runs":
+            # Use date-based manual folder structure
+            output_folder = os.path.join(PROJECT_ROOT, f"data/manual_sequencer_runs/{today}")
         elif selected_value == "data/sequencer_temp":
-            # Use date-based temp folder structure
+            # Use date-based temp folder structure (for automatic pipeline)
             output_folder = os.path.join(PROJECT_ROOT, f"data/sequencer_temp/{today}")
         else:
             output_folder = os.path.join(PROJECT_ROOT, selected_value)
@@ -624,9 +775,13 @@ def main():
                         start_time_str, 
                         "normal", 
                         exclude_days_of_week, 
-                        exclude_days_of_month, 
+                        exclude_days_of_month,
+                        exclude_times,
                         loss_recovery_mode,
-                        data_files=files_to_load if len(files_to_load) > 1 else None  # Only pass if multiple files
+                        data_files=files_to_load if len(files_to_load) > 1 else None,  # Only pass if multiple files
+                        rolling_sum_threshold=rolling_sum_threshold if rolling_sum_threshold_enabled else None,
+                        enable_5_point_bypass=enable_5_point_bypass,
+                        bypass_point_threshold=bypass_point_threshold
                     )
                     
                     # Process data (time change is always enabled)
@@ -650,7 +805,8 @@ def main():
     with col2:
         st.subheader("Quick Stats")
         if 'results' in st.session_state:
-            results = st.session_state['results']
+            results = st.session_state['results'].copy()
+            
             
             # Calculate stats
             total_days = len(results)
@@ -854,6 +1010,15 @@ def main():
                 else:
                     risk_reward_ratio = 0.0
             
+            # Calculate Revised Profit ($) if column exists
+            revised_profit_dollars = 0.0
+            if 'Revised Profit ($)' in results.columns:
+                # Sum only non-empty Revised Profit ($) values
+                # Filter out NaN/NA values
+                # Convert to numeric first to handle any string values, then dropna
+                revised_profit_series = pd.to_numeric(results['Revised Profit ($)'], errors='coerce')
+                revised_profit_dollars = revised_profit_series.dropna().sum()
+            
             # Display stats in a cleaner layout
             col1, col2, col3, col4, col5 = st.columns(5)
             
@@ -862,6 +1027,9 @@ def main():
                 st.metric("Win Rate", f"{win_rate:.0f}%")
                 st.metric("Total Profit", f"{total_profit:.0f}")
                 st.metric("Total Profit ($)", f"${total_profit_dollars:,.0f}")
+                # Show Revised Profit ($) if available
+                if 'Revised Profit ($)' in results.columns:
+                    st.metric("Revised Profit ($)", f"${revised_profit_dollars:,.0f}")
             
             with col2:
                 st.metric("Wins", wins)
@@ -907,13 +1075,16 @@ def main():
                 default_cols = []
                 base_columns = ['Date', 'Day of Week', 'Stream', 'Time', 'Target', 'Range', 'SL', 'Profit', 'Peak', 'Direction', 'Result', 'Revised Score', 'Time Change', 'Profit ($)', 'Revised Profit ($)']
                 
+                # Remove ONR and SCF columns from available columns if they exist
+                available_cols = [col for col in results.columns.tolist() if not col.lower().startswith('onr') and col != 'ONR Q' and col != 'SCF' and not col.lower().startswith('scf')]
+                
                 for col in base_columns:
                     if col in results.columns:
                         default_cols.append(col)
                 
                 show_columns = st.multiselect(
                     "Select columns to display:",
-                    results.columns.tolist(),
+                    available_cols,
                     default=default_cols
                 )
             
@@ -1012,7 +1183,9 @@ def main():
                     st.balloons()
                 
                 # Show save location info
-                if selected_value == "data/sequencer_temp":
+                if selected_value == "data/manual_sequencer_runs":
+                    st.info(f"Results will be saved to:\nParquet: `data/manual_sequencer_runs/{today}/sequential_run_{timestamp}.parquet`\nCSV: `data/manual_sequencer_runs/{today}/sequential_run_{timestamp}.csv`")
+                elif selected_value == "data/sequencer_temp":
                     st.info(f"Results will be saved to:\nParquet: `data/sequencer_temp/{today}/sequential_run_{timestamp}.parquet`\nCSV: `data/sequencer_temp/{today}/sequential_run_{timestamp}.csv`")
                 else:
                     st.info(f"Results will be saved to:\nParquet: `{output_folder}/sequential_run_{timestamp}.parquet`\nCSV: `{output_folder}/sequential_run_{timestamp}.csv`")
@@ -1059,6 +1232,8 @@ def main():
                     excluded_days_info.append(f"Days of Week: {', '.join(exclude_days_of_week)}")
                 if exclude_days_of_month:
                     excluded_days_info.append(f"Days of Month: {', '.join(map(str, exclude_days_of_month))}")
+                if exclude_times:
+                    excluded_days_info.append(f"Time Slots: {', '.join(exclude_times)}")
                 
                 if excluded_days_info:
                     st.info(f"**Excluded from analysis:** {' | '.join(excluded_days_info)}")
@@ -1143,6 +1318,77 @@ def main():
         
         with tab4:
             st.subheader("Summary")
+            
+            # Profit by Time Slot
+            if 'Time' in results.columns and 'Profit' in results.columns:
+                st.markdown("### Profit by Time Slot")
+                
+                # Calculate profit by time slot
+                time_profit = results.groupby('Time')['Profit'].agg(['sum', 'count', 'mean']).reset_index()
+                time_profit.columns = ['Time', 'Total Profit', 'Trades', 'Avg Profit']
+                time_profit = time_profit.sort_values('Total Profit', ascending=False)
+                
+                # Get instrument for dollar conversion
+                if 'Stream' in results.columns and len(results) > 0:
+                    stream = results.iloc[0].get('Stream', 'ES1')
+                    instrument = stream[:2] if len(stream) >= 2 else 'ES'
+                elif 'Instrument' in results.columns and len(results) > 0:
+                    instrument = str(results.iloc[0].get('Instrument', 'ES')).upper()
+                else:
+                    instrument = 'ES'
+                
+                contract_values = {"ES": 50, "NQ": 10, "YM": 5, "CL": 1000, "NG": 10000, "GC": 100}
+                contract_value = contract_values.get(instrument, 50)
+                
+                # Add dollar values
+                time_profit['Total Profit ($)'] = time_profit['Total Profit'] * contract_value
+                time_profit['Avg Profit ($)'] = time_profit['Avg Profit'] * contract_value
+                
+                # Format for display
+                display_cols = ['Time', 'Total Profit', 'Total Profit ($)', 'Trades', 'Avg Profit', 'Avg Profit ($)']
+                time_profit_display = time_profit[display_cols].copy()
+                time_profit_display['Total Profit'] = time_profit_display['Total Profit'].round(2)
+                time_profit_display['Total Profit ($)'] = time_profit_display['Total Profit ($)'].round(2)
+                time_profit_display['Avg Profit'] = time_profit_display['Avg Profit'].round(2)
+                time_profit_display['Avg Profit ($)'] = time_profit_display['Avg Profit ($)'].round(2)
+                time_profit_display['Trades'] = time_profit_display['Trades'].astype(int)
+                
+                # Display table
+                create_auto_sized_dataframe(time_profit_display)
+                
+                # Summary metrics displayed horizontally below the table
+                total_profit = time_profit['Total Profit'].sum()
+                total_profit_dollars = total_profit * contract_value
+                total_trades = time_profit['Trades'].sum()
+                best_time = time_profit.iloc[0]['Time']
+                best_profit = time_profit.iloc[0]['Total Profit']
+                best_profit_dollars = best_profit * contract_value
+                
+                # Calculate best win rate
+                best_win_rate_time = None
+                best_win_rate = 0
+                if 'Result' in results.columns:
+                    time_results = results.groupby('Time')['Result'].apply(lambda x: (x == 'Win').sum() / len(x) * 100 if len(x) > 0 else 0).reset_index()
+                    time_results.columns = ['Time', 'Win Rate %']
+                    time_results = time_results.sort_values('Win Rate %', ascending=False)
+                    if len(time_results) > 0:
+                        best_win_rate_time = time_results.iloc[0]['Time']
+                        best_win_rate = time_results.iloc[0]['Win Rate %']
+                
+                # Display summary metrics horizontally
+                st.markdown("**Summary:**")
+                col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+                with col_sum1:
+                    st.metric("Total Profit", f"${total_profit_dollars:,.2f}", f"{total_profit:.2f} pts")
+                with col_sum2:
+                    st.metric("Total Trades", f"{total_trades:,}")
+                with col_sum3:
+                    st.metric("Best Time Slot", f"{best_time}", f"${best_profit_dollars:,.2f}")
+                with col_sum4:
+                    if best_win_rate_time:
+                        st.metric("Best Win Rate", f"{best_win_rate_time}", f"{best_win_rate:.1f}%")
+                    else:
+                        st.metric("Best Win Rate", "N/A", "N/A")
             
             # Summary statistics
             col1, col2, col3 = st.columns(3)

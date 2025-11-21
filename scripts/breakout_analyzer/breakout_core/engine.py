@@ -90,7 +90,7 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
             target_pts = config_manager.get_base_target(rp.instrument)
             
             if rp.write_no_trade_rows:
-                no_trade_rows.append({
+                no_trade_row = {
                     "Date": R.date.date().isoformat(),
                     "Time": time_label,
                     "Target": target_pts,
@@ -103,7 +103,8 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
                     "Session": sess,
                     "Profit": 0.0,
                     "_sortTime": int(time_label.replace(":", ""))
-                })
+                }
+                no_trade_rows.append(no_trade_row)
     
     # Add no-trade rows to results
     if no_trade_rows:
@@ -255,6 +256,8 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
     ranges_processed = 0
     last_progress_log = 0
     progress_interval = 500  # Log every 500 ranges
+    last_logged_date = None  # Track last logged date to only log once per day
+    slots_per_day = {}  # Track slots processed per day: {date: set(slots)}
     
     for R in ranges:
         ranges_processed += 1
@@ -270,12 +273,28 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
         stream = streamS1 if sess=="S1" else streamS2
         time_label = R.end_label
 
-        # Debug: Show range end time (no emojis to avoid Windows encoding errors)
+        # Debug: Track slots per day and log summary when date changes
         if debug:
             try:
-                print(f"\nProcessing range for date: {R.date.date()}, slot: {time_label}")
-                print(f"   Range end_ts: {R.end_ts}")
-                print(f"   Range end_ts UTC: {R.end_ts.tz_convert('UTC') if R.end_ts.tz else 'N/A'}")
+                current_date = R.date.date()
+                
+                # Track slots for current date
+                if current_date not in slots_per_day:
+                    slots_per_day[current_date] = set()
+                if time_label:
+                    slots_per_day[current_date].add(time_label)
+                
+                # Log when date changes (once per day)
+                if last_logged_date != current_date:
+                    # Log summary for previous day if it exists
+                    if last_logged_date is not None and last_logged_date in slots_per_day:
+                        prev_slots = sorted(slots_per_day[last_logged_date])
+                        slots_str = ", ".join(prev_slots) if prev_slots else "none"
+                        print(f"Completed date {last_logged_date}: processed slots {slots_str}")
+                    
+                    # Start new day
+                    print(f"\nProcessing date: {current_date}")
+                    last_logged_date = current_date
             except Exception:
                 # Silently skip if encoding error
                 pass
@@ -339,11 +358,17 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
                 if entry_result.entry_direction == "NoTrade":
                     # NoTrade - create NoTrade entry for active slot
                     if rp.write_no_trade_rows:
-                        rows.append(result_processor.create_result_row(R.date, time_label, target_pts, 0.0, "NA", "NoTrade", R.range_size, stream, inst, sess, 0.0))
+                        rows.append(result_processor.create_result_row(
+                            R.date, time_label, target_pts, 0.0, "NA", "NoTrade", R.range_size, 
+                            stream, inst, sess, 0.0
+                        ))
                 else:
                     # None - create Setup entry for active slot
                     if rp.write_setup_rows:
-                        rows.append(result_processor.create_result_row(R.date, time_label, target_pts, 0.0, "NA", "Setup", R.range_size, stream, inst, sess, 0.0))
+                        rows.append(result_processor.create_result_row(
+                            R.date, time_label, target_pts, 0.0, "NA", "Setup", R.range_size, 
+                            stream, inst, sess, 0.0
+                        ))
             continue
 
         entry_dir = entry_result.entry_direction
@@ -399,6 +424,15 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
             R.date, time_label, target_pts, trade_execution.peak, 
             entry_dir, trade_execution.result_classification, R.range_size, stream, inst, sess, display_profit
         ))
+
+    # Log final day's summary if debug is enabled
+    if debug and last_logged_date is not None and last_logged_date in slots_per_day:
+        try:
+            final_slots = sorted(slots_per_day[last_logged_date])
+            slots_str = ", ".join(final_slots) if final_slots else "none"
+            print(f"Completed date {last_logged_date}: processed slots {slots_str}")
+        except Exception:
+            pass
 
     # End performance monitoring
     total_time = debug_manager.end_timer()

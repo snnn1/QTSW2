@@ -2,16 +2,23 @@
 """
 Data Merger / Consolidator
 
-Merges daily analyzer and sequencer files into monthly Parquet files.
+Merges daily analyzer and sequencer files into monthly Parquet files, split by session.
 
 Process:
 1. Reads daily files from:
    - data/analyzer_temp/YYYY-MM-DD/
    - data/sequencer_temp/YYYY-MM-DD/
-2. Merges each day's files into monthly files:
-   - Analyzer → data/analyzer_runs/<instrument>/<year>/<instrument>_an_<year>_<month>.parquet
-   - Sequencer → data/sequencer_runs/<instrument>/<year>/<instrument>_seq_<year>_<month>.parquet
-3. Features:
+2. Merges each day's files into monthly files, split by session (S1/S2):
+   - Analyzer → data/analyzer_runs/<instrument><session>/<year>/<instrument><session>_an_<year>_<month>.parquet
+     Example: CL1_an_2025_11.parquet (S1 session), CL2_an_2025_11.parquet (S2 session)
+   - Sequencer → data/sequencer_runs/<instrument><session>/<year>/<instrument><session>_seq_<year>_<month>.parquet
+     Example: CL1_seq_2025_11.parquet (S1 session), CL2_seq_2025_11.parquet (S2 session)
+3. Session Detection:
+   - Uses Session column (S1/S2) if present
+   - Falls back to Time column inference:
+     * S1: 07:30, 08:00, 09:00
+     * S2: 09:30, 10:00, 10:30, 11:00
+4. Features:
    - Appends daily rows to monthly file
    - Removes duplicates
    - Sorts rows
@@ -19,6 +26,7 @@ Process:
    - Skips corrupted daily files
    - Deletes daily temp folder after merge
    - Idempotent (never double-writes data)
+   - Splits data by session automatically (S1 → CL1, S2 → CL2)
 
 Author: Quant Development Environment
 Date: 2025
@@ -76,21 +84,50 @@ class DataMerger:
             directory.mkdir(parents=True, exist_ok=True)
             logger.info(f"Ensured directory exists: {directory}")
         
-        # Create instrument folders in runs directories
+        # Create instrument-session folders in runs directories
         # Common instruments: ES, NQ, YM, CL, GC, NG
+        # Sessions: S1 -> 1, S2 -> 2
         instruments = ["ES", "NQ", "YM", "CL", "GC", "NG"]
+        sessions = ["S1", "S2"]
         
-        # Create analyzer_runs/<instrument> folders
+        # Create analyzer_runs/<instrument><session> folders (e.g., CL1, CL2, ES1, ES2)
         for instrument in instruments:
-            analyzer_instrument_dir = ANALYZER_RUNS_DIR / instrument
-            analyzer_instrument_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Ensured analyzer instrument directory exists: {analyzer_instrument_dir}")
+            for session in sessions:
+                session_suffix = "1" if session == "S1" else "2"
+                instrument_session_name = f"{instrument}{session_suffix}"
+                analyzer_instrument_dir = ANALYZER_RUNS_DIR / instrument_session_name
+                analyzer_instrument_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Ensured analyzer instrument-session directory exists: {analyzer_instrument_dir}")
         
-        # Create sequencer_runs/<instrument> folders
+        # Create sequencer_runs/<instrument><session> folders (e.g., CL1, CL2, ES1, ES2)
         for instrument in instruments:
-            sequencer_instrument_dir = SEQUENCER_RUNS_DIR / instrument
-            sequencer_instrument_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Ensured sequencer instrument directory exists: {sequencer_instrument_dir}")
+            for session in sessions:
+                session_suffix = "1" if session == "S1" else "2"
+                instrument_session_name = f"{instrument}{session_suffix}"
+                sequencer_instrument_dir = SEQUENCER_RUNS_DIR / instrument_session_name
+                sequencer_instrument_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Ensured sequencer instrument-session directory exists: {sequencer_instrument_dir}")
+        
+        # Check for and warn about plain instrument folders (should not exist)
+        self._check_for_plain_instrument_folders()
+    
+    def _check_for_plain_instrument_folders(self):
+        """Check for plain instrument folders (CL, ES, etc.) that should not exist."""
+        instruments = ["ES", "NQ", "YM", "CL", "GC", "NG"]
+        runs_dirs = [ANALYZER_RUNS_DIR, SEQUENCER_RUNS_DIR]
+        
+        for runs_dir in runs_dirs:
+            if not runs_dir.exists():
+                continue
+            
+            for item in runs_dir.iterdir():
+                if item.is_dir():
+                    folder_name = item.name.upper()
+                    # Check if this is a plain instrument folder (not instrument-session like CL1, ES2)
+                    if folder_name in instruments:
+                        logger.warning(f"WARNING: Found plain instrument folder '{item.name}' in {runs_dir.name}. "
+                                     f"This folder should not exist - only instrument-session folders like '{item.name}1' and '{item.name}2' should be present.")
+                        logger.warning(f"Please manually remove or rename '{item.name}' folder if it's empty or contains old data.")
     
     def _load_processed_log(self) -> Dict:
         """Load the log of processed daily folders."""
@@ -171,22 +208,35 @@ class DataMerger:
         # Check for longer/more specific patterns first
         instruments = ["CL", "GC", "NG", "ES", "NQ", "YM"]  # Reordered to check CL first
         for inst in instruments:
-            # Use word boundaries to avoid false matches (e.g., "CL" in "CLOSE")
-            if f"_{inst.lower()}_" in filename or filename.startswith(f"{inst.lower()}_") or filename.endswith(f"_{inst.lower()}"):
+            inst_lower = inst.lower()
+            # Check for patterns like: GC1_seq_, GC2_seq_, GC1_an_, _GC1_, GC1_, etc.
+            # Also check for: _gc_, gc_, _gc (original patterns)
+            if (f"{inst_lower}1_" in filename or f"_{inst_lower}2_" in filename or
+                filename.startswith(f"{inst_lower}1_") or filename.startswith(f"{inst_lower}2_") or
+                f"_{inst_lower}_" in filename or filename.startswith(f"{inst_lower}_") or 
+                filename.endswith(f"_{inst_lower}")):
                 logger.info(f"Detected instrument '{inst}' from filename {file_path.name}")
                 return inst
         
         logger.warning(f"Could not detect instrument from filename or content: {file_path.name}")
         return None
     
-    def _get_monthly_file_path(self, instrument: str, year: int, month: int, file_type: str) -> Path:
-        """Get the monthly file path for an instrument, year, and month."""
+    def _get_monthly_file_path(self, instrument: str, session: str, year: int, month: int, file_type: str) -> Path:
+        """Get the monthly file path for an instrument, session, year, and month."""
+        # Validate session is S1 or S2
+        if session not in ['S1', 'S2']:
+            raise ValueError(f"Invalid session: {session}. Must be 'S1' or 'S2'")
+        
+        # Convert session to suffix: S1 -> 1, S2 -> 2
+        session_suffix = "1" if session == "S1" else "2"
+        instrument_name = f"{instrument}{session_suffix}"  # Always include session suffix
+        
         if file_type == "analyzer":
-            base_dir = ANALYZER_RUNS_DIR / instrument / str(year)
-            filename = f"{instrument}_an_{year}_{month:02d}.parquet"
+            base_dir = ANALYZER_RUNS_DIR / instrument_name / str(year)
+            filename = f"{instrument_name}_an_{year}_{month:02d}.parquet"
         elif file_type == "sequencer":
-            base_dir = SEQUENCER_RUNS_DIR / instrument / str(year)
-            filename = f"{instrument}_seq_{year}_{month:02d}.parquet"
+            base_dir = SEQUENCER_RUNS_DIR / instrument_name / str(year)
+            filename = f"{instrument_name}_seq_{year}_{month:02d}.parquet"
         else:
             raise ValueError(f"Unknown file_type: {file_type}")
         
@@ -220,11 +270,13 @@ class DataMerger:
             return df.drop_duplicates(keep='first')
         
         initial_count = len(df)
+        
+        # Remove duplicates, keeping first occurrence
         df_deduped = df.drop_duplicates(subset=available_cols, keep='first')
         duplicates_removed = initial_count - len(df_deduped)
         
         if duplicates_removed > 0:
-            logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data")
+            logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data (keep=first)")
         
         return df_deduped
     
@@ -287,8 +339,12 @@ class DataMerger:
         
         return df.sort_values(by=available_cols, ascending=[True, True, True] if len(available_cols) == 3 else [True, True]).reset_index(drop=True)
     
-    def _merge_daily_files(self, daily_files: List[Path], file_type: str) -> Dict[str, pd.DataFrame]:
-        """Merge daily files grouped by instrument."""
+    def _merge_daily_files(self, daily_files: List[Path], file_type: str) -> Dict[Tuple[str, str], pd.DataFrame]:
+        """Merge daily files grouped by instrument and session.
+        
+        Returns:
+            Dict with keys (instrument, session) and values as DataFrames
+        """
         # First, collect all dataframes
         all_dfs = []
         
@@ -317,38 +373,143 @@ class DataMerger:
         # Combine all dataframes
         combined_df = pd.concat(all_dfs, ignore_index=True)
         
-        # Split by Instrument column if it exists
+        # Split by Instrument and Session columns
         result = {}
         if 'Instrument' in combined_df.columns:
-            for instrument in combined_df['Instrument'].unique():
-                instrument_str = str(instrument).upper().strip()
-                if not instrument_str:
-                    continue
+            # Check if Session column exists
+            if 'Session' in combined_df.columns:
+                # Split by both Instrument and Session
+                for instrument in combined_df['Instrument'].unique():
+                    instrument_str = str(instrument).upper().strip()
+                    if not instrument_str:
+                        continue
+                    
+                    instrument_df = combined_df[combined_df['Instrument'] == instrument].copy()
+                    
+                    # Split by Session - first handle valid S1/S2 sessions
+                    valid_sessions = {}
+                    invalid_rows = pd.DataFrame()
+                    
+                    for session in instrument_df['Session'].unique():
+                        session_str = str(session).strip()
+                        if session_str in ['S1', 'S2']:
+                            valid_sessions[session_str] = instrument_df[instrument_df['Session'] == session].copy()
+                        else:
+                            # Collect invalid session rows
+                            invalid_rows = pd.concat([invalid_rows, instrument_df[instrument_df['Session'] == session]], ignore_index=True)
+                    
+                    # Process valid sessions
+                    for session_str, session_df in valid_sessions.items():
+                        # Remove duplicates
+                        if file_type == "analyzer":
+                            session_df = self._remove_duplicates_analyzer(session_df)
+                            session_df = self._sort_analyzer_data(session_df)
+                        elif file_type == "sequencer":
+                            session_df = self._remove_duplicates_sequencer(session_df)
+                            session_df = self._sort_sequencer_data(session_df)
+                        
+                        if not session_df.empty:
+                            session_key = (instrument_str, session_str)
+                            if session_key not in result:
+                                result[session_key] = []
+                            result[session_key].append(session_df)
+                            logger.info(f"Grouped {len(session_df)} rows for {instrument_str} {session_str}")
+                    
+                    # Process invalid session rows by inferring from Time column
+                    if not invalid_rows.empty and 'Time' in invalid_rows.columns:
+                        time_slots_s1 = ['07:30', '08:00', '09:00']
+                        time_slots_s2 = ['09:30', '10:00', '10:30', '11:00']
+                        
+                        s1_df = invalid_rows[invalid_rows['Time'].isin(time_slots_s1)].copy()
+                        if not s1_df.empty:
+                            s1_df['Session'] = 'S1'
+                            if file_type == "analyzer":
+                                s1_df = self._remove_duplicates_analyzer(s1_df)
+                                s1_df = self._sort_analyzer_data(s1_df)
+                            elif file_type == "sequencer":
+                                s1_df = self._remove_duplicates_sequencer(s1_df)
+                                s1_df = self._sort_sequencer_data(s1_df)
+                            session_key = (instrument_str, 'S1')
+                            if session_key not in result:
+                                result[session_key] = []
+                            result[session_key].append(s1_df)
+                            logger.info(f"Grouped {len(s1_df)} rows for {instrument_str} S1 (inferred from Time)")
+                        
+                        s2_df = invalid_rows[invalid_rows['Time'].isin(time_slots_s2)].copy()
+                        if not s2_df.empty:
+                            s2_df['Session'] = 'S2'
+                            if file_type == "analyzer":
+                                s2_df = self._remove_duplicates_analyzer(s2_df)
+                                s2_df = self._sort_analyzer_data(s2_df)
+                            elif file_type == "sequencer":
+                                s2_df = self._remove_duplicates_sequencer(s2_df)
+                                s2_df = self._sort_sequencer_data(s2_df)
+                            session_key = (instrument_str, 'S2')
+                            if session_key not in result:
+                                result[session_key] = []
+                            result[session_key].append(s2_df)
+                            logger.info(f"Grouped {len(s2_df)} rows for {instrument_str} S2 (inferred from Time)")
+            else:
+                # No Session column - try to infer from Time column
+                logger.warning("No Session column found. Inferring from Time column.")
+                time_slots_s1 = ['07:30', '08:00', '09:00']
+                time_slots_s2 = ['09:30', '10:00', '10:30', '11:00']
                 
-                instrument_df = combined_df[combined_df['Instrument'] == instrument].copy()
-                
-                # Remove duplicates
-                if file_type == "analyzer":
-                    instrument_df = self._remove_duplicates_analyzer(instrument_df)
-                    instrument_df = self._sort_analyzer_data(instrument_df)
-                elif file_type == "sequencer":
-                    instrument_df = self._remove_duplicates_sequencer(instrument_df)
-                    instrument_df = self._sort_sequencer_data(instrument_df)
-                
-                if not instrument_df.empty:
-                    result[instrument_str] = instrument_df
-                    logger.info(f"Grouped {len(instrument_df)} rows for instrument {instrument_str}")
+                for instrument in combined_df['Instrument'].unique():
+                    instrument_str = str(instrument).upper().strip()
+                    if not instrument_str:
+                        continue
+                    
+                    instrument_df = combined_df[combined_df['Instrument'] == instrument].copy()
+                    
+                    # Split by inferred session from Time
+                    if 'Time' in instrument_df.columns:
+                        s1_df = instrument_df[instrument_df['Time'].isin(time_slots_s1)].copy()
+                        s2_df = instrument_df[instrument_df['Time'].isin(time_slots_s2)].copy()
+                        
+                        if not s1_df.empty:
+                            s1_df['Session'] = 'S1'
+                            if file_type == "analyzer":
+                                s1_df = self._remove_duplicates_analyzer(s1_df)
+                                s1_df = self._sort_analyzer_data(s1_df)
+                            elif file_type == "sequencer":
+                                s1_df = self._remove_duplicates_sequencer(s1_df)
+                                s1_df = self._sort_sequencer_data(s1_df)
+                            result[(instrument_str, 'S1')] = [s1_df]
+                            logger.info(f"Grouped {len(s1_df)} rows for {instrument_str} S1 (inferred from Time)")
+                        
+                        if not s2_df.empty:
+                            s2_df['Session'] = 'S2'
+                            if file_type == "analyzer":
+                                s2_df = self._remove_duplicates_analyzer(s2_df)
+                                s2_df = self._sort_analyzer_data(s2_df)
+                            elif file_type == "sequencer":
+                                s2_df = self._remove_duplicates_sequencer(s2_df)
+                                s2_df = self._sort_sequencer_data(s2_df)
+                            result[(instrument_str, 'S2')] = [s2_df]
+                            logger.info(f"Grouped {len(s2_df)} rows for {instrument_str} S2 (inferred from Time)")
+                    else:
+                        # No Time column either - can't infer session
+                        logger.warning(f"Cannot infer session for {instrument_str} - no Session or Time column")
         else:
             # Fallback: try to detect from filename (shouldn't happen if Instrument column exists)
             logger.warning("No Instrument column found in combined data. Using filename detection.")
-            # This shouldn't happen, but handle it gracefully
             for file_path in daily_files:
                 instrument = self._detect_instrument_from_file(file_path)
                 if instrument:
-                    if instrument not in result:
-                        result[instrument] = pd.DataFrame()
+                    if (instrument, 'S1') not in result:
+                        result[(instrument, 'S1')] = []
+                    if (instrument, 'S2') not in result:
+                        result[(instrument, 'S2')] = []
         
-        return result
+        # Combine DataFrames for each (instrument, session) key
+        final_result = {}
+        for (instrument, session), dfs in result.items():
+            if dfs:
+                combined = pd.concat(dfs, ignore_index=True)
+                final_result[(instrument, session)] = combined
+        
+        return final_result
     
     def _merge_with_existing_monthly_file(self, new_data: pd.DataFrame, monthly_file: Path, file_type: str) -> pd.DataFrame:
         """Merge new data with existing monthly file."""
@@ -444,9 +605,22 @@ class DataMerger:
             logger.warning(f"No valid data found in analyzer folder {daily_folder.name}")
             return False
         
-        # Write monthly files for each instrument, splitting by month if data spans multiple months
+        # Write monthly files for each (instrument, session) combination, splitting by month if data spans multiple months
         success_count = 0
-        for instrument, df in merged_data.items():
+        for (instrument, session), df in merged_data.items():
+            # Validate that the Instrument column matches what we expect (safety check)
+            if 'Instrument' in df.columns:
+                unique_instruments = df['Instrument'].dropna().unique()
+                unique_instruments_str = [str(inst).upper().strip() for inst in unique_instruments]
+                if instrument not in unique_instruments_str:
+                    logger.error(f"CRITICAL: Instrument mismatch! Expected {instrument} but found {unique_instruments_str} in data. Skipping this group.")
+                    logger.error(f"This indicates corrupted data - Instrument column doesn't match grouping. File would be: {instrument}{session[-1]}_an_*.parquet")
+                    continue
+                # Check for mixed instruments (shouldn't happen after grouping, but double-check)
+                if len(unique_instruments_str) > 1:
+                    logger.error(f"CRITICAL: Mixed instruments found in grouped data! Expected {instrument} but found {unique_instruments_str}. Skipping this group.")
+                    continue
+            
             # Check if Date column exists and split by month
             if 'Date' in df.columns:
                 try:
@@ -458,7 +632,7 @@ class DataMerger:
                     # Group by year and month
                     for (year, month), month_df in df.groupby(['Year', 'Month']):
                         if pd.isna(year) or pd.isna(month):
-                            logger.warning(f"Skipping rows with invalid dates for {instrument}")
+                            logger.warning(f"Skipping rows with invalid dates for {instrument} {session}")
                             continue
                         
                         year = int(year)
@@ -467,38 +641,81 @@ class DataMerger:
                         # Remove temporary columns
                         month_df_clean = month_df.drop(columns=['Year', 'Month'])
                         
-                        monthly_file = self._get_monthly_file_path(instrument, year, month, "analyzer")
+                        monthly_file = self._get_monthly_file_path(instrument, session, year, month, "analyzer")
                         
                         # Merge with existing monthly file
                         combined_df = self._merge_with_existing_monthly_file(month_df_clean, monthly_file, "analyzer")
+                        
+                        # Validate combined data AFTER merging (to catch corrupted existing files)
+                        if 'Instrument' in combined_df.columns:
+                            combined_instruments = combined_df['Instrument'].dropna().unique()
+                            combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                            if instrument not in combined_instruments_str:
+                                logger.error(f"CRITICAL: After merging, instrument mismatch detected! Expected {instrument} but found {combined_instruments_str} in combined data.")
+                                logger.error(f"This indicates the existing file {monthly_file.name} is corrupted. Skipping write to prevent further corruption.")
+                                logger.error(f"Please manually delete or fix the corrupted file: {monthly_file}")
+                                continue
+                            if len(combined_instruments_str) > 1:
+                                logger.error(f"CRITICAL: After merging, mixed instruments detected! Expected {instrument} but found {combined_instruments_str} in combined data.")
+                                logger.error(f"This indicates the existing file {monthly_file.name} contains mixed instruments. Skipping write to prevent further corruption.")
+                                logger.error(f"Please manually delete or fix the corrupted file: {monthly_file}")
+                                continue
                         
                         # Write monthly file
                         try:
                             self._write_monthly_file(combined_df, monthly_file)
                             success_count += 1
-                            logger.info(f"Created monthly file for {instrument} - {year}-{month:02d}: {len(combined_df)} rows")
+                            logger.info(f"Created monthly file for {instrument}{session[-1]} - {year}-{month:02d}: {len(combined_df)} rows")
                         except Exception as e:
-                            logger.error(f"Error writing monthly file for {instrument} {year}-{month:02d}: {e}")
+                            logger.error(f"Error writing monthly file for {instrument}{session[-1]} {year}-{month:02d}: {e}")
                 except Exception as e:
-                    logger.error(f"Error processing dates for {instrument}: {e}. Using folder date.")
+                    logger.error(f"Error processing dates for {instrument} {session}: {e}. Using folder date.")
                     # Fallback to folder date
-                    monthly_file = self._get_monthly_file_path(instrument, folder_year, folder_month, "analyzer")
+                    monthly_file = self._get_monthly_file_path(instrument, session, folder_year, folder_month, "analyzer")
                     combined_df = self._merge_with_existing_monthly_file(df, monthly_file, "analyzer")
+                    
+                    # Validate combined data AFTER merging (to catch corrupted existing files)
+                    if 'Instrument' in combined_df.columns:
+                        combined_instruments = combined_df['Instrument'].dropna().unique()
+                        combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                        if instrument not in combined_instruments_str:
+                            logger.error(f"CRITICAL: After merging (fallback), instrument mismatch detected! Expected {instrument} but found {combined_instruments_str}.")
+                            logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                            continue
+                        if len(combined_instruments_str) > 1:
+                            logger.error(f"CRITICAL: After merging (fallback), mixed instruments detected! Expected {instrument} but found {combined_instruments_str}.")
+                            logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                            continue
+                    
                     try:
                         self._write_monthly_file(combined_df, monthly_file)
                         success_count += 1
                     except Exception as e:
-                        logger.error(f"Error writing monthly file for {instrument}: {e}")
+                        logger.error(f"Error writing monthly file for {instrument}{session[-1]}: {e}")
             else:
                 # No Date column - use folder date
-                logger.warning(f"No Date column found for {instrument}, using folder date {folder_year}-{folder_month:02d}")
-                monthly_file = self._get_monthly_file_path(instrument, folder_year, folder_month, "analyzer")
+                logger.warning(f"No Date column found for {instrument} {session}, using folder date {folder_year}-{folder_month:02d}")
+                monthly_file = self._get_monthly_file_path(instrument, session, folder_year, folder_month, "analyzer")
                 combined_df = self._merge_with_existing_monthly_file(df, monthly_file, "analyzer")
+                
+                # Validate combined data AFTER merging (to catch corrupted existing files)
+                if 'Instrument' in combined_df.columns:
+                    combined_instruments = combined_df['Instrument'].dropna().unique()
+                    combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                    if instrument not in combined_instruments_str:
+                        logger.error(f"CRITICAL: After merging (no date), instrument mismatch detected! Expected {instrument} but found {combined_instruments_str}.")
+                        logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                        continue
+                    if len(combined_instruments_str) > 1:
+                        logger.error(f"CRITICAL: After merging (no date), mixed instruments detected! Expected {instrument} but found {combined_instruments_str}.")
+                        logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                        continue
+                
                 try:
                     self._write_monthly_file(combined_df, monthly_file)
                     success_count += 1
                 except Exception as e:
-                    logger.error(f"Error writing monthly file for {instrument}: {e}")
+                    logger.error(f"Error writing monthly file for {instrument}{session[-1]}: {e}")
         
         if success_count > 0:
             # Mark folder as processed
@@ -559,9 +776,22 @@ class DataMerger:
             logger.warning(f"No valid data found in sequencer folder {daily_folder.name}")
             return False
         
-        # Write monthly files for each instrument, splitting by month if data spans multiple months
+        # Write monthly files for each (instrument, session) combination, splitting by month if data spans multiple months
         success_count = 0
-        for instrument, df in merged_data.items():
+        for (instrument, session), df in merged_data.items():
+            # Validate that the Instrument column matches what we expect (safety check)
+            if 'Instrument' in df.columns:
+                unique_instruments = df['Instrument'].dropna().unique()
+                unique_instruments_str = [str(inst).upper().strip() for inst in unique_instruments]
+                if instrument not in unique_instruments_str:
+                    logger.error(f"CRITICAL: Instrument mismatch! Expected {instrument} but found {unique_instruments_str} in data. Skipping this group.")
+                    logger.error(f"This indicates corrupted data - Instrument column doesn't match grouping. File would be: {instrument}{session[-1]}_seq_*.parquet")
+                    continue
+                # Check for mixed instruments (shouldn't happen after grouping, but double-check)
+                if len(unique_instruments_str) > 1:
+                    logger.error(f"CRITICAL: Mixed instruments found in grouped data! Expected {instrument} but found {unique_instruments_str}. Skipping this group.")
+                    continue
+            
             # Check if Date column exists and split by month
             if 'Date' in df.columns:
                 try:
@@ -573,7 +803,7 @@ class DataMerger:
                     # Group by year and month
                     for (year, month), month_df in df.groupby(['Year', 'Month']):
                         if pd.isna(year) or pd.isna(month):
-                            logger.warning(f"Skipping rows with invalid dates for {instrument}")
+                            logger.warning(f"Skipping rows with invalid dates for {instrument} {session}")
                             continue
                         
                         year = int(year)
@@ -582,38 +812,81 @@ class DataMerger:
                         # Remove temporary columns
                         month_df_clean = month_df.drop(columns=['Year', 'Month'])
                         
-                        monthly_file = self._get_monthly_file_path(instrument, year, month, "sequencer")
+                        monthly_file = self._get_monthly_file_path(instrument, session, year, month, "sequencer")
                         
                         # Merge with existing monthly file
                         combined_df = self._merge_with_existing_monthly_file(month_df_clean, monthly_file, "sequencer")
+                        
+                        # Validate combined data AFTER merging (to catch corrupted existing files)
+                        if 'Instrument' in combined_df.columns:
+                            combined_instruments = combined_df['Instrument'].dropna().unique()
+                            combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                            if instrument not in combined_instruments_str:
+                                logger.error(f"CRITICAL: After merging, instrument mismatch detected! Expected {instrument} but found {combined_instruments_str} in combined data.")
+                                logger.error(f"This indicates the existing file {monthly_file.name} is corrupted. Skipping write to prevent further corruption.")
+                                logger.error(f"Please manually delete or fix the corrupted file: {monthly_file}")
+                                continue
+                            if len(combined_instruments_str) > 1:
+                                logger.error(f"CRITICAL: After merging, mixed instruments detected! Expected {instrument} but found {combined_instruments_str} in combined data.")
+                                logger.error(f"This indicates the existing file {monthly_file.name} contains mixed instruments. Skipping write to prevent further corruption.")
+                                logger.error(f"Please manually delete or fix the corrupted file: {monthly_file}")
+                                continue
                         
                         # Write monthly file
                         try:
                             self._write_monthly_file(combined_df, monthly_file)
                             success_count += 1
-                            logger.info(f"Created monthly file for {instrument} - {year}-{month:02d}: {len(combined_df)} rows")
+                            logger.info(f"Created monthly file for {instrument}{session[-1]} - {year}-{month:02d}: {len(combined_df)} rows")
                         except Exception as e:
-                            logger.error(f"Error writing monthly file for {instrument} {year}-{month:02d}: {e}")
+                            logger.error(f"Error writing monthly file for {instrument}{session[-1]} {year}-{month:02d}: {e}")
                 except Exception as e:
-                    logger.error(f"Error processing dates for {instrument}: {e}. Using folder date.")
+                    logger.error(f"Error processing dates for {instrument} {session}: {e}. Using folder date.")
                     # Fallback to folder date
-                    monthly_file = self._get_monthly_file_path(instrument, folder_year, folder_month, "sequencer")
+                    monthly_file = self._get_monthly_file_path(instrument, session, folder_year, folder_month, "sequencer")
                     combined_df = self._merge_with_existing_monthly_file(df, monthly_file, "sequencer")
+                    
+                    # Validate combined data AFTER merging (to catch corrupted existing files)
+                    if 'Instrument' in combined_df.columns:
+                        combined_instruments = combined_df['Instrument'].dropna().unique()
+                        combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                        if instrument not in combined_instruments_str:
+                            logger.error(f"CRITICAL: After merging (fallback), instrument mismatch detected! Expected {instrument} but found {combined_instruments_str}.")
+                            logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                            continue
+                        if len(combined_instruments_str) > 1:
+                            logger.error(f"CRITICAL: After merging (fallback), mixed instruments detected! Expected {instrument} but found {combined_instruments_str}.")
+                            logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                            continue
+                    
                     try:
                         self._write_monthly_file(combined_df, monthly_file)
                         success_count += 1
                     except Exception as e:
-                        logger.error(f"Error writing monthly file for {instrument}: {e}")
+                        logger.error(f"Error writing monthly file for {instrument}{session[-1]}: {e}")
             else:
                 # No Date column - use folder date
-                logger.warning(f"No Date column found for {instrument}, using folder date {folder_year}-{folder_month:02d}")
-                monthly_file = self._get_monthly_file_path(instrument, folder_year, folder_month, "sequencer")
+                logger.warning(f"No Date column found for {instrument} {session}, using folder date {folder_year}-{folder_month:02d}")
+                monthly_file = self._get_monthly_file_path(instrument, session, folder_year, folder_month, "sequencer")
                 combined_df = self._merge_with_existing_monthly_file(df, monthly_file, "sequencer")
+                
+                # Validate combined data AFTER merging (to catch corrupted existing files)
+                if 'Instrument' in combined_df.columns:
+                    combined_instruments = combined_df['Instrument'].dropna().unique()
+                    combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                    if instrument not in combined_instruments_str:
+                        logger.error(f"CRITICAL: After merging (no date), instrument mismatch detected! Expected {instrument} but found {combined_instruments_str}.")
+                        logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                        continue
+                    if len(combined_instruments_str) > 1:
+                        logger.error(f"CRITICAL: After merging (no date), mixed instruments detected! Expected {instrument} but found {combined_instruments_str}.")
+                        logger.error(f"Corrupted file: {monthly_file}. Skipping write.")
+                        continue
+                
                 try:
                     self._write_monthly_file(combined_df, monthly_file)
                     success_count += 1
                 except Exception as e:
-                    logger.error(f"Error writing monthly file for {instrument}: {e}")
+                    logger.error(f"Error writing monthly file for {instrument}{session[-1]}: {e}")
         
         if success_count > 0:
             # Mark folder as processed

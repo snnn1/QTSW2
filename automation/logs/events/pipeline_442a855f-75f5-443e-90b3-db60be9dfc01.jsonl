@@ -1,0 +1,52 @@
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "pipeline", "event": "start", "timestamp": "2025-11-20T19:36:17.214887-06:00", "msg": "Running sequential stage only"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "start", "timestamp": "2025-11-20T19:36:17.215502-06:00", "msg": "Starting sequential processor stage"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.272321-06:00", "msg": "Found 108 analyzer output file(s)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "metric", "timestamp": "2025-11-20T19:36:17.272849-06:00", "msg": "Sequential processor started", "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"]}}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.273994-06:00", "msg": "Starting ES (1/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.274246-06:00", "msg": "Input file: ES2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.274698-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.953356-06:00", "msg": "[ES] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.954983-06:00", "msg": "[ES] Results saved to: data/sequencer_temp/2025-11-21/ES2_seq_20251121_013617.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.955318-06:00", "msg": "[ES] Results also saved to: data/sequencer_temp/2025-11-21/ES2_seq_20251121_013617.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.956089-06:00", "msg": "[ES] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.957124-06:00", "msg": "Starting NQ (2/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.957371-06:00", "msg": "Input file: NQ2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:17.957828-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.596093-06:00", "msg": "[NQ] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.597536-06:00", "msg": "[NQ] Results saved to: data/sequencer_temp/2025-11-21/NQ2_seq_20251121_013618.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.597946-06:00", "msg": "[NQ] Results also saved to: data/sequencer_temp/2025-11-21/NQ2_seq_20251121_013618.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.598784-06:00", "msg": "[NQ] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.599827-06:00", "msg": "Starting YM (3/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.600076-06:00", "msg": "Input file: YM2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:18.600540-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.260058-06:00", "msg": "[YM] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.261613-06:00", "msg": "[YM] Results saved to: data/sequencer_temp/2025-11-21/YM2_seq_20251121_013619.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.262020-06:00", "msg": "[YM] Results also saved to: data/sequencer_temp/2025-11-21/YM2_seq_20251121_013619.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.262908-06:00", "msg": "[YM] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.263990-06:00", "msg": "Starting CL (4/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.264237-06:00", "msg": "Input file: CL2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.264670-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.897095-06:00", "msg": "[CL] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.898521-06:00", "msg": "[CL] Results saved to: data/sequencer_temp/2025-11-21/CL2_seq_20251121_013619.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.898853-06:00", "msg": "[CL] Results also saved to: data/sequencer_temp/2025-11-21/CL2_seq_20251121_013619.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.899870-06:00", "msg": "[CL] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.901074-06:00", "msg": "Starting NG (5/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.901405-06:00", "msg": "Input file: NG2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:19.901815-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.544476-06:00", "msg": "[NG] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.545723-06:00", "msg": "[NG] Results saved to: data/sequencer_temp/2025-11-21/NG2_seq_20251121_013620.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.546181-06:00", "msg": "[NG] Results also saved to: data/sequencer_temp/2025-11-21/NG2_seq_20251121_013620.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.547296-06:00", "msg": "[NG] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.548602-06:00", "msg": "Starting GC (6/6)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.548891-06:00", "msg": "Input file: GC2_an_2025_09.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:20.549303-06:00", "msg": "Using start time: 09:30"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:21.180659-06:00", "msg": "[GC] FINAL RESULTS"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:21.182325-06:00", "msg": "[GC] Results saved to: data/sequencer_temp/2025-11-21/GC2_seq_20251121_013621.parquet"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:21.182744-06:00", "msg": "[GC] Results also saved to: data/sequencer_temp/2025-11-21/GC2_seq_20251121_013621.csv"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:36:21.183774-06:00", "msg": "[GC] Completed successfully"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:36:21.184108-06:00", "msg": "Completed for all 6 instrument(s)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "archive", "event": "start", "timestamp": "2025-11-20T19:36:21.184573-06:00", "msg": "Archiving analyzer files"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "archive", "event": "log", "timestamp": "2025-11-20T19:36:21.202570-06:00", "msg": "Archiving 1274 analyzer file(s)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "archive", "event": "metric", "timestamp": "2025-11-20T19:36:22.224135-06:00", "msg": "Archiving complete", "data": {"archived_count": 1274, "failed_count": 0, "total_files": 1274}}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "archive", "event": "success", "timestamp": "2025-11-20T19:36:22.224474-06:00", "msg": "Archived 1274 analyzer file(s)"}
+{"run_id": "6cf9295d-350f-468c-b584-41bb951a375b", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:36:22.225314-06:00", "msg": "sequential stage completed successfully"}

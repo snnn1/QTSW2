@@ -107,3 +107,5 @@ class ConfigManager:
             "SLOT_START": self.slot_start,
             "SLOT_ENDS": self.slot_ends
         }
+    
+    

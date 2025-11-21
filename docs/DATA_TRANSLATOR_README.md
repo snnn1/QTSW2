@@ -1,8 +1,8 @@
-# 📊 Raw Data Translator App
+# Raw Data Translator App
 
 A user-friendly GUI application for converting raw trading data into processed, organized files.
 
-## 🚀 How to Launch
+## How to Launch
 
 ### Option 1: Double-click the App (Easiest)
 - Double-click `Data Translator App.bat`
@@ -13,20 +13,20 @@ A user-friendly GUI application for converting raw trading data into processed, 
 streamlit run scripts\translate_raw_app.py
 ```
 
-## 🎯 What the App Does
+## What the App Does
 
 1. **Loads raw data** from your `data_raw` folder
 2. **Converts formats** from various sources (CSV, TXT, DAT)
 3. **Separates by years** into individual files
 4. **Creates organized output** in `data_processed` folder
 
-## ⚙️ App Features
+## App Features
 
-### 📁 Folder Settings
+### Folder Settings
 - **Input Folder**: Where your raw data files are located
 - **Output Folder**: Where processed files will be saved
 
-### 🔧 Processing Options
+### Processing Options
 
 #### Year Separation Modes:
 - **Separate by years**: Creates individual files for each instrument and year (ES_2024.parquet, NQ_2024.parquet, etc.)
@@ -37,22 +37,22 @@ streamlit run scripts\translate_raw_app.py
 - **Parquet only**: Fastest option, smaller files
 - **Both Parquet and CSV**: More compatible but slower
 
-## 📊 Data Preview
+## Data Preview
 
 The app shows:
-- ✅ Number of data files found
-- 📄 List of files and their sizes
-- 🔍 Preview of first few lines
-- 📈 Data summary (rows, date range, instruments)
+- Number of data files found
+- List of files and their sizes
+- Preview of first few lines
+- Data summary (rows, date range, instruments)
 
-## 🚀 Processing
+## Processing
 
 1. **Click "Start Processing"** button
 2. **Watch progress** in real-time
 3. **See results** as files are created
 4. **View summary** of what was processed
 
-## 📁 Output Files
+## Output Files
 
 The app creates organized files like:
 ```
@@ -65,7 +65,7 @@ data_processed/
 └── ES_NQ_2024-2025.csv    # Complete dataset (if CSV enabled)
 ```
 
-## 🎯 Use Cases
+## Use Cases
 
 ### For Large Datasets (6M+ rows):
 - Use "Specific years only" mode
@@ -82,17 +82,17 @@ data_processed/
 - Choose "Parquet only"
 - Get single merged file quickly
 
-## 🔧 Advanced Options
+## Advanced Options
 
 The app automatically:
-- ✅ Detects different data formats
-- ✅ Handles timezone conversion (UTC to Chicago)
-- ✅ Removes duplicate entries
-- ✅ Validates data integrity
-- ✅ Shows processing progress
-- ✅ Creates organized file structure
+- Detects different data formats
+- Handles timezone conversion (UTC to Chicago)
+- Removes duplicate entries
+- Validates data integrity
+- Shows processing progress
+- Creates organized file structure
 
-## 🆘 Troubleshooting
+## Troubleshooting
 
 ### App won't start:
 - Make sure Python and Streamlit are installed
@@ -108,7 +108,7 @@ The app automatically:
 - Ensure sufficient disk space
 - Verify folder permissions
 
-## 📞 Support
+## Support
 
 The app is built on the same engine as the command-line tool, so all the same data formats and processing logic apply.
 

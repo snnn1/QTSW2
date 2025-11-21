@@ -1,0 +1,94 @@
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "pipeline", "event": "start", "timestamp": "2025-11-20T19:48:14.682031-06:00", "msg": "Running sequential stage only"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "start", "timestamp": "2025-11-20T19:48:14.682646-06:00", "msg": "Starting sequential processor stage"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:14.740475-06:00", "msg": "Found 12 stream(s) to process: CL1, CL2, ES1, ES2, GC1, GC2, NG1, NG2, NQ1, NQ2, YM1, YM2"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "metric", "timestamp": "2025-11-20T19:48:14.740914-06:00", "msg": "Sequential processor started", "data": {"stream_count": 12, "streams": ["CL1", "CL2", "ES1", "ES2", "GC1", "GC2", "NG1", "NG2", "NQ1", "NQ2", "YM1", "YM2"]}}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:14.741873-06:00", "msg": "Starting CL1 (1/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:14.742147-06:00", "msg": "Input file: CL1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:14.742541-06:00", "msg": "Stream: CL1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.391975-06:00", "msg": "[CL1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.393328-06:00", "msg": "[CL1] Results saved to: data/sequencer_temp/2025-11-21/CL1_seq_20251121_014815.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.393804-06:00", "msg": "[CL1] Results also saved to: data/sequencer_temp/2025-11-21/CL1_seq_20251121_014815.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.394618-06:00", "msg": "[CL1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.395390-06:00", "msg": "Starting CL2 (2/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.395640-06:00", "msg": "Input file: CL2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:15.396057-06:00", "msg": "Stream: CL2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.040666-06:00", "msg": "[CL2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.041937-06:00", "msg": "[CL2] Results saved to: data/sequencer_temp/2025-11-21/CL2_seq_20251121_014815.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.042291-06:00", "msg": "[CL2] Results also saved to: data/sequencer_temp/2025-11-21/CL2_seq_20251121_014815.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.043245-06:00", "msg": "[CL2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.044119-06:00", "msg": "Starting ES1 (3/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.044399-06:00", "msg": "Input file: ES1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.044779-06:00", "msg": "Stream: ES1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.692166-06:00", "msg": "[ES1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.694121-06:00", "msg": "[ES1] Results saved to: data/sequencer_temp/2025-11-21/ES1_seq_20251121_014816.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.694550-06:00", "msg": "[ES1] Results also saved to: data/sequencer_temp/2025-11-21/ES1_seq_20251121_014816.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.695496-06:00", "msg": "[ES1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.696455-06:00", "msg": "Starting ES2 (4/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.696769-06:00", "msg": "Input file: ES2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:16.697195-06:00", "msg": "Stream: ES2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.389781-06:00", "msg": "[ES2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.391430-06:00", "msg": "[ES2] Results saved to: data/sequencer_temp/2025-11-21/ES2_seq_20251121_014817.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.391860-06:00", "msg": "[ES2] Results also saved to: data/sequencer_temp/2025-11-21/ES2_seq_20251121_014817.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.392771-06:00", "msg": "[ES2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.393750-06:00", "msg": "Starting GC1 (5/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.394092-06:00", "msg": "Input file: GC1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:17.394494-06:00", "msg": "Stream: GC1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.042741-06:00", "msg": "[GC1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.044600-06:00", "msg": "[GC1] Results saved to: data/sequencer_temp/2025-11-21/GC1_seq_20251121_014817.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.044989-06:00", "msg": "[GC1] Results also saved to: data/sequencer_temp/2025-11-21/GC1_seq_20251121_014817.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.045826-06:00", "msg": "[GC1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.046607-06:00", "msg": "Starting GC2 (6/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.046854-06:00", "msg": "Input file: GC2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.047237-06:00", "msg": "Stream: GC2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.690681-06:00", "msg": "[GC2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.692147-06:00", "msg": "[GC2] Results saved to: data/sequencer_temp/2025-11-21/GC2_seq_20251121_014818.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.692518-06:00", "msg": "[GC2] Results also saved to: data/sequencer_temp/2025-11-21/GC2_seq_20251121_014818.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.693418-06:00", "msg": "[GC2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.694207-06:00", "msg": "Starting NG1 (7/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.694466-06:00", "msg": "Input file: NG1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:18.694858-06:00", "msg": "Stream: NG1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.319990-06:00", "msg": "[NG1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.321566-06:00", "msg": "[NG1] Results saved to: data/sequencer_temp/2025-11-21/NG1_seq_20251121_014819.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.321980-06:00", "msg": "[NG1] Results also saved to: data/sequencer_temp/2025-11-21/NG1_seq_20251121_014819.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.322929-06:00", "msg": "[NG1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.323824-06:00", "msg": "Starting NG2 (8/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.324072-06:00", "msg": "Input file: NG2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.324435-06:00", "msg": "Stream: NG2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.956439-06:00", "msg": "[NG2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.957972-06:00", "msg": "[NG2] Results saved to: data/sequencer_temp/2025-11-21/NG2_seq_20251121_014819.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.958362-06:00", "msg": "[NG2] Results also saved to: data/sequencer_temp/2025-11-21/NG2_seq_20251121_014819.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.959309-06:00", "msg": "[NG2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.960217-06:00", "msg": "Starting NQ1 (9/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.960522-06:00", "msg": "Input file: NQ1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:19.960911-06:00", "msg": "Stream: NQ1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.575252-06:00", "msg": "[NQ1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.577173-06:00", "msg": "[NQ1] Results saved to: data/sequencer_temp/2025-11-21/NQ1_seq_20251121_014820.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.577618-06:00", "msg": "[NQ1] Results also saved to: data/sequencer_temp/2025-11-21/NQ1_seq_20251121_014820.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.578636-06:00", "msg": "[NQ1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.579393-06:00", "msg": "Starting NQ2 (10/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.579640-06:00", "msg": "Input file: NQ2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:20.580056-06:00", "msg": "Stream: NQ2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.198322-06:00", "msg": "[NQ2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.199576-06:00", "msg": "[NQ2] Results saved to: data/sequencer_temp/2025-11-21/NQ2_seq_20251121_014821.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.199945-06:00", "msg": "[NQ2] Results also saved to: data/sequencer_temp/2025-11-21/NQ2_seq_20251121_014821.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.200848-06:00", "msg": "[NQ2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.201753-06:00", "msg": "Starting YM1 (11/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.201973-06:00", "msg": "Input file: YM1_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.202295-06:00", "msg": "Stream: YM1, Start time: 08:00"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.822212-06:00", "msg": "[YM1] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.823506-06:00", "msg": "[YM1] Results saved to: data/sequencer_temp/2025-11-21/YM1_seq_20251121_014821.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.823840-06:00", "msg": "[YM1] Results also saved to: data/sequencer_temp/2025-11-21/YM1_seq_20251121_014821.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.824682-06:00", "msg": "[YM1] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.825701-06:00", "msg": "Starting YM2 (12/12)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.825964-06:00", "msg": "Input file: YM2_an_2025_09.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:21.826374-06:00", "msg": "Stream: YM2, Start time: 09:30"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:22.460748-06:00", "msg": "[YM2] FINAL RESULTS"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:22.462329-06:00", "msg": "[YM2] Results saved to: data/sequencer_temp/2025-11-21/YM2_seq_20251121_014822.parquet"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:22.462683-06:00", "msg": "[YM2] Results also saved to: data/sequencer_temp/2025-11-21/YM2_seq_20251121_014822.csv"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:48:22.463650-06:00", "msg": "[YM2] Completed successfully"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:48:22.464005-06:00", "msg": "Completed for all 12 stream(s)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "archive", "event": "start", "timestamp": "2025-11-20T19:48:22.464483-06:00", "msg": "Archiving analyzer files"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "archive", "event": "log", "timestamp": "2025-11-20T19:48:22.482908-06:00", "msg": "Archiving 1274 analyzer file(s)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "archive", "event": "metric", "timestamp": "2025-11-20T19:48:22.927710-06:00", "msg": "Archiving complete", "data": {"archived_count": 1274, "failed_count": 0, "total_files": 1274}}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "archive", "event": "success", "timestamp": "2025-11-20T19:48:22.928040-06:00", "msg": "Archived 1274 analyzer file(s)"}
+{"run_id": "afdcdaae-0ba1-43e8-9a80-d4caed6dc7a0", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:48:22.928768-06:00", "msg": "sequential stage completed successfully"}

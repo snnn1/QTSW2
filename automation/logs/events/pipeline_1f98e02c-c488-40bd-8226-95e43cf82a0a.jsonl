@@ -1,0 +1,5 @@
+{"run_id": "139566d9-729d-42fe-9571-c6671f408602", "stage": "pipeline", "event": "start", "timestamp": "2025-11-20T19:37:03.474061-06:00", "msg": "Running sequential stage only"}
+{"run_id": "139566d9-729d-42fe-9571-c6671f408602", "stage": "sequential", "event": "start", "timestamp": "2025-11-20T19:37:03.474657-06:00", "msg": "Starting sequential processor stage"}
+{"run_id": "139566d9-729d-42fe-9571-c6671f408602", "stage": "sequential", "event": "log", "timestamp": "2025-11-20T19:37:03.489813-06:00", "msg": "No analyzer parquet files found in C:\\Users\\jakej\\QTSW2\\data\\analyzer_runs"}
+{"run_id": "139566d9-729d-42fe-9571-c6671f408602", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:37:03.490254-06:00", "msg": "Sequential processor skipped (no analyzer files)"}
+{"run_id": "139566d9-729d-42fe-9571-c6671f408602", "stage": "sequential", "event": "success", "timestamp": "2025-11-20T19:37:03.490563-06:00", "msg": "sequential stage completed successfully"}
