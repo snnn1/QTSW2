@@ -948,6 +948,32 @@ async def build_master_matrix(request: MatrixBuildRequest):
     logger.info("BUILD ENDPOINT HIT!")
     logger.info("=" * 80)
     
+    # Write directly to master_matrix.log FIRST (before module reload) - FORCE IT
+    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
+        # Open in append mode, write immediately, force flush
+        f = open(master_matrix_log, 'a', encoding='utf-8')
+        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
+        f.write(f"{timestamp} - INFO - BUILD ENDPOINT HIT!\n")
+        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
+        f.flush()
+        import os
+        if hasattr(f, 'fileno'):
+            try:
+                os.fsync(f.fileno())
+            except:
+                pass
+        f.close()
+        # Also print to stderr to confirm
+        print(f"[DEBUG] Wrote BUILD ENDPOINT HIT to {master_matrix_log}", file=sys.stderr, flush=True)
+    except Exception as e:
+        error_msg = f"ERROR writing to master_matrix.log: {e}"
+        logger.error(error_msg)
+        print(error_msg, file=sys.stderr, flush=True)
+    
     # RELOAD MODULE FIRST - before anything else
     try:
         import importlib
@@ -990,71 +1016,48 @@ async def build_master_matrix(request: MatrixBuildRequest):
     except Exception as e:
         logger.error(f"ERROR reloading MasterMatrix module: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to load MasterMatrix module: {e}")
-        
-        # Test that debug logging works - write directly to file
-        master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
-        try:
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(master_matrix_log, 'a', encoding='utf-8') as f:
-                f.write(f"[{timestamp}] [DEBUG] BUILD ENDPOINT CALLED - Master Matrix import successful\n")
-                f.write(f"[{timestamp}] [DEBUG] About to process stream_filters\n")
-                f.flush()
-                import os
-                os.fsync(f.fileno()) if hasattr(f, 'fileno') else None
-        except Exception as e:
-            print(f"Error writing debug log: {e}", file=sys.stderr, flush=True)
-        
-        # Also use debug_log function
-        logger.info("BUILD ENDPOINT CALLED - Master Matrix import successful")
-        logger.info("About to process stream_filters")
-        
-        # Convert stream_filters from Pydantic models to dicts
-        stream_filters_dict = None
-        if request.stream_filters:
-            stream_filters_dict = {
-                stream_id: {
-                    "exclude_days_of_week": filter_config.exclude_days_of_week,
-                    "exclude_days_of_month": filter_config.exclude_days_of_month,
-                    "exclude_times": filter_config.exclude_times
-                }
-                for stream_id, filter_config in request.stream_filters.items()
+    
+    # Write to master_matrix.log using the master_matrix logger (after successful reload)
+    master_matrix_logger = logging.getLogger('master_matrix.master_matrix')
+    master_matrix_logger.info("BUILD ENDPOINT CALLED - Master Matrix import successful")
+    master_matrix_logger.info("About to process stream_filters")
+    
+    # Convert stream_filters from Pydantic models to dicts
+    stream_filters_dict = None
+    if request.stream_filters:
+        stream_filters_dict = {
+            stream_id: {
+                "exclude_days_of_week": filter_config.exclude_days_of_week,
+                "exclude_days_of_month": filter_config.exclude_days_of_month,
+                "exclude_times": filter_config.exclude_times
             }
-        
-        # Write debug info to master matrix debug log
-        master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
-        try:
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(master_matrix_log, 'a', encoding='utf-8') as f:
-                f.write(f"[{timestamp}] [DEBUG] BUILDING MASTER MATRIX - FILTER DEBUG\n")
-                f.write(f"[{timestamp}] [DEBUG] Streams to rebuild: {request.streams}\n")
-                f.write(f"[{timestamp}] [DEBUG] Stream filters received: {stream_filters_dict}\n")
-                if stream_filters_dict:
-                    for stream_id, filters in stream_filters_dict.items():
-                        exclude_times = filters.get('exclude_times', [])
-                        if exclude_times:
-                            f.write(f"[{timestamp}] [DEBUG]   {stream_id}: exclude_times = {exclude_times}\n")
-                f.write(f"[{timestamp}] ========================================\n")
-                f.flush()
-                import os
-                os.fsync(f.fileno()) if hasattr(f, 'fileno') else None
-        except Exception as e:
-            import sys
-            print(f"Error writing to master matrix debug log: {e}", file=sys.stderr, flush=True)
-        
-        logger = logging.getLogger(__name__)
-        logger.info("=" * 80)
-        logger.info("[DEBUG] BUILDING MASTER MATRIX")
-        logger.info(f"[DEBUG] Streams: {request.streams}")
-        logger.info(f"[DEBUG] Filters: {stream_filters_dict}")
-        if stream_filters_dict:
-            for stream_id, filters in stream_filters_dict.items():
-                exclude_times = filters.get('exclude_times', [])
-                if exclude_times:
-                    logger.info(f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}")
-        logger.info("=" * 80)
-        
+            for stream_id, filter_config in request.stream_filters.items()
+        }
+    
+    # Write debug info to master matrix log using logger
+    master_matrix_logger.info("=" * 80)
+    master_matrix_logger.info("BUILDING MASTER MATRIX - FILTER DEBUG")
+    master_matrix_logger.info(f"Streams to rebuild: {request.streams}")
+    master_matrix_logger.info(f"Stream filters received: {stream_filters_dict}")
+    if stream_filters_dict:
+        for stream_id, filters in stream_filters_dict.items():
+            exclude_times = filters.get('exclude_times', [])
+            if exclude_times:
+                master_matrix_logger.info(f"  {stream_id}: exclude_times = {exclude_times}")
+    master_matrix_logger.info("=" * 80)
+    
+    logger.info("=" * 80)
+    logger.info("[DEBUG] BUILDING MASTER MATRIX")
+    logger.info(f"[DEBUG] Streams: {request.streams}")
+    logger.info(f"[DEBUG] Filters: {stream_filters_dict}")
+    if stream_filters_dict:
+        for stream_id, filters in stream_filters_dict.items():
+            exclude_times = filters.get('exclude_times', [])
+            if exclude_times:
+                logger.info(f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}")
+    logger.info("=" * 80)
+    
+    try:
         # Initialize MasterMatrix - verify we have the latest version
         logger.info("About to create MasterMatrix instance")
         
@@ -1067,7 +1070,11 @@ async def build_master_matrix(request: MatrixBuildRequest):
         # Build kwargs only with valid parameters
         init_kwargs = {}
         if "analyzer_runs_dir" in valid_params:
-            init_kwargs["analyzer_runs_dir"] = request.analyzer_runs_dir
+            # Convert relative path to absolute path
+            analyzer_runs_path = Path(request.analyzer_runs_dir)
+            if not analyzer_runs_path.is_absolute():
+                analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
+            init_kwargs["analyzer_runs_dir"] = str(analyzer_runs_path)
         if "stream_filters" in valid_params and stream_filters_dict is not None:
             init_kwargs["stream_filters"] = stream_filters_dict
         
@@ -1113,13 +1120,18 @@ async def build_master_matrix(request: MatrixBuildRequest):
             f.write(f"[DEBUG] About to call build_master_matrix with filters: {stream_filters_dict}\n")
             f.flush()
         
+        # Convert analyzer_runs_dir to absolute path for build_master_matrix call
+        analyzer_runs_path = Path(request.analyzer_runs_dir)
+        if not analyzer_runs_path.is_absolute():
+            analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
+        
         master_df = matrix.build_master_matrix(
             start_date=request.start_date,
             end_date=request.end_date,
             specific_date=request.specific_date,
             output_dir=request.output_dir,
             stream_filters=stream_filters_dict,
-            analyzer_runs_dir=request.analyzer_runs_dir,
+            analyzer_runs_dir=str(analyzer_runs_path),
             streams=request.streams
         )
         
@@ -1152,6 +1164,8 @@ async def build_master_matrix(request: MatrixBuildRequest):
             "allowed_trades": int(master_df['final_allowed'].sum()),
             "statistics": stats
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
 

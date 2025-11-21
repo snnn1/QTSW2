@@ -300,3 +300,5 @@ Timetable Files (data/timetable/)
 - Verify day-of-month blocking logic
 - Check that filters are configured correctly
 
+
+

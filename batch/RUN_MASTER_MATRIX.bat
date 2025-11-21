@@ -26,7 +26,9 @@ REM Check if backend is already running
 netstat -an | findstr ":8000" >nul 2>&1
 if errorlevel 1 (
     echo [1/4] Starting backend...
-    start "Master Matrix Backend" cmd /k "cd /d \"%PROJECT_ROOT%\dashboard\backend\" && python -u main.py"
+    cd /d "%PROJECT_ROOT%\dashboard\backend"
+    start "Master Matrix Backend" cmd /k "python -u main.py"
+    cd /d "%PROJECT_ROOT%"
     echo Waiting for backend to start...
     timeout /t 5 /nobreak >nul
 ) else (
@@ -37,7 +39,9 @@ REM Check if frontend is already running
 netstat -an | findstr ":5174" >nul 2>&1
 if errorlevel 1 (
     echo [2/4] Starting frontend...
-    start "Master Matrix Frontend" cmd /k "cd /d \"%PROJECT_ROOT%\matrix_timetable_app\frontend\" && npm run dev"
+    cd /d "%PROJECT_ROOT%\matrix_timetable_app\frontend"
+    start "Master Matrix Frontend" cmd /k "npm run dev"
+    cd /d "%PROJECT_ROOT%"
     echo Waiting for frontend to start...
     timeout /t 8 /nobreak >nul
 ) else (
@@ -51,7 +55,9 @@ start http://localhost:5174
 
 REM Open debug log viewer
 echo [4/4] Opening debug log viewer...
-start "Master Matrix Debug Log" cmd /k "cd /d \"%PROJECT_ROOT%\" && batch\VIEW_MASTER_MATRIX_DEBUG.bat"
+cd /d "%PROJECT_ROOT%\batch"
+start "Master Matrix Debug Log" cmd /k "VIEW_MASTER_MATRIX_DEBUG.bat"
+cd /d "%PROJECT_ROOT%"
 
 echo.
 echo ================================================

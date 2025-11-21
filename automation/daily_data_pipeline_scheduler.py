@@ -1233,17 +1233,42 @@ class PipelineOrchestrator:
                 
                 # Load and combine all files
                 self.logger.info(f"  Combining {len(session_files)} files into temporary file...")
+                emit_event(self.run_id, "sequential", "log", f"Loading {len(session_files)} monthly file(s)...")
                 combined_dfs = []
-                for data_file in session_files:
+                for file_idx, data_file in enumerate(session_files, 1):
+                    # Extract month/year from filename (e.g., ES1_an_2025_11.parquet -> 2025-11)
+                    filename = data_file.name
+                    month_match = None
+                    import re
+                    # Try to extract year_month from filename patterns
+                    match = re.search(r'(\d{4})[_-](\d{1,2})', filename)
+                    if match:
+                        year = match.group(1)
+                        month = match.group(2).zfill(2)
+                        month_match = f"{year}-{month}"
+                    
                     df = pd.read_parquet(data_file)
+                    row_count = len(df)
                     combined_dfs.append(df)
+                    
+                    month_info = f" ({month_match})" if month_match else ""
+                    self.logger.info(f"    [{file_idx}/{len(session_files)}] Loaded {data_file.name}{month_info}: {row_count:,} rows")
+                    emit_event(self.run_id, "sequential", "log", f"Loaded {file_idx}/{len(session_files)}: {data_file.name}{month_info} ({row_count:,} rows)")
                 
                 combined_df = pd.concat(combined_dfs, ignore_index=True)
                 combined_df = combined_df.sort_values('Date').reset_index(drop=True)
                 combined_df.to_parquet(temp_combined_path, index=False, compression='snappy')
                 
-                self.logger.info(f"  Combined {len(combined_df):,} rows from {len(session_files)} file(s)")
-                emit_event(self.run_id, "sequential", "log", f"Combined {len(combined_df):,} rows from {len(session_files)} file(s)")
+                # Get date range
+                if len(combined_df) > 0:
+                    min_date = combined_df['Date'].min()
+                    max_date = combined_df['Date'].max()
+                    date_range = f" ({min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')})"
+                else:
+                    date_range = ""
+                
+                self.logger.info(f"  Combined {len(combined_df):,} rows from {len(session_files)} file(s){date_range}")
+                emit_event(self.run_id, "sequential", "log", f"Combined {len(combined_df):,} rows from {len(session_files)} file(s){date_range}")
                 
                 sequential_cmd = [
                     sys.executable,
@@ -1501,15 +1526,15 @@ class DailyPipelineScheduler:
         
         # Stage 2.5: Data Merger (merge analyzer files into monthly files)
         if success and run_analyzer_stage:
-            self.orchestrator.run_data_merger()
+            success = success and self.orchestrator.run_data_merger()
         
         # Stage 3: Sequential Processor (runs on merged analyzer files)
         if success:
-            self.orchestrator.run_sequential_processor()
+            success = success and self.orchestrator.run_sequential_processor()
         
         # Stage 3.5: Data Merger (merge sequencer files into monthly files)
         if success:
-            self.orchestrator.run_data_merger()
+            success = success and self.orchestrator.run_data_merger()
         
         # Generate audit report
         report = self.orchestrator.generate_audit_report()

@@ -522,15 +522,24 @@ class SequentialProcessorV2:
         print("=" * 100)
         print(f"Starting with: Time={self.current_time}")
         print(f"Max Days: {'ALL AVAILABLE DATA' if max_days >= 10000 else max_days}")
+        
+        # Get date range from data
+        if len(self.data) > 0:
+            min_date = self.data['Date'].min()
+            max_date = self.data['Date'].max()
+            print(f"Data range: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+            print(f"Total rows: {len(self.data):,}")
         print("=" * 100)
         
         # Process all available data if max_days is very high
         if max_days >= 10000:
             max_days = 999999  # Effectively unlimited
         
+        # Track current month for progress logging
+        current_month = None
+        days_in_month = 0
+        
         for day in range(1, max_days + 1):
-            print(f"\n--- DAY {day} ---")
-            
             # Check if current time is excluded
             exclude_times_str = [str(t) for t in self.exclude_times] if self.exclude_times else []
             if str(self.current_time) in exclude_times_str:
@@ -549,13 +558,38 @@ class SequentialProcessorV2:
             # Get data for current time/session combination
             data_row = self.get_next_data(self.current_time, self.current_session)
             
-            print(f"Looking for: Time={self.current_time}, Session={self.current_session}")
-            print(f"Data found: {data_row['Date']} | Peak={data_row['Peak']} | Result={data_row['Result']}")
-            
             # Check if we've run out of data
             if data_row['Date'] == 'NO DATA':
-                print(f"No more data available. Stopping at day {day-1}")
+                # Log final month summary if we were processing a month
+                if current_month is not None:
+                    print(f"\n✓ Completed month {current_month}: {days_in_month} days processed")
+                print(f"\nNo more data available. Stopping at day {day-1}")
                 break
+            
+            # Track month changes for progress logging
+            if data_row['Date'] != 'NO DATA':
+                data_date = pd.to_datetime(data_row['Date'])
+                month_key = f"{data_date.year}-{data_date.month:02d}"
+                
+                # If month changed, log completion of previous month
+                if current_month is not None and month_key != current_month:
+                    print(f"\n✓ Completed month {current_month}: {days_in_month} days processed")
+                    days_in_month = 0
+                
+                # If starting a new month, log it
+                if month_key != current_month:
+                    current_month = month_key
+                    month_name = data_date.strftime('%B %Y')
+                    print(f"\n{'='*100}")
+                    print(f"📅 Processing month: {month_name} ({current_month})")
+                    print(f"{'='*100}")
+                    days_in_month = 0
+                
+                days_in_month += 1
+            
+            print(f"\n--- DAY {day} ({data_row['Date']}) ---")
+            print(f"Looking for: Time={self.current_time}, Session={self.current_session}")
+            print(f"Data found: {data_row['Date']} | Peak={data_row['Peak']} | Result={data_row['Result']}")
             
             # Store current state before changes
             old_time = self.current_time

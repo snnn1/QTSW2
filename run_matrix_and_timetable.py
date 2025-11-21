@@ -48,8 +48,8 @@ Examples:
                        help='End date for master matrix (YYYY-MM-DD)')
     parser.add_argument('--date', type=str,
                        help='Specific date for matrix/timetable (YYYY-MM-DD)')
-    parser.add_argument('--sequencer-runs-dir', type=str, default='data/sequencer_runs',
-                       help='Directory containing sequential processor output files')
+    parser.add_argument('--analyzer-runs-dir', type=str, default='data/analyzer_runs',
+                       help='Directory containing analyzer output files')
     parser.add_argument('--matrix-output-dir', type=str, default='data/master_matrix',
                        help='Output directory for master matrix files')
     parser.add_argument('--timetable-output-dir', type=str, default='data/timetable',
@@ -69,13 +69,13 @@ Examples:
         print("BUILDING MASTER MATRIX")
         print("=" * 80)
         
-        matrix = MasterMatrix(sequencer_runs_dir=args.sequencer_runs_dir)
+        matrix = MasterMatrix(analyzer_runs_dir=args.analyzer_runs_dir)
         master_df = matrix.build_master_matrix(
             start_date=args.start_date,
             end_date=args.end_date,
             specific_date=args.date,
             output_dir=args.matrix_output_dir,
-            sequencer_runs_dir=args.sequencer_runs_dir
+            analyzer_runs_dir=args.analyzer_runs_dir
         )
         
         if master_df.empty:

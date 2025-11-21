@@ -1,0 +1,7 @@
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "pipeline", "event": "start", "timestamp": "2025-11-21T08:16:40.529586-06:00", "msg": "Running sequential stage only"}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "start", "timestamp": "2025-11-21T08:16:40.530162-06:00", "msg": "Starting sequential processor stage"}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "log", "timestamp": "2025-11-21T08:16:40.551162-06:00", "msg": "Found 12 stream(s) to process: CL1, CL2, ES1, ES2, GC1, GC2, NG1, NG2, NQ1, NQ2, YM1, YM2"}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "metric", "timestamp": "2025-11-21T08:16:40.551504-06:00", "msg": "Sequential processor started", "data": {"stream_count": 12, "streams": ["CL1", "CL2", "ES1", "ES2", "GC1", "GC2", "NG1", "NG2", "NQ1", "NQ2", "YM1", "YM2"]}}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "log", "timestamp": "2025-11-21T08:16:40.552065-06:00", "msg": "Starting CL1 (1/12)"}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "log", "timestamp": "2025-11-21T08:16:40.552378-06:00", "msg": "Processing 106 monthly file(s)"}
+{"run_id": "f21b4c6c-6ceb-41f9-af9f-1ee59bf9f623", "stage": "sequential", "event": "log", "timestamp": "2025-11-21T08:16:40.557105-06:00", "msg": "Stream: CL1, Start time: 08:00"}

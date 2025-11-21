@@ -2,7 +2,10 @@
 setlocal enabledelayedexpansion
 REM View Master Matrix Debug Log
 
-cd /d %~dp0..
+REM Get the project root (parent of batch directory)
+set "BATCH_DIR=%~dp0"
+set "PROJECT_ROOT=%BATCH_DIR%.."
+cd /d "%PROJECT_ROOT%"
 
 title Master Matrix Debug Log
 color 0A
@@ -50,12 +53,14 @@ echo ========================================
 echo.
 
 REM Show last 50 lines first
-powershell -NoProfile -Command "Get-Content '%LOG_PATH%' -Tail 50 -ErrorAction SilentlyContinue"
+powershell -NoProfile -Command "Get-Content \"%LOG_PATH%\" -Tail 50 -ErrorAction SilentlyContinue"
 echo.
 echo.
 echo Tailing log - new entries will appear below
 echo.
 
-REM Tail the log file - use a more reliable method
-powershell -NoProfile -Command "$logPath = '%LOG_PATH%'; $lastSize = 0; while ($true) { if (Test-Path $logPath) { $currentSize = (Get-Item $logPath).Length; if ($currentSize -gt $lastSize) { $newContent = Get-Content $logPath -Tail 50; $newContent | ForEach-Object { Write-Host $_ }; $lastSize = $currentSize } } Start-Sleep -Seconds 1 }"
+REM Tail the log file - pass path via environment variable to avoid quoting issues
+set "PS_LOG_PATH=%LOG_PATH%"
+powershell -NoProfile -Command "$logPath = $env:PS_LOG_PATH; $lastSize = 0; while ($true) { if (Test-Path $logPath) { try { $currentSize = (Get-Item $logPath).Length; if ($currentSize -gt $lastSize) { $newContent = Get-Content $logPath -Tail 50 -ErrorAction Stop; $newContent | ForEach-Object { Write-Host $_ }; $lastSize = $currentSize } } catch { Start-Sleep -Seconds 1 } } else { Start-Sleep -Seconds 2 } Start-Sleep -Seconds 1 }"
+set "PS_LOG_PATH="
 

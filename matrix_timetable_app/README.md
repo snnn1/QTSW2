@@ -66,3 +66,5 @@ The app uses the dashboard backend API:
 - The frontend runs on port 5174 (different from dashboard frontend)
 - Both can run simultaneously
 
+
+
