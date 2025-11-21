@@ -1,130 +1,69 @@
 @echo off
-title Master Matrix Builder
+setlocal enabledelayedexpansion
+title Master Matrix
 color 0A
 
-REM Prevent immediate exit on error
-setlocal enabledelayedexpansion
-
 echo.
 echo ================================================
-echo       MASTER MATRIX BUILDER
+echo   Master Matrix
 echo ================================================
 echo.
 
-REM Get script directory and go to project root
-cd /d "%~dp0\.."
-if errorlevel 1 (
-    echo ERROR: Failed to change to project directory
-    echo Current directory: %CD%
-    pause
-    exit /b 1
+REM Change to project root
+cd /d %~dp0..
+set "PROJECT_ROOT=%CD%"
+
+REM Create logs directory if it doesn't exist
+if not exist "%PROJECT_ROOT%\logs" mkdir "%PROJECT_ROOT%\logs" 2>nul
+
+REM Create master matrix log file if it doesn't exist
+set "MASTER_MATRIX_LOG=%PROJECT_ROOT%\logs\master_matrix.log"
+if not exist "%MASTER_MATRIX_LOG%" (
+    echo [%date% %time%] Log file created by RUN_MASTER_MATRIX.bat > "%MASTER_MATRIX_LOG%"
 )
 
-set PROJECT_ROOT=%CD%
-echo Project Root: %PROJECT_ROOT%
-echo.
-
-REM Check if backend is running
-echo [1/3] Checking backend...
+REM Check if backend is already running
 netstat -an | findstr ":8000" >nul 2>&1
 if errorlevel 1 (
-    echo Backend not running. Starting...
-    cd /d "%PROJECT_ROOT%\dashboard\backend"
-    if errorlevel 1 (
-        echo ERROR: Cannot access backend directory
-        echo Path: %PROJECT_ROOT%\dashboard\backend
-        echo Current directory: %CD%
-        pause
-        exit /b 1
-    )
-    if exist "main.py" (
-        echo Starting backend server...
-        echo Backend window will open - keep it open!
-        start "" cmd /k "title Dashboard Backend && cd /d \"%PROJECT_ROOT%\dashboard\backend\" && python main.py"
-        echo Waiting 8 seconds for backend to start...
-        timeout /t 8 /nobreak >nul
-        
-        REM Check if it started
-        netstat -an | findstr ":8000" >nul 2>&1
-        if errorlevel 1 (
-            echo.
-            echo WARNING: Backend may not have started yet.
-            echo Check the "Dashboard Backend" window for errors.
-            echo Waiting 5 more seconds...
-            timeout /t 5 /nobreak >nul
-            netstat -an | findstr ":8000" >nul 2>&1
-            if errorlevel 1 (
-                echo ERROR: Backend failed to start. Check the backend window.
-            ) else (
-                echo Backend started successfully!
-            )
-        ) else (
-            echo Backend started successfully!
-        )
-    ) else (
-        echo ERROR: main.py not found at %PROJECT_ROOT%\dashboard\backend\main.py
-        pause
-        exit /b 1
-    )
+    echo [1/4] Starting backend...
+    start "Master Matrix Backend" cmd /k "cd /d \"%PROJECT_ROOT%\dashboard\backend\" && python -u main.py"
+    echo Waiting for backend to start...
+    timeout /t 5 /nobreak >nul
 ) else (
-    echo Backend already running on port 8000
+    echo [1/4] Backend already running on port 8000
 )
 
-REM Check if frontend is running
-echo [2/3] Checking frontend...
+REM Check if frontend is already running
 netstat -an | findstr ":5174" >nul 2>&1
 if errorlevel 1 (
-    echo Frontend not running. Starting...
-    cd /d "%PROJECT_ROOT%\matrix_timetable_app\frontend"
-    if errorlevel 1 (
-        echo ERROR: Cannot access frontend directory
-        echo Path: %PROJECT_ROOT%\matrix_timetable_app\frontend
-        pause
-        exit /b 1
-    )
-    if exist "package.json" (
-        if not exist "node_modules" (
-            echo Installing dependencies...
-            call npm install
-            if errorlevel 1 (
-                echo ERROR: npm install failed
-                pause
-                exit /b 1
-            )
-        )
-        echo Starting frontend server...
-        start "" cmd /k "cd /d \"%PROJECT_ROOT%\matrix_timetable_app\frontend\" && npm run dev"
-        echo Waiting 15 seconds for server to start...
-        timeout /t 15 /nobreak >nul
-        
-        REM Check if it started
-        netstat -an | findstr ":5174" >nul 2>&1
-        if errorlevel 1 (
-            echo WARNING: Frontend may not have started. Check the frontend window for errors.
-        ) else (
-            echo Frontend started successfully!
-        )
-    ) else (
-        echo ERROR: package.json not found
-        pause
-        exit /b 1
-    )
+    echo [2/4] Starting frontend...
+    start "Master Matrix Frontend" cmd /k "cd /d \"%PROJECT_ROOT%\matrix_timetable_app\frontend\" && npm run dev"
+    echo Waiting for frontend to start...
+    timeout /t 8 /nobreak >nul
 ) else (
-    echo Frontend already running
+    echo [2/4] Frontend already running on port 5174
 )
 
 REM Open browser
-echo [3/3] Opening browser...
+echo [3/4] Opening browser...
 timeout /t 2 /nobreak >nul
 start http://localhost:5174
 
+REM Open debug log viewer
+echo [4/4] Opening debug log viewer...
+start "Master Matrix Debug Log" cmd /k "cd /d \"%PROJECT_ROOT%\" && batch\VIEW_MASTER_MATRIX_DEBUG.bat"
+
 echo.
 echo ================================================
-echo Done!
+echo Master Matrix is ready!
+echo.
+echo Backend:  http://localhost:8000
 echo Frontend: http://localhost:5174
-echo Backend: http://localhost:8000
 echo.
-echo Check the frontend window for any errors.
-echo Press any key to close...
+echo Browser should open automatically.
+echo Debug log viewer opened in separate window.
+echo.
+echo Press any key to close this window...
+echo (Backend and frontend will keep running)
 echo ================================================
-pause
+pause >nul

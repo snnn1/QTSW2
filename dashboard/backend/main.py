@@ -4,6 +4,7 @@ FastAPI server for pipeline monitoring and control
 """
 
 import os
+import sys
 import json
 import subprocess
 import asyncio
@@ -46,10 +47,60 @@ app = FastAPI(title="Pipeline Dashboard API")
 # Configure logging to reduce verbosity for routine polling
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
+# Configure logging to also write to log file
+LOG_FILE_PATH = QTSW2_ROOT / "logs" / "backend_debug.log"
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Create a file handler for the log file
+file_handler = logging.FileHandler(LOG_FILE_PATH, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Add file handler to root logger
+root_logger = logging.getLogger()
+root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.INFO)
+
+# Log startup message
+import sys
+startup_msg = "=" * 80 + "\nMaster Matrix Backend Starting...\n" + "=" * 80 + "\n"
+print(startup_msg, file=sys.stderr)
+sys.stderr.flush()
+# Also write directly to log file
+with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+    f.write(startup_msg)
+    f.flush()
+
+# Startup event handler - this runs when FastAPI starts
+@app.on_event("startup")
+async def startup_event():
+    import sys
+    logger = logging.getLogger(__name__)
+    startup_msg2 = "=" * 80 + "\nFastAPI application started - ready to receive requests\n" + "=" * 80 + "\n"
+    print(startup_msg2, file=sys.stderr)
+    sys.stderr.flush()
+    # Also write directly to log file
+    with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+        f.write(startup_msg2)
+        f.flush()
+    logger.info("FastAPI application started - ready to receive requests")
+    
+    # Create master matrix debug log file on startup
+    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+    master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(master_matrix_log, 'a', encoding='utf-8') as f:
+            from datetime import datetime
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Backend started - master matrix debug logging ready\n")
+            f.flush()
+    except:
+        pass
+
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000"],  # Vite default ports
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://192.168.1.171:5174"],  # Vite default ports + network
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,7 +146,35 @@ def save_schedule_config(config: ScheduleConfig):
 
 @app.get("/")
 async def root():
-    return {"message": "Pipeline Dashboard API"}
+    return {"message": "Pipeline Dashboard API", "status": "running", "test_endpoint": "/api/test-debug-log"}
+
+@app.get("/api/matrix/test")
+async def test_matrix_endpoint():
+    """Simple test endpoint to verify frontend can reach backend"""
+    logger = logging.getLogger(__name__)
+    logger.info("TEST ENDPOINT HIT - Frontend can reach backend!")
+    return {"status": "success", "message": "Backend is reachable from frontend"}
+
+
+@app.get("/api/test-debug-log")
+async def test_debug_log():
+    """Test endpoint to verify debug logging works"""
+    import os
+    from datetime import datetime
+    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+    master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    test_msg = f"[{timestamp}] TEST: Debug log endpoint works!\n"
+    
+    try:
+        with open(master_matrix_log, 'a', encoding='utf-8') as f:
+            f.write(test_msg)
+            f.flush()
+            os.fsync(f.fileno())
+        return {"status": "success", "message": "Debug log written successfully", "file": str(master_matrix_log)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "file": str(master_matrix_log)}
 
 
 @app.get("/api/schedule", response_model=ScheduleConfig)
@@ -843,9 +922,10 @@ class MatrixBuildRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     specific_date: Optional[str] = None
-    sequencer_runs_dir: str = "data/sequencer_runs"
+    analyzer_runs_dir: str = "data/analyzer_runs"
     output_dir: str = "data/master_matrix"
     stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
+    streams: Optional[List[str]] = None  # If provided, only rebuild these streams
 
 
 class TimetableRequest(BaseModel):
@@ -858,10 +938,76 @@ class TimetableRequest(BaseModel):
 @app.post("/api/matrix/build")
 async def build_master_matrix(request: MatrixBuildRequest):
     """Build master matrix from all streams."""
+    import os
+    import sys
+    from datetime import datetime
+    
+    # Get logger first
+    logger = logging.getLogger(__name__)
+    logger.info("=" * 80)
+    logger.info("BUILD ENDPOINT HIT!")
+    logger.info("=" * 80)
+    
+    # RELOAD MODULE FIRST - before anything else
     try:
-        import sys
+        import importlib
+        import inspect
         sys.path.insert(0, str(QTSW2_ROOT))
-        from master_matrix.master_matrix import MasterMatrix
+        
+        # ALWAYS reload the module to ensure we have the latest version
+        # Remove all master_matrix related modules from cache
+        modules_to_remove = [key for key in list(sys.modules.keys()) if 'master_matrix' in key]
+        for module_name in modules_to_remove:
+            del sys.modules[module_name]
+        
+        # Clear import cache
+        importlib.invalidate_caches()
+        
+        # Force reload from file - this ensures we get the latest code
+        import importlib.util
+        master_matrix_file = QTSW2_ROOT / "master_matrix" / "master_matrix.py"
+        spec = importlib.util.spec_from_file_location(
+            "master_matrix_master_matrix",
+            master_matrix_file
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load spec from {master_matrix_file}")
+        
+        master_matrix_module = importlib.util.module_from_spec(spec)
+        # Execute the module to load it
+        spec.loader.exec_module(master_matrix_module)
+        MasterMatrix = master_matrix_module.MasterMatrix
+        
+        # Verify the signature
+        sig = inspect.signature(MasterMatrix.__init__)
+        params = list(sig.parameters.keys())
+        logger.info(f"MasterMatrix signature: {params}")
+        
+        if 'sequencer_runs_dir' not in params:
+            logger.warning("WARNING: MasterMatrix does NOT have sequencer_runs_dir parameter!")
+        else:
+            logger.info("MasterMatrix has sequencer_runs_dir parameter - good!")
+    except Exception as e:
+        logger.error(f"ERROR reloading MasterMatrix module: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load MasterMatrix module: {e}")
+        
+        # Test that debug logging works - write directly to file
+        master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(master_matrix_log, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] [DEBUG] BUILD ENDPOINT CALLED - Master Matrix import successful\n")
+                f.write(f"[{timestamp}] [DEBUG] About to process stream_filters\n")
+                f.flush()
+                import os
+                os.fsync(f.fileno()) if hasattr(f, 'fileno') else None
+        except Exception as e:
+            print(f"Error writing debug log: {e}", file=sys.stderr, flush=True)
+        
+        # Also use debug_log function
+        logger.info("BUILD ENDPOINT CALLED - Master Matrix import successful")
+        logger.info("About to process stream_filters")
         
         # Convert stream_filters from Pydantic models to dicts
         stream_filters_dict = None
@@ -875,18 +1021,111 @@ async def build_master_matrix(request: MatrixBuildRequest):
                 for stream_id, filter_config in request.stream_filters.items()
             }
         
-        matrix = MasterMatrix(
-            sequencer_runs_dir=request.sequencer_runs_dir,
-            stream_filters=stream_filters_dict
-        )
+        # Write debug info to master matrix debug log
+        master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(master_matrix_log, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] [DEBUG] BUILDING MASTER MATRIX - FILTER DEBUG\n")
+                f.write(f"[{timestamp}] [DEBUG] Streams to rebuild: {request.streams}\n")
+                f.write(f"[{timestamp}] [DEBUG] Stream filters received: {stream_filters_dict}\n")
+                if stream_filters_dict:
+                    for stream_id, filters in stream_filters_dict.items():
+                        exclude_times = filters.get('exclude_times', [])
+                        if exclude_times:
+                            f.write(f"[{timestamp}] [DEBUG]   {stream_id}: exclude_times = {exclude_times}\n")
+                f.write(f"[{timestamp}] ========================================\n")
+                f.flush()
+                import os
+                os.fsync(f.fileno()) if hasattr(f, 'fileno') else None
+        except Exception as e:
+            import sys
+            print(f"Error writing to master matrix debug log: {e}", file=sys.stderr, flush=True)
+        
+        logger = logging.getLogger(__name__)
+        logger.info("=" * 80)
+        logger.info("[DEBUG] BUILDING MASTER MATRIX")
+        logger.info(f"[DEBUG] Streams: {request.streams}")
+        logger.info(f"[DEBUG] Filters: {stream_filters_dict}")
+        if stream_filters_dict:
+            for stream_id, filters in stream_filters_dict.items():
+                exclude_times = filters.get('exclude_times', [])
+                if exclude_times:
+                    logger.info(f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}")
+        logger.info("=" * 80)
+        
+        # Initialize MasterMatrix - verify we have the latest version
+        logger.info("About to create MasterMatrix instance")
+        
+        # Only pass parameters that exist in the signature - explicitly check signature first
+        import inspect
+        sig = inspect.signature(MasterMatrix.__init__)
+        valid_params = set(sig.parameters.keys()) - {'self'}
+        logger.info(f"MasterMatrix valid parameters: {valid_params}")
+        
+        # Build kwargs only with valid parameters
+        init_kwargs = {}
+        if "analyzer_runs_dir" in valid_params:
+            init_kwargs["analyzer_runs_dir"] = request.analyzer_runs_dir
+        if "stream_filters" in valid_params and stream_filters_dict is not None:
+            init_kwargs["stream_filters"] = stream_filters_dict
+        
+        # Explicitly exclude sequencer_runs_dir even if it exists in signature
+        if "sequencer_runs_dir" in init_kwargs:
+            del init_kwargs["sequencer_runs_dir"]
+        
+        logger.info(f"Creating MasterMatrix with kwargs: {init_kwargs}")
+        logger.info(f"Valid parameters from signature: {valid_params}")
+        
+        # Double-check we're not passing sequencer_runs_dir
+        if "sequencer_runs_dir" in init_kwargs:
+            logger.error(f"ERROR: sequencer_runs_dir is in init_kwargs! Removing it...")
+            del init_kwargs["sequencer_runs_dir"]
+        
+        try:
+            matrix = MasterMatrix(**init_kwargs)
+            logger.info("MasterMatrix created successfully")
+        except TypeError as e:
+            error_str = str(e)
+            logger.error(f"TypeError creating MasterMatrix: {error_str}")
+            logger.error(f"init_kwargs passed: {init_kwargs}")
+            logger.error(f"Valid params: {valid_params}")
+            
+            # If the error mentions sequencer_runs_dir but we didn't pass it, the module is cached
+            if "sequencer_runs_dir" in error_str and "sequencer_runs_dir" not in init_kwargs:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"{error_str} - The backend is using a cached version of MasterMatrix. Please restart the backend completely."
+                )
+            else:
+                raise HTTPException(status_code=500, detail=error_str)
+        
+        print("Calling build_master_matrix...", file=sys.stderr)
+        sys.stderr.flush()
+        logger.info("Calling build_master_matrix...")
+        
+        # Force immediate output
+        import sys
+        print(f"[DEBUG] About to call build_master_matrix with filters: {stream_filters_dict}", file=sys.stderr)
+        sys.stderr.flush()
+        with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"[DEBUG] About to call build_master_matrix with filters: {stream_filters_dict}\n")
+            f.flush()
+        
         master_df = matrix.build_master_matrix(
             start_date=request.start_date,
             end_date=request.end_date,
             specific_date=request.specific_date,
             output_dir=request.output_dir,
             stream_filters=stream_filters_dict,
-            sequencer_runs_dir=request.sequencer_runs_dir
+            analyzer_runs_dir=request.analyzer_runs_dir,
+            streams=request.streams
         )
+        
+        print(f"Build complete. Trades: {len(master_df)}", file=sys.stderr)
+        sys.stderr.flush()
+        logger.info(f"Build complete. Trades: {len(master_df)}")
         
         if master_df.empty:
             return {
@@ -896,6 +1135,9 @@ async def build_master_matrix(request: MatrixBuildRequest):
                 "streams": [],
                 "instruments": []
             }
+        
+        # Calculate summary statistics
+        stats = matrix._log_summary_stats(master_df)
         
         return {
             "status": "success",
@@ -907,7 +1149,8 @@ async def build_master_matrix(request: MatrixBuildRequest):
             },
             "streams": sorted(master_df['Stream'].unique().tolist()),
             "instruments": sorted(master_df['Instrument'].unique().tolist()),
-            "allowed_trades": int(master_df['final_allowed'].sum())
+            "allowed_trades": int(master_df['final_allowed'].sum()),
+            "statistics": stats
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
@@ -1014,22 +1257,71 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
         # Convert to records (limit rows)
         records = df.head(limit).to_dict('records')
         
+        # Debug: Check SL column in first few records
+        logger = logging.getLogger(__name__)
+        print("=" * 80, file=sys.stderr)
+        print("SL DEBUG: Checking SL column in records", file=sys.stderr)
+        if records and 'SL' in records[0]:
+            sl_val = records[0].get('SL')
+            sl_type = type(sl_val).__name__
+            print(f"SL DEBUG: SL in first record: {sl_val} (type: {sl_type})", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: SL in first record: {sl_val} (type: {sl_type}) ===")
+            sl_count = sum(1 for r in records[:10] if r.get('SL') is not None and r.get('SL') != 0)
+            print(f"SL DEBUG: SL non-zero in first 10 records: {sl_count}", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: SL non-zero in first 10 records: {sl_count} ===")
+            # Show sample SL values
+            sample_sl = [r.get('SL') for r in records[:5]]
+            print(f"SL DEBUG: Sample SL values: {sample_sl}", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: Sample SL values: {sample_sl} ===")
+        elif records:
+            available_keys = list(records[0].keys())[:20]
+            print(f"SL DEBUG: SL column MISSING! Available keys: {available_keys}", file=sys.stderr)
+            logger.warning(f"=== SL DEBUG: SL column missing from records! Available keys: {available_keys} ===")
+        print("=" * 80, file=sys.stderr)
+        
         # Convert dates and other types to strings for JSON
-        for record in records:
+        logger = logging.getLogger(__name__)
+        for idx, record in enumerate(records):
             for key, value in record.items():
-                if pd.isna(value):
+                # Debug SL conversion for first 3 records
+                debug_sl = (key == 'SL' and idx < 3)
+                
+                # Check for NaN/NaT first (before type checks)
+                if pd.isna(value) or str(type(value)) == "<class 'pandas._libs.tslibs.nattype.NaTType'>":
+                    if debug_sl:
+                        logger.warning(f"=== SL DEBUG [record {idx}]: SL is NaN/NaT, converting to None ===")
                     record[key] = None
                 elif isinstance(value, (pd.Timestamp, datetime)):
                     if hasattr(value, 'isoformat'):
                         record[key] = value.isoformat()
                     else:
                         record[key] = str(value)
-                elif str(type(value)) == "<class 'pandas._libs.tslibs.nattype.NaTType'>":
-                    record[key] = None
-                elif isinstance(value, (int, float)) and pd.isna(value):
-                    record[key] = None
                 elif isinstance(value, (np.integer, np.floating)):
-                    record[key] = float(value) if isinstance(value, np.floating) else int(value)
+                    # Convert numpy types to Python types (preserve 0 values)
+                    converted = float(value) if isinstance(value, np.floating) else int(value)
+                    if debug_sl:
+                        logger.info(f"=== SL DEBUG [record {idx}]: Converted numpy {type(value).__name__} to {type(converted).__name__}: {converted} ===")
+                    record[key] = converted
+                elif isinstance(value, (int, float)):
+                    # Python int/float - keep as is (including 0)
+                    if debug_sl:
+                        logger.info(f"=== SL DEBUG [record {idx}]: Keeping Python {type(value).__name__}: {value} ===")
+                    record[key] = value
+        
+        # Final check: verify SL in first few records after conversion
+        if records:
+            sl_val = records[0].get('SL')
+            sl_type = type(sl_val).__name__ if sl_val is not None else 'None'
+            print(f"SL DEBUG: After conversion, first record SL: {sl_val} (type: {sl_type})", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: After conversion, first record SL: {sl_val} (type: {sl_type}) ===")
+            sl_in_records = sum(1 for r in records[:10] if 'SL' in r and r.get('SL') is not None)
+            print(f"SL DEBUG: SL present in first 10 records: {sl_in_records}/10", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: SL present in first 10 records: {sl_in_records}/10 ===")
+            # Show sample SL values
+            sample_sl = [r.get('SL') for r in records[:5] if 'SL' in r]
+            print(f"SL DEBUG: Sample SL values after conversion: {sample_sl}", file=sys.stderr)
+            logger.info(f"=== SL DEBUG: Sample SL values after conversion: {sample_sl} ===")
+        print("=" * 80, file=sys.stderr)
         
         return {
             "data": records,
@@ -1066,5 +1358,17 @@ async def list_timetable_files():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+    # Force immediate output to stderr and log file
+    import sys
+    uvicorn_msg = "=" * 80 + "\nStarting uvicorn server...\n" + "=" * 80 + "\n"
+    print(uvicorn_msg, file=sys.stderr)
+    sys.stderr.flush()
+    sys.stdout.flush()
+    # Also write directly to log file
+    with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
+        f.write(uvicorn_msg)
+        f.flush()
+    
+    # Set log level to info so we can see SL calculation logs
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
