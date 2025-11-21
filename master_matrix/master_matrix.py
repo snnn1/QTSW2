@@ -155,8 +155,10 @@ class MasterMatrix:
         logger.info("MASTER MATRIX - Loading from analyzer_runs (applying sequencer logic)")
         logger.info("=" * 80)
         
-        # Re-discover streams in case new ones were added
-        self.streams = self._discover_streams()
+        # Re-discover streams in case new ones were added (only if self.streams is empty or None)
+        # If self.streams is already set (e.g., for partial rebuild), preserve it
+        if not self.streams or len(self.streams) == 0:
+            self.streams = self._discover_streams()
         
         if not self.streams:
             logger.warning("No streams discovered! Check analyzer_runs directory.")
@@ -866,12 +868,13 @@ class MasterMatrix:
         if 'time_bucket' not in df.columns:
             df['time_bucket'] = df['Time']
         
-        # trade_date (same as Date)
+        # trade_date (same as Date) - keep as datetime for consistent sorting
         if 'trade_date' not in df.columns:
             if 'Date' in df.columns:
-                df['trade_date'] = pd.to_datetime(df['Date']).dt.date
+                # Keep as datetime (not date objects) to avoid type mixing issues
+                df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
             else:
-                df['trade_date'] = None
+                df['trade_date'] = pd.NaT
         
         logger.info(f"Schema normalized. Columns: {list(df.columns)}")
         
@@ -1171,8 +1174,8 @@ class MasterMatrix:
                     logger.info(msg)
         
         # If rebuilding specific streams, we need to merge with existing master matrix
-        # Otherwise, rebuild everything from scratch
-        if streams:
+        # If streams is None or empty, rebuild EVERYTHING from scratch (master rebuild)
+        if streams and len(streams) > 0:
             logger.info(f"Rebuilding only streams: {streams}")
             # Load existing master matrix if it exists
             existing_df = pd.DataFrame()
@@ -1191,9 +1194,16 @@ class MasterMatrix:
                         logger.warning(f"Could not load existing master matrix: {e}")
             
             # Update stream filters BEFORE loading (critical for time filtering)
+            # When rebuilding specific streams, MERGE filters (don't replace all)
             if stream_filters:
-                self.stream_filters = stream_filters
-                # Initialize defaults for streams not in provided filters
+                # Merge provided filters with existing filters (preserve other streams' filters)
+                for stream_id, filters in stream_filters.items():
+                    self.stream_filters[stream_id] = {
+                        "exclude_days_of_week": filters.get('exclude_days_of_week', []),
+                        "exclude_days_of_month": filters.get('exclude_days_of_month', []),
+                        "exclude_times": [str(t) for t in filters.get('exclude_times', [])]  # Ensure strings
+                    }
+                # Initialize defaults for streams not in provided filters (preserve existing)
                 for stream in self.streams:
                     if stream not in self.stream_filters:
                         self.stream_filters[stream] = {
@@ -1201,20 +1211,30 @@ class MasterMatrix:
                             "exclude_days_of_month": [],
                             "exclude_times": []
                         }
-                logger.info(f"Stream filters updated (partial rebuild): {list(self.stream_filters.keys())}")
+                logger.info(f"Stream filters merged (partial rebuild): {list(self.stream_filters.keys())}")
                 for stream_id, filters in self.stream_filters.items():
                     if filters.get('exclude_times'):
                         logger.info(f"  {stream_id}: exclude_times = {filters.get('exclude_times')}")
             
             # Only process requested streams
             original_streams = self.streams.copy()
-            self.streams = [s for s in self.streams if s in streams]
+            streams_to_load = [s for s in self.streams if s in streams]
+            
+            # Set streams to only the ones we want to rebuild
+            # load_all_streams will now preserve this list (won't rediscover)
+            self.streams = streams_to_load
+            logger.info(f"Limiting load to streams: {streams_to_load}")
             
             # Load only the requested streams
             # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
             # The display_year filtering happens in _apply_sequencer_logic
             # NOTE: stream_filters are already set above, so they will be used in _apply_sequencer_logic
             new_df = self.load_all_streams(start_date=None, end_date=None, specific_date=None)
+            
+            # Double-check: filter to only the streams we wanted (safety check)
+            if not new_df.empty:
+                new_df = new_df[new_df['Stream'].isin(streams_to_load)].copy()
+                logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
             
             # Restore original streams list
             self.streams = original_streams
@@ -1260,9 +1280,25 @@ class MasterMatrix:
             df['Time Change'] = ''
         
         # Sort by: trade_date, then entry_time, then symbol, then stream_id
+        # Ensure trade_date is datetime (not date objects) for consistent sorting
+        if 'trade_date' in df.columns:
+            if df['trade_date'].dtype == 'object':
+                # Convert date objects to datetime for proper sorting
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+            elif not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+        
+        # Filter out rows with invalid trade_date before sorting
+        valid_dates = df['trade_date'].notna()
+        if not valid_dates.all():
+            invalid_count = (~valid_dates).sum()
+            logger.warning(f"Found {invalid_count} rows with invalid trade_date out of {len(df)} total rows - filtering them out")
+            df = df[valid_dates].copy()
+        
         df = df.sort_values(
             by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
-            ascending=[True, True, True, True]
+            ascending=[True, True, True, True],
+            na_position='last'
         ).reset_index(drop=True)
         
         # Update global_trade_id after sorting
