@@ -15,6 +15,7 @@ function App() {
   const [masterData, setMasterData] = useState([])
   const [masterLoading, setMasterLoading] = useState(false)
   const [masterError, setMasterError] = useState(null)
+  const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
   
   // Available columns (detected from data)
   const [availableColumns, setAvailableColumns] = useState([])
@@ -49,6 +50,12 @@ function App() {
   })
   
   // Per-stream filters (persisted in localStorage)
+  // Contract multiplier for master stream (default 1 contract)
+  const [masterContractMultiplier, setMasterContractMultiplier] = useState(() => {
+    const saved = localStorage.getItem('matrix_master_contract_multiplier')
+    return saved ? parseFloat(saved) || 1 : 1
+  })
+  
   const [streamFilters, setStreamFilters] = useState(() => {
     const saved = localStorage.getItem('matrix_stream_filters')
     if (saved) {
@@ -106,9 +113,14 @@ function App() {
     localStorage.setItem('matrix_show_stats', JSON.stringify(showStats))
   }, [showStats])
   
+  // Save contract multiplier to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem('matrix_master_contract_multiplier', masterContractMultiplier.toString())
+  }, [masterContractMultiplier])
+  
   // Calculate stats for a stream from filtered data
   const calculateStats = (streamId) => {
-    let filtered = getFilteredData(streamId)
+    let filtered = getFilteredData(masterData, streamId)
     
     // Apply year filter if specified
     const filters = getStreamFilters(streamId)
@@ -165,7 +177,8 @@ function App() {
     
     // Total Days - count unique dates
     const uniqueDates = new Set(filtered.map(t => {
-      const date = t.Date
+      // Check both Date and trade_date fields
+      const date = t.Date || t.trade_date
       if (!date) return null
       try {
         if (typeof date === 'string' && date.includes('/')) {
@@ -179,15 +192,44 @@ function App() {
     }).filter(d => d !== null))
     const totalDays = uniqueDates.size
     
-    // Currency conversion - assume $1 per point (or use multiplier if available)
-    const profitMultiplier = 1 // Can be adjusted if there's a multiplier field
-    const totalProfitDollars = totalProfit * profitMultiplier
+    // Currency conversion - use contract values based on instrument
+    const contractValues = {
+      'ES': 50,
+      'NQ': 10,
+      'YM': 5,
+      'CL': 1000,
+      'NG': 10000,
+      'GC': 100
+    }
+    
+    // Helper function to get contract value for a trade
+    const getContractValue = (trade) => {
+      const symbol = (trade.Symbol || trade.Instrument || 'ES').toUpperCase()
+      // Extract base symbol (ES1 -> ES, NQ2 -> NQ, etc.) or use as-is if no number
+      const baseSymbol = symbol.replace(/\d+$/, '') || symbol
+      return contractValues[baseSymbol] || 50 // Default to ES if unknown
+    }
+    
+    // Calculate total profit in dollars by summing each trade's profit * contract value
+    // Apply contract multiplier for master stream
+    const contractMultiplier = streamId === 'master' ? masterContractMultiplier : 1
+    const totalProfitDollars = filtered.reduce((sum, t) => {
+      const profit = parseFloat(t.Profit) || 0
+      const contractValue = getContractValue(t)
+      return sum + (profit * contractValue * contractMultiplier)
+    }, 0)
     
     // Time Changes and Final Time - track time slot changes
+    // Sort by date and time to ensure proper chronological order (important for drawdown calculation)
     const sortedByDate = [...filtered].sort((a, b) => {
-      const dateA = new Date(a.Date)
-      const dateB = new Date(b.Date)
-      return dateA.getTime() - dateB.getTime()
+      const dateA = new Date(a.Date || a.trade_date)
+      const dateB = new Date(b.Date || b.trade_date)
+      const dateDiff = dateA.getTime() - dateB.getTime()
+      if (dateDiff !== 0) return dateDiff
+      // If same date, sort by time
+      const timeA = (a.Time || '').toString()
+      const timeB = (b.Time || '').toString()
+      return timeA.localeCompare(timeB)
     })
     
     let timeChanges = 0
@@ -205,51 +247,134 @@ function App() {
       }
     })
     
-    // Profit Factor = Gross Profit / Gross Loss
-    const grossProfit = winningTrades.reduce((sum, t) => sum + Math.max(0, parseFloat(t.Profit) || 0), 0)
-    const grossLoss = Math.abs(losingTrades.reduce((sum, t) => sum + Math.min(0, parseFloat(t.Profit) || 0), 0))
-    const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0)
+    // Profit Factor = Gross Profit / Gross Loss (in dollars)
+    const grossProfitDollars = winningTrades.reduce((sum, t) => {
+      const profit = Math.max(0, parseFloat(t.Profit) || 0)
+      return sum + (profit * getContractValue(t) * contractMultiplier)
+    }, 0)
+    const grossLossDollars = Math.abs(losingTrades.reduce((sum, t) => {
+      const profit = Math.min(0, parseFloat(t.Profit) || 0)
+      return sum + (profit * getContractValue(t) * contractMultiplier)
+    }, 0))
+    const profitFactor = grossLossDollars > 0 ? grossProfitDollars / grossLossDollars : (grossProfitDollars > 0 ? Infinity : 0)
     
-    // Max Drawdown calculation
-    let runningProfit = 0
-    let peak = 0
-    let maxDrawdown = 0
-    let maxDrawdownDollars = 0
+    // Rolling Drawdown calculation (in dollars) - standard peak-to-trough calculation
+    // Track peak equity and calculate drawdown as: current - peak (negative when below peak)
+    let runningProfitDollars = 0
+    let peakDollars = 0
+    let maxDrawdownDollars = 0 // Will be the most negative value (largest decline)
     
+    // Process each trade in chronological order
     sortedByDate.forEach(trade => {
       const profit = parseFloat(trade.Profit) || 0
-      runningProfit += profit
-      if (runningProfit > peak) {
-        peak = runningProfit
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      // Update running profit (cumulative equity)
+      runningProfitDollars += profitDollars
+      
+      // Update peak if we've reached a new high
+      if (runningProfitDollars > peakDollars) {
+        peakDollars = runningProfitDollars
       }
-      const drawdown = peak - runningProfit
-      if (drawdown > maxDrawdown) {
-        maxDrawdown = drawdown
-        maxDrawdownDollars = drawdown * profitMultiplier
+      
+      // Calculate current drawdown: current equity - peak equity
+      // This will be negative when below peak, zero or positive when at/above peak
+      const currentDrawdown = runningProfitDollars - peakDollars
+      
+      // Track maximum drawdown (most negative value, which is the largest decline)
+      if (currentDrawdown < maxDrawdownDollars) {
+        maxDrawdownDollars = currentDrawdown
       }
     })
     
-    // Sharpe Ratio - (Average Return - Risk Free Rate) / Standard Deviation
-    // Risk-free rate assumed to be 0 for simplicity
-    const returns = filtered.map(t => parseFloat(t.Profit) || 0)
-    const meanReturn = avgProfit
-    const variance = returns.reduce((sum, r) => sum + Math.pow(r - meanReturn, 2), 0) / returns.length
-    const stdDev = Math.sqrt(variance)
-    const sharpeRatio = stdDev > 0 ? meanReturn / stdDev : 0
+    // Convert to positive number for display (drawdown is stored as negative)
+    const maxDrawdownDollarsPositive = Math.abs(maxDrawdownDollars)
     
-    // Sortino Ratio - (Average Return - Risk Free Rate) / Downside Deviation
-    const downsideReturns = returns.filter(r => r < 0)
-    const downsideVariance = downsideReturns.length > 0
-      ? downsideReturns.reduce((sum, r) => sum + Math.pow(r, 2), 0) / downsideReturns.length
-      : 0
-    const downsideDev = Math.sqrt(downsideVariance)
-    const sortinoRatio = downsideDev > 0 ? meanReturn / downsideDev : 0
+    // Max drawdown in points (for display) - approximate conversion
+    const maxDrawdown = maxDrawdownDollarsPositive > 0 ? maxDrawdownDollarsPositive / 50 : 0
     
-    // Calmar Ratio - Annual Return / Max Drawdown
-    // Assuming 252 trading days per year
+    // Sharpe Ratio - Annualized: (Mean Daily Return / Daily Std Dev) * sqrt(252)
+    // Risk-free rate assumed to be 0
     const tradingDaysPerYear = 252
-    const annualReturn = totalDays > 0 ? (totalProfit / totalDays) * tradingDaysPerYear : 0
-    const calmarRatio = maxDrawdown > 0 ? annualReturn / maxDrawdown : 0
+    
+    // For master stream, group trades by date and sum daily returns
+    // For individual streams, each trade is typically one per day
+    let dailyReturnsDollars = []
+    
+    if (streamId === 'master') {
+      // Group trades by date and sum returns per day
+      const tradesByDate = new Map()
+      filtered.forEach(trade => {
+        const dateValue = trade.Date || trade.trade_date
+        if (!dateValue) return
+        
+        try {
+          let dateKey
+          if (typeof dateValue === 'string') {
+            if (dateValue.includes('/')) {
+              dateKey = dateValue.split(' ')[0]
+            } else if (dateValue.includes('-')) {
+              dateKey = dateValue.split(' ')[0].split('T')[0]
+            } else {
+              const d = new Date(dateValue)
+              dateKey = isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+            }
+          } else {
+            const d = new Date(dateValue)
+            dateKey = isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+          }
+          
+          if (dateKey) {
+            if (!tradesByDate.has(dateKey)) {
+              tradesByDate.set(dateKey, 0)
+            }
+            const profit = parseFloat(trade.Profit) || 0
+            const contractValue = getContractValue(trade)
+            tradesByDate.set(dateKey, tradesByDate.get(dateKey) + (profit * contractValue * contractMultiplier))
+          }
+        } catch {
+          // Skip invalid dates
+        }
+      })
+      
+      // Convert to array of daily returns
+      dailyReturnsDollars = Array.from(tradesByDate.values())
+    } else {
+      // Individual stream - one trade per day typically
+      dailyReturnsDollars = filtered.map(t => {
+        const profit = parseFloat(t.Profit) || 0
+        return profit * getContractValue(t) * contractMultiplier
+      })
+    }
+    
+    // Calculate daily returns statistics
+    const meanDailyReturnDollars = dailyReturnsDollars.length > 0 
+      ? dailyReturnsDollars.reduce((sum, r) => sum + r, 0) / dailyReturnsDollars.length 
+      : 0
+    const varianceDollars = dailyReturnsDollars.length > 1 
+      ? dailyReturnsDollars.reduce((sum, r) => sum + Math.pow(r - meanDailyReturnDollars, 2), 0) / (dailyReturnsDollars.length - 1)
+      : 0
+    const stdDevDollars = Math.sqrt(varianceDollars)
+    
+    // Annualized Sharpe Ratio
+    const annualizedReturn = meanDailyReturnDollars * tradingDaysPerYear
+    const annualizedVolatility = stdDevDollars * Math.sqrt(tradingDaysPerYear)
+    const sharpeRatio = annualizedVolatility > 0 ? annualizedReturn / annualizedVolatility : 0
+    
+    // Sortino Ratio - Annualized: (Mean Daily Return / Downside Std Dev) * sqrt(252)
+    // Only considers negative returns for downside deviation
+    const downsideReturnsDollars = dailyReturnsDollars.filter(r => r < 0)
+    const downsideVarianceDollars = downsideReturnsDollars.length > 1
+      ? downsideReturnsDollars.reduce((sum, r) => sum + Math.pow(r, 2), 0) / (downsideReturnsDollars.length - 1)
+      : 0
+    const downsideDevDollars = Math.sqrt(downsideVarianceDollars)
+    const annualizedDownsideVolatility = downsideDevDollars * Math.sqrt(tradingDaysPerYear)
+    const sortinoRatio = annualizedDownsideVolatility > 0 ? annualizedReturn / annualizedDownsideVolatility : 0
+    
+    // Calmar Ratio - Annual Return / Max Drawdown (both in dollars)
+    const annualReturnDollars = totalDays > 0 ? (totalProfitDollars / totalDays) * tradingDaysPerYear : 0
+    const calmarRatio = maxDrawdownDollarsPositive > 0 ? annualReturnDollars / maxDrawdownDollarsPositive : 0
     
     // Best and worst trades
     const tradesWithProfit = filtered.filter(t => t.Result !== 'NoTrade')
@@ -276,9 +401,13 @@ function App() {
       }).format(value)
     }
     
+    // Average trades per day
+    const avgTradesPerDay = totalDays > 0 ? totalTrades / totalDays : 0
+    
     return {
       totalTrades,
       totalDays,
+      avgTradesPerDay: avgTradesPerDay.toFixed(2),
       wins,
       losses,
       breakEven,
@@ -297,7 +426,7 @@ function App() {
       sortinoRatio: sortinoRatio.toFixed(2),
       calmarRatio: calmarRatio.toFixed(2),
       maxDrawdown: maxDrawdown.toFixed(2),
-      maxDrawdownDollars: formatCurrency(maxDrawdownDollars),
+      maxDrawdownDollars: formatCurrency(maxDrawdownDollarsPositive),
       allowedTrades,
       blockedTrades,
       bestTrade,
@@ -413,6 +542,14 @@ function App() {
       
       const data = await dataResponse.json()
       const trades = data.data || []
+      
+      // Store available years from API response
+      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
+        setAvailableYearsFromAPI(data.years)
+        console.log('[DEBUG] Available years from API:', data.years)
+      } else {
+        console.warn('[DEBUG] No years field in API response or empty array')
+      }
       
       // Debug: Check if Time Change column exists in the data
       if (trades.length > 0 && 'Time Change' in trades[0]) {
@@ -652,8 +789,8 @@ function App() {
   const getFilteredData = (data, streamId = null) => {
     let filtered = [...data]
     
-    // Filter by stream if specified
-    if (streamId) {
+    // Filter by stream if specified (but not for 'master' which shows all streams)
+    if (streamId && streamId !== 'master') {
       filtered = filtered.filter(row => row.Stream === streamId)
     }
     
@@ -663,7 +800,7 @@ function App() {
     // but the resulting trades (at the chosen times) will still be visible
     // Year filter is also applied on frontend (for display purposes)
     
-    if (streamId) {
+    if (streamId && streamId !== 'master') {
       // Individual stream tab - apply its filters
       if (streamFilters[streamId]) {
         const filters = streamFilters[streamId]
@@ -703,17 +840,26 @@ function App() {
         // Year filter (for display purposes, doesn't require rebuild)
         if (filters.include_years && filters.include_years.length > 0) {
           filtered = filtered.filter(row => {
-            if (!row.Date) return false
+            // Check both Date and trade_date fields
+            const dateValue = row.Date || row.trade_date
+            if (!dateValue) return false
             try {
-              const date = new Date(row.Date)
+              const date = new Date(dateValue)
               if (!isNaN(date.getTime())) {
-                return filters.include_years.includes(date.getFullYear())
+                const year = date.getFullYear()
+                return filters.include_years.includes(year)
               }
-              // Try to extract year from DD/MM/YYYY format
-              if (typeof row.Date === 'string') {
-                const match = row.Date.match(/(\d{4})/)
-                if (match) {
-                  return filters.include_years.includes(parseInt(match[1]))
+              // Try to extract year from string formats
+              if (typeof dateValue === 'string') {
+                // Try YYYY-MM-DD format
+                const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
+                if (isoMatch) {
+                  return filters.include_years.includes(parseInt(isoMatch[1]))
+                }
+                // Try MM/DD/YYYY or DD/MM/YYYY format
+                const slashMatch = dateValue.match(/(\d{4})/)
+                if (slashMatch) {
+                  return filters.include_years.includes(parseInt(slashMatch[1]))
                 }
               }
               return false
@@ -723,8 +869,154 @@ function App() {
           })
         }
       }
+    } else if (streamId === 'master') {
+      // Master tab - apply each stream's filters to its own trades
+      // This ensures master stats reflect all the filters from individual streams
+      filtered = filtered.filter(row => {
+        const rowStream = row.Stream
+        if (!rowStream || !streamFilters[rowStream]) {
+          return true // No filters for this stream, show all
+        }
+        
+        const filters = streamFilters[rowStream]
+        const dateValue = row.Date || row.trade_date
+        
+        // Day of week filter
+        if (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) {
+          if (dateValue) {
+            try {
+              const date = new Date(dateValue)
+              if (!isNaN(date.getTime())) {
+                const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
+                if (filters.exclude_days_of_week.includes(dayName)) {
+                  return false
+                }
+              }
+            } catch {
+              // Continue if date parsing fails
+            }
+          }
+        }
+        
+        // Day of month filter
+        if (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) {
+          if (dateValue) {
+            try {
+              const date = new Date(dateValue)
+              if (!isNaN(date.getTime())) {
+                if (filters.exclude_days_of_month.includes(date.getDate())) {
+                  return false
+                }
+              }
+            } catch {
+              // Continue if date parsing fails
+            }
+          }
+        }
+        
+        // Year filter
+        if (filters.include_years && filters.include_years.length > 0) {
+          if (!dateValue) return false
+          try {
+            const date = new Date(dateValue)
+            if (!isNaN(date.getTime())) {
+              const year = date.getFullYear()
+              if (!filters.include_years.includes(year)) {
+                return false
+              }
+            } else {
+              // Try to extract year from string formats
+              if (typeof dateValue === 'string') {
+                const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
+                if (isoMatch) {
+                  if (!filters.include_years.includes(parseInt(isoMatch[1]))) {
+                    return false
+                  }
+                } else {
+                  const slashMatch = dateValue.match(/(\d{4})/)
+                  if (slashMatch) {
+                    if (!filters.include_years.includes(parseInt(slashMatch[1]))) {
+                      return false
+                    }
+                  } else {
+                    return false
+                  }
+                }
+              } else {
+                return false
+              }
+            }
+          } catch {
+            return false
+          }
+        }
+        
+        return true // Passed all filters for this stream
+      })
+      
+      // Also apply master-specific filters if they exist (on top of stream filters)
+      const masterFilters = streamFilters['master'] || {}
+      
+      // Master day of week filter (additional filtering)
+      if (masterFilters.exclude_days_of_week && masterFilters.exclude_days_of_week.length > 0) {
+        filtered = filtered.filter(row => {
+          const dateValue = row.Date || row.trade_date
+          if (!dateValue) return true
+          try {
+            const date = new Date(dateValue)
+            if (isNaN(date.getTime())) return true
+            const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
+            return !masterFilters.exclude_days_of_week.includes(dayName)
+          } catch {
+            return true
+          }
+        })
+      }
+      
+      // Master day of month filter (additional filtering)
+      if (masterFilters.exclude_days_of_month && masterFilters.exclude_days_of_month.length > 0) {
+        filtered = filtered.filter(row => {
+          const dateValue = row.Date || row.trade_date
+          if (!dateValue) return true
+          try {
+            const date = new Date(dateValue)
+            if (isNaN(date.getTime())) return true
+            return !masterFilters.exclude_days_of_month.includes(date.getDate())
+          } catch {
+            return true
+          }
+        })
+      }
+      
+      // Master year filter (additional filtering)
+      if (masterFilters.include_years && masterFilters.include_years.length > 0) {
+        filtered = filtered.filter(row => {
+          const dateValue = row.Date || row.trade_date
+          if (!dateValue) return false
+          try {
+            const date = new Date(dateValue)
+            if (!isNaN(date.getTime())) {
+              const year = date.getFullYear()
+              return masterFilters.include_years.includes(year)
+            }
+            if (typeof dateValue === 'string') {
+              const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
+              if (isoMatch) {
+                return masterFilters.include_years.includes(parseInt(isoMatch[1]))
+              }
+              const slashMatch = dateValue.match(/(\d{4})/)
+              if (slashMatch) {
+                return masterFilters.include_years.includes(parseInt(slashMatch[1]))
+              }
+            }
+            return false
+          } catch {
+            return false
+          }
+        })
+      }
     } else {
-      // Master tab - apply each stream's filters to its own rows
+      // Master tab (no streamId) - apply each stream's filters to its own rows
       filtered = filtered.filter(row => {
         const rowStream = row.Stream
         if (!rowStream || !streamFilters[rowStream]) {
@@ -866,11 +1158,21 @@ function App() {
       exclude_times: [],
       include_years: [] // Empty array means all years
     }
+    // For 'master', return default filters (no stream-specific filters applied)
+    if (streamId === 'master' || !streamId) {
+      return defaultFilters
+    }
     return streamFilters[streamId] ? { ...defaultFilters, ...streamFilters[streamId] } : defaultFilters
   }
   
-  // Get available years from master data
+  // Get available years - use API response first, fallback to extracting from data
   const getAvailableYears = () => {
+    // Use years from API response if available (more reliable - includes all years from source files)
+    if (availableYearsFromAPI && availableYearsFromAPI.length > 0) {
+      return [...availableYearsFromAPI].sort((a, b) => b - a) // Newest first
+    }
+    
+    // Fallback: extract from master data if API years not available
     if (!masterData || masterData.length === 0) return []
     const years = new Set()
     masterData.forEach(row => {
@@ -896,10 +1198,22 @@ function App() {
   
   const renderStats = (streamId) => {
     const stats = calculateStats(streamId)
+    console.log(`[DEBUG] renderStats for ${streamId}:`, { stats, hasStats: !!stats })
     if (!stats) {
+      // Debug why stats are null
+      const filtered = getFilteredData(masterData, streamId)
+      console.log(`[DEBUG] No stats - filtered data length:`, filtered.length)
+      if (filtered.length > 0) {
+        console.log(`[DEBUG] Sample row:`, filtered[0])
+        console.log(`[DEBUG] Has Result column:`, 'Result' in (filtered[0] || {}))
+        console.log(`[DEBUG] Has Profit column:`, 'Profit' in (filtered[0] || {}))
+      }
       return (
         <div className="bg-gray-800 rounded-lg p-4 mb-4">
           <p className="text-gray-400 text-sm">No data available for statistics</p>
+          {filtered.length === 0 && (
+            <p className="text-gray-500 text-xs mt-2">No filtered data found for {streamId}</p>
+          )}
         </div>
       )
     }
@@ -908,19 +1222,31 @@ function App() {
       <div className="bg-gray-800 rounded-lg p-4 mb-4 border border-gray-700">
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
           <div>
+            <div className="text-xs text-gray-400 mb-1">Total Trades</div>
+            <div className="text-lg font-semibold">{stats.totalTrades}</div>
+          </div>
+          <div>
             <div className="text-xs text-gray-400 mb-1">Total Days</div>
             <div className="text-lg font-semibold">{stats.totalDays}</div>
           </div>
+          {streamId === 'master' && (
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Avg Trades/Day</div>
+              <div className="text-lg font-semibold">{stats.avgTradesPerDay}</div>
+            </div>
+          )}
           <div>
             <div className="text-xs text-gray-400 mb-1">Win Rate</div>
             <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
           </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Total Profit</div>
-            <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {stats.totalProfit}
+          {streamId !== 'master' && (
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Total Profit</div>
+              <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {stats.totalProfit}
+              </div>
             </div>
-          </div>
+          )}
           <div>
             <div className="text-xs text-gray-400 mb-1">Total Profit ($)</div>
             <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
@@ -939,10 +1265,12 @@ function App() {
             <div className="text-xs text-gray-400 mb-1">Break-Even</div>
             <div className="text-lg font-semibold">{stats.breakEven}</div>
           </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Final Time</div>
-            <div className="text-lg font-semibold">{stats.finalTime}</div>
-          </div>
+          {streamId !== 'master' && (
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Final Time</div>
+              <div className="text-lg font-semibold">{stats.finalTime}</div>
+            </div>
+          )}
           <div>
             <div className="text-xs text-gray-400 mb-1">Sharpe Ratio</div>
             <div className={`text-lg font-semibold ${parseFloat(stats.sharpeRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
@@ -969,14 +1297,23 @@ function App() {
             <div className="text-xs text-gray-400 mb-1">Risk-Reward</div>
             <div className="text-lg font-semibold">{stats.rrRatio}</div>
           </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Max Drawdown</div>
-            <div className="text-lg font-semibold text-red-400">{stats.maxDrawdown}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
-            <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
-          </div>
+          {streamId === 'master' ? (
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
+              <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
+            </div>
+          ) : (
+            <>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Max Drawdown</div>
+                <div className="text-lg font-semibold text-red-400">{stats.maxDrawdown}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
+                <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
+              </div>
+            </>
+          )}
         </div>
       </div>
     )
@@ -1010,7 +1347,40 @@ function App() {
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           {/* Years Filter */}
           <div>
-            <label className="block text-xs font-medium mb-2 text-gray-400">Include Years</label>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-xs font-medium text-gray-400">Isolate Years</label>
+              {filters.include_years && filters.include_years.length > 0 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    // Clear all year filters
+                    setStreamFilters(prev => {
+                      const updated = { ...prev }
+                      if (updated[streamId]) {
+                        updated[streamId] = {
+                          ...updated[streamId],
+                          include_years: []
+                        }
+                      } else {
+                        updated[streamId] = {
+                          exclude_days_of_week: [],
+                          exclude_days_of_month: [],
+                          exclude_times: [],
+                          include_years: []
+                        }
+                      }
+                      return updated
+                    })
+                  }}
+                  className="text-xs text-blue-400 hover:text-blue-300 underline"
+                  title="Show all years"
+                >
+                  Show All
+                </button>
+              )}
+            </div>
             <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto">
               {availableYears.length > 0 ? (
                 availableYears.map(year => {
@@ -1041,11 +1411,6 @@ function App() {
             {filters.include_years && filters.include_years.length > 0 && (
               <div className="mt-2 text-xs text-gray-400">
                 Selected: {filters.include_years.sort((a, b) => b - a).join(', ')}
-              </div>
-            )}
-            {(!filters.include_years || filters.include_years.length === 0) && (
-              <div className="mt-2 text-xs text-gray-500">
-                (All years included)
               </div>
             )}
           </div>
@@ -1581,6 +1946,47 @@ function App() {
               </div>
               
               {renderColumnSelector()}
+              
+              {/* Stats Toggle for Master */}
+              <div className="mb-4">
+                <button
+                  onClick={() => toggleStats('master')}
+                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-left"
+                >
+                  <span className="font-medium">Statistics (All Streams)</span>
+                  <span>{showStats['master'] ? '▼' : '▶'}</span>
+                </button>
+                {showStats['master'] && renderStats('master')}
+              </div>
+              
+              {/* Contract Multiplier for Master */}
+              <div className="mb-4 bg-gray-700 rounded-lg p-4">
+                <label className="block text-sm font-medium mb-2">
+                  Contract Size Multiplier
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min="0.01"
+                    max="100"
+                    step="0.01"
+                    value={masterContractMultiplier}
+                    onChange={(e) => {
+                      const value = parseFloat(e.target.value)
+                      if (!isNaN(value) && value > 0) {
+                        setMasterContractMultiplier(Math.max(0.01, Math.min(100, value)))
+                      }
+                    }}
+                    className="w-24 px-3 py-2 bg-gray-800 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500"
+                  />
+                  <span className="text-sm text-gray-400">
+                    (Default: 1 contract. All dollar calculations are multiplied by this value)
+                  </span>
+                </div>
+              </div>
+              
+              {/* Filters for Master */}
+              {renderFilters('master')}
               
               {masterLoading ? (
                 <div className="text-center py-8">Loading master matrix...</div>

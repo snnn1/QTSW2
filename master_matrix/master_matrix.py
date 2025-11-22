@@ -90,13 +90,7 @@ class MasterMatrix:
         self.stream_filters = stream_filters or {}
         
         # Initialize default filters for each stream if not provided
-        for stream in self.streams:
-            if stream not in self.stream_filters:
-                self.stream_filters[stream] = {
-                    "exclude_days_of_week": [],
-                    "exclude_days_of_month": [],
-                    "exclude_times": []
-                }
+        self._ensure_default_filters()
     
     def _discover_streams(self) -> List[str]:
         """
@@ -128,6 +122,122 @@ class MasterMatrix:
         streams.sort()  # Sort alphabetically for consistency
         logger.info(f"Discovered {len(streams)} streams: {streams}")
         return streams
+    
+    def _normalize_filter(self, filters: Dict) -> Dict:
+        """Normalize a single stream filter (ensure exclude_times are strings)."""
+        return {
+            "exclude_days_of_week": filters.get('exclude_days_of_week', []),
+            "exclude_days_of_month": filters.get('exclude_days_of_month', []),
+            "exclude_times": [str(t) for t in filters.get('exclude_times', [])]  # Ensure strings
+        }
+    
+    def _ensure_default_filters(self):
+        """Ensure all streams have filter entries (even if empty)."""
+        for stream in self.streams:
+            if stream not in self.stream_filters:
+                self.stream_filters[stream] = {
+                    "exclude_days_of_week": [],
+                    "exclude_days_of_month": [],
+                    "exclude_times": []
+                }
+    
+    def _update_stream_filters(self, stream_filters: Optional[Dict[str, Dict]], merge: bool = False):
+        """
+        Update stream filters.
+        
+        Args:
+            stream_filters: New filters to apply
+            merge: If True, merge with existing filters. If False, replace all filters.
+        """
+        if stream_filters:
+            if merge:
+                # Merge provided filters with existing filters (preserve other streams' filters)
+                for stream_id, filters in stream_filters.items():
+                    self.stream_filters[stream_id] = self._normalize_filter(filters)
+            else:
+                # Replace all filters
+                normalized_filters = {}
+                for stream_id, filters in stream_filters.items():
+                    normalized_filters[stream_id] = self._normalize_filter(filters)
+                self.stream_filters = normalized_filters
+        
+        # Always ensure defaults for all streams
+        self._ensure_default_filters()
+    
+    def _rebuild_full(self) -> pd.DataFrame:
+        """Rebuild everything from scratch."""
+        logger.info("Rebuilding all streams from scratch")
+        # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
+        # The display_year filtering happens in _apply_sequencer_logic
+        return self.load_all_streams(start_date=None, end_date=None, specific_date=None)
+    
+    def _rebuild_partial(self, streams: List[str], output_dir: str) -> pd.DataFrame:
+        """Rebuild specific streams and merge with existing data."""
+        logger.info(f"Rebuilding only streams: {streams}")
+        
+        # Load existing master matrix if it exists
+        existing_df = pd.DataFrame()
+        output_path = Path(output_dir)
+        if output_path.exists():
+            parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
+            if parquet_files:
+                try:
+                    existing_df = pd.read_parquet(parquet_files[0])
+                    logger.info(f"Loaded existing master matrix: {len(existing_df)} trades")
+                    # Remove old data for streams being rebuilt
+                    existing_df = existing_df[~existing_df['Stream'].isin(streams)]
+                    logger.info(f"After removing rebuilt streams: {len(existing_df)} trades")
+                except Exception as e:
+                    logger.warning(f"Could not load existing master matrix: {e}")
+        
+        # Only process requested streams
+        original_streams = self.streams.copy()
+        streams_to_load = [s for s in self.streams if s in streams]
+        
+        # Set streams to only the ones we want to rebuild
+        # load_all_streams will now preserve this list (won't rediscover)
+        self.streams = streams_to_load
+        logger.info(f"Limiting load to streams: {streams_to_load}")
+        
+        # Load only the requested streams
+        # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
+        new_df = self.load_all_streams(start_date=None, end_date=None, specific_date=None)
+        
+        # Double-check: filter to only the streams we wanted (safety check)
+        if not new_df.empty:
+            new_df = new_df[new_df['Stream'].isin(streams_to_load)].copy()
+            logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
+            # Show which streams are actually in new_df
+            if 'Stream' in new_df.columns:
+                streams_in_new = sorted(new_df['Stream'].unique().tolist())
+        else:
+            logger.warning(f"[WARNING] No trades loaded for streams: {streams_to_load}")
+            logger.warning(f"[WARNING] This likely means all times were excluded for these streams")
+            # Check which streams were supposed to be loaded
+            for stream_id in streams_to_load:
+                stream_filters = self.stream_filters.get(stream_id, {})
+                exclude_times = stream_filters.get('exclude_times', [])
+                if exclude_times:
+                    logger.warning(f"[WARNING] Stream {stream_id} has excluded times: {exclude_times}")
+        
+        # Restore original streams list
+        self.streams = original_streams
+        
+        # Merge with existing data
+        if not existing_df.empty:
+            if not new_df.empty:
+                df = pd.concat([existing_df, new_df], ignore_index=True)
+                logger.info(f"Merged with existing data: {len(df)} total trades")
+            else:
+                # new_df is empty, so just use existing_df (streams were skipped)
+                df = existing_df
+                logger.info(f"No new trades to merge (streams skipped), keeping existing data: {len(df)} trades")
+        else:
+            df = new_df
+            if df.empty:
+                logger.warning(f"[WARNING] Final result is empty - no trades for streams: {streams_to_load}")
+        
+        return df
         
     def load_all_streams(self, start_date: Optional[str] = None, 
                          end_date: Optional[str] = None,
@@ -307,11 +417,11 @@ class MasterMatrix:
         # Apply sequencer logic to select one trade per day per stream
         # CRITICAL: Process ALL historical data to build accurate time slot histories (13-trade rolling window)
         # Each stream needs at least 13 days of historical data for accurate time slot selection
-        # Only return most recent year for display (but histories are built from ALL data)
+        # Return ALL years (histories are built from ALL data)
         logger.info("Applying sequencer time-change logic to select chosen trades...")
         logger.info("Processing ALL historical data to build accurate time slot histories (requires 13+ days for rolling window)")
-        logger.info("Only returning most recent year for display (histories built from all historical data)")
-        master_df = self._apply_sequencer_logic(master_df, display_year=None)  # None = auto-detect most recent year
+        logger.info("Returning ALL years (histories built from all historical data)")
+        master_df = self._apply_sequencer_logic(master_df, display_year=None)  # None = return ALL years
         
         logger.info(f"Total chosen trades (after sequencer logic): {len(master_df)}")
         
@@ -323,40 +433,30 @@ class MasterMatrix:
         Uses time change logic similar to sequential processor.
         
         Processes ALL historical data to build accurate time slot histories,
-        but only returns trades from the most recent year (or all if display_year is None).
+        and returns trades from all years (or filtered by display_year if specified).
         
         Args:
             df: DataFrame with all trades from analyzer_runs
             display_year: If provided, only return trades from this year (for display).
+                         If None, return trades from ALL years.
                          All data is still processed to build accurate histories.
             
         Returns:
-            DataFrame with one chosen trade per day per stream (filtered by display_year if provided)
+            DataFrame with one chosen trade per day per stream (filtered by display_year if provided, all years if None)
         """
         if df.empty:
             return df
         
-        # Determine the most recent year if not specified
-        if display_year is None:
-            df_copy = df.copy()
-            df_copy['Date'] = pd.to_datetime(df_copy['Date'])
-            if not df_copy.empty:
-                max_date = df_copy['Date'].max()
-                display_year = max_date.year
-                logger.info(f"Auto-detected most recent year: {display_year}")
-            else:
-                display_year = None
+        # If display_year is None, return ALL years (don't auto-detect)
+        # Only filter by year if display_year is explicitly provided
         
         chosen_trades = []
+        streams_processed = []
+        streams_skipped = []
         
         # CRITICAL: Verify stream_filters are set
         if not self.stream_filters:
-            msg = "[DEBUG] WARNING: self.stream_filters is empty! Filters may not be applied!"
-            logger.info(msg)
-            logger.warning(msg)
-        else:
-            msg = f"[DEBUG] self.stream_filters contains: {list(self.stream_filters.keys())}"
-            logger.info(msg)
+            logger.warning("self.stream_filters is empty! Filters may not be applied!")
             logger.info(msg)
         
         # Group by stream and date
@@ -368,22 +468,6 @@ class MasterMatrix:
             # Get stream filters (same as sequencer)
             stream_filters = self.stream_filters.get(stream_id, {})
             exclude_times = [str(t) for t in stream_filters.get('exclude_times', [])]
-            
-            # DEBUG: Log filter application - FORCE to log file
-            msg = f"[DEBUG] Stream {stream_id}: stream_filters dict = {stream_filters}"
-            logger.info(msg)
-            logger.info(msg)
-            
-            if exclude_times:
-                msg = f"[DEBUG] Stream {stream_id}: Applying exclude_times filter: {exclude_times}"
-                logger.info(msg)
-                logger.info(msg)
-            else:
-                msg = f"[DEBUG] Stream {stream_id}: No exclude_times filter (empty or not set). Available filters: {list(stream_filters.keys())}"
-                logger.info(msg)
-                logger.info(msg)
-            
-            # Filter out excluded time slots (EXACTLY like sequencer - use string comparison)
             exclude_times_str = [str(t) for t in exclude_times] if exclude_times else []
             
             # Determine available times for this stream (convert to strings for comparison, like sequencer)
@@ -392,14 +476,14 @@ class MasterMatrix:
             available_times = [t for t in all_times if t not in exclude_times_str]
             
             if not available_times:
-                logger.warning(f"No available times for stream {stream_id} after filtering. Excluded: {exclude_times_str}")
+                logger.warning(f"[WARNING] Stream {stream_id}: No available times after filtering. Excluded: {exclude_times_str}")
+                logger.warning(f"[WARNING] Stream {stream_id}: All {total_trades_in_stream} trades will be skipped!")
+                streams_skipped.append(stream_id)
                 continue
             
+            streams_processed.append(stream_id)
+            
             logger.info(f"Stream {stream_id}: Available times: {available_times}, Excluded: {exclude_times_str}")
-            if exclude_times_str:
-                msg = f"[DEBUG] Stream {stream_id}: Will completely remove trades at times: {exclude_times_str}"
-                print(msg, file=sys.stderr, flush=True)
-                logger.info(msg)
             
             # Session configuration (same as sequencer)
             SLOT_ENDS = {
@@ -425,59 +509,56 @@ class MasterMatrix:
                 
                 # CRITICAL: Filter out trades at excluded times FIRST - before any processing (EXACTLY like sequencer)
                 # Convert Time column to strings for comparison (like sequencer line 137-138)
+                # Initialize exclude_times_normalized (needed for filtering even when empty)
+                exclude_times_normalized = [str(t).strip() for t in exclude_times_str] if exclude_times_str else []
+                
                 if exclude_times_str:
-                    date_df['Time_str'] = date_df['Time'].apply(str)
+                    date_df['Time_str'] = date_df['Time'].apply(str).str.strip()
+                    
                     # Remove ALL trades at excluded times - they should never be considered
                     before_count = len(date_df)
-                    date_df = date_df[~date_df['Time_str'].isin(exclude_times_str)].copy()
+                    date_df = date_df[~date_df['Time_str'].isin(exclude_times_normalized)].copy()
                     after_count = len(date_df)
+                    
                     if before_count != after_count:
                         excluded_count = before_count - after_count
-                        excluded_times_found = date_df[date_df['Time_str'].isin(exclude_times_str)]['Time'].unique().tolist() if len(date_df) > 0 else []
-                        msg = f"[DEBUG] Stream {stream_id} {date}: Removed {excluded_count} trades at excluded times {exclude_times_str}"
-                        print(msg, file=sys.stderr, flush=True)
-                        logger.info(msg)
-                    if 'Time_str' in date_df.columns:
-                        date_df = date_df.drop(columns=['Time_str'])
+                        # Verify they're actually gone (safety check)
+                        remaining_excluded = date_df[date_df['Time_str'].isin(exclude_times_normalized)]
+                        if len(remaining_excluded) > 0:
+                            msg = f"[ERROR] Stream {stream_id} {date}: {len(remaining_excluded)} excluded trades still present after filtering!"
+                            logger.error(msg)
+                            logger.error(f"  Excluded times: {exclude_times_normalized}")
+                            logger.error(f"  Remaining times: {remaining_excluded['Time_str'].unique().tolist()}")
+                    
                     if date_df.empty:
-                        msg = f"[DEBUG] Stream {stream_id} {date}: No trades available after excluding times {exclude_times_str}"
-                        logger.info(msg)
-                        logger.info(msg)
                         continue
                     
                     # If current_time is excluded, switch to first available time in same session (EXACTLY like sequencer lines 544-556)
-                    if str(current_time) in exclude_times_str:
+                    if str(current_time).strip() in exclude_times_normalized:
                         session_times = SLOT_ENDS.get(current_session, [])
-                        available_in_session = [t for t in available_times if t in session_times and str(t) not in exclude_times_str]
+                        available_in_session = [t for t in available_times if t in session_times and str(t).strip() not in exclude_times_normalized]
                         if available_in_session:
                             current_time = available_in_session[0]
                             current_session = self._get_session_for_time(current_time, SLOT_ENDS)
-                            msg = f"[DEBUG] Stream {stream_id} {date}: Current time was excluded. Switched to: {current_time}"
-                            logger.info(msg)
-                            logger.info(msg)
                         else:
                             logger.warning(f"Stream {stream_id} {date}: All times in {current_session} are excluded. Skipping day.")
                             continue
                 
-                # Get trade for current time/session
+                # Get trade for current time/session - use Time_str for consistent string comparison
+                # Keep Time_str column for reliable matching (don't drop it yet)
+                if 'Time_str' not in date_df.columns:
+                    date_df['Time_str'] = date_df['Time'].apply(str)
+                
                 trade = date_df[
-                    (date_df['Time'] == current_time) & 
+                    (date_df['Time_str'] == str(current_time)) & 
                     (date_df['Session'] == current_session)
                 ]
                 
                 if trade.empty:
                     # Try to find any trade for this date (but ensure it's not at an excluded time)
                     if len(date_df) > 0:
-                        # Double-check: ensure we don't pick a trade at an excluded time (like sequencer)
-                        if exclude_times_str:
-                            date_df_check = date_df.copy()
-                            date_df_check['Time_str'] = date_df_check['Time'].apply(str)
-                            valid_trades = date_df_check[~date_df_check['Time_str'].isin(exclude_times_str)]
-                            if 'Time_str' in valid_trades.columns:
-                                valid_trades = valid_trades.drop(columns=['Time_str'])
-                            trade = valid_trades.iloc[0:1] if len(valid_trades) > 0 else pd.DataFrame()
-                        else:
-                            trade = date_df.iloc[0:1] if len(date_df) > 0 else pd.DataFrame()
+                        # date_df already has Time_str and is already filtered, so just pick first valid trade
+                        trade = date_df.iloc[0:1] if len(date_df) > 0 else pd.DataFrame()
                     else:
                         trade = pd.DataFrame()
                 
@@ -486,10 +567,13 @@ class MasterMatrix:
                     trade_row = trade.iloc[0].copy()
                     
                     # CRITICAL SAFETY CHECK: Ensure trade is not at an excluded time (like sequencer)
-                    if exclude_times_str and str(trade_row['Time']) in exclude_times_str:
-                        msg = f"[DEBUG] Stream {stream_id} {date}: ERROR - Selected trade at excluded time {trade_row['Time']}! Skipping this day."
-                        logger.info(msg)
+                    # Use Time_str if available, otherwise convert Time to string
+                    trade_time_str = trade_row.get('Time_str', str(trade_row['Time'])).strip()
+                    
+                    if exclude_times_str and trade_time_str in exclude_times_normalized:
+                        msg = f"[ERROR] Stream {stream_id} {date}: Selected trade at excluded time '{trade_time_str}'! Skipping this day."
                         logger.error(msg)
+                        print(msg, file=sys.stderr, flush=True)
                         continue
                     
                     # Track the time we're using for THIS day (before any changes)
@@ -592,8 +676,9 @@ class MasterMatrix:
                             if time_slot not in session_times:
                                 continue
                             # Get today's result for this time slot
+                            # Use Time_str for consistent string comparison
                             slot_trade = date_df[
-                                (date_df['Time'] == time_slot) & 
+                                (date_df['Time_str'] == str(time_slot)) & 
                                 (date_df['Session'] == current_session)
                             ]
                             if not slot_trade.empty:
@@ -625,13 +710,22 @@ class MasterMatrix:
                             sl_value = min(sl_value, trade_row['Range'])
                     trade_row['SL'] = sl_value
                     
-                    # Only add to chosen_trades if it's from the display year (or all if display_year is None)
+                    # Add to chosen_trades - filter by year only if display_year is explicitly set
                     # We still process ALL days to build accurate time slot histories
-                    trade_date = pd.to_datetime(trade_row['Date'])
-                    if display_year is None or trade_date.year == display_year:
+                    trade_date = pd.to_datetime(trade_row['Date'], errors='coerce')
+                    if display_year is None or (pd.notna(trade_date) and trade_date.year == display_year):
                         # Convert Series to dict - SL is already in trade_row
                         trade_dict = trade_row.to_dict()
                         trade_dict['SL'] = sl_value  # Ensure SL is set
+                        
+                        # CRITICAL: Set trade_date immediately (before normalize_schema)
+                        # This ensures trade_date is always set and valid
+                        if pd.notna(trade_date):
+                            trade_dict['trade_date'] = trade_date
+                        else:
+                            # If Date is invalid, use the date from the loop (should always be valid)
+                            trade_dict['trade_date'] = pd.to_datetime(date)
+                            logger.warning(f"[WARNING] Stream {stream_id} {date}: Date column was invalid, using loop date instead")
                         
                         # Format Time Change column like sequencer: "old_time→new_time" when time changes
                         # The sequencer shows the change on the day it happens (when we switch from old_time to new_time)
@@ -649,6 +743,19 @@ class MasterMatrix:
                             logger.info(f"Stream {stream_id} {date}: Time will change for NEXT day: {old_time_for_today} → {next_day_time}")
                         
                         trade_dict['Time Change'] = time_change_display
+                        
+                        # Final check before adding
+                        if 'Time_str' in trade_dict:
+                            final_check_time = trade_dict['Time_str'].strip()
+                            if exclude_times_str and final_check_time in exclude_times_normalized:
+                                msg = f"[ERROR] Stream {stream_id} {date}: About to add trade with excluded time '{final_check_time}'! Skipping."
+                                logger.error(msg)
+                                print(msg, file=sys.stderr, flush=True)
+                                continue
+                        
+                        # Remove Time_str from trade_dict before appending (cleanup)
+                        if 'Time_str' in trade_dict:
+                            del trade_dict['Time_str']
                         chosen_trades.append(trade_dict)
                     
                     # Update current_time for next day if a time change was decided (like sequencer)
@@ -656,8 +763,7 @@ class MasterMatrix:
                     # CRITICAL: Ensure next_day_time is not excluded (safety check - like sequencer)
                     if next_day_time != current_time:
                         if str(next_day_time) in exclude_times_str:
-                            msg = f"[DEBUG] Stream {stream_id} {date}: ERROR - next_day_time {next_day_time} is excluded! Staying on {current_time}"
-                            logger.info(msg)
+                            logger.warning(f"Stream {stream_id} {date}: next_day_time {next_day_time} is excluded! Staying on {current_time}")
                             logger.error(msg)
                             next_day_time = current_time  # Don't change to excluded time
                         else:
@@ -667,6 +773,27 @@ class MasterMatrix:
                     
                     # Update previous_time for next iteration
                     previous_time = current_time
+        
+        logger.info("=" * 80)
+        logger.info("STREAM PROCESSING SUMMARY")
+        logger.info(f"Streams processed: {sorted(streams_processed)}")
+        logger.info(f"Streams skipped (no available times): {sorted(streams_skipped)}")
+        
+        if chosen_trades:
+            chosen_df_temp = pd.DataFrame(chosen_trades)
+            if 'Stream' in chosen_df_temp.columns:
+                stream_counts = chosen_df_temp['Stream'].value_counts().to_dict()
+                for stream_id in sorted(stream_counts.keys()):
+                    stream_chosen = chosen_df_temp[chosen_df_temp['Stream'] == stream_id]
+                
+                # Show which streams were processed but have no chosen trades
+                processed_but_no_trades = [s for s in streams_processed if s not in stream_counts]
+                if processed_but_no_trades:
+                    logger.warning(f"[WARNING] Streams processed but have no chosen trades: {processed_but_no_trades}")
+        else:
+            logger.warning("[WARNING] No chosen trades after sequencer logic!")
+        
+        logger.info("=" * 80)
         
         if not chosen_trades:
             return pd.DataFrame()
@@ -679,29 +806,38 @@ class MasterMatrix:
         for stream_id, filters in self.stream_filters.items():
             exclude_times = [str(t) for t in filters.get('exclude_times', [])]
             all_excluded_times.update(exclude_times)
-            
+        
+        # Remove trades at excluded times for each stream
+        for stream_id, filters in self.stream_filters.items():
+            exclude_times = [str(t) for t in filters.get('exclude_times', [])]
             # Remove trades at excluded times for this stream (using string comparison like sequencer)
             if exclude_times:
                 stream_mask = result_df['Stream'] == stream_id
-                result_df_check = result_df.copy()
-                result_df_check['Time_str'] = result_df_check['Time'].apply(str)
-                time_mask = result_df_check['Time_str'].isin(exclude_times)
-                rows_to_remove = stream_mask & time_mask
-                
-                if rows_to_remove.any():
-                    removed_count = rows_to_remove.sum()
-                    msg = f"[DEBUG] FINAL CLEANUP: Removing {removed_count} trades at excluded times for stream {stream_id}: {exclude_times}"
-                    logger.info(msg)
-                    logger.warning(msg)
-                    excluded_trades = result_df[rows_to_remove]
-                    if len(excluded_trades) > 0:
-                        msg = f"[DEBUG] Excluded trades being removed:\n{excluded_trades[['Date', 'Time', 'Result']].to_string()}"
-                        logger.info(msg)
-                        logger.info(msg)
-                    result_df = result_df[~rows_to_remove].copy()
-                
-                if 'Time_str' in result_df.columns:
-                    result_df = result_df.drop(columns=['Time_str'])
+                if stream_mask.any():
+                    result_df_check = result_df.copy()
+                    result_df_check['Time_str'] = result_df_check['Time'].apply(str)
+                    # Normalize time strings (remove leading zeros, ensure format matches)
+                    result_df_check['Time_str'] = result_df_check['Time_str'].apply(lambda x: x.strip())
+                    exclude_times_normalized = [str(t).strip() for t in exclude_times]
+                    time_mask = result_df_check['Time_str'].isin(exclude_times_normalized)
+                    rows_to_remove = stream_mask & time_mask
+                    
+                    if rows_to_remove.any():
+                        removed_count = rows_to_remove.sum()
+                        logger.info(f"Removing {removed_count} trades at excluded times for stream {stream_id}: {exclude_times}")
+                        result_df = result_df[~rows_to_remove].copy()
+                    
+                    if 'Time_str' in result_df.columns:
+                        result_df = result_df.drop(columns=['Time_str'])
+        
+        # Check if any excluded times are still present (error check only)
+        if len(result_df) > 0 and all_excluded_times:
+            all_times_after = sorted([str(t) for t in result_df['Time'].unique()])
+            excluded_still_present = [t for t in all_times_after if t in all_excluded_times]
+            if excluded_still_present:
+                logger.error(f"[ERROR] Excluded times still present in result: {excluded_still_present}")
+                logger.error(f"  All excluded times: {sorted(all_excluded_times)}")
+                logger.error(f"  All times in result: {all_times_after}")
         
         # Remove rolling sum columns for ALL excluded times (globally, to keep schema consistent)
         cols_removed = []
@@ -711,16 +847,11 @@ class MasterMatrix:
             if rolling_col in result_df.columns:
                 result_df = result_df.drop(columns=[rolling_col])
                 cols_removed.append(rolling_col)
-                logger.debug(f"[DEBUG] Removed column: {rolling_col}")
             if points_col in result_df.columns:
                 result_df = result_df.drop(columns=[points_col])
                 cols_removed.append(points_col)
-                logger.debug(f"[DEBUG] Removed column: {points_col}")
         if cols_removed:
-            logger.info(f"[DEBUG] Removed {len(cols_removed)} rolling sum columns for excluded times: {cols_removed}")
-            msg = f"[DEBUG] Removed {len(cols_removed)} rolling sum columns for excluded times: {cols_removed}"
-            logger.info(msg)
-            logger.info(msg)
+            logger.debug(f"Removed {len(cols_removed)} rolling sum columns for excluded times")
         
         # Ensure SL column exists (should already be there from calculation above)
         if 'SL' not in result_df.columns:
@@ -1115,12 +1246,7 @@ class MasterMatrix:
         logger.info(f"Streams: {streams}")
         logger.info(f"Output dir: {output_dir}")
         logger.info(f"Stream filters: {stream_filters}")
-        logger.info("=" * 80)
-        
-        logger.info("=" * 80)
         logger.info("BUILDING MASTER MATRIX (Applying Sequencer Logic)")
-        logger.info(f"Streams: {streams}")
-        logger.info(f"Output dir: {output_dir}")
         logger.info("=" * 80)
         
         # Override analyzer_runs_dir if provided
@@ -1131,126 +1257,22 @@ class MasterMatrix:
         
         # CRITICAL: Update stream filters BEFORE loading data
         # load_all_streams calls _apply_sequencer_logic which needs these filters
-        # ALWAYS update filters, even if stream_filters is None (use existing self.stream_filters)
-        if stream_filters:
-            msg = f"[DEBUG] Received stream_filters parameter: {stream_filters}"
-            logger.info(msg)
-            logger.info(msg)
-            # Ensure all exclude_times are strings (like sequencer expects)
-            normalized_filters = {}
-            for stream_id, filters in stream_filters.items():
-                normalized_filters[stream_id] = {
-                    "exclude_days_of_week": filters.get('exclude_days_of_week', []),
-                    "exclude_days_of_month": filters.get('exclude_days_of_month', []),
-                    "exclude_times": [str(t) for t in filters.get('exclude_times', [])]  # Ensure strings
-                }
-            self.stream_filters = normalized_filters
-        else:
-            msg = f"[DEBUG] No stream_filters parameter provided, using existing: {self.stream_filters}"
-            print(msg, file=sys.stderr, flush=True)
-            logger.info(msg)
+        # For full rebuild, replace filters. For partial rebuild, merge filters.
+        is_partial_rebuild = streams and len(streams) > 0
+        self._update_stream_filters(stream_filters, merge=is_partial_rebuild)
         
-        # ALWAYS ensure all streams have filter entries (even if empty)
-        for stream in self.streams:
-            if stream not in self.stream_filters:
-                self.stream_filters[stream] = {
-                    "exclude_days_of_week": [],
-                    "exclude_days_of_month": [],
-                    "exclude_times": []
-                }
+        # Log filter state
+        logger.info(f"Stream filters set BEFORE load_all_streams: {list(self.stream_filters.keys())}")
+        for stream_id, filters in self.stream_filters.items():
+            exclude_times = filters.get('exclude_times', [])
+            if exclude_times:
+                logger.info(f"  {stream_id}: exclude_times = {exclude_times}")
         
-            msg = f"[DEBUG] Stream filters set BEFORE load_all_streams: {list(self.stream_filters.keys())}"
-            logger.info(msg)
-            logger.info(msg)
-            for stream_id, filters in self.stream_filters.items():
-                exclude_times = filters.get('exclude_times', [])
-                if exclude_times:
-                    msg = f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}"
-                    logger.info(msg)
-                    logger.info(msg)
-                else:
-                    msg = f"[DEBUG]   {stream_id}: exclude_times = [] (no filter)"
-                    logger.info(msg)
-                    logger.info(msg)
-        
-        # If rebuilding specific streams, we need to merge with existing master matrix
-        # If streams is None or empty, rebuild EVERYTHING from scratch (master rebuild)
+        # If rebuilding specific streams, merge with existing. Otherwise rebuild everything.
         if streams and len(streams) > 0:
-            logger.info(f"Rebuilding only streams: {streams}")
-            # Load existing master matrix if it exists
-            existing_df = pd.DataFrame()
-            output_path = Path(output_dir)
-            if output_path.exists():
-                # Find the most recent master matrix file
-                parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
-                if parquet_files:
-                    try:
-                        existing_df = pd.read_parquet(parquet_files[0])
-                        logger.info(f"Loaded existing master matrix: {len(existing_df)} trades")
-                        # Remove old data for streams being rebuilt
-                        existing_df = existing_df[~existing_df['Stream'].isin(streams)]
-                        logger.info(f"After removing rebuilt streams: {len(existing_df)} trades")
-                    except Exception as e:
-                        logger.warning(f"Could not load existing master matrix: {e}")
-            
-            # Update stream filters BEFORE loading (critical for time filtering)
-            # When rebuilding specific streams, MERGE filters (don't replace all)
-            if stream_filters:
-                # Merge provided filters with existing filters (preserve other streams' filters)
-                for stream_id, filters in stream_filters.items():
-                    self.stream_filters[stream_id] = {
-                        "exclude_days_of_week": filters.get('exclude_days_of_week', []),
-                        "exclude_days_of_month": filters.get('exclude_days_of_month', []),
-                        "exclude_times": [str(t) for t in filters.get('exclude_times', [])]  # Ensure strings
-                    }
-                # Initialize defaults for streams not in provided filters (preserve existing)
-                for stream in self.streams:
-                    if stream not in self.stream_filters:
-                        self.stream_filters[stream] = {
-                            "exclude_days_of_week": [],
-                            "exclude_days_of_month": [],
-                            "exclude_times": []
-                        }
-                logger.info(f"Stream filters merged (partial rebuild): {list(self.stream_filters.keys())}")
-                for stream_id, filters in self.stream_filters.items():
-                    if filters.get('exclude_times'):
-                        logger.info(f"  {stream_id}: exclude_times = {filters.get('exclude_times')}")
-            
-            # Only process requested streams
-            original_streams = self.streams.copy()
-            streams_to_load = [s for s in self.streams if s in streams]
-            
-            # Set streams to only the ones we want to rebuild
-            # load_all_streams will now preserve this list (won't rediscover)
-            self.streams = streams_to_load
-            logger.info(f"Limiting load to streams: {streams_to_load}")
-            
-            # Load only the requested streams
-            # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
-            # The display_year filtering happens in _apply_sequencer_logic
-            # NOTE: stream_filters are already set above, so they will be used in _apply_sequencer_logic
-            new_df = self.load_all_streams(start_date=None, end_date=None, specific_date=None)
-            
-            # Double-check: filter to only the streams we wanted (safety check)
-            if not new_df.empty:
-                new_df = new_df[new_df['Stream'].isin(streams_to_load)].copy()
-                logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
-            
-            # Restore original streams list
-            self.streams = original_streams
-            
-            # Merge with existing data
-            if not existing_df.empty:
-                df = pd.concat([existing_df, new_df], ignore_index=True)
-                logger.info(f"Merged with existing data: {len(df)} total trades")
-            else:
-                df = new_df
+            df = self._rebuild_partial(streams, output_dir)
         else:
-            # Rebuild everything from scratch
-            # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
-            # The display_year filtering happens in _apply_sequencer_logic
-            # NOTE: stream_filters are already set above (before this if/else), so they will be used in _apply_sequencer_logic
-            df = self.load_all_streams(start_date=None, end_date=None, specific_date=None)
+            df = self._rebuild_full()
         
         if df.empty:
             logger.warning("No data loaded!")
@@ -1268,11 +1290,6 @@ class MasterMatrix:
         # SL is already calculated in _apply_sequencer_logic, just ensure it exists
         if 'SL' not in df.columns:
             df['SL'] = 0
-        
-        # Ensure Time Change column exists (should already be there from _apply_sequencer_logic)
-        if 'Time Change' not in df.columns:
-            logger.warning("Time Change column missing, adding with empty values")
-            df['Time Change'] = ''
         
         # Ensure Time Change column exists (should already be there from _apply_sequencer_logic)
         if 'Time Change' not in df.columns:

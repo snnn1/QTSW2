@@ -1220,12 +1220,24 @@ async def generate_timetable(request: TimetableRequest):
 async def list_matrix_files():
     """List available master matrix files."""
     try:
-        matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        if not matrix_dir.exists():
-            return {"files": []}
+        # Check both possible locations (where files are actually saved vs. where they might be)
+        # Backend script is in dashboard/backend/, so resolve relative to that
+        backend_dir = Path(__file__).parent  # dashboard/backend/
+        backend_matrix_dir = backend_dir / "data" / "master_matrix"  # dashboard/backend/data/master_matrix/
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"  # QTSW2_ROOT/data/master_matrix/
+        
+        # Collect files from both locations
+        parquet_files = []
+        if backend_matrix_dir.exists():
+            parquet_files.extend(backend_matrix_dir.glob("master_matrix_*.parquet"))
+        if root_matrix_dir.exists():
+            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
+        
+        # Remove duplicates and sort by modification time
+        parquet_files = sorted(set(parquet_files), key=lambda p: p.stat().st_mtime, reverse=True)
         
         files = []
-        for file_path in sorted(matrix_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True):
+        for file_path in parquet_files:
             files.append({
                 "name": file_path.name,
                 "path": str(file_path),
@@ -1241,11 +1253,23 @@ async def list_matrix_files():
 @app.get("/api/matrix/data")
 async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
     """Get master matrix data from the most recent file or specified file."""
+    logger = logging.getLogger(__name__)
     try:
         import pandas as pd
         
-        matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        matrix_dir.mkdir(parents=True, exist_ok=True)
+        # Check both possible locations (where files are actually saved vs. where they might be)
+        # Files are saved to relative path "data/master_matrix" from backend's working directory
+        # Backend script is in dashboard/backend/, so resolve relative to that
+        backend_dir = Path(__file__).parent  # dashboard/backend/
+        backend_matrix_dir = backend_dir / "data" / "master_matrix"  # dashboard/backend/data/master_matrix/
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"  # QTSW2_ROOT/data/master_matrix/
+        
+        # Collect files from both locations
+        parquet_files = []
+        if backend_matrix_dir.exists():
+            parquet_files.extend(backend_matrix_dir.glob("master_matrix_*.parquet"))
+        if root_matrix_dir.exists():
+            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
         
         if file_path:
             # Use specified file
@@ -1253,11 +1277,13 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
             if not file_to_load.exists():
                 return {"data": [], "total": 0, "file": None, "error": f"File not found: {file_path}"}
         else:
-            # Find most recent file
-            parquet_files = sorted(matrix_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if not parquet_files:
-                return {"data": [], "total": 0, "file": None, "error": "No master matrix files found. Build the matrix first."}
-            file_to_load = parquet_files[0]
+            # Find most recent file from all collected files
+            if parquet_files:
+                # Sort all files by modification time and get most recent
+                parquet_files = sorted(parquet_files, key=lambda p: p.stat().st_mtime, reverse=True)
+                file_to_load = parquet_files[0]
+            else:
+                return {"data": [], "total": 0, "file": None, "error": f"No master matrix files found. Checked: {backend_matrix_dir} and {root_matrix_dir}. Build the matrix first."}
         
         # Load parquet file
         try:
@@ -1268,42 +1294,114 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
         if df.empty:
             return {"data": [], "total": 0, "file": file_to_load.name, "error": "File is empty"}
         
-        # Convert to records (limit rows)
+        # Extract available years from source analyzer_runs data
+        # Files are named like: ES1_an_2017_01.parquet, so extract year from filename
+        available_years = []
+        try:
+            logger.info("=" * 80)
+            logger.info("YEAR EXTRACTION DEBUG START")
+            logger.info("=" * 80)
+            
+            analyzer_runs_dir = QTSW2_ROOT / "data" / "analyzer_runs"
+            logger.info(f"Checking analyzer_runs_dir: {analyzer_runs_dir}")
+            logger.info(f"Directory exists: {analyzer_runs_dir.exists()}")
+            
+            if analyzer_runs_dir.exists():
+                import re
+                parquet_files = list(analyzer_runs_dir.rglob("*.parquet"))
+                logger.info(f"Found {len(parquet_files)} parquet files")
+                
+                all_years = set()
+                sample_files = []
+                
+                # Extract years from filenames (format: STREAM_an_YYYY_MM.parquet)
+                for parquet_file in parquet_files:
+                    # Look for 4-digit year in filename
+                    match = re.search(r'_(\d{4})_', parquet_file.name)
+                    if match:
+                        year = int(match.group(1))
+                        if 2000 <= year <= 2100:  # Sanity check
+                            all_years.add(year)
+                            if len(sample_files) < 5:
+                                sample_files.append((parquet_file.name, year))
+                
+                logger.info(f"Sample files checked: {sample_files}")
+                logger.info(f"Unique years found: {sorted(all_years)}")
+                
+                if all_years:
+                    available_years = sorted(list(all_years))
+                    logger.info(f"✓ Found {len(available_years)} years from filenames: {available_years}")
+                else:
+                    logger.warning("✗ No years found in filenames!")
+            
+            # If no years found from source, fallback to matrix data
+            if not available_years:
+                logger.info("Falling back to matrix data for years...")
+                if 'trade_date' in df.columns:
+                    logger.info("Using trade_date column")
+                    dates = pd.to_datetime(df['trade_date'], errors='coerce')
+                    years = dates.dt.year.dropna().unique()
+                    available_years = sorted([int(y) for y in years if pd.notna(y)])
+                    logger.info(f"Years from trade_date: {available_years}")
+                elif 'Date' in df.columns:
+                    logger.info("Using Date column")
+                    dates = pd.to_datetime(df['Date'], errors='coerce')
+                    years = dates.dt.year.dropna().unique()
+                    available_years = sorted([int(y) for y in years if pd.notna(y)])
+                    logger.info(f"Years from Date: {available_years}")
+                else:
+                    logger.warning("No Date or trade_date column in dataframe!")
+            
+            logger.info(f"FINAL available_years (from source files): {available_years}")
+            logger.info("=" * 80)
+            logger.info("YEAR EXTRACTION DEBUG END")
+            logger.info("=" * 80)
+            
+            # Also add years from the actual data to ensure completeness
+            if 'trade_date' in df.columns:
+                dates = pd.to_datetime(df['trade_date'], errors='coerce')
+                years_from_data = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
+                if years_from_data:
+                    # Merge with available_years to ensure all years are included
+                    all_years_set = set(available_years) | set(years_from_data)
+                    available_years = sorted(list(all_years_set))
+                    logger.info(f"Combined years (source files + data): {available_years}")
+            elif 'Date' in df.columns:
+                dates = pd.to_datetime(df['Date'], errors='coerce')
+                years_from_data = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
+                if years_from_data:
+                    # Merge with available_years to ensure all years are included
+                    all_years_set = set(available_years) | set(years_from_data)
+                    available_years = sorted(list(all_years_set))
+                    logger.info(f"Combined years (source files + data): {available_years}")
+        except Exception as e:
+            logger.error(f"Error extracting years: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            available_years = []
+        
+        # Extract years from the actual data being returned (to verify all years are included)
+        years_in_data = []
+        if 'trade_date' in df.columns:
+            dates = pd.to_datetime(df['trade_date'], errors='coerce')
+            years_in_data = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
+        elif 'Date' in df.columns:
+            dates = pd.to_datetime(df['Date'], errors='coerce')
+            years_in_data = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
+        
+        logger.info(f"Years in loaded data: {years_in_data}")
+        logger.info(f"Total records in file: {len(df)}")
+        logger.info(f"Returning all data (up to limit {limit}) - includes all years: {years_in_data}")
+        
+        # Convert to records (limit rows AFTER extracting years)
+        # NOTE: This returns ALL data from the file - no year filtering applied
         records = df.head(limit).to_dict('records')
         
-        # Debug: Check SL column in first few records
-        logger = logging.getLogger(__name__)
-        print("=" * 80, file=sys.stderr)
-        print("SL DEBUG: Checking SL column in records", file=sys.stderr)
-        if records and 'SL' in records[0]:
-            sl_val = records[0].get('SL')
-            sl_type = type(sl_val).__name__
-            print(f"SL DEBUG: SL in first record: {sl_val} (type: {sl_type})", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: SL in first record: {sl_val} (type: {sl_type}) ===")
-            sl_count = sum(1 for r in records[:10] if r.get('SL') is not None and r.get('SL') != 0)
-            print(f"SL DEBUG: SL non-zero in first 10 records: {sl_count}", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: SL non-zero in first 10 records: {sl_count} ===")
-            # Show sample SL values
-            sample_sl = [r.get('SL') for r in records[:5]]
-            print(f"SL DEBUG: Sample SL values: {sample_sl}", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: Sample SL values: {sample_sl} ===")
-        elif records:
-            available_keys = list(records[0].keys())[:20]
-            print(f"SL DEBUG: SL column MISSING! Available keys: {available_keys}", file=sys.stderr)
-            logger.warning(f"=== SL DEBUG: SL column missing from records! Available keys: {available_keys} ===")
-        print("=" * 80, file=sys.stderr)
-        
         # Convert dates and other types to strings for JSON
-        logger = logging.getLogger(__name__)
-        for idx, record in enumerate(records):
+        for record in records:
             for key, value in record.items():
-                # Debug SL conversion for first 3 records
-                debug_sl = (key == 'SL' and idx < 3)
-                
                 # Check for NaN/NaT first (before type checks)
                 if pd.isna(value) or str(type(value)) == "<class 'pandas._libs.tslibs.nattype.NaTType'>":
-                    if debug_sl:
-                        logger.warning(f"=== SL DEBUG [record {idx}]: SL is NaN/NaT, converting to None ===")
                     record[key] = None
                 elif isinstance(value, (pd.Timestamp, datetime)):
                     if hasattr(value, 'isoformat'):
@@ -1313,36 +1411,34 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
                 elif isinstance(value, (np.integer, np.floating)):
                     # Convert numpy types to Python types (preserve 0 values)
                     converted = float(value) if isinstance(value, np.floating) else int(value)
-                    if debug_sl:
-                        logger.info(f"=== SL DEBUG [record {idx}]: Converted numpy {type(value).__name__} to {type(converted).__name__}: {converted} ===")
                     record[key] = converted
                 elif isinstance(value, (int, float)):
                     # Python int/float - keep as is (including 0)
-                    if debug_sl:
-                        logger.info(f"=== SL DEBUG [record {idx}]: Keeping Python {type(value).__name__}: {value} ===")
                     record[key] = value
         
-        # Final check: verify SL in first few records after conversion
-        if records:
-            sl_val = records[0].get('SL')
-            sl_type = type(sl_val).__name__ if sl_val is not None else 'None'
-            print(f"SL DEBUG: After conversion, first record SL: {sl_val} (type: {sl_type})", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: After conversion, first record SL: {sl_val} (type: {sl_type}) ===")
-            sl_in_records = sum(1 for r in records[:10] if 'SL' in r and r.get('SL') is not None)
-            print(f"SL DEBUG: SL present in first 10 records: {sl_in_records}/10", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: SL present in first 10 records: {sl_in_records}/10 ===")
-            # Show sample SL values
-            sample_sl = [r.get('SL') for r in records[:5] if 'SL' in r]
-            print(f"SL DEBUG: Sample SL values after conversion: {sample_sl}", file=sys.stderr)
-            logger.info(f"=== SL DEBUG: Sample SL values after conversion: {sample_sl} ===")
-        print("=" * 80, file=sys.stderr)
-        
-        return {
+        response = {
             "data": records,
             "total": len(df),
             "file": file_to_load.name,
-            "loaded": len(records)
+            "loaded": len(records),
+            "date_range": {
+                "start": str(df['trade_date'].min()) if 'trade_date' in df.columns and not df['trade_date'].empty else None,
+                "end": str(df['trade_date'].max()) if 'trade_date' in df.columns and not df['trade_date'].empty else None
+            },
+            "streams": sorted(df['Stream'].unique().tolist()) if 'Stream' in df.columns and not df['Stream'].empty else [],
+            "instruments": sorted(df['Instrument'].unique().tolist()) if 'Instrument' in df.columns and not df['Instrument'].empty else [],
+            "years": available_years,
+            "allowed_trades": int(df['final_allowed'].sum()) if 'final_allowed' in df.columns and not df['final_allowed'].empty else 0
         }
+        
+        logger.info("=" * 80)
+        logger.info("API RESPONSE DEBUG")
+        logger.info(f"Years in response: {response['years']}")
+        logger.info(f"Number of years: {len(response['years'])}")
+        logger.info(f"Years type: {type(response['years'])}")
+        logger.info("=" * 80)
+        
+        return response
     except Exception as e:
         import traceback
         error_detail = f"Failed to load matrix data: {str(e)}\n{traceback.format_exc()}"
