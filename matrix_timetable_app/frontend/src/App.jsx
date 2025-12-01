@@ -1,21 +1,69 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { List } from 'react-window'
 import './App.css'
+import { useMatrixWorker } from './useMatrixWorker'
 
 const API_BASE = 'http://localhost:8000/api'
 
 const STREAMS = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2']
 const DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 const AVAILABLE_TIMES = ['07:30', '08:00', '09:00', '09:30', '10:00', '10:30', '11:00']
-const DEFAULT_COLUMNS = ['Date', 'Day of Week', 'Stream', 'Time', 'Target', 'Range', 'SL', 'Profit', 'Peak', 'Direction', 'Result', 'Time Change', 'Profit ($)']
+// Analyzer column order (single source of truth)
+const ANALYZER_COLUMN_ORDER = ['TradeID', 'Date', 'Time', 'EntryTime', 'ExitTime', 'Instrument', 'Stream', 'Session', 'Direction', 'EntryPrice', 'ExitPrice', 'Target', 'Range', 'SL', 'Peak', 'Result', 'Profit']
+// Default columns for all streams (exact structure as specified)
+const DEFAULT_COLUMNS = ['Date', 'DOW', 'Time', 'EntryTime', 'ExitTime', 'Instrument', 'Stream', 'Session', 'Direction', 'Target', 'Range', 'SL', 'Peak', 'Result', 'Profit', 'Time Change', 'Profit ($)']
 
 function App() {
-  const [activeTab, setActiveTab] = useState('master') // 'master' or stream ID
+  // Error boundary - catch any initialization errors
+  try {
+    return <AppContent />
+  } catch (error) {
+    console.error('App initialization error:', error)
+    return (
+      <div className="min-h-screen bg-black text-white p-8">
+        <h1 className="text-2xl font-bold mb-4 text-red-400">Error Loading App</h1>
+        <p className="text-gray-300 mb-2">Error: {error.message}</p>
+        <pre className="bg-gray-900 p-4 rounded text-sm overflow-auto">{error.stack}</pre>
+      </div>
+    )
+  }
+}
+
+function AppContent() {
+  const [activeTab, setActiveTab] = useState('timetable') // 'timetable', 'master', or stream ID
+  const [currentTime, setCurrentTime] = useState(new Date())
   
-  // Master matrix data
+  // Web Worker for all heavy computations
+  const {
+    workerReady,
+    filteredLength,
+    filterMask,
+    filteredIndices: workerFilteredIndices,
+    filteredRows: workerFilteredRows,
+    stats: workerStats,
+    statsLoading,
+    profitBreakdown: workerProfitBreakdown,
+    breakdownType: workerBreakdownType,
+    breakdownLoading: workerBreakdownLoading,
+    timetable: workerTimetable,
+    timetableLoading: workerTimetableLoading,
+    error: workerError,
+    initData: workerInitData,
+    filter: workerFilter,
+    calculateStats: workerCalculateStats,
+    getRows: workerGetRows,
+    calculateProfitBreakdown,
+    calculateTimetable: workerCalculateTimetable
+  } = useMatrixWorker()
+  
+  // Master matrix data (raw data from API - will be sent to worker)
   const [masterData, setMasterData] = useState([])
   const [masterLoading, setMasterLoading] = useState(false)
   const [masterError, setMasterError] = useState(null)
   const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
+  
+  // Filtered data indices (from worker mask)
+  const [filteredIndices, setFilteredIndices] = useState([])
   
   // Available columns (detected from data)
   const [availableColumns, setAvailableColumns] = useState([])
@@ -55,18 +103,70 @@ function App() {
     const saved = localStorage.getItem('matrix_master_contract_multiplier')
     return saved ? parseFloat(saved) || 1 : 1
   })
+  // Temporary input value for multiplier (doesn't trigger recalculations)
+  const [multiplierInput, setMultiplierInput] = useState(() => {
+    const saved = localStorage.getItem('matrix_master_contract_multiplier')
+    return saved ? parseFloat(saved) || 1 : 1
+  })
   
-  const [streamFilters, setStreamFilters] = useState(() => {
-    const saved = localStorage.getItem('matrix_stream_filters')
-    if (saved) {
-      try {
-        return JSON.parse(saved)
-      } catch {
-        return {}
+  // Default filter structure for any stream
+  const getDefaultFilters = () => ({
+    exclude_days_of_week: [],
+    exclude_days_of_month: [],
+    exclude_times: [],
+    include_years: []
+  })
+
+  // Filter persistence utility
+  const FILTER_STORAGE_KEY = 'matrix_stream_filters'
+  
+  // Load all filters from localStorage on startup
+  const loadAllFilters = () => {
+    try {
+      const saved = localStorage.getItem(FILTER_STORAGE_KEY)
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        // Validate structure - ensure all entries have the correct shape
+        const validated = {}
+        Object.keys(parsed).forEach(streamId => {
+          const filters = parsed[streamId]
+          validated[streamId] = {
+            exclude_days_of_week: Array.isArray(filters.exclude_days_of_week) ? filters.exclude_days_of_week : [],
+            exclude_days_of_month: Array.isArray(filters.exclude_days_of_month) ? filters.exclude_days_of_month : [],
+            exclude_times: Array.isArray(filters.exclude_times) ? filters.exclude_times : [],
+            include_years: Array.isArray(filters.include_years) ? filters.include_years : []
+          }
+        })
+        return validated
       }
+    } catch (error) {
+      console.error('Error loading filters from localStorage:', error)
     }
     return {}
-  })
+  }
+
+  // Save all filters to localStorage
+  const saveAllFilters = (filters) => {
+    try {
+      localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters))
+    } catch (error) {
+      console.error('Error saving filters to localStorage:', error)
+    }
+  }
+
+  // Get filters for a specific stream (with defaults if not exists)
+  const getStreamFiltersFromStorage = (allFilters, streamId) => {
+    if (allFilters[streamId]) {
+      return {
+        ...getDefaultFilters(),
+        ...allFilters[streamId]
+      }
+    }
+    return getDefaultFilters()
+  }
+
+  // Initialize filters from localStorage
+  const [streamFilters, setStreamFilters] = useState(() => loadAllFilters())
   
   // Infinite scroll
   const [visibleRows, setVisibleRows] = useState(100)
@@ -82,6 +182,14 @@ function App() {
     if (node) observerRef.current.observe(node)
   }, [masterLoading])
   
+  // Update clock every second
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date())
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [])
+
   // Load master matrix on mount (don't rebuild, just load existing)
   useEffect(() => {
     // Wait a bit for backend to be ready, then try loading
@@ -97,15 +205,28 @@ function App() {
     loadMasterMatrix(false)
   }
   
-  // Reload data when filters change (but don't rebuild - filters are applied client-side)
+  // Apply filters in worker when filters or active tab changes
   useEffect(() => {
-    // Filters are applied client-side, so we don't need to reload
-    // But we could trigger a visual update
-  }, [streamFilters])
+    try {
+      if (workerReady && masterData.length > 0 && workerFilter) {
+        const streamId = activeTab === 'timetable' ? 'master' : activeTab
+        // Request initial rows for table rendering (first 100 rows, sorted)
+        const returnRows = activeTab !== 'timetable' // Return rows for data table tabs
+        workerFilter(streamFilters, streamId, returnRows, true) // sortIndices = true
+        
+        // Calculate stats in worker
+        if (activeTab !== 'timetable' && workerCalculateStats) {
+          workerCalculateStats(streamFilters, streamId, masterContractMultiplier)
+        }
+      }
+    } catch (error) {
+      console.error('Error in filter useEffect:', error)
+    }
+  }, [streamFilters, activeTab, masterContractMultiplier, workerReady, masterData.length, workerFilter, workerCalculateStats])
   
   // Save filters to localStorage whenever they change
   useEffect(() => {
-    localStorage.setItem('matrix_stream_filters', JSON.stringify(streamFilters))
+    saveAllFilters(streamFilters)
   }, [streamFilters])
   
   // Save stats visibility to localStorage whenever it changes
@@ -116,9 +237,242 @@ function App() {
   // Save contract multiplier to localStorage whenever it changes
   useEffect(() => {
     localStorage.setItem('matrix_master_contract_multiplier', masterContractMultiplier.toString())
+    // Sync input value when multiplier changes (e.g., from localStorage on mount)
+    setMultiplierInput(masterContractMultiplier)
   }, [masterContractMultiplier])
   
   // Calculate stats for a stream from filtered data
+  // Helper function to parse date
+  const parseDateValue = (dateValue) => {
+    if (!dateValue) return null
+    try {
+      let date
+      if (typeof dateValue === 'string' && dateValue.includes('/')) {
+        // Handle DD/MM/YYYY format
+        const parts = dateValue.split('/')
+        if (parts.length === 3) {
+          date = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
+        } else {
+          date = new Date(dateValue)
+        }
+      } else {
+        date = new Date(dateValue)
+      }
+      if (isNaN(date.getTime())) return null
+      return date
+    } catch (e) {
+      return null
+    }
+  }
+  
+  // Get contract value helper
+  const getContractValue = (trade) => {
+    const symbol = trade.Symbol || trade.Instrument || 'ES'
+    const baseSymbol = symbol.replace(/\d+$/, '') // Remove trailing numbers
+    const contractValues = {
+      'ES': 50,
+      'NQ': 10,
+      'YM': 5,
+      'CL': 1000,
+      'NG': 10000,
+      'GC': 100
+    }
+    return contractValues[baseSymbol] || 50 // Default to ES if unknown
+  }
+  
+  // Calculate profit by Time slot by stream
+  const calculateTimeProfit = (data = masterData) => {
+    const timeData = {}
+    const contractMultiplier = masterContractMultiplier
+    
+    data.forEach(trade => {
+      const time = trade.Time
+      if (!time || time === 'NA' || time === '00:00') return
+      
+      // Normalize time format (ensure HH:MM format)
+      let timeKey = time.toString().trim()
+      // If time doesn't match HH:MM format, try to extract it
+      if (!/^\d{2}:\d{2}$/.test(timeKey)) {
+        // Try to extract time from string
+        const match = timeKey.match(/(\d{2}:\d{2})/)
+        if (match) {
+          timeKey = match[1]
+        } else {
+          return // Skip if we can't parse the time
+        }
+      }
+      
+      const stream = trade.Stream || 'Unknown'
+      
+      if (!timeData[timeKey]) {
+        timeData[timeKey] = {}
+      }
+      if (!timeData[timeKey][stream]) {
+        timeData[timeKey][stream] = 0
+      }
+      
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      timeData[timeKey][stream] += profitDollars
+    })
+    
+    // Sort time slots chronologically
+    const sortedTimeKeys = Object.keys(timeData).sort((a, b) => {
+      const [aHour, aMin] = a.split(':').map(Number)
+      const [bHour, bMin] = b.split(':').map(Number)
+      if (aHour !== bHour) return aHour - bHour
+      return aMin - bMin
+    })
+    
+    // Return data ordered by time
+    const orderedData = {}
+    sortedTimeKeys.forEach(timeKey => {
+      orderedData[timeKey] = timeData[timeKey]
+    })
+    
+    return orderedData
+  }
+  
+  // Calculate profit by Day of Month (DOM) by stream
+  const calculateDOMProfit = (data = masterData) => {
+    const domData = {}
+    const contractMultiplier = masterContractMultiplier
+    
+    data.forEach(trade => {
+      const date = parseDateValue(trade.Date || trade.trade_date)
+      if (!date) return
+      
+      const dayOfMonth = date.getDate() // 1-31
+      const stream = trade.Stream || 'Unknown'
+      
+      if (!domData[dayOfMonth]) {
+        domData[dayOfMonth] = {}
+      }
+      if (!domData[dayOfMonth][stream]) {
+        domData[dayOfMonth][stream] = 0
+      }
+      
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      domData[dayOfMonth][stream] += profitDollars
+    })
+    
+    // Return data ordered by day of month (1-31)
+    const orderedData = {}
+    for (let day = 1; day <= 31; day++) {
+      if (domData[day]) {
+        orderedData[day] = domData[day]
+      }
+    }
+    
+    return orderedData
+  }
+  
+  // Calculate profit by Day of Week (DOW) by stream
+  const calculateDailyProfit = (data = masterData) => {
+    const dowData = {}
+    const contractMultiplier = masterContractMultiplier
+    const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+    
+    data.forEach(trade => {
+      const date = parseDateValue(trade.Date || trade.trade_date)
+      if (!date) return
+      
+      const dow = date.toLocaleDateString('en-US', { weekday: 'long' })
+      // Skip weekends
+      if (!dowOrder.includes(dow)) return
+      
+      const stream = trade.Stream || 'Unknown'
+      
+      if (!dowData[dow]) {
+        dowData[dow] = {}
+      }
+      if (!dowData[dow][stream]) {
+        dowData[dow][stream] = 0
+      }
+      
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      dowData[dow][stream] += profitDollars
+    })
+    
+    // Return data ordered by DOW
+    const orderedData = {}
+    dowOrder.forEach(dow => {
+      if (dowData[dow]) {
+        orderedData[dow] = dowData[dow]
+      }
+    })
+    
+    return orderedData
+  }
+  
+  // Calculate monthly profit by stream
+  const calculateMonthlyProfit = (data = masterData) => {
+    const monthlyData = {}
+    const contractMultiplier = masterContractMultiplier
+    
+    data.forEach(trade => {
+      const date = parseDateValue(trade.Date || trade.trade_date)
+      if (!date) return
+      
+      const year = date.getFullYear()
+      const month = date.getMonth() + 1 // 1-12
+      const monthKey = `${year}-${String(month).padStart(2, '0')}`
+      const stream = trade.Stream || 'Unknown'
+      
+      if (!monthlyData[monthKey]) {
+        monthlyData[monthKey] = {}
+      }
+      if (!monthlyData[monthKey][stream]) {
+        monthlyData[monthKey][stream] = 0
+      }
+      
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      monthlyData[monthKey][stream] += profitDollars
+    })
+    
+    return monthlyData
+  }
+  
+  // Calculate yearly profit by stream
+  const calculateYearlyProfit = (data = masterData) => {
+    const yearlyData = {}
+    const contractMultiplier = masterContractMultiplier
+    
+    data.forEach(trade => {
+      const date = parseDateValue(trade.Date || trade.trade_date)
+      if (!date) return
+      
+      const year = date.getFullYear()
+      const stream = trade.Stream || 'Unknown'
+      
+      if (!yearlyData[year]) {
+        yearlyData[year] = {}
+      }
+      if (!yearlyData[year][stream]) {
+        yearlyData[year][stream] = 0
+      }
+      
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      
+      yearlyData[year][stream] += profitDollars
+    })
+    
+    return yearlyData
+  }
+  
   const calculateStats = (streamId) => {
     let filtered = getFilteredData(masterData, streamId)
     
@@ -202,13 +556,16 @@ function App() {
       'GC': 100
     }
     
-    // Helper function to get contract value for a trade
-    const getContractValue = (trade) => {
+    // Helper function to get contract value for a trade (local to calculateStats)
+    const getContractValueLocal = (trade) => {
       const symbol = (trade.Symbol || trade.Instrument || 'ES').toUpperCase()
       // Extract base symbol (ES1 -> ES, NQ2 -> NQ, etc.) or use as-is if no number
       const baseSymbol = symbol.replace(/\d+$/, '') || symbol
       return contractValues[baseSymbol] || 50 // Default to ES if unknown
     }
+    
+    // Use local version inside calculateStats
+    const getContractValue = getContractValueLocal
     
     // Calculate total profit in dollars by summing each trade's profit * contract value
     // Apply contract multiplier for master stream
@@ -404,6 +761,308 @@ function App() {
     // Average trades per day
     const avgTradesPerDay = totalDays > 0 ? totalTrades / totalDays : 0
     
+    // ===== STATISTICS FOR ALL STREAMS =====
+    // Calculate per-trade PnL in dollars (needed for both master and individual streams)
+    // Exclude NoTrade entries from PnL calculations
+    const perTradePnLDollars = sortedByDate
+      .filter(trade => trade.Result !== 'NoTrade')
+      .map(trade => {
+        const profit = parseFloat(trade.Profit) || 0
+        const contractValue = getContractValue(trade)
+        return profit * contractValue * contractMultiplier
+      })
+    
+    // Std Dev of PnL (for all streams)
+    const meanPnL = perTradePnLDollars.length > 0
+      ? perTradePnLDollars.reduce((sum, pnl) => sum + pnl, 0) / perTradePnLDollars.length
+      : 0
+    const variancePnL = perTradePnLDollars.length > 1
+      ? perTradePnLDollars.reduce((sum, pnl) => sum + Math.pow(pnl - meanPnL, 2), 0) / (perTradePnLDollars.length - 1)
+      : 0
+    const stdDevPnL = Math.sqrt(variancePnL)
+    
+    // Max Consecutive Losses (for all streams) - count only trades with pnl < 0
+    let maxConsecutiveLosses = 0
+    let currentConsecutiveLosses = 0
+    perTradePnLDollars.forEach(pnl => {
+      if (pnl < 0) {
+        currentConsecutiveLosses++
+        maxConsecutiveLosses = Math.max(maxConsecutiveLosses, currentConsecutiveLosses)
+      } else {
+        currentConsecutiveLosses = 0
+      }
+    })
+    
+    // Profit per Trade (for all streams)
+    const profitPerTrade = meanPnL
+    
+    // Rolling 30-Day Win Rate (for individual streams)
+    let rolling30DayWinRate = null
+    if (streamId !== 'master') {
+      // Get last 30 days of trades
+      const tradesByDateMap = new Map()
+      sortedByDate.forEach(trade => {
+        const dateValue = trade.Date || trade.trade_date
+        if (!dateValue) return
+        
+        try {
+          let dateKey
+          if (typeof dateValue === 'string' && dateValue.includes('/')) {
+            const parts = dateValue.split(' ')[0].split('/')
+            if (parts.length === 3) {
+              const dateObj = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
+              if (!isNaN(dateObj.getTime())) {
+                dateKey = dateObj.toISOString().split('T')[0]
+              }
+            }
+          } else if (typeof dateValue === 'string' && dateValue.includes('-')) {
+            dateKey = dateValue.split(' ')[0].split('T')[0]
+          } else {
+            const d = new Date(dateValue)
+            dateKey = isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+          }
+          
+          if (dateKey) {
+            if (!tradesByDateMap.has(dateKey)) {
+              tradesByDateMap.set(dateKey, [])
+            }
+            tradesByDateMap.get(dateKey).push(trade)
+          }
+        } catch {
+          // Skip invalid dates
+        }
+      })
+      
+      // Get unique dates sorted
+      const uniqueDates = Array.from(tradesByDateMap.keys()).sort()
+      
+      if (uniqueDates.length > 0) {
+        // Get the most recent date
+        const mostRecentDate = new Date(uniqueDates[uniqueDates.length - 1])
+        const thirtyDaysAgo = new Date(mostRecentDate)
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
+        
+        // Filter trades from last 30 days
+        const recent30DayTrades = []
+        uniqueDates.forEach(dateKey => {
+          const dateObj = new Date(dateKey)
+          if (dateObj >= thirtyDaysAgo) {
+            recent30DayTrades.push(...tradesByDateMap.get(dateKey))
+          }
+        })
+        
+        if (recent30DayTrades.length > 0) {
+          const recentWins = recent30DayTrades.filter(t => t.Result === 'Win').length
+          const recentLosses = recent30DayTrades.filter(t => t.Result === 'Loss').length
+          const recentWinLossTrades = recentWins + recentLosses
+          rolling30DayWinRate = recentWinLossTrades > 0 ? (recentWins / recentWinLossTrades * 100) : 0
+        }
+      }
+    }
+    
+    // ===== ADDITIONAL STATISTICS (Master Stream Only) =====
+    // 1. Mean PnL per trade (in dollars) - same as profitPerTrade but named differently for master
+    const meanPnLPerTrade = profitPerTrade
+    
+    // 2. Median PnL per trade (in dollars)
+    // Sort the per-trade PnL array for median calculation
+    const validPnL = perTradePnLDollars.filter(pnl => !isNaN(pnl) && isFinite(pnl))
+    const sortedPnLForMedian = [...validPnL].sort((a, b) => a - b)
+    let medianPnLPerTrade = 0
+    if (sortedPnLForMedian.length > 0) {
+      const midIndex = Math.floor(sortedPnLForMedian.length / 2)
+      if (sortedPnLForMedian.length % 2 === 0) {
+        // Even number of trades - average the two middle values
+        const mid1 = sortedPnLForMedian[midIndex - 1]
+        const mid2 = sortedPnLForMedian[midIndex]
+        medianPnLPerTrade = (mid1 + mid2) / 2
+      } else {
+        // Odd number of trades - take the middle value
+        medianPnLPerTrade = sortedPnLForMedian[midIndex]
+      }
+    }
+    
+    // 3. 95% VaR (per trade) - 5th percentile of per-trade PnL
+    // Use the same sorted array for consistency
+    const sortedPnL = sortedPnLForMedian
+    const var95Index = Math.floor(sortedPnL.length * 0.05)
+    const var95 = sortedPnL.length > 0 && var95Index < sortedPnL.length
+      ? sortedPnL[var95Index]
+      : 0
+    
+    // 4. Expected Shortfall (CVaR 95%) - mean of all trades worse than 5th percentile
+    const cvar95Trades = sortedPnL.slice(0, var95Index + 1)
+    const cvar95 = cvar95Trades.length > 0
+      ? cvar95Trades.reduce((sum, pnl) => sum + pnl, 0) / cvar95Trades.length
+      : 0
+    
+    // 7. Time-to-Recovery (Longest Drawdown Duration in days)
+    // Track equity curve and find peak → trough → recovery cycles
+    // Recovery = when equity reaches or exceeds the previous peak
+    let timeToRecoveryDays = 0
+    let drawdownStartPeak = 0
+    let drawdownStartDate = null
+    let inDrawdown = false
+    
+    // Map dates for each trade
+    const tradeDates = sortedByDate.map(trade => {
+      const dateValue = trade.Date || trade.trade_date
+      if (!dateValue) return null
+      try {
+        if (typeof dateValue === 'string' && dateValue.includes('/')) {
+          const parts = dateValue.split(' ')[0].split('/')
+          if (parts.length === 3) {
+            return new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
+          }
+          return null
+        } else if (typeof dateValue === 'string' && dateValue.includes('-')) {
+          return new Date(dateValue.split(' ')[0].split('T')[0])
+        } else {
+          const d = new Date(dateValue)
+          return isNaN(d.getTime()) ? null : d
+        }
+      } catch {
+        return null
+      }
+    })
+    
+    let runningEquity = 0
+    sortedByDate.forEach((trade, idx) => {
+      const profit = parseFloat(trade.Profit) || 0
+      const contractValue = getContractValue(trade)
+      const profitDollars = profit * contractValue * contractMultiplier
+      runningEquity += profitDollars
+      
+      const tradeDate = tradeDates[idx]
+      if (!tradeDate || isNaN(tradeDate.getTime())) return
+      
+      if (runningEquity > drawdownStartPeak) {
+        // New peak reached - check if we were in drawdown
+        if (inDrawdown && drawdownStartDate) {
+          // Calculate recovery time from peak to recovery (new peak)
+          const daysDiff = Math.floor((tradeDate.getTime() - drawdownStartDate.getTime()) / (1000 * 60 * 60 * 24))
+          timeToRecoveryDays = Math.max(timeToRecoveryDays, daysDiff)
+          inDrawdown = false
+        }
+        // Update peak
+        drawdownStartPeak = runningEquity
+        drawdownStartDate = tradeDate
+      } else if (runningEquity < drawdownStartPeak) {
+        // In drawdown
+        if (!inDrawdown) {
+          // Just entered drawdown - record the peak date
+          inDrawdown = true
+        }
+      }
+    })
+    
+    // 8. Monthly Return Std Dev - group by calendar month, sum PnL per month, then std dev
+    const monthlyReturns = new Map()
+    sortedByDate.forEach((trade) => {
+      const dateValue = trade.Date || trade.trade_date
+      if (!dateValue) return
+      
+      try {
+        let dateObj
+        if (typeof dateValue === 'string' && dateValue.includes('/')) {
+          const parts = dateValue.split(' ')[0].split('/')
+          if (parts.length === 3) {
+            // Try DD/MM/YYYY first
+            dateObj = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
+            if (isNaN(dateObj.getTime())) {
+              // Try MM/DD/YYYY
+              dateObj = new Date(parseInt(parts[2]), parseInt(parts[0]) - 1, parseInt(parts[1]))
+            }
+          } else {
+            return
+          }
+        } else if (typeof dateValue === 'string' && dateValue.includes('-')) {
+          dateObj = new Date(dateValue.split(' ')[0].split('T')[0])
+        } else {
+          dateObj = new Date(dateValue)
+        }
+        
+        if (isNaN(dateObj.getTime())) return
+        
+        const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`
+        const profit = parseFloat(trade.Profit) || 0
+        const contractValue = getContractValue(trade)
+        const profitDollars = profit * contractValue * contractMultiplier
+        
+        if (!monthlyReturns.has(monthKey)) {
+          monthlyReturns.set(monthKey, 0)
+        }
+        monthlyReturns.set(monthKey, monthlyReturns.get(monthKey) + profitDollars)
+      } catch {
+        // Skip invalid dates
+      }
+    })
+    
+    const monthlyReturnsArray = Array.from(monthlyReturns.values())
+    const meanMonthlyReturn = monthlyReturnsArray.length > 0
+      ? monthlyReturnsArray.reduce((sum, ret) => sum + ret, 0) / monthlyReturnsArray.length
+      : 0
+    const monthlyReturnVariance = monthlyReturnsArray.length > 1
+      ? monthlyReturnsArray.reduce((sum, ret) => sum + Math.pow(ret - meanMonthlyReturn, 2), 0) / (monthlyReturnsArray.length - 1)
+      : 0
+    const monthlyReturnStdDev = Math.sqrt(monthlyReturnVariance)
+    
+    // 5. Profit per Day - average daily profit (not total/totalDays) (master only)
+    const dailyProfits = new Map()
+    sortedByDate.forEach((trade, idx) => {
+      const dateValue = trade.Date || trade.trade_date
+      if (!dateValue) return
+      
+      try {
+        let dateKey
+        if (typeof dateValue === 'string' && dateValue.includes('/')) {
+          dateKey = dateValue.split(' ')[0]
+        } else if (typeof dateValue === 'string' && dateValue.includes('-')) {
+          dateKey = dateValue.split(' ')[0].split('T')[0]
+        } else {
+          const d = new Date(dateValue)
+          dateKey = isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+        }
+        
+        if (dateKey) {
+          const profit = parseFloat(trade.Profit) || 0
+          const contractValue = getContractValue(trade)
+          const profitDollars = profit * contractValue * contractMultiplier
+          
+          if (!dailyProfits.has(dateKey)) {
+            dailyProfits.set(dateKey, 0)
+          }
+          dailyProfits.set(dateKey, dailyProfits.get(dateKey) + profitDollars)
+        }
+      } catch {
+        // Skip invalid dates
+      }
+    })
+    
+    const dailyProfitsArray = Array.from(dailyProfits.values())
+    const profitPerDay = dailyProfitsArray.length > 0
+      ? dailyProfitsArray.reduce((sum, profit) => sum + profit, 0) / dailyProfitsArray.length
+      : 0
+    
+    // 11. Skewness (on per-trade PnL)
+    const n = perTradePnLDollars.length
+    let skewness = 0
+    if (n > 2 && stdDevPnL > 0) {
+      const skewnessSum = perTradePnLDollars.reduce((sum, pnl) => {
+        return sum + Math.pow((pnl - meanPnL) / stdDevPnL, 3)
+      }, 0)
+      skewness = (n / ((n - 1) * (n - 2))) * skewnessSum
+    }
+    
+    // 12. Kurtosis (on per-trade PnL)
+    let kurtosis = 0
+    if (n > 3 && stdDevPnL > 0) {
+      const kurtosisSum = perTradePnLDollars.reduce((sum, pnl) => {
+        return sum + Math.pow((pnl - meanPnL) / stdDevPnL, 4)
+      }, 0)
+      kurtosis = ((n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3))) * kurtosisSum - (3 * (n - 1) * (n - 1)) / ((n - 2) * (n - 3))
+    }
+    
     return {
       totalTrades,
       totalDays,
@@ -430,7 +1089,22 @@ function App() {
       allowedTrades,
       blockedTrades,
       bestTrade,
-      worstTrade
+      worstTrade,
+      // Statistics for all streams
+      stdDevPnL: formatCurrency(stdDevPnL),
+      maxConsecutiveLosses: maxConsecutiveLosses,
+      profitPerTrade: formatCurrency(profitPerTrade),
+      rolling30DayWinRate: rolling30DayWinRate !== null ? rolling30DayWinRate.toFixed(1) : null,
+      // Additional statistics (master stream only)
+      meanPnLPerTrade: streamId === 'master' ? formatCurrency(meanPnLPerTrade) : null,
+      medianPnLPerTrade: streamId === 'master' ? formatCurrency(medianPnLPerTrade) : null,
+      var95: streamId === 'master' ? formatCurrency(var95) : null,
+      cvar95: streamId === 'master' ? formatCurrency(cvar95) : null,
+      timeToRecoveryDays: streamId === 'master' ? timeToRecoveryDays : null,
+      monthlyReturnStdDev: streamId === 'master' ? formatCurrency(monthlyReturnStdDev) : null,
+      profitPerDay: streamId === 'master' ? formatCurrency(profitPerDay) : null,
+      skewness: streamId === 'master' ? skewness.toFixed(3) : null,
+      kurtosis: streamId === 'master' ? kurtosis.toFixed(3) : null
     }
   }
   
@@ -480,28 +1154,43 @@ function App() {
               exclude_days_of_month: filters.exclude_days_of_month || [],
               exclude_times: filters.exclude_times || []
             }
-            // Debug logging
-            if (filters.exclude_times && filters.exclude_times.length > 0) {
-              console.log(`[DEBUG] Stream ${streamId} exclude_times:`, filters.exclude_times)
-            }
           }
         })
         
-        console.log('[DEBUG] Sending stream_filters to API:', streamFiltersApi)
+        // Determine which years should be visible in the rebuilt matrix.
+        // We take the union of all include_years across all streams (including master).
+        const visibleYearsSet = new Set()
+        Object.keys(streamFilters).forEach(id => {
+          const f = streamFilters[id]
+          if (f && Array.isArray(f.include_years)) {
+            f.include_years.forEach(y => {
+              const num = parseInt(y)
+              if (!isNaN(num)) {
+                visibleYearsSet.add(num)
+              }
+            })
+          }
+        })
+        const visibleYears = Array.from(visibleYearsSet).sort((a, b) => a - b)
         
         // If rebuilding a specific stream, only rebuild that stream
         // Otherwise rebuild all streams (master tab)
         const buildBody = {
           stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
         }
+
+        // Only send visible_years if user explicitly selected one or more years.
+        // If none are selected, backend will auto-detect most recent available year.
+        if (visibleYears.length > 0) {
+          buildBody.visible_years = visibleYears
+        }
+
+        // Always use a 1-month warmup window before the earliest visible year
+        buildBody.warmup_months = 1
         if (rebuildStream) {
           buildBody.streams = [rebuildStream]
         }
         
-        console.log('[DEBUG] Build request body:', JSON.stringify(buildBody, null, 2))
-        console.log('[DEBUG] ES1 filters in request:', buildBody.stream_filters?.ES1)
-        
-        console.log('[DEBUG] About to send build request to:', `${API_BASE}/matrix/build`)
         try {
           const buildResponse = await fetch(`${API_BASE}/matrix/build`, {
             method: 'POST',
@@ -509,20 +1198,15 @@ function App() {
             body: JSON.stringify(buildBody)
           })
           
-          console.log('[DEBUG] Build response status:', buildResponse.status)
-          
           if (!buildResponse.ok) {
             const errorData = await buildResponse.json()
-            console.error('[DEBUG] Build failed:', errorData)
             setMasterError(errorData.detail || 'Failed to build master matrix')
             setMasterLoading(false)
             return
           }
           
-          const buildResult = await buildResponse.json()
-          console.log('[DEBUG] Build result:', buildResult)
+          await buildResponse.json()
         } catch (error) {
-          console.error('[DEBUG] Build request error:', error)
           setMasterError(`Failed to build master matrix: ${error.message}`)
           setMasterLoading(false)
           return
@@ -546,21 +1230,15 @@ function App() {
       // Store available years from API response
       if (data.years && Array.isArray(data.years) && data.years.length > 0) {
         setAvailableYearsFromAPI(data.years)
-        console.log('[DEBUG] Available years from API:', data.years)
-      } else {
-        console.warn('[DEBUG] No years field in API response or empty array')
-      }
-      
-      // Debug: Check if Time Change column exists in the data
-      if (trades.length > 0 && 'Time Change' in trades[0]) {
-        const timeChangeCount = trades.filter(t => t['Time Change'] && t['Time Change'].trim() !== '').length
-        console.log(`[DEBUG] Time Change column found in ${timeChangeCount} of ${trades.length} trades`)
-      } else if (trades.length > 0) {
-        console.log('[DEBUG] Time Change column NOT found in data. Available columns:', Object.keys(trades[0]).slice(0, 20))
       }
       
       if (trades.length > 0) {
         setMasterData(trades)
+        
+        // Initialize worker with data (converts to columnar format)
+        if (trades.length > 0) {
+          workerInitData(trades)
+        }
         
         // Detect available columns from first row
         if (availableColumns.length === 0) {
@@ -640,9 +1318,6 @@ function App() {
           // These columns may exist in data but should not be shown by default
           const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
           
-          // Required columns that must always be included by default
-          const requiredDefaultColumns = ['Day of Week', 'Profit', 'Profit ($)', 'Time Change']
-          
           setAvailableColumns(displayableCols)
           
           // Initialize column selections for all streams if not set
@@ -650,43 +1325,24 @@ function App() {
             const updated = { ...prev }
             let changed = false
             
-            // Helper function to ensure required columns are included
-            const ensureRequiredColumns = (cols) => {
-              const filtered = cols.filter(col => !excludedFromDefault.includes(col))
-              // Add any missing required columns
-              requiredDefaultColumns.forEach(reqCol => {
-                if (!filtered.includes(reqCol) && displayableCols.includes(reqCol)) {
-                  filtered.push(reqCol)
-                }
-              })
-              return sortColumnsByDefaultOrder(filtered)
+            // Helper function to filter out excluded columns and ensure DEFAULT_COLUMNS structure
+            const getDefaultColumns = () => {
+              // Filter out any excluded columns from DEFAULT_COLUMNS (shouldn't be any, but just in case)
+              return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
             }
             
-            // Initialize Master tab - filter out excluded columns, ensure required columns, and sort
-            if (!updated['master'] || updated['master'].length === 0) {
-              updated['master'] = ensureRequiredColumns(DEFAULT_COLUMNS)
+            // Master tab always uses exact DEFAULT_COLUMNS structure (force reset to ensure correct columns)
+            const defaultCols = getDefaultColumns()
+            if (JSON.stringify(updated['master']) !== JSON.stringify(defaultCols)) {
+              updated['master'] = defaultCols
               changed = true
-            } else {
-              // Remove excluded columns, ensure required columns, and sort
-              const masterCols = ensureRequiredColumns(updated['master'])
-              if (JSON.stringify(masterCols) !== JSON.stringify(updated['master'])) {
-                updated['master'] = masterCols
-                changed = true
-              }
             }
             
-            // Initialize each stream tab - filter out excluded columns, ensure required columns, and sort
+            // Initialize each stream tab with exact DEFAULT_COLUMNS structure
             STREAMS.forEach(stream => {
               if (!updated[stream] || updated[stream].length === 0) {
-                updated[stream] = ensureRequiredColumns(DEFAULT_COLUMNS)
+                updated[stream] = getDefaultColumns()
                 changed = true
-              } else {
-                // Remove excluded columns, ensure required columns, and sort
-                const streamCols = ensureRequiredColumns(updated[stream])
-                if (JSON.stringify(streamCols) !== JSON.stringify(updated[stream])) {
-                  updated[stream] = streamCols
-                  changed = true
-                }
               }
             })
             
@@ -714,24 +1370,22 @@ function App() {
     }
   }
   
+  // Update filter for a specific stream (with persistence)
   const updateStreamFilter = (streamId, filterType, value) => {
-    console.log(`[DEBUG] updateStreamFilter called: streamId=${streamId}, filterType=${filterType}, value=${value}`)
-    console.log(`[DEBUG] updateStreamFilter: current streamFilters state =`, streamFilters)
     setStreamFilters(prev => {
-      console.log(`[DEBUG] updateStreamFilter: prev state =`, prev)
+      // Create a deep copy to avoid mutations
       const updated = { ...prev }
+      
+      // Initialize stream filters if they don't exist
       if (!updated[streamId]) {
-        updated[streamId] = {
-          exclude_days_of_week: [],
-          exclude_days_of_month: [],
-          exclude_times: [],
-          include_years: []
-        }
+        updated[streamId] = getDefaultFilters()
       }
       
-      // Create a new filter object for this stream
-      const currentFilters = { ...updated[streamId] }
-      console.log(`[DEBUG] updateStreamFilter: currentFilters before update =`, currentFilters)
+      // Create a new filter object for this stream (merge with defaults to ensure completeness)
+      const currentFilters = {
+        ...getDefaultFilters(),
+        ...updated[streamId]
+      }
       
       if (filterType === 'exclude_days_of_week') {
         const current = currentFilters.exclude_days_of_week || []
@@ -757,11 +1411,11 @@ function App() {
         if (current.includes(value)) {
           // Remove filter
           currentFilters.exclude_times = current.filter(t => t !== value)
-          console.log(`[DEBUG] Removed exclude_times filter for ${streamId}: ${value}. New filters:`, currentFilters.exclude_times)
+          // Debug logging disabled
         } else {
           // Add filter
           currentFilters.exclude_times = [...current, value]
-          console.log(`[DEBUG] Added exclude_times filter for ${streamId}: ${value}. New filters:`, currentFilters.exclude_times)
+          // Debug logging disabled
         }
       } else if (filterType === 'include_years') {
         const current = currentFilters.include_years || []
@@ -780,310 +1434,146 @@ function App() {
         ...updated,
         [streamId]: currentFilters
       }
-      console.log(`[DEBUG] updateStreamFilter: new state =`, newState)
-      console.log(`[DEBUG] updateStreamFilter: new filters for ${streamId} =`, currentFilters)
+      // Debug logging disabled for performance
       return newState
     })
   }
   
+  // Optimized date parsing cache
+  const parseDateCached = (() => {
+    const cache = new Map()
+    return (dateValue) => {
+      if (!dateValue) return null
+      if (cache.has(dateValue)) return cache.get(dateValue)
+      const parsed = parseDateValue(dateValue)
+      if (parsed) cache.set(dateValue, parsed)
+      return parsed
+    }
+  })()
+
   const getFilteredData = (data, streamId = null) => {
-    let filtered = [...data]
+    // Early return if no data
+    if (!data || data.length === 0) return []
     
-    // Filter by stream if specified (but not for 'master' which shows all streams)
-    if (streamId && streamId !== 'master') {
-      filtered = filtered.filter(row => row.Stream === streamId)
+    // Single-pass filtering for better performance
+    const filtered = []
+    
+    // Pre-compute filter sets for faster lookups (Set.has() is O(1) vs Array.includes() O(n))
+    const getFilterSets = (filters) => {
+      if (!filters) return null
+      return {
+        excludeDaysOfWeek: filters.exclude_days_of_week?.length > 0 
+          ? new Set(filters.exclude_days_of_week) 
+          : null,
+        excludeDaysOfMonth: filters.exclude_days_of_month?.length > 0 
+          ? new Set(filters.exclude_days_of_month) 
+          : null,
+        includeYears: filters.include_years?.length > 0 
+          ? new Set(filters.include_years) 
+          : null
+      }
     }
     
-    // Apply day filters on frontend (for immediate visual feedback)
-    // NOTE: Time filters are NOT applied client-side - they only affect sequencer logic during rebuild
-    // When a time is excluded, the sequencer won't consider it when choosing which time slot to use,
-    // but the resulting trades (at the chosen times) will still be visible
-    // Year filter is also applied on frontend (for display purposes)
+    // Get master filters if they exist
+    const masterFilterSets = getFilterSets(streamFilters['master'])
     
-    if (streamId && streamId !== 'master') {
-      // Individual stream tab - apply its filters
-      if (streamFilters[streamId]) {
-        const filters = streamFilters[streamId]
-        
-        // NOTE: Time filters are NOT applied here - they only affect sequencer logic during rebuild
-        // Excluding a time means the sequencer won't consider it when choosing which time slot to use
-        
-        // Day of week filter (frontend filtering for immediate visual feedback)
-        if (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) {
-          filtered = filtered.filter(row => {
-            if (!row.Date) return true
-            try {
-              const date = new Date(row.Date)
-              if (isNaN(date.getTime())) return true
-              const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
-              return !filters.exclude_days_of_week.includes(dayName)
-            } catch {
-              return true
-            }
-          })
-        }
-        
-        // Day of month filter (frontend filtering for immediate visual feedback)
-        if (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) {
-          filtered = filtered.filter(row => {
-            if (!row.Date) return true
-            try {
-              const date = new Date(row.Date)
-              if (isNaN(date.getTime())) return true
-              return !filters.exclude_days_of_month.includes(date.getDate())
-            } catch {
-              return true
-            }
-          })
-        }
-        
-        // Year filter (for display purposes, doesn't require rebuild)
-        if (filters.include_years && filters.include_years.length > 0) {
-          filtered = filtered.filter(row => {
-            // Check both Date and trade_date fields
-            const dateValue = row.Date || row.trade_date
-            if (!dateValue) return false
-            try {
-              const date = new Date(dateValue)
-              if (!isNaN(date.getTime())) {
-                const year = date.getFullYear()
-                return filters.include_years.includes(year)
-              }
-              // Try to extract year from string formats
-              if (typeof dateValue === 'string') {
-                // Try YYYY-MM-DD format
-                const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
-                if (isoMatch) {
-                  return filters.include_years.includes(parseInt(isoMatch[1]))
-                }
-                // Try MM/DD/YYYY or DD/MM/YYYY format
-                const slashMatch = dateValue.match(/(\d{4})/)
-                if (slashMatch) {
-                  return filters.include_years.includes(parseInt(slashMatch[1]))
-                }
-              }
-              return false
-            } catch {
-              return false
-            }
-          })
+    // Single pass through data with all filters applied
+    for (const row of data) {
+      // Filter by stream first (fastest check)
+      if (streamId && streamId !== 'master' && row.Stream !== streamId) {
+        continue
+      }
+      
+      // Get filters for this row's stream
+      const rowStream = row.Stream
+      const rowFilters = streamId && streamId !== 'master' 
+        ? streamFilters[streamId] 
+        : streamFilters[rowStream]
+      
+      const filterSets = getFilterSets(rowFilters)
+      
+      // Parse date once and reuse for all date-based filters
+      const dateValue = row.Date || row.trade_date
+      let parsedDate = null
+      let dayOfWeek = null
+      let dayOfMonth = null
+      let year = null
+      
+      if (dateValue) {
+        parsedDate = parseDateCached(dateValue)
+        if (parsedDate) {
+          dayOfWeek = parsedDate.toLocaleDateString('en-US', { weekday: 'long' })
+          dayOfMonth = parsedDate.getDate()
+          year = parsedDate.getFullYear()
         }
       }
-    } else if (streamId === 'master') {
-      // Master tab - apply each stream's filters to its own trades
-      // This ensures master stats reflect all the filters from individual streams
-      filtered = filtered.filter(row => {
-        const rowStream = row.Stream
-        if (!rowStream || !streamFilters[rowStream]) {
-          return true // No filters for this stream, show all
-        }
-        
-        const filters = streamFilters[rowStream]
-        const dateValue = row.Date || row.trade_date
-        
+      
+      // Apply individual stream filters (if not master tab)
+      if (streamId && streamId !== 'master' && filterSets) {
         // Day of week filter
-        if (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) {
-          if (dateValue) {
-            try {
-              const date = new Date(dateValue)
-              if (!isNaN(date.getTime())) {
-                const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
-                if (filters.exclude_days_of_week.includes(dayName)) {
-                  return false
-                }
-              }
-            } catch {
-              // Continue if date parsing fails
-            }
-          }
+        if (filterSets.excludeDaysOfWeek && dayOfWeek && filterSets.excludeDaysOfWeek.has(dayOfWeek)) {
+          continue
         }
         
         // Day of month filter
-        if (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) {
-          if (dateValue) {
-            try {
-              const date = new Date(dateValue)
-              if (!isNaN(date.getTime())) {
-                if (filters.exclude_days_of_month.includes(date.getDate())) {
-                  return false
-                }
-              }
-            } catch {
-              // Continue if date parsing fails
-            }
-          }
+        if (filterSets.excludeDaysOfMonth && dayOfMonth !== null && filterSets.excludeDaysOfMonth.has(dayOfMonth)) {
+          continue
         }
         
         // Year filter
-        if (filters.include_years && filters.include_years.length > 0) {
-          if (!dateValue) return false
-          try {
-            const date = new Date(dateValue)
-            if (!isNaN(date.getTime())) {
-              const year = date.getFullYear()
-              if (!filters.include_years.includes(year)) {
-                return false
-              }
-            } else {
-              // Try to extract year from string formats
-              if (typeof dateValue === 'string') {
-                const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
-                if (isoMatch) {
-                  if (!filters.include_years.includes(parseInt(isoMatch[1]))) {
-                    return false
-                  }
-                } else {
-                  const slashMatch = dateValue.match(/(\d{4})/)
-                  if (slashMatch) {
-                    if (!filters.include_years.includes(parseInt(slashMatch[1]))) {
-                      return false
-                    }
-                  } else {
-                    return false
-                  }
-                }
-              } else {
-                return false
-              }
-            }
-          } catch {
-            return false
+        if (filterSets.includeYears) {
+          if (year === null || !filterSets.includeYears.has(year)) {
+            continue
           }
         }
-        
-        return true // Passed all filters for this stream
-      })
-      
-      // Also apply master-specific filters if they exist (on top of stream filters)
-      const masterFilters = streamFilters['master'] || {}
-      
-      // Master day of week filter (additional filtering)
-      if (masterFilters.exclude_days_of_week && masterFilters.exclude_days_of_week.length > 0) {
-        filtered = filtered.filter(row => {
-          const dateValue = row.Date || row.trade_date
-          if (!dateValue) return true
-          try {
-            const date = new Date(dateValue)
-            if (isNaN(date.getTime())) return true
-            const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
-            return !masterFilters.exclude_days_of_week.includes(dayName)
-          } catch {
-            return true
-          }
-        })
       }
       
-      // Master day of month filter (additional filtering)
-      if (masterFilters.exclude_days_of_month && masterFilters.exclude_days_of_month.length > 0) {
-        filtered = filtered.filter(row => {
-          const dateValue = row.Date || row.trade_date
-          if (!dateValue) return true
-          try {
-            const date = new Date(dateValue)
-            if (isNaN(date.getTime())) return true
-            return !masterFilters.exclude_days_of_month.includes(date.getDate())
-          } catch {
-            return true
+      // Apply master tab filters (each stream's filters to its own rows)
+      if (streamId === 'master' || !streamId) {
+        const streamFilterSets = rowStream ? getFilterSets(streamFilters[rowStream]) : null
+        
+        if (streamFilterSets) {
+          // Day of week filter
+          if (streamFilterSets.excludeDaysOfWeek && dayOfWeek && streamFilterSets.excludeDaysOfWeek.has(dayOfWeek)) {
+            continue
           }
-        })
+          
+          // Day of month filter
+          if (streamFilterSets.excludeDaysOfMonth && dayOfMonth !== null && streamFilterSets.excludeDaysOfMonth.has(dayOfMonth)) {
+            continue
+          }
+          
+          // Year filter
+          if (streamFilterSets.includeYears) {
+            if (year === null || !streamFilterSets.includeYears.has(year)) {
+              continue
+            }
+          }
+        }
+        
+        // Apply master-specific filters on top of stream filters
+        if (masterFilterSets) {
+          // Day of week filter
+          if (masterFilterSets.excludeDaysOfWeek && dayOfWeek && masterFilterSets.excludeDaysOfWeek.has(dayOfWeek)) {
+            continue
+          }
+          
+          // Day of month filter
+          if (masterFilterSets.excludeDaysOfMonth && dayOfMonth !== null && masterFilterSets.excludeDaysOfMonth.has(dayOfMonth)) {
+            continue
+          }
+          
+          // Year filter
+          if (masterFilterSets.includeYears) {
+            if (year === null || !masterFilterSets.includeYears.has(year)) {
+              continue
+            }
+          }
+        }
       }
       
-      // Master year filter (additional filtering)
-      if (masterFilters.include_years && masterFilters.include_years.length > 0) {
-        filtered = filtered.filter(row => {
-          const dateValue = row.Date || row.trade_date
-          if (!dateValue) return false
-          try {
-            const date = new Date(dateValue)
-            if (!isNaN(date.getTime())) {
-              const year = date.getFullYear()
-              return masterFilters.include_years.includes(year)
-            }
-            if (typeof dateValue === 'string') {
-              const isoMatch = dateValue.match(/^(\d{4})-\d{2}-\d{2}/)
-              if (isoMatch) {
-                return masterFilters.include_years.includes(parseInt(isoMatch[1]))
-              }
-              const slashMatch = dateValue.match(/(\d{4})/)
-              if (slashMatch) {
-                return masterFilters.include_years.includes(parseInt(slashMatch[1]))
-              }
-            }
-            return false
-          } catch {
-            return false
-          }
-        })
-      }
-    } else {
-      // Master tab (no streamId) - apply each stream's filters to its own rows
-      filtered = filtered.filter(row => {
-        const rowStream = row.Stream
-        if (!rowStream || !streamFilters[rowStream]) {
-          return true // No filters for this stream, show all
-        }
-        
-        const filters = streamFilters[rowStream]
-        
-        // NOTE: Time filters are NOT applied here - they only affect sequencer logic during rebuild
-        // Excluding a time means the sequencer won't consider it when choosing which time slot to use
-        
-        // Day of week filter (frontend filtering for immediate visual feedback)
-        if (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) {
-          if (row.Date) {
-            try {
-              const date = new Date(row.Date)
-              if (!isNaN(date.getTime())) {
-                const dayName = date.toLocaleDateString('en-US', { weekday: 'long' })
-                if (filters.exclude_days_of_week.includes(dayName)) {
-                  return false
-                }
-              }
-            } catch {
-              // Continue if date parsing fails
-            }
-          }
-        }
-        
-        // Day of month filter (frontend filtering for immediate visual feedback)
-        if (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) {
-          if (row.Date) {
-            try {
-              const date = new Date(row.Date)
-              if (!isNaN(date.getTime())) {
-                if (filters.exclude_days_of_month.includes(date.getDate())) {
-                  return false
-                }
-              }
-            } catch {
-              // Continue if date parsing fails
-            }
-          }
-        }
-        
-        // Year filter (for display purposes)
-        if (filters.include_years && filters.include_years.length > 0) {
-          if (!row.Date) return false
-          try {
-            const date = new Date(row.Date)
-            if (!isNaN(date.getTime())) {
-              return filters.include_years.includes(date.getFullYear())
-            }
-            // Try to extract year from DD/MM/YYYY format
-            if (typeof row.Date === 'string') {
-              const match = row.Date.match(/(\d{4})/)
-              if (match) {
-                return filters.include_years.includes(parseInt(match[1]))
-              }
-            }
-            return false
-          } catch {
-            return false
-          }
-        }
-        
-        return true
-      })
+      // Row passed all filters
+      filtered.push(row)
     }
     
     // Sort: Date (newest first), then Time (earliest first)
@@ -1151,18 +1641,13 @@ function App() {
     return filtered
   }
   
+  // Get filters for a stream (with defaults) - used by filtering logic
+  // Note: For 'master', this returns default filters (master filters are applied separately in getFilteredData)
   const getStreamFilters = (streamId) => {
-    const defaultFilters = {
-      exclude_days_of_week: [],
-      exclude_days_of_month: [],
-      exclude_times: [],
-      include_years: [] // Empty array means all years
-    }
-    // For 'master', return default filters (no stream-specific filters applied)
     if (streamId === 'master' || !streamId) {
-      return defaultFilters
+      return getDefaultFilters()
     }
-    return streamFilters[streamId] ? { ...defaultFilters, ...streamFilters[streamId] } : defaultFilters
+    return getStreamFiltersFromStorage(streamFilters, streamId)
   }
   
   // Get available years - use API response first, fallback to extracting from data
@@ -1196,20 +1681,95 @@ function App() {
     return Array.from(years).sort((a, b) => b - a) // Newest first
   }
   
-  const renderStats = (streamId) => {
-    const stats = calculateStats(streamId)
-    console.log(`[DEBUG] renderStats for ${streamId}:`, { stats, hasStats: !!stats })
-    if (!stats) {
-      // Debug why stats are null
-      const filtered = getFilteredData(masterData, streamId)
-      console.log(`[DEBUG] No stats - filtered data length:`, filtered.length)
-      if (filtered.length > 0) {
-        console.log(`[DEBUG] Sample row:`, filtered[0])
-        console.log(`[DEBUG] Has Result column:`, 'Result' in (filtered[0] || {}))
-        console.log(`[DEBUG] Has Profit column:`, 'Profit' in (filtered[0] || {}))
+  // Format worker stats for display (defined early so renderStats can use it)
+  const formatWorkerStats = useCallback((rawStats, streamId) => {
+    if (!rawStats) return null
+    
+    const formatCurrency = (value) => {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+      }).format(value)
+    }
+    
+    return {
+      totalTrades: rawStats.totalTrades || 0,
+      totalProfit: (rawStats.totalProfit || 0).toFixed(2),
+      totalProfitDollars: formatCurrency(rawStats.totalProfitDollars || 0),
+      totalDays: rawStats.totalDays || 0,
+      avgTradesPerDay: rawStats.avgTradesPerDay ? rawStats.avgTradesPerDay.toFixed(2) : '0.00',
+      winRate: rawStats.winRate ? rawStats.winRate.toFixed(1) : '0.0',
+      wins: rawStats.wins || 0,
+      losses: rawStats.losses || 0,
+      breakEven: rawStats.breakEven || 0,
+      noTrade: rawStats.noTrade || 0,
+      profitFactor: rawStats.profitFactor ? (rawStats.profitFactor === Infinity ? '∞' : rawStats.profitFactor.toFixed(2)) : '0.00',
+      sharpeRatio: rawStats.sharpeRatio ? rawStats.sharpeRatio.toFixed(2) : '0.00',
+      sortinoRatio: rawStats.sortinoRatio ? rawStats.sortinoRatio.toFixed(2) : '0.00',
+      calmarRatio: rawStats.calmarRatio ? rawStats.calmarRatio.toFixed(2) : '0.00',
+      maxDrawdown: rawStats.maxDrawdown ? rawStats.maxDrawdown.toFixed(2) : '0.00',
+      maxDrawdownDollars: formatCurrency(rawStats.maxDrawdownDollars || 0),
+      riskReward: rawStats.riskReward ? (rawStats.riskReward === Infinity ? '∞' : rawStats.riskReward.toFixed(2)) : '0.00',
+      rrRatio: rawStats.riskReward ? (rawStats.riskReward === Infinity ? '∞' : rawStats.riskReward.toFixed(2)) : '0.00',
+      meanPnLPerTrade: streamId === 'master' ? formatCurrency(rawStats.meanPnLPerTrade || 0) : null,
+      medianPnLPerTrade: streamId === 'master' ? formatCurrency(rawStats.medianPnLPerTrade || 0) : null,
+      stdDevPnL: formatCurrency(rawStats.stdDevPnL || 0),
+      maxConsecutiveLosses: rawStats.maxConsecutiveLosses || 0,
+      var95: streamId === 'master' ? formatCurrency(rawStats.var95 || 0) : null,
+      cvar95: streamId === 'master' ? formatCurrency(rawStats.cvar95 || 0) : null,
+      timeToRecoveryDays: streamId === 'master' ? (rawStats.timeToRecovery || 0) : null,
+      monthlyReturnStdDev: streamId === 'master' ? formatCurrency(rawStats.monthlyReturnStdDev || 0) : null,
+      profitPerDay: streamId === 'master' ? formatCurrency(rawStats.profitPerDay || 0) : null,
+      profitPerWeek: streamId === 'master' ? formatCurrency(rawStats.profitPerWeek || 0) : null,
+      profitPerMonth: streamId === 'master' ? formatCurrency(rawStats.profitPerMonth || 0) : null,
+      profitPerYear: streamId === 'master' ? formatCurrency(rawStats.profitPerYear || 0) : null,
+      profitPerTrade: formatCurrency(rawStats.meanPnLPerTrade || 0),
+      skewness: streamId === 'master' ? (rawStats.skewness || 0).toFixed(3) : null,
+      kurtosis: streamId === 'master' ? (rawStats.kurtosis || 0).toFixed(3) : null,
+      rolling30DayWinRate: null // Would need to calculate in worker
+    }
+  }, [])
+  
+  const renderStats = (streamId, precomputedStats = null) => {
+    // Always use worker stats when available, only fallback if worker not ready
+    let stats = null
+    try {
+      if (precomputedStats) {
+        stats = precomputedStats
+      } else if (workerReady && workerStats && formatWorkerStats) {
+        // Use worker stats (much faster - computed off main thread)
+        stats = formatWorkerStats(workerStats, streamId)
+      } else if (!workerReady) {
+        // Only fallback to main thread if worker not ready yet
+        stats = calculateStats(streamId)
+      } else {
+        // Worker ready but no stats yet - show loading or empty
+        return (
+          <div className="bg-gray-900 rounded-lg p-4 mb-4">
+            <p className="text-gray-400 text-sm">Calculating statistics...</p>
+          </div>
+        )
       }
+    } catch (error) {
+      console.error('Error in renderStats:', error)
+      // Only fallback if worker not ready
+      if (!workerReady) {
+        stats = calculateStats(streamId)
+      } else {
+        return (
+          <div className="bg-gray-900 rounded-lg p-4 mb-4">
+            <p className="text-red-400 text-sm">Error calculating statistics</p>
+          </div>
+        )
+      }
+    }
+    // Debug logging disabled for performance
+    if (!stats) {
+      const filtered = getFilteredData(masterData, streamId)
       return (
-        <div className="bg-gray-800 rounded-lg p-4 mb-4">
+        <div className="bg-gray-900 rounded-lg p-4 mb-4">
           <p className="text-gray-400 text-sm">No data available for statistics</p>
           {filtered.length === 0 && (
             <p className="text-gray-500 text-xs mt-2">No filtered data found for {streamId}</p>
@@ -1218,117 +1778,243 @@ function App() {
       )
     }
     
-    return (
-      <div className="bg-gray-800 rounded-lg p-4 mb-4 border border-gray-700">
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Total Trades</div>
-            <div className="text-lg font-semibold">{stats.totalTrades}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Total Days</div>
-            <div className="text-lg font-semibold">{stats.totalDays}</div>
-          </div>
-          {streamId === 'master' && (
-            <div>
-              <div className="text-xs text-gray-400 mb-1">Avg Trades/Day</div>
-              <div className="text-lg font-semibold">{stats.avgTradesPerDay}</div>
-            </div>
-          )}
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Win Rate</div>
-            <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
-          </div>
-          {streamId !== 'master' && (
-            <div>
-              <div className="text-xs text-gray-400 mb-1">Total Profit</div>
-              <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {stats.totalProfit}
-              </div>
-            </div>
-          )}
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Total Profit ($)</div>
-            <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {stats.totalProfitDollars}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Wins</div>
-            <div className="text-lg font-semibold text-green-400">{stats.wins}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Losses</div>
-            <div className="text-lg font-semibold text-red-400">{stats.losses}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Break-Even</div>
-            <div className="text-lg font-semibold">{stats.breakEven}</div>
-          </div>
-          {streamId !== 'master' && (
-            <div>
-              <div className="text-xs text-gray-400 mb-1">Final Time</div>
-              <div className="text-lg font-semibold">{stats.finalTime}</div>
-            </div>
-          )}
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Sharpe Ratio</div>
-            <div className={`text-lg font-semibold ${parseFloat(stats.sharpeRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {stats.sharpeRatio}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Sortino Ratio</div>
-            <div className={`text-lg font-semibold ${parseFloat(stats.sortinoRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {stats.sortinoRatio}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Calmar Ratio</div>
-            <div className={`text-lg font-semibold ${parseFloat(stats.calmarRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {stats.calmarRatio}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Profit Factor</div>
-            <div className="text-lg font-semibold">{stats.profitFactor}</div>
-          </div>
-          <div>
-            <div className="text-xs text-gray-400 mb-1">Risk-Reward</div>
-            <div className="text-lg font-semibold">{stats.rrRatio}</div>
-          </div>
-          {streamId === 'master' ? (
-            <div>
-              <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
-              <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
-            </div>
-          ) : (
-            <>
+    // Render different stats for master vs individual streams
+    if (streamId === 'master') {
+      // Master stream - show all 4 sections
+      return (
+        <div className="bg-gray-900 rounded-lg p-4 mb-4 border border-gray-700">
+          {/* Section 1: Core Performance */}
+          <div className="mb-4">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Core Performance</h4>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
               <div>
-                <div className="text-xs text-gray-400 mb-1">Max Drawdown</div>
-                <div className="text-lg font-semibold text-red-400">{stats.maxDrawdown}</div>
+                <div className="text-xs text-gray-400 mb-1">Total Profit ($)</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.totalProfitDollars}
+                </div>
               </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Total Trades</div>
+                <div className="text-lg font-semibold">{stats.totalTrades}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Total Days</div>
+                <div className="text-lg font-semibold">{stats.totalDays}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Avg Trades/Day</div>
+                <div className="text-lg font-semibold">{stats.avgTradesPerDay}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Day</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerDay?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerDay || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Week</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerWeek?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerWeek || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Month</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerMonth?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerMonth || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Year</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerYear?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerYear || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Trade (Mean PnL)</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerTrade || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Win Rate</div>
+                <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Wins</div>
+                <div className="text-lg font-semibold text-green-400">{stats.wins}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Losses</div>
+                <div className="text-lg font-semibold text-red-400">{stats.losses}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Break-Even</div>
+                <div className="text-lg font-semibold">{stats.breakEven}</div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Section 2: Risk-Adjusted Performance */}
+          <div className="mb-4 pt-4 border-t border-gray-700">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Risk-Adjusted Performance</h4>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Sharpe Ratio</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.sharpeRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.sharpeRatio}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Sortino Ratio</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.sortinoRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.sortinoRatio}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Calmar Ratio</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.calmarRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.calmarRatio}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit Factor</div>
+                <div className="text-lg font-semibold">{stats.profitFactor}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Risk-Reward</div>
+                <div className="text-lg font-semibold">{stats.rrRatio}</div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Section 3: Drawdowns & Stability */}
+          <div className="mb-4 pt-4 border-t border-gray-700">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Drawdowns & Stability</h4>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
               <div>
                 <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
                 <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
               </div>
-            </>
-          )}
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Time-to-Recovery (Days)</div>
+                <div className="text-lg font-semibold">{stats.timeToRecoveryDays ?? 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
+                <div className="text-lg font-semibold text-red-400">{stats.maxConsecutiveLosses ?? 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Monthly Return Std Dev</div>
+                <div className="text-lg font-semibold">{stats.monthlyReturnStdDev || 'N/A'}</div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Section 4: PnL Distribution & Tail Risk */}
+          <div className="pt-4 border-t border-gray-700">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">PnL Distribution & Tail Risk</h4>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Median PnL per Trade</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.medianPnLPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.medianPnLPerTrade || 'N/A'}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Std Dev of PnL</div>
+                <div className="text-lg font-semibold">{stats.stdDevPnL || 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">95% VaR (per trade)</div>
+                <div className="text-lg font-semibold text-red-400">{stats.var95 || 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Expected Shortfall (CVaR 95%)</div>
+                <div className="text-lg font-semibold text-red-400">{stats.cvar95 || 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Skewness</div>
+                <div className="text-lg font-semibold">{stats.skewness ?? 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Kurtosis</div>
+                <div className="text-lg font-semibold">{stats.kurtosis ?? 'N/A'}</div>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
-    )
+      )
+    } else {
+      // Individual streams - show 3 sections with 8 stats total
+      return (
+        <div className="bg-gray-900 rounded-lg p-4 mb-4 border border-gray-700">
+          {/* Section 1: Core Performance */}
+          <div className="mb-4">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Core Performance</h4>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Trades</div>
+                <div className="text-lg font-semibold">{stats.totalTrades}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit ($)</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.totalProfitDollars}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Win Rate</div>
+                <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Trade</div>
+                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  {stats.profitPerTrade || 'N/A'}
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Section 2: Risk & Volatility */}
+          <div className="mb-4 pt-4 border-t border-gray-700">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Risk & Volatility</h4>
+            <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Std Dev of PnL</div>
+                <div className="text-lg font-semibold">{stats.stdDevPnL || 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
+                <div className="text-lg font-semibold text-red-400">{stats.maxConsecutiveLosses ?? 'N/A'}</div>
+              </div>
+            </div>
+          </div>
+          
+          {/* Section 3: Efficiency */}
+          <div className="pt-4 border-t border-gray-700">
+            <h4 className="text-sm font-semibold mb-3 text-gray-300">Efficiency</h4>
+            <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Profit Factor</div>
+                <div className="text-lg font-semibold">{stats.profitFactor}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Rolling 30-Day Win Rate</div>
+                <div className="text-lg font-semibold text-green-400">
+                  {stats.rolling30DayWinRate !== null ? `${stats.rolling30DayWinRate}%` : 'N/A'}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )
+    }
   }
   
   const renderFilters = (streamId) => {
-    // Get filters directly from state to ensure we have the latest values
-    const filters = streamFilters[streamId] || {
-      exclude_days_of_week: [],
-      exclude_days_of_month: [],
-      exclude_times: [],
-      include_years: []
-    }
-    console.log(`[DEBUG] renderFilters for ${streamId}: streamFilters state =`, streamFilters)
-    console.log(`[DEBUG] renderFilters for ${streamId}: filters =`, filters)
+    // Get filters for this stream (with defaults if not exists)
+    // This ensures UI always has complete filter structure and reflects saved filters
+    const filters = getStreamFiltersFromStorage(streamFilters, streamId)
     const availableYears = getAvailableYears()
     const hasFilters = (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) || 
                       (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) || 
@@ -1336,7 +2022,7 @@ function App() {
                       (filters.include_years && filters.include_years.length > 0)
     
     return (
-      <div className="bg-gray-700 rounded-lg p-4 mb-4">
+      <div className="bg-gray-800 rounded-lg p-4 mb-4">
         <div className="flex items-center justify-between mb-3">
           <h4 className="font-medium text-sm">Filters for {streamId}</h4>
           {hasFilters && (
@@ -1344,9 +2030,9 @@ function App() {
           )}
         </div>
         
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className={`grid grid-cols-1 md:grid-cols-4 gap-6`}>
           {/* Years Filter */}
-          <div>
+          <div className="space-y-2">
             <div className="flex items-center justify-between mb-2">
               <label className="block text-xs font-medium text-gray-400">Isolate Years</label>
               {filters.include_years && filters.include_years.length > 0 && (
@@ -1397,7 +2083,7 @@ function App() {
                       className={`px-2 py-1 text-xs rounded cursor-pointer ${
                         isSelected
                           ? 'bg-green-600 text-white'
-                          : 'bg-gray-600 hover:bg-gray-500'
+                          : 'bg-gray-700 hover:bg-gray-600'
                       }`}
                     >
                       {year}
@@ -1416,7 +2102,7 @@ function App() {
           </div>
           
           {/* Days of Week */}
-          <div>
+          <div className="space-y-2">
             <label className="block text-xs font-medium mb-2 text-gray-400">Exclude Days</label>
             <div className="flex flex-wrap gap-1">
               {DAYS_OF_WEEK.map(dow => {
@@ -1428,13 +2114,12 @@ function App() {
                     onClick={(e) => {
                       e.preventDefault()
                       e.stopPropagation()
-                      console.log('Day of week clicked:', dow, 'Stream:', streamId)
-                      updateStreamFilter(streamId, 'exclude_days_of_week', dow)
+                        updateStreamFilter(streamId, 'exclude_days_of_week', dow)
                     }}
                     className={`px-2 py-1 text-xs rounded cursor-pointer transition-colors ${
                       isExcluded
                         ? 'bg-red-600 text-white'
-                        : 'bg-gray-600 hover:bg-gray-500'
+                        : 'bg-gray-700 hover:bg-gray-600'
                     }`}
                   >
                     {dow.substring(0, 3)}
@@ -1445,7 +2130,7 @@ function App() {
           </div>
           
           {/* Days of Month */}
-          <div className="relative dom-dropdown-container">
+          <div className="relative dom-dropdown-container space-y-2">
             <label className="block text-xs font-medium mb-2 text-gray-400">Exclude DOM</label>
             <button
               type="button"
@@ -1469,7 +2154,7 @@ function App() {
                   }
                 })
               }}
-              className="w-full px-2 py-1 text-xs bg-gray-600 border border-gray-500 rounded text-gray-100 text-left flex items-center justify-between hover:bg-gray-500"
+              className="w-full px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-gray-100 text-left flex items-center justify-between hover:bg-gray-600"
             >
               <span>
                 {filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0
@@ -1480,7 +2165,7 @@ function App() {
             </button>
             {streamFilters[streamId]?._showDomDropdown && (
               <div 
-                className="absolute z-10 w-full mt-1 bg-gray-700 border border-gray-500 rounded shadow-lg max-h-48 overflow-y-auto"
+                className="absolute z-10 w-full mt-1 bg-gray-800 border border-gray-600 rounded shadow-lg max-h-48 overflow-y-auto"
                 onClick={(e) => e.stopPropagation()}
                 onMouseDown={(e) => e.stopPropagation()}
               >
@@ -1493,13 +2178,12 @@ function App() {
                         onClick={(e) => {
                           e.preventDefault()
                           e.stopPropagation()
-                          console.log('DOM clicked:', day, 'Stream:', streamId)
                           updateStreamFilter(streamId, 'exclude_days_of_month', day)
                         }}
                         className={`px-2 py-1 text-xs rounded cursor-pointer text-center transition-colors ${
                           isSelected
                             ? 'bg-red-600 text-white'
-                            : 'bg-gray-600 text-gray-200 hover:bg-gray-500'
+                            : 'bg-gray-700 text-gray-200 hover:bg-gray-600'
                         }`}
                       >
                         <input
@@ -1509,7 +2193,6 @@ function App() {
                           onClick={(e) => {
                             e.preventDefault()
                             e.stopPropagation()
-                            console.log('DOM checkbox clicked:', day, 'Stream:', streamId)
                             updateStreamFilter(streamId, 'exclude_days_of_month', day)
                           }}
                           className="hidden"
@@ -1524,14 +2207,13 @@ function App() {
           </div>
           
           {/* Times */}
-          <div>
+          <div className="space-y-2">
             <label className="block text-xs font-medium mb-2 text-gray-400">Exclude Times</label>
             <div className="flex flex-wrap gap-1">
               {/* Only show relevant times for this stream */}
               {(() => {
                 const relevantTimes = getRelevantTimeSlots(streamId) || AVAILABLE_TIMES
                 const excludeTimes = filters.exclude_times || []
-                console.log(`[DEBUG] Filter button render for ${streamId}: exclude_times =`, excludeTimes)
                 return relevantTimes.map(time => {
                   const isExcluded = excludeTimes.includes(time)
                   return (
@@ -1541,13 +2223,12 @@ function App() {
                       onClick={(e) => {
                         e.preventDefault()
                         e.stopPropagation()
-                        console.log(`[DEBUG] Filter button clicked for ${streamId}: ${time}, current exclude_times:`, excludeTimes)
                         updateStreamFilter(streamId, 'exclude_times', time)
                       }}
                       className={`px-2 py-1 text-xs rounded font-mono cursor-pointer transition-colors ${
                         isExcluded
                           ? 'bg-red-600 text-white'
-                          : 'bg-gray-600 hover:bg-gray-500'
+                          : 'bg-gray-700 hover:bg-gray-600'
                       }`}
                     >
                       {time}
@@ -1562,26 +2243,48 @@ function App() {
     )
   }
   
-  // Sort columns to maintain DEFAULT_COLUMNS order, with extra columns at the end
+  // Sort columns to maintain DEFAULT_COLUMNS order, then time slots sorted by time, then extras
+  // TradeID always comes first if selected
   const sortColumnsByDefaultOrder = (columns) => {
     const sorted = []
+    const timeSlotColumns = []
     const extras = []
     
-    // First, add columns in DEFAULT_COLUMNS order
+    // TradeID always comes first if it's selected
+    if (columns.includes('TradeID')) {
+      sorted.push('TradeID')
+    }
+    
+    // Then add DEFAULT_COLUMNS in exact order (excluding TradeID if it was already added)
     DEFAULT_COLUMNS.forEach(defaultCol => {
       if (columns.includes(defaultCol)) {
         sorted.push(defaultCol)
       }
     })
     
-    // Then add any columns not in DEFAULT_COLUMNS at the end
+    // Extract time slot columns (format: "HH:MM Rolling" or "HH:MM Points")
+    const timeSlotRegex = /^(\d{2}:\d{2})\s+(Rolling|Points)$/
     columns.forEach(col => {
-      if (!DEFAULT_COLUMNS.includes(col) && !sorted.includes(col)) {
+      const match = col.match(timeSlotRegex)
+      if (match) {
+        timeSlotColumns.push({ name: col, time: match[1], type: match[2] })
+      } else if (col !== 'TradeID' && !DEFAULT_COLUMNS.includes(col) && !sorted.includes(col)) {
         extras.push(col)
       }
     })
     
-    return [...sorted, ...extras]
+    // Sort time slot columns: by time first, then by type (Points before Rolling)
+    timeSlotColumns.sort((a, b) => {
+      if (a.time !== b.time) {
+        return a.time.localeCompare(b.time) // Sort by time
+      }
+      // Same time: Points comes before Rolling
+      if (a.type === 'Points' && b.type === 'Rolling') return -1
+      if (a.type === 'Rolling' && b.type === 'Points') return 1
+      return 0
+    })
+    
+    return [...sorted, ...timeSlotColumns.map(t => t.name), ...extras]
   }
   
   const toggleColumn = (col) => {
@@ -1611,7 +2314,6 @@ function App() {
     // Ensure columns are always in the correct order
     return sortColumnsByDefaultOrder(cols)
   }
-  
   // Get relevant time slots for a stream (S1 or S2)
   const getRelevantTimeSlots = (streamId) => {
     if (!streamId || streamId === 'master') return null
@@ -1653,7 +2355,7 @@ function App() {
     const sortedColumns = sortColumnsByDefaultOrder(filteredColumns)
     
     return (
-      <div className="mb-4 bg-gray-800 rounded-lg p-4 border border-gray-700">
+      <div className="mb-4 bg-gray-900 rounded-lg p-4 border border-gray-700">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-lg font-semibold">Select Columns</h3>
           <button
@@ -1663,16 +2365,16 @@ function App() {
             ✕
           </button>
         </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2 max-h-64 overflow-y-auto">
+        <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
           {sortedColumns.map(col => {
             const currentCols = getSelectedColumnsForTab(activeTab)
             return (
-              <label key={col} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-700 p-2 rounded">
+              <label key={col} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-900 p-2 rounded">
                 <input
                   type="checkbox"
                   checked={currentCols.includes(col)}
                   onChange={() => toggleColumn(col)}
-                  className="w-4 h-4 text-blue-600 bg-gray-700 border-gray-600 rounded focus:ring-blue-500"
+                  className="w-4 h-4 text-blue-600 bg-gray-800 border-gray-700 rounded focus:ring-blue-500"
                 />
                 <span className="text-sm text-gray-300">{col}</span>
               </label>
@@ -1691,7 +2393,7 @@ function App() {
                 return updated
               })
             }}
-            className="px-3 py-1 text-sm bg-gray-700 hover:bg-gray-600 rounded"
+            className="px-3 py-1 text-sm bg-gray-800 hover:bg-gray-800 rounded"
           >
             Reset to Default
           </button>
@@ -1709,7 +2411,7 @@ function App() {
                 return updated
               })
             }}
-            className="px-3 py-1 text-sm bg-gray-700 hover:bg-gray-600 rounded"
+            className="px-3 py-1 text-sm bg-gray-800 hover:bg-gray-800 rounded"
           >
             Select All
           </button>
@@ -1718,11 +2420,214 @@ function App() {
     )
   }
   
-  const renderDataTable = (data, streamId = null) => {
-    const filtered = getFilteredData(data, streamId)
-    const visible = filtered.slice(0, visibleRows)
+  // Virtualized row renderer for react-window v2
+  // In v2, rowProps are spread directly into the component props
+  const Row = useCallback(({ index, style, rows, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices }) => {
+    // If row not loaded yet, show loading placeholder
+    if (index >= rows.length && workerFilteredIndices && index < totalFiltered) {
+      return (
+        <div style={style} className="flex border-b border-gray-700 bg-gray-800">
+          {columnsToShow.map(col => (
+            <div 
+              key={col} 
+              className="p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+              style={{ width: `${getColumnWidth(col)}px` }}
+            >
+              <span className="text-gray-500">...</span>
+            </div>
+          ))}
+        </div>
+      )
+    }
     
-    if (filtered.length === 0) {
+    const row = rows[index]
+    if (!row) return null
+    
+    return (
+      <div 
+        style={style} 
+        className={`flex border-b border-gray-700 hover:bg-gray-900 ${
+          row.final_allowed === false ? 'bg-red-900/20' : ''
+        }`}
+      >
+        {columnsToShow.map(col => {
+          let value = row[col]
+          // Handle column name variations
+          if (col === 'Symbol' && !value) {
+            value = row['Instrument'] || ''
+          }
+          if (col === 'Date' && value) {
+            value = new Date(value).toLocaleDateString()
+          }
+          // Calculate DOW (Day of Week) from Date
+          if (col === 'DOW') {
+            const dateValue = row['Date']
+            if (dateValue) {
+              try {
+                const date = new Date(dateValue)
+                if (!isNaN(date.getTime())) {
+                  value = date.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase()
+                } else {
+                  value = '-'
+                }
+              } catch {
+                value = '-'
+              }
+            } else {
+              value = '-'
+            }
+          }
+          // Format numeric columns
+          if (['Profit', 'Peak', 'Target', 'Range', 'SL'].includes(col)) {
+            const symbol = (row.Symbol || row.Instrument || '').toUpperCase()
+            const baseSymbol = symbol.replace(/\d+$/, '') || symbol
+            const isNG = baseSymbol === 'NG'
+            const decimalPlaces = isNG ? 3 : 2
+            
+            if (col === 'SL') {
+              if (value === null || value === undefined) {
+                value = '-'
+              } else {
+                const numValue = typeof value === 'number' ? value : parseFloat(value)
+                if (numValue === 0 || numValue === '0' || numValue === 0.0) {
+                  value = isNG ? '0.000' : '0.00'
+                } else if (!isNaN(numValue) && isFinite(numValue)) {
+                  value = numValue.toFixed(decimalPlaces)
+                } else {
+                  value = '-'
+                }
+              }
+            } else if (value !== null && value !== undefined) {
+              const numValue = parseFloat(value)
+              if (!isNaN(numValue)) {
+                value = numValue.toFixed(decimalPlaces)
+              }
+            }
+          }
+          // Time Change
+          if (col === 'Time Change') {
+            if (value && typeof value === 'string' && value.trim() !== '') {
+              value = value.trim()
+            } else {
+              value = ''
+            }
+          }
+          // Format dollar columns
+          if (col === 'Profit ($)') {
+            const profitValue = parseFloat(row.Profit) || 0
+            const symbol = row.Symbol || row.Instrument || 'ES'
+            const contractValues = {
+              'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100
+            }
+            const contractValue = contractValues[symbol.toUpperCase()] || 50
+            const dollarValue = profitValue * contractValue
+            value = new Intl.NumberFormat('en-US', {
+              style: 'currency',
+              currency: 'USD',
+              minimumFractionDigits: 0,
+              maximumFractionDigits: 0
+            }).format(dollarValue)
+          }
+          // Format time slot columns
+          if (col.includes(' Rolling') && value !== null && value !== undefined) {
+            const numValue = parseFloat(value)
+            if (!isNaN(numValue)) value = numValue.toFixed(2)
+          }
+          if (col.includes(' Points') && value !== null && value !== undefined) {
+            const numValue = parseFloat(value)
+            if (!isNaN(numValue)) value = numValue.toFixed(0)
+          }
+          
+          return (
+            <div 
+              key={col} 
+              className="p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+              style={{ width: `${getColumnWidth(col)}px` }}
+            >
+              {value !== null && value !== undefined ? String(value) : '-'}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }, [])
+  
+  // State to track loaded rows for incremental loading
+  const [loadedRows, setLoadedRows] = useState([])
+  const [loadingMoreRows, setLoadingMoreRows] = useState(false)
+  
+  // Update loaded rows when worker filtered rows change
+  useEffect(() => {
+    if (workerReady && workerFilteredRows && workerFilteredRows.length > 0) {
+      setLoadedRows(workerFilteredRows)
+    }
+  }, [workerReady, workerFilteredRows])
+  
+  // Load more rows function - use ref to access current loadedRows without dependency
+  const loadedRowsRef = useRef([])
+  useEffect(() => {
+    loadedRowsRef.current = loadedRows
+  }, [loadedRows])
+  
+  const loadMoreRows = useCallback((startIndex, stopIndex) => {
+    if (!workerReady || !workerGetRows || !workerFilteredIndices || loadingMoreRows) {
+      return
+    }
+    
+    // Get current loaded length from ref to avoid stale closure
+    const currentLoaded = loadedRowsRef.current.length > 0 
+      ? loadedRowsRef.current 
+      : (workerFilteredRows || [])
+    const currentLoadedLength = currentLoaded.length
+    
+    // Load more if we're within 20 rows of the end of loaded data
+    if (stopIndex >= currentLoadedLength - 20 && workerFilteredIndices.length > currentLoadedLength) {
+      setLoadingMoreRows(true)
+      const neededIndices = workerFilteredIndices.slice(currentLoadedLength, stopIndex + 50) // Load 50 extra for buffer
+      
+      if (neededIndices.length > 0) {
+        workerGetRows(neededIndices, (newRows) => {
+          setLoadedRows(prev => {
+            // Avoid duplicates - check if we already have these rows
+            const existingLength = prev.length
+            if (existingLength >= currentLoadedLength + newRows.length) {
+              // Already loaded, don't add again
+              return prev
+            }
+            return [...prev, ...newRows]
+          })
+          setLoadingMoreRows(false)
+        })
+      } else {
+        setLoadingMoreRows(false)
+      }
+    }
+  }, [workerReady, workerGetRows, workerFilteredIndices, loadingMoreRows, workerFilteredRows])
+  
+  const renderDataTable = (data, streamId = null) => {
+    // Use worker filtered data if available (much faster - off main thread)
+    let filtered = []
+    let totalFiltered = 0
+    
+    if (workerReady && workerFilteredIndices.length > 0) {
+      // Use loaded rows (incrementally loaded as user scrolls)
+      // Start with workerFilteredRows, then use loadedRows as they accumulate
+      filtered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
+      totalFiltered = filteredLength || workerFilteredIndices.length
+      
+      // Trigger initial load if we have indices but no loaded rows yet
+      if (loadedRows.length === 0 && workerFilteredRows && workerFilteredRows.length > 0) {
+        // Already loaded via useEffect, but ensure state is set
+        setLoadedRows(workerFilteredRows)
+        filtered = workerFilteredRows
+      }
+    } else {
+      // Fallback to main thread filtering only if worker not ready
+      filtered = getFilteredData(data, streamId)
+      totalFiltered = filtered.length
+    }
+    
+    if (totalFiltered === 0) {
       return (
         <div className="text-center py-8 text-gray-400">
           No data available{streamId ? ` for ${streamId}` : ''}
@@ -1737,157 +2642,411 @@ function App() {
     // Filter columns based on stream (only show relevant time slot columns)
     columnsToShow = getFilteredColumns(columnsToShow, streamId)
     
+    // Calculate column widths based on content
+    const getColumnWidth = (col) => {
+      const widths = {
+        'Date': 110,
+        'DOW': 60,
+        'Time': 70,
+        'EntryTime': 130,
+        'ExitTime': 130,
+        'Instrument': 90,
+        'Stream': 70,
+        'Session': 60,
+        'Direction': 70,
+        'Target': 80,
+        'Range': 80,
+        'SL': 70,
+        'Peak': 70,
+        'Result': 70,
+        'Profit': 80,
+        'Time Change': 100,
+        'Profit ($)': 120
+      }
+      return widths[col] || 120
+    }
+    
+    const totalWidth = columnsToShow.reduce((sum, col) => sum + getColumnWidth(col), 0)
+    
     return (
       <div className="overflow-x-auto">
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="bg-gray-800">
-              {columnsToShow.map(col => (
-                <th key={col} className="text-left p-2 font-medium border border-gray-600">{col}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {visible.map((row, idx) => (
-              <tr
-                key={idx}
-                ref={idx === visible.length - 1 ? lastRowRef : null}
-                className={`hover:bg-gray-800 ${
-                  row.final_allowed === false ? 'bg-red-900/20' : ''
-                }`}
-              >
-                {columnsToShow.map(col => {
-                  let value = row[col]
-                  // Handle column name variations
-                  if (col === 'Symbol' && !value) {
-                    value = row['Instrument'] || ''
-                  }
-                  // Debug SL column access
-                  if (col === 'SL' && idx < 3) {
-                    console.log(`Row ${idx} SL access:`, { col, value, rowHasSL: 'SL' in row, rowKeys: Object.keys(row).filter(k => k.includes('SL')) })
-                  }
-                  if (col === 'Date' && value) {
-                    value = new Date(value).toLocaleDateString()
-                  }
-                  // Day of Week - extract from Date (show 3-letter abbreviation)
-                  if (col === 'Day of Week' && row.Date) {
-                    try {
-                      const date = new Date(row.Date)
-                      if (!isNaN(date.getTime())) {
-                        value = date.toLocaleDateString('en-US', { weekday: 'short' })
-                      } else {
-                        value = ''
-                      }
-                    } catch {
-                      value = ''
-                    }
-                  }
-                  // Format numeric columns
-                  if (['Profit', 'Peak', 'Target', 'Range', 'SL'].includes(col)) {
-                    // Handle SL specially - 0 is valid, null/undefined shows as "-"
-                    if (col === 'SL') {
-                      // Debug: log first few SL values
-                      if (idx < 3) {
-                        console.log(`SL value for row ${idx}, col ${col}:`, value, 'type:', typeof value)
-                      }
-                      // Check if value exists and is not null/undefined
-                      if (value === null || value === undefined) {
-                        value = '-' // Missing value
-                      } else {
-                        // Convert to number - handle both string and number types
-                        const numValue = typeof value === 'number' ? value : parseFloat(value)
-                        // Check for 0 explicitly (0 is falsy but valid)
-                        if (numValue === 0 || numValue === '0' || numValue === 0.0) {
-                          value = '0.00'
-                        } else if (!isNaN(numValue) && isFinite(numValue)) {
-                          // Valid number - format to 2 decimal places
-                          value = numValue.toFixed(2)
-                        } else {
-                          // Invalid number or empty string
-                          value = '-'
-                        }
-                      }
-                    } else if (value !== null && value !== undefined) {
-                      const numValue = parseFloat(value)
-                      if (!isNaN(numValue)) {
-                        value = numValue.toFixed(2)
-                      }
-                    }
-                  }
-                  // Time Change - show the new time if changed, blank otherwise
-                  if (col === 'Time Change') {
-                    // If value is a time string (e.g., "08:00", "09:30"), show it
-                    // Otherwise show blank
-                    if (value && typeof value === 'string' && value.trim() !== '') {
-                      // Value is already the time (e.g., "08:00"), keep it as is
-                      value = value.trim()
-                    } else {
-                      // Show blank for null/undefined/empty/false/0
-                      value = ''
-                    }
-                  }
-                  // Format dollar columns (computed from Profit using contract values)
-                  if (col === 'Profit ($)') {
-                    const profitValue = parseFloat(row.Profit) || 0
-                    // Get contract value based on Symbol/Instrument (same as sequential processor)
-                    const symbol = row.Symbol || row.Instrument || 'ES'
-                    const contractValues = {
-                      'ES': 50,
-                      'NQ': 10,
-                      'YM': 5,
-                      'CL': 1000,
-                      'NG': 10000,
-                      'GC': 100
-                    }
-                    const contractValue = contractValues[symbol.toUpperCase()] || 50
-                    const dollarValue = profitValue * contractValue
-                    value = new Intl.NumberFormat('en-US', {
-                      style: 'currency',
-                      currency: 'USD',
-                      minimumFractionDigits: 0,
-                      maximumFractionDigits: 0
-                    }).format(dollarValue)
-                  }
-                  // Format time slot rolling columns (e.g., "07:30 Rolling", "08:00 Rolling")
-                  if (col.includes(' Rolling') && value !== null && value !== undefined) {
-                    const numValue = parseFloat(value)
-                    if (!isNaN(numValue)) {
-                      value = numValue.toFixed(2)
-                    }
-                  }
-                  // Format time slot points columns (e.g., "07:30 Points", "08:00 Points")
-                  if (col.includes(' Points') && value !== null && value !== undefined) {
-                    const numValue = parseFloat(value)
-                    if (!isNaN(numValue)) {
-                      value = numValue.toFixed(0)
-                    }
-                  }
-                  return (
-                    <td key={col} className="p-2 border border-gray-600">
-                      {value !== null && value !== undefined ? String(value) : '-'}
-                    </td>
-                  )
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {visible.length < filtered.length && (
+        {/* Table header - sticky */}
+        <div className="flex bg-gray-800 sticky top-0 z-10 border-b border-gray-700" style={{ width: `${totalWidth}px` }}>
+          {columnsToShow.map(col => (
+            <div 
+              key={col} 
+              className="p-2 font-medium border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+              style={{ width: `${getColumnWidth(col)}px` }}
+            >
+              {col}
+            </div>
+          ))}
+        </div>
+        {/* Virtualized table body */}
+        <List
+          rowCount={totalFiltered} // Use total filtered count, not just loaded rows
+          rowHeight={35} // Fixed row height
+          rowComponent={Row}
+          rowProps={{ rows: filtered, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices }}
+          overscanCount={10} // Render 10 extra rows for smooth scrolling
+          style={{ height: 600, width: `${totalWidth}px` }} // Fixed height and width for virtual list
+          onRowsRendered={({ startIndex, stopIndex }) => {
+            // Load more rows when user scrolls near the end
+            if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0) {
+              loadMoreRows(startIndex, stopIndex)
+            }
+          }}
+        />
+        {filtered.length < totalFiltered && (
           <div className="text-center py-4 text-gray-400 text-sm">
-            Showing {visible.length} of {filtered.length} rows (scroll for more)
+            Showing {filtered.length} of {totalFiltered} rows {loadingMoreRows && '(loading more...)'}
           </div>
         )}
       </div>
     )
   }
   
-  return (
-    <div className="min-h-screen bg-gray-900 text-gray-100">
-      <div className="container mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold mb-8">Master Matrix</h1>
+  // Helper function to get ordinal suffix (1st, 2nd, 3rd, etc.)
+  const getOrdinalSuffix = (num) => {
+    const n = parseInt(num)
+    const lastDigit = n % 10
+    const lastTwoDigits = n % 100
+    
+    if (lastTwoDigits >= 11 && lastTwoDigits <= 13) {
+      return 'th'
+    }
+    
+    switch (lastDigit) {
+      case 1: return 'st'
+      case 2: return 'nd'
+      case 3: return 'rd'
+      default: return 'th'
+    }
+  }
+  
+  // Render profit breakdown tables
+  const renderProfitTable = (data, periodType) => {
+    const formatCurrency = (value) => {
+      return new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0
+      }).format(value)
+    }
+    
+    // Get all unique streams from data
+    const allStreams = new Set()
+    Object.values(data).forEach(periodData => {
+      Object.keys(periodData).forEach(stream => allStreams.add(stream))
+    })
+    const sortedStreams = Array.from(allStreams).sort()
+    
+    // Get sorted periods
+    // For DOM (Day of Month), sort numerically; for week, sort by year-month-week; otherwise sort as strings
+    const sortedPeriods = periodType === 'dom' 
+      ? Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b))
+      : periodType === 'week'
+      ? Object.keys(data).sort((a, b) => {
+          // Sort by week number: Week 1, Week 2, Week 3, Week 4, Week 5
+          const aWeekNum = parseInt(a.replace('Week ', ''))
+          const bWeekNum = parseInt(b.replace('Week ', ''))
+          return aWeekNum - bWeekNum
+        })
+      : Object.keys(data).sort()
+    
+    if (sortedPeriods.length === 0) {
+      return (
+        <div className="text-center py-8 text-gray-400">
+          No data available
+        </div>
+      )
+    }
+    
+    return (
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse border border-gray-700">
+          <thead>
+            <tr className="bg-gray-800">
+              <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
+                {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'week' ? 'Week' : periodType === 'month' ? 'Month' : 'Year'}
+              </th>
+              {sortedStreams.map(stream => (
+                <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
+                  {stream}
+                </th>
+              ))}
+              <th className="p-3 border border-gray-700 text-right font-semibold bg-gray-700">
+                Total
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedPeriods.map(period => {
+              const periodData = data[period]
+              let total = 0
+              
+              return (
+                <tr key={period} className="hover:bg-gray-900">
+                  <td className="p-3 border border-gray-700 font-medium">
+                    {periodType === 'time'
+                      ? period // Already the time string (e.g., "08:00")
+                      : periodType === 'day' 
+                      ? period // Already the day of week name (Monday, Tuesday, etc.)
+                      : periodType === 'dom'
+                      ? `${period}${getOrdinalSuffix(period)}` // e.g., "1st", "2nd", "3rd"
+                      : periodType === 'week'
+                      ? period // Already "Week 1", "Week 2", etc.
+                      : periodType === 'month'
+                      ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
+                      : period}
+                  </td>
+                  {sortedStreams.map(stream => {
+                    const profit = periodData[stream] || 0
+                    total += profit
+                    return (
+                      <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                        profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
+                      }`}>
+                        {formatCurrency(profit)}
+                      </td>
+                    )
+                  })}
+                  <td className={`p-3 border border-gray-700 text-right font-semibold bg-gray-800 ${
+                    total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
+                  }`}>
+                    {formatCurrency(total)}
+                  </td>
+                </tr>
+              )
+            })}
+            {/* Totals row */}
+            <tr className="bg-gray-800 font-semibold">
+              <td className="p-3 border border-gray-700">Total</td>
+              {sortedStreams.map(stream => {
+                const streamTotal = sortedPeriods.reduce((sum, period) => {
+                  return sum + (data[period][stream] || 0)
+                }, 0)
+                return (
+                  <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                    streamTotal > 0 ? 'text-green-400' : streamTotal < 0 ? 'text-red-400' : 'text-gray-400'
+                  }`}>
+                    {formatCurrency(streamTotal)}
+                  </td>
+                )
+              })}
+              <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
+                sortedPeriods.reduce((sum, period) => {
+                  return sum + Object.values(data[period]).reduce((s, v) => s + v, 0)
+                }, 0) > 0 ? 'text-green-400' : 'text-red-400'
+              }`}>
+                {formatCurrency(
+                  sortedPeriods.reduce((sum, period) => {
+                    return sum + Object.values(data[period]).reduce((s, v) => s + v, 0)
+                  }, 0)
+                )}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+  
+  
+  // Use worker stats instead of calculating in React
+  const memoizedActiveTabStats = useMemo(() => {
+    if (!workerStats) return null
+    return formatWorkerStats(workerStats, activeTab === 'timetable' ? 'master' : activeTab)
+  }, [workerStats, activeTab, formatWorkerStats])
+  
+  // Get filtered data length from worker
+  const filteredDataLength = filteredLength || 0
+  
+  // Note: Profit breakdown calculations still use old filtering for now
+  // TODO: Move these to worker for better performance
+  const memoizedMasterFilteredData = useMemo(() => {
+    return getFilteredData(masterData, 'master')
+  }, [masterData, streamFilters])
+  
+  const memoizedActiveTabFilteredData = useMemo(() => {
+    if (activeTab === 'master') return memoizedMasterFilteredData
+    return getFilteredData(masterData, activeTab)
+  }, [masterData, activeTab, streamFilters, memoizedMasterFilteredData])
+  
+  // Profit breakdown calculations - now using worker for better performance
+  const [profitBreakdowns, setProfitBreakdowns] = useState({})
+  
+  // Store profit breakdowns from worker as they arrive
+  useEffect(() => {
+    if (workerProfitBreakdown && workerBreakdownType) {
+      // workerBreakdownType includes the suffix like 'time_before' or 'time_after'
+      setProfitBreakdowns(prev => ({
+        ...prev,
+        [workerBreakdownType]: workerProfitBreakdown
+      }))
+    }
+  }, [workerProfitBreakdown, workerBreakdownType])
+  
+  // Calculate profit breakdowns in worker when needed (lazy - only when tab is active)
+  useEffect(() => {
+    if (workerReady && masterData.length > 0 && calculateProfitBreakdown) {
+      const activeBreakdownTabs = ['time', 'day', 'dom', 'week', 'month', 'year']
+      
+      // Only calculate if we're on a breakdown tab
+      if (activeBreakdownTabs.includes(activeTab)) {
+        const streamId = 'master' // Breakdowns always use master stream
         
-        {/* Tabs */}
-        <div className="flex gap-2 mb-6 border-b border-gray-700 overflow-x-auto">
+        // Calculate "before filters" (using all data)
+        // The worker will send back with breakdownType: `${activeTab}_before`
+        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
+        
+        // Calculate "after filters" (using filtered data)
+        // The worker will send back with breakdownType: `${activeTab}_after`
+        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+      }
+    }
+  }, [workerReady, masterData.length, masterContractMultiplier, streamFilters, activeTab, calculateProfitBreakdown])
+  
+  // Memoized profit breakdowns (fallback to main thread if worker not ready)
+  const memoizedTimeProfitBefore = useMemo(() => {
+    if (profitBreakdowns['time_before']) return profitBreakdowns['time_before']
+    if (!workerReady) return calculateTimeProfit(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedTimeProfitAfter = useMemo(() => {
+    if (profitBreakdowns['time_after']) return profitBreakdowns['time_after']
+    if (!workerReady) return calculateTimeProfit(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedDayProfitBefore = useMemo(() => {
+    if (profitBreakdowns['day_before']) return profitBreakdowns['day_before']
+    if (!workerReady) return calculateDailyProfit(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedDayProfitAfter = useMemo(() => {
+    if (profitBreakdowns['day_after']) return profitBreakdowns['day_after']
+    if (!workerReady) return calculateDailyProfit(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedDOMProfitBefore = useMemo(() => {
+    if (profitBreakdowns['dom_before']) return profitBreakdowns['dom_before']
+    if (!workerReady) return calculateDOMProfit(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedDOMProfitAfter = useMemo(() => {
+    if (profitBreakdowns['dom_after']) return profitBreakdowns['dom_after']
+    if (!workerReady) return calculateDOMProfit(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedWeekProfitBefore = useMemo(() => {
+    if (profitBreakdowns['week_before']) return profitBreakdowns['week_before']
+    if (!workerReady) return {}
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedWeekProfitAfter = useMemo(() => {
+    if (profitBreakdowns['week_after']) return profitBreakdowns['week_after']
+    if (!workerReady) return {}
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedMonthProfitBefore = useMemo(() => {
+    if (profitBreakdowns['month_before']) return profitBreakdowns['month_before']
+    if (!workerReady) return calculateMonthlyProfit(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedMonthProfitAfter = useMemo(() => {
+    if (profitBreakdowns['month_after']) return profitBreakdowns['month_after']
+    if (!workerReady) return calculateMonthlyProfit(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedYearProfitBefore = useMemo(() => {
+    if (profitBreakdowns['year_before']) return profitBreakdowns['year_before']
+    if (!workerReady) return calculateYearlyProfit(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedYearProfitAfter = useMemo(() => {
+    if (profitBreakdowns['year_after']) return profitBreakdowns['year_after']
+    if (!workerReady) return calculateYearlyProfit(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+
+  // Calculate current trading day (for filtering timetable) - only update when date changes, not every second
+  const [currentTradingDay, setCurrentTradingDay] = useState(() => {
+    let tradingDay = new Date()
+    const dayOfWeek = tradingDay.getDay()
+    if (dayOfWeek === 0) { // Sunday
+      tradingDay.setDate(tradingDay.getDate() + 1) // Monday
+    } else if (dayOfWeek === 6) { // Saturday
+      tradingDay.setDate(tradingDay.getDate() + 2) // Monday
+    }
+    return tradingDay
+  })
+  
+  // Update trading day only when the date changes (not every second)
+  useEffect(() => {
+    const updateTradingDay = () => {
+      let tradingDay = new Date()
+      const dayOfWeek = tradingDay.getDay()
+      if (dayOfWeek === 0) { // Sunday
+        tradingDay.setDate(tradingDay.getDate() + 1) // Monday
+      } else if (dayOfWeek === 6) { // Saturday
+        tradingDay.setDate(tradingDay.getDate() + 2) // Monday
+      }
+      
+      // Only update if the date string changed (not the time)
+      const newDateStr = tradingDay.toISOString().split('T')[0]
+      const currentDateStr = currentTradingDay.toISOString().split('T')[0]
+      if (newDateStr !== currentDateStr) {
+        setCurrentTradingDay(tradingDay)
+      }
+    }
+    
+    // Check every minute instead of every second
+    const interval = setInterval(updateTradingDay, 60000)
+    updateTradingDay() // Check immediately
+    
+    return () => clearInterval(interval)
+  }, [currentTradingDay])
+  
+  // Calculate timetable in worker when needed
+  useEffect(() => {
+    if (workerReady && masterData.length > 0 && workerCalculateTimetable && activeTab === 'timetable') {
+      // Calculate timetable when on timetable tab or when filters change
+      // Pass current trading day so worker can filter rows
+      workerCalculateTimetable(streamFilters, currentTradingDay)
+    }
+  }, [workerReady, masterData.length, streamFilters, activeTab, workerCalculateTimetable, currentTradingDay])
+  
+  return (
+    <div className="min-h-screen bg-black text-gray-100">
+      <div className="container mx-auto px-4 py-8">
+        {/* Sticky Header with Title and Tabs */}
+        <div className="sticky top-0 z-20 bg-black pt-4 pb-2 -mx-4 px-4">
+          <h1 className="text-3xl font-bold mb-6">Master Matrix</h1>
+          
+          {/* Tabs */}
+          <div className="flex gap-2 mb-6 border-b border-gray-700 overflow-x-auto">
+          <button
+            onClick={() => setActiveTab('timetable')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'timetable'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Timetable
+          </button>
           <button
             onClick={() => setActiveTab('master')}
             className={`px-4 py-2 font-medium whitespace-nowrap ${
@@ -1896,7 +3055,7 @@ function App() {
                 : 'text-gray-400 hover:text-gray-300'
             }`}
           >
-            Master (All Streams)
+            Masterstream
           </button>
           {STREAMS.map(stream => (
             <button
@@ -1911,12 +3070,182 @@ function App() {
               {stream}
             </button>
           ))}
+          <button
+            onClick={() => setActiveTab('time')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'time'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Time
+          </button>
+          <button
+            onClick={() => setActiveTab('day')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'day'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            DOW
+          </button>
+          <button
+            onClick={() => setActiveTab('dom')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'dom'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            DOM
+          </button>
+          <button
+            onClick={() => setActiveTab('week')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'week'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Week
+          </button>
+          <button
+            onClick={() => setActiveTab('month')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'month'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Month
+          </button>
+          <button
+            onClick={() => setActiveTab('year')}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'year'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Year
+          </button>
+          </div>
         </div>
         
         {/* Content */}
-        {activeTab === 'master' ? (
+        {activeTab === 'timetable' ? (
+          <div className="space-y-6">
+            <div className="bg-gray-900 rounded-lg p-6">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-xl font-semibold">Trading Timetable</h2>
+                <div className="text-center">
+                  <div className="text-lg font-semibold text-gray-300">
+                    {currentTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-lg font-mono font-semibold text-gray-300">
+                    {currentTime.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                  </div>
+                  <div className="text-2xl font-mono font-bold text-blue-400">
+                    {currentTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </div>
+                </div>
+              </div>
+              
+              {masterLoading ? (
+                <div className="text-center py-8">Loading data...</div>
+              ) : masterError ? (
+                <div className="text-center py-8 text-red-400">
+                  <div className="mb-4">{masterError}</div>
+                  <button
+                    onClick={retryLoad}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded"
+                  >
+                    Retry Load
+                  </button>
+                </div>
+              ) : workerTimetableLoading ? (
+                <div className="text-center py-8 text-gray-400">Calculating timetable...</div>
+              ) : !workerTimetable || workerTimetable.length === 0 ? (
+                <div className="text-center py-8 text-gray-400">No timetable data available</div>
+              ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full border-collapse">
+                      <thead>
+                        <tr className="bg-gray-800">
+                          <th className="px-4 py-3 text-left font-semibold">Stream</th>
+                          <th className="px-4 py-3 text-left font-semibold">Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {workerTimetable.map((row, idx) => (
+                          <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
+                            <td className="px-4 py-3">{row.Stream}</td>
+                            <td className="px-4 py-3 font-mono">{row.Time}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+              )}
+            </div>
+          </div>
+        ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'week' || activeTab === 'month' || activeTab === 'year' ? (
+          <div className="space-y-6">
+            <div className="bg-gray-900 rounded-lg p-6">
+              <h2 className="text-xl font-semibold mb-6">
+                Profit by {activeTab === 'time' ? 'Time' : activeTab === 'day' ? 'Day of Week (DOW)' : activeTab === 'dom' ? 'Day of Month' : activeTab === 'week' ? 'Week' : activeTab === 'month' ? 'Month' : 'Year'} - All Streams
+              </h2>
+              {masterLoading ? (
+                <div className="text-center py-8">Loading data...</div>
+              ) : masterError ? (
+                <div className="text-center py-8 text-red-400">
+                  <div className="mb-4">{masterError}</div>
+                  <button
+                    onClick={retryLoad}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded"
+                  >
+                    Retry Load
+                  </button>
+                </div>
+              ) : (
+                <>
+                  {/* Before Filters */}
+                  <div className="mb-8">
+                    <h3 className="text-lg font-semibold mb-4 text-blue-400">Before Filters</h3>
+                    {renderProfitTable(
+                      activeTab === 'time' ? memoizedTimeProfitBefore :
+                      activeTab === 'day' ? memoizedDayProfitBefore :
+                      activeTab === 'dom' ? memoizedDOMProfitBefore :
+                      activeTab === 'week' ? memoizedWeekProfitBefore :
+                      activeTab === 'month' ? memoizedMonthProfitBefore :
+                      memoizedYearProfitBefore,
+                      activeTab
+                    )}
+                  </div>
+                  
+                  {/* After Filters */}
+                  <div>
+                    <h3 className="text-lg font-semibold mb-4 text-green-400">After Filters</h3>
+                    {renderProfitTable(
+                      activeTab === 'time' ? memoizedTimeProfitAfter :
+                      activeTab === 'day' ? memoizedDayProfitAfter :
+                      activeTab === 'dom' ? memoizedDOMProfitAfter :
+                      activeTab === 'week' ? memoizedWeekProfitAfter :
+                      activeTab === 'month' ? memoizedMonthProfitAfter :
+                      memoizedYearProfitAfter,
+                      activeTab
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        ) : activeTab === 'master' ? (
           <div className="space-y-4">
-            <div className="bg-gray-800 rounded-lg p-6">
+            <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h2 className="text-xl font-semibold">All Streams Combined</h2>
@@ -1927,7 +3256,7 @@ function App() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => setShowColumnSelector(!showColumnSelector)}
-                    className="px-4 py-2 rounded font-medium text-sm bg-gray-700 hover:bg-gray-600"
+                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
                   >
                     {showColumnSelector ? 'Hide' : 'Show'} Columns
                   </button>
@@ -1936,7 +3265,7 @@ function App() {
                     disabled={masterLoading}
                     className={`px-4 py-2 rounded font-medium text-sm ${
                       masterLoading
-                        ? 'bg-gray-600 cursor-not-allowed'
+                        ? 'bg-gray-700 cursor-not-allowed'
                         : 'bg-blue-600 hover:bg-blue-700'
                     }`}
                   >
@@ -1951,7 +3280,7 @@ function App() {
               <div className="mb-4">
                 <button
                   onClick={() => toggleStats('master')}
-                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-left"
+                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-800 hover:bg-gray-800 rounded text-left"
                 >
                   <span className="font-medium">Statistics (All Streams)</span>
                   <span>{showStats['master'] ? '▼' : '▶'}</span>
@@ -1960,25 +3289,58 @@ function App() {
               </div>
               
               {/* Contract Multiplier for Master */}
-              <div className="mb-4 bg-gray-700 rounded-lg p-4">
+              <div className="mb-4 bg-gray-800 rounded-lg p-4">
                 <label className="block text-sm font-medium mb-2">
                   Contract Size Multiplier
                 </label>
                 <div className="flex items-center gap-3">
                   <input
                     type="number"
-                    min="0.01"
+                    min="0.1"
                     max="100"
-                    step="0.01"
-                    value={masterContractMultiplier}
+                    step="0.1"
+                    value={multiplierInput}
                     onChange={(e) => {
-                      const value = parseFloat(e.target.value)
-                      if (!isNaN(value) && value > 0) {
-                        setMasterContractMultiplier(Math.max(0.01, Math.min(100, value)))
+                      const value = e.target.value
+                      // Allow free typing - just update the input state
+                      if (value === '' || value === '-') {
+                        setMultiplierInput(value)
+                      } else {
+                        const numValue = parseFloat(value)
+                        if (!isNaN(numValue)) {
+                          setMultiplierInput(value)
+                        }
                       }
                     }}
-                    className="w-24 px-3 py-2 bg-gray-800 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500"
+                    onBlur={(e) => {
+                      // Validate on blur
+                      const value = parseFloat(e.target.value)
+                      if (isNaN(value) || value <= 0) {
+                        setMultiplierInput(masterContractMultiplier)
+                      } else {
+                        const clamped = Math.max(0.1, Math.min(100, value))
+                        setMultiplierInput(clamped)
+                      }
+                    }}
+                    className="w-24 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-white focus:outline-none focus:border-blue-500"
                   />
+                  <button
+                    onClick={() => {
+                      const value = parseFloat(multiplierInput)
+                      if (!isNaN(value) && value > 0) {
+                        const clamped = Math.max(0.1, Math.min(100, value))
+                        setMasterContractMultiplier(clamped)
+                        setMultiplierInput(clamped)
+                      } else {
+                        // Reset to current value if invalid
+                        setMultiplierInput(masterContractMultiplier)
+                      }
+                    }}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-sm font-medium transition-colors"
+                    title="Apply multiplier changes"
+                  >
+                    Apply
+                  </button>
                   <span className="text-sm text-gray-400">
                     (Default: 1 contract. All dollar calculations are multiplied by this value)
                   </span>
@@ -2013,22 +3375,22 @@ function App() {
               ) : (
                 <>
                   <div className="mb-4 text-sm text-gray-400">
-                    Showing {Math.min(visibleRows, getFilteredData(masterData).length)} of {getFilteredData(masterData).length} trades
+                    Showing {Math.min(visibleRows, filteredDataLength || 0)} of {filteredDataLength || 0} trades
                   </div>
-                  {renderDataTable(masterData)}
+                  {renderDataTable(masterData, 'master')}
                 </>
               )}
             </div>
           </div>
         ) : (
           <div className="space-y-4">
-            <div className="bg-gray-800 rounded-lg p-6">
+            <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-xl font-semibold">Stream: {activeTab}</h2>
                 <div className="flex gap-2">
                   <button
                     onClick={() => setShowColumnSelector(!showColumnSelector)}
-                    className="px-4 py-2 rounded font-medium text-sm bg-gray-700 hover:bg-gray-600"
+                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
                   >
                     {showColumnSelector ? 'Hide' : 'Show'} Columns
                   </button>
@@ -2037,7 +3399,7 @@ function App() {
                     disabled={masterLoading}
                     className={`px-4 py-2 rounded font-medium text-sm ${
                       masterLoading
-                        ? 'bg-gray-600 cursor-not-allowed'
+                        ? 'bg-gray-700 cursor-not-allowed'
                         : 'bg-green-600 hover:bg-green-700'
                     }`}
                   >
@@ -2048,16 +3410,41 @@ function App() {
               
               {renderColumnSelector()}
               
+              {/* Timetable Info for This Stream */}
+              {workerTimetable && workerTimetable.length > 0 && (() => {
+                const streamTimetable = workerTimetable.find(t => t.Stream === activeTab)
+                if (streamTimetable) {
+                  return (
+                    <div className="mb-4 p-4 bg-blue-900/30 border border-blue-700 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <div className="text-sm font-semibold text-blue-400 mb-1">Next Trading Day</div>
+                          <div className="text-lg font-mono">
+                            {streamTimetable.Date} ({streamTimetable.DOW}) at {streamTimetable.Time}
+                          </div>
+                          {streamTimetable.LastDataDate && (
+                            <div className="text-xs text-gray-400 mt-1">
+                              Based on data from {streamTimetable.LastDataDate}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                }
+                return null
+              })()}
+              
               {/* Stats Toggle */}
               <div className="mb-4">
                 <button
                   onClick={() => toggleStats(activeTab)}
-                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-left"
+                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-800 hover:bg-gray-800 rounded text-left"
                 >
                   <span className="font-medium">Statistics</span>
                   <span>{showStats[activeTab] ? '▼' : '▶'}</span>
                 </button>
-                {showStats[activeTab] && renderStats(activeTab)}
+                {showStats[activeTab] && renderStats(activeTab, memoizedActiveTabStats)}
               </div>
               
               {/* Filters */}
@@ -2089,7 +3476,7 @@ function App() {
               ) : (
                 <>
                   <div className="mb-4 text-sm text-gray-400">
-                    Showing {Math.min(visibleRows, getFilteredData(masterData, activeTab).length)} of {getFilteredData(masterData, activeTab).length} trades
+                    Showing {Math.min(visibleRows, filteredDataLength || 0)} of {filteredDataLength || 0} trades
                   </div>
                   {renderDataTable(masterData, activeTab)}
                 </>
