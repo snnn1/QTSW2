@@ -15,172 +15,35 @@ if sys.platform == 'win32':
         pass  # Python < 3.7 or reconfigure not available
 
 import pandas as pd
-import numpy as np
 from pathlib import Path
 from typing import Optional
 import argparse
-import re
 
-
-def root_symbol(contract: str) -> str:
-    """Extract root instrument from contract name."""
-    # Handle different filename formats
-    # DataExport_CL_*, DataExport_ES_*, etc.
-    if "DataExport_CL" in contract or "_CL_" in contract:
-        return "CL"
-    elif "DataExport_ES" in contract or "_ES_" in contract:
-        return "ES"
-    elif "DataExport_NQ" in contract or "_NQ_" in contract:
-        return "NQ"
-    elif "DataExport_YM" in contract or "_YM_" in contract:
-        return "YM"
-    elif "DataExport_NG" in contract or "_NG_" in contract:
-        return "NG"
-    elif "DataExport_GC" in contract or "_GC_" in contract:
-        return "GC"
-    # MinuteDataExport format
-    elif "MinuteDataExport_ES" in contract:
-        return "ES"
-    elif "MinuteDataExport_NQ" in contract:
-        return "NQ"
-    elif "MinuteDataExport_YM" in contract:
-        return "YM"
-    elif "MinuteDataExport_CL" in contract:
-        return "CL"
-    elif "MinuteDataExport_NG" in contract:
-        return "NG"
-    elif "MinuteDataExport_GC" in contract:
-        return "GC"
-    else:
-        # Try to extract instrument from filename pattern: DataExport_INSTRUMENT_*
-        match = re.search(r"DataExport_([A-Z]{2})_", contract)
-        if match:
-            return match.group(1)
-        # Fallback: try to find 2-letter code
-        match = re.search(r"_([A-Z]{2})_", contract)
-        if match:
-            return match.group(1)
-        # Last resort: first 2 uppercase letters
-        match = re.match(r"([A-Z]{2})", contract)
-        return match.group(1) if match else contract.upper()
-
-
-def infer_contract_from_filename(filepath: Path) -> str:
-    """Extract contract name from filename."""
-    filename = filepath.name
-    # Remove extension
-    name_without_ext = filename.rsplit('.', 1)[0]
-    return name_without_ext
-
-
-def detect_file_format(filepath: Path) -> dict:
-    """Detect file format and separator."""
-    with open(filepath, 'r') as f:
-        first_line = f.readline().strip()
-    
-    has_header = first_line.startswith('Date') or first_line.startswith('Time')
-    
-    # Detect separator
-    if ',' in first_line:
-        sep = ','
-    elif ';' in first_line:
-        sep = ';'
-    else:
-        sep = ','
-    
-    return {
-        'has_header': has_header,
-        'separator': sep,
-        'first_line': first_line
-    }
+# Import from translator module to avoid duplication
+from translator import root_symbol, infer_contract_from_filename, load_single_file as translator_load_single_file, detect_file_format
 
 
 def load_single_file(filepath: Path) -> pd.DataFrame:
-    """Load a single data file with proper format detection."""
+    """Load a single data file with proper format detection (CLI wrapper)."""
     print(f"Processing: {filepath.name}")
     
-    # Detect file format
+    # Use translator module's load_single_file
+    df = translator_load_single_file(filepath)
+    
+    if df is None:
+        raise ValueError(f"Failed to load {filepath.name}")
+    
+    # Add CLI-specific logging
     format_info = detect_file_format(filepath)
-    has_header = format_info['has_header']
-    sep = format_info['separator']
+    print(f"  Format: {'Header' if format_info['has_header'] else 'No Header'}, Separator: '{format_info['separator']}'")
     
-    print(f"  Format: {'Header' if has_header else 'No Header'}, Separator: '{sep}'")
-    
-    try:
-        if has_header:
-            # CSV with header (Date,Time,Open,High,Low,Close,Volume,Instrument)
-            df = pd.read_csv(filepath, sep=sep)
-            
-            # Combine Date and Time into timestamp
-            df['timestamp'] = pd.to_datetime(df['Date'] + ' ' + df['Time'])
-            
-            # Clean up column names
-            df = df.rename(columns={
-                'Open': 'open',
-                'High': 'high', 
-                'Low': 'low',
-                'Close': 'close',
-                'Volume': 'volume',
-                'Instrument': 'instrument'
-            })
-            
-            # Drop original date/time columns
-            df = df.drop(columns=['Date', 'Time'])
-            
-        else:
-            # No header format
-            df = pd.read_csv(
-                filepath,
-                sep=sep,
-                header=None,
-                names=["raw_dt", "open", "high", "low", "close", "volume"],
-            )
-            df["timestamp"] = pd.to_datetime(df["raw_dt"], format="%Y%m%d %H%M%S", errors="coerce")
-            df.drop(columns=["raw_dt"], inplace=True)
-            df["instrument"] = "ES"  # Default for no-header format
-        
-        # Determine timezone from filename
-        # Check if filename indicates UTC (e.g., DataExport_ES_*_UTC.csv)
-        filename_lower = filepath.name.lower()
-        is_utc_data = "_utc" in filename_lower
-        
-        # Ensure timestamp is timezone-aware
-        if df["timestamp"].dt.tz is None:
-            if is_utc_data:
-                # Data is in UTC, convert to Chicago time
-                df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Chicago")
-                print(f"  Detected UTC data (from filename), converted to Chicago time")
-            else:
-                # Assume data is already in Chicago time (local trading timezone)
-                df["timestamp"] = df["timestamp"].dt.tz_localize("America/Chicago")
-                print(f"  Detected Chicago time data (no _UTC in filename), kept as Chicago time")
-        
-        # Convert numeric columns
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        
-        # Remove rows with invalid timestamps
-        df = df.dropna(subset=["timestamp"])
-        
-        # Add contract and instrument info
-        contract = infer_contract_from_filename(filepath)
-        df["contract"] = contract
-        instrument = root_symbol(contract)
-        # ALWAYS override instrument column with filename-derived value (more reliable)
-        # The CSV Instrument column often has "DATAEXPORT" or other incorrect values
-        df["instrument"] = instrument
+    # The translator module already sets contract and instrument, but we add CLI logging
+    if "contract" in df.columns and "instrument" in df.columns:
+        instrument = df["instrument"].iloc[0] if len(df) > 0 else "UNKNOWN"
         print(f"  Set instrument to: {instrument} (from filename: {filepath.name})")
-        
-        # Sort by timestamp
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        
-        print(f"  Loaded: {len(df):,} rows, {df['timestamp'].min()} to {df['timestamp'].max()}")
-        return df
-        
-    except Exception as e:
-        print(f"  ERROR loading {filepath.name}: {e}")
-        raise
+    
+    print(f"  Loaded: {len(df):,} rows, {df['timestamp'].min()} to {df['timestamp'].max()}")
+    return df
 
 
 def load_folder(folder_path: str) -> pd.DataFrame:
