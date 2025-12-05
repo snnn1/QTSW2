@@ -1,0 +1,9 @@
+{
+  "timestamp": "2025-11-27T15:41:27.059233-06:00",
+  "stages": {
+    "translator": true,
+    "analyzer": false
+  },
+  "success": false,
+  "log_file": "C:\\Users\\jakej\\QTSW2\\automation\\logs\\pipeline_20251127_214045.log"
+}

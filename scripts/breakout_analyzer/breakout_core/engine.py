@@ -422,7 +422,9 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False,
         # Add result row
         rows.append(result_processor.create_result_row(
             R.date, time_label, target_pts, trade_execution.peak, 
-            entry_dir, trade_execution.result_classification, R.range_size, stream, inst, sess, display_profit
+            entry_dir, trade_execution.result_classification, R.range_size, stream, inst, sess, display_profit,
+            entry_time=entry_time,
+            exit_time=trade_execution.exit_time
         ))
 
     # Log final day's summary if debug is enabled

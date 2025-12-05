@@ -1,0 +1,3 @@
+{"run_id": "748a35c7-b220-413a-b677-d4a7399c2a70", "stage": "pipeline", "event": "start", "timestamp": "2025-12-04T15:25:01.484731-06:00", "msg": "Pipeline run started"}
+{"run_id": "748a35c7-b220-413a-b677-d4a7399c2a70", "stage": "pipeline", "event": "log", "timestamp": "2025-12-04T15:25:01.485723-06:00", "msg": "No files found - skipping all stages"}
+{"run_id": "748a35c7-b220-413a-b677-d4a7399c2a70", "stage": "pipeline", "event": "success", "timestamp": "2025-12-04T15:25:01.485991-06:00", "msg": "Pipeline complete (no files to process)"}

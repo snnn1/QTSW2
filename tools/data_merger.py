@@ -20,13 +20,14 @@ Process:
      * S2: 09:30, 10:00, 10:30, 11:00
 4. Features:
    - Appends daily rows to monthly file
-   - Removes duplicates
+   - Removes duplicates (new data replaces old when duplicates found)
    - Sorts rows
    - Creates monthly file if it doesn't exist
    - Skips corrupted daily files
    - Deletes daily temp folder after merge
    - Idempotent (never double-writes data)
    - Splits data by session automatically (S1 → CL1, S2 → CL2)
+   - Prefers new data: when duplicate records exist, keeps the new one and removes the old one
 
 Author: Quant Development Environment
 Date: 2025
@@ -256,7 +257,10 @@ class DataMerger:
             return None
     
     def _remove_duplicates_analyzer(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Remove duplicates from analyzer DataFrame."""
+        """Remove duplicates from analyzer DataFrame.
+        
+        When duplicates are found, keeps the LAST occurrence (new data replaces old data).
+        """
         if df.empty:
             return df
         
@@ -267,21 +271,24 @@ class DataMerger:
         available_cols = [col for col in duplicate_key if col in df.columns]
         if not available_cols:
             logger.warning("No duplicate key columns found. Using all columns.")
-            return df.drop_duplicates(keep='first')
+            return df.drop_duplicates(keep='last')
         
         initial_count = len(df)
         
-        # Remove duplicates, keeping first occurrence
-        df_deduped = df.drop_duplicates(subset=available_cols, keep='first')
+        # Remove duplicates, keeping last occurrence (new data replaces old)
+        df_deduped = df.drop_duplicates(subset=available_cols, keep='last')
         duplicates_removed = initial_count - len(df_deduped)
         
         if duplicates_removed > 0:
-            logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data (keep=first)")
+            logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data (new data replaces old)")
         
         return df_deduped
     
     def _remove_duplicates_sequencer(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Remove duplicates from sequencer DataFrame."""
+        """Remove duplicates from sequencer DataFrame.
+        
+        When duplicates are found, keeps the LAST occurrence (new data replaces old data).
+        """
         if df.empty:
             return df
         
@@ -295,14 +302,14 @@ class DataMerger:
         available_cols = [col for col in duplicate_key if col in df.columns]
         if not available_cols:
             logger.warning("No duplicate key columns found. Using all columns.")
-            return df.drop_duplicates(keep='first')
+            return df.drop_duplicates(keep='last')
         
         initial_count = len(df)
-        df_deduped = df.drop_duplicates(subset=available_cols, keep='first')
+        df_deduped = df.drop_duplicates(subset=available_cols, keep='last')
         duplicates_removed = initial_count - len(df_deduped)
         
         if duplicates_removed > 0:
-            logger.info(f"Removed {duplicates_removed} duplicate rows from sequencer data")
+            logger.info(f"Removed {duplicates_removed} duplicate rows from sequencer data (new data replaces old)")
         
         return df_deduped
     

@@ -1,0 +1,17 @@
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "pipeline", "event": "start", "timestamp": "2025-12-03T18:15:00.002471-06:00", "msg": "Pipeline run started"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "pipeline", "event": "log", "timestamp": "2025-12-03T18:15:00.002991-06:00", "msg": "Checking for CSV files in data/raw"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "pipeline", "event": "log", "timestamp": "2025-12-03T18:15:00.005204-06:00", "msg": "Found 6 CSV file(s), starting translator"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "pipeline", "event": "log", "timestamp": "2025-12-03T18:15:00.006441-06:00", "msg": "Found 6 processed file(s), will run analyzer"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "start", "timestamp": "2025-12-03T18:15:00.006909-06:00", "msg": "Starting data translator stage"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:00.007532-06:00", "msg": "Files found", "data": {"raw_file_count": 6}}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:00.008307-06:00", "msg": "Starting translation of 6 file(s)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:02.388974-06:00", "msg": "File written: Saved: CL_2025_CL.parquet (164,713 rows)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:02.389574-06:00", "msg": "Wrote CL 2025 file", "data": {"instrument": "CL", "year": "2025", "file_type": "parquet"}}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:02.390338-06:00", "msg": "File written: Saved: ES_2025_ES.parquet (144,174 rows)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:02.390706-06:00", "msg": "Wrote ES 2025 file", "data": {"instrument": "ES", "year": "2025", "file_type": "parquet"}}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:02.391452-06:00", "msg": "File written: Saved: GC_2025_GC.parquet (160,802 rows)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:02.391783-06:00", "msg": "Wrote GC 2025 file", "data": {"instrument": "GC", "year": "2025", "file_type": "parquet"}}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:02.392472-06:00", "msg": "File written: Saved: NG_2025_NG.parquet (152,204 rows)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:02.392807-06:00", "msg": "Wrote NG 2025 file", "data": {"instrument": "NG", "year": "2025", "file_type": "parquet"}}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "log", "timestamp": "2025-12-03T18:15:02.393766-06:00", "msg": "File written: Saved: NQ_2025_NQ.parquet (132,610 rows)"}
+{"run_id": "2da9a108-5dbe-4db4-be68-0c3dbf9594b5", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T18:15:02.394119-06:00", "msg": "Wrote NQ 2025 file", "data": {"instrument": "NQ", "year": "2025", "file_type": "parquet"}}

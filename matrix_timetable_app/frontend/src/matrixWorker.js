@@ -520,84 +520,19 @@ function calculateStats(columnarData, streamId, contractMultiplier, contractValu
     ? dailyProfitValues.reduce((sum, p) => sum + p, 0) / dailyProfitValues.length
     : 0
   
-  // Profit per week - group trades by week of month
-  const weeklyProfits = new Map()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const day = parsed.getDate()
-        // Calculate which week of the month (1-5)
-        let weekOfMonth
-        if (day <= 7) {
-          weekOfMonth = 1
-        } else if (day <= 14) {
-          weekOfMonth = 2
-        } else if (day <= 21) {
-          weekOfMonth = 3
-        } else if (day <= 28) {
-          weekOfMonth = 4
-        } else {
-          weekOfMonth = 5
-        }
-        const weekKey = `Week ${weekOfMonth}`
-        if (!weeklyProfits.has(weekKey)) {
-          weeklyProfits.set(weekKey, 0)
-        }
-        weeklyProfits.set(weekKey, weeklyProfits.get(weekKey) + perTradePnLDollars[i])
-      }
-    }
-  }
-  const weeklyProfitValues = Array.from(weeklyProfits.values())
-  const profitPerWeek = weeklyProfitValues.length > 0
-    ? weeklyProfitValues.reduce((sum, p) => sum + p, 0) / weeklyProfitValues.length
-    : 0
+  // Profit per week - calculate as profit per day * 5 trading days
+  // This is more accurate than grouping by week of month
+  const profitPerWeek = profitPerDay * 5
   
-  // Profit per month - group trades by month
-  const monthlyProfitsForAvg = new Map()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const year = parsed.getFullYear()
-        const month = parsed.getMonth() + 1
-        const monthKey = `${year}-${String(month).padStart(2, '0')}`
-        if (!monthlyProfitsForAvg.has(monthKey)) {
-          monthlyProfitsForAvg.set(monthKey, 0)
-        }
-        monthlyProfitsForAvg.set(monthKey, monthlyProfitsForAvg.get(monthKey) + perTradePnLDollars[i])
-      }
-    }
-  }
-  const monthlyProfitValues = Array.from(monthlyProfitsForAvg.values())
-  const profitPerMonth = monthlyProfitValues.length > 0
-    ? monthlyProfitValues.reduce((sum, p) => sum + p, 0) / monthlyProfitValues.length
-    : 0
+  // Profit per month - calculate as profit per day * ~21 trading days per month
+  // This is more accurate than averaging monthly profits
+  const tradingDaysPerMonth = 21  // Average trading days per month
+  const profitPerMonth = profitPerDay * tradingDaysPerMonth
   
-  // Profit per year - group trades by year
-  const yearlyProfits = new Map()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const year = parsed.getFullYear().toString()
-        if (!yearlyProfits.has(year)) {
-          yearlyProfits.set(year, 0)
-        }
-        yearlyProfits.set(year, yearlyProfits.get(year) + perTradePnLDollars[i])
-      }
-    }
-  }
-  const yearlyProfitValues = Array.from(yearlyProfits.values())
-  const profitPerYear = yearlyProfitValues.length > 0
-    ? yearlyProfitValues.reduce((sum, p) => sum + p, 0) / yearlyProfitValues.length
-    : 0
+  // Profit per year - calculate as profit per day * 252 trading days
+  // This is more accurate than averaging yearly profits
+  const tradingDaysPerYear = 252
+  const profitPerYear = profitPerDay * tradingDaysPerYear
   
   // Calculate daily returns statistics for Sharpe/Sortino
   const meanDailyReturn = profitPerDay
@@ -803,6 +738,16 @@ function calculateProfitBreakdown(columnarData, contractMultiplier, contractValu
         weekOfMonth = 5
       }
       key = `Week ${weekOfMonth}`
+    } else if (breakdownType === 'date') {
+      const dateValue = DateColumn[i] || trade_date[i]
+      if (!dateValue) continue
+      const parsed = parseDateCached(dateValue)
+      if (!parsed) continue
+      // Format as YYYY-MM-DD
+      const year = parsed.getFullYear()
+      const month = String(parsed.getMonth() + 1).padStart(2, '0')
+      const day = String(parsed.getDate()).padStart(2, '0')
+      key = `${year}-${month}-${day}`
     } else if (breakdownType === 'month') {
       const dateValue = DateColumn[i] || trade_date[i]
       if (!dateValue) continue

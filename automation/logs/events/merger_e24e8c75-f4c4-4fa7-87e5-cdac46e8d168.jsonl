@@ -1,0 +1,5 @@
+{"run_id": "6a66e634-6f62-40e3-bf6e-24b8ab132feb", "stage": "merger", "event": "start", "timestamp": "2025-11-26T18:19:44.594931", "msg": "Starting Data Merger / Consolidator"}
+{"run_id": "6a66e634-6f62-40e3-bf6e-24b8ab132feb", "stage": "merger", "event": "log", "timestamp": "2025-11-26T18:19:44.595838", "msg": "Found 0 analyzer folders and 0 sequencer folders", "data": {"analyzer_folders": 0, "sequencer_folders": 0}}
+{"run_id": "6a66e634-6f62-40e3-bf6e-24b8ab132feb", "stage": "merger", "event": "metric", "timestamp": "2025-11-26T18:19:44.596184", "msg": "Analyzer processing complete: 0/0", "data": {"analyzer_success": 0, "analyzer_total": 0}}
+{"run_id": "6a66e634-6f62-40e3-bf6e-24b8ab132feb", "stage": "merger", "event": "metric", "timestamp": "2025-11-26T18:19:44.596729", "msg": "Sequencer processing complete: 0/0", "data": {"sequencer_success": 0, "sequencer_total": 0}}
+{"run_id": "6a66e634-6f62-40e3-bf6e-24b8ab132feb", "stage": "merger", "event": "success", "timestamp": "2025-11-26T18:19:44.597261", "msg": "Merger completed: 0/0 folders processed", "data": {"total_success": 0, "total_folders": 0, "analyzer_success": 0, "sequencer_success": 0}}

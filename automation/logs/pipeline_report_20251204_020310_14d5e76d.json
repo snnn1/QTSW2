@@ -1,0 +1,20 @@
+{
+  "run_id": "14d5e76d-37fa-42ba-92cd-359d9eafc32f",
+  "start_time": "2025-12-04T02:03:10.102369",
+  "end_time": "2025-12-04T02:03:10.102372",
+  "overall_status": "success",
+  "stage_results": {
+    "translator": {
+      "status": "success"
+    },
+    "analyzer": {
+      "status": "success"
+    },
+    "merger": {
+      "status": "success"
+    }
+  },
+  "metrics": {
+    "total_duration_seconds": 123.45
+  }
+}

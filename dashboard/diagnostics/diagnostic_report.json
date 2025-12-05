@@ -1,0 +1,1246 @@
+{
+  "metadata": {
+    "timestamp": "2025-12-03T21:40:37.739680",
+    "duration_seconds": 88.942074,
+    "total_tests": 38,
+    "passed": 36,
+    "failed": 2,
+    "pass_rate": "94.7%"
+  },
+  "categories": [
+    {
+      "category": "Frontend",
+      "tests": [
+        {
+          "name": "React Build Compilation",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2491.7991161346436,
+          "details": {
+            "output": "\n> pipeline-dashboard@0.1.0 build\n> vite build\n\n\u001b[36mvite v5.4.21 \u001b[32mbuilding for production...\u001b[36m\u001b[39m\ntransforming...\n\u001b[32m\u00e2\u0153\u201c\u001b[39m 48 modules transformed.\nrendering chunks...\ncomputing gzip size...\n\u001b[2mdist/\u001b[22m\u001b[32mindex.html                 \u001b[39m\u001b[1m\u001b[2m  0.50 kB\u001b[22m\u001b[1m\u001b[22m\u001b[2m \u00e2\u201d\u201a gzip:  0.31 kB\u001b[22m\n\u001b[2mdist/\u001b[22m\u001b[35massets/index-C44uK_hO.css  \u001b[39m\u001b[1m\u001b[2m 10.78 kB\u001b[22m\u001b[1m\u001b[22m\u001b[2m \u00e2\u201d\u201a gzip:  2.87 kB\u001b[22m\n\u001b[2mdist/\u001b[22m\u001b[36massets/index-B4LNlPJ5.js   \u001b[39m\u001b[1m\u001b[2m169.67 kB\u001b[22m"
+          },
+          "remediation": null
+        },
+        {
+          "name": "Port 5173 Availability",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2050.92453956604,
+          "details": {
+            "status": "Port available"
+          },
+          "remediation": null
+        },
+        {
+          "name": "WebSocket Auto-Reconnect Logic",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 3012.9799842834473,
+          "details": {
+            "reconnect_logic_found": true,
+            "attempts": 0
+          },
+          "remediation": null
+        },
+        {
+          "name": "ErrorBoundary Component",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.24509429931640625,
+          "details": {
+            "has_getDerivedStateFromError": true,
+            "has_componentDidCatch": true,
+            "has_error_display": true,
+            "has_reload_button": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "API Error Handling",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.2117156982421875,
+          "details": {
+            "has_try_catch": true,
+            "has_error_logging": true,
+            "has_fallback_values": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "State Store Integrity",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.35858154296875,
+          "details": {
+            "uses_reducer": true,
+            "has_event_limit": true,
+            "has_deduplication": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Event Deduplication",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.23674964904785156,
+          "details": {
+            "has_deduplication": true,
+            "has_event_key": true,
+            "has_some_check": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Memory Capping (100 events)",
+          "category": "Frontend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.2467632293701172,
+          "details": {
+            "has_slice_limit": true,
+            "mentions_100": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 8,
+      "failed": 0,
+      "total": 8,
+      "critical_issues": []
+    },
+    {
+      "category": "Backend",
+      "tests": [
+        {
+          "name": "Port 8000 Availability",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.4756450653076172,
+          "details": {
+            "status": "Port in use (expected if backend running)"
+          },
+          "remediation": null
+        },
+        {
+          "name": "Backend API Routes",
+          "category": "Backend",
+          "passed": false,
+          "error": "Test failed",
+          "stack_trace": null,
+          "latency_ms": 49317.13676452637,
+          "details": {
+            "/": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/schedule": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/schedule/next": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/pipeline/status": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/metrics/files": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/matrix/files": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            },
+            "/api/timetable/files": {
+              "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+            }
+          },
+          "remediation": null
+        },
+        {
+          "name": "File System Error Handling",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.5338191986083984,
+          "details": {
+            "has_try_catch": true,
+            "has_httpexception": true,
+            "has_file_operations": true,
+            "has_error_logging": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "JSONL Malformed Line Handling",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.3941059112548828,
+          "details": {
+            "has_json_decode_error": true,
+            "has_skip_logic": true,
+            "has_error_counting": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "WebSocket Burst Load (1k events)",
+          "category": "Backend",
+          "passed": false,
+          "error": "Test failed",
+          "stack_trace": null,
+          "latency_ms": 5021.932601928711,
+          "details": {
+            "events_received": 0,
+            "expected": 1000
+          },
+          "remediation": null
+        },
+        {
+          "name": "Module Reload Error Handling",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.8177757263183594,
+          "details": {
+            "has_importlib": true,
+            "has_reload": true,
+            "has_error_handling": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "CORS Middleware",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.44798851013183594,
+          "details": {
+            "has_cors": true,
+            "has_origins": true,
+            "has_localhost_5173": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Logging System Fallback",
+          "category": "Backend",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.3113746643066406,
+          "details": {
+            "has_file_handler": true,
+            "has_log_file_path": true,
+            "has_console_logging": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 6,
+      "failed": 2,
+      "total": 8,
+      "critical_issues": [
+        "Backend API Routes",
+        "WebSocket Burst Load (1k events)"
+      ]
+    },
+    {
+      "category": "Pipeline",
+      "tests": [
+        {
+          "name": "Export Timeout Logic (60min)",
+          "category": "Pipeline",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.6849765777587891,
+          "details": {
+            "scheduler_has_timeout": true,
+            "frontend_has_timeout": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Stall Detection (5min)",
+          "category": "Pipeline",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.5145072937011719,
+          "details": {
+            "scheduler_has_stall": true,
+            "frontend_has_stall": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Pipeline Status Detection",
+          "category": "Pipeline",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 5616.456508636475,
+          "details": {
+            "endpoint_works": true,
+            "returns_active": true,
+            "returns_run_id": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "total": 3,
+      "critical_issues": []
+    },
+    {
+      "category": "EventLog",
+      "tests": [
+        {
+          "name": "Event Log Tailing",
+          "category": "EventLog",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.9572505950927734,
+          "details": {
+            "events_written": 3,
+            "file_readable": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Corrupted JSON Handling",
+          "category": "EventLog",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 1.1544227600097656,
+          "details": {
+            "has_error_handling": true,
+            "test_lines": 5
+          },
+          "remediation": null
+        },
+        {
+          "name": "Rapid Writes Handling",
+          "category": "EventLog",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 3.188610076904297,
+          "details": {
+            "events_written": 100,
+            "write_time_ms": 2.844572067260742,
+            "throughput_events_per_sec": 35154.67270136619
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "total": 3,
+      "critical_issues": []
+    },
+    {
+      "category": "Schedule",
+      "tests": [
+        {
+          "name": "Schedule Validation",
+          "category": "Schedule",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 4093.8961505889893,
+          "details": {
+            "code_has_validation": true,
+            "code_has_error_response": true,
+            "api_test_valid": true,
+            "api_test_invalid": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 1,
+      "failed": 0,
+      "total": 1,
+      "critical_issues": []
+    },
+    {
+      "category": "Streamlit",
+      "tests": [
+        {
+          "name": "Port Scanning Logic",
+          "category": "Streamlit",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.7557868957519531,
+          "details": {
+            "has_socket": true,
+            "has_port_check": true,
+            "has_already_running": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 1,
+      "failed": 0,
+      "total": 1,
+      "critical_issues": []
+    },
+    {
+      "category": "Merger",
+      "tests": [
+        {
+          "name": "Merger Timeout (5min)",
+          "category": "Merger",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 1.0886192321777344,
+          "details": {
+            "has_timeout": true,
+            "has_300": true,
+            "has_timeout_expired": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 1,
+      "failed": 0,
+      "total": 1,
+      "critical_issues": []
+    },
+    {
+      "category": "Resilience",
+      "tests": [
+        {
+          "name": "Graceful Degradation",
+          "category": "Resilience",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 0.3006458282470703,
+          "details": {
+            "has_try_catch": true,
+            "has_fallback": true,
+            "has_error_logging": true
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 1,
+      "failed": 0,
+      "total": 1,
+      "critical_issues": []
+    },
+    {
+      "category": "ErrorInjection",
+      "tests": [
+        {
+          "name": "File Permission Error",
+          "category": "ErrorInjection",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 1.4033317565917969,
+          "details": {
+            "write_blocked": true,
+            "note": "File permission error correctly prevented write"
+          },
+          "remediation": null
+        },
+        {
+          "name": "Subprocess Failure",
+          "category": "ErrorInjection",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 25.785207748413086,
+          "details": {
+            "subprocess_failed": true,
+            "note": "Non-existent script correctly failed"
+          },
+          "remediation": null
+        },
+        {
+          "name": "API 404 Error",
+          "category": "ErrorInjection",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2039.4413471221924,
+          "details": {
+            "status_code": 404,
+            "note": "404 correctly returned for non-existent endpoint"
+          },
+          "remediation": null
+        },
+        {
+          "name": "API 500 Error Simulation",
+          "category": "ErrorInjection",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2048.389196395874,
+          "details": {
+            "status_code": 400,
+            "note": "Error correctly returned for invalid data"
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 4,
+      "failed": 0,
+      "total": 4,
+      "critical_issues": []
+    },
+    {
+      "category": "Integration",
+      "tests": [
+        {
+          "name": "WebSocket Event Ordering",
+          "category": "Integration",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2080.7244777679443,
+          "details": {
+            "events_received": 50,
+            "events_written": 50,
+            "is_ordered": true,
+            "sequences": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ]
+          },
+          "remediation": null
+        },
+        {
+          "name": "Pipeline Start Integration",
+          "category": "Integration",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2051.328182220459,
+          "details": {
+            "pipeline_started": true,
+            "run_id": "db9c3afc-fab4-4eb9-bfe3-20481a514985",
+            "status": "started"
+          },
+          "remediation": null
+        },
+        {
+          "name": "File Counts Integration",
+          "category": "Integration",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2062.407970428467,
+          "details": {
+            "has_required_keys": true,
+            "values_valid": true,
+            "data": {
+              "raw_files": 6,
+              "processed_files": 0,
+              "analyzed_files": 1152
+            }
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "total": 3,
+      "critical_issues": []
+    },
+    {
+      "category": "Performance",
+      "tests": [
+        {
+          "name": "High Frequency Events (100/sec)",
+          "category": "Performance",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 32.31167793273926,
+          "details": {
+            "events_written": 100,
+            "write_time_sec": 0.03175973892211914,
+            "events_per_sec": 3148.6404924555213,
+            "meets_target": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Large Event Log (10k events)",
+          "category": "Performance",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2899.643898010254,
+          "details": {
+            "events_written": 10000,
+            "file_size_mb": 1.1136817932128906,
+            "write_time_sec": 2.899061441421509,
+            "throughput_events_per_sec": 3449.3922264361045
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 2,
+      "failed": 0,
+      "total": 2,
+      "critical_issues": []
+    },
+    {
+      "category": "ErrorRecovery",
+      "tests": [
+        {
+          "name": "Backend Connection Recovery",
+          "category": "ErrorRecovery",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2015.5208110809326,
+          "details": {
+            "has_reconnect": true,
+            "has_error_handling": true,
+            "has_retry_logic": true,
+            "backend_running": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Event Log Deletion During Tail",
+          "category": "ErrorRecovery",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 4.325389862060547,
+          "details": {
+            "has_file_existence_check": true,
+            "has_error_handling": true
+          },
+          "remediation": null
+        },
+        {
+          "name": "Concurrent WebSocket Connections",
+          "category": "ErrorRecovery",
+          "passed": true,
+          "error": null,
+          "stack_trace": null,
+          "latency_ms": 2058.171033859253,
+          "details": {
+            "connections_attempted": 3,
+            "events_received_per_connection": [
+              0,
+              21,
+              1
+            ],
+            "note": "Backend may not be running - test checks code structure"
+          },
+          "remediation": null
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "total": 3,
+      "critical_issues": []
+    }
+  ],
+  "all_tests": [
+    {
+      "name": "React Build Compilation",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2491.7991161346436,
+      "details": {
+        "output": "\n> pipeline-dashboard@0.1.0 build\n> vite build\n\n\u001b[36mvite v5.4.21 \u001b[32mbuilding for production...\u001b[36m\u001b[39m\ntransforming...\n\u001b[32m\u00e2\u0153\u201c\u001b[39m 48 modules transformed.\nrendering chunks...\ncomputing gzip size...\n\u001b[2mdist/\u001b[22m\u001b[32mindex.html                 \u001b[39m\u001b[1m\u001b[2m  0.50 kB\u001b[22m\u001b[1m\u001b[22m\u001b[2m \u00e2\u201d\u201a gzip:  0.31 kB\u001b[22m\n\u001b[2mdist/\u001b[22m\u001b[35massets/index-C44uK_hO.css  \u001b[39m\u001b[1m\u001b[2m 10.78 kB\u001b[22m\u001b[1m\u001b[22m\u001b[2m \u00e2\u201d\u201a gzip:  2.87 kB\u001b[22m\n\u001b[2mdist/\u001b[22m\u001b[36massets/index-B4LNlPJ5.js   \u001b[39m\u001b[1m\u001b[2m169.67 kB\u001b[22m"
+      },
+      "remediation": null
+    },
+    {
+      "name": "Port 5173 Availability",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2050.92453956604,
+      "details": {
+        "status": "Port available"
+      },
+      "remediation": null
+    },
+    {
+      "name": "WebSocket Auto-Reconnect Logic",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 3012.9799842834473,
+      "details": {
+        "reconnect_logic_found": true,
+        "attempts": 0
+      },
+      "remediation": null
+    },
+    {
+      "name": "ErrorBoundary Component",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.24509429931640625,
+      "details": {
+        "has_getDerivedStateFromError": true,
+        "has_componentDidCatch": true,
+        "has_error_display": true,
+        "has_reload_button": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "API Error Handling",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.2117156982421875,
+      "details": {
+        "has_try_catch": true,
+        "has_error_logging": true,
+        "has_fallback_values": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "State Store Integrity",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.35858154296875,
+      "details": {
+        "uses_reducer": true,
+        "has_event_limit": true,
+        "has_deduplication": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Event Deduplication",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.23674964904785156,
+      "details": {
+        "has_deduplication": true,
+        "has_event_key": true,
+        "has_some_check": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Memory Capping (100 events)",
+      "category": "Frontend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.2467632293701172,
+      "details": {
+        "has_slice_limit": true,
+        "mentions_100": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Port 8000 Availability",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.4756450653076172,
+      "details": {
+        "status": "Port in use (expected if backend running)"
+      },
+      "remediation": null
+    },
+    {
+      "name": "Backend API Routes",
+      "category": "Backend",
+      "passed": false,
+      "error": "Test failed",
+      "stack_trace": null,
+      "latency_ms": 49317.13676452637,
+      "details": {
+        "/": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/schedule": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/schedule/next": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/pipeline/status": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/metrics/files": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/matrix/files": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        },
+        "/api/timetable/files": {
+          "error": "HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=5)"
+        }
+      },
+      "remediation": null
+    },
+    {
+      "name": "File System Error Handling",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.5338191986083984,
+      "details": {
+        "has_try_catch": true,
+        "has_httpexception": true,
+        "has_file_operations": true,
+        "has_error_logging": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "JSONL Malformed Line Handling",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.3941059112548828,
+      "details": {
+        "has_json_decode_error": true,
+        "has_skip_logic": true,
+        "has_error_counting": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "WebSocket Burst Load (1k events)",
+      "category": "Backend",
+      "passed": false,
+      "error": "Test failed",
+      "stack_trace": null,
+      "latency_ms": 5021.932601928711,
+      "details": {
+        "events_received": 0,
+        "expected": 1000
+      },
+      "remediation": null
+    },
+    {
+      "name": "Module Reload Error Handling",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.8177757263183594,
+      "details": {
+        "has_importlib": true,
+        "has_reload": true,
+        "has_error_handling": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "CORS Middleware",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.44798851013183594,
+      "details": {
+        "has_cors": true,
+        "has_origins": true,
+        "has_localhost_5173": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Logging System Fallback",
+      "category": "Backend",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.3113746643066406,
+      "details": {
+        "has_file_handler": true,
+        "has_log_file_path": true,
+        "has_console_logging": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Export Timeout Logic (60min)",
+      "category": "Pipeline",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.6849765777587891,
+      "details": {
+        "scheduler_has_timeout": true,
+        "frontend_has_timeout": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Stall Detection (5min)",
+      "category": "Pipeline",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.5145072937011719,
+      "details": {
+        "scheduler_has_stall": true,
+        "frontend_has_stall": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Pipeline Status Detection",
+      "category": "Pipeline",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 5616.456508636475,
+      "details": {
+        "endpoint_works": true,
+        "returns_active": true,
+        "returns_run_id": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Event Log Tailing",
+      "category": "EventLog",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.9572505950927734,
+      "details": {
+        "events_written": 3,
+        "file_readable": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Corrupted JSON Handling",
+      "category": "EventLog",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 1.1544227600097656,
+      "details": {
+        "has_error_handling": true,
+        "test_lines": 5
+      },
+      "remediation": null
+    },
+    {
+      "name": "Rapid Writes Handling",
+      "category": "EventLog",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 3.188610076904297,
+      "details": {
+        "events_written": 100,
+        "write_time_ms": 2.844572067260742,
+        "throughput_events_per_sec": 35154.67270136619
+      },
+      "remediation": null
+    },
+    {
+      "name": "Schedule Validation",
+      "category": "Schedule",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 4093.8961505889893,
+      "details": {
+        "code_has_validation": true,
+        "code_has_error_response": true,
+        "api_test_valid": true,
+        "api_test_invalid": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Port Scanning Logic",
+      "category": "Streamlit",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.7557868957519531,
+      "details": {
+        "has_socket": true,
+        "has_port_check": true,
+        "has_already_running": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Merger Timeout (5min)",
+      "category": "Merger",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 1.0886192321777344,
+      "details": {
+        "has_timeout": true,
+        "has_300": true,
+        "has_timeout_expired": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Graceful Degradation",
+      "category": "Resilience",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 0.3006458282470703,
+      "details": {
+        "has_try_catch": true,
+        "has_fallback": true,
+        "has_error_logging": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "File Permission Error",
+      "category": "ErrorInjection",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 1.4033317565917969,
+      "details": {
+        "write_blocked": true,
+        "note": "File permission error correctly prevented write"
+      },
+      "remediation": null
+    },
+    {
+      "name": "Subprocess Failure",
+      "category": "ErrorInjection",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 25.785207748413086,
+      "details": {
+        "subprocess_failed": true,
+        "note": "Non-existent script correctly failed"
+      },
+      "remediation": null
+    },
+    {
+      "name": "API 404 Error",
+      "category": "ErrorInjection",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2039.4413471221924,
+      "details": {
+        "status_code": 404,
+        "note": "404 correctly returned for non-existent endpoint"
+      },
+      "remediation": null
+    },
+    {
+      "name": "API 500 Error Simulation",
+      "category": "ErrorInjection",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2048.389196395874,
+      "details": {
+        "status_code": 400,
+        "note": "Error correctly returned for invalid data"
+      },
+      "remediation": null
+    },
+    {
+      "name": "WebSocket Event Ordering",
+      "category": "Integration",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2080.7244777679443,
+      "details": {
+        "events_received": 50,
+        "events_written": 50,
+        "is_ordered": true,
+        "sequences": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      "remediation": null
+    },
+    {
+      "name": "Pipeline Start Integration",
+      "category": "Integration",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2051.328182220459,
+      "details": {
+        "pipeline_started": true,
+        "run_id": "db9c3afc-fab4-4eb9-bfe3-20481a514985",
+        "status": "started"
+      },
+      "remediation": null
+    },
+    {
+      "name": "File Counts Integration",
+      "category": "Integration",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2062.407970428467,
+      "details": {
+        "has_required_keys": true,
+        "values_valid": true,
+        "data": {
+          "raw_files": 6,
+          "processed_files": 0,
+          "analyzed_files": 1152
+        }
+      },
+      "remediation": null
+    },
+    {
+      "name": "High Frequency Events (100/sec)",
+      "category": "Performance",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 32.31167793273926,
+      "details": {
+        "events_written": 100,
+        "write_time_sec": 0.03175973892211914,
+        "events_per_sec": 3148.6404924555213,
+        "meets_target": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Large Event Log (10k events)",
+      "category": "Performance",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2899.643898010254,
+      "details": {
+        "events_written": 10000,
+        "file_size_mb": 1.1136817932128906,
+        "write_time_sec": 2.899061441421509,
+        "throughput_events_per_sec": 3449.3922264361045
+      },
+      "remediation": null
+    },
+    {
+      "name": "Backend Connection Recovery",
+      "category": "ErrorRecovery",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2015.5208110809326,
+      "details": {
+        "has_reconnect": true,
+        "has_error_handling": true,
+        "has_retry_logic": true,
+        "backend_running": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Event Log Deletion During Tail",
+      "category": "ErrorRecovery",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 4.325389862060547,
+      "details": {
+        "has_file_existence_check": true,
+        "has_error_handling": true
+      },
+      "remediation": null
+    },
+    {
+      "name": "Concurrent WebSocket Connections",
+      "category": "ErrorRecovery",
+      "passed": true,
+      "error": null,
+      "stack_trace": null,
+      "latency_ms": 2058.171033859253,
+      "details": {
+        "connections_attempted": 3,
+        "events_received_per_connection": [
+          0,
+          21,
+          1
+        ],
+        "note": "Backend may not be running - test checks code structure"
+      },
+      "remediation": null
+    }
+  ],
+  "critical_issues": [
+    "Backend API Routes",
+    "WebSocket Burst Load (1k events)"
+  ],
+  "remediation_suggestions": []
+}

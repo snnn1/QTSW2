@@ -1,0 +1,5 @@
+{"run_id": "df3adb4c-0bbd-4fa7-b05f-4b898a606ad1", "stage": "pipeline", "event": "start", "timestamp": "2025-12-02T19:30:00.005600-06:00", "msg": "Scheduled run started at 19:30:00 CST", "data": {"scheduled": true, "run_time": "2025-12-02T19:30:00.005392-06:00"}}
+{"run_id": "df3adb4c-0bbd-4fa7-b05f-4b898a606ad1", "stage": "pipeline", "event": "log", "timestamp": "2025-12-02T19:30:00.007667-06:00", "msg": "Checking for CSV files in data/raw"}
+{"run_id": "df3adb4c-0bbd-4fa7-b05f-4b898a606ad1", "stage": "pipeline", "event": "log", "timestamp": "2025-12-02T19:30:00.011241-06:00", "msg": "Found 6 CSV file(s), starting translator"}
+{"run_id": "df3adb4c-0bbd-4fa7-b05f-4b898a606ad1", "stage": "translator", "event": "start", "timestamp": "2025-12-02T19:30:00.013319-06:00", "msg": "Starting data translator stage"}
+{"run_id": "df3adb4c-0bbd-4fa7-b05f-4b898a606ad1", "stage": "translator", "event": "failure", "timestamp": "2025-12-02T19:30:01.124924-06:00", "msg": "Translator failed with code 1"}

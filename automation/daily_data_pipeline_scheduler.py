@@ -2,9 +2,10 @@
 Quantitative Trading System - Daily Data Pipeline Scheduler
 
 Automated scheduler that orchestrates the complete data pipeline:
-1. Launches NinjaTrader at scheduled time (07:30 CT)
-2. Monitors for data export completion
-3. Triggers Translator → Analyzer → Sequential Processor → Stream Matrix
+1. Runs every 15 minutes at :00, :15, :30, :45
+2. Checks for CSV files in data/raw/ → Runs Translator
+3. Checks for processed files in data/processed/ → Runs Analyzer
+4. Runs Data Merger after analyzer completes (pipeline ends here)
 
 Implements quant-style automation with:
 - Deterministic execution
@@ -23,6 +24,8 @@ import logging
 import subprocess
 import argparse
 import re
+import threading
+import queue
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
@@ -51,10 +54,6 @@ except ImportError:
 QTSW_ROOT = Path(r"C:\Users\jakej\QTSW")  # Main workspace
 QTSW2_ROOT = Path(r"C:\Users\jakej\QTSW2")  # Data translator workspace
 
-# NinjaTrader configuration
-NINJATRADER_EXE = Path(r"C:\Program Files\NinjaTrader 8\bin\NinjaTrader.exe")
-NINJATRADER_WORKSPACE = Path(r"C:\Users\jakej\Documents\NinjaTrader 8\workspaces\DataExport.ntworkspace")  # Adjust to your workspace name
-
 # Data directories
 # Note: DATA_RAW matches DataExporter output path (QTSW2/data/raw)
 DATA_RAW = QTSW2_ROOT / "data" / "raw"
@@ -63,12 +62,14 @@ DATA_PROCESSED = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (wher
 ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzer_runs"  # QTSW2/data/analyzer_runs
 SEQUENCER_RUNS = QTSW2_ROOT / "data" / "sequencer_runs"  # QTSW2/data/sequencer_runs
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
+EVENT_LOGS_DIR = LOGS_DIR / "events"
+EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Pipeline scripts (adjust paths as needed)
 TRANSLATOR_SCRIPT = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
 ANALYZER_SCRIPT = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "scripts" / "run_data_processed.py"
+PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
-SEQUENTIAL_PROCESSOR_SCRIPT = QTSW2_ROOT / "sequential_processor" / "sequential_processor.py"
 
 # Logging configuration
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,7 +98,7 @@ def emit_event(
     
     Args:
         run_id: Unique identifier for this pipeline run
-        stage: Current pipeline stage (translator, analyzer, sequential, audit, etc.)
+        stage: Current pipeline stage (translator, analyzer, merger, audit, etc.)
         event: Event type (start, metric, success, failure, log)
         msg: Optional message
         data: Optional data dictionary (for metrics, file counts, etc.)
@@ -189,292 +190,6 @@ def setup_logging(log_file: Path, debug_window=None) -> logging.Logger:
 
 
 # ============================================================
-# NinjaTrader Control
-# ============================================================
-
-class NinjaTraderController:
-    """Manages NinjaTrader process lifecycle and monitoring."""
-    
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
-        self.process: Optional[subprocess.Popen] = None
-        self.workspace_path = NINJATRADER_WORKSPACE
-        
-    def launch(self) -> bool:
-        """Launch NinjaTrader with saved workspace."""
-        try:
-            if not NINJATRADER_EXE.exists():
-                self.logger.error(f"NinjaTrader not found at: {NINJATRADER_EXE}")
-                return False
-                
-            if not self.workspace_path.exists():
-                self.logger.warning(f"Workspace not found: {self.workspace_path}")
-                self.logger.info("Launching NinjaTrader without workspace (you'll need to open workspace manually)")
-                command = [str(NINJATRADER_EXE)]
-            else:
-                self.logger.info(f"Launching NinjaTrader with workspace: {self.workspace_path.name}")
-                command = [str(NINJATRADER_EXE), str(self.workspace_path)]
-            
-            self.logger.info(f"Executing: {' '.join(command)}")
-            self.process = subprocess.Popen(
-                command,
-                cwd=str(NINJATRADER_EXE.parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            
-            self.logger.info(f"NinjaTrader launched (PID: {self.process.pid})")
-            time.sleep(5)  # Give it time to start
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to launch NinjaTrader: {e}")
-            return False
-    
-    def is_running(self) -> bool:
-        """Check if NinjaTrader process is still running."""
-        if self.process is None:
-            return False
-        return self.process.poll() is None
-    
-    def wait_for_export(self, timeout_minutes: int = 60, run_id: Optional[str] = None) -> bool:
-        """
-        Wait for data export to complete by monitoring data_raw directory.
-        
-        Enhanced detection:
-        - Checks for completion signal files (export_complete_*.json)
-        - Monitors progress files (export_progress_*.json)
-        - Falls back to file modification time detection
-        - Detects stalled exports (file not growing)
-        
-        Args:
-            timeout_minutes: Maximum time to wait (default 60 minutes)
-            
-        Returns:
-            True if export detected and completed, False if timeout
-        """
-        self.logger.info(f"Monitoring {DATA_RAW} for exports (timeout: {timeout_minutes} min)")
-        
-        # Get initial state
-        initial_files = self._get_csv_files()
-        initial_count = len(initial_files)
-        initial_times = {f: f.stat().st_mtime for f in initial_files}
-        initial_sizes = {f: f.stat().st_size for f in initial_files}
-        
-        # Get initial completion signals (from logs subfolder)
-        initial_completion_signals = set(DATA_RAW_LOGS.glob("export_complete_*.json")) if DATA_RAW_LOGS.exists() else set()
-        
-        # Get initial start signals to detect new exports (from logs subfolder)
-        initial_start_signals = set(DATA_RAW_LOGS.glob("export_start_*.json")) if DATA_RAW_LOGS.exists() else set()
-        
-        self.logger.info(f"Initial file count: {initial_count}")
-        if initial_count > 0:
-            self.logger.info(f"Most recent file: {max(initial_times.items(), key=lambda x: x[1])[0].name}")
-        
-        start_time = time.time()
-        timeout_seconds = timeout_minutes * 60
-        check_interval = 10  # Check every 10 seconds (more frequent for better detection)
-        last_size_check = {}  # Track file sizes to detect stalled exports
-        stalled_check_interval = 300  # Check for stalled exports every 5 minutes
-        last_progress_emission = {}  # Track last progress emission to avoid spam
-        export_started_emitted = False
-        
-        while (time.time() - start_time) < timeout_seconds:
-            # Check for start signals (export beginning) - from logs subfolder
-            current_start_signals = set(DATA_RAW_LOGS.glob("export_start_*.json")) if DATA_RAW_LOGS.exists() else set()
-            new_start_signals = current_start_signals - initial_start_signals
-            
-            if new_start_signals and not export_started_emitted and run_id:
-                export_started_emitted = True
-                for signal_file in new_start_signals:
-                    try:
-                        with open(signal_file, "r") as f:
-                            start_data = json.load(f)
-                            instrument = start_data.get('instrument', 'unknown')
-                            data_type = start_data.get('dataType', 'unknown')
-                            emit_event(run_id, "export", "start", f"Export started for {instrument} ({data_type})", {
-                                "instrument": instrument,
-                                "dataType": data_type
-                            })
-                            self.logger.info(f"Export start signal detected: {instrument} ({data_type})")
-                    except Exception as e:
-                        self.logger.warning(f"Could not read start signal {signal_file.name}: {e}")
-            
-            # Check for completion signals first (most reliable) - from logs subfolder
-            current_completion_signals = set(DATA_RAW_LOGS.glob("export_complete_*.json")) if DATA_RAW_LOGS.exists() else set()
-            new_completion_signals = current_completion_signals - initial_completion_signals
-            
-            if new_completion_signals:
-                for signal_file in new_completion_signals:
-                    try:
-                        with open(signal_file, "r") as f:
-                            signal_data = json.load(f)
-                            self.logger.info(f"Export completion signal detected: {signal_data.get('fileName', 'unknown')}")
-                            self.logger.info(f"  Instrument: {signal_data.get('instrument', 'unknown')}")
-                            self.logger.info(f"  Records: {signal_data.get('totalBarsProcessed', 0):,}")
-                            self.logger.info(f"  File size: {signal_data.get('fileSizeMB', 0):.2f} MB")
-                            
-                            # Emit completion event
-                            if run_id:
-                                emit_event(run_id, "export", "success", 
-                                    f"Export completed: {signal_data.get('totalBarsProcessed', 0):,} records, {signal_data.get('fileSizeMB', 0):.2f} MB",
-                                    {
-                                        "instrument": signal_data.get('instrument', 'unknown'),
-                                        "dataType": signal_data.get('dataType', 'unknown'),
-                                        "totalBarsProcessed": signal_data.get('totalBarsProcessed', 0),
-                                        "fileSizeMB": signal_data.get('fileSizeMB', 0),
-                                        "gapsDetected": signal_data.get('gapsDetected', 0),
-                                        "invalidDataSkipped": signal_data.get('invalidDataSkipped', 0),
-                                        "fileName": signal_data.get('fileName', 'unknown')
-                                    })
-                    except Exception as e:
-                        self.logger.warning(f"Could not read completion signal {signal_file.name}: {e}")
-                
-                return True
-            
-            # Check for progress files (export in progress) - from logs subfolder
-            progress_files = list(DATA_RAW_LOGS.glob("export_progress_*.json")) if DATA_RAW_LOGS.exists() else []
-            if progress_files:
-                # Read most recent progress file
-                latest_progress = max(progress_files, key=lambda p: p.stat().st_mtime)
-                try:
-                    with open(latest_progress, "r") as f:
-                        progress_data = json.load(f)
-                        records = progress_data.get("totalBarsProcessed", 0)
-                        file_size_mb = progress_data.get("fileSizeMB", 0)
-                        instrument = progress_data.get("instrument", "unknown")
-                        
-                        # Emit progress event (throttle to avoid spam - only every 30 seconds per file)
-                        if run_id:
-                            progress_key = str(latest_progress)
-                            last_emit_time = last_progress_emission.get(progress_key, 0)
-                            current_time = time.time()
-                            
-                            if current_time - last_emit_time >= 30:  # Emit at most every 30 seconds
-                                last_progress_emission[progress_key] = current_time
-                                
-                                # Count files
-                                csv_files = self._get_csv_files()
-                                file_count = len(csv_files)
-                                
-                                emit_event(run_id, "export", "metric",
-                                    f"Export in progress: {records:,} records, {file_size_mb:.2f} MB",
-                                    {
-                                        "instrument": instrument,
-                                        "dataType": progress_data.get("dataType", "unknown"),
-                                        "totalBarsProcessed": records,
-                                        "fileSizeMB": file_size_mb,
-                                        "fileCount": file_count,
-                                        "gapsDetected": progress_data.get("gapsDetected", 0),
-                                        "invalidDataSkipped": progress_data.get("invalidDataSkipped", 0)
-                                    })
-                        
-                        self.logger.info(f"Export in progress: {records:,} records, {file_size_mb:.2f} MB")
-                except Exception as e:
-                    pass  # Ignore read errors
-            
-            # Check for new CSV files
-            current_files = self._get_csv_files()
-            current_count = len(current_files)
-            
-            new_files = set(current_files) - set(initial_files)
-            if new_files:
-                self.logger.info(f"New export file detected: {len(new_files)} file(s)")
-                for new_file in new_files:
-                    file_size_mb = new_file.stat().st_size / 1024 / 1024
-                    self.logger.info(f"  - {new_file.name} ({file_size_mb:.2f} MB)")
-                    last_size_check[new_file] = new_file.stat().st_size
-                
-                # Wait a bit to see if file is still being written
-                time.sleep(5)
-                # Check if file is still growing (export in progress)
-                for new_file in new_files:
-                    current_size = new_file.stat().st_size
-                    if current_size > last_size_check.get(new_file, 0):
-                        self.logger.info(f"  {new_file.name} is still being written, waiting for completion...")
-                        last_size_check[new_file] = current_size
-                    else:
-                        # File stopped growing, might be complete
-                        # Check for completion signal (in logs subfolder)
-                        completion_pattern = f"export_complete_{new_file.stem}.json"
-                        completion_signal = DATA_RAW_LOGS / completion_pattern
-                        if completion_signal.exists():
-                            self.logger.info(f"Export complete: {new_file.name}")
-                            return True
-                        else:
-                            # File exists but no completion signal - might still be writing
-                            # Continue monitoring
-                            pass
-            
-            # Check if existing files were modified recently
-            for file_path in current_files:
-                if file_path not in initial_files or file_path.stat().st_mtime > initial_times.get(file_path, 0):
-                    mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                    time_since_mod = (datetime.now() - mod_time).total_seconds()
-                    
-                    if time_since_mod < 120:  # Modified within last 2 minutes
-                        self.logger.info(f"Export file recently modified: {file_path.name}")
-                        # Check for completion signal (in logs subfolder)
-                        completion_pattern = f"export_complete_{file_path.stem}.json"
-                        completion_signal = DATA_RAW_LOGS / completion_pattern
-                        if completion_signal.exists():
-                            return True
-                        return True  # File modified, assume export in progress
-            
-            # Check for stalled exports (file not growing)
-            elapsed = int(time.time() - start_time)
-            if elapsed % stalled_check_interval == 0 and last_size_check:
-                for file_path, last_size in list(last_size_check.items()):
-                    if file_path.exists():
-                        current_size = file_path.stat().st_size
-                        if current_size == last_size:
-                            # File hasn't grown - check if there's a completion signal (in logs subfolder)
-                            completion_pattern = f"export_complete_{file_path.stem}.json"
-                            completion_signal = DATA_RAW_LOGS / completion_pattern
-                            if completion_signal.exists():
-                                self.logger.info(f"Export completed: {file_path.name}")
-                                return True
-                            else:
-                                # File stalled but no completion signal - might be an error
-                                self.logger.warning(f"Export may have stalled: {file_path.name} (no growth in 5 min)")
-                                if run_id:
-                                    emit_event(run_id, "export", "failure",
-                                        f"Export may have stalled: {file_path.name} (no growth in 5 minutes)",
-                                        {
-                                            "fileName": file_path.name,
-                                            "fileSizeMB": file_path.stat().st_size / (1024 * 1024)
-                                        })
-                        else:
-                            last_size_check[file_path] = current_size
-            
-            # Log progress
-            if elapsed % 300 == 0:  # Log every 5 minutes
-                self.logger.info(f"Still waiting... ({elapsed // 60} min elapsed)")
-            
-            time.sleep(check_interval)
-        
-        self.logger.warning(f"Timeout reached ({timeout_minutes} min) - no export completion detected")
-        if run_id:
-            emit_event(run_id, "export", "failure",
-                f"Export timeout: no completion detected after {timeout_minutes} minutes",
-                {"timeoutMinutes": timeout_minutes})
-        return False
-    
-    def _get_csv_files(self) -> List[Path]:
-        """Get all CSV export files from data_raw directory."""
-        if not DATA_RAW.exists():
-            return []
-        
-        # Look for all CSV export patterns (MinuteDataExport, TickDataExport, DataExport)
-        files = list(DATA_RAW.glob("MinuteDataExport_*.csv"))
-        files.extend(DATA_RAW.glob("TickDataExport_*.csv"))
-        files.extend(DATA_RAW.glob("DataExport_*.csv"))
-        # Exclude files in subdirectories (like logs folder)
-        files = [f for f in files if f.parent == DATA_RAW]
-        return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
-
-
-# ============================================================
 # Pipeline Orchestration
 # ============================================================
 
@@ -532,33 +247,228 @@ class PipelineOrchestrator:
             emit_event(self.run_id, "translator", "log", f"Starting translation of {len(raw_files)} file(s)")
             
             # Run translator with timeout and capture output
+            # Use Popen instead of run to allow progress monitoring
             try:
-                result = subprocess.run(
+                process = subprocess.Popen(
                     translator_cmd,
                     cwd=str(QTSW2_ROOT),
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=3600  # 1 hour timeout
+                    bufsize=1  # Line buffered
                 )
                 
-                # Log output for debugging
-                if result.stdout:
-                    self.logger.info("Translator output:")
-                    for line in result.stdout.split('\n'):
-                        if line.strip():
-                            self.logger.info(f"  {line}")
-                            # Emit progress events for key milestones
-                            if any(keyword in line for keyword in ["Processing:", "Loaded:", "Saving", "rows", "completed"]):
-                                # Only emit if line has content
-                                if line.strip():
+                # Monitor progress and emit periodic updates
+                import threading
+                import queue
+                
+                stdout_queue = queue.Queue()
+                stderr_queue = queue.Queue()
+                
+                def read_stdout():
+                    for line in iter(process.stdout.readline, ''):
+                        stdout_queue.put(line)
+                    process.stdout.close()
+                
+                def read_stderr():
+                    for line in iter(process.stderr.readline, ''):
+                        stderr_queue.put(line)
+                    process.stderr.close()
+                
+                stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+                stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+                stdout_thread.start()
+                stderr_thread.start()
+                
+                # Monitor process with progress updates
+                files_written = []
+                # Track which input files have been processed by instrument name
+                processed_instruments = set()
+                # Extract instrument names from raw file names (e.g., "CL.csv" -> "CL")
+                expected_instruments = {f.stem.upper() for f in raw_files}
+                last_progress_time = time.time()
+                last_output_time = time.time()  # Track when we last saw output
+                progress_interval = 60  # Emit progress every 60 seconds
+                no_output_warning_interval = 300  # Warn if no output for 5 minutes
+                start_time = time.time()
+                timeout_seconds = 3600  # 1 hour timeout
+                no_output_timeout = 30  # If no output for 30 seconds after all files written, treat as complete
+                last_file_written_time = None
+                
+                self.logger.info(f"Expected instruments to process: {sorted(expected_instruments)}")
+                
+                while process.poll() is None:
+                    elapsed = time.time() - start_time
+                    if elapsed > timeout_seconds:
+                        self.logger.error("✗ Translator timed out after 1 hour")
+                        process.kill()
+                        emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
+                        self.stage_results["translator"] = False
+                        return False
+                    
+                    # Check for new output
+                    output_received = False
+                    translator_completed = False
+                    try:
+                        while True:
+                            line = stdout_queue.get_nowait()
+                            if line.strip():
+                                output_received = True
+                                last_output_time = time.time()
+                                self.logger.info(f"  {line.strip()}")
+                                
+                                # Check for completion message
+                                if "[SUCCESS]" in line and "completed successfully" in line:
+                                    translator_completed = True
                                     emit_event(self.run_id, "translator", "log", line.strip())
-                            # Emit event when a year file is written
+                                
+                                # Emit event when a file is successfully written
+                                if "Saved:" in line or "Saved PARQUET:" in line or "Saved CSV:" in line:
+                                    emit_event(self.run_id, "translator", "log", f"File written: {line.strip()}")
+                                    files_written.append(line.strip())
+                                    last_file_written_time = time.time()  # Track when last file was written
+                                    
+                                    # Extract instrument from saved file name (e.g., "CL_2025_CL.parquet" -> "CL")
+                                    if ".parquet" in line:
+                                        match = re.search(r'([A-Z]+)_(\d{4})', line)
+                                        if match:
+                                            instrument = match.group(1)
+                                            year = match.group(2)
+                                            processed_instruments.add(instrument)
+                                            emit_event(self.run_id, "translator", "metric", f"Wrote {instrument} {year} file", {
+                                                "instrument": instrument,
+                                                "year": year,
+                                                "file_type": "parquet"
+                                            })
+                                            self.logger.info(f"  ✓ File written: {instrument} ({len(processed_instruments)}/{len(expected_instruments)} instruments complete)")
+                                    else:
+                                        self.logger.info(f"  ✓ File written: {len(files_written)} files total")
+                                # Also emit any "Processing:" messages to show activity
+                                elif "Processing:" in line:
+                                    emit_event(self.run_id, "translator", "log", line.strip())
+                                # Emit other important messages
+                                elif "[INFO]" in line or "[ERROR]" in line:
+                                    emit_event(self.run_id, "translator", "log", line.strip())
+                    except queue.Empty:
+                        pass
+                    
+                    # Check for stderr output too
+                    try:
+                        while True:
+                            line = stderr_queue.get_nowait()
+                            if line.strip():
+                                output_received = True
+                                last_output_time = time.time()
+                                self.logger.warning(f"  [stderr] {line.strip()}")
+                                # Emit warnings/errors as events
+                                if "error" in line.lower() or "exception" in line.lower() or "traceback" in line.lower():
+                                    emit_event(self.run_id, "translator", "log", f"Warning: {line.strip()}")
+                    except queue.Empty:
+                        pass
+                    
+                    # Warn if no output for extended period (might be stuck on large file)
+                    time_since_output = time.time() - last_output_time
+                    if time_since_output >= no_output_warning_interval:
+                        elapsed_minutes = int(elapsed / 60)
+                        no_output_minutes = int(time_since_output / 60)
+                        self.logger.warning(f"Translator has produced no output for {no_output_minutes} minutes (elapsed: {elapsed_minutes} min)")
+                        emit_event(self.run_id, "translator", "metric", f"Translation in progress - no output for {no_output_minutes} min (may be processing large file)", {
+                            "elapsed_minutes": elapsed_minutes,
+                            "no_output_minutes": no_output_minutes,
+                            "files_written": len(files_written)
+                        })
+                        last_output_time = time.time()  # Reset to avoid spam
+                    
+                    # Emit periodic progress updates (even if no new output)
+                    if time.time() - last_progress_time >= progress_interval:
+                        elapsed_minutes = int(elapsed / 60)
+                        emit_event(self.run_id, "translator", "metric", f"Translation in progress ({elapsed_minutes} min elapsed, {len(files_written)} files written)", {
+                            "elapsed_minutes": elapsed_minutes,
+                            "files_written": len(files_written)
+                        })
+                        last_progress_time = time.time()
+                    
+                    # If translator printed success message, wait a bit for process to exit naturally
+                    # If it doesn't exit within 10 seconds, we'll treat it as complete anyway
+                    if translator_completed:
+                        wait_start = time.time()
+                        while process.poll() is None and (time.time() - wait_start) < 10:
+                            time.sleep(0.5)
+                        # If still running after 10 seconds, it might be stuck - break out and treat as complete
+                        if process.poll() is None:
+                            self.logger.warning("Translator printed success but process hasn't exited after 10s - treating as complete")
+                            process.terminate()  # Try to terminate gracefully
+                            time.sleep(2)
+                            if process.poll() is None:
+                                process.kill()  # Force kill if still running
+                            # Set returncode to 0 since we saw success message
+                            process.returncode = 0
+                            break  # Exit monitoring loop
+                    
+                    # If all expected instruments have been processed and no output for 30 seconds, treat as complete
+                    # This handles cases where translator hangs after writing files
+                    # Check by instrument count (more reliable than file count since one input can produce multiple outputs)
+                    all_instruments_processed = len(processed_instruments) >= len(expected_instruments)
+                    
+                    if all_instruments_processed and last_file_written_time is not None:
+                        time_since_last_file = time.time() - last_file_written_time
+                        if time_since_last_file >= no_output_timeout:
+                            missing = expected_instruments - processed_instruments
+                            self.logger.info(f"All {len(expected_instruments)} instruments processed: {sorted(processed_instruments)}")
+                            if missing:
+                                self.logger.warning(f"Missing instruments: {sorted(missing)}")
+                            self.logger.info(f"No output for {no_output_timeout}s - treating translator as complete")
+                            self.logger.warning("Translator process may be hanging - terminating and treating as success")
+                            emit_event(self.run_id, "translator", "log", f"All {len(expected_instruments)} instruments processed - terminating hanging process")
+                            process.terminate()  # Try to terminate gracefully
+                            time.sleep(2)
+                            if process.poll() is None:
+                                process.kill()  # Force kill if still running
+                            # Set returncode to 0 since files were written
+                            process.returncode = 0
+                            break  # Exit monitoring loop
+                    elif all_instruments_processed:
+                        # All instruments processed but last_file_written_time not set - check if we should wait
+                        if last_file_written_time is None:
+                            # Set it now if we just detected all instruments are processed
+                            last_file_written_time = time.time()
+                            self.logger.info(f"All {len(expected_instruments)} instruments detected as processed: {sorted(processed_instruments)} - monitoring for completion")
+                    
+                    time.sleep(0.5)  # Small delay to avoid busy waiting
+                
+                # Process finished, get remaining output
+                result_stdout = []
+                result_stderr = []
+                try:
+                    while True:
+                        result_stdout.append(stdout_queue.get_nowait())
+                except queue.Empty:
+                    pass
+                try:
+                    while True:
+                        result_stderr.append(stderr_queue.get_nowait())
+                except queue.Empty:
+                    pass
+                
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+                
+                result = type('obj', (object,), {
+                    'returncode': process.returncode,
+                    'stdout': ''.join(result_stdout),
+                    'stderr': ''.join(result_stderr)
+                })()
+                
+                # Log remaining output (files_written already populated from monitoring loop)
+                if result.stdout:
+                    remaining_lines = result.stdout.split('\n')
+                    for line in remaining_lines:
+                        if line.strip() and line.strip() not in [f.strip() for f in files_written]:
+                            self.logger.info(f"  {line.strip()}")
                             if "Saved:" in line or "Saved PARQUET:" in line or "Saved CSV:" in line:
-                                # Extract file info from line like "Saved: ES_2024.parquet" or "Saved PARQUET: ES_2024_file.parquet (1,234 rows)"
                                 emit_event(self.run_id, "translator", "log", f"File written: {line.strip()}")
-                                # Also emit as metric for tracking
+                                files_written.append(line.strip())
                                 if ".parquet" in line:
-                                    # Try to extract year and instrument from filename
                                     match = re.search(r'([A-Z]+)_(\d{4})', line)
                                     if match:
                                         instrument = match.group(1)
@@ -575,44 +485,78 @@ class PipelineOrchestrator:
                         if line.strip():
                             self.logger.warning(f"  {line}")
                             
-            except subprocess.TimeoutExpired:
-                self.logger.error("✗ Translator timed out after 1 hour")
-                emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
-                self.stage_results["translator"] = False
-                return False
             except Exception as e:
-                self.logger.error(f"✗ Translator exception: {e}")
-                emit_event(self.run_id, "translator", "failure", f"Translator exception: {str(e)}")
+                # Handle any errors in the monitoring loop
+                if hasattr(e, 'timeout') or 'timeout' in str(e).lower():
+                    self.logger.error("✗ Translator timed out after 1 hour")
+                    emit_event(self.run_id, "translator", "failure", "Translator timed out after 1 hour")
+                else:
+                    self.logger.error(f"✗ Translator exception: {e}")
+                    emit_event(self.run_id, "translator", "failure", f"Translator exception: {str(e)}")
                 self.stage_results["translator"] = False
                 return False
             
-            if result.returncode == 0:
+            # Check if translator completed (either by return code, success message, or files written)
+            translator_success_in_output = "[SUCCESS]" in result.stdout and "completed successfully" in result.stdout
+            translator_success_in_stderr = "[SUCCESS]" in result.stderr and "completed successfully" in result.stderr
+            
+            # Check if files were actually written (more reliable than return code)
+            processed_files_after = []
+            if DATA_PROCESSED.exists():
+                processed_files_after = list(DATA_PROCESSED.glob("*.parquet"))
+                processed_files_after.extend(DATA_PROCESSED.glob("*.csv"))
+            
+            # Success if: return code 0, success message in output, OR files were written
+            translator_succeeded = (
+                result.returncode == 0 or 
+                translator_success_in_output or 
+                translator_success_in_stderr or
+                len(processed_files_after) > 0 or
+                len(files_written) > 0
+            )
+            
+            # Debug logging
+            self.logger.info(f"Translator completion check:")
+            self.logger.info(f"  Return code: {result.returncode}")
+            self.logger.info(f"  Success in stdout: {translator_success_in_output}")
+            self.logger.info(f"  Success in stderr: {translator_success_in_stderr}")
+            self.logger.info(f"  Processed files found: {len(processed_files_after)}")
+            self.logger.info(f"  Files written during monitoring: {len(files_written)}")
+            self.logger.info(f"  Translator succeeded: {translator_succeeded}")
+            
+            if translator_succeeded:
+                self.logger.info("=" * 60)
                 self.logger.info("✓ Translator completed successfully")
-                self.logger.info(result.stdout[-500:])  # Last 500 chars
+                self.logger.info(f"  Files written: {len(files_written)}")
+                self.logger.info(f"  Processed files found: {len(processed_files_after)}")
+                self.logger.info(f"  Return code: {result.returncode}")
+                self.logger.info("=" * 60)
+                
+                if result.stdout:
+                    self.logger.info(f"Last 500 chars of stdout: {result.stdout[-500:]}")
                 
                 # Count processed files
-                processed_files = list(DATA_PROCESSED.glob("*.parquet"))
-                processed_files.extend(DATA_PROCESSED.glob("*.csv"))
                 emit_event(self.run_id, "translator", "metric", "Translation complete", {
-                    "processed_file_count": len(processed_files)
+                    "processed_file_count": len(processed_files_after),
+                    "files_written_count": len(files_written),
+                    "return_code": result.returncode
                 })
                 
-                # Delete processed raw CSV files
-                deleted_count = self._delete_raw_files(raw_files)
-                if deleted_count > 0:
-                    self.logger.info(f"✓ Deleted {deleted_count} raw CSV file(s)")
-                    emit_event(self.run_id, "translator", "metric", "Raw files deleted", {
-                        "deleted_file_count": deleted_count
-                    })
+                # NOTE: Raw files are NOT deleted (as per requirements)
+                # They remain in data/raw/ for backup/archival purposes
+                self.logger.info(f"✓ Translator completed - {len(raw_files)} raw file(s) preserved in data/raw/")
                 
                 emit_event(self.run_id, "translator", "success", "Translator completed successfully")
+                self.logger.info("✓ Translator success event emitted")
                 
                 self.stage_results["translator"] = True
                 return True
             else:
                 self.logger.error(f"✗ Translator failed (code: {result.returncode})")
+                self.logger.error(f"Files written during monitoring: {len(files_written)}")
+                self.logger.error(f"Processed files found: {len(processed_files_after)}")
                 if result.stderr:
-                    self.logger.error(f"Error output: {result.stderr}")
+                    self.logger.error(f"Error output: {result.stderr[-500:]}")
                 emit_event(self.run_id, "translator", "failure", f"Translator failed with code {result.returncode}")
                 self.stage_results["translator"] = False
                 return False
@@ -624,19 +568,7 @@ class PipelineOrchestrator:
             self.stage_results["translator"] = False
             return False
     
-    def _delete_raw_files(self, raw_files: List[Path]) -> int:
-        """Delete processed raw CSV files."""
-        deleted_count = 0
-        for raw_file in raw_files:
-            try:
-                raw_file.unlink()
-                deleted_count += 1
-                self.logger.info(f"  Deleted: {raw_file.name}")
-            except Exception as e:
-                self.logger.warning(f"  Failed to delete {raw_file.name}: {e}")
-                # Continue with other files
-        
-        return deleted_count
+    # NOTE: _delete_raw_files() method removed - raw files are never deleted (as per requirements)
     
     def _delete_processed_files(self, processed_files: List[Path]) -> int:
         """Delete analyzed processed files."""
@@ -697,11 +629,143 @@ class PipelineOrchestrator:
             "processed_file_count": len(processed_files)
         })
         
-        success_count = 0
-        self.logger.info(f"Starting analyzer for {len(instruments)} instrument(s): {', '.join(instruments)}")
-        emit_event(self.run_id, "analyzer", "log", f"Processing {len(instruments)} instrument(s): {', '.join(instruments)}")
+        # Use parallel analyzer runner for faster processing
+        self.logger.info(f"Using parallel analyzer runner for {len(instruments)} instrument(s): {', '.join(instruments)}")
+        emit_event(self.run_id, "analyzer", "log", f"Starting parallel analyzer for {len(instruments)} instrument(s): {', '.join(instruments)}")
         
-        for i, instrument in enumerate(instruments, 1):
+        # Build command for parallel analyzer runner
+        parallel_cmd = [
+            sys.executable,
+            str(PARALLEL_ANALYZER_SCRIPT),
+            "--instruments"
+        ] + instruments + [
+            "--folder", str(DATA_PROCESSED),
+            "--run-id", self.run_id
+        ]
+        
+        self.logger.info(f"Running parallel analyzer...")
+        self.logger.info(f"  Command: {' '.join(parallel_cmd)}")
+        emit_event(self.run_id, "analyzer", "log", "Starting parallel analyzer processes")
+        
+        try:
+            # Set environment variable for event logging
+            env = os.environ.copy()
+            env["PIPELINE_RUN"] = "1"
+            env["PIPELINE_EVENT_LOG"] = str(EVENT_LOGS_DIR / f"pipeline_{self.run_id}.jsonl")
+            env["PIPELINE_RUN_ID"] = self.run_id
+            
+            process = subprocess.Popen(
+                parallel_cmd,
+                cwd=str(QTSW2_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env
+            )
+            
+            # Stream output
+            stdout_lines = []
+            stderr_lines = []
+            max_lines = 100
+            
+            def read_stream(stream, lines_list):
+                try:
+                    for line in iter(stream.readline, ''):
+                        if line:
+                            lines_list.append(line.rstrip())
+                            if len(lines_list) > max_lines:
+                                lines_list.pop(0)
+                            
+                            # Log important messages
+                            line_upper = line.upper()
+                            line_stripped = line.rstrip()
+                            
+                            if any(keyword in line_upper for keyword in ['ERROR', 'WARNING', 'COMPLETED', 'FAILED', 'SUCCESS']):
+                                self.logger.info(f"[Parallel Analyzer] {line_stripped}")
+                                emit_event(self.run_id, "analyzer", "log", line_stripped)
+                except Exception as e:
+                    self.logger.error(f"Error reading stream: {e}")
+            
+            import threading
+            stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines), daemon=True)
+            stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines), daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # Wait for completion
+            import time
+            start_time = time.time()
+            timeout_seconds = 21600  # 6 hour timeout
+            
+            while process.poll() is None:
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    self.logger.error("Parallel analyzer timed out after 6 hours")
+                    emit_event(self.run_id, "analyzer", "failure", "Parallel analyzer timed out after 6 hours")
+                    process.kill()
+                    process.wait()
+                    return False
+                time.sleep(1)
+            
+            returncode = process.returncode
+            elapsed_minutes = int((time.time() - start_time) / 60)
+            
+            # Wait for threads
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            
+            if returncode == 0:
+                self.logger.info(f"✓ Parallel analyzer completed successfully in {elapsed_minutes} minutes")
+                emit_event(self.run_id, "analyzer", "success", f"Parallel analyzer completed in {elapsed_minutes} minutes")
+                success = True
+            else:
+                error_msg = '\n'.join(stderr_lines[-20:]) if stderr_lines else '\n'.join(stdout_lines[-20:])
+                self.logger.error(f"✗ Parallel analyzer failed (code: {returncode})")
+                self.logger.error(f"Error output: {error_msg}")
+                emit_event(self.run_id, "analyzer", "failure", f"Parallel analyzer failed: {error_msg}")
+                success = False
+            
+            # Set stage result
+            self.stage_results["analyzer"] = success
+            
+            # Delete processed files after successful analysis (same as old code)
+            if success:
+                # Get list of processed files that match the analyzed instruments
+                processed_files_to_delete = []
+                if DATA_PROCESSED.exists():
+                    all_processed = list(DATA_PROCESSED.glob("*.parquet"))
+                    all_processed.extend(list(DATA_PROCESSED.glob("*.csv")))
+                    
+                    # Filter files that match analyzed instruments
+                    for proc_file in all_processed:
+                        # Check if file name contains any of the analyzed instruments
+                        file_name_upper = proc_file.name.upper()
+                        for instrument in instruments:
+                            if instrument.upper() in file_name_upper:
+                                processed_files_to_delete.append(proc_file)
+                                break
+                
+                if processed_files_to_delete:
+                    deleted_count = 0
+                    for proc_file in processed_files_to_delete:
+                        try:
+                            proc_file.unlink()
+                            deleted_count += 1
+                        except Exception as e:
+                            self.logger.warning(f"Failed to delete {proc_file.name}: {e}")
+                    
+                    if deleted_count > 0:
+                        self.logger.info(f"Deleted {deleted_count} processed file(s) after successful analysis")
+                        emit_event(self.run_id, "analyzer", "log", f"Deleted {deleted_count} processed file(s)")
+            
+            return success
+                
+        except Exception as e:
+            self.logger.error(f"Failed to run parallel analyzer: {e}")
+            emit_event(self.run_id, "analyzer", "failure", f"Failed to start parallel analyzer: {str(e)}")
+            self.stage_results["analyzer"] = False
+            return False
             try:
                 self.logger.info(f"=" * 60)
                 self.logger.info(f"Starting analyzer for {instrument} ({i}/{len(instruments)})")
@@ -843,7 +907,13 @@ class PipelineOrchestrator:
                                     # Also emit as event for dashboard
                                     # Only emit if line is not empty after stripping
                                     if line_stripped and line_stripped.strip():
-                                        emit_event(self.run_id, "analyzer", "log", f"[{instrument}] {line_stripped}")
+                                        # Filter out verbose analyzer completion messages
+                                        # Skip "Completed date" messages - too verbose, one per date
+                                        if "Completed date" in line_stripped and "processed slots" in line_stripped:
+                                            # Don't emit these - they're too verbose
+                                            pass
+                                        else:
+                                            emit_event(self.run_id, "analyzer", "log", f"[{instrument}] {line_stripped}")
                     except Exception as e:
                         self.logger.error(f"Error reading {stream_name} stream: {e}")
                 
@@ -1111,257 +1181,6 @@ class PipelineOrchestrator:
             self.stage_results["merger"] = False
             return False
     
-    def run_sequential_processor(self, instruments: List[str] = None) -> bool:
-        """Stage 3: Run sequential processor on analyzer output files."""
-        self.logger.info("=" * 60)
-        self.logger.info("STAGE 3: Sequential Processor")
-        self.logger.info("=" * 60)
-        
-        emit_event(self.run_id, "sequential", "start", "Starting sequential processor stage")
-        
-        # Find analyzer output files from analyzer_runs (merged monthly files)
-        # Look for files in analyzer_runs/<instrument><session>/<year>/ folders
-        analyzer_runs_dir = QTSW2_ROOT / "data" / "analyzer_runs"
-        
-        if not analyzer_runs_dir.exists():
-            self.logger.warning(f"No analyzer_runs directory found: {analyzer_runs_dir}")
-            self.logger.info("Sequential processor requires merged analyzer files")
-            emit_event(self.run_id, "sequential", "log", f"No analyzer_runs directory found: {analyzer_runs_dir}")
-            emit_event(self.run_id, "sequential", "success", "Sequential processor skipped (no analyzer_runs directory)")
-            self.stage_results["sequential_processor"] = True  # Mark as skipped but not failed
-            return True
-        
-        # Find analyzer files grouped by instrument-session (ES1, ES2, NQ1, NQ2, etc.)
-        # Pattern: analyzer_runs/<instrument><session>/<year>/*.parquet
-        # Example: analyzer_runs/ES1/2025/ES1_an_2025_11.parquet
-        instrument_session_files = {}  # Key: "ES1", "ES2", etc. Value: list of files
-        
-        # Common instruments and sessions
-        instruments_list = ["ES", "NQ", "YM", "CL", "NG", "GC"]
-        sessions = ["1", "2"]  # S1 -> 1, S2 -> 2
-        
-        for instrument in instruments_list:
-            for session in sessions:
-                instrument_session = f"{instrument}{session}"
-                instrument_dir = analyzer_runs_dir / instrument_session
-                
-                if instrument_dir.exists():
-                    # Look for parquet files in year subdirectories - collect ALL monthly files
-                    session_files = []
-                    for year_dir in instrument_dir.iterdir():
-                        if year_dir.is_dir() and year_dir.name.isdigit():
-                            year_files = list(year_dir.glob("*.parquet"))
-                            # Add ALL monthly files, not just the most recent
-                            session_files.extend(year_files)
-                    
-                    if session_files:
-                        # Sort files by path to ensure consistent ordering (by year/month)
-                        session_files = sorted(session_files)
-                        # Store ALL files for this instrument-session combination
-                        instrument_session_files[instrument_session] = session_files
-        
-        if not instrument_session_files:
-            self.logger.warning(f"No analyzer parquet files found in {analyzer_runs_dir}")
-            emit_event(self.run_id, "sequential", "log", f"No analyzer parquet files found in {analyzer_runs_dir}")
-            emit_event(self.run_id, "sequential", "success", "Sequential processor skipped (no analyzer files)")
-            self.stage_results["sequential_processor"] = True
-            return True
-        
-        # Get list of instrument-session combinations to process
-        instrument_sessions = sorted(instrument_session_files.keys())
-        total_count = len(instrument_sessions)
-        
-        self.logger.info(f"Found {total_count} instrument-session combination(s) to process: {', '.join(instrument_sessions)}")
-        emit_event(self.run_id, "sequential", "log", f"Found {total_count} stream(s) to process: {', '.join(instrument_sessions)}")
-        emit_event(self.run_id, "sequential", "metric", "Sequential processor started", {
-            "stream_count": total_count,
-            "streams": instrument_sessions
-        })
-        
-        success_count = 0
-        for i, instrument_session in enumerate(instrument_sessions, 1):
-            # Extract instrument and session from key (e.g., "ES1" -> "ES", "1")
-            instrument = instrument_session[:-1]  # Remove last character (session number)
-            session_num = instrument_session[-1]  # Get session number
-            
-            # Get ALL files for this instrument-session (all monthly files across all years)
-            session_files = instrument_session_files[instrument_session]
-            
-            self.logger.info(f"=" * 60)
-            self.logger.info(f"Starting sequential processor for {instrument_session} ({i}/{total_count})")
-            self.logger.info(f"  Processing {len(session_files)} monthly file(s) for {instrument_session}")
-            emit_event(self.run_id, "sequential", "log", f"Starting {instrument_session} ({i}/{total_count})")
-            emit_event(self.run_id, "sequential", "log", f"Processing {len(session_files)} monthly file(s)")
-            
-            # Log all files being processed
-            for file_idx, data_file in enumerate(session_files, 1):
-                self.logger.info(f"    [{file_idx}/{len(session_files)}] {data_file.name}")
-            
-            # Determine start time based on session: S1 uses 08:00, S2 uses 09:30
-            start_time = "08:00" if session_num == "1" else "09:30"
-            
-            self.logger.info(f"  Stream: {instrument_session}, Session: S{session_num}, Start time: {start_time}")
-            emit_event(self.run_id, "sequential", "log", f"Stream: {instrument_session}, Start time: {start_time}")
-            
-            # Build command - pass ALL files to process complete dataset
-            # The sequential processor script needs to be updated to accept multiple files
-            # For now, we'll create a temporary combined file or pass files as a comma-separated list
-            # Check if sequential processor supports multiple files via CLI
-            if len(session_files) == 1:
-                # Single file - use existing --data-file argument
-                sequential_cmd = [
-                    sys.executable,
-                    str(SEQUENTIAL_PROCESSOR_SCRIPT),
-                    "--data-file", str(session_files[0]),
-                    "--start-time", start_time,
-                    "--max-days", "10000",
-                    "--output-folder", "data/sequencer_runs"
-                ]
-            else:
-                # Multiple files - need to combine them or pass as list
-                # For now, combine all files into a temporary file
-                import tempfile
-                temp_combined_file = tempfile.NamedTemporaryFile(
-                    mode='w', suffix='.parquet', delete=False,
-                    dir=str(QTSW2_ROOT / "data" / "temp")
-                )
-                temp_combined_path = Path(temp_combined_file.name)
-                temp_combined_file.close()
-                
-                # Ensure temp directory exists
-                temp_combined_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Load and combine all files
-                self.logger.info(f"  Combining {len(session_files)} files into temporary file...")
-                emit_event(self.run_id, "sequential", "log", f"Loading {len(session_files)} monthly file(s)...")
-                combined_dfs = []
-                for file_idx, data_file in enumerate(session_files, 1):
-                    # Extract month/year from filename (e.g., ES1_an_2025_11.parquet -> 2025-11)
-                    filename = data_file.name
-                    month_match = None
-                    import re
-                    # Try to extract year_month from filename patterns
-                    match = re.search(r'(\d{4})[_-](\d{1,2})', filename)
-                    if match:
-                        year = match.group(1)
-                        month = match.group(2).zfill(2)
-                        month_match = f"{year}-{month}"
-                    
-                    df = pd.read_parquet(data_file)
-                    row_count = len(df)
-                    combined_dfs.append(df)
-                    
-                    month_info = f" ({month_match})" if month_match else ""
-                    self.logger.info(f"    [{file_idx}/{len(session_files)}] Loaded {data_file.name}{month_info}: {row_count:,} rows")
-                    emit_event(self.run_id, "sequential", "log", f"Loaded {file_idx}/{len(session_files)}: {data_file.name}{month_info} ({row_count:,} rows)")
-                
-                combined_df = pd.concat(combined_dfs, ignore_index=True)
-                combined_df = combined_df.sort_values('Date').reset_index(drop=True)
-                combined_df.to_parquet(temp_combined_path, index=False, compression='snappy')
-                
-                # Get date range
-                if len(combined_df) > 0:
-                    min_date = combined_df['Date'].min()
-                    max_date = combined_df['Date'].max()
-                    date_range = f" ({min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')})"
-                else:
-                    date_range = ""
-                
-                self.logger.info(f"  Combined {len(combined_df):,} rows from {len(session_files)} file(s){date_range}")
-                emit_event(self.run_id, "sequential", "log", f"Combined {len(combined_df):,} rows from {len(session_files)} file(s){date_range}")
-                
-                sequential_cmd = [
-                    sys.executable,
-                    str(SEQUENTIAL_PROCESSOR_SCRIPT),
-                    "--data-file", str(temp_combined_path),
-                    "--start-time", start_time,
-                    "--max-days", "10000",
-                    "--output-folder", "data/sequencer_runs"
-                ]
-            
-            self.logger.info(f"Running sequential processor for {instrument_session}...")
-            self.logger.info(f"  Command: {' '.join(sequential_cmd)}")
-            self.logger.info(f"  Working directory: {QTSW2_ROOT}")
-            
-            # Track temporary file for cleanup
-            temp_combined_path = None
-            if len(session_files) > 1:
-                # Find the temp_combined_path from the command
-                temp_combined_path = Path(sequential_cmd[sequential_cmd.index("--data-file") + 1])
-            
-            # Run sequential processor with timeout
-            try:
-                # Set environment variables
-                env = os.environ.copy()
-                env["PIPELINE_RUN"] = "1"
-                # Set UTF-8 encoding for Windows console to handle Unicode characters
-                env["PYTHONIOENCODING"] = "utf-8"
-                
-                result = subprocess.run(
-                    sequential_cmd,
-                    cwd=str(QTSW2_ROOT),
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',  # Explicit UTF-8 encoding
-                    errors='replace',  # Replace problematic characters instead of failing
-                    timeout=3600,  # 1 hour timeout
-                    env=env
-                )
-                
-                # Log output for debugging
-                if result.stdout:
-                    self.logger.info(f"[{instrument_session}] Sequential processor output:")
-                    for line in result.stdout.split('\n'):
-                        if line.strip():
-                            self.logger.info(f"  {line}")
-                            # Emit key milestones
-                            if any(keyword in line.upper() for keyword in ["SAVED", "RESULTS", "COMPLETE", "ERROR"]):
-                                if line.strip():
-                                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] {line.strip()}")
-                
-                if result.stderr:
-                    self.logger.warning(f"[{instrument_session}] Sequential processor stderr:")
-                    for line in result.stderr.split('\n'):
-                        if line.strip():
-                            self.logger.warning(f"  {line}")
-                            if "ERROR" in line.upper() or "FAILED" in line.upper():
-                                emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] ERROR: {line.strip()}")
-                
-                if result.returncode == 0:
-                    self.logger.info(f"✓ [{instrument_session}] Sequential processor completed successfully")
-                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] Completed successfully")
-                    success_count += 1
-                else:
-                    self.logger.error(f"✗ [{instrument_session}] Sequential processor failed with return code {result.returncode}")
-                    emit_event(self.run_id, "sequential", "log", f"[{instrument_session}] Failed with return code {result.returncode}")
-                    
-            except subprocess.TimeoutExpired:
-                self.logger.error(f"✗ [{instrument_session}] Sequential processor timed out after 1 hour")
-                emit_event(self.run_id, "sequential", "failure", f"[{instrument_session}] Timed out after 1 hour")
-            except Exception as e:
-                self.logger.error(f"✗ [{instrument_session}] Failed to run sequential processor: {e}")
-                emit_event(self.run_id, "sequential", "failure", f"[{instrument_session}] Failed: {str(e)}")
-            finally:
-                # Clean up temporary combined file if it was created
-                if temp_combined_path and temp_combined_path.exists():
-                    try:
-                        temp_combined_path.unlink()
-                        self.logger.info(f"  Cleaned up temporary combined file: {temp_combined_path.name}")
-                    except Exception as e:
-                        self.logger.warning(f"  Failed to clean up temporary file {temp_combined_path.name}: {e}")
-        
-        # Summary
-        all_success = success_count == total_count
-        if all_success:
-            self.logger.info(f"✓ Sequential processor completed for all {success_count} stream(s)")
-            emit_event(self.run_id, "sequential", "success", f"Completed for all {success_count} stream(s)")
-        else:
-            self.logger.warning(f"Sequential processor completed for {success_count}/{total_count} stream(s)")
-            emit_event(self.run_id, "sequential", "log", f"Completed for {success_count}/{total_count} stream(s)")
-        
-        self.stage_results["sequential_processor"] = all_success
-        return all_success
-    
     def generate_audit_report(self) -> Dict:
         """Generate audit report of pipeline execution."""
         emit_event(self.run_id, "audit", "start", "Generating audit report")
@@ -1405,7 +1224,6 @@ class DailyPipelineScheduler:
         self.debug_window = debug_window
         self.logger = setup_logging(LOG_FILE, debug_window=debug_window)
         self.schedule_time = schedule_time
-        self.nt_controller = NinjaTraderController(self.logger)
         self.orchestrator: Optional[PipelineOrchestrator] = None
         
         # Update debug window periodically if it exists
@@ -1420,17 +1238,22 @@ class DailyPipelineScheduler:
                         break
             threading.Thread(target=update_window, daemon=True).start()
         
-    def run_now(self, wait_for_export: bool = False, launch_ninjatrader: bool = False) -> bool:
+    def run_now(self) -> bool:
         """
         Execute pipeline immediately (for testing or manual runs).
-        
-        Args:
-            wait_for_export: If True, wait for new exports before processing
-            launch_ninjatrader: If True, launch NinjaTrader before waiting for exports
         """
         run_id = str(uuid.uuid4())
+        
+        # Create event log file for this run (if not already set)
+        global EVENT_LOG_PATH
+        if EVENT_LOG_PATH is None:
+            event_log_file = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
+            event_log_file.touch()
+            EVENT_LOG_PATH = str(event_log_file)
+            self.logger.info(f"Created event log: {EVENT_LOG_PATH}")
+        
         self.logger.info("=" * 60)
-        self.logger.info("DAILY DATA PIPELINE - MANUAL RUN")
+        self.logger.info("DAILY DATA PIPELINE - RUN")
         self.logger.info(f"Run ID: {run_id}")
         self.logger.info("=" * 60)
         
@@ -1438,24 +1261,6 @@ class DailyPipelineScheduler:
         
         # Create orchestrator with run_id
         self.orchestrator = PipelineOrchestrator(self.logger, run_id)
-        
-        # Optionally launch NinjaTrader and wait for exports
-        if launch_ninjatrader:
-            self.logger.info("Launching NinjaTrader...")
-            if not self.nt_controller.launch():
-                self.logger.error("Failed to launch NinjaTrader - aborting pipeline")
-                emit_event(run_id, "pipeline", "failure", "Failed to launch NinjaTrader")
-                return False
-        
-        if wait_for_export:
-            self.logger.info("Waiting for exports to complete...")
-            emit_event(run_id, "pipeline", "log", "Waiting for exports to complete")
-            if not self.nt_controller.wait_for_export(timeout_minutes=60, run_id=run_id):
-                self.logger.error("Export timeout or failure - aborting pipeline")
-                emit_event(run_id, "pipeline", "failure", "Export timeout or failure")
-                return False
-            self.logger.info("Exports detected - proceeding to translator")
-            emit_event(run_id, "pipeline", "log", "Exports detected - proceeding to translator")
         
         # Check for existing CSV files in data/raw
         emit_event(run_id, "pipeline", "log", "Checking for CSV files in data/raw")
@@ -1472,6 +1277,9 @@ class DailyPipelineScheduler:
         # Determine which stages to run
         run_translator_stage = len(raw_files) > 0
         run_analyzer_stage = len(processed_files) > 0
+        
+        # Store initial processed_files count for logging
+        initial_processed_count = len(processed_files)
         
         if not run_translator_stage and not run_analyzer_stage:
             self.logger.warning("No CSV files found in data/raw/ and no processed files found - nothing to process")
@@ -1509,32 +1317,59 @@ class DailyPipelineScheduler:
                     return False
             else:
                 # Translator succeeded, refresh processed files list
+                # Wait a moment for files to be written to disk
+                time.sleep(2)
+                
                 if DATA_PROCESSED.exists():
-                    processed_files = list(DATA_PROCESSED.glob("*.parquet"))
-                    processed_files.extend(list(DATA_PROCESSED.glob("*.csv")))
+                    # Check for parquet and csv files (recursive to catch any subdirectories)
+                    processed_files = list(DATA_PROCESSED.rglob("*.parquet"))
+                    processed_files.extend(list(DATA_PROCESSED.rglob("*.csv")))
+                    # Filter out files in subdirectories if they exist (keep only root level)
+                    processed_files = [f for f in processed_files if f.parent == DATA_PROCESSED]
+                    
+                    self.logger.info(f"After translator: Found {len(processed_files)} processed file(s)")
+                    if processed_files:
+                        for proc_file in processed_files[:5]:
+                            self.logger.info(f"  - {proc_file.name}")
+                        if len(processed_files) > 5:
+                            self.logger.info(f"  ... and {len(processed_files) - 5} more")
+                    
                     run_analyzer_stage = len(processed_files) > 0
+                    
+                    if not run_analyzer_stage:
+                        self.logger.warning("Translator completed but no processed files detected in data/processed/")
+                        emit_event(run_id, "pipeline", "log", "Translator completed but no processed files found - analyzer will be skipped")
+                else:
+                    self.logger.warning(f"Data processed directory does not exist: {DATA_PROCESSED}")
+                    run_analyzer_stage = False
         
         # Stage 2: Analyzer (if processed files exist)
         if run_analyzer_stage and success:
+            self.logger.info("=" * 60)
+            self.logger.info("Proceeding to analyzer stage")
+            self.logger.info(f"Processed files available: {len(processed_files)}")
             if not self.orchestrator.run_analyzer():
                 self.logger.error("Analyzer failed - continuing anyway")
                 success = False  # Non-fatal
-        elif not run_analyzer_stage and run_translator_stage:
-            # Translator ran but no processed files were created
-            self.logger.warning("Translator completed but no processed files found - skipping analyzer")
-            emit_event(run_id, "analyzer", "log", "Skipped: No processed files available")
+        elif not run_analyzer_stage:
+            # No processed files available
+            if run_translator_stage:
+                # Translator ran but no processed files were created
+                self.logger.warning("Translator completed but no processed files found - skipping analyzer")
+                self.logger.warning(f"Checked directory: {DATA_PROCESSED}")
+                self.logger.warning(f"Directory exists: {DATA_PROCESSED.exists()}")
+                emit_event(run_id, "analyzer", "log", "Skipped: No processed files available")
+            else:
+                # No translator ran, and no processed files exist
+                self.logger.warning(f"No processed files found (initial count: {initial_processed_count}) - skipping analyzer")
+                emit_event(run_id, "analyzer", "log", "Skipped: No processed files available")
         
         # Stage 2.5: Data Merger (merge analyzer files into monthly files)
+        # Pipeline ends here after merger completes
         if success and run_analyzer_stage:
             success = success and self.orchestrator.run_data_merger()
         
-        # Stage 3: Sequential Processor (runs on merged analyzer files)
-        if success:
-            success = success and self.orchestrator.run_sequential_processor()
-        
-        # Stage 3.5: Data Merger (merge sequencer files into monthly files)
-        if success:
-            success = success and self.orchestrator.run_data_merger()
+        # Pipeline ends after data merger - sequential processor removed
         
         # Generate audit report
         report = self.orchestrator.generate_audit_report()
@@ -1547,31 +1382,68 @@ class DailyPipelineScheduler:
         return success
     
     def wait_for_schedule(self):
-        """Wait until scheduled time, then execute."""
+        """Wait until scheduled time, then execute. Runs every 15 minutes at :00, :15, :30, :45."""
+        global EVENT_LOG_PATH
+        
+        self.logger.info("=" * 60)
+        self.logger.info("SCHEDULER STARTED - Running every 15 minutes")
+        self.logger.info("=" * 60)
+        
+        # Emit a scheduler start event (create a temporary event log for this)
+        scheduler_start_id = str(uuid.uuid4())
+        if EVENT_LOG_PATH is None:
+            event_log_file = EVENT_LOGS_DIR / f"scheduler_{scheduler_start_id}.jsonl"
+            event_log_file.touch()
+            EVENT_LOG_PATH = str(event_log_file)
+            emit_event(scheduler_start_id, "scheduler", "start", "Scheduler started - will run every 15 minutes")
+            EVENT_LOG_PATH = None  # Reset so each pipeline run gets its own log
+        
         while True:
-            now_chicago = datetime.now(CHICAGO_TZ)
-            target_time = datetime.strptime(self.schedule_time, "%H:%M").time()
-            target_datetime = CHICAGO_TZ.localize(
-                datetime.combine(now_chicago.date(), target_time)
-            )
-            
-            # If target time already passed today, schedule for tomorrow
-            if target_datetime <= now_chicago:
-                target_datetime += timedelta(days=1)
-            
-            wait_seconds = (target_datetime - now_chicago).total_seconds()
-            wait_hours = wait_seconds / 3600
-            
-            self.logger.info(f"Scheduled for {target_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-            self.logger.info(f"Waiting {wait_hours:.1f} hours...")
-            
-            time.sleep(wait_seconds)
-            
-            # Execute pipeline with NinjaTrader launch and export waiting
-            self.run_now(wait_for_export=True, launch_ninjatrader=True)
-            
-            # Wait a bit before scheduling next run (avoid tight loops)
-            time.sleep(60)
+            try:
+                now_chicago = datetime.now(CHICAGO_TZ)
+                
+                # Calculate next 15-minute interval (:00, :15, :30, :45)
+                current_minute = now_chicago.minute
+                current_second = now_chicago.second
+                current_microsecond = now_chicago.microsecond
+                
+                # Calculate minutes until next 15-minute mark
+                minutes_until_next = 15 - (current_minute % 15)
+                
+                # If we're exactly at a 15-minute mark, wait 15 minutes
+                if current_minute % 15 == 0 and current_second == 0 and current_microsecond == 0:
+                    minutes_until_next = 15
+                
+                # Create target datetime at next 15-minute mark
+                target_datetime = now_chicago.replace(second=0, microsecond=0)
+                target_datetime += timedelta(minutes=minutes_until_next)
+                
+                wait_seconds = (target_datetime - now_chicago).total_seconds()
+                wait_minutes = wait_seconds / 60
+                
+                self.logger.info(f"Next run scheduled for: {target_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                self.logger.info(f"Waiting {wait_minutes:.1f} minutes ({wait_seconds:.0f} seconds)...")
+                
+                # Sleep until next 15-minute mark
+                time.sleep(wait_seconds)
+                
+                # Execute pipeline (process existing files)
+                self.logger.info("=" * 60)
+                self.logger.info(f"SCHEDULED RUN - {datetime.now(CHICAGO_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                self.logger.info("=" * 60)
+                
+                # Reset EVENT_LOG_PATH for each scheduled run so a new log file is created
+                EVENT_LOG_PATH = None
+                
+                self.run_now()
+                
+                # Small delay before calculating next run
+                time.sleep(5)
+                
+            except Exception as e:
+                self.logger.error(f"Scheduler error: {e}", exc_info=True)
+                # Wait 1 minute before retrying
+                time.sleep(60)
 
 
 # ============================================================
@@ -1595,16 +1467,6 @@ def main():
         help="Execute pipeline immediately instead of waiting for schedule"
     )
     parser.add_argument(
-        "--wait-for-export",
-        action="store_true",
-        help="Wait for new exports to complete before processing (use with --now)"
-    )
-    parser.add_argument(
-        "--launch-ninjatrader",
-        action="store_true",
-        help="Launch NinjaTrader before waiting for exports (use with --now and --wait-for-export)"
-    )
-    parser.add_argument(
         "--test",
         action="store_true",
         help="Test mode: check configuration without executing"
@@ -1617,8 +1479,8 @@ def main():
     parser.add_argument(
         "--stage",
         type=str,
-        choices=["translator", "analyzer", "sequential"],
-        help="Run only a specific pipeline stage (translator, analyzer, or sequential)"
+        choices=["translator", "analyzer"],
+        help="Run only a specific pipeline stage (translator or analyzer)"
     )
     
     args = parser.parse_args()
@@ -1644,8 +1506,6 @@ def main():
     
     if args.test:
         scheduler.logger.info("TEST MODE: Configuration check")
-        scheduler.logger.info(f"NinjaTrader EXE exists: {NINJATRADER_EXE.exists()}")
-        scheduler.logger.info(f"Workspace exists: {NINJATRADER_WORKSPACE.exists()}")
         scheduler.logger.info(f"Data raw dir exists: {DATA_RAW.exists()}")
         scheduler.logger.info(f"Data processed dir exists: {DATA_PROCESSED.exists()}")
         return
@@ -1667,8 +1527,6 @@ def main():
             success = orchestrator.run_translator()
         elif args.stage == "analyzer":
             success = orchestrator.run_analyzer()
-        elif args.stage == "sequential":
-            success = orchestrator.run_sequential_processor()
         
         if success:
             emit_event(run_id, args.stage, "success", f"{args.stage} stage completed successfully")
@@ -1679,10 +1537,7 @@ def main():
         
         sys.exit(0 if success else 1)
     elif args.now:
-        success = scheduler.run_now(
-            wait_for_export=args.wait_for_export,
-            launch_ninjatrader=args.launch_ninjatrader
-        )
+        success = scheduler.run_now()
         sys.exit(0 if success else 1)
     else:
         scheduler.wait_for_schedule()

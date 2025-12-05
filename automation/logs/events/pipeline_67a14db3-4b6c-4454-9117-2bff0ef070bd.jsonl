@@ -1,0 +1,11 @@
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "pipeline", "event": "start", "timestamp": "2025-12-03T20:06:02.618476-06:00", "msg": "Pipeline run started"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "translator", "event": "start", "timestamp": "2025-12-03T20:06:02.622358-06:00", "msg": "Starting data translator stage"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T20:06:02.622792-06:00", "msg": "Files found", "data": {"raw_file_count": 6}}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "translator", "event": "metric", "timestamp": "2025-12-03T20:06:03.631062-06:00", "msg": "Translation complete", "data": {"processed_file_count": 6, "files_written_count": 0, "return_code": 0}}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "translator", "event": "success", "timestamp": "2025-12-03T20:06:03.631453-06:00", "msg": "Translator completed successfully"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "analyzer", "event": "start", "timestamp": "2025-12-03T20:06:03.633074-06:00", "msg": "Starting analyzer stage"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "analyzer", "event": "metric", "timestamp": "2025-12-03T20:06:03.633369-06:00", "msg": "Analyzer started", "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"], "processed_file_count": 6}}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "analyzer", "event": "success", "timestamp": "2025-12-03T20:06:16.666962-06:00", "msg": "Analyzer completed successfully"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "merger", "event": "start", "timestamp": "2025-12-03T20:06:16.667818-06:00", "msg": "Starting data merger"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "merger", "event": "success", "timestamp": "2025-12-03T20:06:17.676521-06:00", "msg": "Data merger completed successfully"}
+{"run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd", "stage": "pipeline", "event": "success", "timestamp": "2025-12-03T20:06:17.677431-06:00", "msg": "Pipeline complete - success"}

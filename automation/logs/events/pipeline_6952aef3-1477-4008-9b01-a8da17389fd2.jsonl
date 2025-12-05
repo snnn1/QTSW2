@@ -1,0 +1,10 @@
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "start", "msg": "Starting parallel analyzer for 6 instrument(s)", "timestamp": 1764802903.3531132, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "Processing 6 instrument(s) in parallel: ES, NQ, YM, CL, NG, GC", "timestamp": 1764802903.3538084, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "metric", "msg": "Parallel analyzer started", "timestamp": 1764802903.3542378, "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"], "max_workers": 6}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[NQ] \u2713 Completed: Completed in 117.5s", "timestamp": 1764803020.9937038, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[GC] \u2713 Completed: Completed in 127.6s", "timestamp": 1764803031.0962462, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[ES] \u2713 Completed: Completed in 129.9s", "timestamp": 1764803033.4003084, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[NG] \u2713 Completed: Completed in 137.8s", "timestamp": 1764803041.274271, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[YM] \u2713 Completed: Completed in 141.2s", "timestamp": 1764803044.683142, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "log", "msg": "[CL] \u2713 Completed: Completed in 154.8s", "timestamp": 1764803058.292484, "data": {}}
+{"run_id": "6952aef3-1477-4008-9b01-a8da17389fd2", "stage": "analyzer", "event": "success", "msg": "All 6 instruments completed successfully in 2.6 minutes", "timestamp": 1764803058.308669, "data": {"total_time_minutes": 2.5825555602709453, "successful": 6, "failed": 0}}

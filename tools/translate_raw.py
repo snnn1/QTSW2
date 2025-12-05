@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Optional
 import argparse
 
+# Add QTSW2 root to Python path so we can import translator module
+QTSW2_ROOT = Path(__file__).resolve().parent.parent
+if str(QTSW2_ROOT) not in sys.path:
+    sys.path.insert(0, str(QTSW2_ROOT))
+
 # Import from translator module to avoid duplication
 from translator import root_symbol, infer_contract_from_filename, load_single_file as translator_load_single_file, detect_file_format
 

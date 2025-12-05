@@ -22,38 +22,32 @@ if not exist "%MASTER_MATRIX_LOG%" (
     echo [%date% %time%] Log file created by RUN_MASTER_MATRIX.bat > "%MASTER_MATRIX_LOG%"
 )
 
-echo [1/4] Starting backend...
+echo [1/3] Starting backend...
 cd /d "%PROJECT_ROOT%\dashboard\backend"
-start "Master Matrix Backend" cmd /k "python -u main.py"
+start /b "" python -u main.py
 cd /d "%PROJECT_ROOT%"
 timeout /t 3 /nobreak >nul
 
-echo [2/4] Starting frontend...
-cd /d "%PROJECT_ROOT%\matrix_timetable_app\frontend"
-start "Master Matrix Frontend" cmd /k "npm run dev"
-cd /d "%PROJECT_ROOT%"
-timeout /t 5 /nobreak >nul
-
-echo [3/4] Opening browser...
+echo [2/3] Opening browser...
 timeout /t 2 /nobreak >nul
 start http://localhost:5174
 
-echo [4/4] Opening debug log viewer...
-cd /d "%PROJECT_ROOT%\batch"
-start "Master Matrix Debug Log" cmd /k "VIEW_MASTER_MATRIX_DEBUG.bat"
-cd /d "%PROJECT_ROOT%"
+echo [3/3] Starting frontend...
+echo Frontend will run in this window...
+echo.
 
 echo.
 echo ================================================
 echo Master Matrix is ready!
 echo.
-echo Backend:  http://localhost:8000
-echo Frontend: http://localhost:5174
+echo Backend:  http://localhost:8000 (running in background)
+echo Frontend: http://localhost:5174 (output shown below)
 echo.
 echo Browser should open automatically.
-echo Debug log viewer opened in separate window.
 echo.
-echo Press any key to close this window...
-echo (Backend and frontend will keep running)
+echo Press Ctrl+C to stop frontend (backend will keep running).
 echo ================================================
-pause >nul
+echo.
+
+cd /d "%PROJECT_ROOT%\matrix_timetable_app\frontend"
+npm run dev

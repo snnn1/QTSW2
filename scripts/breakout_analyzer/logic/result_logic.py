@@ -31,7 +31,9 @@ class ResultProcessor:
     
     def create_result_row(self, date: pd.Timestamp, time_label: str, target: float, 
                          peak: float, direction: str, result: str, range_sz: float, 
-                         stream: str, instrument: str, session: str, profit: float) -> Dict[str, object]:
+                         stream: str, instrument: str, session: str, profit: float,
+                         entry_time: Optional[pd.Timestamp] = None,
+                         exit_time: Optional[pd.Timestamp] = None) -> Dict[str, object]:
         """
         Create a result row dictionary
         
@@ -47,15 +49,34 @@ class ResultProcessor:
             instrument: Trading instrument
             session: Trading session
             profit: Profit amount
+            entry_time: Entry timestamp (optional)
+            exit_time: Exit timestamp (optional)
             
         Returns:
             Dictionary representing the result row
         """
         from breakout_core.utils import hhmm_to_sort_int
         
+        # Format EntryTime and ExitTime as DD/MM/YY HH:MM strings
+        entry_time_str = ""
+        if entry_time is not None:
+            if isinstance(entry_time, pd.Timestamp):
+                entry_time_str = entry_time.strftime("%d/%m/%y %H:%M")
+            else:
+                entry_time_str = str(entry_time)
+        
+        exit_time_str = ""
+        if exit_time is not None:
+            if isinstance(exit_time, pd.Timestamp):
+                exit_time_str = exit_time.strftime("%d/%m/%y %H:%M")
+            else:
+                exit_time_str = str(exit_time)
+        
         row = {
             "Date": date.date().isoformat(),
             "Time": time_label,
+            "EntryTime": entry_time_str,
+            "ExitTime": exit_time_str,
             "Target": target,
             "Peak": peak,
             "Direction": direction,
@@ -80,8 +101,8 @@ class ResultProcessor:
         Returns:
             Processed DataFrame sorted by Date and Time (earliest first)
         """
-        # Define base columns (always present)
-        base_columns = ["Date","Time","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","_sortTime"]
+        # Define base columns (always present) - EntryTime and ExitTime after Time to match expected schema
+        base_columns = ["Date","Time","EntryTime","ExitTime","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","_sortTime"]
         
         if rows:
             # Create DataFrame

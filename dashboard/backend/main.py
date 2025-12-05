@@ -11,7 +11,8 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Optional, Dict, List
-from datetime import datetime
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 import uuid
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -26,6 +27,7 @@ import numpy as np
 QTSW2_ROOT = Path(__file__).parent.parent.parent
 SCHEDULER_SCRIPT = QTSW2_ROOT / "automation" / "daily_data_pipeline_scheduler.py"
 DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
+PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,49 +44,97 @@ TIMETABLE_MODULE = QTSW2_ROOT / "timetable_engine" / "timetable_engine.py"
 # Schedule config file
 SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "automation" / "schedule_config.json"
 
-app = FastAPI(title="Pipeline Dashboard API")
+# Global variable to track scheduler process (legacy)
+scheduler_process: Optional[subprocess.Popen] = None
 
-# Configure logging to reduce verbosity for routine polling
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Global orchestrator instance
+orchestrator_instance = None
 
-# Configure logging to also write to log file
-LOG_FILE_PATH = QTSW2_ROOT / "logs" / "backend_debug.log"
-LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Create a file handler for the log file
-file_handler = logging.FileHandler(LOG_FILE_PATH, mode='a', encoding='utf-8')
-file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(file_formatter)
-
-# Add file handler to root logger
-root_logger = logging.getLogger()
-root_logger.addHandler(file_handler)
-root_logger.setLevel(logging.INFO)
-
-# Log startup message
-import sys
-startup_msg = "=" * 80 + "\nMaster Matrix Backend Starting...\n" + "=" * 80 + "\n"
-print(startup_msg, file=sys.stderr)
-sys.stderr.flush()
-# Also write directly to log file
-with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
-    f.write(startup_msg)
-    f.flush()
-
-# Startup event handler - this runs when FastAPI starts
-@app.on_event("startup")
-async def startup_event():
-    import sys
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for startup and shutdown."""
+    global scheduler_process, orchestrator_instance
     logger = logging.getLogger(__name__)
-    startup_msg2 = "=" * 80 + "\nFastAPI application started - ready to receive requests\n" + "=" * 80 + "\n"
-    print(startup_msg2, file=sys.stderr)
-    sys.stderr.flush()
-    # Also write directly to log file
-    with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
-        f.write(startup_msg2)
-        f.flush()
-    logger.info("FastAPI application started - ready to receive requests")
+    logger.info("Pipeline Dashboard API started")
+    
+    # Initialize orchestrator
+    print("\n" + "=" * 60)
+    print("INITIALIZING ORCHESTRATOR")
+    print("=" * 60)
+    try:
+        print("Step 1: Importing orchestrator...")
+        logger.info("Initializing Pipeline Orchestrator...")
+        try:
+            from .orchestrator import PipelineOrchestrator, OrchestratorConfig
+        except ImportError:
+            from orchestrator import PipelineOrchestrator, OrchestratorConfig
+        print("   [OK] Imported")
+        
+        print("Step 2: Creating config...")
+        logger.info("Creating orchestrator config...")
+        config = OrchestratorConfig.from_environment(qtsw2_root=QTSW2_ROOT)
+        logger.info(f"Config created: event_logs_dir={config.event_logs_dir}")
+        print(f"   [OK] Config created: {config.event_logs_dir}")
+        
+        print("Step 3: Creating orchestrator instance...")
+        logger.info("Creating orchestrator instance...")
+        orchestrator_instance = PipelineOrchestrator(
+            config=config,
+            schedule_config_path=SCHEDULE_CONFIG_FILE,
+            logger=logger
+        )
+        logger.info("Orchestrator instance created")
+        print("   [OK] Instance created")
+        
+        print("Step 4: Starting orchestrator...")
+        logger.info("Starting orchestrator (scheduler and watchdog)...")
+        await orchestrator_instance.start()
+        logger.info("Pipeline Orchestrator started successfully")
+        print("   [OK] Orchestrator started successfully!")
+        print("=" * 60 + "\n")
+    except Exception as e:
+        import traceback
+        error_msg = f"Failed to start orchestrator: {e}\nFull traceback:\n{traceback.format_exc()}"
+        logger.error(error_msg, exc_info=True)
+        # Print to console for immediate visibility
+        print("\n" + "=" * 60)
+        print("[ERROR] Orchestrator failed to start!")
+        print("=" * 60)
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error message: {str(e)}")
+        print("\nFull traceback:")
+        traceback.print_exc()
+        print("=" * 60 + "\n")
+        orchestrator_instance = None
+    
+    # Legacy: Auto-start old scheduler (can be removed later)
+    try:
+        schedule_config = load_schedule_config()
+        schedule_time = schedule_config.schedule_time
+        logger.info(f"Auto-starting legacy scheduler with schedule time: {schedule_time}")
+        
+        env = os.environ.copy()
+        cmd = ["python", str(SCHEDULER_SCRIPT), "--schedule", schedule_time, "--no-debug-window"]
+        
+        global scheduler_process
+        scheduler_process = subprocess.Popen(
+            cmd,
+            cwd=str(QTSW2_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        logger.info(f"Legacy scheduler started (PID: {scheduler_process.pid}, schedule: {schedule_time})")
+        
+        # Set scheduler process in schedule router
+        try:
+            from .routers import schedule
+        except ImportError:
+            from routers import schedule
+        schedule.set_scheduler_process(scheduler_process)
+    except Exception as e:
+        logger.warning(f"Legacy scheduler auto-start failed: {e}")
     
     # Create master matrix debug log file on startup
     master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
@@ -96,6 +146,61 @@ async def startup_event():
             f.flush()
     except:
         pass
+    
+    yield  # Application runs here
+    
+    # Shutdown
+    logger = logging.getLogger(__name__)
+    
+    # Stop orchestrator
+    if orchestrator_instance:
+        try:
+            logger.info("Stopping Pipeline Orchestrator...")
+            await orchestrator_instance.stop()
+            logger.info("Pipeline Orchestrator stopped")
+        except Exception as e:
+            logger.error(f"Error stopping orchestrator: {e}")
+    
+    # Stop legacy scheduler
+    if scheduler_process:
+        try:
+            logger.info("Stopping legacy scheduler process...")
+            scheduler_process.terminate()
+            scheduler_process.wait(timeout=5)
+            logger.info("Legacy scheduler stopped")
+        except Exception as e:
+            logger.error(f"Error stopping legacy scheduler: {e}")
+            if scheduler_process:
+                scheduler_process.kill()
+
+
+app = FastAPI(title="Pipeline Dashboard API", lifespan=lifespan)
+
+# Configure logging - DEBUG mode for troubleshooting
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+logging.getLogger("uvicorn.error").setLevel(logging.DEBUG)
+logging.getLogger("dashboard").setLevel(logging.DEBUG)
+logging.getLogger("orchestrator").setLevel(logging.DEBUG)
+
+# Configure logging to also write to log file
+LOG_FILE_PATH = QTSW2_ROOT / "logs" / "backend_debug.log"
+LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Create a file handler for the log file
+file_handler = logging.FileHandler(LOG_FILE_PATH, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.DEBUG)  # Changed to DEBUG to catch more
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Add file handler to root logger
+root_logger = logging.getLogger()
+# Don't add if already added (reload issue)
+if not any(isinstance(h, logging.FileHandler) and h.baseFilename == str(LOG_FILE_PATH) for h in root_logger.handlers):
+    root_logger.addHandler(file_handler)
+root_logger.setLevel(logging.DEBUG)  # Changed to DEBUG
+
+# Startup message written to log file only
+
 
 # CORS middleware for React frontend
 app.add_middleware(
@@ -105,6 +210,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Import and include routers
+try:
+    from .routers import pipeline, schedule, websocket, apps, metrics, matrix
+except ImportError:
+    # Fallback for when running as script (not as module)
+    from routers import pipeline, schedule, websocket, apps, metrics, matrix
+
+app.include_router(pipeline.router)
+app.include_router(schedule.router)
+app.include_router(websocket.router)
+app.include_router(apps.router)
+app.include_router(metrics.router)
+app.include_router(matrix.router)
+
+# Set scheduler process in schedule router after it's created
+def set_scheduler_process_for_router():
+    """Set scheduler process in schedule router."""
+    schedule.set_scheduler_process(scheduler_process)
 
 
 # ============================================================
@@ -119,6 +243,11 @@ class PipelineStartResponse(BaseModel):
     run_id: str
     event_log_path: str
     status: str
+
+
+class PipelineStartRequest(BaseModel):
+    wait_for_export: bool = False
+    launch_ninjatrader: bool = False
 
 
 # ============================================================
@@ -147,6 +276,15 @@ def save_schedule_config(config: ScheduleConfig):
 @app.get("/")
 async def root():
     return {"message": "Pipeline Dashboard API", "status": "running", "test_endpoint": "/api/test-debug-log"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "service": "Pipeline Dashboard API"
+    }
 
 @app.get("/api/matrix/test")
 async def test_matrix_endpoint():
@@ -186,30 +324,195 @@ async def get_schedule():
 @app.post("/api/schedule", response_model=ScheduleConfig)
 async def update_schedule(config: ScheduleConfig):
     """Update scheduled daily run time."""
+    logger = logging.getLogger(__name__)
     # Validate time format
     try:
         datetime.strptime(config.schedule_time, "%H:%M")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid time format. Use HH:MM (24-hour)")
+        logger.warning(f"Invalid schedule time format received: {config.schedule_time}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid time format. Please use HH:MM format (24-hour, e.g., '07:30')"
+        )
     
-    save_schedule_config(config)
-    return config
+    # Validate time range (00:00 to 23:59)
+    try:
+        hour, minute = map(int, config.schedule_time.split(':'))
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError("Time out of range")
+    except (ValueError, AttributeError):
+        logger.warning(f"Invalid schedule time values: {config.schedule_time}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid time. Hours must be 0-23, minutes must be 0-59."
+        )
+    
+    try:
+        save_schedule_config(config)
+        logger.info(f"Schedule updated to: {config.schedule_time}")
+        return config
+    except Exception as e:
+        logger.error(f"Failed to save schedule config: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save schedule. Please check logs for details."
+        )
+
+
+@app.post("/api/scheduler/start")
+async def start_scheduler():
+    """Start the scheduler process."""
+    global scheduler_process
+    logger = logging.getLogger(__name__)
+    
+    # Check if already running
+    if scheduler_process is not None and scheduler_process.poll() is None:
+        return {
+            "running": True,
+            "status": "already_running",
+            "pid": scheduler_process.pid,
+            "message": "Scheduler is already running"
+        }
+    
+    # Load schedule config to get the scheduled time
+    try:
+        schedule_config = load_schedule_config()
+        schedule_time = schedule_config.schedule_time
+    except Exception as e:
+        logger.warning(f"Could not load schedule config, using default 07:30: {e}")
+        schedule_time = "07:30"
+    
+    # Start scheduler process
+    try:
+        env = os.environ.copy()
+        cmd = ["python", str(SCHEDULER_SCRIPT), "--schedule", schedule_time, "--no-debug-window"]
+        
+        scheduler_process = subprocess.Popen(
+            cmd,
+            cwd=str(QTSW2_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        logger.info(f"Scheduler started with PID {scheduler_process.pid}, schedule time: {schedule_time}")
+        return {
+            "running": True,
+            "status": "started",
+            "pid": scheduler_process.pid,
+            "schedule_time": schedule_time,
+            "message": f"Scheduler started (runs at {schedule_time} CT)"
+        }
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start scheduler: {str(e)}"
+        )
+
+
+@app.get("/api/scheduler/status")
+async def get_scheduler_status():
+    """Get scheduler process status."""
+    global scheduler_process
+    if scheduler_process is None:
+        return {
+            "running": False,
+            "status": "not_started",
+            "message": "Scheduler process not started"
+        }
+    
+    # Check if process is still running
+    if scheduler_process.poll() is None:
+        return {
+            "running": True,
+            "status": "running",
+            "pid": scheduler_process.pid,
+            "message": "Scheduler is running (runs every 15 minutes at :00, :15, :30, :45)"
+        }
+    else:
+        return {
+            "running": False,
+            "status": "stopped",
+            "returncode": scheduler_process.returncode,
+            "message": f"Scheduler process stopped (exit code: {scheduler_process.returncode})"
+        }
+
+
+@app.get("/api/schedule/next")
+async def get_next_scheduled_run():
+    """Get next scheduled run time (runs every 15 minutes)."""
+    try:
+        import pytz
+        chicago_tz = pytz.timezone("America/Chicago")
+        now_chicago = datetime.now(chicago_tz)
+        
+        # Calculate next 15-minute interval (:00, :15, :30, :45)
+        current_minute = now_chicago.minute
+        current_second = now_chicago.second
+        current_microsecond = now_chicago.microsecond
+        
+        # Check if we're exactly at a 15-minute mark
+        is_at_15min_mark = (current_minute % 15 == 0) and current_second == 0 and current_microsecond == 0
+        
+        if is_at_15min_mark:
+            # Already at :00, :15, :30, or :45, wait 15 minutes for next interval
+            minutes_to_add = 15
+        else:
+            # Calculate minutes until next 15-minute mark
+            minutes_to_add = 15 - (current_minute % 15)
+        
+        next_run = now_chicago + timedelta(minutes=minutes_to_add)
+        # Round down seconds and microseconds to get exact :00, :15, :30, or :45
+        next_run = next_run.replace(second=0, microsecond=0)
+        
+        wait_seconds = (next_run - now_chicago).total_seconds()
+        wait_minutes = wait_seconds / 60
+        wait_minutes_int = int(wait_seconds // 60)
+        wait_seconds_remaining = int(wait_seconds % 60)
+        
+        return {
+            "next_run_time": next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "next_run_time_short": next_run.strftime("%H:%M"),
+            "wait_minutes": round(wait_minutes, 1),
+            "wait_seconds": int(wait_seconds),
+            "wait_minutes_int": wait_minutes_int,
+            "wait_seconds_remaining": wait_seconds_remaining,
+            "wait_display": f"{wait_minutes_int} min {wait_seconds_remaining} sec",
+            "interval": "15 minutes",
+            "runs_all_day": True
+        }
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Error calculating next run time: {e}")
+        return {
+            "error": str(e),
+            "interval": "15 minutes",
+            "runs_all_day": True
+        }
 
 
 @app.post("/api/pipeline/start", response_model=PipelineStartResponse)
-async def start_pipeline(wait_for_export: bool = False, launch_ninjatrader: bool = False):
+async def start_pipeline(request: PipelineStartRequest = PipelineStartRequest()):
     """
     Start a pipeline run immediately.
     
     Args:
-        wait_for_export: If True, wait for new exports before processing (default: False)
-        launch_ninjatrader: If True, launch NinjaTrader before waiting for exports (default: False)
+        request: Pipeline start request with optional parameters
     """
+    logger = logging.getLogger(__name__)
     run_id = str(uuid.uuid4())
     event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
     
     # Create empty event log file
-    event_log_path.touch()
+    try:
+        event_log_path.touch()
+    except Exception as e:
+        logger.error(f"Failed to create event log file: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create event log file. Please check file permissions."
+        )
     
     # Launch pipeline as separate process
     env = os.environ.copy()
@@ -217,9 +520,9 @@ async def start_pipeline(wait_for_export: bool = False, launch_ninjatrader: bool
     
     # Build command arguments
     cmd = ["python", str(SCHEDULER_SCRIPT), "--now", "--no-debug-window"]
-    if wait_for_export:
+    if request.wait_for_export:
         cmd.append("--wait-for-export")
-    if launch_ninjatrader:
+    if request.launch_ninjatrader:
         cmd.append("--launch-ninjatrader")
     
     try:
@@ -231,13 +534,24 @@ async def start_pipeline(wait_for_export: bool = False, launch_ninjatrader: bool
             stderr=subprocess.PIPE
         )
         
+        logger.info(f"Pipeline started with run_id: {run_id}")
         return PipelineStartResponse(
             run_id=run_id,
             event_log_path=str(event_log_path),
             status="started"
         )
+    except FileNotFoundError as e:
+        logger.error(f"Pipeline script not found: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Pipeline script not found. Please check installation."
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start pipeline: {str(e)}")
+        logger.error(f"Failed to start pipeline: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to start pipeline. Please check logs for details."
+        )
 
 
 @app.post("/api/pipeline/stage/{stage_name}", response_model=PipelineStartResponse)
@@ -398,7 +712,7 @@ async def get_pipeline_status():
                     "timestamp": last_event.get("timestamp")
                 }
     except Exception as e:
-        print(f"Error reading pipeline status: {e}")
+        logger.debug(f"Error reading pipeline status: {e}")
         pass
     
     return {"active": False}
@@ -633,117 +947,8 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@app.websocket("/ws/events")
-async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
-    """WebSocket endpoint for real-time event streaming."""
-    try:
-        await manager.connect(websocket)
-        print(f"WebSocket connected. run_id: {run_id}")
-        
-        # Send initial connection confirmation
-        try:
-            await websocket.send_json({
-                "type": "connected",
-                "run_id": run_id,
-                "timestamp": datetime.now().isoformat()
-            })
-        except Exception as e:
-            print(f"Error sending initial message: {e}")
-            manager.disconnect(websocket)
-            return
-        
-        # If run_id provided, start tailing that log
-        if run_id:
-            event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-            print(f"Starting to tail event log: {event_log_path}")
-            print(f"Event log exists: {event_log_path.exists()}")
-            try:
-                manager.start_tailing(str(event_log_path))
-            except Exception as e:
-                print(f"Error starting tailing: {e}")
-                import traceback
-                traceback.print_exc()
-                # Don't disconnect - continue with connection
-    except Exception as e:
-        print(f"Error in WebSocket connection setup: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            manager.disconnect(websocket)
-        except:
-            pass
-        return
-    
-    # Keep connection alive
-    try:
-        while True:
-            try:
-                # Check if websocket is still in active connections
-                if websocket not in manager.active_connections:
-                    print("WebSocket no longer in active connections, breaking")
-                    break
-                    
-                # Wait for client messages (ping/pong or requests)
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)  # Increased timeout
-                # Echo back or handle commands
-                if data == "ping":
-                    try:
-                        await websocket.send_json({"type": "pong"})
-                    except Exception as e:
-                        print(f"Error sending pong: {e}")
-                        break
-            except asyncio.TimeoutError:
-                # Send keepalive to prevent connection timeout
-                try:
-                    if websocket in manager.active_connections:
-                        await websocket.send_json({"type": "keepalive", "timestamp": datetime.now().isoformat()})
-                except Exception as e:
-                    error_msg = str(e)
-                    # If connection is closed, break the loop
-                    if "websocket.close" in error_msg.lower() or "response already completed" in error_msg.lower():
-                        print("WebSocket closed during keepalive")
-                        break
-                    print(f"Error sending keepalive: {e}")
-                    # Don't break on keepalive errors - connection might still be valid
-            except WebSocketDisconnect:
-                print("WebSocket disconnect detected in receive loop")
-                break
-            except Exception as e:
-                print(f"Unexpected error in WebSocket loop: {e}")
-                import traceback
-                traceback.print_exc()
-                break
-                
-    except WebSocketDisconnect:
-        print("WebSocket disconnected normally")
-        manager.disconnect(websocket)
-        # Stop tailing when connection closes
-        if run_id:
-            event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-            if str(event_log_path) in manager.tail_tasks:
-                task = manager.tail_tasks.pop(str(event_log_path))
-                task.cancel()
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-        import traceback
-        traceback.print_exc()
-        try:
-            manager.disconnect(websocket)
-            # Stop tailing on error
-            if run_id:
-                event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-                if str(event_log_path) in manager.tail_tasks:
-                    task = manager.tail_tasks.pop(str(event_log_path))
-                    task.cancel()
-        except:
-            pass
-
-
-@app.websocket("/ws/events/{run_id}")
-async def websocket_events_by_run(websocket: WebSocket, run_id: str):
-    """WebSocket endpoint for specific run ID."""
-    print(f"WebSocket connection request for run_id: {run_id}")
-    await websocket_events(websocket, run_id=run_id)
+# WebSocket endpoints are now handled by routers/websocket.py (orchestrator-based)
+# Old file-tailing WebSocket endpoints removed - using EventBus instead
 
 
 # ============================================================

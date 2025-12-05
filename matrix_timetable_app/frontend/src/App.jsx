@@ -2,16 +2,26 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { List } from 'react-window'
 import './App.css'
 import { useMatrixWorker } from './useMatrixWorker'
+import { STREAMS, DAYS_OF_WEEK, AVAILABLE_TIMES, ANALYZER_COLUMN_ORDER, DEFAULT_COLUMNS } from './utils/constants'
+import { getDefaultFilters, loadAllFilters, saveAllFilters, getStreamFiltersFromStorage } from './utils/filterUtils'
+// Use existing utility files instead of duplicating code
+import { 
+  getContractValue, 
+  parseDateValue,
+  calculateTimeProfit,
+  calculateDailyProfit,
+  calculateDOMProfit,
+  calculateDateProfit,
+  calculateMonthlyProfit,
+  calculateYearlyProfit
+} from './utils/profitCalculations'
+import { calculateStats as calculateStatsUtil } from './utils/statsCalculations'
+// Use existing hooks
+import { useMatrixFilters } from './hooks/useMatrixFilters'
+import { useMatrixData } from './hooks/useMatrixData'
+import { useColumnSelection } from './hooks/useColumnSelection'
 
 const API_BASE = 'http://localhost:8000/api'
-
-const STREAMS = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2']
-const DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-const AVAILABLE_TIMES = ['07:30', '08:00', '09:00', '09:30', '10:00', '10:30', '11:00']
-// Analyzer column order (single source of truth)
-const ANALYZER_COLUMN_ORDER = ['TradeID', 'Date', 'Time', 'EntryTime', 'ExitTime', 'Instrument', 'Stream', 'Session', 'Direction', 'EntryPrice', 'ExitPrice', 'Target', 'Range', 'SL', 'Peak', 'Result', 'Profit']
-// Default columns for all streams (exact structure as specified)
-const DEFAULT_COLUMNS = ['Date', 'DOW', 'Time', 'EntryTime', 'ExitTime', 'Instrument', 'Stream', 'Session', 'Direction', 'Target', 'Range', 'SL', 'Peak', 'Result', 'Profit', 'Time Change', 'Profit ($)']
 
 function App() {
   // Error boundary - catch any initialization errors
@@ -32,6 +42,7 @@ function App() {
 function AppContent() {
   const [activeTab, setActiveTab] = useState('timetable') // 'timetable', 'master', or stream ID
   const [currentTime, setCurrentTime] = useState(new Date())
+  const [lastMergeTime, setLastMergeTime] = useState(null)
   
   // Web Worker for all heavy computations
   const {
@@ -56,17 +67,18 @@ function AppContent() {
     calculateTimetable: workerCalculateTimetable
   } = useMatrixWorker()
   
-  // Master matrix data (raw data from API - will be sent to worker)
+  // Use existing hooks for filter state management
+  const {
+    streamFilters,
+    setStreamFilters,
+    getFiltersForStream
+  } = useMatrixFilters()
+  
+  // Keep local state for complex logic (loadMasterMatrix, toggleColumn, etc. have complex implementations)
   const [masterData, setMasterData] = useState([])
   const [masterLoading, setMasterLoading] = useState(false)
   const [masterError, setMasterError] = useState(null)
   const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
-  
-  // Filtered data indices (from worker mask)
-  const [filteredIndices, setFilteredIndices] = useState([])
-  
-  // Available columns (detected from data)
-  const [availableColumns, setAvailableColumns] = useState([])
   
   // Per-stream selected columns (persisted in localStorage)
   const [selectedColumns, setSelectedColumns] = useState(() => {
@@ -83,6 +95,12 @@ function AppContent() {
   
   // Column selector visibility
   const [showColumnSelector, setShowColumnSelector] = useState(false)
+  
+  // Filtered data indices (from worker mask)
+  const [filteredIndices, setFilteredIndices] = useState([])
+  
+  // Available columns (detected from data)
+  const [availableColumns, setAvailableColumns] = useState([])
   
   // Stats visibility per stream
   const [showStats, setShowStats] = useState(() => {
@@ -109,65 +127,6 @@ function AppContent() {
     return saved ? parseFloat(saved) || 1 : 1
   })
   
-  // Default filter structure for any stream
-  const getDefaultFilters = () => ({
-    exclude_days_of_week: [],
-    exclude_days_of_month: [],
-    exclude_times: [],
-    include_years: []
-  })
-
-  // Filter persistence utility
-  const FILTER_STORAGE_KEY = 'matrix_stream_filters'
-  
-  // Load all filters from localStorage on startup
-  const loadAllFilters = () => {
-    try {
-      const saved = localStorage.getItem(FILTER_STORAGE_KEY)
-      if (saved) {
-        const parsed = JSON.parse(saved)
-        // Validate structure - ensure all entries have the correct shape
-        const validated = {}
-        Object.keys(parsed).forEach(streamId => {
-          const filters = parsed[streamId]
-          validated[streamId] = {
-            exclude_days_of_week: Array.isArray(filters.exclude_days_of_week) ? filters.exclude_days_of_week : [],
-            exclude_days_of_month: Array.isArray(filters.exclude_days_of_month) ? filters.exclude_days_of_month : [],
-            exclude_times: Array.isArray(filters.exclude_times) ? filters.exclude_times : [],
-            include_years: Array.isArray(filters.include_years) ? filters.include_years : []
-          }
-        })
-        return validated
-      }
-    } catch (error) {
-      console.error('Error loading filters from localStorage:', error)
-    }
-    return {}
-  }
-
-  // Save all filters to localStorage
-  const saveAllFilters = (filters) => {
-    try {
-      localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(filters))
-    } catch (error) {
-      console.error('Error saving filters to localStorage:', error)
-    }
-  }
-
-  // Get filters for a specific stream (with defaults if not exists)
-  const getStreamFiltersFromStorage = (allFilters, streamId) => {
-    if (allFilters[streamId]) {
-      return {
-        ...getDefaultFilters(),
-        ...allFilters[streamId]
-      }
-    }
-    return getDefaultFilters()
-  }
-
-  // Initialize filters from localStorage
-  const [streamFilters, setStreamFilters] = useState(() => loadAllFilters())
-  
   // Infinite scroll
   const [visibleRows, setVisibleRows] = useState(100)
   const observerRef = useRef(null)
@@ -182,6 +141,202 @@ function AppContent() {
     if (node) observerRef.current.observe(node)
   }, [masterLoading])
   
+  // Load master matrix function - defined early so it can be used in useEffect
+  const loadMasterMatrix = useCallback(async (rebuild = false, rebuildStream = null) => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    try {
+      // Check if backend is reachable
+      try {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 3000)
+        const healthCheck = await fetch(`${API_BASE.replace('/api', '')}/`, { 
+          method: 'GET', 
+          signal: controller.signal 
+        })
+        clearTimeout(timeoutId)
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          setMasterError('Backend connection timeout. Make sure the dashboard backend is running on http://localhost:8000')
+        } else {
+          setMasterError('Backend not running. Please start the dashboard backend on port 8000. Error: ' + e.message)
+        }
+        setMasterData([])
+        setMasterLoading(false)
+        return
+      }
+      
+      // If rebuild requested, build matrix first
+      if (rebuild) {
+        // Build stream filters for API
+        const streamFiltersApi = {}
+        Object.keys(streamFilters).forEach(streamId => {
+          const filters = streamFilters[streamId]
+          if (filters) {
+            streamFiltersApi[streamId] = {
+              exclude_days_of_week: filters.exclude_days_of_week || [],
+              exclude_days_of_month: filters.exclude_days_of_month || [],
+              exclude_times: filters.exclude_times || []
+            }
+          }
+        })
+        
+        const visibleYearsSet = new Set()
+        Object.keys(streamFilters).forEach(id => {
+          const f = streamFilters[id]
+          if (f && Array.isArray(f.include_years)) {
+            f.include_years.forEach(y => {
+              const num = parseInt(y)
+              if (!isNaN(num)) {
+                visibleYearsSet.add(num)
+              }
+            })
+          }
+        })
+        const visibleYears = Array.from(visibleYearsSet).sort((a, b) => a - b)
+        
+        const buildBody = {
+          stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
+        }
+        if (visibleYears.length > 0) {
+          buildBody.visible_years = visibleYears
+        }
+        buildBody.warmup_months = 1
+        if (rebuildStream) {
+          buildBody.streams = [rebuildStream]
+        }
+        
+        try {
+          const buildResponse = await fetch(`${API_BASE}/matrix/build`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(buildBody)
+          })
+          
+          if (!buildResponse.ok) {
+            const errorData = await buildResponse.json()
+            setMasterError(errorData.detail || 'Failed to build master matrix')
+            setMasterLoading(false)
+            return
+          }
+          
+          await buildResponse.json()
+        } catch (error) {
+          setMasterError(`Failed to build master matrix: ${error.message}`)
+          setMasterLoading(false)
+          return
+        }
+      }
+      
+      // Load the matrix data
+      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=50000`)
+      
+      if (!dataResponse.ok) {
+        const errorData = await dataResponse.json()
+        setMasterError(errorData.detail || 'Failed to load matrix data')
+        setMasterData([])
+        setMasterLoading(false)
+        return
+      }
+      
+      const data = await dataResponse.json()
+      const trades = data.data || []
+      
+      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
+        setAvailableYearsFromAPI(data.years)
+      }
+      
+      if (trades.length > 0) {
+        setMasterData(trades)
+        setLastMergeTime(new Date()) // Track when merge data was received
+        
+        if (trades.length > 0) {
+          workerInitData(trades)
+        }
+        
+        if (availableColumns.length === 0) {
+          const cols = Object.keys(trades[0])
+          const hiddenColumns = [
+            'global_trade_id', 'filter_reasons', 'onr_high', 'onr_low', 'onr',
+            'scf_s1', 'scf_s2', 'prewindow_high_s1', 'prewindow_low_s1', 'prewindow_range_s1',
+            'session_high_s1', 'session_low_s1', 'session_range_s1', 'prewindow_high_s2',
+            'prewindow_low_s2', 'prewindow_range_s2', 'session_high_s2', 'session_low_s2',
+            'session_range_s2', 'onr_q1', 'onr_q2', 'onr_q3', 'onr_bucket', 'entry_time',
+            'exit_time', 'entry_price', 'exit_price', 'R', 'pnl', 'rs_value', 'selected_time',
+            'time_bucket', 'trade_date', 'day_of_month', 'dow', 'dow_full', 'month',
+            'session_index', 'is_two_stream', 'dom_blocked', 'final_allowed'
+          ]
+          const displayableCols = cols.filter(col => {
+            if (col.includes(' Points') || col.includes(' Rolling')) {
+              return true
+            }
+            return !col.startsWith('_') && !hiddenColumns.includes(col)
+          })
+          
+          if (displayableCols.includes('Profit') && !displayableCols.includes('Profit ($)')) {
+            displayableCols.push('Profit ($)')
+          }
+          
+          DEFAULT_COLUMNS.forEach(col => {
+            if (!displayableCols.includes(col)) {
+              displayableCols.push(col)
+            }
+          })
+          
+          const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
+          setAvailableColumns(displayableCols)
+          
+          setSelectedColumns(prev => {
+            const updated = { ...prev }
+            let changed = false
+            
+            const getDefaultColumns = () => {
+              return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
+            }
+            
+            const defaultCols = getDefaultColumns()
+            if (JSON.stringify(updated['master']) !== JSON.stringify(defaultCols)) {
+              updated['master'] = defaultCols
+              changed = true
+            }
+            
+            STREAMS.forEach(stream => {
+              if (!updated[stream] || updated[stream].length === 0) {
+                updated[stream] = getDefaultColumns()
+                changed = true
+              }
+            })
+            
+            if (changed) {
+              localStorage.setItem('matrix_selected_columns', JSON.stringify(updated))
+            }
+            return updated
+          })
+        }
+        
+        setMasterError(null)
+      } else {
+        setMasterData([])
+        setMasterError('No data found. Click "Rebuild Matrix" to build it.')
+      }
+    } catch (error) {
+      if (error.name === 'TypeError' && error.message.includes('fetch')) {
+        setMasterError('Cannot connect to backend. Make sure the dashboard backend is running on http://localhost:8000')
+      } else {
+        setMasterError('Failed to load master matrix: ' + error.message)
+      }
+      setMasterData([])
+    } finally {
+      setMasterLoading(false)
+    }
+  }, [streamFilters, workerInitData, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, availableColumns, setAvailableColumns, setSelectedColumns])
+  
+  // Retry loading if backend wasn't ready
+  const retryLoad = useCallback(() => {
+    loadMasterMatrix(false)
+  }, [loadMasterMatrix])
+
   // Update clock every second
   useEffect(() => {
     const timer = setInterval(() => {
@@ -198,12 +353,7 @@ function AppContent() {
     }, 1000)
     
     return () => clearTimeout(timer)
-  }, [])
-  
-  // Retry loading if backend wasn't ready
-  const retryLoad = () => {
-    loadMasterMatrix(false)
-  }
+  }, [loadMasterMatrix])
   
   // Apply filters in worker when filters or active tab changes
   useEffect(() => {
@@ -241,243 +391,30 @@ function AppContent() {
     setMultiplierInput(masterContractMultiplier)
   }, [masterContractMultiplier])
   
-  // Calculate stats for a stream from filtered data
-  // Helper function to parse date
-  const parseDateValue = (dateValue) => {
-    if (!dateValue) return null
-    try {
-      let date
-      if (typeof dateValue === 'string' && dateValue.includes('/')) {
-        // Handle DD/MM/YYYY format
-        const parts = dateValue.split('/')
-        if (parts.length === 3) {
-          date = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
-        } else {
-          date = new Date(dateValue)
-        }
-      } else {
-        date = new Date(dateValue)
-      }
-      if (isNaN(date.getTime())) return null
-      return date
-    } catch (e) {
-      return null
-    }
-  }
+  // Use imported utility functions - wrap to pass masterContractMultiplier
+  const calculateTimeProfitLocal = useCallback((data = masterData) => 
+    calculateTimeProfit(data, masterContractMultiplier), [masterData, masterContractMultiplier])
   
-  // Get contract value helper
-  const getContractValue = (trade) => {
-    const symbol = trade.Symbol || trade.Instrument || 'ES'
-    const baseSymbol = symbol.replace(/\d+$/, '') // Remove trailing numbers
-    const contractValues = {
-      'ES': 50,
-      'NQ': 10,
-      'YM': 5,
-      'CL': 1000,
-      'NG': 10000,
-      'GC': 100
-    }
-    return contractValues[baseSymbol] || 50 // Default to ES if unknown
-  }
+  const calculateDOMProfitLocal = (data = masterData) => 
+    calculateDOMProfit(data, masterContractMultiplier)
   
-  // Calculate profit by Time slot by stream
-  const calculateTimeProfit = (data = masterData) => {
-    const timeData = {}
-    const contractMultiplier = masterContractMultiplier
-    
-    data.forEach(trade => {
-      const time = trade.Time
-      if (!time || time === 'NA' || time === '00:00') return
-      
-      // Normalize time format (ensure HH:MM format)
-      let timeKey = time.toString().trim()
-      // If time doesn't match HH:MM format, try to extract it
-      if (!/^\d{2}:\d{2}$/.test(timeKey)) {
-        // Try to extract time from string
-        const match = timeKey.match(/(\d{2}:\d{2})/)
-        if (match) {
-          timeKey = match[1]
-        } else {
-          return // Skip if we can't parse the time
-        }
-      }
-      
-      const stream = trade.Stream || 'Unknown'
-      
-      if (!timeData[timeKey]) {
-        timeData[timeKey] = {}
-      }
-      if (!timeData[timeKey][stream]) {
-        timeData[timeKey][stream] = 0
-      }
-      
-      const profit = parseFloat(trade.Profit) || 0
-      const contractValue = getContractValue(trade)
-      const profitDollars = profit * contractValue * contractMultiplier
-      
-      timeData[timeKey][stream] += profitDollars
-    })
-    
-    // Sort time slots chronologically
-    const sortedTimeKeys = Object.keys(timeData).sort((a, b) => {
-      const [aHour, aMin] = a.split(':').map(Number)
-      const [bHour, bMin] = b.split(':').map(Number)
-      if (aHour !== bHour) return aHour - bHour
-      return aMin - bMin
-    })
-    
-    // Return data ordered by time
-    const orderedData = {}
-    sortedTimeKeys.forEach(timeKey => {
-      orderedData[timeKey] = timeData[timeKey]
-    })
-    
-    return orderedData
-  }
+  const calculateDailyProfitLocal = (data = masterData) => 
+    calculateDailyProfit(data, masterContractMultiplier)
   
-  // Calculate profit by Day of Month (DOM) by stream
-  const calculateDOMProfit = (data = masterData) => {
-    const domData = {}
-    const contractMultiplier = masterContractMultiplier
-    
-    data.forEach(trade => {
-      const date = parseDateValue(trade.Date || trade.trade_date)
-      if (!date) return
-      
-      const dayOfMonth = date.getDate() // 1-31
-      const stream = trade.Stream || 'Unknown'
-      
-      if (!domData[dayOfMonth]) {
-        domData[dayOfMonth] = {}
-      }
-      if (!domData[dayOfMonth][stream]) {
-        domData[dayOfMonth][stream] = 0
-      }
-      
-      const profit = parseFloat(trade.Profit) || 0
-      const contractValue = getContractValue(trade)
-      const profitDollars = profit * contractValue * contractMultiplier
-      
-      domData[dayOfMonth][stream] += profitDollars
-    })
-    
-    // Return data ordered by day of month (1-31)
-    const orderedData = {}
-    for (let day = 1; day <= 31; day++) {
-      if (domData[day]) {
-        orderedData[day] = domData[day]
-      }
-    }
-    
-    return orderedData
-  }
+  const calculateDateProfitLocal = (data = masterData) => 
+    calculateDateProfit(data, masterContractMultiplier)
   
-  // Calculate profit by Day of Week (DOW) by stream
-  const calculateDailyProfit = (data = masterData) => {
-    const dowData = {}
-    const contractMultiplier = masterContractMultiplier
-    const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-    
-    data.forEach(trade => {
-      const date = parseDateValue(trade.Date || trade.trade_date)
-      if (!date) return
-      
-      const dow = date.toLocaleDateString('en-US', { weekday: 'long' })
-      // Skip weekends
-      if (!dowOrder.includes(dow)) return
-      
-      const stream = trade.Stream || 'Unknown'
-      
-      if (!dowData[dow]) {
-        dowData[dow] = {}
-      }
-      if (!dowData[dow][stream]) {
-        dowData[dow][stream] = 0
-      }
-      
-      const profit = parseFloat(trade.Profit) || 0
-      const contractValue = getContractValue(trade)
-      const profitDollars = profit * contractValue * contractMultiplier
-      
-      dowData[dow][stream] += profitDollars
-    })
-    
-    // Return data ordered by DOW
-    const orderedData = {}
-    dowOrder.forEach(dow => {
-      if (dowData[dow]) {
-        orderedData[dow] = dowData[dow]
-      }
-    })
-    
-    return orderedData
-  }
+  const calculateMonthlyProfitLocal = (data = masterData) => 
+    calculateMonthlyProfit(data, masterContractMultiplier)
   
-  // Calculate monthly profit by stream
-  const calculateMonthlyProfit = (data = masterData) => {
-    const monthlyData = {}
-    const contractMultiplier = masterContractMultiplier
-    
-    data.forEach(trade => {
-      const date = parseDateValue(trade.Date || trade.trade_date)
-      if (!date) return
-      
-      const year = date.getFullYear()
-      const month = date.getMonth() + 1 // 1-12
-      const monthKey = `${year}-${String(month).padStart(2, '0')}`
-      const stream = trade.Stream || 'Unknown'
-      
-      if (!monthlyData[monthKey]) {
-        monthlyData[monthKey] = {}
-      }
-      if (!monthlyData[monthKey][stream]) {
-        monthlyData[monthKey][stream] = 0
-      }
-      
-      const profit = parseFloat(trade.Profit) || 0
-      const contractValue = getContractValue(trade)
-      const profitDollars = profit * contractValue * contractMultiplier
-      
-      monthlyData[monthKey][stream] += profitDollars
-    })
-    
-    return monthlyData
-  }
-  
-  // Calculate yearly profit by stream
-  const calculateYearlyProfit = (data = masterData) => {
-    const yearlyData = {}
-    const contractMultiplier = masterContractMultiplier
-    
-    data.forEach(trade => {
-      const date = parseDateValue(trade.Date || trade.trade_date)
-      if (!date) return
-      
-      const year = date.getFullYear()
-      const stream = trade.Stream || 'Unknown'
-      
-      if (!yearlyData[year]) {
-        yearlyData[year] = {}
-      }
-      if (!yearlyData[year][stream]) {
-        yearlyData[year][stream] = 0
-      }
-      
-      const profit = parseFloat(trade.Profit) || 0
-      const contractValue = getContractValue(trade)
-      const profitDollars = profit * contractValue * contractMultiplier
-      
-      yearlyData[year][stream] += profitDollars
-    })
-    
-    return yearlyData
-  }
+  const calculateYearlyProfitLocal = (data = masterData) => 
+    calculateYearlyProfit(data, masterContractMultiplier)
   
   const calculateStats = (streamId) => {
     let filtered = getFilteredData(masterData, streamId)
     
     // Apply year filter if specified
-    const filters = getStreamFilters(streamId)
+    const filters = getStreamFilters(streamId) // Uses hook's getFiltersForStream internally
     if (filters.include_years && filters.include_years.length > 0) {
       filtered = filtered.filter(row => {
         if (!row.Date) return false
@@ -1113,261 +1050,6 @@ function AppContent() {
       ...prev,
       [streamId]: !prev[streamId]
     }))
-  }
-  
-  const loadMasterMatrix = async (rebuild = false, rebuildStream = null) => {
-    setMasterLoading(true)
-    setMasterError(null)
-    
-    try {
-      // Check if backend is reachable
-      try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 3000)
-        const healthCheck = await fetch(`${API_BASE.replace('/api', '')}/`, { 
-          method: 'GET', 
-          signal: controller.signal 
-        })
-        clearTimeout(timeoutId)
-      } catch (e) {
-        if (e.name === 'AbortError') {
-          setMasterError('Backend connection timeout. Make sure the dashboard backend is running on http://localhost:8000')
-        } else {
-          setMasterError('Backend not running. Please start the dashboard backend on port 8000. Error: ' + e.message)
-        }
-        setMasterData([])
-        setMasterLoading(false)
-        return
-      }
-      
-      // If rebuild requested, build matrix first
-      if (rebuild) {
-        // Build stream filters for API
-        const streamFiltersApi = {}
-        Object.keys(streamFilters).forEach(streamId => {
-          const filters = streamFilters[streamId]
-          // Include filters even if arrays are empty (to ensure all streams are represented)
-          // But only include if the stream has filter configuration
-          if (filters) {
-            streamFiltersApi[streamId] = {
-              exclude_days_of_week: filters.exclude_days_of_week || [],
-              exclude_days_of_month: filters.exclude_days_of_month || [],
-              exclude_times: filters.exclude_times || []
-            }
-          }
-        })
-        
-        // Determine which years should be visible in the rebuilt matrix.
-        // We take the union of all include_years across all streams (including master).
-        const visibleYearsSet = new Set()
-        Object.keys(streamFilters).forEach(id => {
-          const f = streamFilters[id]
-          if (f && Array.isArray(f.include_years)) {
-            f.include_years.forEach(y => {
-              const num = parseInt(y)
-              if (!isNaN(num)) {
-                visibleYearsSet.add(num)
-              }
-            })
-          }
-        })
-        const visibleYears = Array.from(visibleYearsSet).sort((a, b) => a - b)
-        
-        // If rebuilding a specific stream, only rebuild that stream
-        // Otherwise rebuild all streams (master tab)
-        const buildBody = {
-          stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
-        }
-
-        // Only send visible_years if user explicitly selected one or more years.
-        // If none are selected, backend will auto-detect most recent available year.
-        if (visibleYears.length > 0) {
-          buildBody.visible_years = visibleYears
-        }
-
-        // Always use a 1-month warmup window before the earliest visible year
-        buildBody.warmup_months = 1
-        if (rebuildStream) {
-          buildBody.streams = [rebuildStream]
-        }
-        
-        try {
-          const buildResponse = await fetch(`${API_BASE}/matrix/build`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildBody)
-          })
-          
-          if (!buildResponse.ok) {
-            const errorData = await buildResponse.json()
-            setMasterError(errorData.detail || 'Failed to build master matrix')
-            setMasterLoading(false)
-            return
-          }
-          
-          await buildResponse.json()
-        } catch (error) {
-          setMasterError(`Failed to build master matrix: ${error.message}`)
-          setMasterLoading(false)
-          return
-        }
-      }
-      
-      // Load the matrix data
-      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=50000`)
-      
-      if (!dataResponse.ok) {
-        const errorData = await dataResponse.json()
-        setMasterError(errorData.detail || 'Failed to load matrix data')
-        setMasterData([])
-        setMasterLoading(false)
-        return
-      }
-      
-      const data = await dataResponse.json()
-      const trades = data.data || []
-      
-      // Store available years from API response
-      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
-        setAvailableYearsFromAPI(data.years)
-      }
-      
-      if (trades.length > 0) {
-        setMasterData(trades)
-        
-        // Initialize worker with data (converts to columnar format)
-        if (trades.length > 0) {
-          workerInitData(trades)
-        }
-        
-        // Detect available columns from first row
-        if (availableColumns.length === 0) {
-          const cols = Object.keys(trades[0])
-          // Filter out internal/technical columns that shouldn't be displayed
-          const hiddenColumns = [
-            'global_trade_id',
-            'filter_reasons',
-            'onr_high',
-            'onr_low',
-            'onr',
-            'scf_s1',
-            'scf_s2',
-            'prewindow_high_s1',
-            'prewindow_low_s1',
-            'prewindow_range_s1',
-            'session_high_s1',
-            'session_low_s1',
-            'session_range_s1',
-            'prewindow_high_s2',
-            'prewindow_low_s2',
-            'prewindow_range_s2',
-            'session_high_s2',
-            'session_low_s2',
-            'session_range_s2',
-            'onr_q1',
-            'onr_q2',
-            'onr_q3',
-            'onr_bucket',
-            'entry_time',
-            'exit_time',
-            'entry_price',
-            'exit_price',
-            'R',
-            'pnl',
-            'rs_value',
-            'selected_time',
-            'time_bucket',
-            'trade_date',
-            'day_of_month',
-            'dow',
-            'dow_full',
-            'month',
-            'session_index',
-            'is_two_stream',
-            'dom_blocked',
-            'final_allowed'
-          ]
-          // Keep time slot rolling and points columns (e.g., "07:30 Rolling", "08:00 Points")
-          // These should be included in the column selector
-          // Filter out internal columns, but explicitly include time slot columns
-          const displayableCols = cols.filter(col => {
-            // Always include time slot Points and Rolling columns
-            if (col.includes(' Points') || col.includes(' Rolling')) {
-              return true
-            }
-            // Filter out internal columns
-            return !col.startsWith('_') && !hiddenColumns.includes(col)
-          })
-          
-          // Add computed dollar columns if Profit column exists
-          if (displayableCols.includes('Profit')) {
-            if (!displayableCols.includes('Profit ($)')) {
-              displayableCols.push('Profit ($)')
-            }
-          }
-          
-          // Ensure default columns are always available (even if not in data yet)
-          // This is important for columns like SL that are calculated but might not be in old files
-          DEFAULT_COLUMNS.forEach(col => {
-            if (!displayableCols.includes(col)) {
-              displayableCols.push(col)
-            }
-          })
-          
-          // Explicitly exclude "Revised Score" and "Revised Profit ($)" from default selection
-          // These columns may exist in data but should not be shown by default
-          const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
-          
-          setAvailableColumns(displayableCols)
-          
-          // Initialize column selections for all streams if not set
-          setSelectedColumns(prev => {
-            const updated = { ...prev }
-            let changed = false
-            
-            // Helper function to filter out excluded columns and ensure DEFAULT_COLUMNS structure
-            const getDefaultColumns = () => {
-              // Filter out any excluded columns from DEFAULT_COLUMNS (shouldn't be any, but just in case)
-              return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
-            }
-            
-            // Master tab always uses exact DEFAULT_COLUMNS structure (force reset to ensure correct columns)
-            const defaultCols = getDefaultColumns()
-            if (JSON.stringify(updated['master']) !== JSON.stringify(defaultCols)) {
-              updated['master'] = defaultCols
-              changed = true
-            }
-            
-            // Initialize each stream tab with exact DEFAULT_COLUMNS structure
-            STREAMS.forEach(stream => {
-              if (!updated[stream] || updated[stream].length === 0) {
-                updated[stream] = getDefaultColumns()
-                changed = true
-              }
-            })
-            
-            if (changed) {
-              localStorage.setItem('matrix_selected_columns', JSON.stringify(updated))
-            }
-            return updated
-          })
-        }
-        
-        setMasterError(null)
-      } else {
-        setMasterData([])
-        setMasterError('No data found. Click "Rebuild Matrix" to build it.')
-      }
-    } catch (error) {
-      if (error.name === 'TypeError' && error.message.includes('fetch')) {
-        setMasterError('Cannot connect to backend. Make sure the dashboard backend is running on http://localhost:8000')
-      } else {
-        setMasterError('Failed to load master matrix: ' + error.message)
-      }
-      setMasterData([])
-    } finally {
-      setMasterLoading(false)
-    }
   }
   
   // Update filter for a specific stream (with persistence)
@@ -2743,15 +2425,20 @@ function AppContent() {
     const sortedStreams = Array.from(allStreams).sort()
     
     // Get sorted periods
-    // For DOM (Day of Month), sort numerically; for week, sort by year-month-week; otherwise sort as strings
+    // For DOM (Day of Month), sort numerically; for month/year/date, sort with latest first; otherwise sort as strings
     const sortedPeriods = periodType === 'dom' 
       ? Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b))
-      : periodType === 'week'
+      : periodType === 'month'
       ? Object.keys(data).sort((a, b) => {
-          // Sort by week number: Week 1, Week 2, Week 3, Week 4, Week 5
-          const aWeekNum = parseInt(a.replace('Week ', ''))
-          const bWeekNum = parseInt(b.replace('Week ', ''))
-          return aWeekNum - bWeekNum
+          return b.localeCompare(a)
+        })
+      : periodType === 'date'
+      ? Object.keys(data).sort((a, b) => {
+          return b.localeCompare(a) // Latest first (YYYY-MM-DD format)
+        })
+      : periodType === 'year'
+      ? Object.keys(data).sort((a, b) => {
+          return parseInt(b) - parseInt(a)
         })
       : Object.keys(data).sort()
     
@@ -2763,13 +2450,105 @@ function AppContent() {
       )
     }
     
+    // Use virtualization for date tab (can have thousands of rows)
+    if (periodType === 'date') {
+      const Row = ({ index, style }) => {
+        const period = sortedPeriods[index]
+        const periodData = data[period]
+        let total = 0
+        
+        return (
+          <div style={style} className="flex border-b border-gray-700 hover:bg-gray-900">
+            <div className="p-3 border-r border-gray-700 font-medium flex-shrink-0" style={{ width: '200px' }}>
+              {new Date(period + 'T00:00:00').toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', weekday: 'short' })}
+            </div>
+            {sortedStreams.map(stream => {
+              const profit = periodData[stream] || 0
+              total += profit
+              return (
+                <div 
+                  key={stream} 
+                  className={`p-3 border-r border-gray-700 text-right flex-shrink-0 ${
+                    profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
+                  }`}
+                  style={{ width: '120px' }}
+                >
+                  {formatCurrency(profit)}
+                </div>
+              )
+            })}
+            <div className={`p-3 text-right font-semibold bg-gray-800 flex-shrink-0 ${
+              total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
+            }`} style={{ width: '120px' }}>
+              {formatCurrency(total)}
+            </div>
+          </div>
+        )
+      }
+      
+      // Calculate totals for footer
+      const streamTotals = sortedStreams.map(stream => 
+        sortedPeriods.reduce((sum, period) => sum + (data[period][stream] || 0), 0)
+      )
+      const grandTotal = streamTotals.reduce((sum, total) => sum + total, 0)
+      
+      return (
+        <div className="overflow-x-auto">
+          <div className="flex border-b border-gray-700 bg-gray-800 sticky top-0 z-10">
+            <div className="p-3 border-r border-gray-700 font-semibold flex-shrink-0" style={{ width: '200px' }}>
+              Day
+            </div>
+            {sortedStreams.map(stream => (
+              <div key={stream} className="p-3 border-r border-gray-700 text-right font-semibold flex-shrink-0" style={{ width: '120px' }}>
+                {stream}
+              </div>
+            ))}
+            <div className="p-3 text-right font-semibold bg-gray-700 flex-shrink-0" style={{ width: '120px' }}>
+              Total
+            </div>
+          </div>
+          <List
+            height={600}
+            itemCount={sortedPeriods.length}
+            itemSize={45}
+            width="100%"
+          >
+            {Row}
+          </List>
+          {/* Totals footer */}
+          <div className="flex border-t-2 border-gray-600 bg-gray-800 font-semibold">
+            <div className="p-3 border-r border-gray-700 flex-shrink-0" style={{ width: '200px' }}>
+              Total
+            </div>
+            {streamTotals.map((total, idx) => (
+              <div 
+                key={sortedStreams[idx]} 
+                className={`p-3 border-r border-gray-700 text-right flex-shrink-0 ${
+                  total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
+                }`}
+                style={{ width: '120px' }}
+              >
+                {formatCurrency(total)}
+              </div>
+            ))}
+            <div className={`p-3 text-right bg-gray-700 flex-shrink-0 ${
+              grandTotal > 0 ? 'text-green-400' : grandTotal < 0 ? 'text-red-400' : 'text-gray-400'
+            }`} style={{ width: '120px' }}>
+              {formatCurrency(grandTotal)}
+            </div>
+          </div>
+        </div>
+      )
+    }
+    
+    // Regular table for other period types (fewer rows)
     return (
       <div className="overflow-x-auto">
         <table className="w-full border-collapse border border-gray-700">
           <thead>
             <tr className="bg-gray-800">
               <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
-                {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'week' ? 'Week' : periodType === 'month' ? 'Month' : 'Year'}
+                {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'month' ? 'Month' : 'Year'}
               </th>
               {sortedStreams.map(stream => (
                 <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
@@ -2795,8 +2574,6 @@ function AppContent() {
                       ? period // Already the day of week name (Monday, Tuesday, etc.)
                       : periodType === 'dom'
                       ? `${period}${getOrdinalSuffix(period)}` // e.g., "1st", "2nd", "3rd"
-                      : periodType === 'week'
-                      ? period // Already "Week 1", "Week 2", etc.
                       : periodType === 'month'
                       ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
                       : period}
@@ -2891,7 +2668,7 @@ function AppContent() {
   // Calculate profit breakdowns in worker when needed (lazy - only when tab is active)
   useEffect(() => {
     if (workerReady && masterData.length > 0 && calculateProfitBreakdown) {
-      const activeBreakdownTabs = ['time', 'day', 'dom', 'week', 'month', 'year']
+      const activeBreakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year']
       
       // Only calculate if we're on a breakdown tab
       if (activeBreakdownTabs.includes(activeTab)) {
@@ -2911,73 +2688,73 @@ function AppContent() {
   // Memoized profit breakdowns (fallback to main thread if worker not ready)
   const memoizedTimeProfitBefore = useMemo(() => {
     if (profitBreakdowns['time_before']) return profitBreakdowns['time_before']
-    if (!workerReady) return calculateTimeProfit(masterData)
+    if (!workerReady) return calculateTimeProfitLocal(masterData)
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedTimeProfitAfter = useMemo(() => {
     if (profitBreakdowns['time_after']) return profitBreakdowns['time_after']
-    if (!workerReady) return calculateTimeProfit(memoizedMasterFilteredData)
+    if (!workerReady) return calculateTimeProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedDayProfitBefore = useMemo(() => {
     if (profitBreakdowns['day_before']) return profitBreakdowns['day_before']
-    if (!workerReady) return calculateDailyProfit(masterData)
+    if (!workerReady) return calculateDailyProfitLocal(masterData)
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedDayProfitAfter = useMemo(() => {
     if (profitBreakdowns['day_after']) return profitBreakdowns['day_after']
-    if (!workerReady) return calculateDailyProfit(memoizedMasterFilteredData)
+    if (!workerReady) return calculateDailyProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedDOMProfitBefore = useMemo(() => {
     if (profitBreakdowns['dom_before']) return profitBreakdowns['dom_before']
-    if (!workerReady) return calculateDOMProfit(masterData)
+    if (!workerReady) return calculateDOMProfitLocal(masterData)
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedDOMProfitAfter = useMemo(() => {
     if (profitBreakdowns['dom_after']) return profitBreakdowns['dom_after']
-    if (!workerReady) return calculateDOMProfit(memoizedMasterFilteredData)
-    return {}
-  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
-  
-  const memoizedWeekProfitBefore = useMemo(() => {
-    if (profitBreakdowns['week_before']) return profitBreakdowns['week_before']
-    if (!workerReady) return {}
-    return {}
-  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
-  
-  const memoizedWeekProfitAfter = useMemo(() => {
-    if (profitBreakdowns['week_after']) return profitBreakdowns['week_after']
-    if (!workerReady) return {}
+    if (!workerReady) return calculateDOMProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedMonthProfitBefore = useMemo(() => {
     if (profitBreakdowns['month_before']) return profitBreakdowns['month_before']
-    if (!workerReady) return calculateMonthlyProfit(masterData)
+    if (!workerReady) return calculateMonthlyProfitLocal(masterData)
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedMonthProfitAfter = useMemo(() => {
     if (profitBreakdowns['month_after']) return profitBreakdowns['month_after']
-    if (!workerReady) return calculateMonthlyProfit(memoizedMasterFilteredData)
+    if (!workerReady) return calculateMonthlyProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedYearProfitBefore = useMemo(() => {
     if (profitBreakdowns['year_before']) return profitBreakdowns['year_before']
-    if (!workerReady) return calculateYearlyProfit(masterData)
+    if (!workerReady) return calculateYearlyProfitLocal(masterData)
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedYearProfitAfter = useMemo(() => {
     if (profitBreakdowns['year_after']) return profitBreakdowns['year_after']
-    if (!workerReady) return calculateYearlyProfit(memoizedMasterFilteredData)
+    if (!workerReady) return calculateYearlyProfitLocal(memoizedMasterFilteredData)
+    return {}
+  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedDateProfitBefore = useMemo(() => {
+    if (profitBreakdowns['date_before']) return profitBreakdowns['date_before']
+    if (!workerReady) return calculateDateProfitLocal(masterData)
+    return {}
+  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+  
+  const memoizedDateProfitAfter = useMemo(() => {
+    if (profitBreakdowns['date_after']) return profitBreakdowns['date_after']
+    if (!workerReady) return calculateDateProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
 
@@ -3033,8 +2810,6 @@ function AppContent() {
       <div className="container mx-auto px-4 py-8">
         {/* Sticky Header with Title and Tabs */}
         <div className="sticky top-0 z-20 bg-black pt-4 pb-2 -mx-4 px-4">
-          <h1 className="text-3xl font-bold mb-6">Master Matrix</h1>
-          
           {/* Tabs */}
           <div className="flex gap-2 mb-6 border-b border-gray-700 overflow-x-auto">
           <button
@@ -3101,14 +2876,14 @@ function AppContent() {
             DOM
           </button>
           <button
-            onClick={() => setActiveTab('week')}
+            onClick={() => setActiveTab('date')}
             className={`px-4 py-2 font-medium whitespace-nowrap ${
-              activeTab === 'week'
+              activeTab === 'date'
                 ? 'border-b-2 border-blue-500 text-blue-400'
                 : 'text-gray-400 hover:text-gray-300'
             }`}
           >
-            Week
+            Day
           </button>
           <button
             onClick={() => setActiveTab('month')}
@@ -3151,6 +2926,11 @@ function AppContent() {
                   <div className="text-2xl font-mono font-bold text-blue-400">
                     {currentTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                   </div>
+                  {lastMergeTime && (
+                    <div className="mt-2 text-sm font-mono text-gray-400">
+                      Last Merge: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                    </div>
+                  )}
                 </div>
               </div>
               
@@ -3192,11 +2972,11 @@ function AppContent() {
               )}
             </div>
           </div>
-        ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'week' || activeTab === 'month' || activeTab === 'year' ? (
+        ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'date' || activeTab === 'month' || activeTab === 'year' ? (
           <div className="space-y-6">
             <div className="bg-gray-900 rounded-lg p-6">
               <h2 className="text-xl font-semibold mb-6">
-                Profit by {activeTab === 'time' ? 'Time' : activeTab === 'day' ? 'Day of Week (DOW)' : activeTab === 'dom' ? 'Day of Month' : activeTab === 'week' ? 'Week' : activeTab === 'month' ? 'Month' : 'Year'} - All Streams
+                Profit by {activeTab === 'time' ? 'Time' : activeTab === 'day' ? 'Day of Week (DOW)' : activeTab === 'dom' ? 'Day of Month' : activeTab === 'date' ? 'Day' : activeTab === 'month' ? 'Month' : 'Year'} - All Streams
               </h2>
               {masterLoading ? (
                 <div className="text-center py-8">Loading data...</div>
@@ -3212,30 +2992,30 @@ function AppContent() {
                 </div>
               ) : (
                 <>
-                  {/* Before Filters */}
-                  <div className="mb-8">
-                    <h3 className="text-lg font-semibold mb-4 text-blue-400">Before Filters</h3>
-                    {renderProfitTable(
-                      activeTab === 'time' ? memoizedTimeProfitBefore :
-                      activeTab === 'day' ? memoizedDayProfitBefore :
-                      activeTab === 'dom' ? memoizedDOMProfitBefore :
-                      activeTab === 'week' ? memoizedWeekProfitBefore :
-                      activeTab === 'month' ? memoizedMonthProfitBefore :
-                      memoizedYearProfitBefore,
-                      activeTab
-                    )}
-                  </div>
-                  
                   {/* After Filters */}
-                  <div>
+                  <div className="mb-8">
                     <h3 className="text-lg font-semibold mb-4 text-green-400">After Filters</h3>
                     {renderProfitTable(
                       activeTab === 'time' ? memoizedTimeProfitAfter :
                       activeTab === 'day' ? memoizedDayProfitAfter :
                       activeTab === 'dom' ? memoizedDOMProfitAfter :
-                      activeTab === 'week' ? memoizedWeekProfitAfter :
+                      activeTab === 'date' ? memoizedDateProfitAfter :
                       activeTab === 'month' ? memoizedMonthProfitAfter :
                       memoizedYearProfitAfter,
+                      activeTab
+                    )}
+                  </div>
+                  
+                  {/* Before Filters */}
+                  <div>
+                    <h3 className="text-lg font-semibold mb-4 text-blue-400">Before Filters</h3>
+                    {renderProfitTable(
+                      activeTab === 'time' ? memoizedTimeProfitBefore :
+                      activeTab === 'day' ? memoizedDayProfitBefore :
+                      activeTab === 'dom' ? memoizedDOMProfitBefore :
+                      activeTab === 'date' ? memoizedDateProfitBefore :
+                      activeTab === 'month' ? memoizedMonthProfitBefore :
+                      memoizedYearProfitBefore,
                       activeTab
                     )}
                   </div>
@@ -3409,31 +3189,6 @@ function AppContent() {
               </div>
               
               {renderColumnSelector()}
-              
-              {/* Timetable Info for This Stream */}
-              {workerTimetable && workerTimetable.length > 0 && (() => {
-                const streamTimetable = workerTimetable.find(t => t.Stream === activeTab)
-                if (streamTimetable) {
-                  return (
-                    <div className="mb-4 p-4 bg-blue-900/30 border border-blue-700 rounded-lg">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <div className="text-sm font-semibold text-blue-400 mb-1">Next Trading Day</div>
-                          <div className="text-lg font-mono">
-                            {streamTimetable.Date} ({streamTimetable.DOW}) at {streamTimetable.Time}
-                          </div>
-                          {streamTimetable.LastDataDate && (
-                            <div className="text-xs text-gray-400 mt-1">
-                              Based on data from {streamTimetable.LastDataDate}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  )
-                }
-                return null
-              })()}
               
               {/* Stats Toggle */}
               <div className="mb-4">
