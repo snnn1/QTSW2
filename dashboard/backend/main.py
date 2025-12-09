@@ -44,97 +44,56 @@ TIMETABLE_MODULE = QTSW2_ROOT / "timetable_engine" / "timetable_engine.py"
 # Schedule config file
 SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "automation" / "schedule_config.json"
 
-# Global variable to track scheduler process (legacy)
-scheduler_process: Optional[subprocess.Popen] = None
+# Legacy scheduler removed - orchestrator handles scheduling
 
 # Global orchestrator instance
 orchestrator_instance = None
 
+def get_orchestrator():
+    """Get the global orchestrator instance"""
+    return orchestrator_instance
+
+
+# ============================================================
+# Import Helpers (simplify repeated try/except chains)
+# ============================================================
+
+def _import_orchestrator():
+    """Import orchestrator classes with fallback handling"""
+    try:
+        from .orchestrator import PipelineOrchestrator, OrchestratorConfig
+        return PipelineOrchestrator, OrchestratorConfig
+    except ImportError:
+        from orchestrator import PipelineOrchestrator, OrchestratorConfig
+        return PipelineOrchestrator, OrchestratorConfig
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan event handler for startup and shutdown."""
-    global scheduler_process, orchestrator_instance
-    logger = logging.getLogger(__name__)
-    logger.info("Pipeline Dashboard API started")
+    """Lifespan event handler for startup and shutdown.
     
-    # Initialize orchestrator
-    print("\n" + "=" * 60)
-    print("INITIALIZING ORCHESTRATOR")
-    print("=" * 60)
+    CRITICAL: Startup must return control immediately (yield) to allow FastAPI
+    to accept HTTP requests. No blocking operations, loops, or background tasks here.
+    """
+    global orchestrator_instance
+    logger = logging.getLogger(__name__)
+    logger.info("Pipeline Dashboard API starting...")
+    
+    # ONLY construct objects and validate config - NO starting, NO blocking
     try:
-        print("Step 1: Importing orchestrator...")
-        logger.info("Initializing Pipeline Orchestrator...")
-        try:
-            from .orchestrator import PipelineOrchestrator, OrchestratorConfig
-        except ImportError:
-            from orchestrator import PipelineOrchestrator, OrchestratorConfig
-        print("   [OK] Imported")
-        
-        print("Step 2: Creating config...")
-        logger.info("Creating orchestrator config...")
-        config = OrchestratorConfig.from_environment(qtsw2_root=QTSW2_ROOT)
-        logger.info(f"Config created: event_logs_dir={config.event_logs_dir}")
-        print(f"   [OK] Config created: {config.event_logs_dir}")
-        
-        print("Step 3: Creating orchestrator instance...")
         logger.info("Creating orchestrator instance...")
+        PipelineOrchestrator, OrchestratorConfig = _import_orchestrator()
+        
+        config = OrchestratorConfig.from_environment(qtsw2_root=QTSW2_ROOT)
         orchestrator_instance = PipelineOrchestrator(
             config=config,
             schedule_config_path=SCHEDULE_CONFIG_FILE,
             logger=logger
         )
-        logger.info("Orchestrator instance created")
-        print("   [OK] Instance created")
-        
-        print("Step 4: Starting orchestrator...")
-        logger.info("Starting orchestrator (scheduler and watchdog)...")
-        await orchestrator_instance.start()
-        logger.info("Pipeline Orchestrator started successfully")
-        print("   [OK] Orchestrator started successfully!")
-        print("=" * 60 + "\n")
+        logger.info("Orchestrator instance created (not started)")
     except Exception as e:
-        import traceback
-        error_msg = f"Failed to start orchestrator: {e}\nFull traceback:\n{traceback.format_exc()}"
-        logger.error(error_msg, exc_info=True)
-        # Print to console for immediate visibility
-        print("\n" + "=" * 60)
-        print("[ERROR] Orchestrator failed to start!")
-        print("=" * 60)
-        print(f"Error type: {type(e).__name__}")
-        print(f"Error message: {str(e)}")
-        print("\nFull traceback:")
-        traceback.print_exc()
-        print("=" * 60 + "\n")
+        logger.error(f"Failed to create orchestrator instance: {e}", exc_info=True)
         orchestrator_instance = None
-    
-    # Legacy: Auto-start old scheduler (can be removed later)
-    try:
-        schedule_config = load_schedule_config()
-        schedule_time = schedule_config.schedule_time
-        logger.info(f"Auto-starting legacy scheduler with schedule time: {schedule_time}")
-        
-        env = os.environ.copy()
-        cmd = ["python", str(SCHEDULER_SCRIPT), "--schedule", schedule_time, "--no-debug-window"]
-        
-        global scheduler_process
-        scheduler_process = subprocess.Popen(
-            cmd,
-            cwd=str(QTSW2_ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        logger.info(f"Legacy scheduler started (PID: {scheduler_process.pid}, schedule: {schedule_time})")
-        
-        # Set scheduler process in schedule router
-        try:
-            from .routers import schedule
-        except ImportError:
-            from routers import schedule
-        schedule.set_scheduler_process(scheduler_process)
-    except Exception as e:
-        logger.warning(f"Legacy scheduler auto-start failed: {e}")
     
     # Create master matrix debug log file on startup
     master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
@@ -147,10 +106,55 @@ async def lifespan(app: FastAPI):
     except:
         pass
     
-    yield  # Application runs here
+    # Define orchestrator startup function (runs after yield, non-blocking)
+    async def start_orchestrator_background():
+        """Start orchestrator after FastAPI is ready to accept requests"""
+        await asyncio.sleep(0.1)  # Brief delay to ensure FastAPI is fully ready
+        if orchestrator_instance:
+            try:
+                logger.info("Starting orchestrator (background task)...")
+                await orchestrator_instance.start()
+                logger.info("Orchestrator started successfully")
+            except Exception as e:
+                logger.error(f"Failed to start orchestrator in background: {e}", exc_info=True)
     
-    # Shutdown
-    logger = logging.getLogger(__name__)
+    # Create background task to start orchestrator (NON-BLOCKING - task is not awaited)
+    # The task will run after yield when FastAPI is accepting requests
+    # Store in app.state for shutdown tracking
+    background_task = None
+    if orchestrator_instance:
+        background_task = asyncio.create_task(start_orchestrator_background())
+        app.state.orchestrator_task = background_task
+    
+    # CRITICAL: Yield immediately - no blocking operations, no awaited tasks
+    # FastAPI will not accept HTTP requests until this yield is reached
+    # The background task created above will run after this yield (non-blocking)
+    yield  # Application runs here - FastAPI can now accept requests
+    
+    # Shutdown phase: Clean up background tasks and orchestrator
+    logger.info("Shutting down...")
+    
+    # Cancel orchestrator background task if it exists
+    background_task = getattr(app.state, 'orchestrator_task', None)
+    if background_task and not background_task.done():
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Stop orchestrator (this will also stop any internal background tasks)
+    if orchestrator_instance:
+        try:
+            logger.info("Stopping Pipeline Orchestrator...")
+            await orchestrator_instance.stop()
+            logger.info("Pipeline Orchestrator stopped")
+        except Exception as e:
+            logger.error(f"Error stopping orchestrator: {e}")
+    
+    # Legacy scheduler cleanup removed - no longer used
+    
+    logger.info("Shutdown complete")
     
     # Stop orchestrator
     if orchestrator_instance:
@@ -161,17 +165,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error stopping orchestrator: {e}")
     
-    # Stop legacy scheduler
-    if scheduler_process:
-        try:
-            logger.info("Stopping legacy scheduler process...")
-            scheduler_process.terminate()
-            scheduler_process.wait(timeout=5)
-            logger.info("Legacy scheduler stopped")
-        except Exception as e:
-            logger.error(f"Error stopping legacy scheduler: {e}")
-            if scheduler_process:
-                scheduler_process.kill()
+    # Legacy scheduler cleanup removed - no longer used
+    
+    logger.info("Shutdown complete")
 
 
 app = FastAPI(title="Pipeline Dashboard API", lifespan=lifespan)
@@ -212,11 +208,29 @@ app.add_middleware(
 )
 
 # Import and include routers
-try:
-    from .routers import pipeline, schedule, websocket, apps, metrics, matrix
-except ImportError:
-    # Fallback for when running as script (not as module)
-    from routers import pipeline, schedule, websocket, apps, metrics, matrix
+def _import_routers():
+    """Import routers with fallback handling"""
+    try:
+        from .routers import pipeline, schedule, websocket, apps, metrics, matrix
+        return pipeline, schedule, websocket, apps, metrics, matrix
+    except (ImportError, ValueError):
+        # Fallback: Add parent directory to path and import
+        import sys
+        from pathlib import Path
+        backend_path = Path(__file__).parent
+        if str(backend_path) not in sys.path:
+            sys.path.insert(0, str(backend_path))
+        dashboard_path = backend_path.parent
+        if str(dashboard_path) not in sys.path:
+            sys.path.insert(0, str(dashboard_path))
+        try:
+            from routers import pipeline, schedule, websocket, apps, metrics, matrix
+            return pipeline, schedule, websocket, apps, metrics, matrix
+        except ImportError:
+            from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics, matrix
+            return pipeline, schedule, websocket, apps, metrics, matrix
+
+pipeline, schedule, websocket, apps, metrics, matrix = _import_routers()
 
 app.include_router(pipeline.router)
 app.include_router(schedule.router)
@@ -225,53 +239,20 @@ app.include_router(apps.router)
 app.include_router(metrics.router)
 app.include_router(matrix.router)
 
-# Set scheduler process in schedule router after it's created
-def set_scheduler_process_for_router():
-    """Set scheduler process in schedule router."""
-    schedule.set_scheduler_process(scheduler_process)
+# Legacy scheduler process tracking removed
 
 
 # ============================================================
 # Data Models
 # ============================================================
-
-class ScheduleConfig(BaseModel):
-    schedule_time: str  # HH:MM format
-
-
-class PipelineStartResponse(BaseModel):
-    run_id: str
-    event_log_path: str
-    status: str
-
-
-class PipelineStartRequest(BaseModel):
-    wait_for_export: bool = False
-    launch_ninjatrader: bool = False
-
-
-# ============================================================
-# Schedule Management
-# ============================================================
-
-def load_schedule_config() -> ScheduleConfig:
-    """Load schedule configuration from file."""
-    if SCHEDULE_CONFIG_FILE.exists():
-        with open(SCHEDULE_CONFIG_FILE, "r") as f:
-            data = json.load(f)
-            return ScheduleConfig(**data)
-    return ScheduleConfig(schedule_time="07:30")
-
-
-def save_schedule_config(config: ScheduleConfig):
-    """Save schedule configuration to file."""
-    with open(SCHEDULE_CONFIG_FILE, "w") as f:
-        json.dump(config.dict(), f, indent=2)
+# Note: Most models are in models.py - only Matrix-specific models here
 
 
 # ============================================================
 # API Endpoints
 # ============================================================
+# Note: Schedule management endpoints are in routers/schedule.py
+# Note: Pipeline endpoints are in routers/pipeline.py
 
 @app.get("/")
 async def root():
@@ -315,285 +296,7 @@ async def test_debug_log():
         return {"status": "error", "message": str(e), "file": str(master_matrix_log)}
 
 
-@app.get("/api/schedule", response_model=ScheduleConfig)
-async def get_schedule():
-    """Get current scheduled daily run time."""
-    return load_schedule_config()
-
-
-@app.post("/api/schedule", response_model=ScheduleConfig)
-async def update_schedule(config: ScheduleConfig):
-    """Update scheduled daily run time."""
-    logger = logging.getLogger(__name__)
-    # Validate time format
-    try:
-        datetime.strptime(config.schedule_time, "%H:%M")
-    except ValueError:
-        logger.warning(f"Invalid schedule time format received: {config.schedule_time}")
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid time format. Please use HH:MM format (24-hour, e.g., '07:30')"
-        )
-    
-    # Validate time range (00:00 to 23:59)
-    try:
-        hour, minute = map(int, config.schedule_time.split(':'))
-        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-            raise ValueError("Time out of range")
-    except (ValueError, AttributeError):
-        logger.warning(f"Invalid schedule time values: {config.schedule_time}")
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid time. Hours must be 0-23, minutes must be 0-59."
-        )
-    
-    try:
-        save_schedule_config(config)
-        logger.info(f"Schedule updated to: {config.schedule_time}")
-        return config
-    except Exception as e:
-        logger.error(f"Failed to save schedule config: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to save schedule. Please check logs for details."
-        )
-
-
-@app.post("/api/scheduler/start")
-async def start_scheduler():
-    """Start the scheduler process."""
-    global scheduler_process
-    logger = logging.getLogger(__name__)
-    
-    # Check if already running
-    if scheduler_process is not None and scheduler_process.poll() is None:
-        return {
-            "running": True,
-            "status": "already_running",
-            "pid": scheduler_process.pid,
-            "message": "Scheduler is already running"
-        }
-    
-    # Load schedule config to get the scheduled time
-    try:
-        schedule_config = load_schedule_config()
-        schedule_time = schedule_config.schedule_time
-    except Exception as e:
-        logger.warning(f"Could not load schedule config, using default 07:30: {e}")
-        schedule_time = "07:30"
-    
-    # Start scheduler process
-    try:
-        env = os.environ.copy()
-        cmd = ["python", str(SCHEDULER_SCRIPT), "--schedule", schedule_time, "--no-debug-window"]
-        
-        scheduler_process = subprocess.Popen(
-            cmd,
-            cwd=str(QTSW2_ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        
-        logger.info(f"Scheduler started with PID {scheduler_process.pid}, schedule time: {schedule_time}")
-        return {
-            "running": True,
-            "status": "started",
-            "pid": scheduler_process.pid,
-            "schedule_time": schedule_time,
-            "message": f"Scheduler started (runs at {schedule_time} CT)"
-        }
-    except Exception as e:
-        logger.error(f"Failed to start scheduler: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to start scheduler: {str(e)}"
-        )
-
-
-@app.get("/api/scheduler/status")
-async def get_scheduler_status():
-    """Get scheduler process status."""
-    global scheduler_process
-    if scheduler_process is None:
-        return {
-            "running": False,
-            "status": "not_started",
-            "message": "Scheduler process not started"
-        }
-    
-    # Check if process is still running
-    if scheduler_process.poll() is None:
-        return {
-            "running": True,
-            "status": "running",
-            "pid": scheduler_process.pid,
-            "message": "Scheduler is running (runs every 15 minutes at :00, :15, :30, :45)"
-        }
-    else:
-        return {
-            "running": False,
-            "status": "stopped",
-            "returncode": scheduler_process.returncode,
-            "message": f"Scheduler process stopped (exit code: {scheduler_process.returncode})"
-        }
-
-
-@app.get("/api/schedule/next")
-async def get_next_scheduled_run():
-    """Get next scheduled run time (runs every 15 minutes)."""
-    try:
-        import pytz
-        chicago_tz = pytz.timezone("America/Chicago")
-        now_chicago = datetime.now(chicago_tz)
-        
-        # Calculate next 15-minute interval (:00, :15, :30, :45)
-        current_minute = now_chicago.minute
-        current_second = now_chicago.second
-        current_microsecond = now_chicago.microsecond
-        
-        # Check if we're exactly at a 15-minute mark
-        is_at_15min_mark = (current_minute % 15 == 0) and current_second == 0 and current_microsecond == 0
-        
-        if is_at_15min_mark:
-            # Already at :00, :15, :30, or :45, wait 15 minutes for next interval
-            minutes_to_add = 15
-        else:
-            # Calculate minutes until next 15-minute mark
-            minutes_to_add = 15 - (current_minute % 15)
-        
-        next_run = now_chicago + timedelta(minutes=minutes_to_add)
-        # Round down seconds and microseconds to get exact :00, :15, :30, or :45
-        next_run = next_run.replace(second=0, microsecond=0)
-        
-        wait_seconds = (next_run - now_chicago).total_seconds()
-        wait_minutes = wait_seconds / 60
-        wait_minutes_int = int(wait_seconds // 60)
-        wait_seconds_remaining = int(wait_seconds % 60)
-        
-        return {
-            "next_run_time": next_run.strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "next_run_time_short": next_run.strftime("%H:%M"),
-            "wait_minutes": round(wait_minutes, 1),
-            "wait_seconds": int(wait_seconds),
-            "wait_minutes_int": wait_minutes_int,
-            "wait_seconds_remaining": wait_seconds_remaining,
-            "wait_display": f"{wait_minutes_int} min {wait_seconds_remaining} sec",
-            "interval": "15 minutes",
-            "runs_all_day": True
-        }
-    except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.error(f"Error calculating next run time: {e}")
-        return {
-            "error": str(e),
-            "interval": "15 minutes",
-            "runs_all_day": True
-        }
-
-
-@app.post("/api/pipeline/start", response_model=PipelineStartResponse)
-async def start_pipeline(request: PipelineStartRequest = PipelineStartRequest()):
-    """
-    Start a pipeline run immediately.
-    
-    Args:
-        request: Pipeline start request with optional parameters
-    """
-    logger = logging.getLogger(__name__)
-    run_id = str(uuid.uuid4())
-    event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-    
-    # Create empty event log file
-    try:
-        event_log_path.touch()
-    except Exception as e:
-        logger.error(f"Failed to create event log file: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create event log file. Please check file permissions."
-        )
-    
-    # Launch pipeline as separate process
-    env = os.environ.copy()
-    env["PIPELINE_EVENT_LOG"] = str(event_log_path)
-    
-    # Build command arguments
-    cmd = ["python", str(SCHEDULER_SCRIPT), "--now", "--no-debug-window"]
-    if request.wait_for_export:
-        cmd.append("--wait-for-export")
-    if request.launch_ninjatrader:
-        cmd.append("--launch-ninjatrader")
-    
-    try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(QTSW2_ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        
-        logger.info(f"Pipeline started with run_id: {run_id}")
-        return PipelineStartResponse(
-            run_id=run_id,
-            event_log_path=str(event_log_path),
-            status="started"
-        )
-    except FileNotFoundError as e:
-        logger.error(f"Pipeline script not found: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Pipeline script not found. Please check installation."
-        )
-    except Exception as e:
-        logger.error(f"Failed to start pipeline: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to start pipeline. Please check logs for details."
-        )
-
-
-@app.post("/api/pipeline/stage/{stage_name}", response_model=PipelineStartResponse)
-async def run_stage(stage_name: str):
-    """
-    Run a specific pipeline stage (translator, analyzer, or sequential).
-    
-    Args:
-        stage_name: Name of the stage to run (translator, analyzer, or sequential)
-    """
-    if stage_name not in ["translator", "analyzer", "sequential"]:
-        raise HTTPException(status_code=400, detail=f"Invalid stage name: {stage_name}. Must be one of: translator, analyzer, sequential")
-    
-    run_id = str(uuid.uuid4())
-    event_log_path = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-    
-    # Create empty event log file
-    event_log_path.touch()
-    
-    # Launch stage as separate process
-    env = os.environ.copy()
-    env["PIPELINE_EVENT_LOG"] = str(event_log_path)
-    
-    # Build command arguments
-    cmd = ["python", str(SCHEDULER_SCRIPT), "--stage", stage_name, "--no-debug-window"]
-    
-    try:
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(QTSW2_ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        
-        return PipelineStartResponse(
-            run_id=run_id,
-            event_log_path=str(event_log_path),
-            status="started"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start {stage_name} stage: {str(e)}")
+# Schedule and pipeline endpoints moved to routers - see routers/schedule.py and routers/pipeline.py
 
 
 @app.post("/api/merger/run")
@@ -603,514 +306,70 @@ async def run_data_merger():
     """
     try:
         # Launch data merger as separate process
+        # CRITICAL: Do not use PIPE - redirect to files to avoid deadlocks
         cmd = ["python", str(DATA_MERGER_SCRIPT)]
         
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(QTSW2_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        # Create log files for output
+        log_dir = QTSW2_ROOT / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = log_dir / "merger_stdout.log"
+        stderr_log = log_dir / "merger_stderr.log"
         
-        # Wait for process to complete (with timeout)
-        try:
-            stdout, stderr = process.communicate(timeout=300)  # 5 minute timeout
-            return_code = process.returncode
+        with open(stdout_log, 'w', encoding='utf-8') as stdout_file, \
+             open(stderr_log, 'w', encoding='utf-8') as stderr_file:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(QTSW2_ROOT),
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True
+            )
             
-            if return_code == 0:
+            # Wait for process to complete (with timeout)
+            try:
+                return_code = process.wait(timeout=300)  # 5 minute timeout
+                
+                # Read output from log files
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout_content = stdout_file.read()
+                stderr_content = stderr_file.read()
+                
+                if return_code == 0:
+                    return {
+                        "status": "success",
+                        "message": "Data merger completed successfully",
+                        "output": stdout_content[-1000:] if stdout_content else ""  # Last 1000 chars
+                    }
+                else:
+                    return {
+                        "status": "error",
+                        "message": f"Data merger failed with return code {return_code}",
+                        "output": stderr_content[-1000:] if stderr_content else stdout_content[-1000:] if stdout_content else ""
+                    }
+            except subprocess.TimeoutExpired:
+                process.kill()
                 return {
-                    "status": "success",
-                    "message": "Data merger completed successfully",
-                    "output": stdout[-1000:] if stdout else ""  # Last 1000 chars
+                    "status": "timeout",
+                    "message": "Data merger timed out after 5 minutes",
+                    "output": ""
                 }
-            else:
-                return {
-                    "status": "error",
-                    "message": f"Data merger failed with return code {return_code}",
-                    "output": stderr[-1000:] if stderr else stdout[-1000:] if stdout else ""
-                }
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return {
-                "status": "timeout",
-                "message": "Data merger timed out after 5 minutes",
-                "output": ""
-            }
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to run data merger: {str(e)}")
 
 
-@app.get("/api/pipeline/status")
-async def get_pipeline_status():
-    """Get current pipeline run status (if any active run)."""
-    # Find most recent event log
-    event_logs = sorted(EVENT_LOGS_DIR.glob("pipeline_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    
-    if not event_logs:
-        return {"active": False}
-    
-    latest_log = event_logs[0]
-    
-    # Check if log file is very old (more than 1 hour) - consider it inactive
-    import time
-    file_age_seconds = time.time() - latest_log.stat().st_mtime
-    if file_age_seconds > 3600:  # 1 hour
-        return {"active": False}
-    
-    # Read last event to determine status
-    try:
-        with open(latest_log, "r") as f:
-            lines = f.readlines()
-            if lines:
-                last_event = json.loads(lines[-1])
-                event_type = last_event.get("event", "")
-                stage = last_event.get("stage", "")
-                
-                # Check if pipeline is completed
-                # Pipeline is complete if:
-                # 1. Last event is "success" or "failure" from "audit" stage (pipeline complete)
-                # 2. Last event is "success" or "failure" from "pipeline" stage with "complete" message
-                # 3. Last event is "success" or "failure" from individual stage (translator, analyzer, sequential) - single stage run complete
-                # 4. Log file hasn't been modified in last 2 minutes (likely completed)
-                
-                is_complete = False
-                if stage == "audit" and event_type in ["success", "failure"]:
-                    is_complete = True
-                elif stage == "pipeline" and event_type in ["success", "failure"]:
-                    msg = last_event.get("msg", "").lower()
-                    if "complete" in msg or "finished" in msg:
-                        is_complete = True
-                elif stage in ["translator", "analyzer", "sequential"] and event_type in ["success", "failure"]:
-                    # Single stage run is complete if last event is success/failure from that stage
-                    # Check if there are any newer events (wait a bit for potential follow-up events)
-                    # If file hasn't been modified in 30 seconds after stage completion, consider it done
-                    if file_age_seconds > 30:  # 30 seconds after last event
-                        is_complete = True
-                
-                # If file hasn't been modified in 2 minutes, consider it inactive (reduced from 5 minutes)
-                if file_age_seconds > 120:  # 2 minutes
-                    is_complete = True
-                
-                if is_complete:
-                    return {"active": False}
-                
-                # Verify the run_id exists and has a valid event log
-                run_id = last_event.get("run_id")
-                if run_id:
-                    expected_log = EVENT_LOGS_DIR / f"pipeline_{run_id}.jsonl"
-                    if not expected_log.exists():
-                        # Run ID doesn't match any existing log file - consider inactive
-                        return {"active": False}
-                
-                return {
-                    "active": True,
-                    "run_id": run_id,
-                    "stage": last_event.get("stage"),
-                    "event": last_event.get("event"),
-                    "timestamp": last_event.get("timestamp")
-                }
-    except Exception as e:
-        logger.debug(f"Error reading pipeline status: {e}")
-        pass
-    
-    return {"active": False}
+# Pipeline status endpoint moved to routers/pipeline.py
 
 
 # ============================================================
 # WebSocket Event Streaming
 # ============================================================
-
-class ConnectionManager:
-    """Manages WebSocket connections."""
-    
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-        self.tail_tasks: Dict[str, asyncio.Task] = {}
-    
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-    
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-    
-    async def send_personal_message(self, message: dict, websocket: WebSocket):
-        try:
-            await websocket.send_json(message)
-        except Exception:
-            self.disconnect(websocket)
-    
-    async def broadcast(self, message: dict):
-        disconnected = []
-        for connection in list(self.active_connections):  # Create copy to avoid modification during iteration
-            try:
-                # Check if connection is still in active_connections before sending
-                if connection in self.active_connections:
-                    await connection.send_json(message)
-            except Exception as e:
-                error_msg = str(e)
-                # Don't log expected errors (connection closed, etc.)
-                if "websocket.close" not in error_msg.lower() and "response already completed" not in error_msg.lower():
-                    print(f"Error broadcasting to WebSocket: {e}")
-                disconnected.append(connection)
-        
-        for conn in disconnected:
-            self.disconnect(conn)
-    
-    def start_tailing(self, event_log_path: str):
-        """Start tailing an event log file."""
-        if event_log_path in self.tail_tasks:
-            return  # Already tailing
-        
-        task = asyncio.create_task(self._tail_file(event_log_path))
-        self.tail_tasks[event_log_path] = task
-    
-    async def _tail_file(self, event_log_path: str):
-        """Tail a file and broadcast events."""
-        path = Path(event_log_path)
-        print(f"Tailing file: {path}, exists: {path.exists()}")
-        
-        # Wait for file to be created if it doesn't exist
-        max_wait = 30  # Wait up to 30 seconds for file to be created
-        waited = 0
-        while not path.exists() and waited < max_wait:
-            await asyncio.sleep(0.5)
-            waited += 0.5
-            # Check if we still have active connections
-            if not self.active_connections:
-                print(f"No active connections, stopping tail wait for {path}")
-                return
-        
-        if not path.exists():
-            print(f"Event log file does not exist after waiting: {path}")
-            # Send a message to clients that the file doesn't exist
-            try:
-                await self.broadcast({
-                    "stage": "system",
-                    "event": "error",
-                    "msg": f"Event log file not found: {path.name}",
-                    "timestamp": datetime.now().isoformat()
-                })
-            except Exception:
-                pass  # Ignore errors if no connections
-            return
-        
-        # Read existing content first and broadcast it
-        last_position = 0
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                existing_lines = f.readlines()
-                print(f"Found {len(existing_lines)} existing lines in event log")
-                if existing_lines:
-                    for line in existing_lines:
-                        if line.strip():
-                            try:
-                                event = json.loads(line)
-                                print(f"Broadcasting existing event: {event.get('stage', 'unknown')}/{event.get('event', 'unknown')}")
-                                await self.broadcast(event)
-                            except json.JSONDecodeError as e:
-                                print(f"Failed to parse line: {line[:100]}, error: {e}")
-                                pass
-                            except Exception as e:
-                                print(f"Error broadcasting existing event: {e}")
-                                # Don't break - continue with other events
-                    last_position = f.tell()
-                else:
-                    # Empty file - wait for events to be written
-                    print(f"Event log file is empty, waiting for events...")
-                    last_position = 0
-                    # Send a status message to client that we're waiting
-                    try:
-                        await self.broadcast({
-                            "stage": "system",
-                            "event": "log",
-                            "msg": "Waiting for pipeline events...",
-                            "timestamp": datetime.now().isoformat()
-                        })
-                    except Exception:
-                        pass  # Ignore if no connections
-        except Exception as e:
-            print(f"Error reading existing content: {e}")
-            import traceback
-            traceback.print_exc()
-            last_position = 0
-        
-        # Poll for new lines - keep tailing even if there are temporary errors
-        consecutive_errors = 0
-        max_consecutive_errors = 20  # Allow more errors before giving up
-        last_successful_read = time.time()
-        
-        while True:
-            try:
-                # Check if we still have active connections
-                if not self.active_connections:
-                    print(f"No active connections, stopping tail for {path}")
-                    # Clean up task reference
-                    if event_log_path in self.tail_tasks:
-                        self.tail_tasks.pop(event_log_path)
-                    break
-                
-                # Check if file exists
-                if not path.exists():
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        print(f"File still doesn't exist after {max_consecutive_errors} checks, stopping tail")
-                        break
-                    await asyncio.sleep(1)  # Wait longer if file doesn't exist
-                    continue
-                
-                # Try to read new lines
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        f.seek(last_position)
-                        new_lines = f.readlines()
-                        last_position = f.tell()
-                        last_successful_read = time.time()
-                        
-                        # Process new lines
-                        for line in new_lines:
-                            if line.strip():
-                                try:
-                                    event = json.loads(line)
-                                    # Only broadcast if we still have connections
-                                    if self.active_connections:
-                                        await self.broadcast(event)
-                                    consecutive_errors = 0  # Reset error counter on success
-                                except json.JSONDecodeError as e:
-                                    consecutive_errors += 1
-                                    print(f"Failed to parse JSON line (error {consecutive_errors}/{max_consecutive_errors}): {e}")
-                                    if consecutive_errors >= max_consecutive_errors:
-                                        print(f"Too many JSON parse errors, but continuing to tail...")
-                                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    consecutive_errors += 1
-                                    # Don't log expected errors (connection closed, etc.)
-                                    if "websocket.close" not in error_msg.lower() and "response already completed" not in error_msg.lower():
-                                        print(f"Error broadcasting new event (error {consecutive_errors}/{max_consecutive_errors}): {e}")
-                                    # Don't break - keep trying
-                                    if consecutive_errors >= max_consecutive_errors:
-                                        print(f"Too many broadcast errors, but continuing to tail...")
-                                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
-                except (IOError, OSError, PermissionError) as e:
-                    # File might be locked or temporarily unavailable
-                    consecutive_errors += 1
-                    print(f"File read error (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
-                    if consecutive_errors < max_consecutive_errors:
-                        await asyncio.sleep(1)  # Wait longer on file errors
-                        continue
-                    else:
-                        print(f"Too many file read errors, but continuing to tail...")
-                        consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
-                        await asyncio.sleep(2)
-                        continue
-                
-                await asyncio.sleep(0.5)  # Poll every 500ms
-                
-            except FileNotFoundError:
-                # File deleted or moved - wait a bit and check again
-                consecutive_errors += 1
-                print(f"File not found (attempt {consecutive_errors}/{max_consecutive_errors})")
-                if consecutive_errors < max_consecutive_errors:
-                    await asyncio.sleep(1)
-                    continue
-                else:
-                    print(f"File still not found after {max_consecutive_errors} attempts, but continuing to tail...")
-                    consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
-                    await asyncio.sleep(2)
-                    continue
-            except asyncio.CancelledError:
-                print(f"Tailing task cancelled for {path}")
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                print(f"Unexpected error in tail loop (attempt {consecutive_errors}/{max_consecutive_errors}): {e}")
-                import traceback
-                traceback.print_exc()
-                if consecutive_errors < max_consecutive_errors:
-                    await asyncio.sleep(1)  # Wait before retrying
-                    continue
-                else:
-                    print(f"Too many errors, but continuing to tail...")
-                    consecutive_errors = max_consecutive_errors - 5  # Reset to allow recovery
-                    await asyncio.sleep(2)
-                    continue
-        
-        # Clean up
-        if event_log_path in self.tail_tasks:
-            del self.tail_tasks[event_log_path]
+# NOTE: WebSocket endpoints are handled by routers/websocket.py using EventBus
+# All file-tailing code has been removed to prevent connection leaks
 
 
-manager = ConnectionManager()
-
-
-# WebSocket endpoints are now handled by routers/websocket.py (orchestrator-based)
-# Old file-tailing WebSocket endpoints removed - using EventBus instead
-
-
-# ============================================================
-# File Count Endpoints
-# ============================================================
-
-@app.get("/api/metrics/files")
-async def get_file_counts():
-    """Get file counts from data directories."""
-    # These paths should match your actual data directories
-    # Using the same paths as in the scheduler
-    data_raw = QTSW2_ROOT / "data" / "raw"  # Fixed: QTSW2/data/raw (where DataExporter writes)
-    data_processed = QTSW2_ROOT / "data" / "processed"  # QTSW2/data/processed (where files should go)
-    analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
-    sequencer_runs = QTSW2_ROOT / "data" / "sequencer_runs"  # Sequencer output folder
-    
-    # Count raw CSV files (exclude subdirectories like logs folder)
-    raw_count = 0
-    if data_raw.exists():
-        raw_files = list(data_raw.glob("*.csv"))
-        raw_count = len([f for f in raw_files if f.parent == data_raw])
-    
-    # Count processed files
-    processed_count = 0
-    if data_processed.exists():
-        processed_files = list(data_processed.glob("*.parquet"))
-        processed_files.extend(list(data_processed.glob("*.csv")))
-        processed_count = len([f for f in processed_files if f.parent == data_processed])
-    
-    # Count analyzed files (monthly consolidated files in instrument/year folders)
-    analyzed_count = 0
-    if analyzer_runs.exists():
-        # Count monthly parquet files in instrument/year subfolders
-        analyzed_files = list(analyzer_runs.rglob("*.parquet"))
-        analyzed_count = len(analyzed_files)
-    
-    return {
-        "raw_files": raw_count,
-        "processed_files": processed_count,
-        "analyzed_files": analyzed_count
-    }
-
-
-# ============================================================
-# Streamlit App Launchers
-# ============================================================
-
-@app.post("/api/apps/translator/start")
-async def start_translator_app():
-    """Start the Translator Streamlit app."""
-    try:
-        # Check if already running by checking if port 8501 is in use
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('localhost', 8501))
-        sock.close()
-        
-        if result == 0:
-            return {"status": "already_running", "url": "http://localhost:8501"}
-        
-        # Start Streamlit app in new console window (Windows)
-        if os.name == 'nt':
-            # Use start command to open in new window
-            # Verify we're using the correct translator app
-            translator_path = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
-            app_path = str(translator_path).replace('/', '\\')
-            subprocess.Popen(
-                f'start "Translator App" cmd /k "streamlit run \"{app_path}\" --server.port 8501"',
-                shell=True,
-                cwd=str(QTSW2_ROOT)
-            )
-        else:
-            # Linux/Mac
-            subprocess.Popen(
-                ["streamlit", "run", str(TRANSLATOR_APP), "--server.port", "8501"],
-                cwd=str(QTSW2_ROOT)
-            )
-        
-        # Wait a moment for the app to start
-        await asyncio.sleep(3)
-        
-        return {"status": "started", "url": "http://localhost:8501"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start translator app: {str(e)}")
-
-
-@app.post("/api/apps/analyzer/start")
-async def start_analyzer_app():
-    """Start the Analyzer Streamlit app."""
-    try:
-        # Check if already running
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('localhost', 8502))
-        sock.close()
-        
-        if result == 0:
-            return {"status": "already_running", "url": "http://localhost:8502"}
-        
-        # Start Streamlit app in new console window (Windows)
-        if os.name == 'nt':
-            # Use start command to open in new window
-            # Verify we're using the correct analyzer app
-            analyzer_path = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "analyzer_app" / "app.py"
-            app_path = str(analyzer_path).replace('/', '\\')
-            subprocess.Popen(
-                f'start "Analyzer App" cmd /k "streamlit run \"{app_path}\" --server.port 8502"',
-                shell=True,
-                cwd=str(QTSW2_ROOT)
-            )
-        else:
-            # Linux/Mac
-            subprocess.Popen(
-                ["streamlit", "run", str(ANALYZER_APP), "--server.port", "8502"],
-                cwd=str(QTSW2_ROOT)
-            )
-        
-        # Wait a moment for the app to start
-        await asyncio.sleep(3)
-        
-        return {"status": "started", "url": "http://localhost:8502"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start analyzer app: {str(e)}")
-
-
-@app.post("/api/apps/sequential/start")
-async def start_sequential_app():
-    """Start the Sequential Processor Streamlit app."""
-    try:
-        # Check if already running
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('localhost', 8503))
-        sock.close()
-        
-        if result == 0:
-            return {"status": "already_running", "url": "http://localhost:8503"}
-        
-        # Start Streamlit app in new console window (Windows)
-        if os.name == 'nt':
-            # Use start command to open in new window
-            # Verify we're using the correct sequential processor app
-            sequential_path = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
-            app_path = str(sequential_path).replace('/', '\\')
-            subprocess.Popen(
-                f'start "Sequential Processor App" cmd /k "streamlit run \"{app_path}\" --server.port 8503"',
-                shell=True,
-                cwd=str(QTSW2_ROOT)
-            )
-        else:
-            # Linux/Mac
-            subprocess.Popen(
-                ["streamlit", "run", str(SEQUENTIAL_APP), "--server.port", "8503"],
-                cwd=str(QTSW2_ROOT)
-            )
-        
-        # Wait a moment for the app to start
-        await asyncio.sleep(3)
-        
-        return {"status": "started", "url": "http://localhost:8503"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start sequential app: {str(e)}")
+# File count and app launcher endpoints moved to routers - see routers/metrics.py and routers/apps.py
 
 
 # ============================================================
@@ -1179,47 +438,18 @@ async def build_master_matrix(request: MatrixBuildRequest):
         logger.error(error_msg)
         print(error_msg, file=sys.stderr, flush=True)
     
-    # RELOAD MODULE FIRST - before anything else
+    # Import MasterMatrix (simplified - standard import, no complex reloading)
     try:
-        import importlib
         import inspect
         sys.path.insert(0, str(QTSW2_ROOT))
-        
-        # ALWAYS reload the module to ensure we have the latest version
-        # Remove all master_matrix related modules from cache
-        modules_to_remove = [key for key in list(sys.modules.keys()) if 'master_matrix' in key]
-        for module_name in modules_to_remove:
-            del sys.modules[module_name]
-        
-        # Clear import cache
-        importlib.invalidate_caches()
-        
-        # Force reload from file - this ensures we get the latest code
-        import importlib.util
-        master_matrix_file = QTSW2_ROOT / "master_matrix" / "master_matrix.py"
-        spec = importlib.util.spec_from_file_location(
-            "master_matrix_master_matrix",
-            master_matrix_file
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec from {master_matrix_file}")
-        
-        master_matrix_module = importlib.util.module_from_spec(spec)
-        # Execute the module to load it
-        spec.loader.exec_module(master_matrix_module)
-        MasterMatrix = master_matrix_module.MasterMatrix
+        from master_matrix.master_matrix import MasterMatrix
         
         # Verify the signature
         sig = inspect.signature(MasterMatrix.__init__)
         params = list(sig.parameters.keys())
         logger.info(f"MasterMatrix signature: {params}")
-        
-        if 'sequencer_runs_dir' not in params:
-            logger.warning("WARNING: MasterMatrix does NOT have sequencer_runs_dir parameter!")
-        else:
-            logger.info("MasterMatrix has sequencer_runs_dir parameter - good!")
     except Exception as e:
-        logger.error(f"ERROR reloading MasterMatrix module: {e}")
+        logger.error(f"ERROR importing MasterMatrix module: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to load MasterMatrix module: {e}")
     
     # Write to master_matrix.log using the master_matrix logger (after successful reload)
@@ -1330,15 +560,22 @@ async def build_master_matrix(request: MatrixBuildRequest):
         if not analyzer_runs_path.is_absolute():
             analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
         
-        master_df = matrix.build_master_matrix(
-            start_date=request.start_date,
-            end_date=request.end_date,
-            specific_date=request.specific_date,
-            output_dir=request.output_dir,
-            stream_filters=stream_filters_dict,
-            analyzer_runs_dir=str(analyzer_runs_path),
-            streams=request.streams
-        )
+        # Run heavy matrix build in thread pool to avoid blocking FastAPI event loop
+        # This keeps matrix operations separate from pipeline but non-blocking
+        def _build_matrix_sync():
+            """Synchronous matrix build function to run in thread"""
+            return matrix.build_master_matrix(
+                start_date=request.start_date,
+                end_date=request.end_date,
+                specific_date=request.specific_date,
+                output_dir=request.output_dir,
+                stream_filters=stream_filters_dict,
+                analyzer_runs_dir=str(analyzer_runs_path),
+                streams=request.streams
+            )
+        
+        # Execute in thread pool (non-blocking for event loop)
+        master_df = await asyncio.to_thread(_build_matrix_sync)
         
         print(f"Build complete. Trades: {len(master_df)}", file=sys.stderr)
         sys.stderr.flush()
@@ -1389,7 +626,12 @@ async def generate_timetable(request: TimetableRequest):
         )
         engine.scf_threshold = request.scf_threshold
         
-        timetable_df = engine.generate_timetable(trade_date=request.date)
+        # Run heavy timetable generation in thread pool to avoid blocking FastAPI
+        def _generate_timetable_sync():
+            """Synchronous timetable generation to run in thread"""
+            return engine.generate_timetable(trade_date=request.date)
+        
+        timetable_df = await asyncio.to_thread(_generate_timetable_sync)
         
         if timetable_df.empty:
             return {
@@ -1490,9 +732,13 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
             else:
                 return {"data": [], "total": 0, "file": None, "error": f"No master matrix files found. Checked: {backend_matrix_dir} and {root_matrix_dir}. Build the matrix first."}
         
-        # Load parquet file
+        # Load parquet file in thread pool to avoid blocking (large files)
+        def _load_parquet_sync():
+            """Synchronous parquet load to run in thread"""
+            return pd.read_parquet(file_to_load)
+        
         try:
-            df = pd.read_parquet(file_to_load)
+            df = await asyncio.to_thread(_load_parquet_sync)
         except Exception as e:
             return {"data": [], "total": 0, "file": file_to_load.name, "error": f"Failed to read file: {str(e)}"}
         
