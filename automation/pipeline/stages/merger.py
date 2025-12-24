@@ -94,15 +94,43 @@ class MergerService:
         # Determine success
         if process_result.success:
             result.status = "success"
-            self.logger.info("✓ Data merger completed successfully")
+            self.logger.info("[SUCCESS] Data merger completed successfully")
             self.event_logger.emit(run_id, "merger", "success", "Data merger completed successfully")
+            
+            # Write success marker file for run_id-specific validation
+            # This ensures validation can check that THIS run completed, not just that merger ran
+            # Merger writes to analyzer_runs, so we'll write marker there too
+            marker_file = self.config.analyzer_runs / f".merge_complete_{run_id}.marker"
+            try:
+                marker_file.parent.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime
+                marker_file.write_text(f"run_id={run_id}\nstatus=success\ntimestamp={datetime.now().isoformat()}\n")
+                self.logger.debug(f"Wrote merger success marker: {marker_file}")
+            except Exception as e:
+                # Non-fatal - marker file is for validation only
+                self.logger.warning(f"Failed to write merger success marker: {e}")
         else:
             result.status = "failure"
             result.error_message = f"Merger failed (code: {process_result.returncode})"
-            self.logger.error(f"✗ {result.error_message}")
+            self.logger.error(f"[ERROR] {result.error_message}")
             self.event_logger.emit(run_id, "merger", "failure", result.error_message)
         
         return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -28,13 +28,29 @@ def emit_event(run_id: Optional[str], stage: str, event: str, msg: str = "", dat
     if not event_log_path:
         return
     
+    # Ensure run_id is set - get from environment if not provided
+    if not run_id:
+        run_id = os.environ.get("PIPELINE_RUN_ID")
+    
+    # If still no run_id, this is an error - events require run_id for EventBus
+    if not run_id:
+        logger.error(f"CRITICAL: Event emitted without run_id: {stage}/{event}. Event will be rejected by EventBus. Check that PIPELINE_RUN_ID environment variable is set.")
+        # Don't write event without run_id - it will be rejected anyway
+        return
+    
     try:
+        from datetime import datetime
+        import pytz
+        # Use Chicago timezone to match pipeline format
+        chicago_tz = pytz.timezone("America/Chicago")
+        timestamp_iso = datetime.now(chicago_tz).isoformat()
+        
         event_data = {
-            "run_id": run_id or "",
+            "run_id": run_id,
             "stage": stage,
             "event": event,
             "msg": msg,
-            "timestamp": time.time(),
+            "timestamp": timestamp_iso,
             "data": data or {}
         }
         
@@ -46,11 +62,11 @@ def emit_event(run_id: Optional[str], stage: str, event: str, msg: str = "", dat
 
 # Base paths
 QTSW2_ROOT = Path(__file__).parent.parent
-ANALYZER_SCRIPT = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "scripts" / "run_data_processed.py"
+ANALYZER_SCRIPT = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
 DATA_PROCESSED = QTSW2_ROOT / "data" / "data_processed"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 
-def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script: Path) -> Tuple[str, bool, str]:
+def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script: Path, run_id: Optional[str] = None) -> Tuple[str, bool, str]:
     """
     Run analyzer for a single instrument.
     
@@ -58,8 +74,10 @@ def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script:
         Tuple of (instrument, success, output_message)
     """
     start_time = time.time()
+    start_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
     
     # Build command with all available time slots for both sessions
+    # Explicitly include all trading days (Mon-Fri) to ensure Friday is processed
     analyzer_cmd = [
         sys.executable,
         str(analyzer_script),
@@ -69,19 +87,32 @@ def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script:
         "--slots", 
         "S1:07:30", "S1:08:00", "S1:09:00",  # All S1 slots
         "S2:09:30", "S2:10:00", "S2:10:30", "S2:11:00",  # All S2 slots
+        "--days", "Mon", "Tue", "Wed", "Thu", "Fri",  # Explicitly include all trading days including Friday
     ]
     
     try:
         logger.info(f"Starting analyzer for {instrument}...")
+        # Emit file processing start event
+        emit_event(run_id, "analyzer", "file_start", f"Starting analysis for {instrument}", {
+            "instrument": instrument,
+            "start_time": start_timestamp,
+            "start_timestamp": start_time
+        })
         
         # Run analyzer process
+        # Pass environment variables (especially PIPELINE_RUN) to child process
+        process_env = os.environ.copy()
+        if run_id:
+            process_env["PIPELINE_RUN_ID"] = run_id
+        
         process = subprocess.Popen(
             analyzer_cmd,
             cwd=str(QTSW2_ROOT),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=process_env  # Pass environment to ensure PIPELINE_RUN is inherited
         )
         
         # Collect output (last 50 lines for error reporting)
@@ -104,20 +135,77 @@ def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script:
         
         # Wait for completion
         returncode = process.wait()
-        elapsed = time.time() - start_time
+        finish_time = time.time()
+        elapsed = finish_time - start_time
+        finish_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(finish_time))
         
         if returncode == 0:
-            logger.info(f"✓ {instrument} completed in {elapsed:.1f}s")
+            logger.info(f"[OK] {instrument} completed in {elapsed:.1f}s")
+            # Emit file processing finish event
+            emit_event(run_id, "analyzer", "file_finish", f"Completed analysis for {instrument} in {elapsed:.1f}s", {
+                "instrument": instrument,
+                "start_time": start_timestamp,
+                "finish_time": finish_timestamp,
+                "start_timestamp": start_time,
+                "finish_timestamp": finish_time,
+                "duration_seconds": elapsed,
+                "status": "success"
+            })
             return (instrument, True, f"Completed in {elapsed:.1f}s")
         else:
             error_msg = '\n'.join(stderr_lines[-10:]) if stderr_lines else '\n'.join(stdout_lines[-10:])
-            logger.error(f"✗ {instrument} failed after {elapsed:.1f}s")
-            logger.error(f"Error output: {error_msg}")
-            return (instrument, False, f"Failed: {error_msg}")
+            # Check if this is an expected "incomplete data" error (not a real failure)
+            is_incomplete_data = "data ends" in error_msg.lower() and "before expected end time" in error_msg.lower()
+            
+            if is_incomplete_data:
+                # This is expected - data is incomplete, analyzer processed what it could
+                # Don't log as error or emit failure events
+                logger.info(f"ℹ {instrument} processed incomplete data in {elapsed:.1f}s (expected when data is incomplete)")
+                # Emit as success since it processed available data correctly
+                emit_event(run_id, "analyzer", "file_finish", f"Processed incomplete data for {instrument} in {elapsed:.1f}s", {
+                    "instrument": instrument,
+                    "start_time": start_timestamp,
+                    "finish_time": finish_timestamp,
+                    "start_timestamp": start_time,
+                    "finish_timestamp": finish_time,
+                    "duration_seconds": elapsed,
+                    "status": "success",
+                    "note": "incomplete_data"
+                })
+                return (instrument, True, f"Processed incomplete data in {elapsed:.1f}s")
+            else:
+                # Real error - log and emit failure
+                logger.error(f"[ERROR] {instrument} failed after {elapsed:.1f}s")
+                logger.error(f"Error output: {error_msg}")
+                # Emit file processing finish event with failure
+                emit_event(run_id, "analyzer", "file_finish", f"Failed analysis for {instrument} after {elapsed:.1f}s", {
+                    "instrument": instrument,
+                    "start_time": start_timestamp,
+                    "finish_time": finish_timestamp,
+                    "start_timestamp": start_time,
+                    "finish_timestamp": finish_time,
+                    "duration_seconds": elapsed,
+                    "status": "failed",
+                    "error": error_msg
+                })
+                return (instrument, False, f"Failed: {error_msg}")
             
     except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(f"✗ {instrument} exception after {elapsed:.1f}s: {e}")
+        finish_time = time.time()
+        elapsed = finish_time - start_time
+        finish_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(finish_time))
+        logger.error(f"[ERROR] {instrument} exception after {elapsed:.1f}s: {e}")
+        # Emit file processing finish event with exception
+        emit_event(run_id, "analyzer", "file_finish", f"Exception during analysis for {instrument} after {elapsed:.1f}s", {
+            "instrument": instrument,
+            "start_time": start_timestamp,
+            "finish_time": finish_timestamp,
+            "start_timestamp": start_time,
+            "finish_timestamp": finish_time,
+            "duration_seconds": elapsed,
+            "status": "exception",
+            "error": str(e)
+        })
         return (instrument, False, f"Exception: {str(e)}")
 
 
@@ -159,14 +247,9 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
     logger.info(f"Analyzer script: {analyzer_script}")
     logger.info("=" * 60)
     
-    # Emit start event
-    emit_event(run_id, "analyzer", "start", f"Starting parallel analyzer for {len(instruments)} instrument(s)")
-    emit_event(run_id, "analyzer", "log", f"Processing {len(instruments)} instrument(s) in parallel: {', '.join(instruments)}")
-    emit_event(run_id, "analyzer", "metric", "Parallel analyzer started", {
-        "instrument_count": len(instruments),
-        "instruments": instruments,
-        "max_workers": max_workers
-    })
+    # Don't emit start/log/metric events here - AnalyzerService already emits them
+    # This prevents duplicate events in the live feed
+    # Only emit file-level events (file_start, file_finish) which are useful for tracking individual instrument progress
     
     start_time = time.time()
     results = {}
@@ -175,7 +258,7 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_instrument = {
-            executor.submit(run_analyzer_instrument, inst, data_folder, analyzer_script): inst
+            executor.submit(run_analyzer_instrument, inst, data_folder, analyzer_script, run_id): inst
             for inst in instruments
         }
         
@@ -188,10 +271,12 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
                 
                 # Emit completion event
                 if success:
-                    emit_event(run_id, "analyzer", "log", f"[{inst}] ✓ Completed: {message}")
+                    emit_event(run_id, "analyzer", "log", f"[{inst}] [OK] Completed: {message}")
                 else:
-                    emit_event(run_id, "analyzer", "log", f"[{inst}] ✗ Failed: {message}")
-                    emit_event(run_id, "analyzer", "failure", f"[{inst}] Analyzer failed: {message}")
+                    # Only emit failure if it's a real error (not incomplete data)
+                    if "incomplete data" not in message.lower() and "data ends" not in message.lower():
+                        emit_event(run_id, "analyzer", "log", f"[{inst}] [ERROR] Failed: {message}")
+                        emit_event(run_id, "analyzer", "failure", f"[{inst}] Analyzer failed: {message}")
             except Exception as e:
                 logger.error(f"Exception processing {instrument}: {e}")
                 results[instrument] = (False, f"Exception: {str(e)}")

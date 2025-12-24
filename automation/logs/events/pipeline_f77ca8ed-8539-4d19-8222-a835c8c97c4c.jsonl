@@ -1,6 +1,0 @@
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "pipeline", "event": "start", "timestamp": "2025-11-16T12:18:52.735589-06:00", "msg": "Running sequential stage only"}
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "sequential", "event": "start", "timestamp": "2025-11-16T12:18:52.736357-06:00", "msg": "Starting sequential processor stage"}
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "sequential", "event": "metric", "timestamp": "2025-11-16T12:18:52.762198-06:00", "msg": "Analyzer files archived", "data": {"archived_file_count": 36}}
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "sequential", "event": "log", "timestamp": "2025-11-16T12:18:52.762702-06:00", "msg": "Sequential processor skipped (requires manual configuration)"}
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "sequential", "event": "success", "timestamp": "2025-11-16T12:18:52.763109-06:00", "msg": "Sequential processor skipped"}
-{"run_id": "200a344e-c7bb-4645-9c21-358f70b3228f", "stage": "sequential", "event": "success", "timestamp": "2025-11-16T12:18:52.763582-06:00", "msg": "sequential stage completed successfully"}

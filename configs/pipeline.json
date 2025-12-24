@@ -1,0 +1,40 @@
+{
+  "timeouts": {
+    "translator_seconds": 3600,
+    "analyzer_seconds": 21600,
+    "merger_seconds": 1800,
+    "process_no_output_seconds": 300,
+    "process_completion_seconds": 30
+  },
+  "intervals": {
+    "progress_update_seconds": 60,
+    "schedule_minutes": 15
+  },
+  "schedule_times": [0, 15, 30, 45],
+  "timezone": "America/Chicago",
+  "file_patterns": {
+    "raw": "*.csv",
+    "processed": ["*.parquet", "*.csv"]
+  },
+  "lock_settings": {
+    "timeout_seconds": 300,
+    "file_name": ".pipeline.lock"
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

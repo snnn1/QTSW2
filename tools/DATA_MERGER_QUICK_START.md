@@ -7,7 +7,7 @@
 batch\RUN_DATA_MERGER.bat
 
 # Or directly
-python tools\data_merger.py
+python modules\merger\merger.py
 ```
 
 ## What It Does

@@ -1,0 +1,1 @@
+{"run_id": "__system__", "stage": "scheduler", "event": "enabled", "timestamp": "2025-12-15T22:38:16.207392", "msg": "Windows Task Scheduler automation enabled", "data": {"changed_by": "dashboard"}}

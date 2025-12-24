@@ -1,0 +1,46 @@
+{
+  "default_instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"],
+  "instruments": {
+    "ES": {
+      "name": "E-mini S&P 500",
+      "sessions": ["S1", "S2"]
+    },
+    "NQ": {
+      "name": "E-mini Nasdaq-100",
+      "sessions": ["S1", "S2"]
+    },
+    "YM": {
+      "name": "E-mini Dow",
+      "sessions": ["S1", "S2"]
+    },
+    "CL": {
+      "name": "Crude Oil",
+      "sessions": ["S1", "S2"]
+    },
+    "NG": {
+      "name": "Natural Gas",
+      "sessions": ["S1", "S2"]
+    },
+    "GC": {
+      "name": "Gold",
+      "sessions": ["S1", "S2"]
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

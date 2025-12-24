@@ -28,10 +28,10 @@ data/
 ### Output Directories (Monthly Files)
 ```
 data/
-├── analyzer_runs/
-│   └── <instrument>/
+├── analyzed/
+│   └── <instrument><session>/
 │       └── <year>/
-│           └── <instrument>_an_<year>_<month>.parquet
+│           └── <instrument><session>_an_<year>_<month>.parquet
 └── sequencer_runs/
     └── <instrument>/
         └── <year>/
@@ -50,12 +50,12 @@ data/
 
 ### Command Line
 ```bash
-python tools/data_merger.py
+python modules/merger/merger.py
 ```
 
 ### Windows Batch File
 ```batch
-batch\RUN_DATA_MERGER.bat
+batch\RUN_DATA_MERGER.bat (updated to use modules/merger/merger.py)
 ```
 
 ## How It Works

@@ -1,7 +1,7 @@
 """
 Pipeline Dashboard Backend - FastAPI Integration Layer
 
-⚠️ ARCHITECTURE NOTE: This is a backend integration layer / control plane, not a domain module.
+[ARCHITECTURE] NOTE: This is a backend integration layer / control plane, not a domain module.
 
 This file serves as the FastAPI application entry point and integration hub, combining:
 - Backend bootstrap and orchestrator wiring
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
         print("Step 1: Importing orchestrator...")
         logger.info("Initializing Pipeline Orchestrator...")
         try:
-            from .orchestrator import PipelineOrchestrator, OrchestratorConfig
+            from modules.orchestrator import PipelineOrchestrator, OrchestratorConfig
         except ImportError:
             from orchestrator import PipelineOrchestrator, OrchestratorConfig
         print("   [OK] Imported")
@@ -217,7 +217,7 @@ except (ImportError, ValueError):
     backend_path = Path(__file__).parent
     if str(backend_path) not in sys.path:
         sys.path.insert(0, str(backend_path))
-    # Also add dashboard to path for orchestrator imports
+    # Also add modules to path for orchestrator imports
     dashboard_path = backend_path.parent
     if str(dashboard_path) not in sys.path:
         sys.path.insert(0, str(dashboard_path))
@@ -227,12 +227,21 @@ except (ImportError, ValueError):
         # Last resort: try absolute import
         from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics
 
+# Import matrix API router from matrix module
+try:
+    from modules.matrix.api import router as matrix_router
+except ImportError:
+    # Fallback if import fails
+    import sys
+    sys.path.insert(0, str(QTSW2_ROOT))
+    from modules.matrix.api import router as matrix_router
+
 app.include_router(pipeline.router)
 app.include_router(schedule.router)
 app.include_router(websocket.router)
 app.include_router(apps.router)
 app.include_router(metrics.router)
-# Matrix router removed - endpoints are implemented directly in main.py to avoid conflicts
+app.include_router(matrix_router)  # Matrix API from modules.matrix.api
 
 # Legacy scheduler removed - no process to set
 
@@ -664,272 +673,22 @@ async def start_sequential_app():
 
 
 # ============================================================
-# Master Matrix & Timetable Engine API
+# Timetable Engine API (Master Matrix API moved to modules.matrix.api)
 # ============================================================
-
-class StreamFilterConfig(BaseModel):
-    exclude_days_of_week: List[str] = []  # e.g., ["Wednesday", "Friday"]
-    exclude_days_of_month: List[int] = []  # e.g., [4, 16, 30]
-    exclude_times: List[str] = []  # e.g., ["07:30", "08:00"]
-
-
-class MatrixBuildRequest(BaseModel):
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    specific_date: Optional[str] = None
-    analyzer_runs_dir: str = "data/analyzer_runs"
-    output_dir: str = "data/master_matrix"
-    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
-    streams: Optional[List[str]] = None  # If provided, only rebuild these streams
-
 
 class TimetableRequest(BaseModel):
     date: Optional[str] = None
     scf_threshold: float = 0.5
-    analyzer_runs_dir: str = "data/analyzer_runs"
+    analyzer_runs_dir: str = "data/analyzed"
     output_dir: str = "data/timetable"
 
 
-@app.post("/api/matrix/build")
-async def build_master_matrix(request: MatrixBuildRequest):
-    """Build master matrix from all streams."""
-    import os
-    import sys
-    from datetime import datetime
-    
-    # Get logger first
-    logger = logging.getLogger(__name__)
-    logger.info("=" * 80)
-    logger.info("BUILD ENDPOINT HIT!")
-    logger.info("=" * 80)
-    
-    # Write directly to master_matrix.log FIRST (before module reload) - FORCE IT
-    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
-        # Open in append mode, write immediately, force flush
-        f = open(master_matrix_log, 'a', encoding='utf-8')
-        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
-        f.write(f"{timestamp} - INFO - BUILD ENDPOINT HIT!\n")
-        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
-        f.flush()
-        import os
-        if hasattr(f, 'fileno'):
-            try:
-                os.fsync(f.fileno())
-            except:
-                pass
-        f.close()
-        # Also print to stderr to confirm
-        print(f"[DEBUG] Wrote BUILD ENDPOINT HIT to {master_matrix_log}", file=sys.stderr, flush=True)
-    except Exception as e:
-        error_msg = f"ERROR writing to master_matrix.log: {e}"
-        logger.error(error_msg)
-        print(error_msg, file=sys.stderr, flush=True)
-    
-    # RELOAD MODULE FIRST - before anything else
-    try:
-        import importlib
-        import inspect
-        sys.path.insert(0, str(QTSW2_ROOT))
-        
-        # ALWAYS reload the module to ensure we have the latest version
-        # Remove all master_matrix related modules from cache
-        modules_to_remove = [key for key in list(sys.modules.keys()) if 'master_matrix' in key]
-        for module_name in modules_to_remove:
-            del sys.modules[module_name]
-        
-        # Clear import cache
-        importlib.invalidate_caches()
-        
-        # Force reload from file - this ensures we get the latest code
-        import importlib.util
-        master_matrix_file = QTSW2_ROOT / "master_matrix" / "master_matrix.py"
-        spec = importlib.util.spec_from_file_location(
-            "master_matrix_master_matrix",
-            master_matrix_file
-        )
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec from {master_matrix_file}")
-        
-        master_matrix_module = importlib.util.module_from_spec(spec)
-        # Execute the module to load it
-        spec.loader.exec_module(master_matrix_module)
-        MasterMatrix = master_matrix_module.MasterMatrix
-        
-        # Verify the signature
-        sig = inspect.signature(MasterMatrix.__init__)
-        params = list(sig.parameters.keys())
-        logger.info(f"MasterMatrix signature: {params}")
-        
-        if 'sequencer_runs_dir' not in params:
-            logger.warning("WARNING: MasterMatrix does NOT have sequencer_runs_dir parameter!")
-        else:
-            logger.info("MasterMatrix has sequencer_runs_dir parameter - good!")
-    except Exception as e:
-        logger.error(f"ERROR reloading MasterMatrix module: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load MasterMatrix module: {e}")
-    
-    # Write to master_matrix.log using the master_matrix logger (after successful reload)
-    master_matrix_logger = logging.getLogger('master_matrix.master_matrix')
-    master_matrix_logger.info("BUILD ENDPOINT CALLED - Master Matrix import successful")
-    master_matrix_logger.info("About to process stream_filters")
-    
-    # Convert stream_filters from Pydantic models to dicts
-    stream_filters_dict = None
-    if request.stream_filters:
-        stream_filters_dict = {
-            stream_id: {
-                "exclude_days_of_week": filter_config.exclude_days_of_week,
-                "exclude_days_of_month": filter_config.exclude_days_of_month,
-                "exclude_times": filter_config.exclude_times
-            }
-            for stream_id, filter_config in request.stream_filters.items()
-        }
-    
-    # Write debug info to master matrix log using logger
-    master_matrix_logger.info("=" * 80)
-    master_matrix_logger.info("BUILDING MASTER MATRIX - FILTER DEBUG")
-    master_matrix_logger.info(f"Streams to rebuild: {request.streams}")
-    master_matrix_logger.info(f"Stream filters received: {stream_filters_dict}")
-    if stream_filters_dict:
-        for stream_id, filters in stream_filters_dict.items():
-            exclude_times = filters.get('exclude_times', [])
-            if exclude_times:
-                master_matrix_logger.info(f"  {stream_id}: exclude_times = {exclude_times}")
-    master_matrix_logger.info("=" * 80)
-    
-    logger.info("=" * 80)
-    logger.info("[DEBUG] BUILDING MASTER MATRIX")
-    logger.info(f"[DEBUG] Streams: {request.streams}")
-    logger.info(f"[DEBUG] Filters: {stream_filters_dict}")
-    if stream_filters_dict:
-        for stream_id, filters in stream_filters_dict.items():
-            exclude_times = filters.get('exclude_times', [])
-            if exclude_times:
-                logger.info(f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}")
-    logger.info("=" * 80)
-    
-    try:
-        # Initialize MasterMatrix - verify we have the latest version
-        logger.info("About to create MasterMatrix instance")
-        
-        # Only pass parameters that exist in the signature - explicitly check signature first
-        import inspect
-        sig = inspect.signature(MasterMatrix.__init__)
-        valid_params = set(sig.parameters.keys()) - {'self'}
-        logger.info(f"MasterMatrix valid parameters: {valid_params}")
-        
-        # Build kwargs only with valid parameters
-        init_kwargs = {}
-        if "analyzer_runs_dir" in valid_params:
-            # Convert relative path to absolute path
-            analyzer_runs_path = Path(request.analyzer_runs_dir)
-            if not analyzer_runs_path.is_absolute():
-                analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
-            init_kwargs["analyzer_runs_dir"] = str(analyzer_runs_path)
-        if "stream_filters" in valid_params and stream_filters_dict is not None:
-            init_kwargs["stream_filters"] = stream_filters_dict
-        
-        # Explicitly exclude sequencer_runs_dir even if it exists in signature
-        if "sequencer_runs_dir" in init_kwargs:
-            del init_kwargs["sequencer_runs_dir"]
-        
-        logger.info(f"Creating MasterMatrix with kwargs: {init_kwargs}")
-        logger.info(f"Valid parameters from signature: {valid_params}")
-        
-        # Double-check we're not passing sequencer_runs_dir
-        if "sequencer_runs_dir" in init_kwargs:
-            logger.error(f"ERROR: sequencer_runs_dir is in init_kwargs! Removing it...")
-            del init_kwargs["sequencer_runs_dir"]
-        
-        try:
-            matrix = MasterMatrix(**init_kwargs)
-            logger.info("MasterMatrix created successfully")
-        except TypeError as e:
-            error_str = str(e)
-            logger.error(f"TypeError creating MasterMatrix: {error_str}")
-            logger.error(f"init_kwargs passed: {init_kwargs}")
-            logger.error(f"Valid params: {valid_params}")
-            
-            # If the error mentions sequencer_runs_dir but we didn't pass it, the module is cached
-            if "sequencer_runs_dir" in error_str and "sequencer_runs_dir" not in init_kwargs:
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"{error_str} - The backend is using a cached version of MasterMatrix. Please restart the backend completely."
-                )
-            else:
-                raise HTTPException(status_code=500, detail=error_str)
-        
-        print("Calling build_master_matrix...", file=sys.stderr)
-        sys.stderr.flush()
-        logger.info("Calling build_master_matrix...")
-        
-        # Force immediate output
-        import sys
-        print(f"[DEBUG] About to call build_master_matrix with filters: {stream_filters_dict}", file=sys.stderr)
-        sys.stderr.flush()
-        with open(LOG_FILE_PATH, 'a', encoding='utf-8') as f:
-            f.write(f"[DEBUG] About to call build_master_matrix with filters: {stream_filters_dict}\n")
-            f.flush()
-        
-        # Convert analyzer_runs_dir to absolute path for build_master_matrix call
-        analyzer_runs_path = Path(request.analyzer_runs_dir)
-        if not analyzer_runs_path.is_absolute():
-            analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
-        
-        # Run heavy matrix build in thread pool to avoid blocking FastAPI event loop
-        # This keeps matrix operations separate from pipeline but non-blocking
-        def _build_matrix_sync():
-            """Synchronous matrix build function to run in thread"""
-            return matrix.build_master_matrix(
-                start_date=request.start_date,
-                end_date=request.end_date,
-                specific_date=request.specific_date,
-                output_dir=request.output_dir,
-                stream_filters=stream_filters_dict,
-                analyzer_runs_dir=str(analyzer_runs_path),
-                streams=request.streams
-            )
-        
-        # Execute in thread pool (non-blocking for event loop)
-        master_df = await asyncio.to_thread(_build_matrix_sync)
-        
-        print(f"Build complete. Trades: {len(master_df)}", file=sys.stderr)
-        sys.stderr.flush()
-        logger.info(f"Build complete. Trades: {len(master_df)}")
-        
-        if master_df.empty:
-            return {
-                "status": "success",
-                "message": "Master matrix built but is empty",
-                "trades": 0,
-                "streams": [],
-                "instruments": []
-            }
-        
-        # Calculate summary statistics
-        stats = matrix._log_summary_stats(master_df)
-        
-        return {
-            "status": "success",
-            "message": "Master matrix built successfully",
-            "trades": len(master_df),
-            "date_range": {
-                "start": str(master_df['trade_date'].min()),
-                "end": str(master_df['trade_date'].max())
-            },
-            "streams": sorted(master_df['Stream'].unique().tolist()),
-            "instruments": sorted(master_df['Instrument'].unique().tolist()),
-            "allowed_trades": int(master_df['final_allowed'].sum()),
-            "statistics": stats
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
+# Master Matrix endpoints moved to modules.matrix.api router
+# All matrix endpoints are now in: modules/matrix/api.py
+# - POST /api/matrix/build
+# - GET /api/matrix/files  
+# - GET /api/matrix/data
+# - GET /api/matrix/test
 
 
 @app.post("/api/timetable/generate")
@@ -983,148 +742,9 @@ async def generate_timetable(request: TimetableRequest):
         raise HTTPException(status_code=500, detail=f"Failed to generate timetable: {str(e)}")
 
 
-@app.get("/api/matrix/files")
-async def list_matrix_files():
-    """List available master matrix files."""
-    try:
-        # Check both possible locations (where files are actually saved vs. where they might be)
-        # Backend script is in dashboard/backend/, so resolve relative to that
-        backend_dir = Path(__file__).parent  # dashboard/backend/
-        backend_matrix_dir = backend_dir / "data" / "master_matrix"  # dashboard/backend/data/master_matrix/
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"  # QTSW2_ROOT/data/master_matrix/
-        
-        # Collect files from both locations
-        parquet_files = []
-        if backend_matrix_dir.exists():
-            parquet_files.extend(backend_matrix_dir.glob("master_matrix_*.parquet"))
-        if root_matrix_dir.exists():
-            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
-        
-        # Remove duplicates and sort by modification time
-        parquet_files = sorted(set(parquet_files), key=lambda p: p.stat().st_mtime, reverse=True)
-        
-        files = []
-        for file_path in parquet_files:
-            files.append({
-                "name": file_path.name,
-                "path": str(file_path),
-                "size": file_path.stat().st_size,
-                "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
-            })
-        
-        return {"files": files[:20]}  # Return last 20 files
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list matrix files: {str(e)}")
-
-
-@app.get("/api/matrix/data")
-async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
-    """Get master matrix data from the most recent file or specified file."""
-    logger = logging.getLogger(__name__)
-    try:
-        import pandas as pd
-        
-        # Check both possible locations (where files are actually saved vs. where they might be)
-        # Files are saved to relative path "data/master_matrix" from backend's working directory
-        # Backend script is in dashboard/backend/, so resolve relative to that
-        backend_dir = Path(__file__).parent  # dashboard/backend/
-        backend_matrix_dir = backend_dir / "data" / "master_matrix"  # dashboard/backend/data/master_matrix/
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"  # QTSW2_ROOT/data/master_matrix/
-        
-        # Collect files from both locations
-        parquet_files = []
-        if backend_matrix_dir.exists():
-            parquet_files.extend(backend_matrix_dir.glob("master_matrix_*.parquet"))
-        if root_matrix_dir.exists():
-            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
-        
-        if file_path:
-            # Use specified file
-            file_to_load = Path(file_path)
-            if not file_to_load.exists():
-                return {"data": [], "total": 0, "file": None, "error": f"File not found: {file_path}"}
-        else:
-            # Find most recent file from all collected files
-            if parquet_files:
-                # Sort all files by modification time and get most recent
-                parquet_files = sorted(parquet_files, key=lambda p: p.stat().st_mtime, reverse=True)
-                file_to_load = parquet_files[0]
-            else:
-                return {"data": [], "total": 0, "file": None, "error": f"No master matrix files found. Checked: {backend_matrix_dir} and {root_matrix_dir}. Build the matrix first."}
-        
-        # Load parquet file in thread pool to avoid blocking (large files)
-        def _load_parquet_sync():
-            """Synchronous parquet load to run in thread"""
-            return pd.read_parquet(file_to_load)
-        
-        try:
-            df = await asyncio.to_thread(_load_parquet_sync)
-        except Exception as e:
-            return {"data": [], "total": 0, "file": file_to_load.name, "error": f"Failed to read file: {str(e)}"}
-        
-        if df.empty:
-            return {"data": [], "total": 0, "file": file_to_load.name, "error": "File is empty"}
-        
-        # Extract available years from the matrix data itself
-        available_years = []
-        try:
-            if 'trade_date' in df.columns:
-                dates = pd.to_datetime(df['trade_date'], errors='coerce')
-                available_years = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
-            elif 'Date' in df.columns:
-                dates = pd.to_datetime(df['Date'], errors='coerce')
-                available_years = sorted([int(y) for y in dates.dt.year.dropna().unique() if pd.notna(y)])
-            
-            logger.info(f"Extracted {len(available_years)} years from matrix data: {available_years}")
-        except Exception as e:
-            logger.error(f"Error extracting years: {e}")
-            available_years = []
-        
-        logger.info(f"Total records in file: {len(df)}, returning up to {limit} records")
-        
-        # Convert to records (limit rows AFTER extracting years)
-        # NOTE: This returns ALL data from the file - no year filtering applied
-        records = df.head(limit).to_dict('records')
-        
-        # Convert dates and other types to strings for JSON
-        for record in records:
-            for key, value in record.items():
-                # Check for NaN/NaT first (before type checks)
-                if pd.isna(value) or str(type(value)) == "<class 'pandas._libs.tslibs.nattype.NaTType'>":
-                    record[key] = None
-                elif isinstance(value, (pd.Timestamp, datetime)):
-                    if hasattr(value, 'isoformat'):
-                        record[key] = value.isoformat()
-                    else:
-                        record[key] = str(value)
-                elif isinstance(value, (np.integer, np.floating)):
-                    # Convert numpy types to Python types (preserve 0 values)
-                    converted = float(value) if isinstance(value, np.floating) else int(value)
-                    record[key] = converted
-                elif isinstance(value, (int, float)):
-                    # Python int/float - keep as is (including 0)
-                    record[key] = value
-        
-        response = {
-            "data": records,
-            "total": len(df),
-            "file": file_to_load.name,
-            "loaded": len(records),
-            "date_range": {
-                "start": str(df['trade_date'].min()) if 'trade_date' in df.columns and not df['trade_date'].empty else None,
-                "end": str(df['trade_date'].max()) if 'trade_date' in df.columns and not df['trade_date'].empty else None
-            },
-            "streams": sorted(df['Stream'].unique().tolist()) if 'Stream' in df.columns and not df['Stream'].empty else [],
-            "instruments": sorted(df['Instrument'].unique().tolist()) if 'Instrument' in df.columns and not df['Instrument'].empty else [],
-            "years": available_years,
-            "allowed_trades": int(df['final_allowed'].sum()) if 'final_allowed' in df.columns and not df['final_allowed'].empty else 0
-        }
-        
-        return response
-    except Exception as e:
-        import traceback
-        error_detail = f"Failed to load matrix data: {str(e)}\n{traceback.format_exc()}"
-        raise HTTPException(status_code=500, detail=error_detail)
+# Matrix endpoints moved to modules.matrix.api router
+# - GET /api/matrix/files -> modules/matrix/api.py
+# - GET /api/matrix/data -> modules/matrix/api.py
 
 
 @app.get("/api/timetable/files")

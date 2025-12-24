@@ -1,3 +1,0 @@
-{"run_id": "62f0b66b-3a93-49b9-86b6-349246cc8eef", "stage": "pipeline", "event": "start", "timestamp": "2025-11-26T12:19:58.939280-06:00", "msg": "Running analyzer stage only"}
-{"run_id": "62f0b66b-3a93-49b9-86b6-349246cc8eef", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-26T12:19:58.940722-06:00", "msg": "No processed files found in data/processed", "data": {"data_folder": "C:\\Users\\jakej\\QTSW2\\data\\processed", "folder_exists": true}}
-{"run_id": "62f0b66b-3a93-49b9-86b6-349246cc8eef", "stage": "analyzer", "event": "failure", "timestamp": "2025-11-26T12:19:58.940995-06:00", "msg": "analyzer stage failed"}

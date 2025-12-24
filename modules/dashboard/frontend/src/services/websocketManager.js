@@ -1,13 +1,12 @@
 /**
- * WebSocket manager for pipeline events
- * Handles connection lifecycle, reconnection logic, and event emission
- * Uses relative URLs so Vite proxy routes to backend on port 8000
+ * WebSocket manager for pipeline events - Phase-1 Always-On
  * 
- * STRICT INVARIANTS:
- * - One WebSocket per tab, zero orphaned connections
- * - Never create new WebSocket until previous one reaches CLOSED
- * - Reconnect flag captured at connect-time (immutable)
- * - All reconnect timers canceled on disconnect()
+ * SIMPLIFIED ARCHITECTURE:
+ * - One connection per page load
+ * - Reconnect only if socket actually closes or backend is unreachable
+ * - No attemptId logic, no stale handler suppression, no multi-attempt state machine
+ * - If socket is open, events flow
+ * - No snapshot gating - events flow immediately
  */
 
 class WebSocketManager {
@@ -15,259 +14,187 @@ class WebSocketManager {
     this.ws = null
     this.runId = null
     this.onEventCallback = null
-    this.reconnectTimeout = null
-    this.isConnecting = false
-    this.allowReconnect = false  // Fixed boolean flag captured at connect-time
-    this.connectionCounter = 0   // Connection counter for backend correlation
-    this._pendingConnection = null  // Track pending connection attempt
-    this._closeCheckInterval = null  // Track close check interval
+    this._reconnectTimer = null
+    // ADDITION 4: Reconnect delay is now randomized 2-5 seconds in onclose handler
   }
 
   /**
    * Connect to WebSocket for a given run ID
-   * @param {string|null} runId - Pipeline run ID, or null for all events (scheduler events)
+   * Phase-1: Simple connection, no complex state machine
+   * 
+   * @param {string|null} runId - Pipeline run ID, or null for all events
    * @param {Function} onEvent - Callback function for events
-   * @param {boolean} allowReconnect - Whether to allow reconnection on disconnect (captured at connect-time)
+   * @param {boolean} allowReconnect - Whether to allow reconnection on disconnect
    */
-  connect(runId, onEvent, allowReconnect = false) {
-    // Allow null runId for scheduler events (all events)
-    if (runId === undefined) {
-      console.warn('No run ID provided for WebSocket connection')
+  connect(runId, onEvent, allowReconnect = true) {
+    // Validation
+    if (runId !== null && (typeof runId !== 'string' || runId.length === 0)) {
+      console.warn(`[WS] Invalid runId: ${runId}`)
       return
     }
 
-    this.onEventCallback = onEvent
-    this.allowReconnect = allowReconnect  // Capture at connect-time (immutable)
-
-    // If already connected to the same runId, skip
-    if (this.ws && this.runId === runId) {
-      const state = this.ws.readyState
-      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
-        console.log(`[WS] Already connected/connecting to runId ${runId}, skipping`)
+    if (onEvent !== undefined && typeof onEvent !== 'function') {
+      console.warn(`[WS] Invalid onEvent callback: ${typeof onEvent}`)
         return
       }
-    }
 
-    // Cancel any pending connection attempt
-    if (this._pendingConnection) {
-      console.log(`[WS] Canceling pending connection to runId ${this._pendingConnection}`)
-      this._cancelPendingConnection()
-    }
-
-    // If there's an existing connection, wait for it to close before creating new one
-    if (this.ws) {
-      const state = this.ws.readyState
-      if (state !== WebSocket.CLOSED) {
-        console.log(`[WS] Existing connection not closed (state: ${state}), waiting for CLOSED before connecting to new runId`)
-        // Disconnect explicitly and wait for CLOSED
-        this._waitForClosedThenConnect(runId)
-        return
-      }
-    }
-
-    // Safe to connect - no existing connection or it's already CLOSED
-    this._connectInternal(runId)
-  }
-
-  /**
-   * Cancel pending connection attempt
-   * @private
-   */
-  _cancelPendingConnection() {
-    if (this._closeCheckInterval) {
-      clearInterval(this._closeCheckInterval)
-      this._closeCheckInterval = null
-    }
-    this._pendingConnection = null
-  }
-
-  /**
-   * Wait for existing connection to close, then connect to new runId
-   * @private
-   */
-  _waitForClosedThenConnect(runId) {
-    // Cancel any pending reconnect timers
-    this._cancelReconnectTimer()
-    
-    // Cancel any existing pending connection
-    this._cancelPendingConnection()
-
-    if (!this.ws) {
-      this._connectInternal(runId)
+    // If already connected to same runId, just update callback
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.runId === runId) {
+      console.log(`[WS] Already connected to runId ${runId}, updating callback`)
+      this.onEventCallback = onEvent
+      this.allowReconnect = allowReconnect  // Update allowReconnect flag
       return
     }
 
-    const state = this.ws.readyState
-    if (state === WebSocket.CLOSED) {
-      this.ws = null
-      this._connectInternal(runId)
-      return
-    }
-
-    // Track this as pending connection
-    this._pendingConnection = runId
-
-    // Close existing connection explicitly
-    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
-      this.ws.close(1000, 'Switching to new runId')
-    }
-
-    // Wait for CLOSED state, then connect
-    this._closeCheckInterval = setInterval(() => {
-      if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
-        this._cancelPendingConnection()
-        this.ws = null
-        this._connectInternal(runId)
-      }
-    }, 50)
-
-    // Timeout after 2 seconds (reduced from 5)
-    setTimeout(() => {
-      if (this._closeCheckInterval) {
-        clearInterval(this._closeCheckInterval)
-        this._closeCheckInterval = null
-      }
-      if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-        console.warn('[WS] Timeout waiting for connection to close, forcing cleanup')
-        this.ws = null
-      }
-      if (this._pendingConnection === runId) {
-        this._pendingConnection = null
-        this._connectInternal(runId)
-      }
-    }, 2000)
+    // Close existing connection if different runId (but preserve allowReconnect for new connection)
+    if (this.ws && this.runId !== runId) {
+      const wasReconnecting = this.allowReconnect
+      this.disconnect()
+      this.allowReconnect = wasReconnecting  // Restore allowReconnect for new connection
   }
 
-  /**
-   * Internal connection logic - NEVER calls disconnect()
-   * @private
-   */
-  _connectInternal(runId) {
-    // STRICT: Never create new WebSocket if previous one isn't CLOSED
-    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-      console.error('[WS] CRITICAL: Attempted to create new WebSocket while previous one is not CLOSED!')
-      return
-    }
-
-    // Cancel any pending reconnect timers
-    this._cancelReconnectTimer()
-
+    // Store configuration
     this.runId = runId
-    this.isConnecting = true
-    this.connectionCounter += 1
-    const connId = this.connectionCounter
+    this.onEventCallback = onEvent
+    this.allowReconnect = allowReconnect
 
-    // Use relative URL so Vite proxy handles it
+    // Start connection
+    this._connect()
+  }
+
+  /**
+   * Internal connection method
+   * @private
+   */
+  _connect() {
+    // Cancel any pending reconnect
+    this._cancelReconnect()
+    
+    // Don't connect if already connected or connecting
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN) {
+        console.log(`[WS] Already connected, skipping reconnect`)
+      return
+    }
+      if (this.ws.readyState === WebSocket.CONNECTING) {
+        console.log(`[WS] Already connecting, skipping reconnect`)
+        return
+    }
+      // If socket is in CLOSING or CLOSED state, clear it so we can create a new one
+      if (this.ws.readyState === WebSocket.CLOSING || this.ws.readyState === WebSocket.CLOSED) {
+        console.log(`[WS] Clearing old socket in ${this.ws.readyState} state`)
+        this.ws = null
+      }
+  }
+
+    // Build WebSocket URL
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = window.location.host
-    // If runId is null, connect to /ws/events (all events), otherwise /ws/events/{runId}
-    const wsUrl = runId === null 
+    const wsUrl = this.runId === null 
       ? `${protocol}//${host}/ws/events`
-      : `${protocol}//${host}/ws/events/${runId}`
+      : `${protocol}//${host}/ws/events/${this.runId}`
+
+    console.log(`[WS] Connecting to ${wsUrl}`)
     
-    console.log(`[WS] [${connId}] CONNECT to ${wsUrl} (runId: ${runId}, allowReconnect: ${this.allowReconnect})`)
+    try {
     const ws = new WebSocket(wsUrl)
+      this.ws = ws
 
     ws.onopen = () => {
-      console.log(`[WS] [${connId}] OPEN - Connected to ${wsUrl}`)
-      this.isConnecting = false
-      // NO ping - backend handles keepalive
+        console.log(`[WS] Connected (runId: ${this.runId || 'all'})`)
+        // Log connection for debugging
+        if (this.onEventCallback) {
+          console.log('[WS] Event callback is set, ready to receive events')
+        } else {
+          console.warn('[WS] WARNING: No event callback set!')
+        }
     }
 
     ws.onmessage = (event) => {
+        // Phase-1: No snapshot gating - forward all messages immediately
       try {
         const data = JSON.parse(event.data)
         if (this.onEventCallback) {
           this.onEventCallback(data)
         }
       } catch (error) {
-        console.error(`[WS] [${connId}] Failed to parse message:`, error, event.data)
+          console.error(`[WS] Failed to parse message:`, error, event.data)
       }
     }
 
     ws.onclose = (event) => {
-      console.log(`[WS] [${connId}] CLOSE - Code: ${event.code}, Reason: ${event.reason || 'none'}`)
+        console.log(`[WS] Closed (code: ${event.code}, reason: ${event.reason || 'none'}, runId: ${this.runId || 'all'})`)
       this.ws = null
-      this.isConnecting = false
 
-      // Only reconnect if allowed (captured at connect-time) and not normal closure
-      if (this.allowReconnect && event.code !== 1000 && event.code !== 1001) {
-        // Single reconnection attempt only
-        if (!this.reconnectTimeout) {
-          console.log(`[WS] [${connId}] Scheduling single reconnection attempt...`)
-          this._scheduleSingleReconnect(runId, connId)
-        }
+        // ADDITION 4: Frontend reconnect policy
+        // On WebSocket close:
+        // - show "Reconnecting..." (handled by UI via connection state)
+        // - retry every 2-5 seconds
+        // - Do NOT reset UI, clear events, disable buttons, or infer backend failure
+        // Reconnect on ANY close code if allowReconnect is true (only skip if we explicitly disconnected)
+        if (this.allowReconnect) {
+          // Use random delay between 2-5 seconds for reconnect
+          const reconnectDelay = 2000 + Math.random() * 3000  // 2000-5000ms
+          console.log(`[WS] Scheduling reconnect in ${Math.round(reconnectDelay)}ms... (code: ${event.code})`)
+          this._reconnectTimer = setTimeout(() => {
+            this._reconnectTimer = null
+            this._connect()
+          }, reconnectDelay)
       } else {
-        console.log(`[WS] [${connId}] Not reconnecting (allowReconnect: ${this.allowReconnect}, code: ${event.code})`)
+          console.log(`[WS] Reconnect disabled, not reconnecting (code: ${event.code})`)
       }
     }
 
     ws.onerror = (error) => {
-      console.error(`[WS] [${connId}] ERROR:`, error)
-      this.isConnecting = false
-    }
-
-    this.ws = ws
-  }
-
-  /**
-   * Schedule a single reconnection attempt (one retry only)
-   * @private
-   */
-  _scheduleSingleReconnect(runId, connId) {
-    // Cancel any existing reconnect timer
-    this._cancelReconnectTimer()
-
-    const delay = 2000  // Fixed 2 second delay
-    console.log(`[WS] [${connId}] Reconnecting in ${delay}ms...`)
-
-    this.reconnectTimeout = setTimeout(() => {
-      this.reconnectTimeout = null
-      
-      // Only reconnect if still allowed and runId matches
-      if (this.allowReconnect && this.runId === runId && (!this.ws || this.ws.readyState === WebSocket.CLOSED)) {
-        this._connectInternal(runId)
-      } else {
-        console.log(`[WS] [${connId}] Reconnection canceled (allowReconnect: ${this.allowReconnect}, runId match: ${this.runId === runId})`)
+        console.error(`[WS] Error (runId: ${this.runId || 'all'}):`, error)
+        // Error will be followed by onclose, so we don't change state here
       }
-    }, delay)
-  }
-
-  /**
-   * Cancel reconnect timer and ensure it cannot fire
-   * @private
-   */
-  _cancelReconnectTimer() {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout)
-      this.reconnectTimeout = null
+    } catch (error) {
+      console.error(`[WS] Failed to create WebSocket:`, error)
+      this.ws = null
+      
+      // Retry if allowed (use same randomized delay as onclose)
+      if (this.allowReconnect) {
+        const reconnectDelay = 2000 + Math.random() * 3000  // 2000-5000ms
+        this._reconnectTimer = setTimeout(() => {
+          this._reconnectTimer = null
+          this._connect()
+        }, reconnectDelay)
+      }
     }
   }
 
   /**
-   * Disconnect from WebSocket - explicit teardown
+   * Cancel reconnect timer
+   * @private
+   */
+  _cancelReconnect() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer)
+      this._reconnectTimer = null
+    }
+  }
+
+  /**
+   * Disconnect from WebSocket
    */
   disconnect() {
-    // Cancel pending connection attempts
-    this._cancelPendingConnection()
-    console.log(`[WS] DISCONNECT called - tearing down connection`)
-    
-    // Cancel reconnect timer (prevents any reconnection after disconnect)
-    this._cancelReconnectTimer()
-    
-    // Disable reconnection permanently
+    console.log(`[WS] Disconnecting`)
     this.allowReconnect = false
+    this._cancelReconnect()
 
     if (this.ws) {
-      const state = this.ws.readyState
-      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+      try {
+        if (this.ws.readyState !== WebSocket.CLOSED) {
         this.ws.close(1000, 'Client disconnecting')
+        }
+      } catch (e) {
+        // Ignore
       }
       this.ws = null
     }
     
     this.runId = null
-    this.isConnecting = false
     this.onEventCallback = null
   }
 
@@ -286,11 +213,19 @@ class WebSocketManager {
   getRunId() {
     return this.runId
   }
+
+  /**
+   * Get current state (simplified)
+   * @returns {string}
+   */
+  getState() {
+    if (!this.ws) return 'idle'
+    if (this.ws.readyState === WebSocket.CONNECTING) return 'connecting'
+    if (this.ws.readyState === WebSocket.OPEN) return 'connected'
+    if (this.ws.readyState === WebSocket.CLOSING) return 'closing'
+    return 'closed'
+  }
 }
 
 // Export singleton instance
 export const websocketManager = new WebSocketManager()
-
-
-
-

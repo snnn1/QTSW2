@@ -1,4 +1,0 @@
-{"run_id": "a77402e6-67c9-472b-b8cd-76d9c3c00c6c", "stage": "pipeline", "event": "start", "timestamp": "2025-12-04T18:45:00.002008-06:00", "msg": "Pipeline run started"}
-{"run_id": "a77402e6-67c9-472b-b8cd-76d9c3c00c6c", "stage": "pipeline", "event": "log", "timestamp": "2025-12-04T18:45:00.002461-06:00", "msg": "Checking for CSV files in data/raw"}
-{"run_id": "a77402e6-67c9-472b-b8cd-76d9c3c00c6c", "stage": "pipeline", "event": "log", "timestamp": "2025-12-04T18:45:00.003208-06:00", "msg": "No files found - skipping all stages"}
-{"run_id": "a77402e6-67c9-472b-b8cd-76d9c3c00c6c", "stage": "pipeline", "event": "success", "timestamp": "2025-12-04T18:45:00.003707-06:00", "msg": "Pipeline complete (no files to process)"}

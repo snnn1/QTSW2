@@ -1,19 +1,5 @@
 """
-Schedule metadata and Windows Task Scheduler integration endpoints.
-
-This module does NOT:
-- Execute or schedule pipeline runs (Windows Task Scheduler does this)
-- Own timing logic or run loops
-- Control when runs occur
-
-This module ONLY:
-- Reads/writes schedule.json (metadata storage)
-- Enables/disables Windows Task Scheduler task (advisory control)
-- Shows observed scheduler health and expected next run time
-- Verifies Windows Task Scheduler task exists
-
-Execution authority: Windows Task Scheduler (external system)
-This module is advisory/observational only.
+Schedule management endpoints - Windows Task Scheduler control
 """
 import json
 import logging
@@ -44,23 +30,15 @@ logger = logging.getLogger(__name__)
 
 @router.get("/schedule", response_model=ScheduleConfig)
 async def get_schedule():
-    """
-    Get schedule metadata from schedule.json.
-    
-    Note: This is metadata only. Windows Task Scheduler controls actual execution timing.
-    Windows Task Scheduler runs every 15 minutes regardless of this config.
-    """
+    """Get current scheduled daily run time."""
     return load_schedule_config()
 
 
 @router.post("/schedule", response_model=ScheduleConfig)
 async def update_schedule(config: ScheduleConfig):
     """
-    Update schedule metadata in schedule.json.
-    
-    Note: This only updates metadata. Windows Task Scheduler controls actual execution timing.
-    Windows Task Scheduler runs every 15 minutes regardless of this config.
-    This endpoint is kept for compatibility with UI that may display schedule preferences.
+    Update scheduled daily run time.
+    Note: This is kept for compatibility but Windows Task Scheduler runs every 15 minutes.
     """
     # Validate time format
     try:
@@ -98,15 +76,7 @@ async def update_schedule(config: ScheduleConfig):
 
 @router.post("/scheduler/enable")
 async def enable_scheduler():
-    """
-    Enable Windows Task Scheduler task (advisory control).
-    
-    This does NOT schedule or execute runs - it only enables the external Windows Task Scheduler task.
-    Execution authority remains with Windows Task Scheduler.
-    """
-    logger.info("=" * 60)
-    logger.info("SCHEDULER ENABLE ENDPOINT CALLED")
-    logger.info("=" * 60)
+    """Enable Windows Task Scheduler automation."""
     try:
         from ..main import orchestrator_instance
     except ImportError:
@@ -117,32 +87,19 @@ async def enable_scheduler():
             sys.path.insert(0, str(backend_path))
         from main import orchestrator_instance
     
-    logger.info(f"Scheduler enable requested - orchestrator_instance={orchestrator_instance is not None}")
-    
-    if orchestrator_instance is None:
-        logger.error("Orchestrator instance is None - orchestrator may have failed to start")
+    if orchestrator_instance is None or orchestrator_instance.scheduler is None:
         raise HTTPException(
             status_code=503,
-            detail="Orchestrator not available - check backend logs for startup errors"
-        )
-    
-    logger.info(f"Scheduler object check - scheduler={orchestrator_instance.scheduler is not None}")
-    if orchestrator_instance.scheduler is None:
-        logger.error("Scheduler is None in orchestrator instance - scheduler initialization failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Scheduler not available - check backend logs for initialization errors"
+            detail="Orchestrator not available"
         )
     
     try:
-        logger.info("Calling scheduler.enable()...")
         success, error_msg = orchestrator_instance.scheduler.enable(changed_by="dashboard")
-        logger.info(f"Scheduler enable result: success={success}, error_msg={error_msg if error_msg else 'None'}")
         if success:
             # Publish scheduler event to EventBus
             try:
                 await orchestrator_instance.event_bus.publish({
-                    "run_id": "__system__",  # System-level event (no specific run_id)
+                    "run_id": None,  # No specific run_id for scheduler lifecycle events
                     "stage": "scheduler",
                     "event": "enabled",
                     "timestamp": datetime.now().isoformat(),
@@ -185,16 +142,6 @@ async def enable_scheduler():
         else:
             # Use the detailed error message from scheduler
             detail = error_msg or "Failed to enable Windows Task Scheduler. Check backend logs for details."
-            
-            # If it's a permission error, provide clear guidance
-            if "Permission denied" in detail or "Access is denied" in detail:
-                detail = (
-                    "Permission denied: Windows Task Scheduler requires administrator privileges to enable/disable tasks. "
-                    "SOLUTION: Run the backend as administrator - Right-click 'batch\\START_DASHBOARD.bat' and select 'Run as administrator'. "
-                    "Alternatively, manually enable/disable the task in Task Scheduler (taskschd.msc)."
-                )
-            
-            logger.error(f"Failed to enable scheduler: {detail}")
             raise HTTPException(
                 status_code=500,
                 detail=detail
@@ -211,15 +158,7 @@ async def enable_scheduler():
 
 @router.post("/scheduler/disable")
 async def disable_scheduler():
-    """
-    Disable Windows Task Scheduler task (advisory control).
-    
-    This does NOT stop scheduling - it only disables the external Windows Task Scheduler task.
-    Execution authority remains with Windows Task Scheduler.
-    """
-    logger.info("=" * 60)
-    logger.info("SCHEDULER DISABLE ENDPOINT CALLED")
-    logger.info("=" * 60)
+    """Disable Windows Task Scheduler automation."""
     try:
         from ..main import orchestrator_instance
     except ImportError:
@@ -230,31 +169,19 @@ async def disable_scheduler():
             sys.path.insert(0, str(backend_path))
         from main import orchestrator_instance
     
-    if orchestrator_instance is None:
-        logger.error("Orchestrator instance is None - orchestrator may have failed to start")
+    if orchestrator_instance is None or orchestrator_instance.scheduler is None:
         raise HTTPException(
             status_code=503,
-            detail="Orchestrator not available - check backend logs for startup errors"
-        )
-    
-    if orchestrator_instance.scheduler is None:
-        logger.error("Scheduler is None in orchestrator instance - scheduler initialization failed")
-        raise HTTPException(
-            status_code=503,
-            detail="Scheduler not available - check backend logs for initialization errors"
+            detail="Orchestrator not available"
         )
     
     try:
-        logger.info(f"Orchestrator instance available: {orchestrator_instance is not None}")
-        logger.info(f"Scheduler object available: {orchestrator_instance.scheduler is not None}")
-        logger.info("Calling scheduler.disable()...")
         success, error_msg = orchestrator_instance.scheduler.disable(changed_by="dashboard")
-        logger.info(f"Scheduler disable result: success={success}, error_msg={error_msg if error_msg else 'None'}")
         if success:
             # Publish scheduler event to EventBus
             try:
                 await orchestrator_instance.event_bus.publish({
-                    "run_id": "__system__",  # System-level event (no specific run_id)
+                    "run_id": None,  # No specific run_id for scheduler lifecycle events
                     "stage": "scheduler",
                     "event": "disabled",
                     "timestamp": datetime.now().isoformat(),
@@ -289,21 +216,9 @@ async def disable_scheduler():
 
 @router.get("/scheduler/status")
 async def get_scheduler_status():
-    """
-    Get scheduler health status inferred from observed events.
-    
-    This endpoint does NOT check backend state or "connection" status.
-    It infers scheduler health by looking for scheduler/start events in the event history.
-    
-    Status meanings:
-    - 🟢 Active: Scheduled runs observed recently (within expected cadence window)
-    - 🟡 Stale: No scheduled run observed within expected window (15-20 minutes)
-    - 🔴 Unknown: No historical scheduled runs ever observed
-    """
-    logger.debug("[SCHEDULER API] Status endpoint called (event-based inference)")
+    """Get Windows Task Scheduler status."""
     try:
         from ..main import orchestrator_instance
-        from datetime import datetime, timedelta
     except ImportError:
         import sys
         from pathlib import Path
@@ -311,155 +226,43 @@ async def get_scheduler_status():
         if str(backend_path) not in sys.path:
             sys.path.insert(0, str(backend_path))
         from main import orchestrator_instance
-        from datetime import datetime, timedelta
     
-    if orchestrator_instance is None:
-        logger.error("Orchestrator instance is None - orchestrator may have failed to start")
+    if orchestrator_instance is None or orchestrator_instance.scheduler is None:
         return {
+            "enabled": False,
             "status": "unknown",
-            "health": "unknown",
-            "message": "Orchestrator not available - check backend logs for startup errors",
-            "windows_task_exists": None,
-            "windows_task_enabled": None
+            "message": "Orchestrator not available"
         }
     
-    if orchestrator_instance.scheduler is None:
-        logger.error("Scheduler is None in orchestrator instance - scheduler initialization failed")
-        return {
-            "status": "unknown",
-            "health": "unknown",
-            "message": "Scheduler not available - check backend logs for initialization errors",
-            "windows_task_exists": None,
-            "windows_task_enabled": None
-        }
-    
-    # Get Windows Task Scheduler state (for reference, but not the primary health indicator)
-    logger.debug("[SCHEDULER API] Getting scheduler state from orchestrator...")
     state = orchestrator_instance.scheduler.get_state()
     windows_status = state.get("windows_task_status", {})
-    windows_task_enabled = windows_status.get("enabled", False)
-    windows_task_exists = windows_status.get("exists", None)
-    logger.debug(f"[SCHEDULER API] Windows task status: exists={windows_task_exists}, enabled={windows_task_enabled}, state={windows_status.get('state')}")
     
-    # INFER HEALTH FROM OBSERVED EVENTS (not backend state)
-    # Look for scheduler/start events in recent event history
-    recent_events = orchestrator_instance.event_bus.get_recent_events(limit=500)
+    # Use authoritative enabled status from Windows Task Scheduler
+    enabled = state.get("is_enabled", False)
+    exists = windows_status.get("exists", None)
     
-    # Filter for scheduler/start events (these indicate scheduled runs)
-    scheduler_start_events = [
-        e for e in recent_events 
-        if e.get("stage") == "scheduler" and e.get("event") == "start"
-    ]
-    
-    # Determine health based on most recent scheduler/start event
-    now = datetime.now()
-    
-    health = "unknown"
-    last_scheduled_run_time = None
-    expected_next_run_time = None
-    message = ""
-    
-    # Expected interval between scheduled runs (15 minutes in seconds)
-    EXPECTED_INTERVAL_SECONDS = 15 * 60  # 900 seconds
-    
-    if scheduler_start_events:
-        # Find the most recent scheduler/start event
-        most_recent = max(scheduler_start_events, key=lambda e: e.get("timestamp", ""))
-        last_scheduled_run_time = most_recent.get("timestamp")
-        
-        try:
-            # Parse timestamp (handle both with and without timezone)
-            timestamp_str = last_scheduled_run_time
-            if timestamp_str.endswith("Z"):
-                timestamp_str = timestamp_str.replace("Z", "+00:00")
-            
-            last_run_time = datetime.fromisoformat(timestamp_str)
-            
-            # Remove timezone for comparison if present
-            if last_run_time.tzinfo:
-                last_run_time_tz = last_run_time
-                last_run_time = last_run_time.replace(tzinfo=None)
-            else:
-                last_run_time_tz = None
-            
-            time_since_last = (now - last_run_time).total_seconds()
-            
-            # Calculate expected next run time (last run + interval, rounded to next 15-minute mark)
-            if last_run_time:
-                # Calculate next 15-minute interval after last run
-                # Runs occur at :00, :15, :30, :45 of each hour
-                minutes = last_run_time.minute
-                interval_slot = (minutes // 15) * 15
-                next_slot_minutes = interval_slot + 15
-                if next_slot_minutes >= 60:
-                    # Next hour
-                    expected_next_run_time_dt = last_run_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                else:
-                    expected_next_run_time_dt = last_run_time.replace(minute=next_slot_minutes, second=0, microsecond=0)
-                expected_next_run_time = expected_next_run_time_dt.isoformat()
-            
-            # Scheduler health: active if last_run < 2 × interval
-            # This gives slack for runs that are slightly late
-            health_threshold = 2 * EXPECTED_INTERVAL_SECONDS  # 30 minutes
-            
-            if time_since_last <= health_threshold:
-                health = "active"
-                minutes_ago = int(time_since_last / 60)
-                message = f"Scheduled runs observed recently (last run {minutes_ago} minute{'s' if minutes_ago != 1 else ''} ago)"
-            elif time_since_last <= 3600:  # 30-60 minutes ago
-                health = "stale"
-                minutes_ago = int(time_since_last / 60)
-                message = f"No scheduled run observed recently (last run {minutes_ago} minutes ago, expected every 15 minutes)"
-            else:  # > 60 minutes
-                health = "stale"
-                hours_ago = time_since_last / 3600
-                message = f"Scheduled runs appear stopped (last run {hours_ago:.1f} hour{'s' if hours_ago > 1 else ''} ago)"
-        except (ValueError, AttributeError, TypeError) as e:
-            logger.warning(f"Failed to parse timestamp {last_scheduled_run_time}: {e}")
-            health = "unknown"
-            message = "Could not determine scheduler health from events"
-            expected_next_run_time = None
+    if exists is False:
+        message = "Windows Task Scheduler task not found. Run setup script to create it."
+    elif enabled:
+        message = "Windows Task Scheduler automation is enabled (runs every 15 minutes)"
     else:
-        # No scheduler/start events ever observed
-        health = "unknown"
-        message = "No scheduled runs observed yet (may be disabled or not yet run)"
-        expected_next_run_time = None
-        last_scheduled_run_time = None
+        message = "Windows Task Scheduler automation is disabled"
     
-    # Map health to UI-friendly status (legacy compatibility)
-    status = "enabled" if health == "active" else ("disabled" if health == "stale" else "unknown")
-    
-    response = {
-        "status": status,  # Legacy: enabled/disabled/unknown (deprecated - use health)
-        "health": health,  # active/stale/unknown (primary field for UI)
-        "message": message,
-        "enabled": windows_task_enabled,  # Direct Windows Task Scheduler enabled state (for UI toggle)
-        "last_scheduled_run_time": last_scheduled_run_time,  # Explicit field name
-        "expected_next_run_time": expected_next_run_time,  # Calculated expected next run
-        "windows_task_exists": windows_task_exists,
-        "windows_task_enabled": windows_task_enabled,  # Explicit Windows task enabled state
+    return {
+        "enabled": enabled,
+        "status": "enabled" if enabled else "disabled",
+        "windows_task_exists": exists,
+        "windows_task_enabled": windows_status.get("enabled", False),
         "windows_task_state": windows_status.get("state", "Unknown"),
-        "scheduler_enabled_setting": state.get("scheduler_enabled", False),  # What the setting is, not health
         "last_changed": state.get("last_changed_timestamp"),
-        "last_changed_by": state.get("last_changed_by")
+        "last_changed_by": state.get("last_changed_by"),
+        "message": message
     }
-    
-    logger.debug(f"[SCHEDULER API] Status response: health={health}, enabled={windows_task_enabled}, last_run={last_scheduled_run_time}, scheduler_events={len(scheduler_start_events)}")
-    
-    return response
 
 
 @router.get("/schedule/next")
 async def get_next_scheduled_run():
-    """
-    Get expected next scheduled run time (calendar/expectation only).
-    
-    This calculates the expected next run based on the 15-minute cadence pattern.
-    It does NOT schedule or control execution - Windows Task Scheduler does that.
-    This is advisory information for display purposes only.
-    """
-    # Use DEBUG level to reduce log noise (polling endpoint)
-    logger.debug("Next scheduled run requested")
+    """Get next scheduled run time (runs every 15 minutes)."""
     try:
         chicago_tz = pytz.timezone("America/Chicago")
         now_chicago = datetime.now(chicago_tz)

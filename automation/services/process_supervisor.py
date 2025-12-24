@@ -54,7 +54,8 @@ class ProcessSupervisor:
         on_stderr_line: Optional[Callable[[str], None]] = None,
         on_progress: Optional[Callable[[Dict], None]] = None,
         completion_detector: Optional[Callable[[List[str]], bool]] = None,
-        completion_timeout: int = 30
+        completion_timeout: int = 30,
+        env: Optional[Dict[str, str]] = None
     ) -> ProcessResult:
         """
         Execute a subprocess with monitoring.
@@ -67,6 +68,7 @@ class ProcessSupervisor:
             on_progress: Callback for progress updates
             completion_detector: Function that returns True when process should be considered complete
             completion_timeout: Seconds to wait after completion_detector returns True before terminating
+            env: Optional environment variables dict (if None, uses current environment)
         
         Returns:
             ProcessResult with execution details
@@ -78,7 +80,8 @@ class ProcessSupervisor:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env
         )
         
         # Thread-safe queues for output

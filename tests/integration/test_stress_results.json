@@ -1,0 +1,320 @@
+{
+  "summary": {
+    "rounds_passed": 0,
+    "total_rounds": 3,
+    "total_tests": 33,
+    "passed_tests": 30,
+    "failed_tests": 3
+  },
+  "results": [
+    {
+      "round_num": 1,
+      "step": "Backend Alive",
+      "success": true,
+      "message": "Backend is running",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:27:53.740452"
+    },
+    {
+      "round_num": 1,
+      "step": "Orchestrator Status",
+      "success": true,
+      "message": "Orchestrator available, state: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:27:55.788302"
+    },
+    {
+      "round_num": 1,
+      "step": "State File",
+      "success": true,
+      "message": "State file exists, state: success",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:27:55.788729"
+    },
+    {
+      "round_num": 1,
+      "step": "Disable Scheduler",
+      "success": true,
+      "message": "Scheduler disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:27:58.209703"
+    },
+    {
+      "round_num": 1,
+      "step": "Scheduler Disabled Check",
+      "success": true,
+      "message": "Scheduler correctly disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:03.105996"
+    },
+    {
+      "round_num": 1,
+      "step": "Enable Scheduler",
+      "success": true,
+      "message": "Scheduler enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:06.268521"
+    },
+    {
+      "round_num": 1,
+      "step": "Scheduler Enabled Check",
+      "success": true,
+      "message": "Scheduler correctly enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:11.124693"
+    },
+    {
+      "round_num": 1,
+      "step": "Start Pipeline",
+      "success": false,
+      "message": "Exception: HTTPConnectionPool(host='localhost', port=8001): Read timed out.",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:25.223182"
+    },
+    {
+      "round_num": 1,
+      "step": "Failure Simulation",
+      "success": true,
+      "message": "Skipped - no safe failure simulation method available",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:25.223664"
+    },
+    {
+      "round_num": 1,
+      "step": "Restart Backend",
+      "success": true,
+      "message": "Backend restarted",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:38.051777"
+    },
+    {
+      "round_num": 1,
+      "step": "State After Restart",
+      "success": true,
+      "message": "State correctly loaded: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:43.082868"
+    },
+    {
+      "round_num": 2,
+      "step": "Backend Alive",
+      "success": true,
+      "message": "Backend is running",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:28:58.261861"
+    },
+    {
+      "round_num": 2,
+      "step": "Orchestrator Status",
+      "success": true,
+      "message": "Orchestrator available, state: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:00.303606"
+    },
+    {
+      "round_num": 2,
+      "step": "State File",
+      "success": true,
+      "message": "State file exists, state: success",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:00.304098"
+    },
+    {
+      "round_num": 2,
+      "step": "Disable Scheduler",
+      "success": true,
+      "message": "Scheduler disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:03.012817"
+    },
+    {
+      "round_num": 2,
+      "step": "Scheduler Disabled Check",
+      "success": true,
+      "message": "Scheduler correctly disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:07.851324"
+    },
+    {
+      "round_num": 2,
+      "step": "Enable Scheduler",
+      "success": true,
+      "message": "Scheduler enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:11.035644"
+    },
+    {
+      "round_num": 2,
+      "step": "Scheduler Enabled Check",
+      "success": true,
+      "message": "Scheduler correctly enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:15.890654"
+    },
+    {
+      "round_num": 2,
+      "step": "Start Pipeline",
+      "success": false,
+      "message": "Exception: HTTPConnectionPool(host='localhost', port=8001): Read timed out.",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:30.005707"
+    },
+    {
+      "round_num": 2,
+      "step": "Failure Simulation",
+      "success": true,
+      "message": "Skipped - no safe failure simulation method available",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:30.006001"
+    },
+    {
+      "round_num": 2,
+      "step": "Restart Backend",
+      "success": true,
+      "message": "Backend restarted",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:43.284474"
+    },
+    {
+      "round_num": 2,
+      "step": "State After Restart",
+      "success": true,
+      "message": "State correctly loaded: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:29:48.318971"
+    },
+    {
+      "round_num": 3,
+      "step": "Backend Alive",
+      "success": true,
+      "message": "Backend is running",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:03.593899"
+    },
+    {
+      "round_num": 3,
+      "step": "Orchestrator Status",
+      "success": true,
+      "message": "Orchestrator available, state: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:05.641083"
+    },
+    {
+      "round_num": 3,
+      "step": "State File",
+      "success": true,
+      "message": "State file exists, state: running_analyzer",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:05.649009"
+    },
+    {
+      "round_num": 3,
+      "step": "Disable Scheduler",
+      "success": true,
+      "message": "Scheduler disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:08.136233"
+    },
+    {
+      "round_num": 3,
+      "step": "Scheduler Disabled Check",
+      "success": true,
+      "message": "Scheduler correctly disabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:13.263423"
+    },
+    {
+      "round_num": 3,
+      "step": "Enable Scheduler",
+      "success": true,
+      "message": "Scheduler enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:16.549958"
+    },
+    {
+      "round_num": 3,
+      "step": "Scheduler Enabled Check",
+      "success": true,
+      "message": "Scheduler correctly enabled",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:21.405629"
+    },
+    {
+      "round_num": 3,
+      "step": "Start Pipeline",
+      "success": false,
+      "message": "Exception: HTTPConnectionPool(host='localhost', port=8001): Read timed out.",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:35.479136"
+    },
+    {
+      "round_num": 3,
+      "step": "Failure Simulation",
+      "success": true,
+      "message": "Skipped - no safe failure simulation method available",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:35.479417"
+    },
+    {
+      "round_num": 3,
+      "step": "Restart Backend",
+      "success": true,
+      "message": "Backend restarted",
+      "observed_state": null,
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:49.142849"
+    },
+    {
+      "round_num": 3,
+      "step": "State After Restart",
+      "success": true,
+      "message": "State correctly loaded: success",
+      "observed_state": {
+        "state": "success"
+      },
+      "expected_state": null,
+      "timestamp": "2025-12-07T21:30:54.191001"
+    }
+  ]
+}

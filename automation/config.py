@@ -1,116 +1,126 @@
 """
-Configuration - All paths, timeouts, and environment settings
+Pipeline Configuration
 
-Single Responsibility: Hold all configuration constants
-No hardcoded paths in other modules
+Centralized configuration for the automation pipeline.
+All paths and settings should be defined here.
 """
 
-from pathlib import Path
-from typing import List
 import os
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 
 
-# Base paths
-QTSW_ROOT = Path(r"C:\Users\jakej\QTSW")
-QTSW2_ROOT = Path(r"C:\Users\jakej\QTSW2")
+@dataclass
+class PipelineConfig:
+    """
+    Configuration for the pipeline system.
+    
+    All paths are relative to qtsw2_root unless specified as absolute.
+    """
+    
+    # Base paths
+    qtsw2_root: Path
+    
+    # Data directories
+    data_raw: Path
+    data_translated: Path  # MANDATORY: Translator output location
+    analyzer_runs: Path
+    
+    # Script paths
+    merger_script: Path
+    parallel_analyzer_script: Path
+    
+    # Logging
+    logs_dir: Path
+    event_logs_dir: Path
+    
+    # Timeouts (in seconds)
+    translator_timeout: int = 3600  # 1 hour
+    analyzer_timeout: int = 21600  # 6 hours
+    merger_timeout: int = 1800  # 30 minutes
+    
+    @classmethod
+    def from_environment(cls, qtsw2_root: Optional[Path] = None) -> 'PipelineConfig':
+        """
+        Create PipelineConfig from environment variables and defaults.
+        
+        Args:
+            qtsw2_root: Optional root path. If None, uses QTSW2_ROOT env var or default.
+        
+        Returns:
+            PipelineConfig instance
+            
+        Raises:
+            ValueError: If data_translated cannot be determined (MANDATORY)
+        """
+        # Determine QTSW2 root
+        if qtsw2_root is None:
+            qtsw2_root_str = os.getenv("QTSW2_ROOT", r"C:\Users\jakej\QTSW2")
+            qtsw2_root = Path(qtsw2_root_str)
+        else:
+            qtsw2_root = Path(qtsw2_root)
+        
+        # Base paths
+        data_raw = qtsw2_root / "data" / "raw"
+        data_translated = qtsw2_root / "data" / "translated"
+        analyzer_runs = qtsw2_root / "data" / "analyzed"
+        
+        # Script paths
+        merger_script = qtsw2_root / "modules" / "merger" / "merger.py"
+        parallel_analyzer_script = qtsw2_root / "tools" / "run_analyzer_parallel.py"
+        
+        # Logging directories
+        logs_dir = qtsw2_root / "automation" / "logs"
+        event_logs_dir = logs_dir / "events"
+        
+        # Validate mandatory paths
+        if data_translated is None or str(data_translated).strip() == "":
+            raise ValueError(
+                "data_translated is MANDATORY but could not be determined. "
+                "This is a configuration error that must be fixed."
+            )
+        
+        return cls(
+            qtsw2_root=qtsw2_root,
+            data_raw=data_raw,
+            data_translated=data_translated,  # MANDATORY
+            analyzer_runs=analyzer_runs,
+            merger_script=merger_script,
+            parallel_analyzer_script=parallel_analyzer_script,
+            logs_dir=logs_dir,
+            event_logs_dir=event_logs_dir,
+            translator_timeout=int(os.getenv("TRANSLATOR_TIMEOUT", "3600")),
+            analyzer_timeout=int(os.getenv("ANALYZER_TIMEOUT", "21600")),
+            merger_timeout=int(os.getenv("MERGER_TIMEOUT", "1800")),
+        )
 
-# Data directories
+
+# Legacy constants for backward compatibility
+# These are kept for code that hasn't been migrated to PipelineConfig yet
+QTSW_ROOT = Path(os.getenv("QTSW_ROOT", r"C:\Users\jakej\QTSW"))
+QTSW2_ROOT = Path(os.getenv("QTSW2_ROOT", r"C:\Users\jakej\QTSW2"))
+
 DATA_RAW = QTSW2_ROOT / "data" / "raw"
 DATA_RAW_LOGS = DATA_RAW / "logs"
-DATA_PROCESSED = QTSW2_ROOT / "data" / "processed"
-ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzer_runs"
+DATA_TRANSLATED = QTSW2_ROOT / "data" / "translated"  # Canonical location for translated data
+
+ANALYZER_RUNS = QTSW2_ROOT / "data" / "analyzed"
 SEQUENCER_RUNS = QTSW2_ROOT / "data" / "sequencer_runs"
 
-# Log directories
 LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 EVENT_LOGS_DIR = LOGS_DIR / "events"
 
-# Pipeline scripts
-TRANSLATOR_SCRIPT = QTSW2_ROOT / "tools" / "translate_raw.py"
+TRANSLATOR_SCRIPT = QTSW2_ROOT / "tools" / "translate_raw.py"  # Deprecated
 PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
-DATA_MERGER_SCRIPT = QTSW2_ROOT / "tools" / "data_merger.py"
+DATA_MERGER_SCRIPT = QTSW2_ROOT / "modules" / "merger" / "merger.py"
 
-# Timeouts (in seconds)
-TRANSLATOR_TIMEOUT = 3600  # 1 hour
-ANALYZER_TIMEOUT = 21600   # 6 hours per instrument
-MERGER_TIMEOUT = 1800      # 30 minutes
-PROCESS_NO_OUTPUT_TIMEOUT = 300  # 5 minutes
-PROCESS_COMPLETION_TIMEOUT = 30  # 30 seconds after completion detected
+TRANSLATOR_TIMEOUT = 3600
+ANALYZER_TIMEOUT = 21600
+MERGER_TIMEOUT = 1800
 
-# Progress intervals
-PROGRESS_UPDATE_INTERVAL = 60  # 1 minute
-
-# Default instruments
-DEFAULT_INSTRUMENTS: List[str] = ["ES", "NQ", "YM", "CL", "NG", "GC"]
-
-# Scheduling
+DEFAULT_INSTRUMENTS = ["ES", "NQ", "YM", "CL", "NG", "GC"]
 SCHEDULE_INTERVAL_MINUTES = 15
-SCHEDULE_TIMES = [0, 15, 30, 45]  # Minutes past the hour
 
-# File patterns
 RAW_FILE_PATTERN = "*.csv"
 PROCESSED_FILE_PATTERNS = ["*.parquet", "*.csv"]
-
-# Lock file settings
-LOCK_TIMEOUT_SECONDS = 300  # 5 minutes
-LOCK_FILE_NAME = ".pipeline.lock"
-
-# Ensure directories exist
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-class PipelineConfig:
-    """
-    Configuration container - can be extended for environment-based config
-    """
-    
-    def __init__(
-        self,
-        qtsw2_root: Path = QTSW2_ROOT,
-        data_raw: Path = DATA_RAW,
-        data_processed: Path = DATA_PROCESSED,
-        analyzer_runs: Path = ANALYZER_RUNS,
-        logs_dir: Path = LOGS_DIR,
-        event_logs_dir: Path = EVENT_LOGS_DIR,
-        translator_script: Path = TRANSLATOR_SCRIPT,
-        parallel_analyzer_script: Path = PARALLEL_ANALYZER_SCRIPT,
-        merger_script: Path = DATA_MERGER_SCRIPT,
-        translator_timeout: int = TRANSLATOR_TIMEOUT,
-        analyzer_timeout: int = ANALYZER_TIMEOUT,
-        merger_timeout: int = MERGER_TIMEOUT,
-        default_instruments: List[str] = None,
-        schedule_interval_minutes: int = SCHEDULE_INTERVAL_MINUTES
-    ):
-        self.qtsw2_root = qtsw2_root
-        self.data_raw = data_raw
-        self.data_processed = data_processed
-        self.analyzer_runs = analyzer_runs
-        self.logs_dir = logs_dir
-        self.event_logs_dir = event_logs_dir
-        self.translator_script = translator_script
-        self.parallel_analyzer_script = parallel_analyzer_script
-        self.merger_script = merger_script
-        self.translator_timeout = translator_timeout
-        self.analyzer_timeout = analyzer_timeout
-        self.merger_timeout = merger_timeout
-        self.default_instruments = default_instruments or DEFAULT_INSTRUMENTS.copy()
-        self.schedule_interval_minutes = schedule_interval_minutes
-        
-        # Ensure directories exist
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.event_logs_dir.mkdir(parents=True, exist_ok=True)
-    
-    @classmethod
-    def from_environment(cls) -> 'PipelineConfig':
-        """Create config from environment variables (for future use)"""
-        # For now, return default config
-        # Can be extended to read from env vars
-        return cls()
-    
-    def get_lock_file(self, run_id: str) -> Path:
-        """Get lock file path for a run"""
-        return self.logs_dir / f"{LOCK_FILE_NAME}.{run_id}"
-
-
-

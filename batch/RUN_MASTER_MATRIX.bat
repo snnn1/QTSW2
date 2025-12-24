@@ -22,10 +22,8 @@ if not exist "%MASTER_MATRIX_LOG%" (
     echo [%date% %time%] Log file created by RUN_MASTER_MATRIX.bat > "%MASTER_MATRIX_LOG%"
 )
 
-echo [1/3] Starting backend...
-cd /d "%PROJECT_ROOT%\dashboard\backend"
-start /b "" python -u main.py
-cd /d "%PROJECT_ROOT%"
+echo [1/3] Starting backend in visible window...
+start "Master Matrix Backend" cmd /k "cd /d %PROJECT_ROOT% && python -m uvicorn modules.dashboard.backend.main:app --host 0.0.0.0 --port 8000"
 timeout /t 3 /nobreak >nul
 
 echo [2/3] Opening browser...
@@ -40,12 +38,13 @@ echo.
 echo ================================================
 echo Master Matrix is ready!
 echo.
-echo Backend:  http://localhost:8000 (running in background)
+echo Backend:  http://localhost:8000 (running in separate window)
 echo Frontend: http://localhost:5174 (output shown below)
 echo.
 echo Browser should open automatically.
 echo.
 echo Press Ctrl+C to stop frontend (backend will keep running).
+echo Close the "Master Matrix Backend" window to stop backend.
 echo ================================================
 echo.
 

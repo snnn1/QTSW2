@@ -6,10 +6,16 @@ This ensures real-time updates to the dashboard without relying solely on the JS
 
 import asyncio
 import logging
+import sys
 from pathlib import Path
 from typing import Optional, Dict
 from datetime import datetime
 import pytz
+
+# Ensure project root is in path for automation imports
+qtsw2_root = Path(__file__).parent.parent.parent.parent
+if str(qtsw2_root) not in sys.path:
+    sys.path.insert(0, str(qtsw2_root))
 
 from automation.services.event_logger import EventLogger
 from .events import EventBus
@@ -57,13 +63,8 @@ class EventLoggerWithBus(EventLogger):
         Emit a structured event to the log file AND EventBus.
         Never raises exceptions - failures are logged but don't crash pipeline.
         """
-        # Call parent to write to JSONL first (this always works)
+        # Call parent to write to JSONL
         super().emit(run_id, stage, event, msg, data)
-        
-        # Log at info level for important events to help diagnose
-        if event in ("start", "success", "failure", "error", "state_change"):
-            if self.logger:
-                self.logger.info(f"EventLoggerWithBus: Emitting {stage}/{event} (run_id: {run_id[:8] if run_id else 'None'}, event_loop={self._event_loop is not None})")
         
         # Also publish to EventBus for real-time updates
         event_obj = {
@@ -80,63 +81,49 @@ class EventLoggerWithBus(EventLogger):
         try:
             # Try to publish to EventBus for real-time updates
             # Services run in asyncio.to_thread() (separate thread), so we need thread-safe scheduling
-            loop = None
+            loop = self._event_loop
             
             # Try to get running loop in current thread first (works if in main event loop thread)
             try:
-                loop = asyncio.get_running_loop()
+                current_loop = asyncio.get_running_loop()
+                # If we're in the main event loop thread, use that loop
+                loop = current_loop
             except RuntimeError:
-                # No loop in current thread - use stored loop reference if available
-                loop = self._event_loop
+                # No loop in current thread - we're in a worker thread
+                # Use stored loop reference (captured during initialization in main thread)
+                if loop is None:
+                    # No event loop available - events will be picked up by JSONL monitor
+                    if self.logger:
+                        self.logger.debug("No event loop available for EventBus publish (JSONL fallback active)")
+                    return
             
-            if loop is not None and loop.is_running():
+            # Check if loop is still valid and running
+            # Note: loop.is_running() may not work correctly from a different thread,
+            # but call_soon_threadsafe will handle it gracefully
+            if loop is not None:
                 # Schedule the publish (thread-safe - works from any thread)
-                # Use a simpler approach: create the task directly via call_soon_threadsafe
-                async def publish_event():
-                    try:
-                        await self.event_bus.publish(event_obj)
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.warning(f"EventBus publish failed for {event_obj.get('stage')}/{event_obj.get('event')}: {e}", exc_info=False)
-                
-                # Schedule the coroutine as a task (thread-safe)
+                # Use asyncio.run_coroutine_threadsafe for better reliability
                 try:
-                    # Create task in the event loop thread
-                    def schedule_task():
+                    # Schedule coroutine directly (more reliable than creating task inside function)
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.event_bus.publish(event_obj),
+                        loop
+                    )
+                    # Add callback to log errors if publish fails (but don't block)
+                    def log_publish_error(fut):
                         try:
-                            task = loop.create_task(publish_event())
-                            # Add done callback to catch any errors
-                            def log_error(task):
-                                try:
-                                    task.result()
-                                except Exception as e:
-                                    if self.logger:
-                                        self.logger.warning(f"EventBus publish task error for {event_obj.get('stage')}/{event_obj.get('event')}: {e}", exc_info=False)
-                            task.add_done_callback(log_error)
+                            fut.result()  # This will raise if the coroutine failed
                         except Exception as e:
                             if self.logger:
-                                self.logger.warning(f"Failed to create EventBus publish task for {event_obj.get('stage')}/{event_obj.get('event')}: {e}", exc_info=False)
-                    
-                    loop.call_soon_threadsafe(schedule_task)
-                    # Log successful scheduling for important events
-                    if event in ("start", "success", "failure", "error") and self.logger:
-                        self.logger.info(f"EventBus publish scheduled for {stage}/{event} (run_id: {run_id[:8] if run_id else 'None'})")
-                except RuntimeError as e:
-                    # Loop might have been closed - log but don't fail
-                    if self.logger:
-                        self.logger.warning(f"Event loop not available for publishing {stage}/{event} (JSONL fallback active): {e}")
+                                self.logger.debug(f"EventBus publish failed (JSONL fallback active): {e}", exc_info=False)
+                    future.add_done_callback(log_publish_error)
                 except Exception as e:
                     if self.logger:
-                        self.logger.warning(f"Failed to schedule EventBus publish for {stage}/{event}: {e}", exc_info=False)
-            else:
-                # No event loop available - events will be picked up by JSONL monitor
-                # Log at info level for important events to help diagnose
-                if self.logger and event in ("start", "success", "failure", "error"):
-                    self.logger.info(f"Event loop not available - {stage}/{event} will be picked up by JSONL monitor (written to {self.log_file.name})")
+                        self.logger.debug(f"Failed to schedule EventBus publish (JSONL fallback active): {e}", exc_info=False)
         except Exception as e:
             # Swallow EventBus failures - never throw from publish
             # Events are still written to JSONL (via super().emit()), so they'll be picked up by the monitor
-            # Log at warning level to help diagnose issues
+            # Log at debug level since this is expected in some contexts and JSONL provides fallback
             if self.logger:
-                self.logger.warning(f"EventBus publish failed (JSONL fallback active): {e}", exc_info=False)
+                self.logger.debug(f"EventBus publish failed (JSONL fallback active): {e}", exc_info=False)
 

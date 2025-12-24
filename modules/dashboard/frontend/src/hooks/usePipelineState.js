@@ -4,9 +4,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { websocketManager } from '../services/websocketManager'
 import { start as startAppService } from '../services/appsManager'
-import { formatEventTimestamp } from '../utils/timeUtils'
+import { useWebSocket } from '../contexts/WebSocketContext'
 
 const API_BASE = '/api'
 const HEALTH_URL = '/health'
@@ -98,6 +97,8 @@ export async function getPipelineStatus() {
    Start pipeline
 ------------------------------------------------------- */
 export async function startPipeline() {
+  console.log('[API] Calling POST /api/pipeline/start')
+  try {
   const res = await fetchWithTimeout(
     `${API_BASE}/pipeline/start`,
     {
@@ -108,11 +109,21 @@ export async function startPipeline() {
     15000
   )
 
+    console.log('[API] Response status:', res.status, res.statusText)
+
   if (!res.ok) {
-    throw new Error(await res.text())
+      const errorText = await res.text()
+      console.error('[API] Pipeline start failed:', res.status, errorText)
+      throw new Error(errorText || `HTTP ${res.status}`)
   }
 
-  return await safeJson(res)
+    const result = await safeJson(res)
+    console.log('[API] Pipeline start success:', result)
+    return result
+  } catch (error) {
+    console.error('[API] Pipeline start exception:', error)
+    throw error
+  }
 }
 
 /* -------------------------------------------------------
@@ -212,19 +223,20 @@ export function usePipelineState() {
   const statusPollingRef = useRef(null)
 
   // Update pipeline status from backend response
+  // Phase-1: Only update state when backend explicitly provides valid data
+  // Never reset state on polling failure - keep last known state
   const updatePipelineStatus = useCallback((statusData) => {
+    // Phase-1 rule: If status fails → do nothing, keep last known state
+    // Only change state when backend explicitly tells you to
     if (!statusData || statusData.state === 'unavailable') {
-      setPipelineStatus({ state: 'idle', isRunning: false, runId: null })
-      setActiveRunId(null)
+      // Don't reset state - just log and return
+      console.warn('[Status] Status unavailable or missing, keeping last known state')
       return
     }
 
+    // Phase-1 always-on: Simple state mapping - canonical states only: idle, running, stopped, error
     const state = String(statusData.state || 'idle').toLowerCase()
-    const isRunning = 
-      state === 'starting' ||
-      state === 'running' ||
-      state.startsWith('running_') ||
-      statusData.active === true
+    const isRunning = state === 'running'  // Only "running" state means pipeline is running
     
     const runId = statusData.run_id || statusData.runId || null
     
@@ -265,24 +277,18 @@ export function usePipelineState() {
     }
   }, [])
 
-  // Consolidated polling strategy:
-  // - When running: Use WebSocket for events, poll status every 10s as backup
-  // - When idle: Poll status + metadata every 10s
+  // Phase-1 always-on: Minimal polling - WebSocket is primary source of truth
+  // Poll status + metadata every 30 seconds (just for button state, WebSocket handles events)
   useEffect(() => {
     // Initial load
     pollPipelineStatus()
     loadMetadata()
     
-    if (pipelineStatus.isRunning) {
-      // When running: poll status every 10s as backup (WebSocket is primary)
-      statusPollingRef.current = setInterval(pollPipelineStatus, 10000)
-    } else {
-      // When idle: poll status + metadata every 10s
+    // Poll every 30 seconds (lightweight, just for status/metadata)
       statusPollingRef.current = setInterval(() => {
         pollPipelineStatus()
         loadMetadata()
-      }, 10000)
-    }
+    }, 30000)  // 30 seconds - WebSocket handles real-time events
     
     return () => {
       if (statusPollingRef.current) {
@@ -290,192 +296,76 @@ export function usePipelineState() {
         statusPollingRef.current = null
       }
     }
-  }, [pipelineStatus.isRunning, pollPipelineStatus, loadMetadata])
+  }, [pollPipelineStatus, loadMetadata])  // Fixed interval, don't depend on isRunning
 
-  // WebSocket connection for events
-  // - When pipeline is running: connect to specific run_id
-  // - When pipeline is idle: connect to all events (null run_id) to receive scheduler events
-  // Use refs to track connection state and prevent unnecessary reconnects
-  const wsRunIdRef = useRef(null)
-  const wsConnectedRef = useRef(false)
-  const snapshotReceivedRef = useRef(false)
+  // Phase-1 always-on: Consume events from WebSocket context (singleton at App level)
+  const { events: wsEvents, subscribe: subscribeToWebSocket } = useWebSocket()
   
+  // Subscribe to WebSocket events and handle them
   useEffect(() => {
     const handleEvent = (event) => {
-      // Filtering rules:
-      // - Always allow scheduler events (stage === 'scheduler')
-      // - Always allow pipeline events (stage === 'pipeline')
-      // - When activeRunId is set, also allow events for that run_id
-      // - When activeRunId is null, allow all events
-      const isSchedulerEvent = event.stage === 'scheduler'
-      const isPipelineEvent = event.stage === 'pipeline'
-      const isActiveRunEvent = activeRunId && event.run_id === activeRunId
-      const isAllEventsMode = activeRunId === null
-      
-      if (!isSchedulerEvent && !isPipelineEvent && !isActiveRunEvent && !isAllEventsMode) {
-        // Skip events that don't match any criteria
-        return
-      }
-      
-      // Format timestamp for display
-      const formattedEvent = {
-        ...event,
-        formattedTimestamp: event.timestamp ? formatEventTimestamp(event.timestamp) : ''
-      }
-      
-      // Handle snapshot events (1-hour historical events sent on connect)
-      // REPLACE existing events with snapshot (fresh start on connect)
-      // Events are already sorted chronologically by the backend
+      // Handle snapshot events (replace existing events)
       if (event.type === 'snapshot' && Array.isArray(event.events)) {
-        const formattedSnapshot = event.events.map(e => ({
-          ...e,
-          formattedTimestamp: e.timestamp ? formatEventTimestamp(e.timestamp) : ''
-        }))
-        
-        // Deduplicate snapshot events using stable key
-        const seen = new Set()
-        const deduplicated = formattedSnapshot.filter(e => {
-          // Stable deduplication key: run_id|stage|event|timestamp|data_hash
-          // Sort data keys to ensure consistent hashing
-          const dataStr = e.data ? JSON.stringify(e.data, Object.keys(e.data).sort()) : '{}'
-          const key = `${e.run_id || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.timestamp || 'null'}|${dataStr}`
-          if (seen.has(key)) {
-            return false
-          }
-          seen.add(key)
-          return true
-        })
-        
-        // Sort by timestamp (parse ISO timestamps for proper sorting)
-        deduplicated.sort((a, b) => {
-          const tsA = a.timestamp ? new Date(a.timestamp).getTime() : 0
-          const tsB = b.timestamp ? new Date(b.timestamp).getTime() : 0
-          return tsA - tsB
-        })
-        
-        setEventsFormatted(deduplicated)
-        snapshotReceivedRef.current = true
-        console.log(`[Events] Snapshot loaded: ${deduplicated.length} events`)
+        setEventsFormatted(event.events)
+        console.log(`[Events] Snapshot loaded: ${event.events.length} events`)
         return
-      }
-      
-      setEventsFormatted(prev => {
-        // Stable deduplication key: run_id|stage|event|timestamp|data_hash
-        // Sort data keys to ensure consistent hashing
-        const dataStr = event.data ? JSON.stringify(event.data, Object.keys(event.data).sort()) : '{}'
-        const eventKey = `${event.run_id || 'null'}|${event.stage || 'null'}|${event.event || 'null'}|${event.timestamp || 'null'}|${dataStr}`
-        
-        // Check if event already exists
-        const exists = prev.some(e => {
-          const eDataStr = e.data ? JSON.stringify(e.data, Object.keys(e.data).sort()) : '{}'
-          const existingKey = `${e.run_id || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.timestamp || 'null'}|${eDataStr}`
-          return existingKey === eventKey
-        })
-        
-        if (exists) return prev
-        
-        // Add new event and sort by timestamp (parse ISO timestamps for proper sorting)
-        const updated = [...prev, formattedEvent].sort((a, b) => {
-          const tsA = a.timestamp ? new Date(a.timestamp).getTime() : 0
-          const tsB = b.timestamp ? new Date(b.timestamp).getTime() : 0
-          return tsA - tsB
-        })
-        
-        return updated
-      })
-      
-      // Update metrics/stage info from events
-      // Note: EventBus filters out 'metric' events, so this will rarely trigger
-      // But we keep it for completeness in case snapshot includes metrics
-      if (event.event === 'metric' && event.data) {
-        setMetrics(prev => ({ ...prev, ...event.data }))
-      }
-      if (event.stage && event.event === 'start') {
-        setStageInfo(prev => ({ ...prev, name: event.stage }))
       }
       
       // Update status from state_change events
-      // Allow state changes for active run OR scheduler/pipeline events
       if (event.event === 'state_change' && event.data) {
-        const shouldUpdate = isPipelineEvent || isSchedulerEvent || (activeRunId && event.run_id === activeRunId)
-        if (shouldUpdate) {
           const newState = event.data.new_state
           if (newState) {
             updatePipelineStatus({ state: newState, run_id: event.run_id || activeRunId })
           }
-        }
       }
     }
     
-    // Determine target run_id for connection
-    const targetRunId = (activeRunId && pipelineStatus.isRunning) ? activeRunId : null
-    
-    // Check current connection state
-    const isConnected = websocketManager.isConnected()
-    const currentRunId = websocketManager.getRunId()
-    const runIdChanged = wsRunIdRef.current !== targetRunId
-    
-    // Always connect on initial mount (when wsRunIdRef.current is null)
-    // Or reconnect if:
-    // 1. run_id changed (activeRunId changed or pipeline started/stopped)
-    // 2. Connection dropped (not connected but we had a connection before)
-    const isInitialConnection = wsRunIdRef.current === null
-    const needsReconnect = isInitialConnection || (runIdChanged && isConnected) || (!isConnected && wsRunIdRef.current !== null)
-    
-    if (needsReconnect) {
-      // Disconnect existing connection if run_id changed (but not on initial connection)
-      if (!isInitialConnection && runIdChanged && isConnected) {
-        console.log(`[Events] Disconnecting due to runId change: ${currentRunId} -> ${targetRunId}`)
-        websocketManager.disconnect()
-      }
-      
-      // Connect to new run_id (or null for all events)
-      // websocketManager.connect() handles waiting for previous connection to close
-      console.log(`[Events] Connecting WebSocket (initial: ${isInitialConnection}, runId: ${targetRunId})`)
-      websocketManager.connect(
-        targetRunId, // null = all events (scheduler), specific run_id = that run only
-        handleEvent,
-        true // Allow reconnect on connection drop
-      )
-      
-      wsRunIdRef.current = targetRunId
-      snapshotReceivedRef.current = false // Reset snapshot flag on (re)connect
-      
-      if (isInitialConnection) {
-        console.log(`[Events] Initial connection established, waiting for snapshot...`)
-      }
-    }
-    
-    // Update connection status
-    wsConnectedRef.current = websocketManager.isConnected()
+    // Subscribe to WebSocket events
+    const unsubscribe = subscribeToWebSocket(handleEvent)
     
     return () => {
-      // Only disconnect on unmount - websocketManager handles reconnects on connection drop
-      // Don't disconnect on every effect re-run
+      unsubscribe()
     }
-  }, [activeRunId, pipelineStatus.isRunning]) // Removed updatePipelineStatus from deps - it's stable
+  }, [subscribeToWebSocket, updatePipelineStatus, activeRunId])
+  
+  // Sync WebSocket events to local state (for EventsLog component)
+  useEffect(() => {
+    setEventsFormatted(wsEvents)
+  }, [wsEvents])
 
   // Start pipeline
   const handleStartPipeline = useCallback(async () => {
+    console.log('[Pipeline] Start button clicked', { isStarting, isRunning: pipelineStatus.isRunning, state: pipelineStatus.state })
+    
     if (isStarting || pipelineStatus.isRunning) {
+      console.log('[Pipeline] Start blocked - already starting or running')
       return
     }
     
     setIsStarting(true)
     try {
+      console.log('[Pipeline] Calling startPipeline API...')
       const result = await startPipeline()
+      console.log('[Pipeline] Start API response:', result)
       
-      if (result.run_id) {
+      if (result && result.run_id) {
+        console.log('[Pipeline] Pipeline started, run_id:', result.run_id)
         setActiveRunId(result.run_id)
         setAlertInfo({
           type: 'success',
           message: 'Pipeline started successfully',
         })
         
-        // Start polling immediately
-        setTimeout(pollPipelineStatus, 1000)
+        // Status will update via WebSocket events - no need to poll
+      } else {
+        console.warn('[Pipeline] Start API returned no run_id:', result)
+        setAlertInfo({
+          type: 'error',
+          message: 'Pipeline start response missing run_id',
+        })
       }
     } catch (error) {
+      console.error('[Pipeline] Start failed:', error)
       setAlertInfo({
         type: 'error',
         message: error.message || 'Failed to start pipeline',
@@ -497,8 +387,7 @@ export function usePipelineState() {
         message: 'Pipeline reset successfully',
       })
       
-      // Refresh status
-      setTimeout(pollPipelineStatus, 500)
+      // Status will update via WebSocket events - no need to poll
     } catch (error) {
       setAlertInfo({
         type: 'error',
@@ -536,7 +425,7 @@ export function usePipelineState() {
         type: 'success',
         message: `${stageName} started`,
       })
-      setTimeout(pollPipelineStatus, 1000)
+      // Status will update via WebSocket events - no need to poll
     } catch (error) {
       setAlertInfo({
         type: 'error',
@@ -553,7 +442,7 @@ export function usePipelineState() {
         type: 'success',
         message: 'Data merger started',
       })
-      setTimeout(pollPipelineStatus, 1000)
+      // Status will update via WebSocket events - no need to poll
     } catch (error) {
       setAlertInfo({
         type: 'error',

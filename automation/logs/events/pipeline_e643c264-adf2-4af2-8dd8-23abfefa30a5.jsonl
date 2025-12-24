@@ -1,6 +1,0 @@
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "pipeline", "event": "start", "timestamp": "2025-11-16T14:19:58.550158-06:00", "msg": "Running sequential stage only"}
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "sequential", "event": "start", "timestamp": "2025-11-16T14:19:58.550842-06:00", "msg": "Starting sequential processor stage"}
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "sequential", "event": "metric", "timestamp": "2025-11-16T14:19:58.557042-06:00", "msg": "Analyzer files archived", "data": {"archived_file_count": 6}}
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "sequential", "event": "log", "timestamp": "2025-11-16T14:19:58.557492-06:00", "msg": "Sequential processor skipped (requires manual configuration)"}
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "sequential", "event": "success", "timestamp": "2025-11-16T14:19:58.557802-06:00", "msg": "Sequential processor skipped"}
-{"run_id": "edc0ef32-c546-4a94-91fc-e019b071aa61", "stage": "sequential", "event": "success", "timestamp": "2025-11-16T14:19:58.558161-06:00", "msg": "sequential stage completed successfully"}

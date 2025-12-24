@@ -1,4 +1,0 @@
-{"run_id": "4cd3b43c-f276-4b8a-ac63-b66c1f141f31", "stage": "pipeline", "event": "start", "timestamp": "2025-11-06T07:47:26.261278-06:00", "msg": "Pipeline run started"}
-{"run_id": "4cd3b43c-f276-4b8a-ac63-b66c1f141f31", "stage": "pipeline", "event": "log", "timestamp": "2025-11-06T07:47:26.261613-06:00", "msg": "Launching NinjaTrader"}
-{"run_id": "4cd3b43c-f276-4b8a-ac63-b66c1f141f31", "stage": "pipeline", "event": "log", "timestamp": "2025-11-06T07:47:31.266463-06:00", "msg": "Waiting for data export"}
-{"run_id": "4cd3b43c-f276-4b8a-ac63-b66c1f141f31", "stage": "pipeline", "event": "failure", "timestamp": "2025-11-06T08:47:31.386972-06:00", "msg": "Export timeout"}

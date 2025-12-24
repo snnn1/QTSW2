@@ -1,4 +1,0 @@
-{"run_id": "676d67e2-6b28-469c-bc6b-30d56e8f2991", "stage": "pipeline", "event": "start", "timestamp": "2025-11-17T19:35:01.219119-06:00", "msg": "Running analyzer stage only"}
-{"run_id": "676d67e2-6b28-469c-bc6b-30d56e8f2991", "stage": "analyzer", "event": "start", "timestamp": "2025-11-17T19:35:01.219700-06:00", "msg": "Starting analyzer stage"}
-{"run_id": "676d67e2-6b28-469c-bc6b-30d56e8f2991", "stage": "analyzer", "event": "metric", "timestamp": "2025-11-17T19:35:01.219974-06:00", "msg": "Analyzer started", "data": {"instrument_count": 6, "instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"]}}
-{"run_id": "676d67e2-6b28-469c-bc6b-30d56e8f2991", "stage": "analyzer", "event": "log", "timestamp": "2025-11-17T19:35:01.221558-06:00", "msg": "Running analyzer for ES"}

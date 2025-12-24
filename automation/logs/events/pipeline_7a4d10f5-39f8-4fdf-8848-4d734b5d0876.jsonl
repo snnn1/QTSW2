@@ -1,4 +1,0 @@
-{"run_id": "9536f12c-965f-4f60-a27c-bc79fd1b262e", "stage": "pipeline", "event": "start", "timestamp": "2025-11-16T11:26:57.187906-06:00", "msg": "Pipeline run started"}
-{"run_id": "9536f12c-965f-4f60-a27c-bc79fd1b262e", "stage": "pipeline", "event": "log", "timestamp": "2025-11-16T11:26:57.188248-06:00", "msg": "Checking for CSV files in data/raw"}
-{"run_id": "9536f12c-965f-4f60-a27c-bc79fd1b262e", "stage": "pipeline", "event": "log", "timestamp": "2025-11-16T11:26:57.189015-06:00", "msg": "No CSV files found - skipping translator"}
-{"run_id": "9536f12c-965f-4f60-a27c-bc79fd1b262e", "stage": "pipeline", "event": "success", "timestamp": "2025-11-16T11:26:57.189471-06:00", "msg": "Pipeline complete (no files to process)"}

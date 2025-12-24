@@ -9,9 +9,9 @@ echo.
 
 REM Configuration
 set TASK_NAME=Pipeline Runner
-set PYTHON_CMD=python
+set PYTHON_CMD=C:\Users\jakej\AppData\Local\Programs\Python\Python313\python.exe
 set WORKING_DIR=%~dp0..
-set ARGUMENTS=-m automation.pipeline_runner
+set ARGUMENTS=-m automation.run_pipeline_standalone
 set DESCRIPTION=Runs data pipeline every 15 minutes at :00, :15, :30, :45
 
 echo Task Name: %TASK_NAME%
@@ -150,6 +150,27 @@ echo   Setup Complete
 echo ================================================
 echo.
 pause
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

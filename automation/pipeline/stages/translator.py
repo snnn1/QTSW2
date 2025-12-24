@@ -1,20 +1,28 @@
 """
-Translator Service - Processes raw CSV files into processed Parquet files
+Translator Service - Translates raw CSV files to canonical Parquet format
 
-Single Responsibility: Translate raw data files
+Single Responsibility: Translate raw exporter CSV files into quant-grade Parquet files
 """
 
-import sys
-import re
 import logging
 from pathlib import Path
-from typing import List, Set, Optional
+from typing import Optional, Set
 from dataclasses import dataclass
+from datetime import date as Date
+from collections import defaultdict
 
 from automation.services.process_supervisor import ProcessSupervisor, ProcessResult
-from automation.services.file_manager import FileManager
 from automation.services.event_logger import EventLogger
 from automation.config import PipelineConfig
+
+# FileManager may not be available - make it optional
+try:
+    from automation.services.file_manager import FileManager
+except ImportError:
+    FileManager = None  # type: ignore
+
+# Import the new translator module
+from modules.translator.core import translate_day
 
 
 @dataclass
@@ -22,27 +30,22 @@ class TranslatorResult:
     """Result of translator stage execution"""
     stage_name: str = "translator"
     status: str = "pending"  # success, failure, skipped
-    raw_files_found: int = 0
-    files_written: int = 0
-    processed_files: Set[Path] = None
     duration_seconds: float = 0.0
     error_message: Optional[str] = None
-    
-    def __post_init__(self):
-        if self.processed_files is None:
-            self.processed_files = set()
+    files_written: int = 0
+    files_skipped: int = 0
+    files_failed: int = 0
 
 
 class TranslatorService:
     """
-    Service for translating raw CSV files to processed Parquet files.
+    Service for translating raw CSV files into canonical Parquet format.
     
     Responsibilities:
-    - Inspect raw data directory for CSVs
-    - Build command to invoke translation tool
-    - Call process supervisor
-    - Interpret result and return stage result
-    - Does NOT delete files (only reports what was processed)
+    - Find raw CSV files
+    - Group by instrument and date
+    - Call translate_day for each instrument-date combination
+    - Report metrics (files written, skipped, failed)
     """
     
     def __init__(
@@ -50,7 +53,7 @@ class TranslatorService:
         config: PipelineConfig,
         logger: logging.Logger,
         process_supervisor: ProcessSupervisor,
-        file_manager: FileManager,
+        file_manager,  # Optional[FileManager] - may be None
         event_logger: EventLogger
     ):
         self.config = config
@@ -69,140 +72,136 @@ class TranslatorService:
         Returns:
             TranslatorResult with stage outcome
         """
+        import time
+        start_time = time.time()
         result = TranslatorResult()
         
-        # Check for raw files
-        raw_files = self.file_manager.scan_directory(
-            self.config.data_raw,
-            "*.csv"
-        )
-        result.raw_files_found = len(raw_files)
+        self.logger.info("Starting translator stage")
+        self.event_logger.emit(run_id, "translator", "start", "Starting translator stage")
         
-        if not raw_files:
-            self.logger.warning("No raw CSV files found")
-            self.event_logger.emit(run_id, "translator", "failure", "No raw CSV files found")
-            result.status = "skipped"
-            return result
-        
-        self.logger.info(f"Found {len(raw_files)} raw file(s) to process")
-        self.event_logger.emit(run_id, "translator", "start", "Starting data translator stage")
-        self.event_logger.emit(run_id, "translator", "metric", "Files found", {"raw_file_count": len(raw_files)})
-        
-        # Build command
-        translator_cmd = [
-            sys.executable,
-            str(self.config.translator_script),
-            "--input", str(self.config.data_raw.resolve()),
-            "--output", str(self.config.data_processed.resolve()),
-            "--separate-years",
-            "--no-merge"
-        ]
-        
-        # Track files written during execution
-        files_written = []
-        processed_instruments = set()
-        expected_instruments = {f.stem.upper() for f in raw_files}
-        
-        def on_stdout_line(line: str):
-            """Handle stdout lines"""
-            self.logger.info(f"  {line}")
+        try:
+            # Find all raw CSV files
+            raw_files = list(self.config.data_raw.rglob("*.csv"))
             
-            # Check for completion message
-            if "[SUCCESS]" in line and "completed successfully" in line:
-                self.event_logger.emit(run_id, "translator", "log", line)
+            if not raw_files:
+                self.logger.warning("No raw CSV files found")
+                self.event_logger.emit(run_id, "translator", "log", "No raw CSV files found")
+                result.status = "skipped"
+                result.duration_seconds = time.time() - start_time
+                return result
             
-            # Track files written
-            if "Saved:" in line or "Saved PARQUET:" in line or "Saved CSV:" in line:
-                files_written.append(line)
-                self.event_logger.emit(run_id, "translator", "log", f"File written: {line}")
+            self.logger.info(f"Found {len(raw_files)} raw file(s) to process")
+            # Don't emit metric event for file count - too verbose, info is in logs
+            
+            # Group files by instrument and date
+            # Filename format: {instrument}_1m_{YYYY-MM-DD}.csv
+            instrument_date_groups = defaultdict(set)
+            
+            for raw_file in raw_files:
+                try:
+                    # Extract instrument and date from filename
+                    stem = raw_file.stem
+                    parts = stem.split("_")
+                    if len(parts) >= 3:
+                        instrument = parts[0].upper()
+                        date_str = parts[-1]  # Last part should be YYYY-MM-DD
+                        try:
+                            trade_date = Date.fromisoformat(date_str)
+                            instrument_date_groups[(instrument, trade_date)].add(raw_file)
+                        except ValueError:
+                            self.logger.warning(f"Could not parse date from filename: {raw_file.name}")
+                            continue
+                except Exception as e:
+                    self.logger.warning(f"Error processing filename {raw_file.name}: {e}")
+                    continue
+            
+            self.logger.info(f"Processing {len(instrument_date_groups)} unique instrument-date combinations")
+            
+            # Process each instrument-date combination
+            files_written = 0
+            files_skipped = 0
+            files_failed = 0
+            total = len(instrument_date_groups)
+            current = 0
+            # Don't emit progress metric events - too verbose for live feed
+            # Progress is logged to file, final summary is emitted at the end
+            
+            for (instrument, trade_date), files in sorted(instrument_date_groups.items()):
+                current += 1
+                self.logger.info(f"Translating {instrument} {trade_date} ({current}/{total})")
                 
-                # Extract instrument from saved file
-                if ".parquet" in line:
-                    match = re.search(r'([A-Z]+)_(\d{4})', line)
-                    if match:
-                        instrument = match.group(1)
-                        year = match.group(2)
-                        processed_instruments.add(instrument)
-                        self.event_logger.emit(run_id, "translator", "metric", f"Wrote {instrument} {year} file", {
-                            "instrument": instrument,
-                            "year": year,
-                            "file_type": "parquet"
-                        })
-                        self.logger.info(f"  ✓ {instrument} ({len(processed_instruments)}/{len(expected_instruments)} instruments complete)")
-        
-        def on_stderr_line(line: str):
-            """Handle stderr lines"""
-            self.logger.warning(f"  [stderr] {line}")
-            if "error" in line.lower() or "exception" in line.lower():
-                self.event_logger.emit(run_id, "translator", "log", f"Warning: {line}")
-        
-        def on_progress(metrics: dict):
-            """Handle progress updates"""
-            elapsed_minutes = int(metrics["elapsed_seconds"] / 60)
-            self.event_logger.emit(run_id, "translator", "metric", 
-                f"Translation in progress ({elapsed_minutes} min elapsed, {len(files_written)} files written)", {
-                    "elapsed_minutes": elapsed_minutes,
-                    "files_written": len(files_written)
-                })
-        
-        def completion_detector(stdout_lines: List[str]) -> bool:
-            """Detect if translator has completed"""
-            # Check for success message
-            full_output = ''.join(stdout_lines)
-            if "[SUCCESS]" in full_output and "completed successfully" in full_output:
-                return True
+                # No progress events - only final summary at the end
+                
+                try:
+                    # Check if output already exists (idempotent)
+                    yyyy = f"{trade_date.year:04d}"
+                    mm = f"{trade_date.month:02d}"
+                    date_str = trade_date.isoformat()
+                    out_file = self.config.data_translated / instrument / "1m" / yyyy / mm / f"{instrument}_1m_{date_str}.parquet"
+                    
+                    if out_file.exists():
+                        self.logger.info(f"  [SKIP] Skipped {instrument} {trade_date} (already exists)")
+                        files_skipped += 1
+                        continue
+                    
+                    # Translate using the new translator module
+                    success = translate_day(
+                        instrument=instrument,
+                        day=trade_date,
+                        raw_root=self.config.data_raw,
+                        output_root=self.config.data_translated,
+                        overwrite=False
+                    )
+                    
+                    if success:
+                        files_written += 1
+                        self.logger.info(f"  [OK] Translated {instrument} {trade_date}")
+                        # Don't emit event for every successful file - too verbose for live events
+                    else:
+                        files_skipped += 1
+                        self.logger.info(f"  - Skipped {instrument} {trade_date} (no raw file)")
+                        
+                except Exception as e:
+                    files_failed += 1
+                    error_msg = f"Failed to translate {instrument} {trade_date}: {e}"
+                    self.logger.error(f"  [ERROR] {error_msg}")
+                    # Only emit error events - these are important and should be visible
+                    self.event_logger.emit(run_id, "translator", "error", error_msg)
             
-            # Check if all expected instruments have been processed
-            if len(processed_instruments) >= len(expected_instruments):
-                # Wait a bit to see if more output comes
-                return False  # Let timeout handle it
+            # Determine overall status
+            if files_failed > 0 and files_written == 0:
+                result.status = "failure"
+                result.error_message = f"All translations failed ({files_failed} failed)"
+            elif files_failed > 0:
+                result.status = "success"  # Partial success
+                result.error_message = f"{files_failed} file(s) failed, but {files_written} succeeded"
+            elif files_written > 0:
+                result.status = "success"
+            else:
+                result.status = "skipped"
             
-            return False
-        
-        # Execute translator
-        process_result = self.process_supervisor.execute(
-            command=translator_cmd,
-            cwd=self.config.qtsw2_root,
-            on_stdout_line=on_stdout_line,
-            on_stderr_line=on_stderr_line,
-            on_progress=on_progress,
-            completion_detector=completion_detector,
-            completion_timeout=30
-        )
-        
-        result.duration_seconds = process_result.execution_time
-        result.files_written = len(files_written)
-        
-        # Check for processed files
-        if self.config.data_processed.exists():
-            processed_files = list(self.config.data_processed.glob("*.parquet"))
-            processed_files.extend(list(self.config.data_processed.glob("*.csv")))
-            result.processed_files = {f for f in processed_files if f.parent == self.config.data_processed}
-        
-        # Determine success
-        # Success if: returncode 0, success message, or files were written
-        translator_succeeded = (
-            process_result.success or
-            len(result.processed_files) > 0 or
-            len(files_written) > 0
-        )
-        
-        if translator_succeeded:
-            result.status = "success"
-            self.logger.info("✓ Translator completed successfully")
-            self.event_logger.emit(run_id, "translator", "metric", "Translation complete", {
-                "processed_file_count": len(result.processed_files),
-                "files_written_count": len(files_written),
-                "return_code": process_result.returncode
+            result.files_written = files_written
+            result.files_skipped = files_skipped
+            result.files_failed = files_failed
+            result.duration_seconds = time.time() - start_time
+            
+            # Emit summary
+            summary = f"Translator completed: {files_written} written, {files_skipped} skipped, {files_failed} failed"
+            self.logger.info(f"[SUCCESS] {summary}")
+            
+            # Emit event matching the status (success, skipped, or failure)
+            event_type = result.status  # "success", "skipped", or "failure"
+            self.event_logger.emit(run_id, "translator", event_type, summary, {
+                "files_written": files_written,
+                "files_skipped": files_skipped,
+                "files_failed": files_failed
             })
-            self.event_logger.emit(run_id, "translator", "success", "Translator completed successfully")
-        else:
+            
+        except Exception as e:
             result.status = "failure"
-            result.error_message = f"Translator failed (code: {process_result.returncode})"
-            self.logger.error(f"✗ {result.error_message}")
+            result.error_message = f"Translator stage exception: {str(e)}"
+            result.duration_seconds = time.time() - start_time
+            self.logger.error(f"[ERROR] {result.error_message}", exc_info=True)
             self.event_logger.emit(run_id, "translator", "failure", result.error_message)
         
         return result
-
-
-

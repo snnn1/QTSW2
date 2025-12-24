@@ -1,3 +1,0 @@
-{"run_id": "21bbde1a-fa07-49bd-9f83-b256fa69212f", "stage": "pipeline", "event": "start", "timestamp": "2025-12-04T15:10:01.633416-06:00", "msg": "Pipeline run started"}
-{"run_id": "21bbde1a-fa07-49bd-9f83-b256fa69212f", "stage": "pipeline", "event": "log", "timestamp": "2025-12-04T15:10:01.634747-06:00", "msg": "No files found - skipping all stages"}
-{"run_id": "21bbde1a-fa07-49bd-9f83-b256fa69212f", "stage": "pipeline", "event": "success", "timestamp": "2025-12-04T15:10:01.635096-06:00", "msg": "Pipeline complete (no files to process)"}

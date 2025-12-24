@@ -19,7 +19,7 @@ echo ================================================
 echo.
 
 cd /d "%~dp0\.."
-streamlit run scripts\breakout_analyzer\analyzer_app\app.py --server.port 8502
+streamlit run modules\analyzer\analyzer_app\app.py --server.port 8502
 
 echo.
 echo App stopped. Press any key to exit.

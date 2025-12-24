@@ -1,0 +1,13 @@
+# Dependencies for automation scripts and standalone pipeline runner
+
+# HTTP client for publishing scheduler events to backend EventBus
+httpx>=0.24.0
+
+# Required for orchestrator and pipeline execution
+# (Other dependencies are handled by the main project)
+
+
+
+
+
+

@@ -1,0 +1,13 @@
+{
+  "run_id": "b79bdc88-9719-4417-86dd-167dc3504332",
+  "state": "running_merger",
+  "current_stage": "merger",
+  "started_at": "2025-12-15T20:42:51.845747-06:00",
+  "updated_at": "2025-12-15T20:42:53.913153-06:00",
+  "retry_count": 0,
+  "error": null,
+  "metadata": {
+    "manual": true,
+    "triggered_at": "2025-12-16T02:42:51.845732"
+  }
+}
