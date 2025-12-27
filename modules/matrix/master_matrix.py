@@ -228,9 +228,9 @@ class MasterMatrix:
         """Add global columns using filter_engine module."""
         return filter_engine.add_global_columns(df, self.stream_filters, self.dom_blocked_days)
     
-    def _log_summary_stats(self, df: pd.DataFrame) -> Dict:
+    def _log_summary_stats(self, df: pd.DataFrame, include_filtered_executed: bool = True) -> Dict:
         """Calculate and log summary statistics using statistics module."""
-        return statistics.calculate_summary_stats(df)
+        return statistics.calculate_summary_stats(df, include_filtered_executed=include_filtered_executed)
     
     def build_master_matrix(self, start_date: Optional[str] = None,
                            end_date: Optional[str] = None,
@@ -342,9 +342,8 @@ class MasterMatrix:
         
         # SL comes from analyzer output (schema_normalizer ensures it exists with NaN if missing)
         
-        # Ensure Time Change column exists (should already be there from _apply_sequencer_logic)
+        # Ensure Time Change column exists (will be calculated after sorting)
         if 'Time Change' not in df.columns:
-            logger.warning("Time Change column missing, adding with empty values")
             df['Time Change'] = ''
         
         # Sort by: trade_date, then entry_time, then symbol, then stream_id
@@ -411,6 +410,52 @@ class MasterMatrix:
         
         # Update global_trade_id after sorting
         df['global_trade_id'] = range(1, len(df) + 1)
+        
+        # Calculate Time Change column from sequencer output (Time column)
+        # This must be done AFTER sorting to ensure correct chronological order per stream
+        from .utils import normalize_time
+        
+        if 'Time Change' not in df.columns:
+            df['Time Change'] = ''
+        
+        # Calculate Time Change per stream (each stream has its own time sequence)
+        # According to sequencer logic:
+        # - Time column shows the time used FOR that day
+        # - Time changes happen at the END of a day (after trade selection)
+        # - The change affects the NEXT day's Time column
+        # - So Time Change should show on the day when Time actually changed
+        if 'Time' in df.columns and 'trade_date' in df.columns and 'Stream' in df.columns:
+            df['Time Change'] = ''  # Reset to empty
+            
+            # Process each stream separately (each has independent time sequence)
+            for stream_id in df['Stream'].unique():
+                stream_mask = df['Stream'] == stream_id
+                stream_subset = df[stream_mask].copy()
+                
+                if len(stream_subset) < 2:
+                    continue  # Need at least 2 days to detect changes
+                
+                # Ensure chronological order within this stream
+                stream_subset = stream_subset.sort_values('trade_date')
+                
+                # Compare consecutive days: Time Change should only show when:
+                # 1. Time changed from previous day to current day
+                # 2. Previous day had Result = 'LOSS' (time changes only happen after losses)
+                prev_idx = None
+                prev_time_normalized = None
+                for idx in stream_subset.index:
+                    curr_time_str = str(df.loc[idx, 'Time'])
+                    curr_time_normalized = normalize_time(curr_time_str)
+                    
+                    if prev_time_normalized is not None and prev_idx is not None and prev_time_normalized != curr_time_normalized:
+                        # Check if previous day had a LOSS (time changes only happen after losses)
+                        prev_result = str(df.loc[prev_idx, 'Result']).upper().strip()
+                        if prev_result == 'LOSS':
+                            # Time changed from previous day after a loss - show on previous day (when change occurred)
+                            df.loc[prev_idx, 'Time Change'] = f"{prev_time_normalized} -> {curr_time_normalized}"
+                    
+                    prev_idx = idx
+                    prev_time_normalized = curr_time_normalized
         
         self.master_df = df
         

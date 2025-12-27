@@ -98,11 +98,31 @@ function AppContent() {
   // Column selector visibility
   const [showColumnSelector, setShowColumnSelector] = useState(false)
   
+  // Show/Hide filtered days toggle (default: ON/show filtered days)
+  const [showFilteredDays, setShowFilteredDays] = useState(() => {
+    const saved = localStorage.getItem('matrix_show_filtered_days')
+    if (saved !== null) {
+      return saved === 'true'
+    }
+    return true // Default: show filtered days
+  })
+  
+  // Save showFilteredDays to localStorage when it changes
+  useEffect(() => {
+    localStorage.setItem('matrix_show_filtered_days', String(showFilteredDays))
+  }, [showFilteredDays])
+  
   // Filtered data indices (from worker mask)
   const [filteredIndices, setFilteredIndices] = useState([])
   
   // Available columns (detected from data)
   const [availableColumns, setAvailableColumns] = useState([])
+  
+  // Include filtered executed trades in stats (default: true)
+  const [includeFilteredExecuted, setIncludeFilteredExecuted] = useState(() => {
+    const saved = localStorage.getItem('matrix_include_filtered_executed')
+    return saved !== null ? JSON.parse(saved) : true
+  })
   
   // Stats visibility per stream
   const [showStats, setShowStats] = useState(() => {
@@ -368,6 +388,12 @@ function AppContent() {
   // Apply filters in worker when filters or active tab changes
   useEffect(() => {
     try {
+      // Breakdown tabs (time, day, dom, date, month, year) don't use data table filtering
+      const breakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year', 'timetable']
+      if (breakdownTabs.includes(activeTab)) {
+        return // Don't run filtering for breakdown tabs
+      }
+      
       if (workerReady && masterData.length > 0 && workerFilter) {
         const streamId = activeTab === 'timetable' ? 'master' : activeTab
         // Request initial rows for table rendering (first 100 rows, sorted)
@@ -376,13 +402,13 @@ function AppContent() {
         
         // Calculate stats in worker
         if (activeTab !== 'timetable' && workerCalculateStats) {
-          workerCalculateStats(streamFilters, streamId, masterContractMultiplier)
+          workerCalculateStats(streamFilters, streamId, masterContractMultiplier, includeFilteredExecuted)
         }
       }
     } catch (error) {
       console.error('Error in filter useEffect:', error)
     }
-  }, [streamFilters, activeTab, masterContractMultiplier, workerReady, masterData.length, workerFilter, workerCalculateStats])
+  }, [streamFilters, activeTab, masterContractMultiplier, workerReady, masterData.length, workerFilter, workerCalculateStats, includeFilteredExecuted])
   
   // Save filters to localStorage whenever they change
   useEffect(() => {
@@ -393,6 +419,11 @@ function AppContent() {
   useEffect(() => {
     localStorage.setItem('matrix_show_stats', JSON.stringify(showStats))
   }, [showStats])
+  
+  // Save includeFilteredExecuted to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem('matrix_include_filtered_executed', JSON.stringify(includeFilteredExecuted))
+  }, [includeFilteredExecuted])
   
   // Save contract multiplier to localStorage whenever it changes
   useEffect(() => {
@@ -1377,6 +1408,7 @@ function AppContent() {
   const formatWorkerStats = useCallback((rawStats, streamId) => {
     if (!rawStats) return null
     
+    // Handle new structure (with sample_counts, performance_trade_metrics, performance_daily_metrics)
     const formatCurrency = (value) => {
       return new Intl.NumberFormat('en-US', {
         style: 'currency',
@@ -1386,6 +1418,77 @@ function AppContent() {
       }).format(value)
     }
     
+    // Check if new structure (has sample_counts)
+    if (rawStats.sample_counts && rawStats.performance_trade_metrics && rawStats.performance_daily_metrics) {
+      const sc = rawStats.sample_counts
+      const ptm = rawStats.performance_trade_metrics
+      const pdm = rawStats.performance_daily_metrics
+      
+      // Calculate avg trades per day
+      // Use new structure with day_counts and behavioral metrics
+      const dayCounts = rawStats.day_counts || { executed_trading_days: 0, allowed_trading_days: 0 }
+      const executedTradingDays = dayCounts.executed_trading_days || 0
+      const allowedTradingDays = dayCounts.allowed_trading_days || 0
+      
+      return {
+        // Sample counts
+        totalRows: sc.total_rows,
+        filteredRows: sc.filtered_rows,
+        allowedRows: sc.allowed_rows,
+        executedTradesTotal: sc.executed_trades_total,
+        executedTradesAllowed: sc.executed_trades_allowed,
+        executedTradesFiltered: sc.executed_trades_filtered,
+        notradeTotal: sc.notrade_total,
+        totalTrades: sc.executed_trades_total, // For backwards compatibility
+        allowedTrades: sc.executed_trades_allowed, // For backwards compatibility
+        
+        // Trade metrics
+        wins: ptm.wins,
+        losses: ptm.losses,
+        breakEven: ptm.be,
+        time: ptm.time,
+        winRate: ptm.win_rate ? ptm.win_rate.toFixed(1) : '0.0',
+        totalProfit: (ptm.total_profit || 0).toFixed(2),
+        totalProfitDollars: formatCurrency(ptm.total_profit || 0),
+        profitFactor: ptm.profit_factor ? (ptm.profit_factor === Infinity ? '∞' : ptm.profit_factor.toFixed(2)) : '0.00',
+        meanPnLPerTrade: formatCurrency(ptm.mean_pnl_per_trade || 0),
+        medianPnLPerTrade: streamId === 'master' ? formatCurrency(ptm.median_pnl_per_trade || 0) : null,
+        stdDevPnL: formatCurrency(ptm.stddev_pnl_per_trade || 0),
+        maxConsecutiveLosses: ptm.max_consecutive_losses || 0,
+        maxDrawdown: (ptm.max_drawdown || 0).toFixed(2),
+        maxDrawdownDollars: formatCurrency(ptm.max_drawdown || 0),
+        var95: streamId === 'master' ? formatCurrency(ptm.var95 || 0) : null,
+        cvar95: streamId === 'master' ? formatCurrency(ptm.cvar95 || 0) : null,
+        riskReward: ptm.rr_ratio ? (ptm.rr_ratio === Infinity ? '∞' : ptm.rr_ratio.toFixed(2)) : '0.00',
+        rrRatio: ptm.rr_ratio ? (ptm.rr_ratio === Infinity ? '∞' : ptm.rr_ratio.toFixed(2)) : '0.00',
+        
+        // Daily metrics
+        // Day counts
+        executedTradingDays: executedTradingDays,
+        allowedTradingDays: allowedTradingDays,
+        // Behavioral metrics (using allowed_trading_days)
+        avgTradesPerDay: pdm.avg_trades_per_day ? pdm.avg_trades_per_day.toFixed(2) : '0.00',
+        profitPerDay: streamId === 'master' ? formatCurrency(pdm.profit_per_day || 0) : null,
+        profitPerWeek: streamId === 'master' ? formatCurrency(pdm.profit_per_week || 0) : null,
+        profitPerMonth: streamId === 'master' ? formatCurrency(pdm.profit_per_month || 0) : null,
+        profitPerYear: streamId === 'master' ? formatCurrency(pdm.profit_per_year || 0) : null,
+        // Risk metrics (from daily PnL series)
+        sharpeRatio: pdm.sharpe_ratio ? pdm.sharpe_ratio.toFixed(2) : '0.00',
+        sortinoRatio: pdm.sortino_ratio ? pdm.sortino_ratio.toFixed(2) : '0.00',
+        timeToRecoveryDays: streamId === 'master' ? pdm.time_to_recovery_days : null,
+        monthlyReturnStdDev: streamId === 'master' ? formatCurrency(pdm.monthly_return_stddev || 0) : null,
+        profitPerTrade: formatCurrency(ptm.mean_pnl_per_trade || 0),
+        calmarRatio: pdm.calmar_ratio ? pdm.calmar_ratio.toFixed(2) : '0.00',
+        
+        // Not available in new structure (set to null)
+        noTrade: sc.notrade_total, // For display
+        skewness: null,
+        kurtosis: null,
+        rolling30DayWinRate: null
+      }
+    }
+    
+    // Fallback: old structure (for backwards compatibility during migration)
     return {
       totalTrades: rawStats.totalTrades || 0,
       totalProfit: (rawStats.totalProfit || 0).toFixed(2),
@@ -1420,7 +1523,7 @@ function AppContent() {
       profitPerTrade: formatCurrency(rawStats.meanPnLPerTrade || 0),
       skewness: streamId === 'master' ? (rawStats.skewness || 0).toFixed(3) : null,
       kurtosis: streamId === 'master' ? (rawStats.kurtosis || 0).toFixed(3) : null,
-      rolling30DayWinRate: null // Would need to calculate in worker
+      rolling30DayWinRate: null
     }
   }, [])
   
@@ -1475,6 +1578,27 @@ function AppContent() {
       // Master stream - show all 4 sections
       return (
         <div className="bg-gray-900 rounded-lg p-4 mb-4 border border-gray-700">
+          {/* Toggle for including filtered executed trades */}
+          <div className="mb-4 pb-3 border-b border-gray-700 flex items-center justify-between">
+            <div>
+              <h4 className="text-sm font-semibold text-gray-300 mb-1">Statistics Settings</h4>
+              <p className="text-xs text-gray-500">Performance stats are computed on executed trades only (Win, Loss, BE, TIME)</p>
+            </div>
+            <label className="flex items-center cursor-pointer">
+              <span className="text-sm text-gray-400 mr-3">Include filtered executed trades</span>
+              <div className="relative">
+                <input
+                  type="checkbox"
+                  className="sr-only"
+                  checked={includeFilteredExecuted}
+                  onChange={(e) => setIncludeFilteredExecuted(e.target.checked)}
+                />
+                <div className={`block w-14 h-8 rounded-full ${includeFilteredExecuted ? 'bg-green-500' : 'bg-gray-600'}`}></div>
+                <div className={`absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition transform ${includeFilteredExecuted ? 'translate-x-6' : ''}`}></div>
+              </div>
+            </label>
+          </div>
+          
           {/* Section 1: Core Performance */}
           <div className="mb-4">
             <h4 className="text-sm font-semibold mb-3 text-gray-300">Core Performance</h4>
@@ -1486,19 +1610,39 @@ function AppContent() {
                 </div>
               </div>
               <div>
-                <div className="text-xs text-gray-400 mb-1">Total Trades</div>
-                <div className="text-lg font-semibold">{stats.totalTrades}</div>
+                <div className="text-xs text-gray-400 mb-1">Executed Trades</div>
+                <div className="text-lg font-semibold">{stats.executedTradesTotal !== undefined ? stats.executedTradesTotal : (stats.allowedTrades || stats.totalTrades)}</div>
+                {stats.executedTradesAllowed !== undefined && stats.executedTradesFiltered !== undefined && (
+                  <div className="text-xs text-gray-500 mt-1">
+                    Allowed: {stats.executedTradesAllowed} | Filtered: {stats.executedTradesFiltered}
+                  </div>
+                )}
+                {stats.totalRows !== undefined && stats.filteredRows !== undefined && (
+                  <div className="text-xs text-gray-400 mt-1">
+                    Total Rows: {stats.totalRows} | Filtered Rows: {stats.filteredRows}
+                  </div>
+                )}
+                {stats.notradeTotal !== undefined && (
+                  <div className="text-xs text-gray-500 mt-1">
+                    NoTrade: {stats.notradeTotal}
+                  </div>
+                )}
               </div>
+              {stats.executedTradingDays !== undefined && stats.allowedTradingDays !== undefined && (
+                <div>
+                  <div className="text-xs text-gray-400 mb-1">Trading Days</div>
+                  <div className="text-lg font-semibold">
+                    Executed: {stats.executedTradingDays}
+                    <span className="text-xs text-gray-500 ml-2">Allowed: {stats.allowedTradingDays}</span>
+                  </div>
+                </div>
+              )}
               <div>
-                <div className="text-xs text-gray-400 mb-1">Total Days</div>
-                <div className="text-lg font-semibold">{stats.totalDays}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Avg Trades/Day</div>
+                <div className="text-xs text-gray-400 mb-1">Avg Trades per Active Day</div>
                 <div className="text-lg font-semibold">{stats.avgTradesPerDay}</div>
               </div>
               <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Day</div>
+                <div className="text-xs text-gray-400 mb-1">Profit per Active Day</div>
                 <div className={`text-lg font-semibold ${parseFloat(stats.profitPerDay?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                   {stats.profitPerDay || 'N/A'}
                 </div>
@@ -1543,6 +1687,12 @@ function AppContent() {
                 <div className="text-xs text-gray-400 mb-1">Break-Even</div>
                 <div className="text-lg font-semibold">{stats.breakEven}</div>
               </div>
+              {stats.time !== undefined && (
+                <div>
+                  <div className="text-xs text-gray-400 mb-1">TIME</div>
+                  <div className="text-lg font-semibold">{stats.time}</div>
+                </div>
+              )}
             </div>
           </div>
           
@@ -2143,11 +2293,17 @@ function AppContent() {
     const row = rows[index]
     if (!row) return null
     
+    // Check if row is filtered
+    const isFiltered = row.final_allowed === false
+    // Check if filtered due to DOW (for DOW cell highlighting)
+    const filterReasons = row.filter_reasons || ''
+    const isFilteredByDOW = isFiltered && filterReasons.toLowerCase().includes('dow_filter')
+    
     return (
       <div 
         style={style} 
         className={`flex border-b border-gray-700 hover:bg-gray-900 ${
-          row.final_allowed === false ? 'bg-red-900/20' : ''
+          isFiltered ? 'bg-red-900/20 opacity-75' : ''
         }`}
       >
         {columnsToShow.map(col => {
@@ -2177,8 +2333,27 @@ function AppContent() {
               value = '-'
             }
           }
-          // Format numeric columns
-          if (['Profit', 'Peak', 'Target', 'Range', 'StopLoss'].includes(col)) {
+          // For filtered rows, show "—" for Profit columns
+          if (isFiltered && (col === 'Profit' || col === 'Profit ($)')) {
+            value = '—'
+          } else if (col === 'Profit ($)') {
+            // Calculate Profit ($) from Profit column (only for allowed rows)
+            const profitValue = parseFloat(row.Profit) || 0
+            const symbol = row.Symbol || row.Instrument || 'ES'
+            const contractValues = {
+              'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100
+            }
+            const contractValue = contractValues[symbol.toUpperCase()] || 50
+            const dollarValue = profitValue * contractValue
+            value = new Intl.NumberFormat('en-US', {
+              style: 'currency',
+              currency: 'USD',
+              minimumFractionDigits: 0,
+              maximumFractionDigits: 0
+            }).format(dollarValue)
+          }
+          // Format numeric columns (skip Profit formatting for filtered rows - already set to "—")
+          if (!isFiltered && ['Profit', 'Peak', 'Target', 'Range', 'StopLoss'].includes(col)) {
             const symbol = (row.Symbol || row.Instrument || '').toUpperCase()
             const baseSymbol = symbol.replace(/\d+$/, '') || symbol
             const isNG = baseSymbol === 'NG'
@@ -2212,22 +2387,6 @@ function AppContent() {
               value = ''
             }
           }
-          // Format dollar columns
-          if (col === 'Profit ($)') {
-            const profitValue = parseFloat(row.Profit) || 0
-            const symbol = row.Symbol || row.Instrument || 'ES'
-            const contractValues = {
-              'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100
-            }
-            const contractValue = contractValues[symbol.toUpperCase()] || 50
-            const dollarValue = profitValue * contractValue
-            value = new Intl.NumberFormat('en-US', {
-              style: 'currency',
-              currency: 'USD',
-              minimumFractionDigits: 0,
-              maximumFractionDigits: 0
-            }).format(dollarValue)
-          }
           // Format time slot columns
           if (col.includes(' Rolling') && value !== null && value !== undefined) {
             const numValue = parseFloat(value)
@@ -2238,13 +2397,29 @@ function AppContent() {
             if (!isNaN(numValue)) value = numValue.toFixed(0)
           }
           
+          // Determine cell styling
+          let cellClassName = `p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm ${col === 'Time Change' ? 'whitespace-nowrap' : ''}`
+          // Highlight DOW cell if filtered due to DOW
+          if (col === 'DOW' && isFilteredByDOW) {
+            cellClassName += ' bg-red-600/30'
+          }
+          
+          // Add filter reasons badge/tooltip for filtered rows
+          const showFilterBadge = isFiltered && col === 'Date' && filterReasons
+          
           return (
             <div 
               key={col} 
-              className="p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+              className={cellClassName}
               style={{ width: `${getColumnWidth(col)}px` }}
+              title={isFiltered && filterReasons ? `Filtered: ${filterReasons}` : undefined}
             >
               {value !== null && value !== undefined ? String(value) : '-'}
+              {showFilterBadge && (
+                <span className="ml-1 text-xs text-red-400" title={filterReasons}>
+                  ⚠
+                </span>
+              )}
             </div>
           )
         })}
@@ -2324,6 +2499,12 @@ function AppContent() {
     } else {
       // Fallback to main thread filtering only if worker not ready
       filtered = getFilteredData(data, streamId)
+      totalFiltered = filtered.length
+    }
+    
+    // Apply "Show/Hide Filtered Days" toggle
+    if (!showFilteredDays) {
+      filtered = filtered.filter(row => row.final_allowed !== false)
       totalFiltered = filtered.length
     }
     
@@ -2468,8 +2649,20 @@ function AppContent() {
   
   // Render profit breakdown tables
   const renderProfitTable = (data, periodType) => {
-    // Ensure data is always an object
-    if (!data || typeof data !== 'object') {
+    // Wrap in try-catch to prevent white screen on errors
+    try {
+    // Ensure data is always an object (never undefined or null)
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return (
+        <div className="text-center py-8 text-gray-400">
+          No data available
+        </div>
+      )
+    }
+    
+    // Ensure data has keys (is not an empty object, or handle empty object gracefully)
+    const dataKeys = Object.keys(data)
+    if (dataKeys.length === 0) {
       return (
         <div className="text-center py-8 text-gray-400">
           No data available
@@ -2496,7 +2689,7 @@ function AppContent() {
     const sortedStreams = Array.from(allStreams).sort()
     
     // Get sorted periods
-    // For DOM (Day of Month), sort numerically; for month/year/date, sort with latest first; otherwise sort as strings
+    // For DOM (Day of Month), sort numerically; for month/year/date/day, sort with latest first; otherwise sort as strings
     const sortedPeriods = periodType === 'dom' 
       ? Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b))
       : periodType === 'month'
@@ -2506,6 +2699,12 @@ function AppContent() {
       : periodType === 'date'
       ? Object.keys(data).sort((a, b) => {
           return b.localeCompare(a) // Latest first (YYYY-MM-DD format)
+        })
+      : periodType === 'day'
+      ? Object.keys(data).sort((a, b) => {
+          // Sort day of week in order: Monday, Tuesday, Wednesday, Thursday, Friday
+          const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+          return dowOrder.indexOf(a) - dowOrder.indexOf(b)
         })
       : periodType === 'year'
       ? Object.keys(data).sort((a, b) => {
@@ -2521,194 +2720,200 @@ function AppContent() {
       )
     }
     
-    // Use virtualization for date tab (can have thousands of rows)
-    if (periodType === 'date') {
-      const Row = ({ index, style }) => {
-        // Use sortedPeriods from closure - add safety check
-        if (!sortedPeriods || index >= sortedPeriods.length) return null
-        const period = sortedPeriods[index]
-        if (!period) return null
-        const periodData = data && data[period]
-        if (!periodData || typeof periodData !== 'object') return null
-        let total = 0
-        
-        return (
-          <div style={style} className="flex border-b border-gray-700 hover:bg-gray-900">
-            <div className="p-3 border-r border-gray-700 font-medium flex-shrink-0" style={{ width: '200px' }}>
-              {new Date(period + 'T00:00:00').toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', weekday: 'short' })}
-            </div>
-            {sortedStreams.map(stream => {
-              const profit = periodData[stream] || 0
-              total += profit
-              return (
-                <div 
-                  key={stream} 
-                  className={`p-3 border-r border-gray-700 text-right flex-shrink-0 ${
-                    profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
-                  }`}
-                  style={{ width: '120px' }}
-                >
-                  {formatCurrency(profit)}
-                </div>
-              )
-            })}
-            <div className={`p-3 text-right font-semibold bg-gray-800 flex-shrink-0 ${
-              total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
-            }`} style={{ width: '120px' }}>
-              {formatCurrency(total)}
-            </div>
-          </div>
-        )
-      }
-      
-      // Calculate totals for footer
-      const streamTotals = sortedStreams.map(stream => 
-        sortedPeriods.reduce((sum, period) => sum + (data[period][stream] || 0), 0)
-      )
-      const grandTotal = streamTotals.reduce((sum, total) => sum + total, 0)
-      
+    // IMPORTANT: Use List component ONLY for 'date' tab (calendar dates with many rows)
+    // Return regular table immediately for other period types (day=DOW, time, dom, month, year)
+    // This prevents any List-related code from executing for tabs with fewer rows
+    if (periodType !== 'date') {
+      // Regular table for other period types (fewer rows)
       return (
         <div className="overflow-x-auto">
-          <div className="flex border-b border-gray-700 bg-gray-800 sticky top-0 z-10">
-            <div className="p-3 border-r border-gray-700 font-semibold flex-shrink-0" style={{ width: '200px' }}>
-              Day
-            </div>
-            {sortedStreams.map(stream => (
-              <div key={stream} className="p-3 border-r border-gray-700 text-right font-semibold flex-shrink-0" style={{ width: '120px' }}>
-                {stream}
-              </div>
-            ))}
-            <div className="p-3 text-right font-semibold bg-gray-700 flex-shrink-0" style={{ width: '120px' }}>
-              Total
-            </div>
-          </div>
-          {sortedPeriods && sortedPeriods.length > 0 ? (
-            <List
-              height={600}
-              itemCount={sortedPeriods.length}
-              itemSize={45}
-              width="100%"
-            >
-              {Row}
-            </List>
-          ) : (
-            <div className="text-center py-8 text-gray-400">
-              No data available
-            </div>
-          )}
-          {/* Totals footer */}
-          <div className="flex border-t-2 border-gray-600 bg-gray-800 font-semibold">
-            <div className="p-3 border-r border-gray-700 flex-shrink-0" style={{ width: '200px' }}>
-              Total
-            </div>
-            {streamTotals.map((total, idx) => (
-              <div 
-                key={sortedStreams[idx]} 
-                className={`p-3 border-r border-gray-700 text-right flex-shrink-0 ${
-                  total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
-                }`}
-                style={{ width: '120px' }}
-              >
-                {formatCurrency(total)}
-              </div>
-            ))}
-            <div className={`p-3 text-right bg-gray-700 flex-shrink-0 ${
-              grandTotal > 0 ? 'text-green-400' : grandTotal < 0 ? 'text-red-400' : 'text-gray-400'
-            }`} style={{ width: '120px' }}>
-              {formatCurrency(grandTotal)}
-            </div>
-          </div>
+          <table className="w-full border-collapse border border-gray-700">
+            <thead>
+              <tr className="bg-gray-800">
+                <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
+                  {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'month' ? 'Month' : 'Year'}
+                </th>
+                {sortedStreams.map(stream => (
+                  <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
+                    {stream}
+                  </th>
+                ))}
+                <th className="p-3 border border-gray-700 text-right font-semibold bg-gray-700">
+                  Total
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedPeriods.map(period => {
+                const periodData = data[period] || {}
+                if (!periodData || typeof periodData !== 'object') return null
+                let total = 0
+                
+                return (
+                  <tr key={period} className="hover:bg-gray-900">
+                    <td className="p-3 border border-gray-700 font-medium">
+                    {periodType === 'time'
+                      ? period
+                      : periodType === 'day'
+                      ? period // Day of week name (Monday, Tuesday, etc.)
+                      : periodType === 'dom'
+                        ? `${period}${getOrdinalSuffix(period)}`
+                        : periodType === 'month'
+                        ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
+                        : period}
+                    </td>
+                    {sortedStreams.map(stream => {
+                      const profit = (periodData && periodData[stream]) || 0
+                      total += profit
+                      return (
+                        <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                          profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
+                        }`}>
+                          {formatCurrency(profit)}
+                        </td>
+                      )
+                    })}
+                    <td className={`p-3 border border-gray-700 text-right font-semibold bg-gray-800 ${
+                      total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
+                    }`}>
+                      {formatCurrency(total)}
+                    </td>
+                  </tr>
+                )
+              })}
+              <tr className="bg-gray-800 font-semibold">
+                <td className="p-3 border border-gray-700">Total</td>
+                {sortedStreams.map(stream => {
+                  const streamTotal = sortedPeriods.reduce((sum, period) => {
+                    const periodData = data[period]
+                    return sum + ((periodData && periodData[stream]) || 0)
+                  }, 0)
+                  return (
+                    <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                      streamTotal > 0 ? 'text-green-400' : streamTotal < 0 ? 'text-red-400' : 'text-gray-400'
+                    }`}>
+                      {formatCurrency(streamTotal)}
+                    </td>
+                  )
+                })}
+                <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
+                  sortedPeriods.reduce((sum, period) => {
+                    const periodData = data[period]
+                    if (!periodData || typeof periodData !== 'object') return sum
+                    return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
+                  }, 0) > 0 ? 'text-green-400' : 'text-red-400'
+                }`}>
+                  {formatCurrency(
+                    sortedPeriods.reduce((sum, period) => {
+                      const periodData = data[period]
+                      if (!periodData || typeof periodData !== 'object') return sum
+                      return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
+                    }, 0)
+                  )}
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       )
     }
     
-    // Regular table for other period types (fewer rows)
-    return (
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse border border-gray-700">
-          <thead>
-            <tr className="bg-gray-800">
-              <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
-                {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'month' ? 'Month' : 'Year'}
-              </th>
-              {sortedStreams.map(stream => (
-                <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
-                  {stream}
-                </th>
-              ))}
-              <th className="p-3 border border-gray-700 text-right font-semibold bg-gray-700">
-                Total
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {sortedPeriods.map(period => {
-              const periodData = data[period]
-              let total = 0
-              
-              return (
-                <tr key={period} className="hover:bg-gray-900">
-                  <td className="p-3 border border-gray-700 font-medium">
-                    {periodType === 'time'
-                      ? period // Already the time string (e.g., "08:00")
-                      : periodType === 'day' 
-                      ? period // Already the day of week name (Monday, Tuesday, etc.)
-                      : periodType === 'dom'
-                      ? `${period}${getOrdinalSuffix(period)}` // e.g., "1st", "2nd", "3rd"
-                      : periodType === 'month'
-                      ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
-                      : period}
-                  </td>
-                  {sortedStreams.map(stream => {
-                    const profit = periodData[stream] || 0
-                    total += profit
-                    return (
-                      <td key={stream} className={`p-3 border border-gray-700 text-right ${
-                        profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
-                      }`}>
-                        {formatCurrency(profit)}
-                      </td>
-                    )
-                  })}
-                  <td className={`p-3 border border-gray-700 text-right font-semibold bg-gray-800 ${
-                    total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
-                  }`}>
-                    {formatCurrency(total)}
-                  </td>
-                </tr>
-              )
-            })}
-            {/* Totals row */}
-            <tr className="bg-gray-800 font-semibold">
-              <td className="p-3 border border-gray-700">Total</td>
-              {sortedStreams.map(stream => {
-                const streamTotal = sortedPeriods.reduce((sum, period) => {
-                  return sum + (data[period][stream] || 0)
-                }, 0)
+    // Simple table for date tab - shows profit for each calendar day
+    if (periodType === 'date') {
+      return (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse border border-gray-700">
+            <thead>
+              <tr className="bg-gray-800">
+                <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">Day</th>
+                {sortedStreams.map(stream => (
+                  <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
+                    {stream}
+                  </th>
+                ))}
+                <th className="p-3 border border-gray-700 text-right font-semibold bg-gray-700">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedPeriods.map(period => {
+                const periodData = data[period] || {}
+                if (!periodData || typeof periodData !== 'object') return null
+                let total = 0
+                
                 return (
-                  <td key={stream} className={`p-3 border border-gray-700 text-right ${
-                    streamTotal > 0 ? 'text-green-400' : streamTotal < 0 ? 'text-red-400' : 'text-gray-400'
-                  }`}>
-                    {formatCurrency(streamTotal)}
-                  </td>
+                  <tr key={period} className="hover:bg-gray-900">
+                    <td className="p-3 border border-gray-700 font-medium">
+                      {new Date(period + 'T00:00:00').toLocaleDateString('en-US', { 
+                        year: 'numeric', 
+                        month: 'short', 
+                        day: 'numeric', 
+                        weekday: 'short' 
+                      })}
+                    </td>
+                    {sortedStreams.map(stream => {
+                      const profit = (periodData && periodData[stream]) || 0
+                      total += profit
+                      return (
+                        <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                          profit > 0 ? 'text-green-400' : profit < 0 ? 'text-red-400' : 'text-gray-400'
+                        }`}>
+                          {formatCurrency(profit)}
+                        </td>
+                      )
+                    })}
+                    <td className={`p-3 border border-gray-700 text-right font-semibold bg-gray-800 ${
+                      total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
+                    }`}>
+                      {formatCurrency(total)}
+                    </td>
+                  </tr>
                 )
               })}
-              <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
-                sortedPeriods.reduce((sum, period) => {
-                  return sum + Object.values(data[period]).reduce((s, v) => s + v, 0)
-                }, 0) > 0 ? 'text-green-400' : 'text-red-400'
-              }`}>
-                {formatCurrency(
-                  sortedPeriods.reduce((sum, period) => {
-                    return sum + Object.values(data[period]).reduce((s, v) => s + v, 0)
+              {/* Totals row */}
+              <tr className="bg-gray-800 font-semibold">
+                <td className="p-3 border border-gray-700">Total</td>
+                {sortedStreams.map(stream => {
+                  const streamTotal = sortedPeriods.reduce((sum, period) => {
+                    const periodData = data[period]
+                    return sum + ((periodData && periodData[stream]) || 0)
                   }, 0)
-                )}
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    )
+                  return (
+                    <td key={stream} className={`p-3 border border-gray-700 text-right ${
+                      streamTotal > 0 ? 'text-green-400' : streamTotal < 0 ? 'text-red-400' : 'text-gray-400'
+                    }`}>
+                      {formatCurrency(streamTotal)}
+                    </td>
+                  )
+                })}
+                <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
+                  sortedPeriods.reduce((sum, period) => {
+                    const periodData = data[period]
+                    if (!periodData || typeof periodData !== 'object') return sum
+                    return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
+                  }, 0) > 0 ? 'text-green-400' : 'text-red-400'
+                }`}>
+                  {formatCurrency(
+                    sortedPeriods.reduce((sum, period) => {
+                      const periodData = data[period]
+                      if (!periodData || typeof periodData !== 'object') return sum
+                      return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
+                    }, 0)
+                  )}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )
+    }
+    } catch (error) {
+      console.error('Error rendering profit table:', error, { periodType, dataKeys: data ? Object.keys(data).length : 0 })
+      return (
+        <div className="text-center py-8 text-red-400">
+          Error rendering table: {error.message}
+        </div>
+      )
+    }
   }
   
   
@@ -2780,14 +2985,14 @@ function AppContent() {
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedDayProfitBefore = useMemo(() => {
-    if (profitBreakdowns['day_before']) return profitBreakdowns['day_before']
-    if (!workerReady) return calculateDailyProfitLocal(masterData)
+    if (profitBreakdowns['day_before']) return profitBreakdowns['day_before'] || {}
+    if (!workerReady) return calculateDailyProfitLocal(masterData) || {}
     return {}
   }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
   
   const memoizedDayProfitAfter = useMemo(() => {
-    if (profitBreakdowns['day_after']) return profitBreakdowns['day_after']
-    if (!workerReady) return calculateDailyProfitLocal(memoizedMasterFilteredData)
+    if (profitBreakdowns['day_after']) return profitBreakdowns['day_after'] || {}
+    if (!workerReady) return calculateDailyProfitLocal(memoizedMasterFilteredData) || {}
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
@@ -3077,12 +3282,15 @@ function AppContent() {
                   <div className="mb-8">
                     <h3 className="text-lg font-semibold mb-4 text-green-400">After Filters</h3>
                     {renderProfitTable(
-                      activeTab === 'time' ? memoizedTimeProfitAfter :
-                      activeTab === 'day' ? memoizedDayProfitAfter :
-                      activeTab === 'dom' ? memoizedDOMProfitAfter :
-                      activeTab === 'date' ? memoizedDateProfitAfter :
-                      activeTab === 'month' ? memoizedMonthProfitAfter :
-                      memoizedYearProfitAfter,
+                      (() => {
+                        const data = activeTab === 'time' ? memoizedTimeProfitAfter :
+                          activeTab === 'day' ? memoizedDayProfitAfter :
+                          activeTab === 'dom' ? memoizedDOMProfitAfter :
+                          activeTab === 'date' ? memoizedDateProfitAfter :
+                          activeTab === 'month' ? memoizedMonthProfitAfter :
+                          memoizedYearProfitAfter
+                        return data || {}
+                      })(),
                       activeTab
                     )}
                   </div>
@@ -3091,12 +3299,15 @@ function AppContent() {
                   <div>
                     <h3 className="text-lg font-semibold mb-4 text-blue-400">Before Filters</h3>
                     {renderProfitTable(
-                      activeTab === 'time' ? memoizedTimeProfitBefore :
-                      activeTab === 'day' ? memoizedDayProfitBefore :
-                      activeTab === 'dom' ? memoizedDOMProfitBefore :
-                      activeTab === 'date' ? memoizedDateProfitBefore :
-                      activeTab === 'month' ? memoizedMonthProfitBefore :
-                      memoizedYearProfitBefore,
+                      (() => {
+                        const data = activeTab === 'time' ? memoizedTimeProfitBefore :
+                          activeTab === 'day' ? memoizedDayProfitBefore :
+                          activeTab === 'dom' ? memoizedDOMProfitBefore :
+                          activeTab === 'date' ? memoizedDateProfitBefore :
+                          activeTab === 'month' ? memoizedMonthProfitBefore :
+                          memoizedYearProfitBefore
+                        return data || {}
+                      })(),
                       activeTab
                     )}
                   </div>
@@ -3120,6 +3331,13 @@ function AppContent() {
                     className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
                   >
                     {showColumnSelector ? 'Hide' : 'Show'} Columns
+                  </button>
+                  <button
+                    onClick={() => setShowFilteredDays(!showFilteredDays)}
+                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
+                    title={showFilteredDays ? "Hide filtered days (DOW/DOM excluded)" : "Show filtered days"}
+                  >
+                    {showFilteredDays ? '✓' : ''} Filtered Days
                   </button>
                   <button
                     onClick={() => loadMasterMatrix(true)}
@@ -3254,6 +3472,13 @@ function AppContent() {
                     className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
                   >
                     {showColumnSelector ? 'Hide' : 'Show'} Columns
+                  </button>
+                  <button
+                    onClick={() => setShowFilteredDays(!showFilteredDays)}
+                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
+                    title={showFilteredDays ? "Hide filtered days (DOW/DOM excluded)" : "Show filtered days"}
+                  >
+                    {showFilteredDays ? '✓' : ''} Filtered Days
                   </button>
                   <button
                     onClick={() => loadMasterMatrix(true, activeTab)}

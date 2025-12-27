@@ -1,7 +1,6 @@
 // Web Worker for Matrix Data Processing
 // Handles all heavy computations: filtering, stats, aggregations
 
-// Columnar data structure
 class ColumnarData {
   constructor(data) {
     if (!data || data.length === 0) {
@@ -10,13 +9,11 @@ class ColumnarData {
       return
     }
     
-    // Extract all unique column names
     const columnNames = new Set()
     data.forEach(row => {
       Object.keys(row).forEach(key => columnNames.add(key))
     })
     
-    // Convert to columnar format
     this.columns = {}
     this.length = data.length
     
@@ -28,12 +25,10 @@ class ColumnarData {
     })
   }
   
-  // Get a column as array
   getColumn(name) {
     return this.columns[name] || new Array(this.length).fill(null)
   }
   
-  // Get a row as object
   getRow(index) {
     const row = {}
     Object.keys(this.columns).forEach(col => {
@@ -42,19 +37,15 @@ class ColumnarData {
     return row
   }
   
-  // Get multiple rows
   getRows(indices) {
     return indices.map(idx => this.getRow(idx))
   }
   
-  // Filter using bitmask
   filter(mask) {
     const filtered = new ColumnarData([])
     filtered.length = mask.filter(Boolean).length
     
-    if (filtered.length === 0) {
-      return filtered
-    }
+    if (filtered.length === 0) return filtered
     
     const filteredIndices = []
     for (let i = 0; i < mask.length; i++) {
@@ -72,7 +63,9 @@ class ColumnarData {
   }
 }
 
+// ---------------------------------------------------------------------
 // Date parsing cache
+// ---------------------------------------------------------------------
 const dateCache = new Map()
 
 function parseDateCached(dateValue) {
@@ -81,16 +74,7 @@ function parseDateCached(dateValue) {
   
   let parsed = null
   try {
-    if (typeof dateValue === 'string' && dateValue.includes('/')) {
-      const parts = dateValue.split('/')
-      if (parts.length === 3) {
-        parsed = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]))
-      } else {
         parsed = new Date(dateValue)
-      }
-    } else {
-      parsed = new Date(dateValue)
-    }
     if (isNaN(parsed.getTime())) parsed = null
   } catch {
     parsed = null
@@ -100,262 +84,386 @@ function parseDateCached(dateValue) {
   return parsed
 }
 
-// Bitmask-based filtering
-function createFilterMask(columnarData, streamFilters, streamId) {
-  const length = columnarData.length
-  const mask = new Array(length).fill(true)
-  
-  // Helper to get filter sets
-  const getFilterSets = (filters) => {
-    if (!filters) return null
-    return {
-      excludeDaysOfWeek: filters.exclude_days_of_week?.length > 0 
-        ? new Set(filters.exclude_days_of_week) 
-        : null,
-      excludeDaysOfMonth: filters.exclude_days_of_month?.length > 0 
-        ? new Set(filters.exclude_days_of_month) 
-        : null,
-      includeYears: filters.include_years?.length > 0 
-        ? new Set(filters.include_years) 
-        : null
-    }
-  }
-  
-  const masterFilterSets = getFilterSets(streamFilters['master'])
-  const Stream = columnarData.getColumn('Stream')
-  const DateColumn = columnarData.getColumn('Date')
-  const trade_date = columnarData.getColumn('trade_date')
-  
-  // Pre-parse dates and extract components
-  const dates = new Array(length)
-  const dayOfWeeks = new Array(length)
-  const dayOfMonths = new Array(length)
-  const years = new Array(length)
-  
-  for (let i = 0; i < length; i++) {
-    const dateValue = DateColumn[i] || trade_date[i]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        dates[i] = parsed
-        dayOfWeeks[i] = parsed.toLocaleDateString('en-US', { weekday: 'long' })
-        dayOfMonths[i] = parsed.getDate()
-        years[i] = parsed.getFullYear()
-      } else {
-        dates[i] = null
-        dayOfWeeks[i] = null
-        dayOfMonths[i] = null
-        years[i] = null
-      }
-    } else {
-      dates[i] = null
-      dayOfWeeks[i] = null
-      dayOfMonths[i] = null
-      years[i] = null
-    }
-  }
-  
-  // Apply filters
-  for (let i = 0; i < length; i++) {
-    if (!mask[i]) continue
-    
-    const rowStream = Stream[i]
-    
-    // Filter by stream if specified
-    if (streamId && streamId !== 'master' && rowStream !== streamId) {
-      mask[i] = false
-      continue
-    }
-    
-    // Apply individual stream filters (if not master tab)
-    if (streamId && streamId !== 'master') {
-      const filterSets = getFilterSets(streamFilters[streamId])
-      if (filterSets) {
-        if (filterSets.excludeDaysOfWeek && dayOfWeeks[i] && filterSets.excludeDaysOfWeek.has(dayOfWeeks[i])) {
-          mask[i] = false
-          continue
-        }
-        if (filterSets.excludeDaysOfMonth && dayOfMonths[i] !== null && filterSets.excludeDaysOfMonth.has(dayOfMonths[i])) {
-          mask[i] = false
-          continue
-        }
-        if (filterSets.includeYears) {
-          if (years[i] === null || !filterSets.includeYears.has(years[i])) {
-            mask[i] = false
-            continue
-          }
-        }
-      }
-    }
-    
-    // Apply master tab filters (each stream's filters to its own rows)
-    if (streamId === 'master' || !streamId) {
-      const streamFilterSets = rowStream ? getFilterSets(streamFilters[rowStream]) : null
-      
-      if (streamFilterSets) {
-        if (streamFilterSets.excludeDaysOfWeek && dayOfWeeks[i] && streamFilterSets.excludeDaysOfWeek.has(dayOfWeeks[i])) {
-          mask[i] = false
-          continue
-        }
-        if (streamFilterSets.excludeDaysOfMonth && dayOfMonths[i] !== null && streamFilterSets.excludeDaysOfMonth.has(dayOfMonths[i])) {
-          mask[i] = false
-          continue
-        }
-        if (streamFilterSets.includeYears) {
-          if (years[i] === null || !streamFilterSets.includeYears.has(years[i])) {
-            mask[i] = false
-            continue
-          }
-        }
-      }
-      
-      // Apply master-specific filters on top
-      if (masterFilterSets) {
-        if (masterFilterSets.excludeDaysOfWeek && dayOfWeeks[i] && masterFilterSets.excludeDaysOfWeek.has(dayOfWeeks[i])) {
-          mask[i] = false
-          continue
-        }
-        if (masterFilterSets.excludeDaysOfMonth && dayOfMonths[i] !== null && masterFilterSets.excludeDaysOfMonth.has(dayOfMonths[i])) {
-          mask[i] = false
-          continue
-        }
-        if (masterFilterSets.includeYears) {
-          if (years[i] === null || !masterFilterSets.includeYears.has(years[i])) {
-            mask[i] = false
-            continue
-          }
-        }
-      }
-    }
-  }
-  
-  return mask
+// ---------------------------------------------------------------------
+// Statistics (EXECUTED TRADES DOMAIN)
+// ---------------------------------------------------------------------
+
+// Definitions (AUTHORITATIVE)
+function normalizeResult(resultValue) {
+  if (!resultValue || resultValue === null || resultValue === undefined) return ''
+  return String(resultValue).trim().toUpperCase()
 }
 
-// Calculate statistics
-function calculateStats(columnarData, streamId, contractMultiplier, contractValues) {
+function isExecutedTrade(resultNorm) {
+  // is_executed_trade = ResultNorm in {"WIN","LOSS","BE","BREAKEVEN","TIME"}
+  return resultNorm === 'WIN' || resultNorm === 'LOSS' || 
+         resultNorm === 'BE' || resultNorm === 'BREAKEVEN' || 
+         resultNorm === 'TIME'
+}
+
+function isNoTrade(resultNorm) {
+  // is_notrade = ResultNorm == "NOTRADE"
+  return resultNorm === 'NOTRADE'
+}
+
+function calculateStats(columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted = true) {
   if (columnarData.length === 0) {
     return {
-      totalTrades: 0,
-      totalProfit: 0,
-      totalProfitDollars: 0,
-      winRate: 0,
-      wins: 0,
-      losses: 0,
-      breakEven: 0,
-      noTrade: 0,
-      profitFactor: 0,
-      sharpeRatio: 0,
-      sortinoRatio: 0,
-      calmarRatio: 0,
-      maxDrawdown: 0,
-      maxDrawdownDollars: 0,
-      riskReward: 0,
-      meanPnLPerTrade: 0,
-      medianPnLPerTrade: 0,
-      stdDevPnL: 0,
-      maxConsecutiveLosses: 0,
-      timeToRecovery: 0,
-      monthlyReturnStdDev: 0,
-      profitPerDay: 0,
-      skewness: 0,
-      kurtosis: 0,
-      var95: 0,
-      cvar95: 0
+      sample_counts: {
+        total_rows: 0,
+        filtered_rows: 0,
+        allowed_rows: 0,
+        executed_trades_total: 0,
+        executed_trades_allowed: 0,
+        executed_trades_filtered: 0,
+        notrade_total: 0
+      },
+      performance_trade_metrics: _emptyTradeMetrics(),
+      performance_daily_metrics: _emptyDailyMetrics()
     }
   }
-  
+
   const Result = columnarData.getColumn('Result')
   const Profit = columnarData.getColumn('Profit')
   const Instrument = columnarData.getColumn('Instrument')
+  const Stream = columnarData.getColumn('Stream')
   const DateColumn = columnarData.getColumn('Date')
   const trade_date = columnarData.getColumn('trade_date')
-  
-  // Filter out NoTrade entries for PnL calculations
-  const validTrades = []
-  const perTradePnLDollars = []
-  
+  const FinalAllowed = columnarData.getColumn('final_allowed')
+  const Time = columnarData.getColumn('Time')
+
+  // Filter by stream if specified (not 'master')
+  let dataIndices = []
   for (let i = 0; i < columnarData.length; i++) {
-    if (Result[i] === 'NoTrade') continue
-    
+    if (streamId && streamId !== 'master' && Stream[i] !== streamId) {
+      continue
+    }
+    dataIndices.push(i)
+  }
+
+  // Normalize results and identify executed trades and NoTrade
+  const resultNorm = []
+  const isExecuted = []
+  const isNoTradeFlag = []
+  
+  for (let i of dataIndices) {
+    const norm = normalizeResult(Result[i])
+    resultNorm[i] = norm
+    isExecuted[i] = isExecutedTrade(norm)
+    isNoTradeFlag[i] = isNoTrade(norm)
+  }
+
+  // ========================================================================
+  // SAMPLE COUNTS
+  // ========================================================================
+  const totalRows = dataIndices.length
+  let filteredRows = 0
+  let allowedRows = 0
+  let executedTradesTotal = 0
+  let executedTradesAllowed = 0
+  let executedTradesFiltered = 0
+  let notradeTotal = 0
+
+  const executedIndices = []
+  const executedAllowedIndices = []
+  const executedFilteredIndices = []
+
+  for (let i of dataIndices) {
+    const finalAllowed = FinalAllowed[i] !== false // Default to true if undefined
+    if (finalAllowed) {
+      allowedRows++
+    } else {
+      filteredRows++
+    }
+
+    if (isExecuted[i]) {
+      executedTradesTotal++
+      executedIndices.push(i)
+      if (finalAllowed) {
+        executedTradesAllowed++
+        executedAllowedIndices.push(i)
+      } else {
+        executedTradesFiltered++
+        executedFilteredIndices.push(i)
+      }
+    }
+
+    if (isNoTradeFlag[i]) {
+      notradeTotal++
+    }
+  }
+
+  const sample_counts = {
+    total_rows: totalRows,
+    filtered_rows: filteredRows,
+    allowed_rows: allowedRows,
+    executed_trades_total: executedTradesTotal,
+    executed_trades_allowed: executedTradesAllowed,
+    executed_trades_filtered: executedTradesFiltered,
+    notrade_total: notradeTotal
+  }
+
+  // ========================================================================
+  // CALCULATE DAY COUNTS
+  // - executed_trading_days: from ALL executed trades (for reporting)
+  // - allowed_trading_days: from stats sample (days actually traded in stats)
+  // ========================================================================
+  const executedDayCounts = _calculateDayCounts(executedIndices, DateColumn, trade_date)
+  const executedTradingDays = executedDayCounts.executed_trading_days
+
+  // ========================================================================
+  // SELECT STATS SAMPLE: Executed trades (optionally filtered by final_allowed)
+  // ========================================================================
+  let statsSampleIndices = includeFilteredExecuted ? executedIndices : executedAllowedIndices
+
+  if (statsSampleIndices.length === 0) {
+    return {
+      sample_counts,
+      performance_trade_metrics: _emptyTradeMetrics(),
+      performance_daily_metrics: _emptyDailyMetrics(),
+      day_counts: {
+        executed_trading_days: executedTradingDays,  // All executed trades (for reference)
+        allowed_trading_days: 0  // Active days from stats sample (0 when no stats sample)
+      }
+    }
+  }
+
+  // ========================================================================
+  // ACTIVE TRADING DAYS: Count unique days from stats sample ONLY
+  // A day is active if and only if it contains ≥1 trade in the stats sample
+  // When toggle OFF: Days with only filtered trades are NOT counted
+  // When toggle ON: All days with executed trades are counted
+  // ========================================================================
+  const activeTradingDays = _countUniqueDays(statsSampleIndices, DateColumn, trade_date)
+  const statsSampleTradeCount = statsSampleIndices.length
+
+  // ========================================================================
+  // PERFORMANCE TRADE METRICS (per-trade, computed on executed trades only)
+  // ========================================================================
+  const performance_trade_metrics = _calculateTradeMetrics(
+    statsSampleIndices,
+    resultNorm,
+    Profit,
+    Instrument,
+    contractValues,
+    contractMultiplier
+  )
+
+  // ========================================================================
+  // PERFORMANCE DAILY METRICS (daily aggregation, computed on executed trades only)
+  // Behavioral averages use active_trading_days (from stats sample ONLY)
+  // Risk metrics (Sharpe/Sortino/Calmar) use daily PnL series from stats sample
+  // ========================================================================
+  const performance_daily_metrics = _calculateDailyMetrics(
+    statsSampleIndices,
+    resultNorm,
+    Profit,
+    Instrument,
+    DateColumn,
+    trade_date,
+    contractValues,
+    contractMultiplier,
+    activeTradingDays,
+    performance_trade_metrics.total_profit,
+    statsSampleTradeCount
+  )
+
+  return {
+    sample_counts,
+    performance_trade_metrics,
+    performance_daily_metrics,
+    day_counts: {
+      executed_trading_days: executedTradingDays,  // All executed trades (for reference)
+      allowed_trading_days: activeTradingDays  // Active days from stats sample (for behavioral metrics)
+    }
+  }
+}
+
+function _emptyTradeMetrics() {
+  return {
+    total_profit: 0.0,
+    wins: 0,
+    losses: 0,
+    be: 0,
+    time: 0,
+    win_rate: 0.0,
+    profit_factor: 0.0,
+    rr_ratio: 0.0,
+    mean_pnl_per_trade: 0.0,
+    median_pnl_per_trade: 0.0,
+    stddev_pnl_per_trade: 0.0,
+    max_consecutive_losses: 0,
+    max_drawdown: 0.0,
+    var95: 0.0,
+    cvar95: 0.0
+  }
+}
+
+function _calculateDayCounts(executedIndices, DateColumn, trade_date) {
+  /**
+   * Calculate executed trading day count from ALL executed trades.
+   * 
+   * Definition:
+   * - Executed Trading Day: A calendar day with ≥1 is_executed_trade == True
+   *   (includes filtered and allowed trades)
+   */
+  if (executedIndices.length === 0) {
+    return { executed_trading_days: 0 }
+  }
+
+  const executedDays = new Set()
+
+  for (const i of executedIndices) {
+    const dateValue = DateColumn[i] || trade_date[i]
+    if (!dateValue) continue
+
+    const parsed = parseDateCached(dateValue)
+    if (!parsed) continue
+
+    const dayKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+    executedDays.add(dayKey)
+  }
+
+  return {
+    executed_trading_days: executedDays.size
+  }
+}
+
+function _countUniqueDays(indices, DateColumn, trade_date) {
+  /**
+   * Count unique trading days in a set of indices.
+   * 
+   * Used for calculating allowed_trading_days from stats sample.
+   */
+  if (indices.length === 0) {
+    return 0
+  }
+
+  const uniqueDays = new Set()
+
+  for (const i of indices) {
+    const dateValue = DateColumn[i] || trade_date[i]
+    if (!dateValue) continue
+
+    const parsed = parseDateCached(dateValue)
+    if (!parsed) continue
+
+    const dayKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+    uniqueDays.add(dayKey)
+  }
+
+  return uniqueDays.size
+}
+
+function _emptyDailyMetrics() {
+    return {
+    executed_trading_days: 0,
+    allowed_trading_days: 0,
+    avg_trades_per_day: 0.0,
+    profit_per_day: 0.0,
+    profit_per_week: 0.0,
+    profit_per_month: 0.0,
+    profit_per_year: 0.0,
+    sharpe_ratio: 0.0,
+    sortino_ratio: 0.0,
+    calmar_ratio: 0.0,
+    time_to_recovery_days: 0,
+    monthly_return_stddev: 0.0
+  }
+}
+
+function _calculateTradeMetrics(
+  indices,
+  resultNorm,
+  Profit,
+  Instrument,
+  contractValues,
+  contractMultiplier
+) {
+  if (indices.length === 0) {
+    return _emptyTradeMetrics()
+  }
+
+  // Count by result type - single pass optimization
+  let wins = 0, losses = 0, be = 0, time = 0
+  const perTradePnLDollars = []
+  let totalProfit = 0
+  let grossProfit = 0
+  let grossLoss = 0
+  let winSum = 0
+  let lossSum = 0
+
+  for (let i of indices) {
+    // Use pre-computed resultNorm instead of re-normalizing (performance optimization)
+    const result = resultNorm[i]
     const profit = parseFloat(Profit[i]) || 0
+
     const symbol = Instrument[i] || 'ES'
     const baseSymbol = symbol.replace(/\d+$/, '') || symbol
     const contractValue = contractValues[baseSymbol] || 50
-    
-    validTrades.push(i)
-    perTradePnLDollars.push(profit * contractValue * contractMultiplier)
-  }
-  
-  if (validTrades.length === 0) {
-    return {
-      totalTrades: columnarData.length,
-      totalProfit: 0,
-      totalProfitDollars: 0,
-      winRate: 0,
-      wins: 0,
-      losses: 0,
-      breakEven: 0,
-      noTrade: columnarData.length,
-      profitFactor: 0,
-      sharpeRatio: 0,
-      sortinoRatio: 0,
-      calmarRatio: 0,
-      maxDrawdown: 0,
-      maxDrawdownDollars: 0,
-      riskReward: 0,
-      meanPnLPerTrade: 0,
-      medianPnLPerTrade: 0,
-      stdDevPnL: 0,
-      maxConsecutiveLosses: 0,
-      timeToRecovery: 0,
-      monthlyReturnStdDev: 0,
-      profitPerDay: 0,
-      skewness: 0,
-      kurtosis: 0,
-      var95: 0,
-      cvar95: 0
+    const profitDollars = profit * contractValue * contractMultiplier
+
+    perTradePnLDollars.push(profitDollars)
+    totalProfit += profitDollars
+
+    // Track profit/loss for profit factor
+    if (profitDollars > 0) {
+      grossProfit += profitDollars
+    } else if (profitDollars < 0) {
+      grossLoss += Math.abs(profitDollars)
+    }
+
+    if (result === 'WIN') {
+      wins++
+      winSum += profitDollars
+    } else if (result === 'LOSS') {
+      losses++
+      lossSum += Math.abs(profitDollars)
+    } else if (result === 'BE' || result === 'BREAKEVEN') {
+      be++
+    } else if (result === 'TIME') {
+      time++
     }
   }
-  
-  // Basic counts
-  let wins = 0, losses = 0, breakEven = 0, noTrade = 0
-  let totalProfit = 0
-  
-  for (let i = 0; i < columnarData.length; i++) {
-    const result = Result[i]
-    const profit = parseFloat(Profit[i]) || 0
-    totalProfit += profit
-    
-    // Check for BreakEven - could be 'BE' or 'BreakEven'
-    if (result === 'Win') wins++
-    else if (result === 'Loss') losses++
-    else if (result === 'BreakEven' || result === 'BE') breakEven++
-    else if (result === 'NoTrade') noTrade++
-  }
-  
-  const totalProfitDollars = perTradePnLDollars.reduce((sum, pnl) => sum + pnl, 0)
-  const totalTrades = validTrades.length
-  // Win Rate should exclude BreakEven and NoTrade: wins / (wins + losses)
+
+  // Win rate (wins / (wins + losses), excluding BE and TIME)
   const winLossTrades = wins + losses
-  const winRate = winLossTrades > 0 ? (wins / winLossTrades) * 100 : 0
-  
-  // Mean and median
-  const meanPnL = perTradePnLDollars.reduce((sum, pnl) => sum + pnl, 0) / perTradePnLDollars.length
+  const winRate = winLossTrades > 0 ? (wins / winLossTrades) * 100 : 0.0
+
+  // Profit factor (already calculated in loop)
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0.0)
+
+  // Risk-Reward ratio (avg_win / avg_loss) - already have sums
+  const avgWin = wins > 0 ? winSum / wins : 0
+  const avgLoss = losses > 0 ? lossSum / losses : 0
+  const rrRatio = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0.0)
+
+  // PnL statistics
+  const meanPnL = perTradePnLDollars.length > 0 
+    ? totalProfit / perTradePnLDollars.length 
+    : 0.0
+
+  // Median
   const sortedPnL = [...perTradePnLDollars].sort((a, b) => a - b)
   const medianPnL = sortedPnL.length % 2 === 0
     ? (sortedPnL[sortedPnL.length / 2 - 1] + sortedPnL[sortedPnL.length / 2]) / 2
     : sortedPnL[Math.floor(sortedPnL.length / 2)]
   
-  // Std Dev
-  const variance = perTradePnLDollars.reduce((sum, pnl) => sum + Math.pow(pnl - meanPnL, 2), 0) / (perTradePnLDollars.length - 1)
+  // Std dev - optimized single pass
+  let varianceSum = 0
+  if (perTradePnLDollars.length > 1) {
+    for (const pnl of perTradePnLDollars) {
+      varianceSum += Math.pow(pnl - meanPnL, 2)
+    }
+  }
+  const variance = perTradePnLDollars.length > 1 ? varianceSum / (perTradePnLDollars.length - 1) : 0
   const stdDevPnL = Math.sqrt(variance)
   
   // Max consecutive losses
   let maxConsecutiveLosses = 0
   let currentStreak = 0
-  for (let i = 0; i < perTradePnLDollars.length; i++) {
-    if (perTradePnLDollars[i] < 0) {
+  for (let i of indices) {
+    if (resultNorm[i] === 'LOSS') {
       currentStreak++
       maxConsecutiveLosses = Math.max(maxConsecutiveLosses, currentStreak)
     } else {
@@ -363,580 +471,303 @@ function calculateStats(columnarData, streamId, contractMultiplier, contractValu
     }
   }
   
-  // Profit Factor
-  const grossProfit = perTradePnLDollars.filter(pnl => pnl > 0).reduce((sum, pnl) => sum + pnl, 0)
-  const grossLoss = Math.abs(perTradePnLDollars.filter(pnl => pnl < 0).reduce((sum, pnl) => sum + pnl, 0))
-  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : 0
-  
-  // Drawdown calculation
-  let runningProfit = 0
-  let peak = 0
+  // Max drawdown (trade equity curve) - keep in dollars, no conversion
+  let cumulativeProfit = 0
+  let runningMax = 0
   let maxDrawdown = 0
-  let maxDrawdownDollars = 0
-  
-  for (let i = 0; i < perTradePnLDollars.length; i++) {
-    runningProfit += perTradePnLDollars[i]
-    peak = Math.max(peak, runningProfit)
-    const drawdown = peak - runningProfit
-    if (drawdown > maxDrawdown) {
-      maxDrawdown = drawdown
-      maxDrawdownDollars = drawdown
-    }
+  for (let pnl of perTradePnLDollars) {
+    cumulativeProfit += pnl
+    runningMax = Math.max(runningMax, cumulativeProfit)
+    const drawdown = cumulativeProfit - runningMax
+    maxDrawdown = Math.max(maxDrawdown, Math.abs(drawdown))
   }
-  
-  // Time to recovery (longest drawdown duration in days)
-  // Track equity curve, find each peak -> trough -> recovery cycle
-  // Return the maximum duration in days
-  let maxRecoveryDays = 0
-  let equityCurve = []
-  runningProfit = 0
-  
-  // Build equity curve
-  for (let i = 0; i < perTradePnLDollars.length; i++) {
-    runningProfit += perTradePnLDollars[i]
-    equityCurve.push({
-      value: runningProfit,
-      tradeIdx: i,
-      dataIdx: validTrades[i]
-    })
-  }
-  
-  // Find all peaks and their subsequent recoveries
-  let currentPeak = -Infinity
-  let currentPeakIdx = -1
-  let currentPeakDate = null
-  
-  for (let i = 0; i < equityCurve.length; i++) {
-    const current = equityCurve[i]
-    
-    // New peak found
-    if (current.value > currentPeak) {
-      // If we had a previous peak, check if we recovered from it
-      if (currentPeakIdx >= 0 && currentPeakDate) {
-        // We've recovered (current value >= previous peak)
-        if (current.value >= currentPeak) {
-          const currentDateValue = DateColumn[current.dataIdx] || trade_date[current.dataIdx]
-          if (currentDateValue) {
-            const currentDate = parseDateCached(currentDateValue)
-            if (currentDate) {
-              const diffTime = currentDate.getTime() - currentPeakDate.getTime()
-              const days = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-              maxRecoveryDays = Math.max(maxRecoveryDays, days)
-            }
-          }
-        }
-      }
-      
-      // Update to new peak
-      currentPeak = current.value
-      currentPeakIdx = i
-      const peakDateValue = DateColumn[current.dataIdx] || trade_date[current.dataIdx]
-      if (peakDateValue) {
-        currentPeakDate = parseDateCached(peakDateValue)
-      }
-    }
-  }
-  
-  // Check if we're still in a drawdown from the last peak
-  if (currentPeakIdx >= 0 && currentPeakDate && equityCurve.length > 0) {
-    const lastValue = equityCurve[equityCurve.length - 1].value
-    if (lastValue < currentPeak) {
-      // Still in drawdown - calculate days from peak to last trade
-      const lastDataIdx = equityCurve[equityCurve.length - 1].dataIdx
-      const lastDateValue = DateColumn[lastDataIdx] || trade_date[lastDataIdx]
-      if (lastDateValue) {
-        const lastDate = parseDateCached(lastDateValue)
-        if (lastDate) {
-          const diffTime = lastDate.getTime() - currentPeakDate.getTime()
-          const days = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-          maxRecoveryDays = Math.max(maxRecoveryDays, days)
-        }
-      }
-    }
-  }
-  
-  const timeToRecovery = maxRecoveryDays
-  
-  // Monthly return std dev
-  const monthlyProfits = new Map()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const monthKey = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`
-        if (!monthlyProfits.has(monthKey)) {
-          monthlyProfits.set(monthKey, 0)
-        }
-        monthlyProfits.set(monthKey, monthlyProfits.get(monthKey) + perTradePnLDollars[i])
-      }
-    }
-  }
-  
-  const monthlyReturns = Array.from(monthlyProfits.values())
-  const meanMonthlyReturn = monthlyReturns.length > 0 
-    ? monthlyReturns.reduce((sum, r) => sum + r, 0) / monthlyReturns.length 
-    : 0
-  const monthlyVariance = monthlyReturns.length > 1
-    ? monthlyReturns.reduce((sum, r) => sum + Math.pow(r - meanMonthlyReturn, 2), 0) / (monthlyReturns.length - 1)
-    : 0
-  const monthlyReturnStdDev = Math.sqrt(monthlyVariance)
-  
-  // Total Days - count unique dates
-  const uniqueDates = new Set()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const dayKey = parsed.toISOString().split('T')[0]
-        uniqueDates.add(dayKey)
-      }
-    }
-  }
-  const totalDays = uniqueDates.size
-  const avgTradesPerDay = totalDays > 0 ? validTrades.length / totalDays : 0
-  
-  // Profit per day - group trades by date
-  const dailyProfits = new Map()
-  for (let i = 0; i < validTrades.length; i++) {
-    const idx = validTrades[i]
-    const dateValue = DateColumn[idx] || trade_date[idx]
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      if (parsed) {
-        const dayKey = parsed.toISOString().split('T')[0]
-        if (!dailyProfits.has(dayKey)) {
-          dailyProfits.set(dayKey, 0)
-        }
-        dailyProfits.set(dayKey, dailyProfits.get(dayKey) + perTradePnLDollars[i])
-      }
-    }
-  }
-  const dailyProfitValues = Array.from(dailyProfits.values())
-  const profitPerDay = dailyProfitValues.length > 0
-    ? dailyProfitValues.reduce((sum, p) => sum + p, 0) / dailyProfitValues.length
-    : 0
-  
-  // Profit per week - calculate as profit per day * 5 trading days
-  // This is more accurate than grouping by week of month
-  const profitPerWeek = profitPerDay * 5
-  
-  // Profit per month - calculate as profit per day * ~21 trading days per month
-  // This is more accurate than averaging monthly profits
-  const tradingDaysPerMonth = 21  // Average trading days per month
-  const profitPerMonth = profitPerDay * tradingDaysPerMonth
-  
-  // Profit per year - calculate as profit per day * 252 trading days
-  // This is more accurate than averaging yearly profits
-  const tradingDaysPerYear = 252
-  const profitPerYear = profitPerDay * tradingDaysPerYear
-  
-  // Calculate daily returns statistics for Sharpe/Sortino
-  const meanDailyReturn = profitPerDay
-  const dailyReturnsVariance = dailyProfitValues.length > 1
-    ? dailyProfitValues.reduce((sum, r) => sum + Math.pow(r - meanDailyReturn, 2), 0) / (dailyProfitValues.length - 1)
-    : 0
-  const dailyReturnsStdDev = Math.sqrt(dailyReturnsVariance)
-  
-  // Downside returns (negative daily returns) for Sortino
-  const downsideDailyReturns = dailyProfitValues.filter(r => r < 0)
-  const downsideDailyVariance = downsideDailyReturns.length > 1
-    ? downsideDailyReturns.reduce((sum, r) => sum + Math.pow(r, 2), 0) / (downsideDailyReturns.length - 1)
-    : 0
-  const downsideDailyStdDev = Math.sqrt(downsideDailyVariance)
-  
-  // Skewness and Kurtosis
-  const n = perTradePnLDollars.length
-  const mean = meanPnL
-  const std = stdDevPnL
-  
-  if (std > 0 && n > 2) {
-    let skewSum = 0
-    let kurtSum = 0
-    for (let i = 0; i < n; i++) {
-      const z = (perTradePnLDollars[i] - mean) / std
-      skewSum += Math.pow(z, 3)
-      kurtSum += Math.pow(z, 4)
-    }
-    const skewness = (n / ((n - 1) * (n - 2))) * skewSum
-    const kurtosis = ((n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3))) * kurtSum - 3 * ((n - 1) * (n - 1)) / ((n - 2) * (n - 3))
-    
-    // VaR and CVaR (95%)
-    const var95Idx = Math.floor(n * 0.05)
-    const var95 = sortedPnL[var95Idx] || 0
+
+  // VaR and CVaR (95%)
+  if (sortedPnL.length > 0) {
+    const var95Idx = Math.floor(sortedPnL.length * 0.05)
+    const var95 = var95Idx < sortedPnL.length ? sortedPnL[var95Idx] : sortedPnL[0]
     const cvar95Values = sortedPnL.slice(0, var95Idx + 1)
     const cvar95 = cvar95Values.length > 0
-      ? cvar95Values.reduce((sum, v) => sum + v, 0) / cvar95Values.length
-      : 0
-    
-    // Sharpe, Sortino, Calmar - use daily returns, not per-trade
-    const tradingDaysPerYear = 252
-    // Annualized return: mean daily return * trading days per year
-    const annualizedReturn = meanDailyReturn * tradingDaysPerYear
-    // Annualized volatility: daily std dev * sqrt(trading days per year)
-    const annualizedVolatility = dailyReturnsStdDev > 0 ? dailyReturnsStdDev * Math.sqrt(tradingDaysPerYear) : 0
-    // Sharpe Ratio: annualized return / annualized volatility (risk-free rate = 0)
-    const sharpeRatio = annualizedVolatility > 0 ? annualizedReturn / annualizedVolatility : 0
-    
-    // Sortino Ratio: annualized return / annualized downside volatility
-    const annualizedDownsideVol = downsideDailyStdDev > 0 ? downsideDailyStdDev * Math.sqrt(tradingDaysPerYear) : 0
-    const sortinoRatio = annualizedDownsideVol > 0 ? annualizedReturn / annualizedDownsideVol : 0
-    
-    // Calmar Ratio: annual return / max drawdown
-    // Annual return = (total profit / total days) * trading days per year
-    const annualReturn = totalDays > 0 ? (totalProfitDollars / totalDays) * tradingDaysPerYear : 0
-    const calmarRatio = maxDrawdownDollars > 0 ? annualReturn / maxDrawdownDollars : 0
-    
-    // Risk-Reward
-    const avgWin = perTradePnLDollars.filter(pnl => pnl > 0).reduce((sum, pnl) => sum + pnl, 0) / wins || 0
-    const avgLoss = Math.abs(perTradePnLDollars.filter(pnl => pnl < 0).reduce((sum, pnl) => sum + pnl, 0) / losses) || 0
-    const riskReward = avgLoss > 0 ? avgWin / avgLoss : 0
-    
+      ? cvar95Values.reduce((a, b) => a + b, 0) / cvar95Values.length
+      : var95
     return {
-      totalTrades,
-      totalProfit,
-      totalProfitDollars,
-      totalDays,
-      avgTradesPerDay,
-      winRate,
+      total_profit: Math.round(totalProfit * 100) / 100,
       wins,
       losses,
-      breakEven,
-      noTrade,
-      profitFactor,
-      sharpeRatio,
-      sortinoRatio,
-      calmarRatio,
-      maxDrawdown: maxDrawdownDollars,
-      maxDrawdownDollars,
-      riskReward,
-      meanPnLPerTrade: meanPnL,
-      medianPnLPerTrade: medianPnL,
-      stdDevPnL,
-      maxConsecutiveLosses,
-      timeToRecovery,
-      monthlyReturnStdDev,
-      profitPerDay,
-      profitPerWeek,
-      profitPerMonth,
-      profitPerYear,
-      skewness,
-      kurtosis,
-      var95,
-      cvar95
+      be,
+      time,
+      win_rate: Math.round(winRate * 10) / 10,
+      profit_factor: Math.round(profitFactor * 100) / 100,
+      rr_ratio: Math.round(rrRatio * 100) / 100,
+      mean_pnl_per_trade: Math.round(meanPnL * 100) / 100,
+      median_pnl_per_trade: Math.round(medianPnL * 100) / 100,
+      stddev_pnl_per_trade: Math.round(stdDevPnL * 100) / 100,
+      max_consecutive_losses: maxConsecutiveLosses,
+      max_drawdown: Math.round(maxDrawdown * 100) / 100,
+      var95: Math.round(var95 * 100) / 100,
+      cvar95: Math.round(cvar95 * 100) / 100
     }
   }
-  
-  // Fallback for small datasets
-  return {
-    totalTrades,
-    totalProfit,
-    totalProfitDollars,
-    totalDays,
-    avgTradesPerDay,
-    winRate,
-    wins,
-    losses,
-    breakEven,
-    noTrade,
-    profitFactor,
-    sharpeRatio: 0,
-    sortinoRatio: 0,
-    calmarRatio: 0,
-    maxDrawdown: maxDrawdownDollars,
-    maxDrawdownDollars,
-    riskReward: 0,
-    meanPnLPerTrade: meanPnL,
-    medianPnLPerTrade: medianPnL,
-    stdDevPnL,
-    maxConsecutiveLosses,
-    timeToRecovery,
-      monthlyReturnStdDev,
-      profitPerDay,
-      profitPerWeek,
-      profitPerMonth,
-      profitPerYear,
-      skewness: 0,
-      kurtosis: 0,
-      var95: 0,
-      cvar95: 0
-    }
+
+  return _emptyTradeMetrics()
 }
 
-// Calculate profit breakdowns (Time, Day, DOM, Month, Year)
-function calculateProfitBreakdown(columnarData, contractMultiplier, contractValues, breakdownType) {
-  const Profit = columnarData.getColumn('Profit')
-  const Stream = columnarData.getColumn('Stream')
-  const Instrument = columnarData.getColumn('Instrument')
-  const Time = columnarData.getColumn('Time')
-  const DateColumn = columnarData.getColumn('Date')
-  const trade_date = columnarData.getColumn('trade_date')
-  
-  const result = {}
-  
-  for (let i = 0; i < columnarData.length; i++) {
+function _calculateDailyMetrics(
+  indices,
+  resultNorm,
+  Profit,
+  Instrument,
+  DateColumn,
+  trade_date,
+  contractValues,
+  contractMultiplier,
+  activeTradingDays,
+  totalProfit,
+  statsSampleTradeCount
+) {
+  /**
+   * Calculate daily aggregation performance metrics.
+   * 
+   * CRITICAL: Behavioral averages (profit_per_day, avg_trades_per_day) use active_trading_days,
+   * which is computed from the stats sample ONLY. A day is active if and only if it contains
+   * ≥1 trade in the stats sample. Days with zero trades in the stats sample are NOT counted.
+   * 
+   * Risk metrics (Sharpe/Sortino/Calmar) use daily PnL series from stats sample.
+   */
+  if (indices.length === 0) {
+    return _emptyDailyMetrics()
+  }
+
+  // Group by trading day (date only) - for risk metrics (daily PnL series)
+  const dailyProfits = new Map() // date string -> array of profit dollars
+
+  for (let i of indices) {
+    const dateValue = DateColumn[i] || trade_date[i]
+    if (!dateValue) continue
+
+      const parsed = parseDateCached(dateValue)
+    if (!parsed) continue
+
+    const dayKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+
     const profit = parseFloat(Profit[i]) || 0
-    const stream = Stream[i] || 'Unknown'
     const symbol = Instrument[i] || 'ES'
     const baseSymbol = symbol.replace(/\d+$/, '') || symbol
     const contractValue = contractValues[baseSymbol] || 50
     const profitDollars = profit * contractValue * contractMultiplier
-    
-    let key = null
-    
-    if (breakdownType === 'time') {
-      const time = Time[i]
-      if (!time || time === 'NA' || time === '00:00') continue
-      let timeKey = time.toString().trim()
-      if (!/^\d{2}:\d{2}$/.test(timeKey)) {
-        const match = timeKey.match(/(\d{2}:\d{2})/)
-        if (match) timeKey = match[1]
-        else continue
-      }
-      key = timeKey
-    } else if (breakdownType === 'day') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      const dow = parsed.toLocaleDateString('en-US', { weekday: 'long' })
-      const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-      if (!dowOrder.includes(dow)) continue
-      key = dow
-    } else if (breakdownType === 'dom') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      key = parsed.getDate().toString()
-    } else if (breakdownType === 'week') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      const day = parsed.getDate()
-      // Calculate which week of the month (1-5): 
-      // Week 1: days 1-7
-      // Week 2: days 8-14
-      // Week 3: days 15-21
-      // Week 4: days 22-28
-      // Week 5: days 29-31 (all remaining days)
-      // Consolidate all months into just 5 weeks
-      let weekOfMonth
-      if (day <= 7) {
-        weekOfMonth = 1
-      } else if (day <= 14) {
-        weekOfMonth = 2
-      } else if (day <= 21) {
-        weekOfMonth = 3
-      } else if (day <= 28) {
-        weekOfMonth = 4
-      } else {
-        weekOfMonth = 5
-      }
-      key = `Week ${weekOfMonth}`
-    } else if (breakdownType === 'date') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      // Format as YYYY-MM-DD
-      const year = parsed.getFullYear()
-      const month = String(parsed.getMonth() + 1).padStart(2, '0')
-      const day = String(parsed.getDate()).padStart(2, '0')
-      key = `${year}-${month}-${day}`
-    } else if (breakdownType === 'month') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      const year = parsed.getFullYear()
-      const month = parsed.getMonth() + 1
-      key = `${year}-${String(month).padStart(2, '0')}`
-    } else if (breakdownType === 'year') {
-      const dateValue = DateColumn[i] || trade_date[i]
-      if (!dateValue) continue
-      const parsed = parseDateCached(dateValue)
-      if (!parsed) continue
-      key = parsed.getFullYear().toString()
+
+        if (!dailyProfits.has(dayKey)) {
+      dailyProfits.set(dayKey, [])
     }
-    
-    if (!key) continue
-    
-    if (!result[key]) result[key] = {}
-    if (!result[key][stream]) result[key][stream] = 0
-    result[key][stream] += profitDollars
+    dailyProfits.get(dayKey).push(profitDollars)
   }
+
+  // Sum per day
+  const dailyPnL = []
+  const dates = []
+  for (const [dateStr, profits] of dailyProfits.entries()) {
+    dates.push(dateStr)
+    dailyPnL.push(profits.reduce((a, b) => a + b, 0))
+  }
+
+  if (dailyPnL.length === 0) {
+    return _emptyDailyMetrics()
+  }
+
+  // Behavioral averages use active_trading_days (days with ≥1 trade in stats sample)
+  // avg_trades_per_active_day = stats_sample_trade_count / active_trading_days
+  const avgTradesPerDay = activeTradingDays > 0 ? statsSampleTradeCount / activeTradingDays : 0.0
   
-  // Sort results appropriately
-  if (breakdownType === 'time') {
-    const sorted = {}
-    Object.keys(result).sort((a, b) => {
-      const [aHour, aMin] = a.split(':').map(Number)
-      const [bHour, bMin] = b.split(':').map(Number)
-      if (aHour !== bHour) return aHour - bHour
-      return aMin - bMin
-    }).forEach(key => { sorted[key] = result[key] })
-    return sorted
-  } else if (breakdownType === 'day') {
-    const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-    const sorted = {}
-    dowOrder.forEach(dow => {
-      if (result[dow]) sorted[dow] = result[dow]
-    })
-    return sorted
-  } else if (breakdownType === 'dom') {
-    const sorted = {}
-    for (let day = 1; day <= 31; day++) {
-      if (result[day.toString()]) sorted[day.toString()] = result[day.toString()]
+  // profit_per_active_day = total_profit / active_trading_days
+  const profitPerDay = activeTradingDays > 0 ? totalProfit / activeTradingDays : 0.0
+
+  // Sharpe/Sortino ratios (annualized using 252 trading days)
+  // Use mean of daily PnL series for risk metrics (not profitPerDay)
+  const meanDailyReturn = dailyPnL.length > 0 ? dailyPnL.reduce((a, b) => a + b, 0) / dailyPnL.length : 0.0
+  const variance = dailyPnL.length > 1
+    ? dailyPnL.reduce((sum, r) => sum + Math.pow(r - meanDailyReturn, 2), 0) / (dailyPnL.length - 1)
+    : 0
+  const stdDailyReturn = Math.sqrt(variance)
+
+    const tradingDaysPerYear = 252
+    const annualizedReturn = meanDailyReturn * tradingDaysPerYear
+  const annualizedVolatility = stdDailyReturn * Math.sqrt(tradingDaysPerYear)
+  const sharpeRatio = annualizedVolatility > 0 ? annualizedReturn / annualizedVolatility : 0.0
+
+  // Sortino: only downside volatility
+  const downsideReturns = dailyPnL.filter(r => r < 0)
+  const downsideVariance = downsideReturns.length > 1
+    ? downsideReturns.reduce((sum, r) => sum + Math.pow(r - meanDailyReturn, 2), 0) / (downsideReturns.length - 1)
+    : 0
+  const downsideStd = Math.sqrt(downsideVariance)
+  const annualizedDownsideVol = downsideStd * Math.sqrt(tradingDaysPerYear)
+  const sortinoRatio = annualizedDownsideVol > 0 ? annualizedReturn / annualizedDownsideVol : 0.0
+
+  // Time to recovery (trading days, not calendar days)
+  // Count as difference in trading day index
+  let cumulativePnL = 0
+  let runningMax = 0
+  let timeToRecoveryDays = 0
+  let inDrawdown = false
+  let drawdownStartIdx = null
+
+  for (let idx = 0; idx < dailyPnL.length; idx++) {
+    cumulativePnL += dailyPnL[idx]
+    runningMax = Math.max(runningMax, cumulativePnL)
+    const drawdown = cumulativePnL - runningMax
+
+    if (drawdown < 0) {
+      if (!inDrawdown) {
+        inDrawdown = true
+        drawdownStartIdx = idx
+      }
+    } else {
+      if (inDrawdown && drawdownStartIdx !== null) {
+        const recoveryDays = idx - drawdownStartIdx
+        timeToRecoveryDays = Math.max(timeToRecoveryDays, recoveryDays)
+        inDrawdown = false
+        drawdownStartIdx = null
+      }
     }
-    return sorted
-  } else if (breakdownType === 'week') {
-    // Sort by week number (Week 1, Week 2, Week 3, Week 4, Week 5)
-    const sorted = {}
-    const weekOrder = ['Week 1', 'Week 2', 'Week 3', 'Week 4', 'Week 5']
-    weekOrder.forEach(week => {
-      if (result[week]) sorted[week] = result[week]
-    })
-    return sorted
   }
-  
-  return result
+
+  // Monthly return std dev (Option 1: actual calendar months)
+  // Group by YYYY-MM
+  const monthlyProfits = new Map() // "YYYY-MM" -> array of daily PnL
+  for (let idx = 0; idx < dates.length; idx++) {
+    const dateStr = dates[idx]
+    const yearMonth = dateStr.substring(0, 7) // "YYYY-MM"
+    if (!monthlyProfits.has(yearMonth)) {
+      monthlyProfits.set(yearMonth, [])
+    }
+    monthlyProfits.get(yearMonth).push(dailyPnL[idx])
+  }
+
+  // Sum per month
+  const monthlyPnL = []
+  for (const profits of monthlyProfits.values()) {
+    monthlyPnL.push(profits.reduce((a, b) => a + b, 0))
+  }
+
+  const monthlyReturnStdDev = monthlyPnL.length > 1
+    ? (() => {
+        const meanMonthly = monthlyPnL.reduce((a, b) => a + b, 0) / monthlyPnL.length
+        const variance = monthlyPnL.reduce((sum, r) => sum + Math.pow(r - meanMonthly, 2), 0) / (monthlyPnL.length - 1)
+        return Math.sqrt(variance)
+      })()
+    : 0.0
+
+  // Calmar ratio (annualized return / max drawdown from daily)
+  // Use mean daily return from PnL series for consistency with Sharpe/Sortino
+  const annualReturnFromDaily = meanDailyReturn * tradingDaysPerYear
+  let cumulativePnLForCalmar = 0
+  let runningMaxForCalmar = 0
+  let maxDrawdownFromDaily = 0
+  for (const pnl of dailyPnL) {
+    cumulativePnLForCalmar += pnl
+    runningMaxForCalmar = Math.max(runningMaxForCalmar, cumulativePnLForCalmar)
+    const drawdown = cumulativePnLForCalmar - runningMaxForCalmar
+    maxDrawdownFromDaily = Math.max(maxDrawdownFromDaily, Math.abs(drawdown))
+  }
+  const calmarRatio = maxDrawdownFromDaily > 0 ? annualReturnFromDaily / maxDrawdownFromDaily : 0.0
+
+  // Projected metrics (from profit_per_day)
+  const profitPerWeek = profitPerDay * 5
+  const profitPerMonth = profitPerDay * 21
+  const profitPerYear = profitPerDay * 252
+
+  return {
+    executed_trading_days: dailyPnL.length, // Days in stats sample daily PnL series (for reference)
+    allowed_trading_days: activeTradingDays, // Active trading days (used for behavioral averages)
+    avg_trades_per_day: Math.round(avgTradesPerDay * 100) / 100,
+    profit_per_day: Math.round(profitPerDay * 100) / 100,
+    profit_per_week: Math.round(profitPerWeek * 100) / 100,
+    profit_per_month: Math.round(profitPerMonth * 100) / 100,
+    profit_per_year: Math.round(profitPerYear * 100) / 100,
+    sharpe_ratio: Math.round(sharpeRatio * 100) / 100,
+    sortino_ratio: Math.round(sortinoRatio * 100) / 100,
+    calmar_ratio: Math.round(calmarRatio * 100) / 100,
+    time_to_recovery_days: timeToRecoveryDays,
+    monthly_return_stddev: Math.round(monthlyReturnStdDev * 100) / 100
+  }
 }
 
-// Calculate timetable: most recent trade per stream with time changes applied
-// Filters rows based on current trading day and each stream's filters
-function calculateTimetable(columnarData, streamFilters, currentTradingDay) {
-  if (!columnarData || columnarData.length === 0) {
-    return []
-  }
-  
-  // Get columns
+// ---------------------------------------------------------------------
+// Minimal filtering (stream + year only, NOT DOW/DOM - those are already marked in backend)
+// ---------------------------------------------------------------------
+function createFilterMask(columnarData, streamFilters, streamId) {
+  const length = columnarData.length
+  const mask = new Array(length).fill(true)
   const Stream = columnarData.getColumn('Stream')
   const DateColumn = columnarData.getColumn('Date')
   const trade_date = columnarData.getColumn('trade_date')
-  const Time = columnarData.getColumn('Time')
-  const TimeChange = columnarData.getColumn('Time Change')
-  
-  // Find most recent trade per stream (across ALL data, no filters)
-  const streamMap = new Map() // stream -> { index, date, time }
-  
-  for (let i = 0; i < columnarData.length; i++) {
-    const stream = Stream[i]
-    if (!stream) continue
-    
+
+  // Extract years for filtering
+  const years = new Array(length)
+  for (let i = 0; i < length; i++) {
     const dateValue = DateColumn[i] || trade_date[i]
-    if (!dateValue) continue
-    
-    const parsedDate = parseDateCached(dateValue)
-    if (!parsedDate) continue
-    
-    const existing = streamMap.get(stream)
-    if (!existing) {
-      streamMap.set(stream, { index: i, date: parsedDate, time: Time[i] || '' })
+    if (dateValue) {
+      const parsed = parseDateCached(dateValue)
+      years[i] = parsed ? parsed.getFullYear() : null
     } else {
-      // Compare dates (newer is better)
-      if (parsedDate > existing.date) {
-        streamMap.set(stream, { index: i, date: parsedDate, time: Time[i] || '' })
-      } else if (parsedDate.getTime() === existing.date.getTime()) {
-        // Same date, compare times
-        const tradeTime = Time[i] || ''
-        if (tradeTime > existing.time) {
-          streamMap.set(stream, { index: i, date: parsedDate, time: tradeTime })
+      years[i] = null
+    }
+  }
+
+  for (let i = 0; i < length; i++) {
+    // Filter by stream if specified
+    if (streamId && streamId !== 'master' && Stream[i] !== streamId) {
+      mask[i] = false
+      continue
+    }
+
+    // Apply year filters only (DOW/DOM already marked with final_allowed=False in backend)
+    const rowStream = Stream[i]
+    if (streamId === 'master' || !streamId) {
+      const streamFilter = streamFilters[rowStream]
+      if (streamFilter?.include_years?.length > 0) {
+        const yearSet = new Set(streamFilter.include_years)
+        if (years[i] === null || !yearSet.has(years[i])) {
+          mask[i] = false
+          continue
+        }
+      }
+      
+      // Master-specific year filter
+      const masterFilter = streamFilters['master']
+      if (masterFilter?.include_years?.length > 0) {
+        const yearSet = new Set(masterFilter.include_years)
+        if (years[i] === null || !yearSet.has(years[i])) {
+          mask[i] = false
+          continue
+        }
+      }
+    } else if (streamId && streamId !== 'master') {
+      const streamFilter = streamFilters[streamId]
+      if (streamFilter?.include_years?.length > 0) {
+        const yearSet = new Set(streamFilter.include_years)
+        if (years[i] === null || !yearSet.has(years[i])) {
+          mask[i] = false
+          continue
         }
       }
     }
   }
-  
-  if (streamMap.size === 0) {
-    return []
-  }
-  
-  // Parse current trading day to check filters
-  let tradingDayDate = null
-  if (currentTradingDay) {
-    tradingDayDate = typeof currentTradingDay === 'string' ? new Date(currentTradingDay) : currentTradingDay
-  }
-  
-  // Build timetable: extract time (prefer Time Change if available) and filter by current trading day
-  const timetable = []
-  for (const [stream, info] of streamMap.entries()) {
-    // Check if this stream would filter out the current trading day
-    if (tradingDayDate) {
-      const streamFilterData = streamFilters[stream] || {}
-      const dayOfWeek = tradingDayDate.toLocaleDateString('en-US', { weekday: 'long' })
-      const dayOfMonth = tradingDayDate.getDate()
-      
-      // Check day of week filter
-      if (streamFilterData.exclude_days_of_week && 
-          Array.isArray(streamFilterData.exclude_days_of_week) &&
-          streamFilterData.exclude_days_of_week.includes(dayOfWeek)) {
-        continue // Skip this stream - current trading day is filtered out
-      }
-      
-      // Check day of month filter
-      if (streamFilterData.exclude_days_of_month && 
-          Array.isArray(streamFilterData.exclude_days_of_month) &&
-          streamFilterData.exclude_days_of_month.includes(dayOfMonth)) {
-        continue // Skip this stream - current trading day is filtered out
-      }
-    }
-    
-    let effectiveTime = info.time || ''
-    
-    // Check if Time Change exists
-    try {
-      const timeChange = TimeChange && TimeChange[info.index] !== undefined ? TimeChange[info.index] : null
-      if (timeChange && typeof timeChange === 'string' && timeChange.trim() !== '') {
-        const match = timeChange.match(/→\s*(\d{2}:\d{2})/)
-        if (match) {
-          effectiveTime = match[1]
-        }
-      }
-    } catch (err) {
-      // If Time Change column doesn't exist, just use original time
-    }
-    
-    // Format date and calculate DOW
-    const dateStr = info.date.toISOString().split('T')[0]
-    const dow = info.date.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase()
-    
-    timetable.push({
-      Date: dateStr,
-      DOW: dow,
-      Stream: stream,
-      Time: effectiveTime
-    })
-  }
-  
-  // Sort by time (latest first)
-  timetable.sort((a, b) => {
-    const timeA = a.Time || '00:00'
-    const timeB = b.Time || '00:00'
-    const [hoursA, minsA] = timeA.split(':').map(Number)
-    const [hoursB, minsB] = timeB.split(':').map(Number)
-    const totalMinsA = (hoursA || 0) * 60 + (minsA || 0)
-    const totalMinsB = (hoursB || 0) * 60 + (minsB || 0)
-    return totalMinsB - totalMinsA // Latest first
-  })
-  
-  return timetable
+
+  return mask
 }
 
+// ---------------------------------------------------------------------
 // Worker message handler
+// ---------------------------------------------------------------------
 self.onmessage = function(e) {
   const { type, payload } = e.data
   
   try {
     switch (type) {
       case 'INIT_DATA': {
-        const { data } = payload
-        const columnarData = new ColumnarData(data)
-        self.columnarData = columnarData
-        self.postMessage({ type: 'DATA_INITIALIZED', payload: { length: columnarData.length } })
+        self.columnarData = new ColumnarData(payload.data)
+        self.postMessage({ type: 'DATA_INITIALIZED', payload: { length: self.columnarData.length } })
         break
       }
       
@@ -947,8 +778,7 @@ self.onmessage = function(e) {
         }
         
         const { streamFilters, streamId, returnRows = false, sortIndices = null } = payload
-        const mask = createFilterMask(self.columnarData, streamFilters, streamId)
-        const filtered = self.columnarData.filter(mask)
+        const mask = createFilterMask(self.columnarData, streamFilters || {}, streamId)
         
         // Get filtered indices
         const filteredIndices = []
@@ -956,21 +786,16 @@ self.onmessage = function(e) {
           if (mask[i]) filteredIndices.push(i)
         }
         
-        // Sort indices if requested (for table display)
+        // Sort indices if requested
         if (sortIndices && filteredIndices.length > 0) {
           filteredIndices.sort((a, b) => {
-            // Sort by date (newest first), then time (latest first)
             const dateA = self.columnarData.getColumn('Date')[a] || self.columnarData.getColumn('trade_date')[a]
             const dateB = self.columnarData.getColumn('Date')[b] || self.columnarData.getColumn('trade_date')[b]
-            
             const parsedA = parseDateCached(dateA)
             const parsedB = parseDateCached(dateB)
-            
             if (parsedA && parsedB) {
               const dateDiff = parsedB.getTime() - parsedA.getTime()
               if (dateDiff !== 0) return dateDiff
-              
-              // Then by time
               const timeA = self.columnarData.getColumn('Time')[a] || ''
               const timeB = self.columnarData.getColumn('Time')[b] || ''
               if (timeA && timeB) {
@@ -978,7 +803,7 @@ self.onmessage = function(e) {
                 const [hB, mB] = timeB.split(':').map(Number)
                 const minsA = (hA || 0) * 60 + (mA || 0)
                 const minsB = (hB || 0) * 60 + (mB || 0)
-                if (minsA !== minsB) return minsB - minsA // Latest first
+                if (minsA !== minsB) return minsB - minsA
               }
             }
             return 0
@@ -986,21 +811,18 @@ self.onmessage = function(e) {
         }
         
         const response = {
-          length: filtered.length,
+          length: filteredIndices.length,
           mask: mask,
           indices: filteredIndices
         }
         
         // Optionally return rows (for initial render)
         if (returnRows && filteredIndices.length > 0) {
-          const maxRows = Math.min(filteredIndices.length, 100) // Return first 100 for initial render
+          const maxRows = Math.min(filteredIndices.length, 100)
           response.rows = self.columnarData.getRows(filteredIndices.slice(0, maxRows))
         }
         
-        self.postMessage({ 
-          type: 'FILTERED', 
-          payload: response
-        })
+        self.postMessage({ type: 'FILTERED', payload: response })
         break
       }
       
@@ -1009,7 +831,6 @@ self.onmessage = function(e) {
           self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
           return
         }
-        
         const { indices } = payload
         const rows = self.columnarData.getRows(indices)
         self.postMessage({ type: 'ROWS', payload: { rows } })
@@ -1021,13 +842,187 @@ self.onmessage = function(e) {
           self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
           return
         }
-        
-        const { streamFilters, streamId, contractMultiplier, contractValues } = payload
-        const mask = createFilterMask(self.columnarData, streamFilters, streamId)
-        const filtered = self.columnarData.filter(mask)
-        const stats = calculateStats(filtered, streamId, contractMultiplier, contractValues)
-        
+        // Note: streamFilters not used here - stream filtering happens in calculateStats via streamId
+        const { streamId, contractMultiplier, contractValues, includeFilteredExecuted = true } = payload
+        const stats = calculateStats(self.columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted)
         self.postMessage({ type: 'STATS', payload: { stats } })
+        break
+      }
+      
+      case 'CALCULATE_TIMETABLE': {
+        if (!self.columnarData) {
+          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          return
+        }
+        
+        const { streamFilters = {}, currentTradingDay } = payload
+        
+        // Extract day-of-week and day-of-month from current trading day
+        // JavaScript getDay(): 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+        let targetDOWJS = null // JavaScript day-of-week (0-6)
+        let targetDOWName = null // Day name ("Monday", "Tuesday", etc.)
+        let targetDOM = null // 1-31
+        if (currentTradingDay) {
+          let dateObj = null
+          if (currentTradingDay instanceof Date) {
+            dateObj = currentTradingDay
+          } else if (typeof currentTradingDay === 'string') {
+            dateObj = parseDateCached(currentTradingDay)
+          }
+          if (dateObj) {
+            targetDOWJS = dateObj.getDay() // 0-6
+            targetDOM = dateObj.getDate() // 1-31
+            
+            // Map to day name for comparison with string filters
+            const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+            targetDOWName = dayNames[targetDOWJS]
+          }
+        }
+        
+        if (targetDOWJS === null || targetDOM === null) {
+          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+          return
+        }
+        
+        // Diagnostic logging
+        console.log('[Worker] Timetable DOW/DOM:', {
+          targetDOWJS,
+          targetDOWName,
+          targetDOM,
+          sampleStreamFilters: Object.keys(streamFilters).slice(0, 3).reduce((acc, key) => {
+            acc[key] = streamFilters[key]?.exclude_days_of_week
+            return acc
+          }, {})
+        })
+        
+        const DateColumn = self.columnarData.getColumn('Date')
+        const trade_date = self.columnarData.getColumn('trade_date')
+        const Stream = self.columnarData.getColumn('Stream')
+        const Time = self.columnarData.getColumn('Time')
+        const TimeChange = self.columnarData.getColumn('Time Change') || []
+        
+        // Find the latest date in the dataset
+        let latestDateStr = null
+        let latestDateParsed = null
+        const dateStrings = new Set()
+        
+        for (let i = 0; i < self.columnarData.length; i++) {
+          const dateValue = DateColumn[i] || trade_date[i]
+          if (!dateValue) continue
+          
+          const parsed = parseDateCached(dateValue)
+          if (!parsed) continue
+          
+          const dayKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+          dateStrings.add(dayKey)
+          
+          if (!latestDateParsed || parsed > latestDateParsed) {
+            latestDateParsed = parsed
+            latestDateStr = dayKey
+          }
+        }
+        
+        if (!latestDateStr) {
+          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+          return
+        }
+        
+        // Build timetable from latest date, applying filters based on current trading day's DOW/DOM
+        const timetableRows = []
+        
+        for (let i = 0; i < self.columnarData.length; i++) {
+          const dateValue = DateColumn[i] || trade_date[i]
+          if (!dateValue) continue
+          
+          const parsed = parseDateCached(dateValue)
+          if (!parsed) continue
+          
+          const dayKey = parsed.toISOString().split('T')[0]
+          if (dayKey !== latestDateStr) continue // Only use latest date
+          
+          const stream = Stream[i] || ''
+          const time = Time[i] || ''
+          const timeChange = TimeChange[i] || ''
+          
+          if (!stream || !time) continue
+          
+          // Check if this stream has the target DOW filtered out
+          const streamFilter = streamFilters[stream]
+          if (streamFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = streamFilter.exclude_days_of_week
+            // Check if filter matches either as number (JS day) or as string (day name)
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              // Match as string name or as number (JS day-of-week)
+              const matches = filterVal === targetDOWName || filterNum === targetDOWJS
+              if (stream === 'YM1' && matches) {
+                console.log('[Worker] YM1 filtered by DOW:', { filterVal, filterNum, targetDOWName, targetDOWJS, excludedDOW })
+              }
+              return matches
+            })
+            if (isFiltered) {
+              continue // This stream has this day of week filtered out
+            }
+          }
+          
+          // Check if this stream has the target DOM filtered out
+          if (streamFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              continue // This stream has this day of month filtered out
+            }
+          }
+          
+          // Check master stream filters
+          const masterFilter = streamFilters['master']
+          if (masterFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = masterFilter.exclude_days_of_week
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              return filterVal === targetDOWName || filterNum === targetDOWJS
+            })
+            if (isFiltered) {
+              continue
+            }
+          }
+          if (masterFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              continue
+            }
+          }
+          
+          // Use Time Change if available, otherwise use Time
+          // Time Change format is like "09:30 -> 10:00", extract the target time (after ->)
+          let displayTime = time
+          if (timeChange && timeChange.includes('->')) {
+            const parts = timeChange.split('->')
+            if (parts.length === 2) {
+              displayTime = parts[1].trim()
+            }
+          }
+          
+          timetableRows.push({ Stream: stream, Time: displayTime })
+        }
+        
+        // Sort by time descending (latest time first, earliest time last)
+        timetableRows.sort((a, b) => {
+          const parseTime = (timeStr) => {
+            if (!timeStr) return 0
+            const [h, m] = (timeStr || '').split(':').map(Number)
+            return (h || 0) * 60 + (m || 0)
+          }
+          
+          const minsA = parseTime(a.Time)
+          const minsB = parseTime(b.Time)
+          
+          // Descending order (latest first)
+          return minsB - minsA
+        })
+        
+        self.postMessage({ type: 'TIMETABLE', payload: { timetable: timetableRows } })
         break
       }
       
@@ -1037,47 +1032,160 @@ self.onmessage = function(e) {
           return
         }
         
-        const { streamFilters, streamId, contractMultiplier, contractValues, breakdownType, useFiltered } = payload
+        const { streamFilters = {}, streamId = 'master', contractMultiplier = 1, contractValues = {}, breakdownType, useFiltered = false } = payload
         
-        let dataToUse = self.columnarData
+        // Parse breakdown type (e.g., "time_before", "day_after")
+        const [periodType, filterType] = breakdownType.split('_')
+        
+        // Get data indices based on filtering
+        let dataIndices = []
         if (useFiltered) {
+          // Use filtered data (apply stream/year filters AND final_allowed)
           const mask = createFilterMask(self.columnarData, streamFilters, streamId)
-          dataToUse = self.columnarData.filter(mask)
+          const FinalAllowed = self.columnarData.getColumn('final_allowed')
+          for (let i = 0; i < mask.length; i++) {
+            // Must pass the mask AND have final_allowed !== false
+            if (mask[i] && FinalAllowed[i] !== false) {
+              dataIndices.push(i)
+            }
+          }
+        } else {
+          // Use all data
+          for (let i = 0; i < self.columnarData.length; i++) {
+            // Filter by stream if specified
+            if (streamId && streamId !== 'master') {
+              const Stream = self.columnarData.getColumn('Stream')
+              if (Stream[i] !== streamId) continue
+            }
+            dataIndices.push(i)
+          }
         }
         
-        // Extract the base breakdown type (remove _before or _after suffix)
-        const baseBreakdownType = breakdownType.replace(/_before$|_after$/, '')
-        const breakdown = calculateProfitBreakdown(dataToUse, contractMultiplier, contractValues, baseBreakdownType)
-        // Send back with the full breakdownType (including _before or _after)
-        self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown, breakdownType } })
-        break
-      }
-      
-      case 'CALCULATE_TIMETABLE': {
-        if (!self.columnarData || self.columnarData.length === 0) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+        if (dataIndices.length === 0) {
+          self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: {}, breakdownType } })
           return
         }
         
-        try {
-          const { streamFilters, currentTradingDay } = payload
-          // Ensure we have valid filters object
-          const filters = streamFilters || {}
-          const timetable = calculateTimetable(self.columnarData, filters, currentTradingDay)
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable } })
-        } catch (err) {
-          console.error('Timetable calculation error:', err)
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
-          self.postMessage({ type: 'ERROR', payload: { message: `Timetable calculation error: ${err.message}`, stack: err.stack } })
+        // Get columns
+        const DateColumn = self.columnarData.getColumn('Date')
+        const trade_date = self.columnarData.getColumn('trade_date')
+        const Stream = self.columnarData.getColumn('Stream')
+        const Time = self.columnarData.getColumn('Time')
+        const Profit = self.columnarData.getColumn('Profit')
+        const Instrument = self.columnarData.getColumn('Instrument')
+        
+        // Contract values helper
+        const getContractValue = (symbol) => {
+          if (!symbol) return 50
+          const baseSymbol = symbol.replace(/\d+$/, '') || symbol
+          return contractValues[baseSymbol] || 50
         }
+        
+        const breakdownData = {}
+        
+        // Calculate profit breakdown based on period type
+        for (const i of dataIndices) {
+          const profit = parseFloat(Profit[i]) || 0
+          const symbol = Instrument[i] || 'ES'
+          const stream = Stream[i] || 'Unknown'
+          const contractValue = getContractValue(symbol)
+          const profitDollars = profit * contractValue * contractMultiplier
+          
+          let periodKey = null
+          
+          if (periodType === 'time') {
+            const time = Time[i] || ''
+            if (!time || time === 'NA' || time === '00:00') continue
+            let timeKey = time.toString().trim()
+            if (!/^\d{2}:\d{2}$/.test(timeKey)) {
+              const match = timeKey.match(/(\d{2}:\d{2})/)
+              if (match) timeKey = match[1]
+              else continue
+            }
+            periodKey = timeKey
+          } else {
+            const dateValue = DateColumn[i] || trade_date[i]
+            if (!dateValue) continue
+            const parsed = parseDateCached(dateValue)
+            if (!parsed) continue
+            
+            if (periodType === 'day') {
+              // Day of Week (Monday, Tuesday, etc.)
+              const dow = parsed.toLocaleDateString('en-US', { weekday: 'long' })
+              const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+              if (!dowOrder.includes(dow)) continue
+              periodKey = dow
+            } else if (periodType === 'dom') {
+              periodKey = parsed.getDate() // 1-31
+            } else if (periodType === 'date') {
+              periodKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+            } else if (periodType === 'month') {
+              const year = parsed.getFullYear()
+              const month = parsed.getMonth() + 1
+              periodKey = `${year}-${String(month).padStart(2, '0')}`
+            } else if (periodType === 'year') {
+              periodKey = parsed.getFullYear()
+            }
+          }
+          
+          if (periodKey === null) continue
+          
+          if (!breakdownData[periodKey]) {
+            breakdownData[periodKey] = {}
+          }
+          if (!breakdownData[periodKey][stream]) {
+            breakdownData[periodKey][stream] = 0
+          }
+          breakdownData[periodKey][stream] += profitDollars
+        }
+        
+        // Sort results based on period type
+        let sortedBreakdown = {}
+        if (periodType === 'time') {
+          const sortedKeys = Object.keys(breakdownData).sort((a, b) => {
+            const [aHour, aMin] = a.split(':').map(Number)
+            const [bHour, bMin] = b.split(':').map(Number)
+            if (aHour !== bHour) return aHour - bHour
+            return aMin - bMin
+          })
+          sortedKeys.forEach(key => {
+            sortedBreakdown[key] = breakdownData[key]
+          })
+        } else if (periodType === 'dom') {
+          for (let day = 1; day <= 31; day++) {
+            if (breakdownData[day]) {
+              sortedBreakdown[day] = breakdownData[day]
+            }
+          }
+        } else if (periodType === 'day') {
+          // Sort day of week in order: Monday, Tuesday, Wednesday, Thursday, Friday
+          const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+          dowOrder.forEach(dow => {
+            if (breakdownData[dow]) {
+              sortedBreakdown[dow] = breakdownData[dow]
+            }
+          })
+        } else {
+          // date, month, year: sort keys naturally (descending for dates)
+          if (periodType === 'date') {
+            // Sort dates descending (latest first)
+            const sortedKeys = Object.keys(breakdownData).sort((a, b) => b.localeCompare(a))
+            sortedKeys.forEach(key => {
+              sortedBreakdown[key] = breakdownData[key]
+            })
+          } else {
+            sortedBreakdown = breakdownData
+          }
+        }
+        
+        self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: sortedBreakdown, breakdownType } })
         break
       }
       
       default:
         self.postMessage({ type: 'ERROR', payload: { message: `Unknown message type: ${type}` } })
     }
-  } catch (error) {
-    self.postMessage({ type: 'ERROR', payload: { message: error.message, stack: error.stack } })
+  } catch (err) {
+    self.postMessage({ type: 'ERROR', payload: { message: err.message, stack: err.stack } })
   }
 }
-

@@ -92,8 +92,15 @@ def decide_time_change(
     """
     from .utils import normalize_time
     
-    # Only evaluate time change on LOSS
-    if str(current_result).upper() != 'LOSS':
+    # Only evaluate time change on LOSS - strict check
+    # Normalize result: handle None/NaN, convert to string, strip whitespace, uppercase
+    if current_result is None or (isinstance(current_result, float) and pd.isna(current_result)):
+        return None
+    
+    result_normalized = str(current_result).strip().upper()
+    
+    # STRICT: Only allow time change if result is exactly 'LOSS'
+    if result_normalized != 'LOSS':
         return None
     
     # Get other selectable times in same session
@@ -230,49 +237,7 @@ def process_stream_daily(
             date_df['Time_str'] = date_df['Time'].apply(lambda t: normalize_time(str(t)))
         
         # ============================================================================
-        # CENTRALIZED DAILY SCORING (ONE BLOCK)
-        # ============================================================================
-        # Score all canonical_times: build results, calculate scores, update histories
-        daily_results = {}  # {time_normalized: result_string}
-        daily_scores = {}   # {time_normalized: score_int}
-        
-        for canonical_time in canonical_times:
-            canonical_time_normalized = normalize_time(str(canonical_time))
-            
-            # Determine result
-            if date_df.empty:
-                result = 'NoTrade'
-            else:
-                slot_trade = date_df[date_df['Time_str'] == canonical_time_normalized]
-                result = slot_trade.iloc[0]['Result'] if not slot_trade.empty else 'NoTrade'
-            
-            # Calculate score and update history
-            score = calculate_time_score(result)
-            update_time_slot_history(time_slot_histories, canonical_time_normalized, score)
-            
-            daily_results[canonical_time_normalized] = result
-            daily_scores[canonical_time_normalized] = score
-        
-        # ============================================================================
-        # TIME CHANGE DECISION (PURE FUNCTION)
-        # ============================================================================
-        current_time_normalized = normalize_time(str(current_time))
-        current_time_result = daily_results.get(current_time_normalized, 'NoTrade')
-        current_sum_after = sum(time_slot_histories.get(current_time_normalized, []))
-        
-        next_time = decide_time_change(
-            current_time,
-            current_time_result,
-            current_sum_after,
-            time_slot_histories,
-            selectable_times,
-            current_session
-        )
-        
-        old_time_for_today = str(current_time).strip()
-        
-        # ============================================================================
-        # TRADE SELECTION (PURE LOOKUP)
+        # TRADE SELECTION (PURE LOOKUP) - MUST HAPPEN BEFORE SCORING AND TIME CHANGE
         # ============================================================================
         # CRITICAL: Filter out excluded times from date_df BEFORE selection
         # This ensures we never accidentally select a trade at an excluded time
@@ -310,6 +275,95 @@ def process_stream_daily(
         else:
             trade_row = select_trade_for_time(date_df, current_time, current_session)
         
+        # Get the actual result from the selected trade (or NoTrade if no trade)
+        # CRITICAL: Extract Result correctly from pandas Series and normalize it
+        if trade_row is not None:
+            # trade_row is a pandas Series, access Result field
+            if 'Result' in trade_row.index:
+                result_value = trade_row['Result']
+                # Normalize: handle NaN/None, convert to string, strip whitespace
+                if pd.isna(result_value) or result_value is None:
+                    actual_result = 'NoTrade'
+                else:
+                    actual_result = str(result_value).strip()
+            else:
+                actual_result = 'NoTrade'
+        else:
+            actual_result = 'NoTrade'
+        
+        # ============================================================================
+        # UPDATE ROLLING HISTORIES FOR ALL CANONICAL TIMES (AFTER FILTERING)
+        # ============================================================================
+        # CRITICAL: Update histories AFTER filtering, using FILTERED data only
+        # This ensures we don't record losses from filtered times that don't affect selection
+        # For current_time: use actual_result from selected trade
+        # For other canonical times: use result from filtered data (or NoTrade if not in filtered data)
+        daily_results = {}  # {time_normalized: result_string}
+        daily_scores = {}   # {time_normalized: score_int}
+        
+        for canonical_time in canonical_times:
+            canonical_time_normalized = normalize_time(str(canonical_time))
+            
+            if canonical_time_normalized == current_time_normalized:
+                # Use actual result from selected trade for current_time
+                result = actual_result
+            else:
+                # Other canonical times: get result from FILTERED data only
+                if date_df.empty:
+                    result = 'NoTrade'
+                else:
+                    slot_trade = date_df[date_df['Time_str'] == canonical_time_normalized]
+                    result = slot_trade.iloc[0]['Result'] if not slot_trade.empty else 'NoTrade'
+            
+            # Calculate score and update history for this canonical time
+            score = calculate_time_score(result)
+            update_time_slot_history(time_slot_histories, canonical_time_normalized, score)
+            
+            daily_results[canonical_time_normalized] = result
+            daily_scores[canonical_time_normalized] = score
+        
+        # ============================================================================
+        # TIME CHANGE DECISION (PURE FUNCTION) - USE ACTUAL RESULT FROM SELECTED TRADE
+        # ============================================================================
+        # CRITICAL: Use the actual result from the trade we selected, not from daily_results
+        # This ensures we only change time after an actual LOSS at current_time
+        current_sum_after = sum(time_slot_histories.get(current_time_normalized, []))
+        
+        # Normalize actual_result to uppercase for consistent comparison
+        actual_result_normalized = str(actual_result).strip().upper()
+        
+        # Log time change decision (always log to help debug incorrect time changes)
+        logger.debug(
+            f"Stream {stream_id} {date}: current_time={current_time_normalized}, "
+            f"actual_result='{actual_result}' (normalized='{actual_result_normalized}'), "
+            f"time_change_allowed={actual_result_normalized == 'LOSS'}"
+        )
+        
+        next_time = decide_time_change(
+            current_time,
+            actual_result,  # Pass original value, function will normalize
+            current_sum_after,
+            time_slot_histories,
+            selectable_times,
+            current_session
+        )
+        
+        # Log if time change was decided (should only happen after LOSS)
+        if next_time is not None:
+            logger.info(
+                f"Stream {stream_id} {date}: Time change DECIDED: {current_time_normalized} -> {next_time} "
+                f"(actual_result was '{actual_result}', normalized='{actual_result_normalized}')"
+            )
+            # Sanity check: warn if time change happened without LOSS
+            if actual_result_normalized != 'LOSS':
+                logger.error(
+                    f"Stream {stream_id} {date}: ERROR - Time change happened but actual_result='{actual_result}' "
+                    f"(normalized='{actual_result_normalized}') is not 'LOSS'! This should not happen!"
+                )
+        
+        old_time_for_today = str(current_time).strip()
+        
+        # Build trade_dict from selected trade
         if trade_row is not None:
             trade_dict = trade_row.to_dict()
             # CRITICAL: Time column is sequencer's authority - overwrite analyzer's Time
@@ -490,7 +544,7 @@ def apply_sequencer_logic(
                     f"Stream {stream_id} {date}: CRITICAL INVARIANT VIOLATION - "
                     f"Time '{time_value}' is not selectable. Selectable: {selectable_times}, Filtered: {sorted(filtered_times)}"
                 )
-            raise AssertionError(
+                raise AssertionError(
                 f"Stream {stream_id}: Found {len(invalid_times)} trades with non-selectable times. "
                     f"Selectable times: {selectable_times}, Filtered times: {sorted(filtered_times)}"
                 )
