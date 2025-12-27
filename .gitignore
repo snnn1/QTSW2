@@ -97,3 +97,25 @@ CHANGES_SINCE_*.md
 # Temporary scripts
 temp_*.py
 
+# Logs directories (runtime artifacts)
+logs/
+
+# Data directories (generated outputs)
+data/
+
+# JSONL files (pipeline event logs and data streams)
+*.jsonl
+
+# Temporary pipeline artifacts
+*.marker
+*.bak
+*.tmp
+
+# Explicitly keep tools/ directory (source code)
+!tools/
+
+# Local ops diagnostics and archive files (never commit)
+ops/diagnostics/
+ops/archive/
+ops/maintenance/clear_pipeline_lock.py
+
