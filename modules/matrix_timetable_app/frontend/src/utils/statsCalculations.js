@@ -18,6 +18,32 @@ const formatCurrency = (value) => {
 }
 
 /**
+ * Normalize result string to uppercase
+ */
+const normalizeResult = (result) => {
+  if (!result) return ''
+  return result.toString().trim().toUpperCase()
+}
+
+/**
+ * Check if result is an executed trade (WIN, LOSS, BE, BREAKEVEN)
+ * Excludes NoTrade and TIME from executed trades
+ */
+const isExecutedTrade = (resultNorm) => {
+  return resultNorm === 'WIN' || 
+         resultNorm === 'LOSS' || 
+         resultNorm === 'BE' || 
+         resultNorm === 'BREAKEVEN'
+}
+
+/**
+ * Check if result is NoTrade
+ */
+const isNoTrade = (resultNorm) => {
+  return resultNorm === 'NOTRADE'
+}
+
+/**
  * Calculate comprehensive statistics for a stream
  * @param {Array} filteredData - Filtered trade data
  * @param {string} streamId - Stream identifier ('master' or stream name)
@@ -30,20 +56,45 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }
   
   const filtered = filteredData
-  const totalTrades = filtered.length
-  const wins = filtered.filter(t => t.Result === 'Win').length
-  const losses = filtered.filter(t => t.Result === 'Loss').length
-  const breakEven = filtered.filter(t => t.Result === 'BE').length
-  const noTrade = filtered.filter(t => t.Result === 'NoTrade').length
+  
+  // Normalize results and separate executed trades from NoTrade and TIME
+  const executedTrades = []
+  let noTradeCount = 0
+  let timeCount = 0
+  
+  filtered.forEach(trade => {
+    const resultNorm = normalizeResult(trade.Result)
+    if (isNoTrade(resultNorm)) {
+      noTradeCount++
+    } else if (resultNorm === 'TIME') {
+      timeCount++
+      // TIME is excluded from executed trades
+    } else if (isExecutedTrade(resultNorm)) {
+      executedTrades.push(trade)
+    }
+    // Note: Any other results are excluded from both counts
+  })
+  
+  // totalTrades = only executed trades (excludes NoTrade and TIME)
+  const totalTrades = executedTrades.length
+  
+  // Count wins, losses, break-even from executed trades only
+  const wins = executedTrades.filter(t => normalizeResult(t.Result) === 'WIN').length
+  const losses = executedTrades.filter(t => normalizeResult(t.Result) === 'LOSS').length
+  const breakEven = executedTrades.filter(t => {
+    const norm = normalizeResult(t.Result)
+    return norm === 'BE' || norm === 'BREAKEVEN'
+  }).length
   
   const winLossTrades = wins + losses
   const winRate = winLossTrades > 0 ? (wins / winLossTrades * 100) : 0
   
-  const totalProfit = filtered.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0)
-  const avgProfit = totalProfit / totalTrades
+  // Calculate profit only from executed trades (excludes NoTrade)
+  const totalProfit = executedTrades.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0)
+  const avgProfit = totalTrades > 0 ? totalProfit / totalTrades : 0
   
-  const winningTrades = filtered.filter(t => t.Result === 'Win')
-  const losingTrades = filtered.filter(t => t.Result === 'Loss')
+  const winningTrades = executedTrades.filter(t => normalizeResult(t.Result) === 'WIN')
+  const losingTrades = executedTrades.filter(t => normalizeResult(t.Result) === 'LOSS')
   const avgWin = winningTrades.length > 0 
     ? winningTrades.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0) / winningTrades.length 
     : 0
@@ -52,10 +103,11 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     : 0
   const rrRatio = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0)
   
-  const allowedTrades = filtered.filter(t => t.final_allowed !== false).length
+  // Allowed/blocked trades count only executed trades
+  const allowedTrades = executedTrades.filter(t => t.final_allowed !== false).length
   const blockedTrades = totalTrades - allowedTrades
   
-  // Total Days - count unique dates
+  // Total Days - count unique dates from all rows (including NoTrade for calendar days)
   const uniqueDates = new Set(filtered.map(t => {
     const date = t.Date || t.trade_date
     if (!date) return null
@@ -71,15 +123,15 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }).filter(d => d !== null))
   const totalDays = uniqueDates.size
   
-  // Calculate total profit in dollars
-  const totalProfitDollars = filtered.reduce((sum, t) => {
+  // Calculate total profit in dollars (only from executed trades, excludes NoTrade)
+  const totalProfitDollars = executedTrades.reduce((sum, t) => {
     const profit = parseFloat(t.Profit) || 0
     const contractValue = getContractValue(t)
     return sum + (profit * contractValue * contractMultiplier)
   }, 0)
   
-  // Sort by date and time for chronological calculations
-  const sortedByDate = [...filtered].sort((a, b) => {
+  // Sort executed trades by date and time for chronological calculations
+  const sortedByDate = [...executedTrades].sort((a, b) => {
     const dateA = new Date(a.Date || a.trade_date)
     const dateB = new Date(b.Date || b.trade_date)
     const dateDiff = dateA.getTime() - dateB.getTime()
@@ -89,12 +141,15 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     return timeA.localeCompare(timeB)
   })
   
-  // Time Changes and Final Time
+  // Time Changes and Final Time (only executed trades, excludes NoTrade)
   let timeChanges = 0
   let lastTime = null
   let finalTime = null
   
   sortedByDate.forEach(trade => {
+    // Only include executed trades in time change tracking
+    if (!isExecutedTrade(normalizeResult(trade.Result))) return
+    
     const currentTime = trade.Time
     if (currentTime && currentTime !== 'NA' && currentTime !== '00:00') {
       if (lastTime !== null && currentTime !== lastTime) {
@@ -116,12 +171,16 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }, 0))
   const profitFactor = grossLossDollars > 0 ? grossProfitDollars / grossLossDollars : (grossProfitDollars > 0 ? Infinity : 0)
   
-  // Rolling Drawdown calculation
+  // Rolling Drawdown calculation (only executed trades, excludes NoTrade and TIME)
   let runningProfitDollars = 0
   let peakDollars = 0
   let maxDrawdownDollars = 0
   
   sortedByDate.forEach(trade => {
+    // Only include executed trades in drawdown calculation
+    const resultNorm = normalizeResult(trade.Result)
+    if (!isExecutedTrade(resultNorm)) return
+    
     const profit = parseFloat(trade.Profit) || 0
     const contractValue = getContractValue(trade)
     const profitDollars = profit * contractValue * contractMultiplier
@@ -141,13 +200,17 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const maxDrawdownDollarsPositive = Math.abs(maxDrawdownDollars)
   const maxDrawdown = maxDrawdownDollarsPositive > 0 ? maxDrawdownDollarsPositive / 50 : 0
   
-  // Sharpe Ratio calculation
+  // Sharpe Ratio calculation (only executed trades, excludes NoTrade and TIME)
   const tradingDaysPerYear = 252
   let dailyReturnsDollars = []
   
   if (streamId === 'master') {
     const tradesByDate = new Map()
-    filtered.forEach(trade => {
+    executedTrades.forEach(trade => {
+      // Only include executed trades in Sharpe calculation
+      const resultNorm = normalizeResult(trade.Result)
+      if (!isExecutedTrade(resultNorm)) return
+      
       const dateValue = trade.Date || trade.trade_date
       if (!dateValue) return
       
@@ -182,10 +245,13 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     
     dailyReturnsDollars = Array.from(tradesByDate.values())
   } else {
-    dailyReturnsDollars = filtered.map(t => {
-      const profit = parseFloat(t.Profit) || 0
-      return profit * getContractValue(t) * contractMultiplier
-    })
+    // Individual stream - only executed trades
+    dailyReturnsDollars = executedTrades
+      .filter(t => isExecutedTrade(normalizeResult(t.Result)))
+      .map(t => {
+        const profit = parseFloat(t.Profit) || 0
+        return profit * getContractValue(t) * contractMultiplier
+      })
   }
   
   const meanDailyReturnDollars = dailyReturnsDollars.length > 0 
@@ -213,26 +279,25 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const annualReturnDollars = totalDays > 0 ? (totalProfitDollars / totalDays) * tradingDaysPerYear : 0
   const calmarRatio = maxDrawdownDollarsPositive > 0 ? annualReturnDollars / maxDrawdownDollarsPositive : 0
   
-  // Best and worst trades
-  const tradesWithProfit = filtered.filter(t => t.Result !== 'NoTrade')
-  const bestTrade = tradesWithProfit.length > 0 
-    ? tradesWithProfit.reduce((best, t) => {
+  // Best and worst trades (only executed trades, excludes NoTrade and TIME)
+  const bestTrade = executedTrades.length > 0 
+    ? executedTrades.reduce((best, t) => {
         const profit = parseFloat(t.Profit) || 0
         return profit > (parseFloat(best.Profit) || 0) ? t : best
-      }, tradesWithProfit[0])
+      }, executedTrades[0])
     : null
-  const worstTrade = tradesWithProfit.length > 0
-    ? tradesWithProfit.reduce((worst, t) => {
+  const worstTrade = executedTrades.length > 0
+    ? executedTrades.reduce((worst, t) => {
         const profit = parseFloat(t.Profit) || 0
         return profit < (parseFloat(worst.Profit) || 0) ? t : worst
-      }, tradesWithProfit[0])
+      }, executedTrades[0])
     : null
   
   const avgTradesPerDay = totalDays > 0 ? totalTrades / totalDays : 0
   
-  // Per-trade PnL calculations
+  // Per-trade PnL calculations (only executed trades, excludes NoTrade and TIME)
   const perTradePnLDollars = sortedByDate
-    .filter(trade => trade.Result !== 'NoTrade')
+    .filter(trade => isExecutedTrade(normalizeResult(trade.Result)))
     .map(trade => {
       const profit = parseFloat(trade.Profit) || 0
       const contractValue = getContractValue(trade)
@@ -261,11 +326,13 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   const profitPerTrade = meanPnL
   
-  // Rolling 30-Day Win Rate (for individual streams)
+  // Rolling 30-Day Win Rate (for individual streams, only executed trades)
   let rolling30DayWinRate = null
   if (streamId !== 'master') {
     const tradesByDateMap = new Map()
     sortedByDate.forEach(trade => {
+      // Only include executed trades
+      if (!isExecutedTrade(normalizeResult(trade.Result))) return
       const dateValue = trade.Date || trade.trade_date
       if (!dateValue) return
       
@@ -313,8 +380,8 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
       })
       
       if (recent30DayTrades.length > 0) {
-        const recentWins = recent30DayTrades.filter(t => t.Result === 'Win').length
-        const recentLosses = recent30DayTrades.filter(t => t.Result === 'Loss').length
+        const recentWins = recent30DayTrades.filter(t => normalizeResult(t.Result) === 'WIN').length
+        const recentLosses = recent30DayTrades.filter(t => normalizeResult(t.Result) === 'LOSS').length
         const recentWinLossTrades = recentWins + recentLosses
         rolling30DayWinRate = recentWinLossTrades > 0 ? (recentWins / recentWinLossTrades * 100) : 0
       }
@@ -381,6 +448,9 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   let runningEquity = 0
   sortedByDate.forEach((trade, idx) => {
+    // Only include executed trades in time-to-recovery calculation
+    if (!isExecutedTrade(normalizeResult(trade.Result))) return
+    
     const profit = parseFloat(trade.Profit) || 0
     const contractValue = getContractValue(trade)
     const profitDollars = profit * contractValue * contractMultiplier
@@ -418,9 +488,11 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     }
   }
   
-  // Monthly Return Std Dev
+  // Monthly Return Std Dev (only executed trades, excludes NoTrade and TIME)
   const monthlyReturns = new Map()
   sortedByDate.forEach((trade) => {
+    // Only include executed trades
+    if (!isExecutedTrade(normalizeResult(trade.Result))) return
     const dateValue = trade.Date || trade.trade_date
     if (!dateValue) return
     
@@ -467,9 +539,11 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     : 0
   const monthlyReturnStdDev = Math.sqrt(monthlyReturnVariance)
   
-  // Profit per Day
+  // Profit per Day (only executed trades, excludes NoTrade and TIME)
   const dailyProfits = new Map()
   sortedByDate.forEach((trade) => {
+    // Only include executed trades
+    if (!isExecutedTrade(normalizeResult(trade.Result))) return
     const dateValue = trade.Date || trade.trade_date
     if (!dateValue) return
     
@@ -524,13 +598,14 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }
   
   return {
-    totalTrades,
+    totalTrades, // Only executed trades (excludes NoTrade and TIME)
     totalDays,
     avgTradesPerDay: avgTradesPerDay.toFixed(2),
     wins,
     losses,
     breakEven,
-    noTrade,
+    timeTrades: timeCount, // TIME trades count (for display only, excluded from all calculations)
+    noTrade: noTradeCount, // NoTrade count (for display only, excluded from all calculations)
     winRate: winRate.toFixed(1),
     totalProfit: totalProfit.toFixed(2),
     totalProfitDollars: formatCurrency(totalProfitDollars),
