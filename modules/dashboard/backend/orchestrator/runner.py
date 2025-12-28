@@ -139,10 +139,15 @@ class PipelineRunner:
         ]
         
         for stage, stage_config in stages:
+            # Track stage execution
+            run_ctx.stages_executed.append(stage.value)
+            
             # Run stage with retry (handles state transitions internally)
             success = await self._run_stage_with_retry(stage, stage_config, run_ctx)
             
             if not success:
+                # Track failed stage
+                run_ctx.stages_failed.append(stage.value)
                 # Permanent failure
                 await self.state_manager.transition(
                     PipelineRunState.FAILED,

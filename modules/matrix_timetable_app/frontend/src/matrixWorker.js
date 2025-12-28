@@ -9,20 +9,42 @@ class ColumnarData {
       return
     }
     
-    const columnNames = new Set()
-    data.forEach(row => {
-      Object.keys(row).forEach(key => columnNames.add(key))
-    })
-    
-    this.columns = {}
     this.length = data.length
     
+    // Harden column discovery: collect ALL column names from ALL rows in a single pass
+    // This ensures we don't silently drop columns that appear in later rows
+    const columnNamesSet = new Set()
+    for (let idx = 0; idx < this.length; idx++) {
+      const row = data[idx]
+      if (row && typeof row === 'object') {
+        Object.keys(row).forEach(colName => {
+          columnNamesSet.add(colName)
+        })
+      }
+    }
+    
+    const columnNames = Array.from(columnNamesSet)
+    
+    // Initialize columns
+    this.columns = {}
     columnNames.forEach(colName => {
-      this.columns[colName] = new Array(data.length)
-      data.forEach((row, idx) => {
-        this.columns[colName][idx] = row[colName] ?? null
-      })
+      this.columns[colName] = new Array(this.length)
     })
+    
+    // Single pass through data, extract all columns at once
+    for (let idx = 0; idx < this.length; idx++) {
+      const row = data[idx]
+      for (const colName of columnNames) {
+        this.columns[colName][idx] = row?.[colName] ?? null
+      }
+    }
+    
+    // Assert required columns exist
+    const requiredColumns = ['Result', 'Profit', 'Stream', 'trade_date', 'final_allowed']
+    const missingColumns = requiredColumns.filter(col => !columnNames.includes(col))
+    if (missingColumns.length > 0) {
+      throw new Error(`ColumnarData: Missing required columns: ${missingColumns.join(', ')}. Available columns: ${columnNames.slice(0, 20).join(', ')}${columnNames.length > 20 ? '...' : ''}`)
+    }
   }
   
   getColumn(name) {
@@ -104,6 +126,12 @@ function isExecutedTrade(resultNorm) {
 function isNoTrade(resultNorm) {
   // is_notrade = ResultNorm == "NOTRADE"
   return resultNorm === 'NOTRADE'
+}
+
+// Helper function to get canonical date value (prefer trade_date over Date)
+function getCanonicalDateValue(trade_date, DateColumn, index) {
+  // Standardize: prefer trade_date, fallback to Date
+  return trade_date[index] ?? DateColumn[index] ?? null
 }
 
 function calculateStats(columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted = true) {
@@ -314,7 +342,7 @@ function _calculateDayCounts(executedIndices, DateColumn, trade_date) {
   const executedDays = new Set()
 
   for (const i of executedIndices) {
-    const dateValue = DateColumn[i] || trade_date[i]
+    const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
     if (!dateValue) continue
 
     const parsed = parseDateCached(dateValue)
@@ -342,7 +370,7 @@ function _countUniqueDays(indices, DateColumn, trade_date) {
   const uniqueDays = new Set()
 
   for (const i of indices) {
-    const dateValue = DateColumn[i] || trade_date[i]
+    const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
     if (!dateValue) continue
 
     const parsed = parseDateCached(dateValue)
@@ -542,7 +570,7 @@ function _calculateDailyMetrics(
   const dailyProfits = new Map() // date string -> array of profit dollars
 
   for (let i of indices) {
-    const dateValue = DateColumn[i] || trade_date[i]
+    const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
     if (!dateValue) continue
 
       const parsed = parseDateCached(dateValue)
@@ -705,7 +733,7 @@ function createFilterMask(columnarData, streamFilters, streamId) {
   // Extract years for filtering
   const years = new Array(length)
   for (let i = 0; i < length; i++) {
-    const dateValue = DateColumn[i] || trade_date[i]
+    const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
     if (dateValue) {
       const parsed = parseDateCached(dateValue)
       years[i] = parsed ? parsed.getFullYear() : null
@@ -773,7 +801,7 @@ self.onmessage = function(e) {
       
       case 'FILTER': {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          self.postMessage({ type: 'ERROR', payload: { message: 'FILTER: Data not initialized', operation: 'FILTER' } })
           return
         }
         
@@ -788,9 +816,11 @@ self.onmessage = function(e) {
         
         // Sort indices if requested
         if (sortIndices && filteredIndices.length > 0) {
+          const DateColumn = self.columnarData.getColumn('Date')
+          const trade_date = self.columnarData.getColumn('trade_date')
           filteredIndices.sort((a, b) => {
-            const dateA = self.columnarData.getColumn('Date')[a] || self.columnarData.getColumn('trade_date')[a]
-            const dateB = self.columnarData.getColumn('Date')[b] || self.columnarData.getColumn('trade_date')[b]
+            const dateA = getCanonicalDateValue(trade_date, DateColumn, a)
+            const dateB = getCanonicalDateValue(trade_date, DateColumn, b)
             const parsedA = parseDateCached(dateA)
             const parsedB = parseDateCached(dateB)
             if (parsedA && parsedB) {
@@ -828,7 +858,7 @@ self.onmessage = function(e) {
       
       case 'GET_ROWS': {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          self.postMessage({ type: 'ERROR', payload: { message: 'GET_ROWS: Data not initialized', operation: 'GET_ROWS' } })
           return
         }
         const { indices } = payload
@@ -839,7 +869,7 @@ self.onmessage = function(e) {
       
       case 'CALCULATE_STATS': {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          self.postMessage({ type: 'ERROR', payload: { message: 'CALCULATE_STATS: Data not initialized', operation: 'CALCULATE_STATS' } })
           return
         }
         // Note: streamFilters not used here - stream filtering happens in calculateStats via streamId
@@ -851,7 +881,7 @@ self.onmessage = function(e) {
       
       case 'CALCULATE_TIMETABLE': {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          self.postMessage({ type: 'ERROR', payload: { message: 'CALCULATE_TIMETABLE: Data not initialized', operation: 'CALCULATE_TIMETABLE' } })
           return
         }
         
@@ -907,7 +937,7 @@ self.onmessage = function(e) {
         const dateStrings = new Set()
         
         for (let i = 0; i < self.columnarData.length; i++) {
-          const dateValue = DateColumn[i] || trade_date[i]
+          const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
           if (!dateValue) continue
           
           const parsed = parseDateCached(dateValue)
@@ -931,7 +961,7 @@ self.onmessage = function(e) {
         const timetableRows = []
         
         for (let i = 0; i < self.columnarData.length; i++) {
-          const dateValue = DateColumn[i] || trade_date[i]
+          const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
           if (!dateValue) continue
           
           const parsed = parseDateCached(dateValue)
@@ -1028,7 +1058,7 @@ self.onmessage = function(e) {
       
       case 'CALCULATE_PROFIT_BREAKDOWN': {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'Data not initialized' } })
+          self.postMessage({ type: 'ERROR', payload: { message: 'CALCULATE_PROFIT_BREAKDOWN: Data not initialized', operation: 'CALCULATE_PROFIT_BREAKDOWN' } })
           return
         }
         
@@ -1104,7 +1134,7 @@ self.onmessage = function(e) {
             }
             periodKey = timeKey
           } else {
-            const dateValue = DateColumn[i] || trade_date[i]
+            const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
             if (!dateValue) continue
             const parsed = parseDateCached(dateValue)
             if (!parsed) continue
@@ -1183,9 +1213,20 @@ self.onmessage = function(e) {
       }
       
       default:
-        self.postMessage({ type: 'ERROR', payload: { message: `Unknown message type: ${type}` } })
+        self.postMessage({ type: 'ERROR', payload: { message: `Unknown message type: ${type}`, operation: 'UNKNOWN', messageType: type } })
     }
   } catch (err) {
-    self.postMessage({ type: 'ERROR', payload: { message: err.message, stack: err.stack } })
+    const dataInfo = self.columnarData 
+      ? { rowCount: self.columnarData.length, columnCount: Object.keys(self.columnarData.columns || {}).length }
+      : { rowCount: 0, columnCount: 0 }
+    self.postMessage({ 
+      type: 'ERROR', 
+      payload: { 
+        message: err.message, 
+        operation: 'CATCH_ALL',
+        stack: err.stack,
+        ...dataInfo
+      } 
+    })
   }
 }

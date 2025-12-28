@@ -8,6 +8,7 @@ export function PipelineControls({
   chicagoTime,
   scheduleInfo,
   isRunning,
+  isStarting,
   schedulerEnabled,
   pipelineState,
   activeRunId,
@@ -19,8 +20,8 @@ export function PipelineControls({
 }) {
   // Determine if reset button should be enabled
   // Phase-1 always-on: Simple button logic
-  // Start button: enabled if not currently running
-  const canStart = !isRunning
+  // Start button: enabled if not currently running or starting
+  const canStart = !isRunning && !isStarting
   
   // Reset button: enabled if running or in non-idle state
   const canReset = isRunning || (pipelineState && pipelineState !== 'idle')
@@ -63,9 +64,9 @@ export function PipelineControls({
                 ? 'bg-gray-600 cursor-not-allowed text-gray-400'
                 : 'bg-green-600 hover:bg-green-700 text-white'
             }`}
-            title={!canStart ? `Cannot start: isRunning=${isRunning}, state=${pipelineState}` : 'Start pipeline'}
+            title={!canStart ? `Cannot start: isRunning=${isRunning}, isStarting=${isStarting}, state=${pipelineState}` : 'Start pipeline'}
           >
-            {isRunning ? 'Running...' : 'Run Pipeline Now'}
+            {isRunning || isStarting ? 'Running...' : 'Run Pipeline Now'}
           </button>
           {canReset && (
             <button

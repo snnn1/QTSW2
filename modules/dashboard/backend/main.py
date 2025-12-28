@@ -38,6 +38,7 @@ import uuid
 from fastapi import FastAPI, HTTPException
 # WebSocket imports removed - WebSocket endpoints are in routers/websocket.py
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 import uvicorn
 import logging
@@ -204,6 +205,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Gzip compression middleware for faster data transfer
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1KB
 
 # Import and include routers
 # Handle both module import (dashboard.backend.main) and direct script execution

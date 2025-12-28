@@ -220,22 +220,29 @@ export function WebSocketProvider({ children }) {
     connect()
 
     return () => {
-      // Cleanup on unmount
+      // GUARANTEED CLEANUP: Always clean up WebSocket and subscribers on unmount
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current)
         reconnectTimerRef.current = null
       }
 
+      // Close WebSocket connection
       if (wsRef.current) {
         try {
           if (wsRef.current.readyState !== WebSocket.CLOSED) {
             wsRef.current.close(1000, 'Component unmounting')
           }
         } catch (e) {
-          // Ignore
+          // Ignore errors during cleanup
         }
         wsRef.current = null
       }
+      
+      // Clear all subscribers (prevent memory leak)
+      subscribersRef.current.clear()
+      
+      // Clear seen events set (free memory)
+      seenEventsRef.current.clear()
     }
   }, [connect])  // connect is stable, so this only runs once
 

@@ -46,6 +46,9 @@ function AppContent() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [lastMergeTime, setLastMergeTime] = useState(null)
   
+  // Track if initial load has been attempted to prevent reload loops
+  const hasLoadedRef = useRef(false)
+  
   // Web Worker for all heavy computations
   const {
     workerReady,
@@ -75,6 +78,11 @@ function AppContent() {
     setStreamFilters,
     getFiltersForStream
   } = useMatrixFilters()
+  
+  // Backend readiness state
+  const [backendReady, setBackendReady] = useState(false)
+  const [backendConnecting, setBackendConnecting] = useState(true)
+  const [backendConnectionError, setBackendConnectionError] = useState(null)
   
   // Keep local state for complex logic (loadMasterMatrix, toggleColumn, etc. have complex implementations)
   const [masterData, setMasterData] = useState([])
@@ -168,6 +176,9 @@ function AppContent() {
     setMasterLoading(true)
     setMasterError(null)
     
+    // Preserve existing data during rebuild/load - only replace when new data is successfully loaded
+    const hadExistingData = masterData.length > 0
+    
     try {
       // Check if backend is reachable
       try {
@@ -184,7 +195,10 @@ function AppContent() {
         } else {
           setMasterError(`Backend not running. Please start the dashboard backend on port ${API_PORT}. Error: ` + e.message)
         }
-        setMasterData([])
+        // Only clear data if we had no existing data (initial load failure)
+        if (!hadExistingData) {
+          setMasterData([])
+        }
         setMasterLoading(false)
         return
       }
@@ -239,6 +253,7 @@ function AppContent() {
           if (!buildResponse.ok) {
             const errorData = await buildResponse.json()
             setMasterError(errorData.detail || 'Failed to build master matrix')
+            // Preserve existing data if rebuild fails
             setMasterLoading(false)
             return
           }
@@ -246,18 +261,22 @@ function AppContent() {
           await buildResponse.json()
         } catch (error) {
           setMasterError(`Failed to build master matrix: ${error.message}`)
+          // Preserve existing data if rebuild fails
           setMasterLoading(false)
           return
         }
       }
       
-      // Load the matrix data
-      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=50000`)
+      // Load the matrix data (fast initial load: 10k rows, essential columns only, skip cleaning)
+      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=10000&essential_columns_only=true&skip_cleaning=true`)
       
       if (!dataResponse.ok) {
         const errorData = await dataResponse.json()
         setMasterError(errorData.detail || 'Failed to load matrix data')
-        setMasterData([])
+        // Only clear data if we had no existing data (initial load failure)
+        if (!hadExistingData) {
+          setMasterData([])
+        }
         setMasterLoading(false)
         return
       }
@@ -270,6 +289,7 @@ function AppContent() {
       }
       
       if (trades.length > 0) {
+        // Only now do we replace the data - new data is successfully loaded
         setMasterData(trades)
         setLastMergeTime(new Date()) // Track when merge data was received
         
@@ -347,8 +367,14 @@ function AppContent() {
         
         setMasterError(null)
       } else {
-        setMasterData([])
-        setMasterError('No data found. Click "Rebuild Matrix" to build it.')
+        // Only clear data if we had no existing data
+        if (!hadExistingData) {
+          setMasterData([])
+          setMasterError('No data found. Click "Rebuild Matrix" to build it.')
+        } else {
+          // If we had existing data but new load returned empty, keep existing data and show warning
+          setMasterError('Warning: Load returned no data. Previous data preserved.')
+        }
       }
     } catch (error) {
       if (error.name === 'TypeError' && error.message.includes('fetch')) {
@@ -356,7 +382,10 @@ function AppContent() {
       } else {
         setMasterError('Failed to load master matrix: ' + error.message)
       }
-      setMasterData([])
+      // Only clear data if we had no existing data (initial load failure)
+      if (!hadExistingData) {
+        setMasterData([])
+      }
     } finally {
       setMasterLoading(false)
     }
@@ -367,6 +396,88 @@ function AppContent() {
     loadMasterMatrix(false)
   }, [loadMasterMatrix])
 
+  // Backend readiness polling - check if backend is ready before loading data
+  useEffect(() => {
+    let pollInterval = null
+    let timeoutId = null
+    let isCancelled = false
+    let isReady = false // Track ready state with local variable
+    
+    const pollBackend = async () => {
+      if (isCancelled || isReady) return false
+      
+      try {
+        const controller = new AbortController()
+        const requestTimeout = setTimeout(() => controller.abort(), 2000) // 2s timeout per request
+        
+        const response = await fetch(`${API_BASE}/matrix/test`, {
+          method: 'GET',
+          signal: controller.signal
+        })
+        
+        clearTimeout(requestTimeout)
+        
+        if (response.ok) {
+          // Backend is ready
+          if (!isCancelled && !isReady) {
+            isReady = true
+            setBackendReady(true)
+            setBackendConnecting(false)
+            setBackendConnectionError(null)
+            
+            // Clear polling
+            if (pollInterval) {
+              clearInterval(pollInterval)
+              pollInterval = null
+            }
+            if (timeoutId) {
+              clearTimeout(timeoutId)
+              timeoutId = null
+            }
+          }
+          return true
+        }
+      } catch (error) {
+        // Backend not ready yet, continue polling
+        if (error.name !== 'AbortError') {
+          console.debug('Backend not ready yet, continuing to poll...', error.message)
+        }
+      }
+      return false
+    }
+    
+    // Start polling immediately, then every 500ms
+    pollBackend().then(ready => {
+      if (!ready && !isCancelled && !isReady) {
+        pollInterval = setInterval(() => {
+          pollBackend()
+        }, 500)
+      }
+    })
+    
+    // Set timeout for max retry window (12 seconds)
+    timeoutId = setTimeout(() => {
+      if (!isCancelled && !isReady) {
+        setBackendConnecting(false)
+        setBackendConnectionError('Backend did not respond within 12 seconds. Please check if the backend is running.')
+        if (pollInterval) {
+          clearInterval(pollInterval)
+          pollInterval = null
+        }
+      }
+    }, 12000)
+    
+    return () => {
+      isCancelled = true
+      if (pollInterval) {
+        clearInterval(pollInterval)
+      }
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+      }
+    }
+  }, []) // Only run once on mount
+
   // Update clock every second
   useEffect(() => {
     const timer = setInterval(() => {
@@ -375,15 +486,21 @@ function AppContent() {
     return () => clearInterval(timer)
   }, [])
 
-  // Load master matrix on mount (don't rebuild, just load existing)
+  // Load master matrix on mount (don't rebuild, just load existing) - only once
+  // Wait for backend to be ready before loading
   useEffect(() => {
-    // Wait a bit for backend to be ready, then try loading
-    const timer = setTimeout(() => {
-      loadMasterMatrix(false)
-    }, 1000)
+    // Only load once on mount if we haven't loaded yet
+    if (hasLoadedRef.current) return
     
-    return () => clearTimeout(timer)
-  }, [loadMasterMatrix])
+    // Wait for backend to be ready
+    if (!backendReady) return
+    
+    // Backend is ready, load the matrix data
+    if (!hasLoadedRef.current) {
+      hasLoadedRef.current = true
+      loadMasterMatrix(false)
+    }
+  }, [backendReady, loadMasterMatrix]) // Wait for backend to be ready before loading
   
   // Apply filters in worker when filters or active tab changes
   useEffect(() => {
@@ -1584,19 +1701,31 @@ function AppContent() {
               <h4 className="text-sm font-semibold text-gray-300 mb-1">Statistics Settings</h4>
               <p className="text-xs text-gray-500">Performance stats are computed on executed trades only (Win, Loss, BE, TIME)</p>
             </div>
-            <label className="flex items-center cursor-pointer">
+            <div className="flex items-center">
               <span className="text-sm text-gray-400 mr-3">Include filtered executed trades</span>
-              <div className="relative">
+              <div 
+                className="relative cursor-pointer"
+                onClick={() => setIncludeFilteredExecuted(!includeFilteredExecuted)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    setIncludeFilteredExecuted(!includeFilteredExecuted)
+                  }
+                }}
+              >
                 <input
                   type="checkbox"
                   className="sr-only"
                   checked={includeFilteredExecuted}
                   onChange={(e) => setIncludeFilteredExecuted(e.target.checked)}
+                  readOnly
                 />
                 <div className={`block w-14 h-8 rounded-full ${includeFilteredExecuted ? 'bg-green-500' : 'bg-gray-600'}`}></div>
                 <div className={`absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition transform ${includeFilteredExecuted ? 'translate-x-6' : ''}`}></div>
               </div>
-            </label>
+            </div>
           </div>
           
           {/* Section 1: Core Performance */}
@@ -2379,10 +2508,14 @@ function AppContent() {
               }
             }
           }
-          // Time Change
+          // Time Change - format for better visual alignment
           if (col === 'Time Change') {
             if (value && typeof value === 'string' && value.trim() !== '') {
+              // Normalize the arrow to a consistent format: handle both -> and → with any spacing
               value = value.trim()
+                .replace(/\s*->\s*/g, ' → ') // Replace -> with → 
+                .replace(/\s*→\s*/g, ' → ') // Normalize any existing → to consistent spacing
+                .trim()
             } else {
               value = ''
             }
@@ -2398,7 +2531,7 @@ function AppContent() {
           }
           
           // Determine cell styling
-          let cellClassName = `p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm ${col === 'Time Change' ? 'whitespace-nowrap' : ''}`
+          let cellClassName = `p-2 border-r border-gray-700 flex-shrink-0 text-sm ${col === 'Time Change' ? 'text-center whitespace-nowrap' : 'text-left'}`
           // Highlight DOW cell if filtered due to DOW
           if (col === 'DOW' && isFilteredByDOW) {
             cellClassName += ' bg-red-600/30'
@@ -2414,11 +2547,36 @@ function AppContent() {
               style={{ width: `${getColumnWidth(col)}px` }}
               title={isFiltered && filterReasons ? `Filtered: ${filterReasons}` : undefined}
             >
-              {value !== null && value !== undefined ? String(value) : '-'}
-              {showFilterBadge && (
-                <span className="ml-1 text-xs text-red-400" title={filterReasons}>
-                  ⚠
-                </span>
+              {col === 'Time Change' ? (
+                value && value.trim() ? (
+                  <span className="font-mono tabular-nums">
+                    {(() => {
+                      // Split on arrow to style separately
+                      const parts = value.split('→')
+                      if (parts.length === 2) {
+                        return (
+                          <>
+                            <span className="text-gray-200">{parts[0].trim()}</span>
+                            <span className="text-gray-500 mx-1">→</span>
+                            <span className="text-gray-200">{parts[1].trim()}</span>
+                          </>
+                        )
+                      }
+                      return <span className="text-gray-200">{value}</span>
+                    })()}
+                  </span>
+                ) : (
+                  ''
+                )
+              ) : (
+                <>
+                  {value !== null && value !== undefined ? String(value) : '-'}
+                  {showFilterBadge && (
+                    <span className="ml-1 text-xs text-red-400" title={filterReasons}>
+                      ⚠
+                    </span>
+                  )}
+                </>
               )}
             </div>
           )
@@ -2432,11 +2590,20 @@ function AppContent() {
   const [loadingMoreRows, setLoadingMoreRows] = useState(false)
   
   // Update loaded rows when worker filtered rows change
+  // Reset loadedRows when stream/activeTab changes to prevent stale data
+  const prevActiveTabRef = useRef(activeTab)
   useEffect(() => {
+    // Reset loadedRows when activeTab changes (stream switch)
+    if (prevActiveTabRef.current !== activeTab) {
+      setLoadedRows([])
+      prevActiveTabRef.current = activeTab
+    }
+    
     if (workerReady && workerFilteredRows && workerFilteredRows.length > 0) {
+      // Set loadedRows when we get new filtered rows (worker re-filtered)
       setLoadedRows(workerFilteredRows)
     }
-  }, [workerReady, workerFilteredRows])
+  }, [workerReady, workerFilteredRows, activeTab])
   
   // Load more rows function - use ref to access current loadedRows without dependency
   const loadedRowsRef = useRef([])
@@ -2455,10 +2622,16 @@ function AppContent() {
       : (workerFilteredRows || [])
     const currentLoadedLength = currentLoaded.length
     
-    // Load more if we're within 20 rows of the end of loaded data
-    if (stopIndex >= currentLoadedLength - 20 && workerFilteredIndices.length > currentLoadedLength) {
+    // Load more if we're within 100 rows of the end of loaded data (very aggressive for better UX)
+    // Also trigger if we're at or past the currently loaded data
+    const shouldLoad = (stopIndex >= currentLoadedLength - 100 || stopIndex >= currentLoadedLength - 1) && 
+                       workerFilteredIndices.length > currentLoadedLength
+    
+    if (shouldLoad) {
       setLoadingMoreRows(true)
-      const neededIndices = workerFilteredIndices.slice(currentLoadedLength, stopIndex + 50) // Load 50 extra for buffer
+      // Load more aggressively - load up to 200 rows ahead of current scroll position
+      const loadUpTo = Math.min(stopIndex + 200, workerFilteredIndices.length)
+      const neededIndices = workerFilteredIndices.slice(currentLoadedLength, loadUpTo)
       
       if (neededIndices.length > 0) {
         workerGetRows(neededIndices, (newRows) => {
@@ -2487,14 +2660,26 @@ function AppContent() {
     if (workerReady && workerFilteredIndices.length > 0) {
       // Use loaded rows (incrementally loaded as user scrolls)
       // Start with workerFilteredRows, then use loadedRows as they accumulate
-      filtered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
-      totalFiltered = filteredLength || workerFilteredIndices.length
+      let baseFiltered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
       
       // Trigger initial load if we have indices but no loaded rows yet
       if (loadedRows.length === 0 && workerFilteredRows && workerFilteredRows.length > 0) {
         // Already loaded via useEffect, but ensure state is set
         setLoadedRows(workerFilteredRows)
-        filtered = workerFilteredRows
+        baseFiltered = workerFilteredRows
+      }
+      
+      // IMPORTANT: Apply stream filter when using worker data
+      // The worker filters by stream filters but may return multiple streams when streamId is 'master'
+      // When viewing a specific stream tab (like 'ES1'), we need to filter to that stream only
+      if (streamId && streamId !== 'master') {
+        filtered = baseFiltered.filter(row => row.Stream === streamId)
+        // Use the actual filtered length, not the worker indices length
+        totalFiltered = filtered.length
+      } else {
+        filtered = baseFiltered
+        // For master, we can use filteredLength or the actual array length
+        totalFiltered = filteredLength || filtered.length
       }
     } else {
       // Fallback to main thread filtering only if worker not ready
@@ -2560,7 +2745,7 @@ function AppContent() {
         'Peak': 70,
         'Result': 70,
         'Profit': 80,
-        'Time Change': 100,
+        'Time Change': 120, // Increased width for better spacing with monospaced font
         'Profit ($)': 120
       }
       return widths[col] || 120
@@ -2588,16 +2773,17 @@ function AppContent() {
     }
     
     return (
-      <div className="overflow-x-auto">
+      <div style={{ overflowX: 'auto', overflowY: 'visible' }}>
         {/* Table header - sticky */}
         <div className="flex bg-gray-800 sticky top-0 z-10 border-b border-gray-700" style={{ width: `${totalWidth}px` }}>
           {columnsToShow.map(col => {
             // Map column names to display names
             const displayName = col === 'StopLoss' ? 'Stop Loss' : col
+            const isTimeChange = col === 'Time Change'
             return (
               <div 
                 key={col} 
-                className="p-2 font-medium border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+                className={`p-2 font-medium border-r border-gray-700 flex-shrink-0 text-sm ${isTimeChange ? 'text-center' : 'text-left'}`}
                 style={{ width: `${getColumnWidth(col)}px` }}
               >
                 {displayName}
@@ -2615,7 +2801,8 @@ function AppContent() {
           style={{ height: 600, width: `${totalWidth}px` }} // Fixed height and width for virtual list
           onRowsRendered={({ startIndex, stopIndex }) => {
             // Load more rows when user scrolls near the end
-            if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0) {
+            // Only call if we have more data to load (filtered.length < totalFiltered)
+            if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0 && filtered.length < totalFiltered) {
               loadMoreRows(startIndex, stopIndex)
             }
           }}
@@ -3091,6 +3278,41 @@ function AppContent() {
     }
   }, [workerReady, masterData.length, streamFilters, activeTab, workerCalculateTimetable, currentTradingDay])
   
+  // Show backend connection state if not ready
+  if (backendConnecting) {
+    return (
+      <div className="min-h-screen bg-black text-gray-100 flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-xl font-semibold text-blue-400 mb-4">Connecting to backend...</div>
+          <div className="text-sm text-gray-400">Waiting for API to be ready</div>
+        </div>
+      </div>
+    )
+  }
+  
+  if (backendConnectionError) {
+    return (
+      <div className="min-h-screen bg-black text-gray-100 flex items-center justify-center">
+        <div className="text-center max-w-md">
+          <div className="text-xl font-semibold text-red-400 mb-4">Backend Connection Error</div>
+          <div className="text-sm text-gray-400 mb-6">{backendConnectionError}</div>
+          <button
+            onClick={() => {
+              setBackendConnecting(true)
+              setBackendConnectionError(null)
+              setBackendReady(false)
+              // Trigger re-polling by resetting state
+              window.location.reload()
+            }}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded text-white"
+          >
+            Retry Connection
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="min-h-screen bg-black text-gray-100">
       <div className="container mx-auto px-4 py-8">

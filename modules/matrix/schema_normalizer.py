@@ -52,6 +52,9 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         'onr': 'float64',
         'onr_high': 'float64',
         'onr_low': 'float64',
+        'actual_trade_time': 'object',  # Original analyzer time (preserved by sequencer)
+        'date_repaired': 'bool',  # Flag indicating if date was repaired
+        'original_date': 'object',  # Original Date value before repair
     }
     
     # Ensure Date is datetime

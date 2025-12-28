@@ -133,24 +133,13 @@ class TranslatorService:
                 # No progress events - only final summary at the end
                 
                 try:
-                    # Check if output already exists (idempotent)
-                    yyyy = f"{trade_date.year:04d}"
-                    mm = f"{trade_date.month:02d}"
-                    date_str = trade_date.isoformat()
-                    out_file = self.config.data_translated / instrument / "1m" / yyyy / mm / f"{instrument}_1m_{date_str}.parquet"
-                    
-                    if out_file.exists():
-                        self.logger.info(f"  [SKIP] Skipped {instrument} {trade_date} (already exists)")
-                        files_skipped += 1
-                        continue
-                    
-                    # Translate using the new translator module
+                    # Translate using the new translator module (always overwrite existing files)
                     success = translate_day(
                         instrument=instrument,
                         day=trade_date,
                         raw_root=self.config.data_raw,
                         output_root=self.config.data_translated,
-                        overwrite=False
+                        overwrite=True
                     )
                     
                     if success:

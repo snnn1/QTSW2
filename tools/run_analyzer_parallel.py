@@ -61,8 +61,7 @@ def emit_event(run_id: Optional[str], stage: str, event: str, msg: str = "", dat
         logger.warning(f"Failed to emit event: {e}")
 
 # Base paths
-# Go up from ops/maintenance/run_analyzer_parallel.py to get QTSW2_ROOT
-QTSW2_ROOT = Path(__file__).parent.parent.parent
+QTSW2_ROOT = Path(__file__).parent.parent
 ANALYZER_SCRIPT = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
 DATA_PROCESSED = QTSW2_ROOT / "data" / "data_processed"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
@@ -295,9 +294,19 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
     logger.info(f"Successful: {successful}/{len(instruments)}")
     logger.info(f"Failed: {failed}/{len(instruments)}")
     
-    # Don't emit success/failure events here - AnalyzerService already emits them
-    # This prevents duplicate events in the live feed
-    # Only emit file-level events (file_start, file_finish) which are useful for tracking individual instrument progress
+    # Emit summary event
+    if successful == len(instruments):
+        emit_event(run_id, "analyzer", "success", f"All {len(instruments)} instruments completed successfully in {elapsed/60:.1f} minutes", {
+            "total_time_minutes": elapsed / 60,
+            "successful": successful,
+            "failed": failed
+        })
+    else:
+        emit_event(run_id, "analyzer", "failure", f"Analyzer completed with {failed} failure(s) out of {len(instruments)} instruments", {
+            "total_time_minutes": elapsed / 60,
+            "successful": successful,
+            "failed": failed
+        })
     
     if failed > 0:
         logger.info("\nFailed instruments:")

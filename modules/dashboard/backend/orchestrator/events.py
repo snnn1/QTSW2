@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, AsyncIterator
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 
 
@@ -67,6 +67,7 @@ class EventBus:
         "pipeline/state_change",
         "pipeline/success",
         "pipeline/failed",
+        "pipeline/run_blocked",  # Policy gate blocked run
         "translator/start",
         "translator/success",
         "translator/failed",
@@ -94,12 +95,15 @@ class EventBus:
         self.buffer_size = buffer_size
         self.logger = logger or logging.getLogger(__name__)
         
-        # Ring buffer for recent events
+        # Ring buffer for recent events (with TTL enforcement)
         self._recent_events: deque = deque(maxlen=buffer_size)
+        # Track event timestamps for TTL cleanup
+        self._event_timestamps: deque = deque(maxlen=buffer_size)
         
-        # Subscribers (queues for each subscriber)
+        # Subscribers (queues for each subscriber) - with hard cap
         self._subscribers: List[asyncio.Queue] = []
         self._subscriber_lock = asyncio.Lock()
+        self._max_subscribers = 100  # Hard cap on concurrent subscribers
         
         # Ensure event logs directory exists
         self.event_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -157,10 +161,7 @@ class EventBus:
                         event_time = event_time.replace(tzinfo=timezone.utc)
                     
                     # Calculate age
-                    now = datetime.now(event_time.tzinfo) if event_time.tzinfo else datetime.now()
-                    if event_time.tzinfo:
-                        from datetime import timezone
-                        now = datetime.now(timezone.utc)
+                    now = datetime.now(timezone.utc) if event_time.tzinfo else datetime.now()
                     age_minutes = (now - event_time).total_seconds() / 60
                     
                     # REJECT events outside live window
@@ -202,28 +203,77 @@ class EventBus:
         
         # Event passes all filters - add to ring buffer and broadcast
         # Add to ring buffer (only live events - for WebSocket snapshot)
+        # Enforce TTL: remove events older than LIVE_EVENT_WINDOW
+        event_timestamp = datetime.fromisoformat(event.get("timestamp", datetime.now().isoformat()).replace("Z", "+00:00"))
+        if event_timestamp.tzinfo is None:
+            event_timestamp = event_timestamp.replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc) if event_timestamp.tzinfo else datetime.now()
+        
+        # Cleanup old events from ring buffer (TTL enforcement)
+        while self._recent_events and self._event_timestamps:
+            oldest_timestamp = self._event_timestamps[0]
+            age_minutes = (now - oldest_timestamp).total_seconds() / 60
+            if age_minutes > self.LIVE_EVENT_WINDOW_MINUTES:
+                self._recent_events.popleft()
+                self._event_timestamps.popleft()
+            else:
+                break
+        
+        # Add new event
         self._recent_events.append(event)
+        self._event_timestamps.append(event_timestamp)
         
         # Broadcast to all subscribers (live channel only)
         async with self._subscriber_lock:
+            # Enforce hard cap on subscribers (prevent unbounded growth)
+            if len(self._subscribers) > self._max_subscribers:
+                # Remove oldest subscribers (FIFO) - they're likely dead connections
+                excess = len(self._subscribers) - self._max_subscribers
+                for _ in range(excess):
+                    removed_queue = self._subscribers.pop(0)
+                    # Try to drain the queue to free memory
+                    try:
+                        while not removed_queue.empty():
+                            removed_queue.get_nowait()
+                    except Exception:
+                        pass
+            
+            # Detect and remove dead subscribers (aggressive cleanup)
             disconnected = []
             for queue in self._subscribers:
                 try:
+                    # Try to put event - if this fails, subscriber is dead
                     queue.put_nowait(event)
                 except asyncio.QueueFull:
-                    # Queue full - drop oldest and add new
+                    # Queue full - drop oldest and add new (subscriber is alive but slow)
                     try:
                         queue.get_nowait()
                         queue.put_nowait(event)
                     except asyncio.QueueEmpty:
-                        pass
+                        # Queue was full but now empty - race condition, try again
+                        try:
+                            queue.put_nowait(event)
+                        except Exception:
+                            disconnected.append(queue)
+                except (RuntimeError, ValueError, AttributeError):
+                    # Queue is closed or invalid - subscriber is dead
+                    disconnected.append(queue)
                 except Exception:
+                    # Any other exception - assume subscriber is dead
                     disconnected.append(queue)
             
-            # Remove disconnected subscribers
+            # Remove disconnected subscribers (guaranteed cleanup)
             for queue in disconnected:
-                    if queue in self._subscribers:
-                        self._subscribers.remove(queue)
+                if queue in self._subscribers:
+                    self._subscribers.remove(queue)
+                    # Drain queue to free memory
+                    try:
+                        while not queue.empty():
+                            queue.get_nowait()
+                    except Exception:
+                        pass
+                    self.logger.debug(f"[EventBus] Removed dead subscriber queue. Active subscribers: {len(self._subscribers)}")
         
         # Write to JSONL file (historical storage - all events that pass filters)
         self._write_to_jsonl_file(event, run_id, stage, event_type)
@@ -320,15 +370,36 @@ class EventBus:
         """
         Subscribe to events.
         
+        CRITICAL: Guaranteed cleanup - subscriber queue is ALWAYS removed on exit.
+        
         Returns:
             Async iterator of events
         """
         queue = asyncio.Queue(maxsize=100)
-        
-        async with self._subscriber_lock:
-            self._subscribers.append(queue)
+        subscriber_added = False
         
         try:
+            # Enforce hard cap before adding subscriber
+            async with self._subscriber_lock:
+                # Check if we're at capacity
+                if len(self._subscribers) >= self._max_subscribers:
+                    self.logger.warning(
+                        f"[EventBus] Subscriber limit reached ({self._max_subscribers}). "
+                        f"Removing oldest subscriber to make room."
+                    )
+                    # Remove oldest subscriber (FIFO)
+                    if self._subscribers:
+                        removed_queue = self._subscribers.pop(0)
+                        try:
+                            while not removed_queue.empty():
+                                removed_queue.get_nowait()
+                        except Exception:
+                            pass
+                
+                # Add subscriber
+                self._subscribers.append(queue)
+                subscriber_added = True
+            
             # Send recent events first
             for event in list(self._recent_events):
                 try:
@@ -353,10 +424,45 @@ class EventBus:
                     # Just log and continue - wait for next event
                     continue
         finally:
-            # Cleanup
+            # GUARANTEED CLEANUP: Always remove subscriber queue, even on exception
             async with self._subscriber_lock:
-                if queue in self._subscribers:
+                if subscriber_added and queue in self._subscribers:
                     self._subscribers.remove(queue)
+                    # Drain queue to free memory
+                    try:
+                        while not queue.empty():
+                            queue.get_nowait()
+                    except Exception:
+                        pass
+                    self.logger.debug(f"[EventBus] Subscriber queue removed. Active subscribers: {len(self._subscribers)}")
+    
+    def cleanup_run_events(self, run_id: str):
+        """
+        Run-scoped teardown: Remove events for a completed run from ring buffer.
+        
+        This prevents memory accumulation across multiple runs.
+        Called when a run completes (success/failed/stopped).
+        
+        Args:
+            run_id: Run ID to clean up
+        """
+        # Remove events for this run from ring buffer
+        events_to_keep = []
+        timestamps_to_keep = []
+        
+        for event, timestamp in zip(self._recent_events, self._event_timestamps):
+            if event.get("run_id") != run_id:
+                events_to_keep.append(event)
+                timestamps_to_keep.append(timestamp)
+        
+        # Replace ring buffer contents
+        self._recent_events.clear()
+        self._event_timestamps.clear()
+        for event, timestamp in zip(events_to_keep, timestamps_to_keep):
+            self._recent_events.append(event)
+            self._event_timestamps.append(timestamp)
+        
+        self.logger.debug(f"[EventBus] Cleaned up events for run {run_id[:8]}. Ring buffer size: {len(self._recent_events)}")
     
     def get_recent_events(self, limit: int = 100) -> List[Dict]:
         """

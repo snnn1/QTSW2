@@ -59,14 +59,17 @@ async def start_pipeline(request: PipelineStartRequest = PipelineStartRequest())
 
     # Read manual flag from request (defaults to True for backward compatibility)
     manual = request.manual if request else True
+    # Read manual_override flag (for policy gate - manual runs only)
+    manual_override = getattr(request, 'manual_override', False) if request else False
     
-    logger.info(f"[START] Starting pipeline: manual={manual}, request={request}, request.manual={request.manual if request else 'N/A'}")
+    logger.info(f"[START] Starting pipeline: manual={manual}, manual_override={manual_override}")
 
     try:
         # Start the pipeline - orchestrator handles run_id generation and event emission
         # The API is a thin command layer - event emission belongs only in the orchestrator
+        # Policy gate is enforced inside start_pipeline()
         run_ctx = await asyncio.wait_for(
-            orchestrator.start_pipeline(manual=manual, run_id=None),
+            orchestrator.start_pipeline(manual=manual, manual_override=manual_override),
             timeout=5.0,  # should be instant
         )
 
@@ -112,6 +115,52 @@ async def stop_pipeline():
 # Status & snapshot
 # ---------------------------------------------------------------------
 
+@router.get("/runs")
+async def list_runs(
+    limit: int = 100,
+    result: Optional[str] = None
+):
+    """
+    List run summaries (first-class persisted artifacts).
+    
+    Query params:
+    - limit: Maximum number of runs to return (default: 100)
+    - result: Filter by result (success, failed, stopped)
+    
+    Returns:
+        List of run summaries, most recent first
+    """
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        return {"runs": []}
+    
+    runs = orchestrator.run_history.list_runs(limit=limit, result_filter=result)
+    
+    return {
+        "runs": [run.to_dict() for run in runs],
+        "total": len(runs)
+    }
+
+
+@router.get("/runs/{run_id}")
+async def get_run(run_id: str):
+    """
+    Get a specific run summary by run_id.
+    
+    Returns:
+        Run summary or 404 if not found
+    """
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        raise HTTPException(status_code=404, detail="Orchestrator not available")
+    
+    run = orchestrator.run_history.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    
+    return run.to_dict()
+
+
 @router.get("/status")
 async def get_pipeline_status():
     orchestrator = get_orchestrator()
@@ -122,10 +171,14 @@ async def get_pipeline_status():
     # No inferred states, no starting_up, ready, waiting, initializing
     from modules.orchestrator.state import canonical_state, PipelineRunState
     
+    # CRITICAL: Read from single canonical state source (state_manager.get_state())
+    # This ensures polling and WebSocket always agree on state
     status = await orchestrator.get_status()
     if status:
         # Map internal FSM state to canonical state
         canonical = canonical_state(status.state)
+        # Return canonical state in same format as state_change events
+        # This ensures consistency between polling and WebSocket
         return {
             "state": canonical,
             "run_id": status.run_id,
@@ -133,6 +186,10 @@ async def get_pipeline_status():
             "started_at": status.started_at.isoformat() if status.started_at else None,
             "updated_at": status.updated_at.isoformat() if status.updated_at else None,
             "error": status.error,
+            "retry_count": status.retry_count,
+            "metadata": status.metadata,
+            # Include internal state for debugging (not used by frontend)
+            "_internal_state": status.state.value,
         }
     else:
         return {"state": "idle"}

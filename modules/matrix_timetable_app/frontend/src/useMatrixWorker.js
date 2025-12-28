@@ -118,7 +118,7 @@ export function useMatrixWorker() {
   }, [workerReady])
   
   // Calculate stats
-  const calculateStats = useCallback((streamFilters, streamId, contractMultiplier) => {
+  const calculateStats = useCallback((streamFilters, streamId, contractMultiplier, includeFilteredExecuted = true) => {
     if (!workerRef.current || !workerReady) return
     
     setStatsLoading(true)
@@ -128,7 +128,8 @@ export function useMatrixWorker() {
         streamFilters,
         streamId,
         contractMultiplier,
-        contractValues: CONTRACT_VALUES
+        contractValues: CONTRACT_VALUES,
+        includeFilteredExecuted
       }
     })
   }, [workerReady])

@@ -122,19 +122,28 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
         # This is needed because sequencer sets Time to intended slot, not actual trade time
         if filters.get('exclude_times'):
             exclude_times = [str(t).strip() for t in filters['exclude_times']]  # Normalize exclude_times
+            from .utils import normalize_time
+            
+            # Normalize exclude_times for consistent comparison
+            exclude_times_normalized = [normalize_time(str(t)) for t in exclude_times]
+            
             # Check actual_trade_time first (if sequencer preserved it), then fall back to Time
             if 'actual_trade_time' in df.columns:
                 # Normalize actual_trade_time values for comparison (handle potential whitespace/format issues)
-                actual_times_normalized = df['actual_trade_time'].astype(str).str.strip()
-                time_mask = stream_mask & actual_times_normalized.isin(exclude_times)
+                actual_times_normalized = df['actual_trade_time'].astype(str).str.strip().apply(normalize_time)
+                time_mask = stream_mask & actual_times_normalized.isin(exclude_times_normalized)
             else:
-                # Normalize Time values for comparison
-                time_values_normalized = df['Time'].astype(str).str.strip()
-                time_mask = stream_mask & time_values_normalized.isin(exclude_times)
-            df.loc[time_mask, 'final_allowed'] = False
-            df.loc[time_mask, 'filter_reasons'] = df.loc[time_mask, 'filter_reasons'].apply(
-                lambda x: f"{x}, " if x else "" 
-            ) + f"time_filter({','.join(exclude_times)})"
+                # Fallback: normalize Time values for comparison (shouldn't happen if sequencer is working correctly)
+                logger.warning(f"Stream {stream_id}: actual_trade_time column missing, falling back to Time column for filtering")
+                time_values_normalized = df['Time'].astype(str).str.strip().apply(normalize_time)
+                time_mask = stream_mask & time_values_normalized.isin(exclude_times_normalized)
+            
+            if time_mask.any():
+                df.loc[time_mask, 'final_allowed'] = False
+                df.loc[time_mask, 'filter_reasons'] = df.loc[time_mask, 'filter_reasons'].apply(
+                    lambda x: f"{x}, " if x else "" 
+                ) + f"time_filter({','.join(exclude_times)})"
+                logger.info(f"Stream {stream_id}: Filtered {time_mask.sum()} trades at excluded times: {exclude_times}")
     
     return df
 

@@ -505,8 +505,9 @@ class PipelineOrchestrator:
                 self.logger.error(f"[Pipeline Background] Failed to update state or emit error event: {state_error}")
             success = False
         finally:
-            # Emit scheduler completion event if this was a scheduled run
+            # Emit completion event based on run type
             if not manual:
+                # Scheduled run completion event
                 event_type = "success" if success else "failed"
                 self.logger.info(f"📅 Publishing scheduler/{event_type} event for run {run_ctx.run_id[:8]}...")
                 await self.event_bus.publish({
@@ -518,6 +519,19 @@ class PipelineOrchestrator:
                     "data": {"manual": False, "success": success}
                 })
                 self.logger.info(f"[SUCCESS] Scheduler/{event_type} event published")
+            else:
+                # Manual run completion event
+                event_type = "success" if success else "failed"
+                self.logger.info(f"📋 Publishing pipeline/{event_type} event for manual run {run_ctx.run_id[:8]}...")
+                await self.event_bus.publish({
+                    "run_id": run_ctx.run_id,
+                    "stage": "pipeline",
+                    "event": event_type,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "msg": f"Manual pipeline run {'completed successfully' if success else 'failed'}",
+                    "data": {"manual": True, "success": success}
+                })
+                self.logger.info(f"[SUCCESS] Pipeline/{event_type} event published for manual run")
             
             # Release lock
             await self.lock_manager.release(run_ctx.run_id)

@@ -338,11 +338,44 @@ export function usePipelineState() {
       }
       
       // Update status from state_change events
+      // CRITICAL: Use complete canonical_state from event for truthfulness
+      // This ensures WebSocket and polling always agree
       if (event.event === 'state_change' && event.data) {
+        // Prefer canonical_state if available (complete truth)
+        if (event.data.canonical_state) {
+          const canonical = event.data.canonical_state
+          // Map internal FSM state to canonical state (idle, running, stopped, error)
+          // This matches the backend canonical_state() function
+          const internalState = canonical.state
+          let canonicalState
+          if (internalState === 'idle' || internalState === 'success') {
+            canonicalState = 'idle'
+          } else if (internalState === 'stopped') {
+            canonicalState = 'stopped'
+          } else if (internalState === 'failed') {
+            canonicalState = 'error'
+          } else {
+            // running_translator, running_analyzer, running_merger, starting, scheduled, retrying
+            canonicalState = 'running'
+          }
+          
+          updatePipelineStatus({
+            state: canonicalState,
+            run_id: canonical.run_id || event.run_id || activeRunId,
+            current_stage: canonical.current_stage,
+            started_at: canonical.started_at,
+            updated_at: canonical.updated_at,
+            error: canonical.error,
+            retry_count: canonical.retry_count,
+            metadata: canonical.metadata,
+          })
+        } else {
+          // Fallback to partial state (backward compatibility)
           const newState = event.data.new_state
           if (newState) {
             updatePipelineStatus({ state: newState, run_id: event.run_id || activeRunId })
           }
+        }
       }
     }
     
@@ -550,6 +583,7 @@ export function usePipelineState() {
     mergerInfo,
     alertInfo,
     schedulerEnabled,
+    isStarting,
     startPipeline: handleStartPipeline,
     runStage: handleRunStage,
     runDataMerger: handleRunDataMerger,

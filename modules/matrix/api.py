@@ -13,6 +13,7 @@ from typing import Optional, List, Dict
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 # Calculate project root
@@ -261,8 +262,15 @@ async def list_matrix_files():
 
 
 @router.get("/data")
-async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
-    """Get master matrix data from the most recent file or specified file."""
+async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, essential_columns_only: bool = True, skip_cleaning: bool = False):
+    """Get master matrix data from the most recent file or specified file.
+    
+    Args:
+        file_path: Optional path to specific file
+        limit: Maximum number of rows to return (default 10000 for faster initial load)
+        essential_columns_only: If True, return only essential columns for faster initial load (default True)
+        skip_cleaning: If True, skip expensive per-value sanitization for faster initial load (default False)
+    """
     try:
         import pandas as pd
         
@@ -278,14 +286,14 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
             # Use specified file
             file_to_load = Path(file_path)
             if not file_to_load.exists():
-                return {"data": [], "total": 0, "file": None, "error": f"File not found: {file_path}"}
+                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         else:
             # Find most recent file
             if parquet_files:
                 parquet_files = sorted(parquet_files, key=lambda p: p.stat().st_mtime, reverse=True)
                 file_to_load = parquet_files[0]
             else:
-                return {"data": [], "total": 0, "file": None, "error": f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first."}
+                raise HTTPException(status_code=404, detail=f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
         
         # Load parquet file in thread pool to avoid blocking (large files)
         def _load_parquet_sync():
@@ -296,56 +304,111 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
         try:
             df = await asyncio.to_thread(_load_parquet_sync)
         except Exception as e:
-            return {"data": [], "total": 0, "file": file_to_load.name, "error": f"Failed to read file: {str(e)}"}
+            raise HTTPException(status_code=500, detail=f"Failed to read file {file_to_load.name}: {str(e)}")
         
         if df.empty:
-            return {"data": [], "total": 0, "file": file_to_load.name, "error": "File is empty"}
+            raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
         
-        # Apply limit
+        # Extract years from FULL dataset BEFORE limiting (so we see all available years)
+        years = []
+        if 'trade_date' in df.columns:
+            df_years = df.copy()
+            df_years['trade_date'] = pd.to_datetime(df_years['trade_date'], errors='coerce')
+            year_values = df_years['trade_date'].dt.year.dropna().unique().tolist()
+            year_values = [int(y) for y in year_values if not pd.isna(y)]
+            if year_values:
+                try:
+                    years = sorted(year_values, reverse=True)  # Newest first
+                except Exception as e:
+                    logger.error(f"Error sorting years: {e}, values: {year_values[:10]}")
+                    years = sorted(year_values, reverse=True) if year_values else []
+        
+        # Apply limit (assume MasterMatrix output is already correctly sorted)
         if limit > 0:
             df = df.head(limit)
         
-        # Replace NaN, Infinity, and -Infinity with None for JSON compatibility
-        # Convert to dict first, then clean values (more reliable than DataFrame operations)
-        import numpy as np
+        # Strict essential columns list for initial load (no dynamic additions)
+        # Identity: Date, trade_date, Stream, Instrument
+        # Ordering: Time, EntryTime, ExitTime
+        # Outcome: Result, Profit, final_allowed
+        # Trading details: Target, Range, StopLoss, Peak
+        # Minimal context: Session, Direction, DOW
+        ESSENTIAL_COLUMNS = [
+            'Date', 'trade_date', 'Stream', 'Instrument',  # Identity
+            'Time', 'EntryTime', 'ExitTime',  # Ordering
+            'Result', 'Profit', 'final_allowed',  # Outcome
+            'Target', 'Range', 'StopLoss', 'Peak',  # Trading details
+            'Session', 'Direction', 'DOW',  # Minimal context
+            'Time Change'  # Essential for sequencer visualization
+        ]
         
-        # Convert to records first
-        records = df.to_dict('records')
+        # Reduce columns for faster initial load (strict list only, no dynamic additions)
+        if essential_columns_only:
+            # Only keep columns that exist in the dataframe
+            available_essential = [col for col in ESSENTIAL_COLUMNS if col in df.columns]
+            df = df[available_essential]
         
-        # Clean all values to ensure JSON compliance
-        def clean_value(v):
-            """Clean a value to be JSON-compliant"""
-            # Handle None
-            if v is None:
-                return None
+        # Convert to records - use fast path for initial load if skip_cleaning is True
+        if skip_cleaning:
+            # Fast path: Use pandas native conversion with single pandas-level replace
+            # Replace all NaN/NA values at DataFrame level (O(n) not O(n×m))
+            import numpy as np
+            # Replace pd.NA and NaN with None in a single operation
+            df_cleaned = df.replace({pd.NA: None, np.nan: None})
+            # Convert datetime columns to strings for JSON serialization
+            # This ensures pandas Timestamp objects are converted before to_dict('records')
+            for col in df_cleaned.columns:
+                if pd.api.types.is_datetime64_any_dtype(df_cleaned[col]):
+                    df_cleaned[col] = df_cleaned[col].astype(str).replace('NaT', None)
+            records = df_cleaned.to_dict('records')
+            # Also handle any Timestamp objects that might still be in the records (defensive)
+            for record in records:
+                for key, value in record.items():
+                    if isinstance(value, pd.Timestamp):
+                        record[key] = str(value)
+                    elif value is pd.NaT:
+                        record[key] = None
+        else:
+            # Full sanitization path (for exports, full dataset requests)
+            import numpy as np
             
-            # Handle pandas Timestamp objects - convert to string
-            if pd.api.types.is_datetime64_any_dtype(type(v)) or isinstance(v, pd.Timestamp):
-                return str(v)
+            # Convert to records first
+            records = df.to_dict('records')
             
-            # Handle float values (NaN, Infinity, out-of-range)
-            if isinstance(v, float):
-                # Check for NaN
-                if pd.isna(v) or np.isnan(v):
+            # Clean all values to ensure JSON compliance
+            def clean_value(v):
+                """Clean a value to be JSON-compliant"""
+                # Handle None
+                if v is None:
                     return None
-                # Check for Infinity
-                if np.isinf(v):
-                    return None
-                # Check if float is too large for JSON (JSON max is ~1.797e308)
-                if abs(v) > 1e308:
-                    return None
+                
+                # Handle pandas Timestamp objects - convert to string
+                if pd.api.types.is_datetime64_any_dtype(type(v)) or isinstance(v, pd.Timestamp):
+                    return str(v)
+                
+                # Handle float values (NaN, Infinity, out-of-range)
+                if isinstance(v, float):
+                    # Check for NaN
+                    if pd.isna(v) or np.isnan(v):
+                        return None
+                    # Check for Infinity
+                    if np.isinf(v):
+                        return None
+                    # Check if float is too large for JSON (JSON max is ~1.797e308)
+                    if abs(v) > 1e308:
+                        return None
+                
+                # Handle numpy types that might cause issues
+                if isinstance(v, (np.integer, np.floating)):
+                    # Convert numpy types to Python native types
+                    if np.isnan(v) or np.isinf(v):
+                        return None
+                    return v.item() if hasattr(v, 'item') else float(v)
+                
+                return v
             
-            # Handle numpy types that might cause issues
-            if isinstance(v, (np.integer, np.floating)):
-                # Convert numpy types to Python native types
-                if np.isnan(v) or np.isinf(v):
-                    return None
-                return v.item() if hasattr(v, 'item') else float(v)
-            
-            return v
-        
-        # Clean all values in records
-        records = [{k: clean_value(v) for k, v in record.items()} for record in records]
+            # Clean all values in records
+            records = [{k: clean_value(v) for k, v in record.items()} for record in records]
         
         # Get metadata - handle None values to avoid comparison errors
         streams = []
@@ -372,22 +435,9 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
                     logger.error(f"Error sorting instruments: {e}, values: {instrument_values[:10]}")
                     instruments = instrument_values  # Return unsorted if sorting fails
         
-        # Get years
-        years = []
-        if 'trade_date' in df.columns:
-            df = df.copy()  # Avoid SettingWithCopyWarning
-            df['trade_date'] = pd.to_datetime(df['trade_date'])
-            year_values = df['trade_date'].dt.year.unique().tolist()
-            # Filter out None/NaN values before sorting
-            year_values = [y for y in year_values if y is not None and pd.notna(y)]
-            if year_values:
-                try:
-                    years = sorted(year_values)
-                except Exception as e:
-                    logger.error(f"Error sorting years: {e}, values: {year_values[:10]}")
-                    years = year_values  # Return unsorted if sorting fails
+        # Years already extracted above from full dataset before limiting
         
-        return {
+        response_data = {
             "data": records,
             "total": len(df),
             "loaded": len(records),
@@ -396,6 +446,22 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 50000):
             "instruments": instruments,
             "years": years
         }
+        
+        # Use orjson for faster JSON serialization if available
+        try:
+            import orjson
+            # orjson handles NaN/None automatically, but Timestamp objects need to be strings
+            # We convert datetime columns to strings above, but handle any remaining Timestamp objects
+            json_bytes = orjson.dumps(
+                response_data,
+                option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_SERIALIZE_DATACLASS | orjson.OPT_PASSTHROUGH_DATETIME
+            )
+            return Response(content=json_bytes, media_type="application/json")
+        except (ImportError, TypeError) as e:
+            # Fallback to standard JSON serialization if orjson fails (e.g., Timestamp not handled)
+            # FastAPI's JSONResponse will handle serialization via Pydantic
+            logger.debug(f"orjson serialization failed, using JSONResponse fallback: {e}")
+            return JSONResponse(content=response_data, media_type="application/json")
     except Exception as e:
         import traceback
         error_detail = str(e)

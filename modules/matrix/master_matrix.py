@@ -172,6 +172,9 @@ class MasterMatrix:
         """
         Load all streams and apply sequencer logic.
         Internal method that wraps data_loader with sequencer logic callback.
+        
+        NOTE: This logic is duplicated in update_master_matrix() (lines 631-704).
+        Future refactoring should consolidate the load + sequencer logic to reduce duplication.
         """
         # Re-discover streams if needed
         if not self.streams or len(self.streams) == 0:
@@ -183,12 +186,12 @@ class MasterMatrix:
         
         # Create sequencer callback that uses current stream_filters
         def apply_sequencer(df: pd.DataFrame, display_year: Optional[int] = None) -> pd.DataFrame:
-            # DIAGNOSTIC: Log function being called and module file path
-            logger.info("=" * 80)
-            logger.info("CALLING SEQUENCER (from _load_all_streams_with_sequencer)")
-            logger.info(f"Function: sequencer_logic.apply_sequencer_logic")
-            logger.info(f"Module file: {sequencer_logic.__file__}")
-            logger.info("=" * 80)
+            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
+            logger.debug("=" * 80)
+            logger.debug("CALLING SEQUENCER (from _load_all_streams_with_sequencer)")
+            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
+            logger.debug(f"Module file: {sequencer_logic.__file__}")
+            logger.debug("=" * 80)
             return sequencer_logic.apply_sequencer_logic(df, self.stream_filters, display_year)
         
         # Load all streams with sequencer logic applied
@@ -253,7 +256,9 @@ class MasterMatrix:
             analyzer_runs_dir: Override analyzer runs directory (optional)
             
         Returns:
-            Master matrix DataFrame sorted by trade_date, entry_time, symbol, stream_id
+            Master matrix DataFrame sorted by trade_date, entry_time, Instrument, Stream
+            (ascending order). This is the CANONICAL sort order - API and UI layers must
+            NOT re-sort this data, they should assume it is already correctly sorted.
         """
         # Force output to stderr immediately AND log file
         import sys
@@ -263,13 +268,15 @@ class MasterMatrix:
         debug_start += f"Stream filters: {stream_filters}\n"
         debug_start += "=" * 80 + "\n"
         
+        # High-signal INFO logs only (build start with key parameters)
         logger.info("=" * 80)
         logger.info("MASTER MATRIX: build_master_matrix() called")
         logger.info(f"Streams: {streams}")
         logger.info(f"Output dir: {output_dir}")
-        logger.info(f"Stream filters: {stream_filters}")
         logger.info("BUILDING MASTER MATRIX (Applying Sequencer Logic)")
         logger.info("=" * 80)
+        # Stream filters details moved to DEBUG (diagnostic, not high-signal)
+        logger.debug(f"Stream filters: {stream_filters}")
         
         # Override analyzer_runs_dir if provided
         if analyzer_runs_dir:
@@ -283,12 +290,12 @@ class MasterMatrix:
         is_partial_rebuild = streams and len(streams) > 0
         self._update_stream_filters(stream_filters, merge=is_partial_rebuild)
         
-        # Log filter state
-        logger.info(f"Stream filters set BEFORE load_all_streams: {list(self.stream_filters.keys())}")
+        # Log filter state (DEBUG level - diagnostic info)
+        logger.debug(f"Stream filters set BEFORE load_all_streams: {list(self.stream_filters.keys())}")
         for stream_id, filters in self.stream_filters.items():
             exclude_times = filters.get('exclude_times', [])
             if exclude_times:
-                logger.info(f"  {stream_id}: exclude_times = {exclude_times}")
+                logger.debug(f"  {stream_id}: exclude_times = {exclude_times}")
         
         # If rebuilding specific streams, merge with existing. Otherwise rebuild everything.
         if streams and len(streams) > 0:
@@ -303,42 +310,42 @@ class MasterMatrix:
         # NOTE: stream_filters are already set above (before loading)
         # They were used in sequencer_logic during loading
         
-        # DIAGNOSTIC: Check Time column values before post-processing
+        # DIAGNOSTIC: Check Time column values before post-processing (DEBUG level - diagnostic only)
         if 'Time' in df.columns and 'Stream' in df.columns:
             s2_streams = ['ES2', 'NQ2', 'GC2', 'NG2', 'YM2', 'CL2']
-            logger.info("=" * 80)
-            logger.info("BEFORE normalize_schema/add_global_columns - Time column check:")
+            logger.debug("=" * 80)
+            logger.debug("BEFORE normalize_schema/add_global_columns - Time column check:")
             for stream in s2_streams:
                 stream_df = df[df['Stream'] == stream]
                 if not stream_df.empty:
                     time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.info(f"  {stream}: {dict(time_counts)}")
-            logger.info("=" * 80)
+                    logger.debug(f"  {stream}: {dict(time_counts)}")
+            logger.debug("=" * 80)
         
         # Normalize schema
         df = self.normalize_schema(df)
         
-        # DIAGNOSTIC: Check Time column values after normalize_schema
+        # DIAGNOSTIC: Check Time column values after normalize_schema (DEBUG level - diagnostic only)
         if 'Time' in df.columns and 'Stream' in df.columns:
-            logger.info("AFTER normalize_schema - Time column check:")
+            logger.debug("AFTER normalize_schema - Time column check:")
             for stream in s2_streams:
                 stream_df = df[df['Stream'] == stream]
                 if not stream_df.empty:
                     time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.info(f"  {stream}: {dict(time_counts)}")
+                    logger.debug(f"  {stream}: {dict(time_counts)}")
         
         # Add global columns (applies filters)
         df = self.add_global_columns(df)
         
-        # DIAGNOSTIC: Check Time column values after add_global_columns
+        # DIAGNOSTIC: Check Time column values after add_global_columns (DEBUG level - diagnostic only)
         if 'Time' in df.columns and 'Stream' in df.columns:
-            logger.info("AFTER add_global_columns - Time column check:")
+            logger.debug("AFTER add_global_columns - Time column check:")
             for stream in s2_streams:
                 stream_df = df[df['Stream'] == stream]
                 if not stream_df.empty:
                     time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.info(f"  {stream}: {dict(time_counts)}")
-            logger.info("=" * 80)
+                    logger.debug(f"  {stream}: {dict(time_counts)}")
+            logger.debug("=" * 80)
         
         # SL comes from analyzer output (schema_normalizer ensures it exists with NaN if missing)
         
@@ -346,7 +353,9 @@ class MasterMatrix:
         if 'Time Change' not in df.columns:
             df['Time Change'] = ''
         
-        # Sort by: trade_date, then entry_time, then symbol, then stream_id
+        # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
+        # Output from build_master_matrix() is fully sorted by: trade_date, entry_time, Instrument, Stream
+        # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
         # Ensure trade_date is datetime (not date objects) for consistent sorting
         if 'trade_date' in df.columns:
             if df['trade_date'].dtype == 'object':
@@ -355,35 +364,100 @@ class MasterMatrix:
             elif not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
                 df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
         
-        # Filter out rows with invalid trade_date before sorting
+        # Initialize date_repaired column (will be set for invalid dates)
+        if 'date_repaired' not in df.columns:
+            df['date_repaired'] = False
+        
+        # Handle rows with invalid trade_date - preserve them instead of removing
         valid_dates = df['trade_date'].notna()
         if not valid_dates.all():
             invalid_count = (~valid_dates).sum()
             invalid_df = df[~valid_dates].copy()
+            invalid_percentage = invalid_count / len(df) * 100
             
             # Report per-stream breakdown for better diagnostics
             if 'Stream' in df.columns:
                 invalid_by_stream = invalid_df.groupby('Stream').size()
                 for stream_id, count in invalid_by_stream.items():
-                    logger.error(f"[ERROR] {stream_id} has {count} trades with invalid trade_date! These will be removed!")
+                    logger.warning(f"[WARNING] {stream_id} has {count} trades with invalid trade_date! Attempting to repair...")
                     # Log sample of invalid dates for this stream for debugging
                     stream_invalid = invalid_df[invalid_df['Stream'] == stream_id]
                     if 'Date' in stream_invalid.columns:
                         sample_dates = stream_invalid['Date'].head(5).tolist()
                         logger.debug(f"  Sample invalid dates for {stream_id}: {sample_dates}")
             
-            # Log total impact
-            logger.warning(
-                f"Found {invalid_count} rows with invalid trade_date out of {len(df)} total rows - filtering them out. "
-                f"This represents {invalid_count/len(df)*100:.1f}% of the data."
-            )
+            # Attempt to repair invalid dates
+            repaired_count = 0
+            for idx in invalid_df.index:
+                original_date = invalid_df.loc[idx, 'Date'] if 'Date' in invalid_df.columns else None
+                
+                # Try to repair: attempt multiple strategies
+                repaired_date = None
+                
+                # Strategy 1: Try parsing Date column again with different formats
+                if original_date is not None and pd.notna(original_date):
+                    try:
+                        # Try common date formats
+                        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y%m%d']:
+                            try:
+                                repaired_date = pd.to_datetime(str(original_date), format=fmt, errors='coerce')
+                                if pd.notna(repaired_date):
+                                    break
+                            except:
+                                continue
+                    except:
+                        pass
+                
+                # Strategy 2: Infer from adjacent valid dates (if available)
+                if pd.isna(repaired_date) and 'Stream' in invalid_df.columns:
+                    stream_id = invalid_df.loc[idx, 'Stream']
+                    if 'Stream' in df.columns:
+                        stream_valid = df[valid_dates & (df['Stream'] == stream_id)]
+                    else:
+                        stream_valid = df[valid_dates]
+                    if not stream_valid.empty and 'trade_date' in stream_valid.columns:
+                        # Use median date from same stream as fallback
+                        median_date = stream_valid['trade_date'].median()
+                        if pd.notna(median_date):
+                            repaired_date = median_date
+                
+                # Strategy 3: Use a default date (first valid date in dataset) as last resort
+                if pd.isna(repaired_date):
+                    valid_dates_in_df = df[valid_dates]['trade_date'] if valid_dates.any() else pd.Series()
+                    if not valid_dates_in_df.empty:
+                        repaired_date = valid_dates_in_df.min()
+                
+                # Update if repair succeeded
+                if pd.notna(repaired_date):
+                    df.loc[idx, 'trade_date'] = repaired_date
+                    df.loc[idx, 'date_repaired'] = True
+                    repaired_count += 1
+                else:
+                    # Mark as unrepaired but keep the row
+                    df.loc[idx, 'date_repaired'] = False
+                    # Set to a sentinel date (far future) so it sorts last but is preserved
+                    df.loc[idx, 'trade_date'] = pd.Timestamp('2099-12-31')
             
-            # Try to preserve original Date column if trade_date failed
-            # This helps with debugging - we can see what the original date was
+            # Preserve original Date column for debugging
             if 'Date' in invalid_df.columns and 'original_date' not in df.columns:
                 df['original_date'] = df['Date']
             
-            df = df[valid_dates].copy()
+            # Log results
+            unrepaired_count = invalid_count - repaired_count
+            logger.warning(
+                f"Found {invalid_count} rows with invalid trade_date out of {len(df)} total rows ({invalid_percentage:.1f}%). "
+                f"Repaired {repaired_count}, {unrepaired_count} could not be repaired but were preserved."
+            )
+            
+            # Alert user if significant data loss would have occurred (>1% of data)
+            if invalid_percentage > 1.0:
+                logger.error(
+                    f"⚠️ CRITICAL: {invalid_percentage:.1f}% of data had invalid dates! "
+                    f"All rows have been preserved (repaired or marked). "
+                    f"Please investigate the source data quality."
+                )
+            
+            # All rows are now preserved (either repaired or marked with sentinel date)
         
         # Debug: Check for None values in sort columns before sorting
         sort_columns = ['trade_date', 'entry_time', 'Instrument', 'Stream']
@@ -402,6 +476,7 @@ class MasterMatrix:
                     df[col] = df[col].fillna('')
                     logger.debug(f"Filled None values in '{col}' with empty string for sorting")
         
+        # Sort with invalid dates (sentinel date 2099-12-31) at the end
         df = df.sort_values(
             by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
             ascending=[True, True, True, True],
@@ -452,6 +527,7 @@ class MasterMatrix:
                         prev_result = str(df.loc[prev_idx, 'Result']).upper().strip()
                         if prev_result == 'LOSS':
                             # Time changed from previous day after a loss - show on previous day (when change occurred)
+                            # Format: remove trailing whitespace for clean canonical data
                             df.loc[prev_idx, 'Time Change'] = f"{prev_time_normalized} -> {curr_time_normalized}"
                     
                     prev_idx = idx
@@ -509,6 +585,7 @@ class MasterMatrix:
         Returns:
             Tuple of (updated DataFrame, update_stats dict with counts of new trades per stream)
         """
+        # High-signal INFO logs only (update start)
         logger.info("=" * 80)
         logger.info("UPDATING MASTER MATRIX - Adding new dates only")
         logger.info("=" * 80)
@@ -586,16 +663,18 @@ class MasterMatrix:
             
             for file_path in parquet_files:
                 try:
-                    # Quick check: read Date column to check for new dates
+                    # Quick check: prefer trade_date (canonical), fallback to Date for backward compatibility
                     df_check = pd.read_parquet(file_path)
                     if df_check.empty:
                         continue
                     
-                    if 'Date' not in df_check.columns:
+                    # Prefer trade_date (canonical), fallback to Date
+                    date_col = 'trade_date' if 'trade_date' in df_check.columns else ('Date' if 'Date' in df_check.columns else None)
+                    if date_col is None:
                         continue
                     
-                    df_check['Date'] = pd.to_datetime(df_check['Date'])
-                    new_dates = df_check[df_check['Date'] > latest_existing_date]
+                    df_check[date_col] = pd.to_datetime(df_check[date_col])
+                    new_dates = df_check[df_check[date_col] > latest_existing_date]
                     
                     if not new_dates.empty:
                         has_new_data = True
@@ -629,6 +708,8 @@ class MasterMatrix:
         logger.info(f"Found {len(streams_to_update)} stream(s) with new data: {streams_to_update}")
         
         # Process each stream: load ALL historical data for sequencer accuracy, then filter to only new dates
+        # NOTE: This logic duplicates _load_all_streams_with_sequencer() (lines 163-205).
+        # Future refactoring should consolidate the load + sequencer logic to reduce duplication.
         all_new_trades = []
         for stream_id in streams_to_update:
             logger.info(f"Processing stream {stream_id}...")
@@ -670,19 +751,21 @@ class MasterMatrix:
             all_history_df = pd.concat(all_stream_data, ignore_index=True) if len(all_stream_data) > 1 else all_stream_data[0]
             
             # Apply sequencer logic to all historical data
-            # DIAGNOSTIC: Log function being called and module file path
-            logger.info("=" * 80)
-            logger.info("CALLING SEQUENCER (from update_master_matrix)")
-            logger.info(f"Function: sequencer_logic.apply_sequencer_logic")
-            logger.info(f"Module file: {sequencer_logic.__file__}")
-            logger.info("=" * 80)
+            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
+            logger.debug("=" * 80)
+            logger.debug("CALLING SEQUENCER (from update_master_matrix)")
+            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
+            logger.debug(f"Module file: {sequencer_logic.__file__}")
+            logger.debug("=" * 80)
             sequencer_result = sequencer_logic.apply_sequencer_logic(all_history_df, self.stream_filters, display_year=None)
             
             # Filter to only new dates (after latest_existing_date)
             latest_existing = latest_dates.get(stream_id)
             if latest_existing:
+                # trade_date is canonical; Date is fallback only
                 if 'trade_date' not in sequencer_result.columns:
                     if 'Date' in sequencer_result.columns:
+                        # Fallback: derive trade_date from Date (for backward compatibility)
                         sequencer_result['trade_date'] = pd.to_datetime(sequencer_result['Date'])
                     else:
                         logger.warning(f"Stream {stream_id}: No date column found in sequencer result")
@@ -716,7 +799,9 @@ class MasterMatrix:
         # Merge with existing data
         updated_df = pd.concat([existing_df, new_df], ignore_index=True)
         
-        # Sort by trade_date, entry_time, Instrument, Stream
+        # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
+        # Output from update_master_matrix() is fully sorted by: trade_date, entry_time, Instrument, Stream
+        # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
         if 'trade_date' in updated_df.columns:
             # Debug: Check for None values in sort columns before sorting
             sort_columns = ['trade_date', 'entry_time', 'Instrument', 'Stream']

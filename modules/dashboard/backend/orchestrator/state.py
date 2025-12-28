@@ -4,7 +4,7 @@ Pipeline State Management - FSM, PipelineState, RunContext
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 import asyncio
@@ -133,6 +133,9 @@ class RunContext:
     retry_count: int = 0
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Track stages executed for run history
+    stages_executed: List[str] = field(default_factory=list)
+    stages_failed: List[str] = field(default_factory=list)
     
     def __post_init__(self):
         if self.updated_at is None:
@@ -140,6 +143,10 @@ class RunContext:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""
+        # Extract health from metadata (derived, not persisted)
+        run_health = self.metadata.get("run_health")
+        run_health_reasons = self.metadata.get("run_health_reasons", [])
+        
         return {
             "run_id": self.run_id,
             "state": self.state.value,
@@ -149,6 +156,11 @@ class RunContext:
             "retry_count": self.retry_count,
             "error": self.error,
             "metadata": self.metadata,
+            "stages_executed": self.stages_executed,
+            "stages_failed": self.stages_failed,
+            # Health fields (derived, read-only)
+            "run_health": run_health,
+            "run_health_reasons": run_health_reasons,
         }
 
 
@@ -227,9 +239,32 @@ class PipelineStateManager:
         await loop.run_in_executor(self._executor, self._save_state)
     
     async def get_state(self) -> Optional[RunContext]:
-        """Get current run context"""
+        """
+        Get current run context.
+        
+        This is the single source of truth for state - used by both
+        polling endpoints and WebSocket state_change events.
+        
+        Returns:
+            Current RunContext or None if no active run
+        """
         async with self._lock:
             return self._current_context
+    
+    async def get_canonical_state_dict(self) -> Optional[Dict[str, Any]]:
+        """
+        Get current canonical state as dictionary.
+        
+        This is the single source of truth for state - used by both
+        polling endpoints and WebSocket state_change events.
+        
+        Returns:
+            Canonical state dictionary or None if no active run
+        """
+        async with self._lock:
+            if self._current_context is None:
+                return None
+            return self._current_context.to_dict()
     
     async def transition(
         self,
@@ -289,6 +324,9 @@ class PipelineStateManager:
             )
             
             if not skip_emission:
+                # Include complete canonical state in state_change event
+                # This ensures WebSocket and polling always agree on state
+                canonical_state_dict = self._current_context.to_dict()
                 await self.event_bus.publish({
                     "run_id": self._current_context.run_id,
                     "stage": "pipeline",
@@ -300,6 +338,8 @@ class PipelineStateManager:
                         "new_state": new_state.value,
                         "current_stage": stage.value if stage else None,
                         "error": error,
+                        # CRITICAL: Include complete canonical state for truthfulness
+                        "canonical_state": canonical_state_dict,
                     }
                 })
             

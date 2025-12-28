@@ -11,6 +11,7 @@ class ScheduleConfig(BaseModel):
 
 class PipelineStartRequest(BaseModel):
     manual: bool = True  # True for manual runs, False for scheduled runs
+    manual_override: bool = False  # True to override policy gate for manual runs (degraded/unstable health)
     wait_for_export: bool = False
     launch_ninjatrader: bool = False
 

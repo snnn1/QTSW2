@@ -7,7 +7,7 @@ import logging
 import uuid
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 
 from .config import OrchestratorConfig
@@ -17,6 +17,9 @@ from .locks import LockManager
 from .runner import PipelineRunner
 from .scheduler import Scheduler
 from .watchdog import Watchdog
+from .run_history import RunHistory, RunSummary, RunResult
+from .run_health import RunHealth, compute_run_health
+from .run_policy import can_run_pipeline
 
 
 class PipelineOrchestrator:
@@ -69,6 +72,13 @@ class PipelineOrchestrator:
             event_bus=self.event_bus,
             state_manager=self.state_manager,
             config=config,
+            logger=self.logger
+        )
+        
+        # Run history - persisted run summaries
+        runs_dir = config.event_logs_dir.parent / "runs"
+        self.run_history = RunHistory(
+            runs_dir=runs_dir,
             logger=self.logger
         )
         
@@ -404,19 +414,51 @@ class PipelineOrchestrator:
                 # Wait 1 hour before retrying on error
                 await asyncio.sleep(3600)
     
-    async def start_pipeline(self, manual: bool = False) -> RunContext:
+    async def start_pipeline(self, manual: bool = False, manual_override: bool = False) -> RunContext:
         """
         Start a new pipeline run.
         
         Args:
             manual: True if manually triggered, False if scheduled
+            manual_override: True if user explicitly overrides policy (manual runs only)
         
         Returns:
             RunContext for the new run
         
         Raises:
-            ValueError: If pipeline is already running
+            ValueError: If pipeline is already running or blocked by policy
         """
+        # POLICY GATE: Check if pipeline can run (before any locks or state changes)
+        auto_run = not manual
+        allowed, reason, health, health_reasons = can_run_pipeline(
+            run_history=self.run_history,
+            auto_run=auto_run,
+            manual_override=manual_override
+        )
+        
+        if not allowed:
+            # Emit run_blocked event
+            await self.event_bus.publish({
+                "run_id": "__system__",
+                "stage": "pipeline",
+                "event": "run_blocked",  # Will be published as pipeline/run_blocked
+                "timestamp": datetime.now().isoformat(),
+                "msg": f"Pipeline run blocked by policy: {reason}",
+                "data": {
+                    "run_health": health.value,
+                    "health_reasons": health_reasons,
+                    "auto_run": auto_run,
+                    "manual_override": manual_override,
+                    "block_reason": reason
+                }
+            })
+            
+            # Update state with health (even though run is blocked)
+            await self._update_state_health(health, health_reasons)
+            
+            # Return cleanly (no exceptions) - this is a policy decision, not an error
+            raise ValueError(f"Pipeline run blocked: {reason}")
+        
         # Check if already running
         status = await self.state_manager.get_state()
         if status and status.state not in {
@@ -427,12 +469,17 @@ class PipelineOrchestrator:
         }:
             raise ValueError(f"Pipeline already running: {status.state.value}")
         
-        # Acquire lock
-        run_id = str(uuid.uuid4())
-        if not await self.lock_manager.acquire(run_id):
-            raise ValueError("Failed to acquire lock (pipeline may already be running)")
+        # Update state with current health before starting
+        await self._update_state_health(health, health_reasons)
         
+        # Acquire lock with guaranteed release on any error
+        run_id = str(uuid.uuid4())
+        lock_acquired = False
         try:
+            if not await self.lock_manager.acquire(run_id):
+                raise ValueError("Failed to acquire lock (pipeline may already be running)")
+            lock_acquired = True
+            
             # Create run context
             run_ctx = await self.state_manager.create_run(
                 run_id=run_id,
@@ -479,12 +526,24 @@ class PipelineOrchestrator:
             return run_ctx
         
         except Exception as e:
-            # Release lock on error
-            await self.lock_manager.release(run_id)
+            # GUARANTEED LOCK RELEASE: Always release lock on error, even if release itself fails
+            if lock_acquired:
+                try:
+                    await self.lock_manager.release(run_id)
+                except Exception as release_error:
+                    self.logger.error(f"Failed to release lock after error: {release_error}", exc_info=True)
+                    # If release fails, try force clear as last resort
+                    try:
+                        await self.lock_manager.force_clear_all()
+                        self.logger.warning("Force cleared lock after release failure")
+                        # Note: Can't mark in metadata here - run context doesn't exist yet
+                        # This case is rare (lock acquisition failure), so we'll track it differently
+                    except Exception as force_error:
+                        self.logger.error(f"Failed to force clear lock: {force_error}", exc_info=True)
             raise
     
     async def _run_pipeline_background(self, run_ctx: RunContext):
-        """Run pipeline in background task"""
+        """Run pipeline in background task with guaranteed lock release"""
         manual = run_ctx.metadata.get("manual", True)
         success = False
         
@@ -514,8 +573,32 @@ class PipelineOrchestrator:
                 })
                 self.logger.info(f"[SUCCESS] Scheduler/{event_type} event published")
             
-            # Release lock
-            await self.lock_manager.release(run_ctx.run_id)
+            # GUARANTEED LOCK RELEASE: Always release lock, even if release itself fails
+            try:
+                await self.lock_manager.release(run_ctx.run_id)
+            except Exception as release_error:
+                self.logger.error(f"Failed to release lock for run {run_ctx.run_id[:8]}: {release_error}", exc_info=True)
+                # If release fails, try force clear as last resort
+                try:
+                    await self.lock_manager.force_clear_all()
+                    self.logger.warning(f"Force cleared lock after release failure for run {run_ctx.run_id[:8]}")
+                    # Mark force lock clear in metadata for health tracking
+                    run_ctx.metadata["force_lock_clear"] = True
+                except Exception as force_error:
+                    self.logger.error(f"Failed to force clear lock: {force_error}", exc_info=True)
+            
+            # Run-scoped teardown: Clean up events for this run from ring buffer
+            try:
+                self.event_bus.cleanup_run_events(run_ctx.run_id)
+            except Exception as cleanup_error:
+                self.logger.warning(f"Failed to cleanup run events: {cleanup_error}")
+            
+            # Persist run summary (first-class artifact)
+            await self._persist_run_summary(run_ctx, success)
+            
+            # Update health after run completion (health may have changed)
+            health, health_reasons = compute_run_health(self.run_history)
+            await self._update_state_health(health, health_reasons)
     
     async def stop_pipeline(self) -> RunContext:
         """
@@ -530,8 +613,30 @@ class PipelineOrchestrator:
         
         await self.state_manager.transition(PipelineRunState.STOPPED)
         
-        # Release lock
-        await self.lock_manager.release(status.run_id)
+        # GUARANTEED LOCK RELEASE: Always release lock, even if release itself fails
+        try:
+            await self.lock_manager.release(status.run_id)
+        except Exception as release_error:
+            self.logger.error(f"Failed to release lock for stopped run {status.run_id[:8]}: {release_error}", exc_info=True)
+            # If release fails, try force clear as last resort
+            try:
+                await self.lock_manager.force_clear_all()
+                self.logger.warning(f"Force cleared lock after release failure for stopped run {status.run_id[:8]}")
+            except Exception as force_error:
+                self.logger.error(f"Failed to force clear lock: {force_error}", exc_info=True)
+        
+        # Run-scoped teardown: Clean up events for this run from ring buffer
+        try:
+            self.event_bus.cleanup_run_events(status.run_id)
+        except Exception as cleanup_error:
+            self.logger.warning(f"Failed to cleanup run events: {cleanup_error}")
+        
+        # Persist run summary (first-class artifact)
+        await self._persist_run_summary(status, success=False, result=RunResult.STOPPED)
+        
+        # Update health after run completion (health may have changed)
+        health, health_reasons = compute_run_health(self.run_history)
+        await self._update_state_health(health, health_reasons)
         
         await self.event_bus.publish({
             "run_id": status.run_id,
@@ -551,6 +656,71 @@ class PipelineOrchestrator:
             Current RunContext or None if no active run
         """
         return await self.state_manager.get_state()
+    
+    async def _persist_run_summary(
+        self,
+        run_ctx: RunContext,
+        success: Optional[bool] = None,
+        result: Optional[RunResult] = None
+    ):
+        """
+        Persist run summary as first-class artifact.
+        
+        Args:
+            run_ctx: Run context
+            success: Whether run succeeded (if None, inferred from state)
+            result: Explicit result (if None, inferred from state)
+        """
+        try:
+            # Determine result from state if not provided
+            if result is None:
+                if run_ctx.state == PipelineRunState.SUCCESS:
+                    result = RunResult.SUCCESS
+                elif run_ctx.state == PipelineRunState.FAILED:
+                    result = RunResult.FAILED
+                elif run_ctx.state == PipelineRunState.STOPPED:
+                    result = RunResult.STOPPED
+                else:
+                    # Not completed yet, don't persist
+                    return
+            
+            # Create run summary
+            summary = RunSummary(
+                run_id=run_ctx.run_id,
+                started_at=run_ctx.started_at.isoformat() if run_ctx.started_at else datetime.now().isoformat(),
+                ended_at=run_ctx.updated_at.isoformat() if run_ctx.updated_at else datetime.now().isoformat(),
+                result=result.value,
+                failure_reason=run_ctx.error,
+                stages_executed=run_ctx.stages_executed.copy(),
+                stages_failed=run_ctx.stages_failed.copy(),
+                retry_count=run_ctx.retry_count,
+                metadata=run_ctx.metadata.copy()
+            )
+            
+            # Persist to JSONL
+            self.run_history.persist_run(summary)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to persist run summary {run_ctx.run_id[:8]}: {e}", exc_info=True)
+    
+    async def _update_state_health(self, health: RunHealth, health_reasons: List[str]):
+        """
+        Update state with current run health (derived, not persisted).
+        
+        Args:
+            health: Current RunHealth state
+            health_reasons: List of health determination reasons
+        """
+        try:
+            # Get current state
+            status = await self.state_manager.get_state()
+            if status:
+                # Update metadata with health (derived value)
+                status.metadata["run_health"] = health.value
+                status.metadata["run_health_reasons"] = health_reasons
+        except Exception as e:
+            # Non-critical - health is derived, not persisted
+            self.logger.debug(f"Failed to update state health: {e}")
     
     async def get_snapshot(self) -> Dict[str, Any]:
         """
@@ -604,11 +774,13 @@ class PipelineOrchestrator:
             metadata={"single_stage": stage.value}
         )
         
-        # Acquire lock
-        if not await self.lock_manager.acquire(run_id):
-            raise ValueError("Failed to acquire lock")
-        
+        # Acquire lock with guaranteed release
+        lock_acquired = False
         try:
+            if not await self.lock_manager.acquire(run_id):
+                raise ValueError("Failed to acquire lock")
+            lock_acquired = True
+            
             # Initialize services before running stage
             # This is required because _run_stage() accesses translator_service, analyzer_service, and merger_service
             self.runner._initialize_services(run_id)
@@ -635,5 +807,36 @@ class PipelineOrchestrator:
             return run_ctx
         
         finally:
-            await self.lock_manager.release(run_id)
+            # GUARANTEED LOCK RELEASE: Always release lock, even if release itself fails
+            if lock_acquired:
+                try:
+                    await self.lock_manager.release(run_id)
+                except Exception as release_error:
+                    self.logger.error(f"Failed to release lock for single stage run {run_id[:8]}: {release_error}", exc_info=True)
+                    # If release fails, try force clear as last resort
+                    try:
+                        await self.lock_manager.force_clear_all()
+                        self.logger.warning(f"Force cleared lock after release failure for single stage run {run_id[:8]}")
+                        # Mark force lock clear in metadata for health tracking
+                        status = await self.state_manager.get_state()
+                        if status and status.run_id == run_id:
+                            status.metadata["force_lock_clear"] = True
+                    except Exception as force_error:
+                        self.logger.error(f"Failed to force clear lock: {force_error}", exc_info=True)
+            
+            # Run-scoped teardown: Clean up events for this run from ring buffer
+            try:
+                self.event_bus.cleanup_run_events(run_id)
+            except Exception as cleanup_error:
+                self.logger.warning(f"Failed to cleanup run events: {cleanup_error}")
+            
+            # Persist run summary (first-class artifact)
+            status = await self.state_manager.get_state()
+            if status and status.run_id == run_id:
+                success = status.state == PipelineRunState.SUCCESS
+                await self._persist_run_summary(status, success=success)
+                
+                # Update health after run completion (health may have changed)
+                health, health_reasons = compute_run_health(self.run_history)
+                await self._update_state_health(health, health_reasons)
 

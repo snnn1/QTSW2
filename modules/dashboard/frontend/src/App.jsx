@@ -31,6 +31,7 @@ function App() {
     clearAlert,
     toggleScheduler,
     clearPipelineLock,
+    isStarting,
   } = usePipelineState()
 
   // Update Chicago time every second
@@ -122,6 +123,7 @@ function App() {
             chicagoTime={chicagoTime}
             scheduleInfo={scheduleInfo}
             isRunning={pipelineStatus.isRunning}
+            isStarting={isStarting}
             schedulerEnabled={schedulerEnabled}
             pipelineState={pipelineStatus.state}
             activeRunId={pipelineStatus.runId}

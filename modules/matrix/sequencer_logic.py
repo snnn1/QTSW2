@@ -366,6 +366,14 @@ def process_stream_daily(
         # Build trade_dict from selected trade
         if trade_row is not None:
             trade_dict = trade_row.to_dict()
+            # CRITICAL: Preserve original analyzer time before overwriting Time column
+            # This is needed for downstream filtering (exclude_times filter needs actual trade time)
+            original_time = trade_dict.get('Time', '')
+            if original_time:
+                trade_dict['actual_trade_time'] = str(original_time).strip()
+            else:
+                trade_dict['actual_trade_time'] = ''
+            
             # CRITICAL: Time column is sequencer's authority - overwrite analyzer's Time
             # This ensures Time always reflects sequencer's intended slot, not trade's original time
             trade_dict['Time'] = str(current_time).strip()
@@ -377,6 +385,7 @@ def process_stream_daily(
                 'Stream': stream_id,
                 'Date': date,
                 'Time': str(current_time).strip(),  # Still set Time to current_time (sequencer's intent)
+                'actual_trade_time': '',  # No actual trade, so no actual time
                 'Result': 'NoTrade',
                 'Session': current_session,
                 'RowSource': 'Sequencer',  # This row was created by sequencer (no analyzer data)
@@ -537,6 +546,18 @@ def apply_sequencer_logic(
                 date = row.get('Date', 'unknown')
                 invalid_times.append((idx, date, time_value))
         
+        # CRITICAL: Also check actual_trade_time to ensure excluded times don't appear
+        # This catches cases where Time was overwritten but actual_trade_time contains excluded time
+        excluded_times_in_output = []
+        if 'actual_trade_time' in stream_rows.columns:
+            for idx, row in stream_rows.iterrows():
+                actual_time = row.get('actual_trade_time', '')
+                if actual_time:
+                    actual_time_normalized = normalize_time(str(actual_time))
+                    if actual_time_normalized in filtered_times_set:
+                        date = row.get('Date', 'unknown')
+                        excluded_times_in_output.append((idx, date, actual_time_normalized))
+        
         if invalid_times:
             # Log all invalid times before raising error
             for idx, date, time_value in invalid_times:
@@ -544,10 +565,23 @@ def apply_sequencer_logic(
                     f"Stream {stream_id} {date}: CRITICAL INVARIANT VIOLATION - "
                     f"Time '{time_value}' is not selectable. Selectable: {selectable_times}, Filtered: {sorted(filtered_times)}"
                 )
-                raise AssertionError(
+            raise AssertionError(
                 f"Stream {stream_id}: Found {len(invalid_times)} trades with non-selectable times. "
-                    f"Selectable times: {selectable_times}, Filtered times: {sorted(filtered_times)}"
+                f"Selectable times: {selectable_times}, Filtered times: {sorted(filtered_times)}"
+            )
+        
+        if excluded_times_in_output:
+            # Log excluded times that appear in output (should be filtered by filter_engine)
+            for idx, date, actual_time in excluded_times_in_output:
+                logger.error(
+                    f"Stream {stream_id} {date}: CRITICAL - Excluded time '{actual_time}' appears in output! "
+                    f"This should have been filtered by filter_engine. Filtered times: {sorted(filtered_times)}"
                 )
+            # Don't raise error here - filter_engine should handle this, but log it as a warning
+            logger.warning(
+                f"Stream {stream_id}: Found {len(excluded_times_in_output)} trades with excluded times in output. "
+                f"These should be marked as final_allowed=False by filter_engine."
+            )
     
     # NOTE: SL column not added here - that's a downstream concern (schema_normalizer or filter_engine)
     # Sequencer only outputs raw data with rolling columns and RowSource
