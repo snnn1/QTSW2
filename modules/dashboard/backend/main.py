@@ -54,6 +54,26 @@ PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+# region agent log
+import json as _agent_json
+_AGENT_LOG_PATH = (QTSW2_ROOT / ".cursor" / "debug.log")
+def _agent_log(hypothesisId: str, location: str, message: str, data: Dict):
+    try:
+        _AGENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_AGENT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(_agent_json.dumps({
+                "sessionId": "debug-session",
+                "runId": "pre-fix",
+                "hypothesisId": hypothesisId,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# endregion
+
 # Streamlit app scripts
 TRANSLATOR_APP = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
 ANALYZER_APP = QTSW2_ROOT / "scripts" / "breakout_analyzer" / "analyzer_app" / "app.py"
@@ -71,6 +91,17 @@ SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "configs" / "schedule.json"
 
 # Global orchestrator instance
 orchestrator_instance = None
+
+# File counts cache (for fast response times)
+_file_counts_cache = {
+    "raw_files": 0,
+    "translated_files": 0,
+    "analyzed_files": 0,
+    "computed_at": None,
+    "last_duration_ms": 0,
+    "refresh_task": None,
+}
+_file_counts_cache_ttl_seconds = 30  # Refresh cache if older than 30 seconds
 
 
 @asynccontextmanager
@@ -115,6 +146,19 @@ async def lifespan(app: FastAPI):
         logger.info("Pipeline Orchestrator started successfully")
         print("   [OK] Orchestrator started successfully!")
         print("=" * 60 + "\n")
+
+        # Warm snapshot cache in background so WebSocket snapshots are instant
+        try:
+            orchestrator_instance.event_bus.start_snapshot_warmer(
+                hours=4.0,
+                max_events=100,
+                exclude_verbose=True,
+                ttl_seconds=15,
+                interval_seconds=15,
+            )
+            logger.info("Snapshot cache warmer started (4h window, 100 events, 15s interval)")
+        except Exception as warm_err:
+            logger.warning(f"Failed to start snapshot cache warmer: {warm_err}")
     except Exception as e:
         import traceback
         error_msg = f"Failed to start orchestrator: {e}\nFull traceback:\n{traceback.format_exc()}"
@@ -142,6 +186,9 @@ async def lifespan(app: FastAPI):
             f.flush()
     except:
         pass
+    
+    # Initialize file counts cache on startup (non-blocking background task)
+    asyncio.create_task(_refresh_file_counts_cache())
     
     yield  # Application runs here
     
@@ -520,38 +567,110 @@ async def run_data_merger():
 # File Count Endpoints
 # ============================================================
 
-@app.get("/api/metrics/files")
-async def get_file_counts():
-    """Get file counts from data directories."""
+async def _refresh_file_counts_cache():
+    """Background task to refresh file counts cache."""
+    global _file_counts_cache
+    
+    t0 = time.perf_counter()
+    
     # These paths should match your actual data directories
     data_raw = QTSW2_ROOT / "data" / "raw"  # Raw CSV files from DataExporter
     data_translated = QTSW2_ROOT / "data" / "translated"  # Translated Parquet files (translator output)
     analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
-    sequencer_runs = QTSW2_ROOT / "data" / "sequencer_runs"  # Sequencer output folder
     
-    # Count raw CSV files (exclude subdirectories like logs folder)
-    raw_count = 0
-    if data_raw.exists():
-        raw_files = list(data_raw.glob("*.csv"))
-        raw_count = len([f for f in raw_files if f.parent == data_raw])
+    # OPTIMIZED: Count files using streaming counter (no list materialization)
+    # This prevents blocking the event loop and uses less memory
+    async def count_files_streaming(pattern: str, directory: Path, exclude_logs: bool = True) -> int:
+        """Count files matching pattern using streaming (no list materialization)."""
+        if not directory.exists():
+            return 0
+        
+        loop = asyncio.get_event_loop()
+        def scan_files():
+            count = 0
+            for file_path in directory.rglob(pattern):
+                if exclude_logs and "logs" in str(file_path):
+                    continue
+                count += 1
+            return count
+        return await loop.run_in_executor(None, scan_files)
     
-    # Count translated files (translator output - recursive search for subdirectories)
-    translated_count = 0
-    if data_translated.exists():
-        translated_files = list(data_translated.rglob("*.parquet"))
-        translated_count = len(translated_files)
+    # Count all file types in parallel
+    raw_count, translated_count, analyzed_count = await asyncio.gather(
+        count_files_streaming("*.csv", data_raw, exclude_logs=True),
+        count_files_streaming("*.parquet", data_translated, exclude_logs=False),
+        count_files_streaming("*.parquet", QTSW2_ROOT / "data" / "analyzed", exclude_logs=True)
+    )
     
-    # Count analyzed files (monthly consolidated files in instrument/year folders)
-    analyzed_count = 0
-    if analyzer_runs.exists():
-        # Count monthly parquet files in instrument/year subfolders
-        analyzed_files = list(analyzer_runs.rglob("*.parquet"))
-        analyzed_count = len(analyzed_files)
+    duration_ms = int((time.perf_counter() - t0) * 1000)
     
-    return {
+    # Update cache
+    _file_counts_cache.update({
         "raw_files": raw_count,
         "translated_files": translated_count,
-        "analyzed_files": analyzed_count
+        "analyzed_files": analyzed_count,
+        "computed_at": datetime.now(),
+        "last_duration_ms": duration_ms,
+    })
+    
+    # Log completion
+    try:
+        _log_path = QTSW2_ROOT / ".cursor" / "debug.log"
+        _log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "debug-session",
+                "runId": "load-audit-1",
+                "hypothesisId": "LOAD1",
+                "location": "modules/dashboard/backend/main.py:_refresh_file_counts_cache",
+                "message": "metrics/files cache refreshed",
+                "data": {
+                    "duration_ms": duration_ms,
+                    "raw_files": raw_count,
+                    "translated_files": translated_count,
+                    "analyzed_files": analyzed_count,
+                },
+                "timestamp": int(time.time() * 1000),
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+@app.get("/api/metrics/files")
+async def get_file_counts():
+    """Get file counts from data directories (cached for fast response)."""
+    global _file_counts_cache
+    
+    # ALWAYS return immediately - even if cache is empty (return zeros, refresh in background)
+    # This ensures instant response on first request
+    
+    # Trigger background refresh if cache is stale or doesn't exist
+    cache_age = None
+    if _file_counts_cache["computed_at"]:
+        cache_age = (datetime.now() - _file_counts_cache["computed_at"]).total_seconds()
+    
+    should_refresh = (
+        _file_counts_cache["computed_at"] is None or
+        cache_age is None or
+        cache_age > _file_counts_cache_ttl_seconds
+    )
+    
+    if should_refresh and _file_counts_cache["refresh_task"] is None:
+        # Start background refresh task (don't await - return cached immediately)
+        _file_counts_cache["refresh_task"] = asyncio.create_task(_refresh_file_counts_cache())
+        
+        # Clear refresh task reference when done
+        def clear_task(task):
+            if _file_counts_cache["refresh_task"] == task:
+                _file_counts_cache["refresh_task"] = None
+        
+        _file_counts_cache["refresh_task"].add_done_callback(clear_task)
+    
+    # Return cached values immediately (even if zeros - cache will update in background)
+    return {
+        "raw_files": _file_counts_cache["raw_files"],
+        "translated_files": _file_counts_cache["translated_files"],
+        "analyzed_files": _file_counts_cache["analyzed_files"]
     }
 
 

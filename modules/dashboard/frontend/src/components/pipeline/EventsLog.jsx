@@ -31,25 +31,34 @@ export function EventsLog({ eventsFormatted }) {
     return () => container.removeEventListener('scroll', handleScroll)
   }, [])
 
-  // Auto-scroll only if user is at bottom and new events arrived
+  // Auto-scroll to bottom during snapshot loading, otherwise only if user is at bottom
   useEffect(() => {
     const container = scrollContainerRef.current
     if (!container) return
 
     const hasNewEvents = eventsFormatted.length > prevEventsLengthRef.current
+    const prevLength = prevEventsLengthRef.current
+    const newLength = eventsFormatted.length
+    
+    // Detect if this is snapshot loading (large increase in events)
+    const isSnapshotLoad = newLength > prevLength + 5
+    
+    // Update prev length
     prevEventsLengthRef.current = eventsFormatted.length
-
-    // Only auto-scroll if:
-    // 1. User is at bottom (or was at bottom before)
-    // 2. New events arrived
-    if (shouldAutoScrollRef.current && hasNewEvents) {
-      // Small delay to ensure DOM is updated
-      setTimeout(() => {
-        if (container && shouldAutoScrollRef.current) {
-          container.scrollTop = container.scrollHeight
-        }
-      }, 0)
-    }
+    
+    // After DOM updates, handle scroll
+    setTimeout(() => {
+      if (!container) return
+      
+      if (isSnapshotLoad) {
+        // During snapshot loading - always stay at bottom
+        container.scrollTop = container.scrollHeight
+      } else if (shouldAutoScrollRef.current && hasNewEvents) {
+        // Normal updates - only auto-scroll if user was at bottom
+        container.scrollTop = container.scrollHeight
+      }
+      // Otherwise, don't change scroll position (user scrolled up, preserve their position)
+    }, 0)
   }, [eventsFormatted])
 
   // Filter events for cleaner display using utility function

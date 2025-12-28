@@ -37,9 +37,9 @@ test_logger.setLevel(logging.WARNING)  # Only warnings and errors
 qtsw2_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(qtsw2_root))
 
-from modules.dashboard.backend.orchestrator.events import EventBus
-from modules.dashboard.backend.orchestrator.locks import LockManager
-from modules.dashboard.backend.orchestrator.state import PipelineStateManager, PipelineRunState
+from modules.orchestrator.events import EventBus
+from modules.orchestrator.locks import LockManager
+from modules.orchestrator.state import PipelineStateManager, PipelineRunState
 
 
 class TestIdleSoak:

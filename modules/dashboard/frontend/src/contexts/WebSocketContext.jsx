@@ -56,6 +56,11 @@ export function WebSocketProvider({ children }) {
 
   // Handle incoming events
   const handleEvent = useCallback((event) => {
+    // Log snapshot-related messages for debugging
+    if (event.type === 'snapshot_chunk' || event.type === 'snapshot_done' || event.type === 'snapshot') {
+      console.log('[Events] Snapshot message received:', event.type, event.chunk_index !== undefined ? `chunk ${event.chunk_index}/${event.total_chunks}` : '', event.events ? `${event.events.length} events` : '')
+    }
+    
     // Phase-1 always-on: Simple event handling - show all events, no complex filtering
     // Reduced logging for performance - only log important events
     if (!event.event || event.event === 'state_change' || event.event === 'error') {
@@ -68,34 +73,90 @@ export function WebSocketProvider({ children }) {
       formattedTimestamp: event.timestamp ? formatEventTimestamp(event.timestamp) : ''
     }
 
-    // Handle snapshot events (replace existing events)
-    if (event.type === 'snapshot' && Array.isArray(event.events)) {
-      seenEventsRef.current.clear()  // Clear seen events on snapshot
-      const formattedSnapshot = event.events.map(e => {
-        const key = `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
-        seenEventsRef.current.add(key)
-        return {
-          ...e,
-          formattedTimestamp: e.timestamp ? formatEventTimestamp(e.timestamp) : ''
-        }
-      })
-      // Sort by timestamp (only once for snapshot)
-      formattedSnapshot.sort((a, b) => {
-        const tsA = a.timestamp ? new Date(a.timestamp).getTime() : 0
-        const tsB = b.timestamp ? new Date(b.timestamp).getTime() : 0
-        return tsA - tsB
-      })
-      // Limit snapshot to last 1000 events
-      const limitedSnapshot = formattedSnapshot.slice(-1000)
-      // Keep only keys for limited events
-      const limitedKeys = new Set(limitedSnapshot.map(e => `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`))
-      seenEventsRef.current.clear()
-      limitedKeys.forEach(k => seenEventsRef.current.add(k))
-      setEvents(limitedSnapshot)
-      console.log(`[Events] Snapshot loaded: ${limitedSnapshot.length} events (from ${formattedSnapshot.length} total)`)
+    // Handle streaming snapshot chunks (append without replacing to avoid scroll jump)
+    if ((event.type === 'snapshot' || event.type === 'snapshot_chunk') && Array.isArray(event.events)) {
+      console.log(`[Events] Received snapshot chunk: ${event.events.length} events (chunk ${event.chunk_index || 0}/${event.total_chunks || 1})`)
       
-      // Notify subscribers of snapshot
-      notifySubscribers({ type: 'snapshot', events: limitedSnapshot })
+      const formattedChunk = event.events.map(e => ({
+        ...e,
+        formattedTimestamp: e.timestamp ? formatEventTimestamp(e.timestamp) : ''
+      }))
+      
+      setEvents(prev => {
+        let updated = [...prev]
+        
+        for (const e of formattedChunk) {
+          const key = `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
+          if (seenEventsRef.current.has(key)) {
+            continue
+          }
+          seenEventsRef.current.add(key)
+          
+          // Insert in sorted order (timestamps ascending)
+          const eventTime = e.timestamp ? new Date(e.timestamp).getTime() : 0
+          let left = 0
+          let right = updated.length
+          while (left < right) {
+            const mid = Math.floor((left + right) / 2)
+            const midTime = updated[mid].timestamp ? new Date(updated[mid].timestamp).getTime() : 0
+            if (midTime < eventTime) {
+              left = mid + 1
+            } else {
+              right = mid
+            }
+          }
+          updated.splice(left, 0, e)
+        }
+        
+        // Limit to last 100 events
+        if (updated.length > 100) {
+          const removed = updated.slice(0, updated.length - 100)
+          removed.forEach(rem => {
+            const remKey = `${rem.timestamp || 'null'}|${rem.stage || 'null'}|${rem.event || 'null'}|${rem.run_id || 'null'}`
+            seenEventsRef.current.delete(remKey)
+          })
+          updated = updated.slice(-100)
+        }
+        
+        return updated
+      })
+      
+      // Notify subscribers of snapshot chunk
+      notifySubscribers({ type: 'snapshot_chunk', events: formattedChunk })
+      
+      // Extract run_id/state from the newest chunk for status inference
+      // (lightweight, does not alter scroll)
+      const recent = [...formattedChunk].reverse()
+      let latestRunId = null
+      let latestState = null
+      for (const e of recent) {
+        if (!latestRunId && e.run_id) latestRunId = e.run_id
+        if (e.event === 'state_change' && e.data) {
+          if (e.data.canonical_state) {
+            latestState = e.data.canonical_state.state || e.data.canonical_state.canonical_state
+            if (e.data.canonical_state.run_id) {
+              latestRunId = e.data.canonical_state.run_id
+            }
+          } else if (e.data.new_state) {
+            latestState = e.data.new_state
+          }
+        }
+        if (latestRunId && latestState) break
+      }
+      if (latestRunId) {
+        notifySubscribers({
+          type: 'snapshot_chunk_status',
+          run_id: latestRunId,
+          state: latestState || 'idle',
+        })
+      }
+      return
+    }
+    
+    // Handle snapshot completion marker
+    if (event.type === 'snapshot_done') {
+      console.log(`[Events] Snapshot complete: ${event.total_events} total events in ${event.total_chunks} chunks`)
+      notifySubscribers({ type: 'snapshot_done', total_events: event.total_events, total_chunks: event.total_chunks })
       return
     }
 
@@ -127,15 +188,15 @@ export function WebSocketProvider({ children }) {
 
       updated.splice(left, 0, formattedEvent)
 
-      // Limit to last 1000 events to prevent memory issues
-      if (updated.length > 1000) {
+      // Limit to last 100 events to prevent memory issues
+      if (updated.length > 100) {
         // Remove oldest event keys from seenEvents
-        const removed = updated.slice(0, updated.length - 1000)
+        const removed = updated.slice(0, updated.length - 100)
         removed.forEach(e => {
           const key = `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
           seenEventsRef.current.delete(key)
         })
-        return updated.slice(-1000)
+        return updated.slice(-100)
       }
 
       return updated
@@ -158,10 +219,13 @@ export function WebSocketProvider({ children }) {
       return
     }
 
-    // Build WebSocket URL - always connect to all events (null runId)
+    // Build WebSocket URL - connect directly to backend (port 8001) instead of relying on Vite proxy
+    // This fixes connection failures when proxy is unstable
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const host = window.location.host
-    const wsUrl = `${protocol}//${host}/ws/events`
+    // Use direct backend URL in development, fallback to proxy in production
+    const isDev = window.location.hostname === 'localhost' && window.location.port === '5173'
+    const backendHost = isDev ? 'localhost:8001' : window.location.host
+    const wsUrl = `${protocol}//${backendHost}/ws/events`
 
     console.log(`[WS] Connecting to ${wsUrl}`)
 
@@ -177,6 +241,10 @@ export function WebSocketProvider({ children }) {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
+          // Log all incoming messages for debugging (can be removed later)
+          if (data.type === 'snapshot_chunk' || data.type === 'snapshot_done') {
+            console.log('[WS] Raw snapshot message:', data.type, data.chunk_index !== undefined ? `chunk ${data.chunk_index}/${data.total_chunks}` : '', data.events ? `${data.events.length} events` : '')
+          }
           handleEvent(data)
         } catch (error) {
           console.error('[WS] Failed to parse message:', error, event.data)

@@ -5,9 +5,11 @@ Event Bus - Centralized event publishing and subscription
 import asyncio
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import deque
 
 
@@ -107,6 +109,16 @@ class EventBus:
         # Archive directory for rotated files
         self.archive_dir = self.event_logs_dir / "archive"
         self.archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # Snapshot cache for past events (for WebSocket snapshot)
+        self._snapshot_cache = {
+            "data": [],
+            "computed_at": 0.0,
+            "duration_ms": 0,
+        }
+        self._snapshot_cache_ttl_seconds = 15  # refresh cache if older than 15s
+        self._snapshot_cache_lock = threading.Lock()
+        self._snapshot_warmer_running = False
     
     async def publish(self, event: Dict):
         """
@@ -364,11 +376,34 @@ class EventBus:
         
         Args:
             limit: Maximum number of events to return
-        
+            
         Returns:
             List of recent events (most recent first)
         """
         return list(self._recent_events)[-limit:]
+    
+    def cleanup_run_events(self, run_id: str):
+        """
+        Run-scoped teardown: Remove events for a completed run from ring buffer.
+        
+        This prevents memory accumulation across multiple runs.
+        Called when a run completes (success/failed/stopped).
+        
+        Args:
+            run_id: Run ID to clean up
+        """
+        # Remove events for this run from ring buffer
+        events_to_keep = [
+            event for event in self._recent_events
+            if event.get("run_id") != run_id
+        ]
+        
+        # Replace ring buffer contents
+        self._recent_events.clear()
+        for event in events_to_keep:
+            self._recent_events.append(event)
+        
+        self.logger.debug(f"[EventBus] Cleaned up events for run {run_id[:8]}. Ring buffer size: {len(self._recent_events)}")
     
     def get_events_for_run(self, run_id: str, limit: int = 1000) -> List[Dict]:
         """
@@ -451,10 +486,19 @@ class EventBus:
                     continue
                 
                 # Read file line by line (handles large files efficiently)
+                # Read ALL events from each file - don't stop early based on old events
+                # because files may contain events from multiple runs spanning days/weeks
                 with open(jsonl_file, "r", encoding="utf-8") as f:
                     for line_num, line in enumerate(f, start=1):
                         if not line.strip():
                             continue
+                        
+                        # Early exit if we've collected enough events
+                        if len(all_events) >= max_events:
+                            self.logger.debug(
+                                f"Event snapshot reached limit ({max_events} events) - stopping file scan"
+                            )
+                            break
                         
                         try:
                             event = json.loads(line)
@@ -484,19 +528,18 @@ class EventBus:
                                     # Assume UTC if no timezone
                                     event_time = event_time.replace(tzinfo=timezone.utc)
                                 
-                                # Filter by time window
+                                # Filter by time window - only include events within the window
                                 if event_time >= cutoff_time:
                                     all_events.append(event)
                                     
-                                    # Safety limit check
+                                    # Early exit when we have enough events (faster loading)
                                     if len(all_events) >= max_events:
-                                        self.logger.warning(
-                                            f"Event snapshot hit safety limit ({max_events} events). "
-                                            f"Consider reducing time window or increasing limit."
+                                        self.logger.debug(
+                                            f"Event snapshot reached limit ({max_events} events) - stopping file scan"
                                         )
-                                        # Sort and return early if limit reached
+                                        # Sort and return immediately (most recent events)
                                         all_events.sort(key=lambda e: e.get("timestamp", ""))
-                                        return all_events
+                                        return all_events[-max_events:]
                                         
                             except (ValueError, AttributeError) as e:
                                 # Skip events with unparseable timestamps
@@ -523,5 +566,148 @@ class EventBus:
         # Sort events chronologically (oldest first)
         all_events.sort(key=lambda e: e.get("timestamp", ""))
         
-        self.logger.info(f"Loaded {len(all_events)} events from last {hours} hours")
+        # Log summary with time range info
+        if all_events:
+            oldest_time = all_events[0].get("timestamp", "unknown")
+            newest_time = all_events[-1].get("timestamp", "unknown")
+            self.logger.info(
+                f"Loaded {len(all_events)} events from last {hours} hours "
+                f"(oldest: {oldest_time}, newest: {newest_time}, cutoff: {cutoff_time.isoformat()})"
+            )
+        else:
+            self.logger.info(f"Loaded 0 events from last {hours} hours (cutoff: {cutoff_time.isoformat()})")
+        
         return all_events
+
+    # ------------------------------------------------------------------
+    # Snapshot cache (past events) for fast WebSocket snapshots
+    # ------------------------------------------------------------------
+    def _is_snapshot_fresh(self, ttl_seconds: Optional[int]) -> bool:
+        ttl = ttl_seconds or self._snapshot_cache_ttl_seconds
+        cached_at = self._snapshot_cache.get("computed_at") or 0
+        return (time.time() - cached_at) < ttl
+
+    def _refresh_snapshot_cache(
+        self,
+        hours: float = 1.0,
+        max_events: int = 200,
+        exclude_verbose: bool = True,
+        ttl_seconds: Optional[int] = None,
+    ) -> List[Dict]:
+        ttl = ttl_seconds or self._snapshot_cache_ttl_seconds
+        with self._snapshot_cache_lock:
+            if self._is_snapshot_fresh(ttl):
+                return self._snapshot_cache["data"]
+
+            start = time.perf_counter()
+            data = self.load_jsonl_events_since(
+                hours=int(hours),
+                max_events=max_events,
+                exclude_verbose=exclude_verbose,
+            )
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            self._snapshot_cache.update(
+                data=data,
+                computed_at=time.time(),
+                duration_ms=duration_ms,
+            )
+            self.logger.info(
+                f"[SnapshotCache] Refreshed snapshot ({len(data)} events, "
+                f"{duration_ms} ms, window={hours}h, limit={max_events})"
+            )
+            return data
+
+    def _refresh_snapshot_cache_async(
+        self,
+        hours: float = 1.0,
+        max_events: int = 500,
+        exclude_verbose: bool = True,
+        ttl_seconds: Optional[int] = None,
+    ) -> None:
+        """
+        Kick off a background thread to refresh the snapshot cache.
+        Non-blocking for callers that already returned stale data.
+        """
+        thread = threading.Thread(
+            target=self._refresh_snapshot_cache,
+            args=(hours, max_events, exclude_verbose, ttl_seconds),
+            daemon=True,
+        )
+        thread.start()
+
+    def get_snapshot_cached(
+        self,
+        hours: float = 1.0,
+        max_events: int = 500,
+        exclude_verbose: bool = True,
+        ttl_seconds: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        Return cached snapshot if fresh.
+        If stale but present, return stale immediately and refresh in background.
+        If missing, refresh synchronously.
+        Intended to be called from a background thread (e.g., asyncio.to_thread)
+        or from a non-blocking context (WebSocket snapshot).
+        """
+        cache = self._snapshot_cache
+        ttl = ttl_seconds or self._snapshot_cache_ttl_seconds
+
+        # Ensure warmer is running (best-effort)
+        if not self._snapshot_warmer_running:
+            try:
+                self.start_snapshot_warmer(
+                    hours=hours,
+                    max_events=max_events,
+                    exclude_verbose=exclude_verbose,
+                    ttl_seconds=ttl_seconds,
+                    interval_seconds=15,
+                )
+            except Exception:
+                pass
+
+        # Fresh cache
+        if self._is_snapshot_fresh(ttl):
+            return cache["data"]
+
+        # Stale but available -> return immediately and refresh in background
+        if cache["data"]:
+            self.logger.debug("[SnapshotCache] Returning stale snapshot and refreshing in background")
+            self._refresh_snapshot_cache_async(hours, max_events, exclude_verbose, ttl)
+            return cache["data"]
+
+        # No cache -> refresh synchronously
+        return self._refresh_snapshot_cache(hours, max_events, exclude_verbose, ttl)
+
+    # ------------------------------------------------------------------
+    # Background snapshot warmer
+    # ------------------------------------------------------------------
+    def start_snapshot_warmer(
+        self,
+        hours: float = 1.0,
+        max_events: int = 200,
+        exclude_verbose: bool = True,
+        ttl_seconds: Optional[int] = None,
+        interval_seconds: int = 15,
+    ):
+        """
+        Start a background thread that refreshes the snapshot cache periodically.
+        """
+        if getattr(self, "_snapshot_warmer_running", False):
+            return
+
+        self._snapshot_warmer_running = True
+
+        def _loop():
+            while self._snapshot_warmer_running:
+                try:
+                    self._refresh_snapshot_cache(hours, max_events, exclude_verbose, ttl_seconds)
+                except Exception as e:
+                    self.logger.warning(f"[SnapshotCache] Warmer error: {e}")
+                finally:
+                    time.sleep(interval_seconds)
+
+        thread = threading.Thread(target=_loop, daemon=True)
+        thread.start()
+
+    def stop_snapshot_warmer(self):
+        self._snapshot_warmer_running = False
