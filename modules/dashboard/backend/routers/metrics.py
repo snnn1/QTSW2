@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 
 
-@router.get("/files")
+@router.get("/list-files")
 async def get_metrics_files() -> Dict:
-    """Get list of available metrics files"""
+    """Get list of available metrics files (renamed from /files to avoid conflict with file counts endpoint)"""
     # Use DEBUG level to reduce log noise (polling endpoint)
     logger.debug("Metrics files requested")
     try:

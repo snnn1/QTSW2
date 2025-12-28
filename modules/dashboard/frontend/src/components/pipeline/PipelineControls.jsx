@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { TimeDisplay } from '../ui/TimeDisplay'
 import { NextRunInfo } from './NextRunInfo'
 
@@ -25,6 +26,16 @@ export function PipelineControls({
   
   // Reset button: enabled if running or in non-idle state
   const canReset = isRunning || (pipelineState && pipelineState !== 'idle')
+  
+  // #region agent log BTN5
+  const _prevCanStartRef = useRef(canStart);
+  useEffect(() => {
+    if (_prevCanStartRef.current !== canStart) {
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/components/pipeline/PipelineControls.jsx',message:'canStart changed',data:{prev:_prevCanStartRef.current,new:canStart,isRunning,isStarting,pipelineState},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN5'})}).catch(()=>{});
+      _prevCanStartRef.current = canStart;
+    }
+  }, [canStart, isRunning, isStarting, pipelineState]);
+  // #endregion
   
   // Debug logging
   if (typeof window !== 'undefined' && window.location.search.includes('debug')) {

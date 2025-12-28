@@ -40,17 +40,19 @@ async function safeJson(response) {
 ------------------------------------------------------- */
 export async function getFileCounts() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, 5000)
+    // Short timeout - cache should make this instant
+    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, 2000)
     if (!res.ok) throw new Error(res.status)
     const data = await safeJson(res)
 
     return {
       raw_files: Number(data?.raw_files) || 0,
-      processed_files: Number(data?.processed_files) || 0,
+      processed_files: Number(data?.translated_files) || 0, // Backend returns translated_files, map to processed_files for UI
       analyzed_files: Number(data?.analyzed_files) || 0,
     }
-  } catch {
-    return { raw_files: 0, processed_files: 0, analyzed_files: 0 }
+  } catch (error) {
+    // Don't return zeros on timeout - throw so caller can keep last-known-good values
+    throw error
   }
 }
 
@@ -59,7 +61,8 @@ export async function getFileCounts() {
 ------------------------------------------------------- */
 export async function getNextScheduledRun() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/schedule/next`, {}, 5000)
+    // Short timeout for fast failure
+    const res = await fetchWithTimeout(`${API_BASE}/schedule/next`, {}, 2000)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -85,7 +88,8 @@ export async function getPipelineSnapshot() {
 ------------------------------------------------------- */
 export async function getPipelineStatus() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/pipeline/status`, {}, 5000)
+    // Short timeout for fast failure
+    const res = await fetchWithTimeout(`${API_BASE}/pipeline/status`, {}, 2000)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -148,7 +152,8 @@ export async function startStage(stageName) {
 ------------------------------------------------------- */
 export async function getSchedulerStatus() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/scheduler/status`, {}, 5000)
+    // Short timeout for fast failure
+    const res = await fetchWithTimeout(`${API_BASE}/scheduler/status`, {}, 2000)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -211,6 +216,8 @@ export function usePipelineState() {
   })
   const [isStarting, setIsStarting] = useState(false)
   const [activeRunId, setActiveRunId] = useState(null)
+  // Track recently started runs to prevent premature state reset
+  const recentlyStartedRunIdRef = useRef(null)
   
   // Other state
   const [stageInfo, setStageInfo] = useState({})
@@ -221,7 +228,12 @@ export function usePipelineState() {
     label: '-',
     percent: 0,
   })
-  const [metrics, setMetrics] = useState({ rowsPerMin: 0 })
+  const [metrics, setMetrics] = useState({ 
+    rowsPerMin: 0,
+    raw_files: 0,
+    processed_files: 0,
+    analyzed_files: 0
+  })
   const [scheduleInfo, setScheduleInfo] = useState(null)
   const [eventsFormatted, setEventsFormatted] = useState([])
   const [mergerInfo, setMergerInfo] = useState({})
@@ -231,84 +243,152 @@ export function usePipelineState() {
   // Refs for polling
   const pollingIntervalRef = useRef(null)
   const statusPollingRef = useRef(null)
+  const metricsRef = useRef(metrics)  // Keep ref to current metrics for callback
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    metricsRef.current = metrics
+  }, [metrics])
 
   // Update pipeline status from backend response
   // Phase-1: Only update state when backend explicitly provides valid data
   // Never reset state on polling failure - keep last known state
-  const updatePipelineStatus = useCallback((statusData) => {
+  const updatePipelineStatus = useCallback((statusData, source = 'unknown') => {
+    // #region agent log BTN1
+    const _logData = { source, statusData: statusData ? { state: statusData.state, run_id: statusData.run_id || statusData.runId } : null };
+    // #endregion
+    
     // Phase-1 rule: If status fails → do nothing, keep last known state
     // Only change state when backend explicitly tells you to
     if (!statusData || statusData.state === 'unavailable') {
       // Don't reset state - just log and return
       console.warn('[Status] Status unavailable or missing, keeping last known state')
+      // #region agent log BTN1
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:'status unavailable - keeping state',data:_logData,timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
+      // #endregion
       return
     }
 
     // Phase-1 always-on: Simple state mapping - canonical states only: idle, running, stopped, error
     const state = String(statusData.state || 'idle').toLowerCase()
-    const isRunning = state === 'running'  // Only "running" state means pipeline is running
+    
+    // Check internal state to detect success/completion
+    const internalState = statusData._internal_state || statusData.internal_state || null
+    const isSuccess = internalState === 'success'
+    
+    // If backend reports success, pipeline is definitely done - make button clickable
+    const isRunning = isSuccess ? false : (state === 'running')  // Only "running" state means pipeline is running
     
     const runId = statusData.run_id || statusData.runId || null
     
-    // Guard: Don't overwrite "running" state with "idle" if we have an active run_id
-    // This prevents immediate polling from resetting the state right after start
     setPipelineStatus(prev => {
-      // If we're currently running and backend says idle, but we have a run_id, keep running
-      // This handles the race condition where polling happens before backend updates
-      if (prev.isRunning && state === 'idle' && (runId || prev.runId)) {
-        console.log('[Status] Keeping running state - backend may not have updated yet', { 
-          prevState: prev.state, 
-          backendState: state, 
-          runId: runId || prev.runId 
-        })
-        return prev  // Keep current running state
-      }
+      // #region agent log BTN1
+      const _prevState = { isRunning: prev.isRunning, state: prev.state, runId: prev.runId };
+      const _newState = { isRunning, state, runId };
+      const _stateChanged = prev.isRunning !== isRunning || prev.state !== state || prev.runId !== runId;
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:_stateChanged?'state changed':'state unchanged',data:{..._logData,prev:_prevState,new:_newState,internal_state:internalState,is_success:isSuccess,state_changed:_stateChanged},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
+      // #endregion
       
-      // Otherwise, update with backend state
-      return {
+      const newStatus = {
         state,
         isRunning,
         runId,
       }
+      
+      // If pipeline finished (success or transitioned from running to idle), reset isStarting flag
+      if (isSuccess || (prev.isRunning && !isRunning && state === 'idle')) {
+        // #region agent log BTN1
+        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:'pipeline finished - resetting isStarting',data:{prev:_prevState,new:newStatus,internal_state:internalState,is_success:isSuccess},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
+        // #endregion
+        // Pipeline finished - reset isStarting flag and clear recently started flag
+        setIsStarting(false)
+        if (recentlyStartedRunIdRef.current === runId || recentlyStartedRunIdRef.current === prev.runId) {
+          recentlyStartedRunIdRef.current = null
+        }
+      }
+      
+      return newStatus
     })
     setActiveRunId(runId)
   }, [])
 
   // Poll pipeline status (lightweight - just status, no snapshot)
   const pollPipelineStatus = useCallback(async () => {
+    // #region agent log BTN2
+    const _pollStart = Date.now();
+    // #endregion
     try {
       const status = await getPipelineStatus()
-      updatePipelineStatus(status)
+      // #region agent log BTN2
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:pollPipelineStatus',message:'poll complete',data:{duration_ms:Date.now()-_pollStart,status:status?{state:status.state,run_id:status.run_id||status.runId}:null},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN2'})}).catch(()=>{});
+      // #endregion
+      updatePipelineStatus(status, 'polling')
     } catch (error) {
       console.error('Error polling pipeline status:', error)
+      // #region agent log BTN2
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:pollPipelineStatus',message:'poll error',data:{duration_ms:Date.now()-_pollStart,error:error.message},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN2'})}).catch(()=>{});
+      // #endregion
     }
   }, [updatePipelineStatus])
 
   // Load metadata (scheduler, schedule, file counts) - separate from status polling
+  // OPTIMIZED: File counts update immediately (cached), others update as they arrive
+  // Never reset to 0 on timeout - keep last-known-good values
   const loadMetadata = useCallback(async () => {
-    try {
-      // Load scheduler status
-      const schedulerStatus = await getSchedulerStatus()
-      setSchedulerEnabled(schedulerStatus?.enabled || false)
-      
-      // Load schedule info
-      const nextRun = await getNextScheduledRun()
-      setScheduleInfo(nextRun)
-      
-      // Load file counts as metrics
-      const fileCounts = await getFileCounts()
-      setMetrics(prev => ({ ...prev, ...fileCounts }))
-    } catch (error) {
-      console.error('Error loading metadata:', error)
-    }
+    // #region agent log LOAD3
+    const _t0 = Date.now()
+    // #endregion
+    
+    // File counts is cached - load it first and update immediately (don't wait for validation)
+    getFileCounts()
+      .then(fileCounts => {
+        // Always update immediately - cache ensures fast response
+        if (fileCounts) {
+          setMetrics(prev => ({ ...prev, ...fileCounts }))
+        }
+      })
+      .catch(error => {
+        console.error('Error loading file counts:', error)
+        // Keep last-known-good values (don't reset to 0)
+      })
+    
+    // Load scheduler and nextRun independently - update UI as each arrives (don't wait for both)
+    getSchedulerStatus()
+      .then(status => {
+        if (status?.enabled !== undefined) {
+          setSchedulerEnabled(status.enabled)
+        }
+      })
+      .catch(error => {
+        console.error('Error loading scheduler status:', error)
+        // Keep last-known-good value
+      })
+    
+    getNextScheduledRun()
+      .then(nextRun => {
+        if (nextRun) {
+          setScheduleInfo(nextRun)
+        }
+      })
+      .catch(error => {
+        console.error('Error loading next scheduled run:', error)
+        // Keep last-known-good value
+      })
+    
+    // Log completion after a short delay (don't block on it)
+    setTimeout(() => {
+      // #region agent log LOAD3
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:loadMetadata',message:'metadata load started (non-blocking)',data:{duration_ms:Date.now()-_t0},timestamp:Date.now(),sessionId:'debug-session',runId:'load-audit-1',hypothesisId:'LOAD3'})}).catch(()=>{});
+      // #endregion
+    }, 100)
   }, [])
 
   // Phase-1 always-on: Minimal polling - WebSocket is primary source of truth
   // Poll status + metadata every 30 seconds (just for button state, WebSocket handles events)
   useEffect(() => {
-    // Initial load
-    pollPipelineStatus()
-    loadMetadata()
+    // Initial load - prioritize status for Run ID, then metadata
+    pollPipelineStatus()  // Get Run ID immediately from status endpoint
+    loadMetadata()  // Load metadata (file counts, scheduler) - non-blocking
     
     // Poll every 30 seconds (lightweight, just for status/metadata)
       statusPollingRef.current = setInterval(() => {
@@ -331,9 +411,53 @@ export function usePipelineState() {
   useEffect(() => {
     const handleEvent = (event) => {
       // Handle snapshot events (replace existing events)
+      // Snapshot is optional - if it arrives, use it, but don't wait for it
       if (event.type === 'snapshot' && Array.isArray(event.events)) {
         setEventsFormatted(event.events)
         console.log(`[Events] Snapshot loaded: ${event.events.length} events`)
+        
+        // Extract run_id from snapshot quickly (only check last 10 events - minimal work)
+        // Run in next tick to avoid blocking UI
+        setTimeout(() => {
+          if (event.events.length > 0) {
+            // Only check last 10 events (most recent) - ultra-fast lookup
+            const recentEvents = event.events.slice(-10)
+            let latestRunId = null
+            
+            // Quick scan for run_id (don't worry about state - status endpoint has that)
+            for (let i = recentEvents.length - 1; i >= 0; i--) {
+              const e = recentEvents[i]
+              if (e.run_id) {
+                latestRunId = e.run_id
+                break  // Found it, stop
+              }
+            }
+            
+            // Update run_id if found (status endpoint will provide state)
+            if (latestRunId) {
+              updatePipelineStatus({
+                run_id: latestRunId,
+              }, 'websocket-snapshot')
+            }
+          }
+        }, 0)
+        return
+      }
+      
+      // Handle scheduler events - track as recently started to update button state
+      if (event.stage === 'scheduler' && event.event === 'scheduled_run_started' && event.run_id) {
+        // Track scheduler-triggered runs as recently started
+        recentlyStartedRunIdRef.current = event.run_id
+        setTimeout(() => {
+          if (recentlyStartedRunIdRef.current === event.run_id) {
+            recentlyStartedRunIdRef.current = null
+          }
+        }, 30000)
+        // Update state to running immediately for scheduler-triggered runs
+        updatePipelineStatus({
+          state: 'running',
+          run_id: event.run_id,
+        }, 'websocket')
         return
       }
       
@@ -341,6 +465,10 @@ export function usePipelineState() {
       // CRITICAL: Use complete canonical_state from event for truthfulness
       // This ensures WebSocket and polling always agree
       if (event.event === 'state_change' && event.data) {
+        // #region agent log BTN3
+        const _wsEventData = { event: event.event, has_canonical: !!event.data.canonical_state, has_new_state: !!event.data.new_state, run_id: event.run_id };
+        // #endregion
+        
         // Prefer canonical_state if available (complete truth)
         if (event.data.canonical_state) {
           const canonical = event.data.canonical_state
@@ -359,6 +487,20 @@ export function usePipelineState() {
             canonicalState = 'running'
           }
           
+          // Track as recently started if transitioning to running
+          if (canonicalState === 'running' && canonical.run_id) {
+            recentlyStartedRunIdRef.current = canonical.run_id
+            setTimeout(() => {
+              if (recentlyStartedRunIdRef.current === canonical.run_id) {
+                recentlyStartedRunIdRef.current = null
+              }
+            }, 30000)
+          }
+          
+          // #region agent log BTN3
+          fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleEvent',message:'websocket state_change (canonical)',data:{..._wsEventData,internal_state:internalState,canonical_state:canonicalState,canonical_run_id:canonical.run_id},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN3'})}).catch(()=>{});
+          // #endregion
+          
           updatePipelineStatus({
             state: canonicalState,
             run_id: canonical.run_id || event.run_id || activeRunId,
@@ -368,12 +510,24 @@ export function usePipelineState() {
             error: canonical.error,
             retry_count: canonical.retry_count,
             metadata: canonical.metadata,
-          })
+          }, 'websocket')
         } else {
           // Fallback to partial state (backward compatibility)
           const newState = event.data.new_state
           if (newState) {
-            updatePipelineStatus({ state: newState, run_id: event.run_id || activeRunId })
+            // Track as recently started if transitioning to running
+            if (newState === 'running' && event.run_id) {
+              recentlyStartedRunIdRef.current = event.run_id
+              setTimeout(() => {
+                if (recentlyStartedRunIdRef.current === event.run_id) {
+                  recentlyStartedRunIdRef.current = null
+                }
+              }, 30000)
+            }
+            // #region agent log BTN3
+            fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleEvent',message:'websocket state_change (fallback)',data:{..._wsEventData,new_state:newState},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN3'})}).catch(()=>{});
+            // #endregion
+            updatePipelineStatus({ state: newState, run_id: event.run_id || activeRunId }, 'websocket')
           }
         }
       }
@@ -394,14 +548,24 @@ export function usePipelineState() {
 
   // Start pipeline
   const handleStartPipeline = useCallback(async () => {
+    // #region agent log BTN4
+    const _clickTime = Date.now();
+    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'button clicked',data:{isStarting,isRunning:pipelineStatus.isRunning,state:pipelineStatus.state,runId:pipelineStatus.runId},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+    // #endregion
     console.log('[Pipeline] Start button clicked', { isStarting, isRunning: pipelineStatus.isRunning, state: pipelineStatus.state })
     
     if (isStarting || pipelineStatus.isRunning) {
       console.log('[Pipeline] Start blocked - already starting or running')
+      // #region agent log BTN4
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'start blocked',data:{isStarting,isRunning:pipelineStatus.isRunning},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+      // #endregion
       return
     }
     
     setIsStarting(true)
+    // #region agent log BTN4
+    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'setIsStarting(true)',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+    // #endregion
     try {
       console.log('[Pipeline] Calling startPipeline API...')
       const result = await startPipeline()
@@ -410,8 +574,20 @@ export function usePipelineState() {
       if (result && result.run_id) {
         console.log('[Pipeline] Pipeline started, run_id:', result.run_id)
         setActiveRunId(result.run_id)
+        // Track this run as recently started (for 30 seconds) to prevent premature state reset
+        recentlyStartedRunIdRef.current = result.run_id
+        setTimeout(() => {
+          // Clear the recently started flag after 30 seconds
+          if (recentlyStartedRunIdRef.current === result.run_id) {
+            recentlyStartedRunIdRef.current = null
+          }
+        }, 30000)
+        
         // Immediately set running state so button disables right away
         // WebSocket events will update this later, but we want immediate UI feedback
+        // #region agent log BTN4
+        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'setting running state',data:{run_id:result.run_id,api_duration_ms:Date.now()-_clickTime},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+        // #endregion
         setPipelineStatus({
           state: 'running',
           isRunning: true,
@@ -422,6 +598,10 @@ export function usePipelineState() {
           message: 'Pipeline started successfully',
         })
         
+        // CRITICAL: Don't reset isStarting here - keep it true until pipeline actually finishes
+        // The button stays disabled via isRunning=true, and isStarting will be reset when
+        // WebSocket events or polling confirm the pipeline has finished
+        
         // Don't poll immediately - backend may not have updated state yet
         // WebSocket events will update state quickly, and regular polling will catch it
         // Poll after a short delay to avoid race condition
@@ -430,6 +610,10 @@ export function usePipelineState() {
         }, 1000)  // Wait 1 second before polling to let backend update
       } else {
         console.warn('[Pipeline] Start API returned no run_id:', result)
+        // #region agent log BTN4
+        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'no run_id in response',data:{result},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+        // #endregion
+        setIsStarting(false)  // Only reset on error
         setAlertInfo({
           type: 'error',
           message: 'Pipeline start response missing run_id',
@@ -437,13 +621,17 @@ export function usePipelineState() {
       }
     } catch (error) {
       console.error('[Pipeline] Start failed:', error)
+      // #region agent log BTN4
+      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'start error',data:{error:error.message,api_duration_ms:Date.now()-_clickTime},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+      // #endregion
+      setIsStarting(false)  // Reset on error
       setAlertInfo({
         type: 'error',
         message: error.message || 'Failed to start pipeline',
       })
-    } finally {
-      setIsStarting(false)
     }
+    // REMOVED: finally block that was resetting isStarting too early
+    // isStarting will be reset when updatePipelineStatus detects pipeline has finished
   }, [isStarting, pipelineStatus.isRunning, pollPipelineStatus])
 
   // Reset pipeline

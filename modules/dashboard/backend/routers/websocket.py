@@ -59,23 +59,6 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
         await websocket.close(code=1011, reason="Orchestrator not available")
         return
     logger.info(f"[WebSocket] Connection established ({client_info})")
-    # #region agent log DBG5
-    try:
-        log_path = Path(__file__).resolve().parents[4] / ".cursor" / "debug.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "post-fix",
-                "hypothesisId": "DBG5",
-                "location": "websocket.py:websocket_events",
-                "message": "ws_connected",
-                "data": {"client": client_info},
-                "timestamp": int(time.time() * 1000),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-    # #endregion
     
     # Phase-1 always-on: WebSocket stays connected forever, streams events whenever they occur
     # Optionally send snapshot, but don't block events waiting for it
@@ -98,9 +81,6 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 logger.error(f"[WebSocket] Orchestrator or event_bus not available for snapshot ({client_info})")
                 return
             
-            # region agent log LOAD2
-            t0 = time.perf_counter()
-            # endregion
             # Snapshot: last 4 hours, max 100 events (UI already caps to 100)
             # Pull from cached snapshot (threaded) so it returns instantly if fresh
             historical_events = await asyncio.to_thread(
@@ -110,29 +90,6 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 True,
                 orchestrator.event_bus._snapshot_cache_ttl_seconds,
             )
-            # #region agent log DBG6
-            try:
-                log_path = Path(__file__).resolve().parents[4] / ".cursor" / "debug.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "post-fix",
-                        "hypothesisId": "DBG6",
-                        "location": "websocket.py:send_snapshot_background",
-                        "message": "snapshot_loaded",
-                        "data": {
-                            "events": len(historical_events) if historical_events else 0,
-                            "run_id_filter": bool(run_id),
-                            "window_hours": 4.0,
-                            "max_events": 100,
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    }, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
-            # #endregion
-            
             # Filter by run_id if provided
             if run_id:
                 historical_events = [
@@ -154,13 +111,19 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 historical_events = list(reversed(historical_events))
 
                 # Stream snapshot in chunks to keep UI responsive
-                chunk_size = 5
+                # Increased chunk size from 5 to 25 for better performance (100 events max = 4 chunks)
+                chunk_size = 25
                 total_events = len(historical_events)
                 total_chunks = (total_events + chunk_size - 1) // chunk_size
 
                 if websocket.client_state == WebSocketState.CONNECTED:
                     logger.info(f"[WebSocket] WebSocket connected, sending {total_chunks} chunks ({client_info})")
                     for idx in range(total_chunks):
+                        # Check connection state before each chunk
+                        if websocket.client_state != WebSocketState.CONNECTED:
+                            logger.info(f"[WebSocket] Connection closed during snapshot send ({client_info})")
+                            break
+                        
                         chunk = historical_events[idx * chunk_size:(idx + 1) * chunk_size]
                         if not chunk:
                             continue
@@ -173,50 +136,30 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                                 "total_chunks": total_chunks,
                                 "events": chunk,
                             })
-                            # Yield with small delay so chunks flush incrementally
-                            await asyncio.sleep(0.1)
+                            # Small delay between chunks to keep UI responsive
+                            await asyncio.sleep(0.05)  # Reduced from 0.1s since chunks are larger
                         except Exception as chunk_err:
                             logger.error(f"[WebSocket] Error sending chunk {idx}/{total_chunks}: {chunk_err} ({client_info})")
                             break
-                    # Final marker
-                    try:
-                        await websocket.send_json({
-                            "type": "snapshot_done",
-                            "window_hours": 4.0,
-                            "max_events": 100,
-                            "total_events": total_events,
-                            "total_chunks": total_chunks,
-                        })
-                        logger.info(f"[WebSocket] Sent snapshot in {total_chunks} chunks ({total_events} events) ({client_info})")
-                    except Exception as done_err:
-                        logger.error(f"[WebSocket] Error sending snapshot_done: {done_err} ({client_info})")
+                    
+                    # Final marker (only if still connected)
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_json({
+                                "type": "snapshot_done",
+                                "window_hours": 4.0,
+                                "max_events": 100,
+                                "total_events": total_events,
+                                "total_chunks": total_chunks,
+                            })
+                            logger.info(f"[WebSocket] Sent snapshot in {total_chunks} chunks ({total_events} events) ({client_info})")
+                        except Exception as done_err:
+                            logger.error(f"[WebSocket] Error sending snapshot_done: {done_err} ({client_info})")
                 else:
                     logger.warning(f"[WebSocket] WebSocket not connected (state: {websocket.client_state}), skipping snapshot ({client_info})")
             else:
                 logger.warning(f"[WebSocket] No events in snapshot - skipping ({client_info})")
 
-            # region agent log LOAD2
-            try:
-                qtsw2_root = Path(__file__).resolve().parents[4]
-                log_path = qtsw2_root / ".cursor" / "debug.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({
-                        "sessionId": "debug-session",
-                        "runId": "load-audit-1",
-                        "hypothesisId": "LOAD2",
-                        "location": "modules/dashboard/backend/routers/websocket.py:send_snapshot_background",
-                        "message": "ws snapshot load complete",
-                        "data": {
-                            "duration_ms": int((time.perf_counter() - t0) * 1000),
-                            "events": len(historical_events) if historical_events else 0,
-                            "run_id_filter": bool(run_id),
-                        },
-                        "timestamp": int(time.time() * 1000),
-                    }, ensure_ascii=False) + "\n")
-            except Exception:
-                pass
-            # endregion
         except Exception as e:
             # Snapshot failed - log but continue (live stream already running)
             logger.error(f"[WebSocket] Snapshot send failed ({client_info}): {e}", exc_info=True)
@@ -249,27 +192,6 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
             try:
                 # Filter events by run_id if specified
                 if run_id is None or event.get("run_id") == run_id:
-                    # #region agent log DBG3
-                    try:
-                        log_path = Path(__file__).resolve().parents[4] / ".cursor" / "debug.log"
-                        log_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps({
-                                "sessionId": "debug-session",
-                                "runId": "post-fix",
-                                "hypothesisId": "DBG3",
-                                "location": "websocket.py:websocket_events",
-                                "message": "send_live_event",
-                                "data": {
-                                    "stage": event.get("stage"),
-                                    "event": event.get("event"),
-                                    "run_id": event.get("run_id")
-                                },
-                                "timestamp": int(time.time() * 1000),
-                            }, ensure_ascii=False) + "\n")
-                    except Exception:
-                        pass
-                    # #endregion
                     await websocket.send_json(event)
                     events_sent += 1
                     # Log first few events and then every 100

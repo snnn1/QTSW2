@@ -23,6 +23,7 @@ router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 logger = logging.getLogger(__name__)
 
 
+
 def get_orchestrator():
     try:
         from ..main import orchestrator_instance
@@ -73,11 +74,12 @@ async def start_pipeline(request: PipelineStartRequest = PipelineStartRequest())
             timeout=5.0,  # should be instant
         )
 
-        return {
+        resp = {
             "run_id": run_ctx.run_id,
             "state": run_ctx.state.value,
             "message": "Pipeline started",
         }
+        return resp
 
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -179,7 +181,7 @@ async def get_pipeline_status():
         canonical = canonical_state(status.state)
         # Return canonical state in same format as state_change events
         # This ensures consistency between polling and WebSocket
-        return {
+        resp = {
             "state": canonical,
             "run_id": status.run_id,
             "current_stage": status.current_stage.value if status.current_stage else None,
@@ -191,6 +193,7 @@ async def get_pipeline_status():
             # Include internal state for debugging (not used by frontend)
             "_internal_state": status.state.value,
         }
+        return resp
     else:
         return {"state": "idle"}
 

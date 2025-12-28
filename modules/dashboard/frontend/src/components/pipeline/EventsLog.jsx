@@ -9,7 +9,6 @@ export function EventsLog({ eventsFormatted }) {
   const scrollContainerRef = useRef(null)
   const shouldAutoScrollRef = useRef(true)
   const prevEventsLengthRef = useRef(0)
-  const [showVerbose, setShowVerbose] = useState(false)
   const [filterStage, setFilterStage] = useState('all')
 
   // Check if user is at bottom of scroll container
@@ -65,11 +64,10 @@ export function EventsLog({ eventsFormatted }) {
   const filteredEvents = useMemo(() => {
     return eventsFormatted.filter(event => 
       shouldShowEvent(event, {
-        showVerbose,
         stageFilter: filterStage
       })
     )
-  }, [eventsFormatted, showVerbose, filterStage])
+  }, [eventsFormatted, filterStage])
 
   // Get unique stages for filter
   const stages = useMemo(() => {
@@ -93,16 +91,6 @@ export function EventsLog({ eventsFormatted }) {
               <option key={stage} value={stage}>{stage}</option>
             ))}
           </select>
-          {/* Verbose Toggle */}
-          <label className="flex items-center gap-1 text-xs text-gray-400 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={showVerbose}
-              onChange={(e) => setShowVerbose(e.target.checked)}
-              className="rounded"
-            />
-            <span>Verbose</span>
-          </label>
         </div>
       </div>
       <div 

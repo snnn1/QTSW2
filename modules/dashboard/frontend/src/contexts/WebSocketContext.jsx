@@ -54,71 +54,54 @@ export function WebSocketProvider({ children }) {
     })
   }, [])
 
+  // Generate deduplication key for an event
+  const getEventKey = useCallback((e) => {
+    const eventTime = e.timestamp ? new Date(e.timestamp).getTime() : 0
+    const timeWindow = Math.floor(eventTime / 1000) // Round to nearest second
+    return `${timeWindow}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
+  }, [])
+
   // Handle incoming events
   const handleEvent = useCallback((event) => {
-    // Log snapshot-related messages for debugging
-    if (event.type === 'snapshot_chunk' || event.type === 'snapshot_done' || event.type === 'snapshot') {
-      console.log('[Events] Snapshot message received:', event.type, event.chunk_index !== undefined ? `chunk ${event.chunk_index}/${event.total_chunks}` : '', event.events ? `${event.events.length} events` : '')
-    }
-    
-    // Phase-1 always-on: Simple event handling - show all events, no complex filtering
-    // Reduced logging for performance - only log important events
-    if (!event.event || event.event === 'state_change' || event.event === 'error') {
-      console.log('[Events] Received event:', event.stage, event.event, event.run_id)
-    }
-
     // Format timestamp for display
     const formattedEvent = {
       ...event,
       formattedTimestamp: event.timestamp ? formatEventTimestamp(event.timestamp) : ''
     }
 
-    // Handle streaming snapshot chunks (append without replacing to avoid scroll jump)
+    // Handle streaming snapshot chunks
     if ((event.type === 'snapshot' || event.type === 'snapshot_chunk') && Array.isArray(event.events)) {
-      console.log(`[Events] Received snapshot chunk: ${event.events.length} events (chunk ${event.chunk_index || 0}/${event.total_chunks || 1})`)
-      
       const formattedChunk = event.events.map(e => ({
         ...e,
         formattedTimestamp: e.timestamp ? formatEventTimestamp(e.timestamp) : ''
       }))
       
       setEvents(prev => {
-        let updated = [...prev]
+        // Filter duplicates using deduplication key
+        const newEvents = formattedChunk.filter(e => {
+          const eventKey = getEventKey(e)
+          if (seenEventsRef.current.has(eventKey)) {
+            return false
+          }
+          seenEventsRef.current.add(eventKey)
+          return true
+        })
         
-        for (const e of formattedChunk) {
-          const key = `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
-          if (seenEventsRef.current.has(key)) {
-            continue
-          }
-          seenEventsRef.current.add(key)
-          
-          // Insert in sorted order (timestamps ascending)
-          const eventTime = e.timestamp ? new Date(e.timestamp).getTime() : 0
-          let left = 0
-          let right = updated.length
-          while (left < right) {
-            const mid = Math.floor((left + right) / 2)
-            const midTime = updated[mid].timestamp ? new Date(updated[mid].timestamp).getTime() : 0
-            if (midTime < eventTime) {
-              left = mid + 1
-            } else {
-              right = mid
-            }
-          }
-          updated.splice(left, 0, e)
+        // Combine, sort, and limit to 100 events
+        const combined = [...prev, ...newEvents]
+        combined.sort((a, b) => {
+          const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0
+          const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0
+          return timeA - timeB
+        })
+        
+        if (combined.length > 100) {
+          const removed = combined.slice(0, combined.length - 100)
+          removed.forEach(rem => seenEventsRef.current.delete(getEventKey(rem)))
+          return combined.slice(-100)
         }
         
-        // Limit to last 100 events
-        if (updated.length > 100) {
-          const removed = updated.slice(0, updated.length - 100)
-          removed.forEach(rem => {
-            const remKey = `${rem.timestamp || 'null'}|${rem.stage || 'null'}|${rem.event || 'null'}|${rem.run_id || 'null'}`
-            seenEventsRef.current.delete(remKey)
-          })
-          updated = updated.slice(-100)
-        }
-        
-        return updated
+        return combined
       })
       
       // Notify subscribers of snapshot chunk
@@ -155,56 +138,41 @@ export function WebSocketProvider({ children }) {
     
     // Handle snapshot completion marker
     if (event.type === 'snapshot_done') {
-      console.log(`[Events] Snapshot complete: ${event.total_events} total events in ${event.total_chunks} chunks`)
       notifySubscribers({ type: 'snapshot_done', total_events: event.total_events, total_chunks: event.total_chunks })
       return
     }
 
-    // Fast duplicate check using Set (O(1))
-    const eventKey = `${event.timestamp || 'null'}|${event.stage || 'null'}|${event.event || 'null'}|${event.run_id || 'null'}`
+    // Check for duplicates
+    const eventKey = getEventKey(event)
     if (seenEventsRef.current.has(eventKey)) {
       return  // Duplicate, skip
     }
     seenEventsRef.current.add(eventKey)
 
-    // Add event to list (optimized - binary search insertion O(log n) instead of O(n log n))
+    // Add event to list
     setEvents(prev => {
-      // Insert event in sorted position using binary search
-      const eventTime = event.timestamp ? new Date(event.timestamp).getTime() : 0
-      const updated = [...prev]
+      const combined = [...prev, formattedEvent]
+      
+      // Sort by timestamp
+      combined.sort((a, b) => {
+        const timeA = a.timestamp ? new Date(a.timestamp).getTime() : 0
+        const timeB = b.timestamp ? new Date(b.timestamp).getTime() : 0
+        return timeA - timeB
+      })
 
-      // Binary search for insertion point
-      let left = 0
-      let right = updated.length
-      while (left < right) {
-        const mid = Math.floor((left + right) / 2)
-        const midTime = updated[mid].timestamp ? new Date(updated[mid].timestamp).getTime() : 0
-        if (midTime < eventTime) {
-          left = mid + 1
-        } else {
-          right = mid
-        }
+      // Limit to last 100 events
+      if (combined.length > 100) {
+        const removed = combined.slice(0, combined.length - 100)
+        removed.forEach(e => seenEventsRef.current.delete(getEventKey(e)))
+        return combined.slice(-100)
       }
 
-      updated.splice(left, 0, formattedEvent)
-
-      // Limit to last 100 events to prevent memory issues
-      if (updated.length > 100) {
-        // Remove oldest event keys from seenEvents
-        const removed = updated.slice(0, updated.length - 100)
-        removed.forEach(e => {
-          const key = `${e.timestamp || 'null'}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
-          seenEventsRef.current.delete(key)
-        })
-        return updated.slice(-100)
-      }
-
-      return updated
+      return combined
     })
 
     // Notify subscribers of new event
     notifySubscribers(formattedEvent)
-  }, [notifySubscribers])
+  }, [notifySubscribers, getEventKey])
 
   // Connect WebSocket (singleton - created once)
   const connect = useCallback(() => {

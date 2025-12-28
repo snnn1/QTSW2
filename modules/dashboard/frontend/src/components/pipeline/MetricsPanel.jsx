@@ -1,9 +1,11 @@
+import { memo } from 'react'
 import { MetricCard } from '../ui/MetricCard'
 
 /**
  * Metrics Panel component
+ * Memoized to prevent excessive re-renders when parent updates
  */
-export function MetricsPanel({
+export const MetricsPanel = memo(function MetricsPanel({
   pipelineStatus,
   stageInfo,
   metrics,
@@ -13,7 +15,7 @@ export function MetricsPanel({
   onRunMerger,
 }) {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+    <div className="grid grid-cols-1 md:grid-cols-6 gap-4 mb-6">
       <MetricCard
         label="Run ID"
         value={pipelineStatus.runId}
@@ -31,7 +33,7 @@ export function MetricsPanel({
       />
       <MetricCard
         label="Raw Files"
-        value={metrics.rawFiles}
+        value={metrics.raw_files ?? 0}
         button={
           <button
             onClick={() => onRunStage('translator')}
@@ -48,7 +50,7 @@ export function MetricsPanel({
       />
       <MetricCard
         label="Processed Files"
-        value={metrics.processedFiles}
+        value={metrics.processed_files ?? 0}
         button={
           <button
             onClick={() => onRunStage('analyzer')}
@@ -62,6 +64,10 @@ export function MetricsPanel({
             Run Analyzer
           </button>
         }
+      />
+      <MetricCard
+        label="Analyzed Files"
+        value={metrics.analyzed_files ?? 0}
       />
       <MetricCard
         label="Data Merger"
@@ -82,5 +88,19 @@ export function MetricsPanel({
       />
     </div>
   )
-}
+}, (prevProps, nextProps) => {
+  // Custom comparison function to prevent re-renders when props haven't meaningfully changed
+  return (
+    prevProps.pipelineStatus?.runId === nextProps.pipelineStatus?.runId &&
+    prevProps.pipelineStatus?.isRunning === nextProps.pipelineStatus?.isRunning &&
+    prevProps.stageInfo?.stageLabel === nextProps.stageInfo?.stageLabel &&
+    prevProps.stageInfo?.isActive === nextProps.stageInfo?.isActive &&
+    prevProps.metrics?.raw_files === nextProps.metrics?.raw_files &&
+    prevProps.metrics?.processed_files === nextProps.metrics?.processed_files &&
+    prevProps.metrics?.analyzed_files === nextProps.metrics?.analyzed_files &&
+    prevProps.mergerInfo?.displayText === nextProps.mergerInfo?.displayText &&
+    prevProps.mergerInfo?.isRunning === nextProps.mergerInfo?.isRunning &&
+    prevProps.isRunning === nextProps.isRunning
+  )
+})
 

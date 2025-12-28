@@ -48,7 +48,7 @@ export async function getFileCounts() {
 
     return {
       raw_files: Number.isFinite(data?.raw_files) ? data.raw_files : 0,
-      processed_files: Number.isFinite(data?.processed_files) ? data.processed_files : 0,
+      processed_files: Number.isFinite(data?.translated_files) ? data.translated_files : 0, // Backend returns translated_files, map to processed_files for UI
       analyzed_files: Number.isFinite(data?.analyzed_files) ? data.analyzed_files : 0,
     }
   } catch {
@@ -181,7 +181,11 @@ export async function startApp(app) {
 
 export async function checkBackendConnection() {
   try {
-    const res = await fetchWithTimeout(HEALTH_URL, {}, 5000) // Increased timeout to 5s
+    // Use direct backend URL in development (port 8001) instead of relying on Vite proxy
+    // This fixes connection failures when proxy is unstable
+    const isDev = window.location.hostname === 'localhost' && window.location.port === '5173'
+    const healthUrl = isDev ? 'http://localhost:8001/health' : HEALTH_URL
+    const res = await fetchWithTimeout(healthUrl, {}, 5000) // Increased timeout to 5s
     if (!res.ok) {
       console.warn(`[Health Check] Backend returned status ${res.status}`)
       return false

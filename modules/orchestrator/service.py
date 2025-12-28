@@ -7,7 +7,7 @@ import logging
 import uuid
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, timezone
 
 from .config import OrchestratorConfig
@@ -17,6 +17,9 @@ from .locks import LockManager
 from .runner import PipelineRunner
 from .scheduler import Scheduler
 from .watchdog import Watchdog
+from .run_history import RunHistory, RunSummary, RunResult
+from .run_health import RunHealth, compute_run_health
+from .run_policy import can_run_pipeline
 
 
 class PipelineOrchestrator:
@@ -89,6 +92,13 @@ class PipelineOrchestrator:
             event_bus=self.event_bus,
             state_manager=self.state_manager,
             config=config,
+            logger=self.logger
+        )
+        
+        # Run history - persisted run summaries
+        runs_dir = config.event_logs_dir.parent / "runs"
+        self.run_history = RunHistory(
+            runs_dir=runs_dir,
             logger=self.logger
         )
         
@@ -363,20 +373,52 @@ class PipelineOrchestrator:
                 # Wait 1 hour before retrying on error - continue loop, never crash
                 await asyncio.sleep(3600)
     
-    async def start_pipeline(self, manual: bool = False, run_id: Optional[str] = None) -> RunContext:
+    async def start_pipeline(self, manual: bool = False, run_id: Optional[str] = None, manual_override: bool = False) -> RunContext:
         """
         Start a new pipeline run.
         
         Args:
             manual: True if manually triggered, False if scheduled
             run_id: Optional run_id (if provided, pipeline/start event should already be emitted)
+            manual_override: True if user explicitly overrides policy (manual runs only)
         
         Returns:
             RunContext for the new run
         
         Raises:
-            ValueError: If pipeline is already running
+            ValueError: If pipeline is already running or blocked by policy
         """
+        # POLICY GATE: Check if pipeline can run (before any locks or state changes)
+        auto_run = not manual
+        allowed, reason, health, health_reasons = can_run_pipeline(
+            run_history=self.run_history,
+            auto_run=auto_run,
+            manual_override=manual_override
+        )
+        
+        if not allowed:
+            # Emit run_blocked event
+            await self.event_bus.publish({
+                "run_id": "__system__",
+                "stage": "pipeline",
+                "event": "run_blocked",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "msg": f"Pipeline run blocked by policy: {reason}",
+                "data": {
+                    "run_health": health.value,
+                    "health_reasons": health_reasons,
+                    "auto_run": auto_run,
+                    "manual_override": manual_override,
+                    "block_reason": reason
+                }
+            })
+            
+            # Update state with health (even though run is blocked)
+            await self._update_state_health(health, health_reasons)
+            
+            # Return cleanly (no exceptions) - this is a policy decision, not an error
+            raise ValueError(f"Pipeline run blocked: {reason}")
+        
         # Check if already running
         status = await self.state_manager.get_state()
         if status and status.state not in {
@@ -386,6 +428,9 @@ class PipelineOrchestrator:
             PipelineRunState.STOPPED,
         }:
             raise ValueError(f"Pipeline already running: {status.state.value}")
+        
+        # Update state with current health before starting
+        await self._update_state_health(health, health_reasons)
         
         # Generate run_id if not provided (for scheduled runs or direct calls)
         if run_id is None:
@@ -412,6 +457,7 @@ class PipelineOrchestrator:
                 run_id=run_id,
                 metadata={
                     "manual": manual,
+                    "manual_override": manual_override,
                     "triggered_at": datetime.now(timezone.utc).isoformat()
                 }
             )
@@ -535,6 +581,13 @@ class PipelineOrchestrator:
             
             # Release lock
             await self.lock_manager.release(run_ctx.run_id)
+            
+            # Persist run summary (first-class artifact)
+            await self._persist_run_summary(run_ctx, success)
+            
+            # Update health after run completion (health may have changed)
+            health, health_reasons = compute_run_health(self.run_history)
+            await self._update_state_health(health, health_reasons)
     
     async def stop_pipeline(self) -> RunContext:
         """
@@ -551,6 +604,13 @@ class PipelineOrchestrator:
         
         # Release lock
         await self.lock_manager.release(status.run_id)
+        
+        # Persist run summary (first-class artifact)
+        await self._persist_run_summary(status, success=False, result=RunResult.STOPPED)
+        
+        # Update health after run completion (health may have changed)
+        health, health_reasons = compute_run_health(self.run_history)
+        await self._update_state_health(health, health_reasons)
         
         await self.event_bus.publish({
             "run_id": status.run_id,
@@ -688,4 +748,89 @@ class PipelineOrchestrator:
         
         finally:
             await self.lock_manager.release(run_id)
+            
+            # Persist run summary (first-class artifact)
+            status = await self.state_manager.get_state()
+            if status and status.run_id == run_id:
+                success = status.state == PipelineRunState.SUCCESS
+                await self._persist_run_summary(status, success=success)
+                
+                # Update health after run completion (health may have changed)
+                health, health_reasons = compute_run_health(self.run_history)
+                await self._update_state_health(health, health_reasons)
+    
+    async def _persist_run_summary(
+        self,
+        run_ctx: RunContext,
+        success: Optional[bool] = None,
+        result: Optional[RunResult] = None
+    ):
+        """
+        Persist run summary as first-class artifact.
+        
+        Args:
+            run_ctx: Run context
+            success: Whether run succeeded (if None, inferred from state)
+            result: Explicit result (if None, inferred from state)
+        """
+        try:
+            # Determine result from state if not provided
+            if result is None:
+                if run_ctx.state == PipelineRunState.SUCCESS:
+                    result = RunResult.SUCCESS
+                elif run_ctx.state == PipelineRunState.FAILED:
+                    result = RunResult.FAILED
+                elif run_ctx.state == PipelineRunState.STOPPED:
+                    result = RunResult.STOPPED
+                else:
+                    # Not completed yet, don't persist
+                    return
+            
+            # Create run summary
+            summary = RunSummary(
+                run_id=run_ctx.run_id,
+                started_at=run_ctx.started_at.isoformat() if run_ctx.started_at else datetime.now(timezone.utc).isoformat(),
+                ended_at=run_ctx.updated_at.isoformat() if run_ctx.updated_at else datetime.now(timezone.utc).isoformat(),
+                result=result.value,
+                failure_reason=run_ctx.error,
+                stages_executed=run_ctx.stages_executed.copy(),
+                stages_failed=run_ctx.stages_failed.copy(),
+                retry_count=run_ctx.retry_count,
+                metadata=run_ctx.metadata.copy()
+            )
+            
+            # Persist to JSONL
+            self.run_history.persist_run(summary)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to persist run summary {run_ctx.run_id[:8]}: {e}", exc_info=True)
+    
+    async def _update_state_health(self, health: RunHealth, health_reasons: List[str]):
+        """
+        Update state with current run health (derived, not persisted).
+        
+        Args:
+            health: Current RunHealth state
+            health_reasons: List of health determination reasons
+        """
+        try:
+            # Get current state
+            status = await self.state_manager.get_state()
+            if status:
+                # Update metadata with health (derived value)
+                status.metadata["run_health"] = health.value
+                status.metadata["run_health_reasons"] = health_reasons
+        except Exception as e:
+            # Non-critical - health is derived, not persisted
+            self.logger.debug(f"Failed to update state health: {e}")
+            
+            # Persist run summary (first-class artifact)
+            status = await self.state_manager.get_state()
+            if status and status.run_id == run_id:
+                success = status.state == PipelineRunState.SUCCESS
+                await self._persist_run_summary(status, success=success)
+                
+                # Update health after run completion (health may have changed)
+                health, health_reasons = compute_run_health(self.run_history)
+                await self._update_state_health(health, health_reasons)
 

@@ -54,25 +54,6 @@ PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# region agent log
-import json as _agent_json
-_AGENT_LOG_PATH = (QTSW2_ROOT / ".cursor" / "debug.log")
-def _agent_log(hypothesisId: str, location: str, message: str, data: Dict):
-    try:
-        _AGENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(_AGENT_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(_agent_json.dumps({
-                "sessionId": "debug-session",
-                "runId": "pre-fix",
-                "hypothesisId": hypothesisId,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-# endregion
 
 # Streamlit app scripts
 TRANSLATOR_APP = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
@@ -613,27 +594,6 @@ async def _refresh_file_counts_cache():
         "last_duration_ms": duration_ms,
     })
     
-    # Log completion
-    try:
-        _log_path = QTSW2_ROOT / ".cursor" / "debug.log"
-        _log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(_log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "sessionId": "debug-session",
-                "runId": "load-audit-1",
-                "hypothesisId": "LOAD1",
-                "location": "modules/dashboard/backend/main.py:_refresh_file_counts_cache",
-                "message": "metrics/files cache refreshed",
-                "data": {
-                    "duration_ms": duration_ms,
-                    "raw_files": raw_count,
-                    "translated_files": translated_count,
-                    "analyzed_files": analyzed_count,
-                },
-                "timestamp": int(time.time() * 1000),
-            }, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
 
 
 @app.get("/api/metrics/files")
