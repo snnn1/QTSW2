@@ -96,6 +96,17 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
     Returns:
         DataFrame with filters applied (final_allowed and filter_reasons updated)
     """
+    # Validate that filter keys match actual streams
+    if not df.empty and 'Stream' in df.columns:
+        valid_streams = set(df['Stream'].unique())
+        filter_streams = set(stream_filters.keys())
+        invalid_filters = filter_streams - valid_streams
+        if invalid_filters:
+            logger.warning(
+                f"Filters provided for non-existent streams: {sorted(invalid_filters)}. "
+                f"These filters will be ignored. Valid streams: {sorted(valid_streams)}"
+            )
+    
     for stream_id, filters in stream_filters.items():
         stream_mask = df['Stream'] == stream_id
         

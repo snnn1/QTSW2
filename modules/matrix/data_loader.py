@@ -35,6 +35,8 @@ def find_parquet_files(stream_dir: Path, stream_id: str) -> List[Path]:
     parquet_files = []
     
     # Look for year subdirectories (e.g., ES1/2024/, ES1/2025/)
+    # CRITICAL: Load ALL years - no year filtering here
+    years_found = []
     for year_dir in sorted(stream_dir.iterdir()):
         if not year_dir.is_dir():
             continue
@@ -45,8 +47,16 @@ def find_parquet_files(stream_dir: Path, stream_id: str) -> List[Path]:
             # This is a year directory - look for monthly consolidated files
             # Pattern: <stream>_an_<year>_<month>.parquet (analyzer output)
             monthly_files = sorted(year_dir.glob(f"{stream_id}_an_*.parquet"))
-            parquet_files.extend(monthly_files)
+            if monthly_files:
+                parquet_files.extend(monthly_files)
+                years_found.append(year_dir_name)
         # Skip date folders (YYYY-MM-DD format) - these contain daily temp files
+    
+    # Log years found for debugging
+    if years_found:
+        logger.debug(f"Stream {stream_id}: Found {len(parquet_files)} files across {len(years_found)} years: {sorted(years_found)}")
+    else:
+        logger.warning(f"Stream {stream_id}: No parquet files found in any year directories")
     
     return parquet_files
 
@@ -60,6 +70,8 @@ def apply_date_filters(
     """
     Apply date filters to a DataFrame.
     
+    OPTIMIZED: Only converts Date column to datetime if filtering is needed.
+    
     Args:
         df: Input DataFrame with 'Date' column
         start_date: Start date for filtering (YYYY-MM-DD) or None
@@ -72,16 +84,23 @@ def apply_date_filters(
     if 'Date' not in df.columns:
         return df
     
+    # If no date filters provided, return DataFrame as-is (no conversion needed)
+    if not specific_date and not start_date and not end_date:
+        return df
+    
+    # Only convert to datetime if we need to filter (optimization)
+    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+        df = df.copy()  # Only copy if we need to modify
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    
     # Pre-compute date filters for efficiency
     specific_date_dt = pd.to_datetime(specific_date).date() if specific_date else None
     start_date_dt = pd.to_datetime(start_date) if start_date else None
     end_date_dt = pd.to_datetime(end_date) if end_date else None
     
     if specific_date_dt:
-        df['Date'] = pd.to_datetime(df['Date'])
         df = df[df['Date'].dt.date == specific_date_dt]
     elif start_date_dt or end_date_dt:
-        df['Date'] = pd.to_datetime(df['Date'])
         if start_date_dt:
             df = df[df['Date'] >= start_date_dt]
         if end_date_dt:
@@ -134,9 +153,11 @@ def load_stream_data(
         logger.warning(error_msg)
         return (False, None, stream_id)
     
-    logger.info(f"Loading stream: {stream_id} ({len(parquet_files)} monthly files)")
+    logger.info(f"Loading stream: {stream_id} ({len(parquet_files)} monthly files from all available years)")
     
     stream_trades = []
+    files_loaded = 0
+    files_skipped = 0
     
     for file_path in parquet_files:
         try:
@@ -159,12 +180,16 @@ def load_stream_data(
                 df = df.copy()  # Only copy if we need to modify
                 df['Stream'] = stream_id
             
-            # Apply date filters
+            # Apply date filters (only filters if dates provided - otherwise loads all data)
             df = apply_date_filters(df, start_date, end_date, specific_date)
             
             if not df.empty:
                 stream_trades.append(df)
+                files_loaded += 1
                 logger.debug(f"  Loaded {len(df)} trades from {file_path.name}")
+            else:
+                files_skipped += 1
+                logger.debug(f"  Skipped {file_path.name} (empty after date filtering)")
                 
         except Exception as e:
             logger.error(f"Error loading {file_path}: {e}")
@@ -181,7 +206,10 @@ def load_stream_data(
         return (False, None, stream_id)
     
     total_trades = sum(len(df) for df in stream_trades)
-    logger.info(f"[OK] Successfully loaded stream: {stream_id} ({total_trades} trades)")
+    logger.info(
+        f"[OK] Successfully loaded stream: {stream_id} "
+        f"({total_trades} trades from {files_loaded} files, {files_skipped} skipped)"
+    )
     return (True, stream_trades, stream_id)
 
 
@@ -300,15 +328,30 @@ def load_all_streams(
         logger.warning("No trade data found!")
         return pd.DataFrame()
     
-    # Merge all DataFrames (optimized: use more efficient concat)
+    # Merge all DataFrames (optimized: use more efficient concat, defer sorting)
     logger.info(f"Merging {len(all_trades)} data files...")
     if len(all_trades) == 1:
         master_df = all_trades[0]
     else:
-        # Use sort=False for faster concat when we'll sort later anyway
+        # Use sort=False for faster concat - sorting will happen later in build_master_matrix
+        # This avoids redundant sorting operations
         master_df = pd.concat(all_trades, ignore_index=True, sort=False)
     
     logger.info(f"Total trades loaded (before sequencer logic): {len(master_df)}")
+    
+    # Log date range if available
+    if not master_df.empty and 'Date' in master_df.columns:
+        try:
+            if not pd.api.types.is_datetime64_any_dtype(master_df['Date']):
+                master_df['Date'] = pd.to_datetime(master_df['Date'], errors='coerce')
+            valid_dates = master_df['Date'].notna()
+            if valid_dates.any():
+                min_date = master_df.loc[valid_dates, 'Date'].min()
+                max_date = master_df.loc[valid_dates, 'Date'].max()
+                logger.info(f"Date range in loaded data: {min_date.date()} to {max_date.date()}")
+        except Exception as e:
+            logger.debug(f"Could not determine date range: {e}")
+    
     logger.info(f"Streams loaded successfully: {streams_loaded} ({len(streams_loaded)}/{len(streams)})")
     if streams_failed:
         logger.warning(f"Streams that failed to load: {list(streams_failed.keys())}")

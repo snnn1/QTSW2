@@ -262,12 +262,12 @@ async def list_matrix_files():
 
 
 @router.get("/data")
-async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, essential_columns_only: bool = True, skip_cleaning: bool = False):
+async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essential_columns_only: bool = True, skip_cleaning: bool = False):
     """Get master matrix data from the most recent file or specified file.
     
     Args:
         file_path: Optional path to specific file
-        limit: Maximum number of rows to return (default 10000 for faster initial load)
+        limit: Maximum number of rows to return (0 = no limit, default 0 to return all trades)
         essential_columns_only: If True, return only essential columns for faster initial load (default True)
         skip_cleaning: If True, skip expensive per-value sanitization for faster initial load (default False)
     """
@@ -324,6 +324,7 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, e
                     years = sorted(year_values, reverse=True) if year_values else []
         
         # Apply limit (assume MasterMatrix output is already correctly sorted)
+        # limit=0 means no limit - return all trades
         if limit > 0:
             df = df.head(limit)
         

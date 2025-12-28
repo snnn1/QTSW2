@@ -11,7 +11,7 @@ Date: 2025
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Callable
 from datetime import datetime, timedelta
 import logging
 import sys
@@ -24,6 +24,7 @@ from . import schema_normalizer
 from . import filter_engine
 from . import statistics
 from . import file_manager
+from .config import DOM_BLOCKED_DAYS
 
 # Configure logging using centralized configuration
 from .logging_config import setup_matrix_logger
@@ -82,8 +83,8 @@ class MasterMatrix:
         # Auto-discover streams by scanning analyzer_runs directory
         self.streams = stream_manager.discover_streams(self.analyzer_runs_dir)
         
-        # Day-of-month blocked days for "2" streams (default)
-        self.dom_blocked_days = {4, 16, 30}
+        # Day-of-month blocked days for "2" streams (from centralized config)
+        self.dom_blocked_days = DOM_BLOCKED_DAYS
         
         # Per-stream filters - initialize with defaults
         self.stream_filters = stream_filters or {}
@@ -106,9 +107,17 @@ class MasterMatrix:
     
     def _rebuild_full(self) -> pd.DataFrame:
         """Rebuild everything from scratch."""
+        import time
+        start_time = time.time()
+        logger.info("=" * 80)
         logger.info("Rebuilding all streams from scratch")
+        logger.info("=" * 80)
         # IMPORTANT: Always load ALL historical data (ignore date filters) to build accurate time slot histories
-        return self._load_all_streams_with_sequencer(start_date=None, end_date=None, specific_date=None)
+        result = self._load_all_streams_with_sequencer(start_date=None, end_date=None, specific_date=None)
+        elapsed = time.time() - start_time
+        logger.info(f"Rebuild completed in {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
+        logger.info(f"Loaded {len(result)} trades")
+        return result
     
     def _rebuild_partial(self, streams: List[str], output_dir: str) -> pd.DataFrame:
         """Rebuild specific streams and merge with existing data."""
@@ -160,21 +169,36 @@ class MasterMatrix:
         
         return df
         
+    def _create_sequencer_callback(self) -> Callable:
+        """
+        Create sequencer callback function that uses current stream_filters.
+        
+        Returns:
+            Callable function that applies sequencer logic to a DataFrame
+        """
+        def apply_sequencer(df: pd.DataFrame, display_year: Optional[int] = None) -> pd.DataFrame:
+            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
+            logger.debug("=" * 80)
+            logger.debug("CALLING SEQUENCER")
+            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
+            logger.debug(f"Module file: {sequencer_logic.__file__}")
+            logger.debug("=" * 80)
+            return sequencer_logic.apply_sequencer_logic(df, self.stream_filters, display_year)
+        
+        return apply_sequencer
+    
     def _load_all_streams_with_sequencer(
         self,
         start_date: Optional[str] = None,
-                         end_date: Optional[str] = None,
-                         specific_date: Optional[str] = None,
-                         wait_for_streams: bool = True,
-                         max_retries: int = 3,
+        end_date: Optional[str] = None,
+        specific_date: Optional[str] = None,
+        wait_for_streams: bool = True,
+        max_retries: int = 3,
         retry_delay_seconds: int = 2
     ) -> pd.DataFrame:
         """
         Load all streams and apply sequencer logic.
         Internal method that wraps data_loader with sequencer logic callback.
-        
-        NOTE: This logic is duplicated in update_master_matrix() (lines 631-704).
-        Future refactoring should consolidate the load + sequencer logic to reduce duplication.
         """
         # Re-discover streams if needed
         if not self.streams or len(self.streams) == 0:
@@ -185,14 +209,7 @@ class MasterMatrix:
             return pd.DataFrame()
         
         # Create sequencer callback that uses current stream_filters
-        def apply_sequencer(df: pd.DataFrame, display_year: Optional[int] = None) -> pd.DataFrame:
-            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
-            logger.debug("=" * 80)
-            logger.debug("CALLING SEQUENCER (from _load_all_streams_with_sequencer)")
-            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
-            logger.debug(f"Module file: {sequencer_logic.__file__}")
-            logger.debug("=" * 80)
-            return sequencer_logic.apply_sequencer_logic(df, self.stream_filters, display_year)
+        apply_sequencer = self._create_sequencer_callback()
         
         # Load all streams with sequencer logic applied
         return data_loader.load_all_streams(
@@ -364,9 +381,11 @@ class MasterMatrix:
             elif not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
                 df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
         
-        # Initialize date_repaired column (will be set for invalid dates)
+        # Initialize date_repaired and date_repair_quality columns (will be set for invalid dates)
         if 'date_repaired' not in df.columns:
             df['date_repaired'] = False
+        if 'date_repair_quality' not in df.columns:
+            df['date_repair_quality'] = 1.0  # 1.0 = original date was valid, no repair needed
         
         # Handle rows with invalid trade_date - preserve them instead of removing
         valid_dates = df['trade_date'].notna()
@@ -386,15 +405,18 @@ class MasterMatrix:
                         sample_dates = stream_invalid['Date'].head(5).tolist()
                         logger.debug(f"  Sample invalid dates for {stream_id}: {sample_dates}")
             
-            # Attempt to repair invalid dates
+            # Attempt to repair invalid dates with quality scoring
             repaired_count = 0
+            repair_quality_scores = []  # Track repair confidence (0.0-1.0)
+            
             for idx in invalid_df.index:
                 original_date = invalid_df.loc[idx, 'Date'] if 'Date' in invalid_df.columns else None
                 
-                # Try to repair: attempt multiple strategies
+                # Try to repair: attempt multiple strategies with quality scoring
                 repaired_date = None
+                repair_quality = 0.0  # 0.0 = low confidence, 1.0 = high confidence
                 
-                # Strategy 1: Try parsing Date column again with different formats
+                # Strategy 1: Try parsing Date column again with different formats (HIGH CONFIDENCE)
                 if original_date is not None and pd.notna(original_date):
                     try:
                         # Try common date formats
@@ -402,13 +424,19 @@ class MasterMatrix:
                             try:
                                 repaired_date = pd.to_datetime(str(original_date), format=fmt, errors='coerce')
                                 if pd.notna(repaired_date):
+                                    repair_quality = 0.9  # High confidence - exact format match
                                     break
                             except:
                                 continue
+                        # If format parsing failed, try general parsing (MEDIUM CONFIDENCE)
+                        if pd.isna(repaired_date):
+                            repaired_date = pd.to_datetime(str(original_date), errors='coerce')
+                            if pd.notna(repaired_date):
+                                repair_quality = 0.7  # Medium confidence - general parsing
                     except:
                         pass
                 
-                # Strategy 2: Infer from adjacent valid dates (if available)
+                # Strategy 2: Infer from adjacent valid dates (MEDIUM CONFIDENCE)
                 if pd.isna(repaired_date) and 'Stream' in invalid_df.columns:
                     stream_id = invalid_df.loc[idx, 'Stream']
                     if 'Stream' in df.columns:
@@ -420,41 +448,57 @@ class MasterMatrix:
                         median_date = stream_valid['trade_date'].median()
                         if pd.notna(median_date):
                             repaired_date = median_date
+                            repair_quality = 0.5  # Medium-low confidence - inferred from stream
                 
-                # Strategy 3: Use a default date (first valid date in dataset) as last resort
+                # Strategy 3: Use a default date (first valid date in dataset) as last resort (LOW CONFIDENCE)
                 if pd.isna(repaired_date):
                     valid_dates_in_df = df[valid_dates]['trade_date'] if valid_dates.any() else pd.Series()
                     if not valid_dates_in_df.empty:
                         repaired_date = valid_dates_in_df.min()
+                        repair_quality = 0.2  # Low confidence - global fallback
                 
                 # Update if repair succeeded
                 if pd.notna(repaired_date):
                     df.loc[idx, 'trade_date'] = repaired_date
                     df.loc[idx, 'date_repaired'] = True
+                    df.loc[idx, 'date_repair_quality'] = repair_quality  # Store quality score
+                    repair_quality_scores.append(repair_quality)
                     repaired_count += 1
                 else:
                     # Mark as unrepaired but keep the row
                     df.loc[idx, 'date_repaired'] = False
+                    df.loc[idx, 'date_repair_quality'] = 0.0  # Failed repair
                     # Set to a sentinel date (far future) so it sorts last but is preserved
                     df.loc[idx, 'trade_date'] = pd.Timestamp('2099-12-31')
+            
+            # Calculate average repair quality
+            avg_repair_quality = sum(repair_quality_scores) / len(repair_quality_scores) if repair_quality_scores else 0.0
             
             # Preserve original Date column for debugging
             if 'Date' in invalid_df.columns and 'original_date' not in df.columns:
                 df['original_date'] = df['Date']
             
-            # Log results
+            # Log results with quality scoring
             unrepaired_count = invalid_count - repaired_count
             logger.warning(
                 f"Found {invalid_count} rows with invalid trade_date out of {len(df)} total rows ({invalid_percentage:.1f}%). "
-                f"Repaired {repaired_count}, {unrepaired_count} could not be repaired but were preserved."
+                f"Repaired {repaired_count} (avg quality: {avg_repair_quality:.2f}), {unrepaired_count} could not be repaired but were preserved."
             )
             
-            # Alert user if significant data loss would have occurred (>1% of data)
+            # Alert user if significant data quality issues
             if invalid_percentage > 1.0:
                 logger.error(
                     f"⚠️ CRITICAL: {invalid_percentage:.1f}% of data had invalid dates! "
                     f"All rows have been preserved (repaired or marked). "
                     f"Please investigate the source data quality."
+                )
+            
+            # Warn if repair quality is low (many dates inferred rather than parsed)
+            if repaired_count > 0 and avg_repair_quality < 0.5:
+                logger.warning(
+                    f"⚠️ WARNING: Low date repair quality ({avg_repair_quality:.2f}). "
+                    f"Many dates were inferred rather than parsed. "
+                    f"Please verify date column format in source data."
                 )
             
             # All rows are now preserved (either repaired or marked with sentinel date)
@@ -708,28 +752,24 @@ class MasterMatrix:
         logger.info(f"Found {len(streams_to_update)} stream(s) with new data: {streams_to_update}")
         
         # Process each stream: load ALL historical data for sequencer accuracy, then filter to only new dates
-        # NOTE: This logic duplicates _load_all_streams_with_sequencer() (lines 163-205).
-        # Future refactoring should consolidate the load + sequencer logic to reduce duplication.
+        # REFACTORED: Use shared sequencer callback instead of duplicating logic
         all_new_trades = []
+        apply_sequencer = self._create_sequencer_callback()
+        
         for stream_id in streams_to_update:
             logger.info(f"Processing stream {stream_id}...")
             
             # Load ALL historical data for this stream (needed for accurate sequencer logic)
+            # Use data_loader for consistency with _load_all_streams_with_sequencer
+            stream_trades_list = []
             stream_dir = self.analyzer_runs_dir / stream_id
-            parquet_files = []
-            for year_dir in sorted(stream_dir.iterdir()):
-                if not year_dir.is_dir():
-                    continue
-                year_dir_name = year_dir.name
-                if len(year_dir_name) == 4 and year_dir_name.isdigit():
-                    monthly_files = sorted(year_dir.glob(f"{stream_id}_an_*.parquet"))
-                    parquet_files.extend(monthly_files)
+            parquet_files = data_loader.find_parquet_files(stream_dir, stream_id)
             
             if not parquet_files:
+                logger.warning(f"Stream {stream_id}: No parquet files found")
                 continue
             
             # Load all historical data for sequencer accuracy
-            all_stream_data = []
             for file_path in parquet_files:
                 try:
                     df = pd.read_parquet(file_path)
@@ -739,25 +779,19 @@ class MasterMatrix:
                         df['Stream'] = stream_id
                     else:
                         df['Stream'] = stream_id
-                    all_stream_data.append(df)
+                    stream_trades_list.append(df)
                 except Exception as e:
                     logger.error(f"Error loading {file_path}: {e}")
                     continue
             
-            if not all_stream_data:
+            if not stream_trades_list:
                 continue
             
             # Merge all historical data for sequencer accuracy
-            all_history_df = pd.concat(all_stream_data, ignore_index=True) if len(all_stream_data) > 1 else all_stream_data[0]
+            all_history_df = pd.concat(stream_trades_list, ignore_index=True) if len(stream_trades_list) > 1 else stream_trades_list[0]
             
-            # Apply sequencer logic to all historical data
-            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
-            logger.debug("=" * 80)
-            logger.debug("CALLING SEQUENCER (from update_master_matrix)")
-            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
-            logger.debug(f"Module file: {sequencer_logic.__file__}")
-            logger.debug("=" * 80)
-            sequencer_result = sequencer_logic.apply_sequencer_logic(all_history_df, self.stream_filters, display_year=None)
+            # Apply sequencer logic to all historical data using shared callback
+            sequencer_result = apply_sequencer(all_history_df, display_year=None)
             
             # Filter to only new dates (after latest_existing_date)
             latest_existing = latest_dates.get(stream_id)

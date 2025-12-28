@@ -551,8 +551,9 @@ def _calculate_daily_metrics(
     profit_col = "ProfitDollars" if "ProfitDollars" in daily_df.columns else "Profit"
     
     # Group by trading day (date only, not time) - for risk metrics (daily PnL series)
+    # OPTIMIZED: Use sort=False for faster groupby when order doesn't matter
     daily_df["trade_date_only"] = daily_df["trade_date"].dt.date
-    daily_pnl = daily_df.groupby("trade_date_only")[profit_col].sum().reset_index()
+    daily_pnl = daily_df.groupby("trade_date_only", sort=False)[profit_col].sum().reset_index()
     daily_pnl.columns = ["date", "pnl"]
     
     # Behavioral averages use active_trading_days (days with ≥1 trade in stats sample)
@@ -602,8 +603,9 @@ def _calculate_daily_metrics(
                 drawdown_start_idx = None
     
     # Monthly return std dev (Option 1: actual calendar months)
+    # OPTIMIZED: Use sort=False for faster groupby
     daily_df["year_month"] = daily_df["trade_date"].dt.to_period("M")
-    monthly_pnl = daily_df.groupby("year_month")[profit_col].sum()
+    monthly_pnl = daily_df.groupby("year_month", sort=False)[profit_col].sum()
     monthly_return_stddev = float(monthly_pnl.std()) if len(monthly_pnl) > 1 else 0.0
     
     # Calmar ratio (annualized return / max drawdown)

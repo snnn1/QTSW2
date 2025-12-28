@@ -15,15 +15,9 @@ from typing import List, Optional, Dict
 import pandas as pd
 
 from .utils import get_session_for_time, normalize_time
+from .config import SLOT_ENDS
 
 logger = logging.getLogger(__name__)
-
-# Session configuration - MUST match sequencer_logic.py (single source of truth)
-# This is a read-only reference for trade selection, not for time decisions
-SLOT_ENDS = {
-    "S1": ["07:30", "08:00", "09:00"],
-    "S2": ["09:30", "10:00", "10:30", "11:00"],
-}
 
 
 def filter_excluded_times(date_df: pd.DataFrame, exclude_times_str: List[str], stream_id: str, date) -> pd.DataFrame:

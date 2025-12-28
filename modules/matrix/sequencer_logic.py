@@ -50,17 +50,12 @@ import pandas as pd
 
 from .utils import calculate_time_score, get_session_for_time
 from .logging_config import setup_matrix_logger
-from .history_manager import update_time_slot_history
+from .history_manager import update_time_slot_history, ROLLING_WINDOW_SIZE
 from .trade_selector import select_trade_for_time
+from .config import SLOT_ENDS
 
 # Set up logger using centralized configuration
 logger = setup_matrix_logger(__name__, console=True, level=logging.INFO)
-
-# Session configuration - OWNED BY sequencer_logic.py
-SLOT_ENDS = {
-    "S1": ["07:30", "08:00", "09:00"],
-    "S2": ["09:30", "10:00", "10:30", "11:00"],
-}
 
 __all__ = ['apply_sequencer_logic', 'process_stream_daily', 'SLOT_ENDS']
 
@@ -211,15 +206,24 @@ def process_stream_daily(
     if stream_df.empty:
         return []
     
-    # Normalize dates for comparison
-    stream_df = stream_df.copy()
+    # OPTIMIZATION: Pre-normalize dates and create Time_str column once (not per-day)
+    # This avoids repeated operations
     if not pd.api.types.is_datetime64_any_dtype(stream_df['Date']):
-        stream_df['Date'] = pd.to_datetime(stream_df['Date'])
+        stream_df = stream_df.copy()  # Only copy if we need to modify
+        stream_df['Date'] = pd.to_datetime(stream_df['Date'], errors='coerce')
+    
+    # Pre-normalize all Time values once (vectorized operation)
+    if 'Time_str' not in stream_df.columns:
+        stream_df = stream_df.copy()  # Only copy if we need to add column
+        stream_df['Time_str'] = stream_df['Time'].astype(str).str.strip().apply(normalize_time)
+    
+    # Pre-normalize dates for efficient filtering
+    stream_df['Date_normalized'] = stream_df['Date'].dt.normalize()
     
     # CRITICAL: Iterate only over dates present in analyzer data (data-driven, not calendar)
     # No weekends, no holidays unless present in data
-    unique_dates = stream_df['Date'].dt.normalize().unique()
-    trading_dates = sorted(unique_dates)
+    unique_dates = stream_df['Date_normalized'].unique()
+    trading_dates = sorted([d for d in unique_dates if pd.notna(d)])
     
     logger.debug(f"Stream {stream_id}: Processing {len(trading_dates)} trading days (from data, not calendar)")
     
@@ -227,29 +231,26 @@ def process_stream_daily(
     # DAILY PROCESSING LOOP (ITERATE ONLY OVER TRADING DAYS IN DATA)
     # ============================================================================
     for date in trading_dates:
-        # date is already normalized from unique() above
-        date_normalized = date
-        date_df = stream_df[stream_df['Date'].dt.normalize() == date_normalized].copy()
+        # OPTIMIZATION: Use boolean indexing instead of copy (faster)
+        date_mask = stream_df['Date_normalized'] == date
+        date_df = stream_df[date_mask]  # Use view, not copy
         
-        # Normalize Time_str for comparisons (once per date_df)
-        if 'Time_str' not in date_df.columns:
-            date_df = date_df.copy()
-            date_df['Time_str'] = date_df['Time'].apply(lambda t: normalize_time(str(t)))
+        # Time_str already normalized above, no need to do it per-day
         
         # ============================================================================
         # TRADE SELECTION (PURE LOOKUP) - MUST HAPPEN BEFORE SCORING AND TIME CHANGE
         # ============================================================================
         # CRITICAL: Filter out excluded times from date_df BEFORE selection
-        # This ensures we never accidentally select a trade at an excluded time
-        # even if current_time somehow became an excluded time (shouldn't happen, but defensive)
+        # OPTIMIZATION: Use boolean indexing instead of copy (faster)
         if not date_df.empty and filtered_times_normalized:
-            date_df_filtered = date_df[~date_df['Time_str'].isin(filtered_times_normalized)].copy()
+            time_mask = ~date_df['Time_str'].isin(filtered_times_normalized)
+            date_df_filtered = date_df[time_mask]  # Use view, not copy
             # Log if we filtered out any rows (shouldn't happen if logic is correct, but good to know)
             filtered_out_count = len(date_df) - len(date_df_filtered)
             if filtered_out_count > 0:
                 logger.warning(
                     f"Stream {stream_id} {date}: Filtered out {filtered_out_count} trades at excluded times: "
-                    f"{sorted(date_df[date_df['Time_str'].isin(filtered_times_normalized)]['Time_str'].unique())}"
+                    f"{sorted(date_df[~time_mask]['Time_str'].unique())}"
                 )
             date_df = date_df_filtered
         
@@ -364,8 +365,10 @@ def process_stream_daily(
         old_time_for_today = str(current_time).strip()
         
         # Build trade_dict from selected trade
+        # OPTIMIZATION: Direct dict construction instead of Series.to_dict() (faster)
         if trade_row is not None:
-            trade_dict = trade_row.to_dict()
+            # Convert Series to dict more efficiently
+            trade_dict = dict(trade_row)
             # CRITICAL: Preserve original analyzer time before overwriting Time column
             # This is needed for downstream filtering (exclude_times filter needs actual trade time)
             original_time = trade_dict.get('Time', '')
@@ -433,7 +436,8 @@ def process_stream_daily(
 def apply_sequencer_logic(
     df: pd.DataFrame,
     stream_filters: Dict[str, Dict],
-    display_year: Optional[int] = None
+    display_year: Optional[int] = None,
+    parallel: bool = True
 ) -> pd.DataFrame:
     """
     Apply sequencer logic to select one trade per day per stream.
@@ -442,12 +446,15 @@ def apply_sequencer_logic(
     Processes ALL historical data to build accurate time slot histories,
     and returns trades from all years (or filtered by display_year if specified).
     
+    OPTIMIZED: Can process streams in parallel for faster rebuilds.
+    
     Args:
         df: DataFrame with all trades from analyzer_runs
         stream_filters: Per-stream filter configuration
         display_year: If provided, only return trades from this year (for display).
                      If None, return trades from ALL years.
                      All data is still processed to build accurate histories.
+        parallel: If True (default), process streams in parallel. Set False for debugging.
         
     Returns:
         DataFrame with one chosen trade per day per stream
@@ -455,38 +462,88 @@ def apply_sequencer_logic(
     if df.empty:
         return df
     
-    # Pre-convert Date column once for all streams
+    # Pre-convert Date column once for all streams (only if needed)
     if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.copy()  # Only copy if we need to modify
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     
     # Sort once by Stream and Date for better cache locality
+    # OPTIMIZED: Use mergesort for stability, but only sort if not already sorted
     # Debug: Check for None values before sorting
-    for col in ['Stream', 'Date']:
-        if col in df.columns:
-            none_count = df[col].isna().sum() if hasattr(df[col], 'isna') else (df[col] == None).sum()
-            if none_count > 0:
-                logger.warning(f"[apply_sequencer_logic] Column '{col}' has {none_count} None/NaN values before sorting")
-                # Log sample of problematic rows
-                problematic = df[df[col].isna()] if hasattr(df[col], 'isna') else df[df[col] == None]
-                if len(problematic) > 0 and len(problematic) <= 10:
-                    logger.debug(f"[apply_sequencer_logic] Rows with None in '{col}': {problematic[['Stream', 'Date']].head(5).to_dict('records') if all(c in problematic.columns for c in ['Stream', 'Date']) else 'N/A'}")
-            # Replace None with empty string for string columns to avoid comparison errors
-            if col == 'Stream' and df[col].dtype == 'object':
-                df[col] = df[col].fillna('')
-                logger.debug(f"[apply_sequencer_logic] Filled None values in 'Stream' with empty string for sorting")
+    needs_sorting = True
+    if len(df) > 1:
+        # Quick check: if Stream and Date are already sorted, skip sorting
+        # This is a heuristic - if data comes pre-sorted, we save time
+        try:
+            if df['Stream'].is_monotonic_increasing and df['Date'].is_monotonic_increasing:
+                needs_sorting = False
+        except:
+            pass  # If check fails, proceed with sorting
     
-    df = df.sort_values(['Stream', 'Date'], kind='mergesort').reset_index(drop=True)
-    
-    chosen_trades = []
-    
-    # Group by stream and process
-    for stream_id in df['Stream'].unique():
-        stream_mask = df['Stream'] == stream_id
-        stream_df = df[stream_mask].copy()
-        stream_filters_for_stream = stream_filters.get(stream_id, {})
+    if needs_sorting:
+        for col in ['Stream', 'Date']:
+            if col in df.columns:
+                none_count = df[col].isna().sum() if hasattr(df[col], 'isna') else (df[col] == None).sum()
+                if none_count > 0:
+                    logger.warning(f"[apply_sequencer_logic] Column '{col}' has {none_count} None/NaN values before sorting")
+                    # Log sample of problematic rows
+                    problematic = df[df[col].isna()] if hasattr(df[col], 'isna') else df[df[col] == None]
+                    if len(problematic) > 0 and len(problematic) <= 10:
+                        logger.debug(f"[apply_sequencer_logic] Rows with None in '{col}': {problematic[['Stream', 'Date']].head(5).to_dict('records') if all(c in problematic.columns for c in ['Stream', 'Date']) else 'N/A'}")
+                # Replace None with empty string for string columns to avoid comparison errors
+                if col == 'Stream' and df[col].dtype == 'object':
+                    df[col] = df[col].fillna('')
+                    logger.debug(f"[apply_sequencer_logic] Filled None values in 'Stream' with empty string for sorting")
         
-        stream_chosen_trades = process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year)
-        chosen_trades.extend(stream_chosen_trades)
+        df = df.sort_values(['Stream', 'Date'], kind='mergesort').reset_index(drop=True)
+    
+    # Get unique streams
+    unique_streams = df['Stream'].unique()
+    logger.info(f"Processing {len(unique_streams)} streams with sequencer logic...")
+    
+    # OPTIMIZATION: Process streams in parallel for faster rebuilds
+    if parallel and len(unique_streams) > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        chosen_trades = []
+        max_workers = min(len(unique_streams), mp.cpu_count())
+        
+        def process_single_stream(stream_id: str) -> List[Dict]:
+            """Process a single stream (for parallel execution)."""
+            stream_mask = df['Stream'] == stream_id
+            stream_df = df[stream_mask]  # Use view, not copy (faster)
+            stream_filters_for_stream = stream_filters.get(stream_id, {})
+            return process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year)
+        
+        logger.info(f"Processing {len(unique_streams)} streams in parallel ({max_workers} workers)...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_stream = {
+                executor.submit(process_single_stream, stream_id): stream_id
+                for stream_id in unique_streams
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_stream):
+                stream_id = future_to_stream[future]
+                try:
+                    stream_chosen_trades = future.result()
+                    chosen_trades.extend(stream_chosen_trades)
+                    logger.debug(f"Completed sequencer processing for stream {stream_id}: {len(stream_chosen_trades)} trades")
+                except Exception as e:
+                    logger.error(f"Error processing stream {stream_id} in sequencer: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+    else:
+        # Sequential processing (for debugging or single stream)
+        chosen_trades = []
+        for stream_id in unique_streams:
+            stream_mask = df['Stream'] == stream_id
+            stream_df = df[stream_mask]  # Use view, not copy (faster)
+            stream_filters_for_stream = stream_filters.get(stream_id, {})
+            
+            stream_chosen_trades = process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year)
+            chosen_trades.extend(stream_chosen_trades)
     
     if not chosen_trades:
         return pd.DataFrame()

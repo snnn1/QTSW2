@@ -267,8 +267,8 @@ function AppContent() {
         }
       }
       
-      // Load the matrix data (fast initial load: 10k rows, essential columns only, skip cleaning)
-      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=10000&essential_columns_only=true&skip_cleaning=true`)
+      // Load the matrix data (NO LIMIT - load all trades)
+      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=0&essential_columns_only=true&skip_cleaning=true`)
       
       if (!dataResponse.ok) {
         const errorData = await dataResponse.json()
@@ -2605,6 +2605,52 @@ function AppContent() {
     }
   }, [workerReady, workerFilteredRows, activeTab])
   
+  // Auto-load ALL rows when filtered indices change (no limit)
+  useEffect(() => {
+    if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0 && workerGetRows) {
+      const currentLoaded = loadedRows.length
+      if (currentLoaded < workerFilteredIndices.length && !loadingMoreRows) {
+        // Load all remaining rows automatically in chunks
+        setLoadingMoreRows(true)
+        const neededIndices = workerFilteredIndices.slice(currentLoaded)
+        
+        if (neededIndices.length > 0) {
+          // Load in chunks to avoid blocking UI
+          const CHUNK_SIZE = 1000
+          const chunks = []
+          for (let i = 0; i < neededIndices.length; i += CHUNK_SIZE) {
+            chunks.push(neededIndices.slice(i, i + CHUNK_SIZE))
+          }
+          
+          let loadedChunks = 0
+          const loadChunk = (chunkIndex) => {
+            if (chunkIndex >= chunks.length) {
+              setLoadingMoreRows(false)
+              return
+            }
+            
+            workerGetRows(chunks[chunkIndex], (newRows) => {
+              setLoadedRows(prev => {
+                const existingLength = prev.length
+                if (existingLength >= currentLoaded + loadedChunks * CHUNK_SIZE + newRows.length) {
+                  return prev
+                }
+                return [...prev, ...newRows]
+              })
+              loadedChunks++
+              // Load next chunk with small delay to yield to UI
+              setTimeout(() => loadChunk(chunkIndex + 1), 10)
+            })
+          }
+          
+          loadChunk(0)
+        } else {
+          setLoadingMoreRows(false)
+        }
+      }
+    }
+  }, [workerReady, workerFilteredIndices?.length, workerGetRows, loadedRows.length, loadingMoreRows])
+  
   // Load more rows function - use ref to access current loadedRows without dependency
   const loadedRowsRef = useRef([])
   useEffect(() => {
@@ -2622,16 +2668,14 @@ function AppContent() {
       : (workerFilteredRows || [])
     const currentLoadedLength = currentLoaded.length
     
-    // Load more if we're within 100 rows of the end of loaded data (very aggressive for better UX)
-    // Also trigger if we're at or past the currently loaded data
-    const shouldLoad = (stopIndex >= currentLoadedLength - 100 || stopIndex >= currentLoadedLength - 1) && 
-                       workerFilteredIndices.length > currentLoadedLength
+    // REMOVED LIMIT: Load ALL remaining rows, not just chunks
+    // Load all remaining rows if we're near the end or scrolling
+    const shouldLoad = workerFilteredIndices.length > currentLoadedLength
     
     if (shouldLoad) {
       setLoadingMoreRows(true)
-      // Load more aggressively - load up to 200 rows ahead of current scroll position
-      const loadUpTo = Math.min(stopIndex + 200, workerFilteredIndices.length)
-      const neededIndices = workerFilteredIndices.slice(currentLoadedLength, loadUpTo)
+      // Load ALL remaining rows - no limit
+      const neededIndices = workerFilteredIndices.slice(currentLoadedLength)
       
       if (neededIndices.length > 0) {
         workerGetRows(neededIndices, (newRows) => {
@@ -3676,7 +3720,7 @@ function AppContent() {
               ) : (
                 <>
                   <div className="mb-4 text-sm text-gray-400">
-                    Showing {Math.min(visibleRows, filteredDataLength || 0)} of {filteredDataLength || 0} trades
+                    Showing {filteredDataLength || 0} of {filteredDataLength || 0} trades
                   </div>
                   {renderDataTable(masterData, 'master')}
                 </>
@@ -3759,7 +3803,7 @@ function AppContent() {
               ) : (
                 <>
                   <div className="mb-4 text-sm text-gray-400">
-                    Showing {Math.min(visibleRows, filteredDataLength || 0)} of {filteredDataLength || 0} trades
+                    Showing {filteredDataLength || 0} of {filteredDataLength || 0} trades
                   </div>
                   {renderDataTable(masterData, activeTab)}
                 </>

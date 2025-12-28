@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date
 import logging
+import sys
+
+# Import centralized config
+# Handle both direct import and relative import
+try:
+    from modules.matrix.config import SLOT_ENDS, DOM_BLOCKED_DAYS, SCF_THRESHOLD
+except ImportError:
+    # Fallback: add parent directory to path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.matrix.config import SLOT_ENDS, DOM_BLOCKED_DAYS, SCF_THRESHOLD
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -43,17 +53,14 @@ class TimetableEngine:
             "NQ1", "NQ2", "NG1", "NG2", "YM1", "YM2"
         ]
         
-        # Day-of-month blocked days for "2" streams
-        self.dom_blocked_days = {4, 16, 30}
+        # Day-of-month blocked days for "2" streams (from centralized config)
+        self.dom_blocked_days = DOM_BLOCKED_DAYS
         
-        # SCF threshold (configurable)
-        self.scf_threshold = 0.5
+        # SCF threshold (from centralized config, but can be overridden)
+        self.scf_threshold = SCF_THRESHOLD
         
-        # Available time slots by session
-        self.session_time_slots = {
-            "S1": ["07:30", "08:00", "09:00"],
-            "S2": ["09:30", "10:00", "10:30", "11:00"]
-        }
+        # Available time slots by session (from centralized config - SINGLE SOURCE OF TRUTH)
+        self.session_time_slots = SLOT_ENDS
     
     def calculate_rs_for_stream(self, stream_id: str, session: str, 
                                lookback_days: int = 13) -> Dict[str, float]:
@@ -90,11 +97,30 @@ class TimetableEngine:
         for file_path in parquet_files[:10]:  # Load last 10 files
             try:
                 df = pd.read_parquet(file_path)
-                if not df.empty:
-                    df['Date'] = pd.to_datetime(df['Date'])
-                    all_trades.append(df)
+                if df.empty:
+                    continue
+                
+                # Validate required columns
+                if 'Date' not in df.columns:
+                    logger.warning(f"File {file_path.name} missing 'Date' column, skipping")
+                    continue
+                if 'Result' not in df.columns:
+                    logger.warning(f"File {file_path.name} missing 'Result' column, skipping")
+                    continue
+                
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+                # Skip rows with invalid dates
+                valid_dates = df['Date'].notna()
+                if not valid_dates.any():
+                    logger.warning(f"File {file_path.name} has no valid dates, skipping")
+                    continue
+                
+                df = df[valid_dates].copy()
+                all_trades.append(df)
             except Exception as e:
-                logger.debug(f"Error loading {file_path}: {e}")
+                logger.warning(f"Error loading {file_path}: {e}")
+                import traceback
+                logger.debug(f"Traceback: {traceback.format_exc()}")
                 continue
         
         if not all_trades:
@@ -123,7 +149,13 @@ class TimetableEngine:
             # Calculate RS score for each trade
             scores = []
             for _, trade in time_trades.iterrows():
-                result = str(trade.get('Result', '')).upper()
+                result_value = trade.get('Result', '')
+                # Handle NaN/None values
+                if pd.isna(result_value) or result_value is None:
+                    result = ''
+                else:
+                    result = str(result_value).strip().upper()
+                
                 if result == 'WIN':
                     scores.append(1)
                 elif result == 'LOSS':
@@ -131,7 +163,9 @@ class TimetableEngine:
                 else:  # BE, TIME, NO TRADE, etc.
                     scores.append(0)
             
-            # Rolling sum
+            # Rolling sum (limit to lookback_days)
+            if len(scores) > lookback_days:
+                scores = scores[-lookback_days:]  # Take last N scores
             rs_value = sum(scores)
             time_slot_rs[time_slot] = float(rs_value)
         

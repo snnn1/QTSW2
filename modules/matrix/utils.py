@@ -7,10 +7,11 @@ and score calculation used throughout the master matrix processing pipeline.
 
 from typing import Dict
 
-
 def normalize_time(time_str: str) -> str:
     """
     Normalize time format to HH:MM (e.g., "7:30" -> "07:30").
+    
+    Uses cached version if available for better performance.
     
     Args:
         time_str: Time string in various formats
@@ -18,15 +19,21 @@ def normalize_time(time_str: str) -> str:
     Returns:
         Normalized time string in HH:MM format
     """
-    if not time_str:
-        return str(time_str)
-    time_str = str(time_str).strip()
-    parts = time_str.split(':')
-    if len(parts) == 2:
-        hours = parts[0].zfill(2)  # Pad with leading zero if needed
-        minutes = parts[1].zfill(2)
-        return f"{hours}:{minutes}"
-    return time_str
+    # Try to use cached version if available
+    try:
+        from .cache import normalize_time_cached
+        return normalize_time_cached(time_str)
+    except (ImportError, AttributeError):
+        # Fallback to direct implementation if cache module not available
+        if not time_str:
+            return str(time_str)
+        time_str = str(time_str).strip()
+        parts = time_str.split(':')
+        if len(parts) == 2:
+            hours = parts[0].zfill(2)  # Pad with leading zero if needed
+            minutes = parts[1].zfill(2)
+            return f"{hours}:{minutes}"
+        return time_str
 
 
 def get_session_for_time(time: str, slot_ends: Dict) -> str:

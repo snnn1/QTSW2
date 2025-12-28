@@ -7,9 +7,7 @@ used for time change decisions in the sequencer.
 """
 
 from typing import Dict, List
-
-# Rolling window size: maintain last 13 days of scores
-ROLLING_WINDOW_SIZE = 13
+from .config import ROLLING_WINDOW_SIZE
 
 
 def update_time_slot_history(

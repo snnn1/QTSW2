@@ -12,11 +12,17 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# Try to use cached version if available
+try:
+    from .cache import get_cached_streams
+    _use_cache = True
+except ImportError:
+    _use_cache = False
 
-def discover_streams(analyzer_runs_dir: Path) -> List[str]:
+
+def _discover_streams_impl(analyzer_runs_dir: Path) -> List[str]:
     """
-    Auto-discover streams by scanning analyzer_runs directory.
-    Looks for subdirectories matching stream patterns (ES1, ES2, GC1, etc.).
+    Internal implementation of stream discovery (without caching).
     
     Args:
         analyzer_runs_dir: Path to analyzer_runs directory
@@ -43,6 +49,27 @@ def discover_streams(analyzer_runs_dir: Path) -> List[str]:
             streams.append(stream_id)
     
     streams.sort()  # Sort alphabetically for consistency
+    return streams
+
+
+def discover_streams(analyzer_runs_dir: Path) -> List[str]:
+    """
+    Auto-discover streams by scanning analyzer_runs directory.
+    Looks for subdirectories matching stream patterns (ES1, ES2, GC1, etc.).
+    
+    Uses caching if available to avoid repeated filesystem scans.
+    
+    Args:
+        analyzer_runs_dir: Path to analyzer_runs directory
+        
+    Returns:
+        List of stream IDs found (e.g., ["ES1", "ES2", "GC1", ...])
+    """
+    if _use_cache:
+        streams = get_cached_streams(analyzer_runs_dir, _discover_streams_impl)
+    else:
+        streams = _discover_streams_impl(analyzer_runs_dir)
+    
     logger.info(f"Discovered {len(streams)} streams: {streams}")
     return streams
 

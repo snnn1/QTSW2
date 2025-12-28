@@ -847,9 +847,10 @@ self.onmessage = function(e) {
         }
         
         // Optionally return rows (for initial render)
+        // REMOVED LIMIT: Return all filtered rows, not just 100
+        // Virtual scrolling will handle rendering efficiently
         if (returnRows && filteredIndices.length > 0) {
-          const maxRows = Math.min(filteredIndices.length, 100)
-          response.rows = self.columnarData.getRows(filteredIndices.slice(0, maxRows))
+          response.rows = self.columnarData.getRows(filteredIndices)
         }
         
         self.postMessage({ type: 'FILTERED', payload: response })
