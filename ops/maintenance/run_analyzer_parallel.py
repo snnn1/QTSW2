@@ -61,7 +61,8 @@ def emit_event(run_id: Optional[str], stage: str, event: str, msg: str = "", dat
         logger.warning(f"Failed to emit event: {e}")
 
 # Base paths
-QTSW2_ROOT = Path(__file__).parent.parent
+# Go up from ops/maintenance/run_analyzer_parallel.py to get QTSW2_ROOT
+QTSW2_ROOT = Path(__file__).parent.parent.parent
 ANALYZER_SCRIPT = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
 DATA_PROCESSED = QTSW2_ROOT / "data" / "data_processed"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"

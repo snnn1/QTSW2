@@ -178,6 +178,16 @@ export async function resetPipeline() {
 }
 
 /* -------------------------------------------------------
+   Clear pipeline lock
+------------------------------------------------------- */
+export async function clearPipelineLock() {
+  console.log('[API] Calling POST /api/pipeline/clear-lock')
+  const res = await fetchWithTimeout(`${API_BASE}/pipeline/clear-lock`, { method: 'POST' }, 8000)
+  if (!res.ok) throw new Error(await res.text())
+  return await safeJson(res)
+}
+
+/* -------------------------------------------------------
    Backend connectivity check
 ------------------------------------------------------- */
 export async function checkBackendConnection() {
@@ -240,10 +250,26 @@ export function usePipelineState() {
     
     const runId = statusData.run_id || statusData.runId || null
     
-    setPipelineStatus({
-      state,
-      isRunning,
-      runId,
+    // Guard: Don't overwrite "running" state with "idle" if we have an active run_id
+    // This prevents immediate polling from resetting the state right after start
+    setPipelineStatus(prev => {
+      // If we're currently running and backend says idle, but we have a run_id, keep running
+      // This handles the race condition where polling happens before backend updates
+      if (prev.isRunning && state === 'idle' && (runId || prev.runId)) {
+        console.log('[Status] Keeping running state - backend may not have updated yet', { 
+          prevState: prev.state, 
+          backendState: state, 
+          runId: runId || prev.runId 
+        })
+        return prev  // Keep current running state
+      }
+      
+      // Otherwise, update with backend state
+      return {
+        state,
+        isRunning,
+        runId,
+      }
     })
     setActiveRunId(runId)
   }, [])
@@ -351,12 +377,24 @@ export function usePipelineState() {
       if (result && result.run_id) {
         console.log('[Pipeline] Pipeline started, run_id:', result.run_id)
         setActiveRunId(result.run_id)
+        // Immediately set running state so button disables right away
+        // WebSocket events will update this later, but we want immediate UI feedback
+        setPipelineStatus({
+          state: 'running',
+          isRunning: true,
+          runId: result.run_id
+        })
         setAlertInfo({
           type: 'success',
           message: 'Pipeline started successfully',
         })
         
-        // Status will update via WebSocket events - no need to poll
+        // Don't poll immediately - backend may not have updated state yet
+        // WebSocket events will update state quickly, and regular polling will catch it
+        // Poll after a short delay to avoid race condition
+        setTimeout(() => {
+          pollPipelineStatus()
+        }, 1000)  // Wait 1 second before polling to let backend update
       } else {
         console.warn('[Pipeline] Start API returned no run_id:', result)
         setAlertInfo({
@@ -403,8 +441,15 @@ export function usePipelineState() {
         ? await disableScheduler()
         : await enableScheduler()
       
-      // Backend always returns { enabled: true/false, status: "...", message: "..." }
-      setSchedulerEnabled(result.enabled)
+      // Refresh status from Windows Task Scheduler to get authoritative state
+      const status = await getSchedulerStatus()
+      if (status) {
+        setSchedulerEnabled(status.enabled)
+      } else {
+        // Fallback to result if status check fails
+        setSchedulerEnabled(result.enabled)
+      }
+      
       setAlertInfo({
         type: 'success',
         message: result.message,
@@ -414,6 +459,15 @@ export function usePipelineState() {
         type: 'error',
         message: error.message || 'Failed to toggle scheduler',
       })
+      // Refresh status even on error to see actual state
+      try {
+        const status = await getSchedulerStatus()
+        if (status) {
+          setSchedulerEnabled(status.enabled)
+        }
+      } catch (e) {
+        // Ignore status refresh errors
+      }
     }
   }, [schedulerEnabled])
 
@@ -468,6 +522,24 @@ export function usePipelineState() {
     setAlertInfo(null)
   }, [])
 
+  // Clear pipeline lock
+  const handleClearLock = useCallback(async () => {
+    try {
+      await clearPipelineLock()
+      setAlertInfo({
+        type: 'success',
+        message: 'Pipeline lock cleared successfully',
+      })
+      // Refresh status after clearing lock
+      pollPipelineStatus()
+    } catch (error) {
+      setAlertInfo({
+        type: 'error',
+        message: error.message || 'Failed to clear pipeline lock',
+      })
+    }
+  }, [pollPipelineStatus])
+
   return {
     pipelineStatus,
     stageInfo,
@@ -485,5 +557,6 @@ export function usePipelineState() {
     resetPipelineState: handleResetPipeline,
     clearAlert,
     toggleScheduler: handleToggleScheduler,
+    clearPipelineLock: handleClearLock,
   }
 }

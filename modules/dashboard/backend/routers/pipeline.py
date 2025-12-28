@@ -219,6 +219,28 @@ async def reset_pipeline():
         raise HTTPException(500, str(e))
 
 
+@router.post("/clear-lock")
+async def clear_pipeline_lock():
+    """
+    Force clear the pipeline lock file.
+    Use with caution when pipeline is stuck with a lock error.
+    """
+    orchestrator = get_orchestrator()
+    if not orchestrator:
+        raise HTTPException(503, "Pipeline orchestrator not available")
+
+    try:
+        lock_info = await orchestrator.lock_manager.get_lock_info()
+        success = await orchestrator.lock_manager.force_clear_all()
+        if success:
+            return {"message": "Pipeline lock cleared successfully", "previous_lock_info": lock_info}
+        else:
+            raise HTTPException(500, "Failed to clear pipeline lock")
+    except Exception as e:
+        logger.exception("Failed to clear pipeline lock")
+        raise HTTPException(500, str(e))
+
+
 # ---------------------------------------------------------------------
 # Scheduler notifications
 # ---------------------------------------------------------------------

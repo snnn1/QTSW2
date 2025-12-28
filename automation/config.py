@@ -68,7 +68,7 @@ class PipelineConfig:
         
         # Script paths
         merger_script = qtsw2_root / "modules" / "merger" / "merger.py"
-        parallel_analyzer_script = qtsw2_root / "tools" / "run_analyzer_parallel.py"
+        parallel_analyzer_script = qtsw2_root / "ops" / "maintenance" / "run_analyzer_parallel.py"
         
         # Logging directories
         logs_dir = qtsw2_root / "automation" / "logs"
@@ -112,7 +112,7 @@ LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 EVENT_LOGS_DIR = LOGS_DIR / "events"
 
 TRANSLATOR_SCRIPT = QTSW2_ROOT / "tools" / "translate_raw.py"  # Deprecated
-PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
+PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "ops" / "maintenance" / "run_analyzer_parallel.py"
 DATA_MERGER_SCRIPT = QTSW2_ROOT / "modules" / "merger" / "merger.py"
 
 TRANSLATOR_TIMEOUT = 3600

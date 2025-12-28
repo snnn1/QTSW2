@@ -30,6 +30,7 @@ function App() {
     resetPipelineState,
     clearAlert,
     toggleScheduler,
+    clearPipelineLock,
   } = usePipelineState()
 
   // Update Chicago time every second
@@ -128,6 +129,7 @@ function App() {
             onResetPipeline={resetPipelineState}
             onStartApp={startApp}
             onToggleScheduler={toggleScheduler}
+            onClearLock={clearPipelineLock}
           />
 
           <MetricsPanel

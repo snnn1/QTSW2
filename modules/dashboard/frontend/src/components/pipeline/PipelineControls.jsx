@@ -15,6 +15,7 @@ export function PipelineControls({
   onResetPipeline,
   onStartApp,
   onToggleScheduler,
+  onClearLock,
 }) {
   // Determine if reset button should be enabled
   // Phase-1 always-on: Simple button logic
@@ -88,6 +89,17 @@ export function PipelineControls({
             title={schedulerEnabled ? 'Disable automated scheduling' : 'Enable automated scheduling'}
           >
             {schedulerEnabled ? 'Automation: ON' : 'Automation: OFF'}
+          </button>
+          <button
+            onClick={() => {
+              if (window.confirm('Clear the pipeline lock? This will allow the pipeline to run if it\'s stuck with a lock error.')) {
+                onClearLock();
+              }
+            }}
+            className="px-4 py-2 rounded font-medium bg-orange-600 hover:bg-orange-700 text-white"
+            title="Clear pipeline lock file (use when getting 'Failed to acquire lock' errors)"
+          >
+            Clear Lock
           </button>
           <div className="flex gap-2 ml-auto">
             <button

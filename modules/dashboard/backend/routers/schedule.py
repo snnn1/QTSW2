@@ -238,7 +238,8 @@ async def get_scheduler_status():
     windows_status = state.get("windows_task_status", {})
     
     # Use authoritative enabled status from Windows Task Scheduler
-    enabled = state.get("is_enabled", False)
+    # Call is_enabled() which directly queries Windows Task Scheduler
+    enabled = orchestrator_instance.scheduler.is_enabled()
     exists = windows_status.get("exists", None)
     
     if exists is False:
