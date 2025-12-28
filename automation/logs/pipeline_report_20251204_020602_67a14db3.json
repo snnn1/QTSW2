@@ -1,0 +1,38 @@
+{
+  "run_id": "67a14db3-4b6c-4454-9117-2bff0ef070bd",
+  "start_time": "2025-12-04T02:06:02.617821",
+  "end_time": "2025-12-04T02:06:17.676888",
+  "overall_status": "success",
+  "stage_results": {
+    "translator": {
+      "status": "success",
+      "raw_files_found": 6,
+      "files_written": 0,
+      "duration_seconds": 1.0061583518981934,
+      "error": null
+    },
+    "analyzer": {
+      "status": "success",
+      "processed_files_found": 6,
+      "instruments_processed": [
+        "ES",
+        "NQ",
+        "YM",
+        "CL",
+        "NG",
+        "GC"
+      ],
+      "duration_seconds": 13.012808799743652,
+      "error": null
+    },
+    "merger": {
+      "status": "success",
+      "duration_seconds": 1.007981538772583,
+      "error": null
+    }
+  },
+  "metrics": {
+    "total_duration_seconds": 15.059067,
+    "stages_run": 3
+  }
+}

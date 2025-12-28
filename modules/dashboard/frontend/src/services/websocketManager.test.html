@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Manager Tests</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #252526;
+            border-left: 3px solid #007acc;
+        }
+        .test-pass {
+            border-left-color: #4ec9b0;
+        }
+        .test-fail {
+            border-left-color: #f48771;
+        }
+        button {
+            background: #007acc;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover {
+            background: #005a9e;
+        }
+        .log {
+            background: #1e1e1e;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #3e3e42;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            margin: 2px 0;
+            font-size: 12px;
+        }
+        .log-info { color: #d4d4d4; }
+        .log-success { color: #4ec9b0; }
+        .log-error { color: #f48771; }
+        .log-warn { color: #dcdcaa; }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Manager Tests</h1>
+    <p>Open browser console (F12) to see detailed logs</p>
+    
+    <button onclick="runAllTests()">Run All Tests</button>
+    <button onclick="clearLogs()">Clear Logs</button>
+    
+    <div id="test-results"></div>
+
+    <script type="module">
+        // Import the WebSocket manager
+        // Note: Adjust path if needed based on your project structure
+        import { websocketManager } from './websocketManager.js';
+        
+        // Make manager available globally for testing
+        window.websocketManager = websocketManager;
+
+        // Mock WebSocket for testing
+        class MockWebSocket {
+            constructor(url) {
+                this.url = url;
+                this.readyState = MockWebSocket.CONNECTING;
+                this._attemptId = null;
+                this.onopen = null;
+                this.onmessage = null;
+                this.onclose = null;
+                this.onerror = null;
+                
+                // Simulate connection after brief delay
+                setTimeout(() => {
+                    if (this.readyState === MockWebSocket.CONNECTING) {
+                        this.readyState = MockWebSocket.OPEN;
+                        if (this.onopen) {
+                            setTimeout(() => this.onopen({}), 0);
+                        }
+                    }
+                }, 10);
+            }
+            
+            close(code, reason) {
+                this.readyState = MockWebSocket.CLOSED;
+                if (this.onclose) {
+                    setTimeout(() => this.onclose({ code: code || 1000, reason: reason || '' }), 0);
+                }
+            }
+            
+            send(data) {
+                // Not used
+            }
+        }
+
+        MockWebSocket.CONNECTING = 0;
+        MockWebSocket.OPEN = 1;
+        MockWebSocket.CLOSING = 2;
+        MockWebSocket.CLOSED = 3;
+
+        // Test results container
+        const resultsDiv = document.getElementById('test-results');
+        let testCount = 0;
+
+        function log(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            entry.textContent = message;
+            console.log(message);
+            return entry;
+        }
+
+        function createTestSection(title) {
+            const section = document.createElement('div');
+            section.className = 'test-section';
+            section.innerHTML = `<h3>${title}</h3><div class="log"></div>`;
+            resultsDiv.appendChild(section);
+            return section.querySelector('.log');
+        }
+
+        function markTest(section, passed) {
+            section.parentElement.className = `test-section ${passed ? 'test-pass' : 'test-fail'}`;
+        }
+
+        // Test 1: Normal flow
+        async function testNormalFlow() {
+            const logDiv = createTestSection('Test 1: Normal Flow');
+            logDiv.appendChild(log('Starting test...', 'info'));
+            
+            const manager = websocketManager;
+            const events = [];
+            
+            // Save original WebSocket
+            const OriginalWebSocket = window.WebSocket;
+            window.WebSocket = MockWebSocket;
+            
+            try {
+                manager.connect('test-run-1', (event) => {
+                    events.push(event);
+                    logDiv.appendChild(log(`Event received: ${event.type || event.event}`, 'success'));
+                }, true);
+                
+                // Wait for connection
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const ws = manager.ws;
+                if (ws && ws.onmessage) {
+                    // Simulate snapshot
+                    ws.onmessage({
+                        data: JSON.stringify({
+                            type: 'snapshot',
+                            events: [],
+                            window_hours: 1
+                        })
+                    });
+                    logDiv.appendChild(log('Snapshot sent', 'info'));
+                    
+                    // Wait a bit
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                    
+                    // Simulate regular event
+                    ws.onmessage({
+                        data: JSON.stringify({
+                            run_id: 'test-run-1',
+                            stage: 'pipeline',
+                            event: 'start',
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    logDiv.appendChild(log('Regular event sent', 'info'));
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const passed = events.length === 2;
+                logDiv.appendChild(log(`Events received: ${events.length}`, passed ? 'success' : 'error'));
+                logDiv.appendChild(log(`Expected: 2 (snapshot + start event)`, 'info'));
+                logDiv.appendChild(log(`Result: ${passed ? 'PASS ✓' : 'FAIL ✗'}`, passed ? 'success' : 'error'));
+                markTest(logDiv, passed);
+                
+                manager.disconnect();
+            } catch (error) {
+                logDiv.appendChild(log(`Error: ${error.message}`, 'error'));
+                markTest(logDiv, false);
+            } finally {
+                window.WebSocket = OriginalWebSocket;
+            }
+        }
+
+        // Test 2: Backend not sending snapshot
+        async function testNoSnapshot() {
+            const logDiv = createTestSection('Test 2: Backend Not Sending Snapshot');
+            logDiv.appendChild(log('Starting test...', 'info'));
+            
+            const manager = websocketManager;
+            const events = [];
+            
+            const OriginalWebSocket = window.WebSocket;
+            window.WebSocket = MockWebSocket;
+            
+            try {
+                manager.connect('test-run-2', (event) => {
+                    events.push(event);
+                    logDiv.appendChild(log(`Event received: ${event.type || event.event}`, 'success'));
+                }, true);
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const ws = manager.ws;
+                if (ws && ws.onmessage) {
+                    // Send regular event immediately (before snapshot)
+                    ws.onmessage({
+                        data: JSON.stringify({
+                            run_id: 'test-run-2',
+                            stage: 'pipeline',
+                            event: 'start',
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    logDiv.appendChild(log('Event sent before snapshot (should be dropped)', 'warn'));
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 200));
+                logDiv.appendChild(log(`Events received (before timeout): ${events.length}`, 'info'));
+                logDiv.appendChild(log('Expected: 0 (event dropped, no snapshot)', 'info'));
+                
+                // Wait for snapshot timeout (5 seconds)
+                logDiv.appendChild(log('Waiting for snapshot timeout (5 seconds)...', 'warn'));
+                await new Promise(resolve => setTimeout(resolve, 5100));
+                
+                // Send another event after timeout
+                if (ws && ws.onmessage) {
+                    ws.onmessage({
+                        data: JSON.stringify({
+                            run_id: 'test-run-2',
+                            stage: 'pipeline',
+                            event: 'log',
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    logDiv.appendChild(log('Event sent after timeout (should be allowed)', 'info'));
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const passed = events.length === 1;
+                logDiv.appendChild(log(`Events received (after timeout): ${events.length}`, passed ? 'success' : 'error'));
+                logDiv.appendChild(log('Expected: 1 (event after timeout allows events through)', 'info'));
+                logDiv.appendChild(log(`Result: ${passed ? 'PASS ✓' : 'FAIL ✗'}`, passed ? 'success' : 'error'));
+                markTest(logDiv, passed);
+                
+                manager.disconnect();
+            } catch (error) {
+                logDiv.appendChild(log(`Error: ${error.message}`, 'error'));
+                markTest(logDiv, false);
+            } finally {
+                window.WebSocket = OriginalWebSocket;
+            }
+        }
+
+        // Test 3: Malformed snapshot
+        async function testMalformedSnapshot() {
+            const logDiv = createTestSection('Test 3: Malformed Snapshot');
+            logDiv.appendChild(log('Starting test...', 'info'));
+            
+            const manager = websocketManager;
+            const events = [];
+            
+            const OriginalWebSocket = window.WebSocket;
+            window.WebSocket = MockWebSocket;
+            
+            try {
+                manager.connect('test-run-3', (event) => {
+                    events.push(event);
+                    logDiv.appendChild(log(`Event received: ${event.type || event.event}`, 'success'));
+                }, true);
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const ws = manager.ws;
+                if (ws && ws.onmessage) {
+                    // Send malformed snapshot (invalid JSON)
+                    logDiv.appendChild(log('Sending malformed snapshot (invalid JSON)...', 'warn'));
+                    try {
+                        ws.onmessage({
+                            data: '{"type":"snapshot",invalid json}'  // Malformed JSON
+                        });
+                    } catch (e) {
+                        // Expected to fail
+                        logDiv.appendChild(log('Parse error caught (expected)', 'warn'));
+                    }
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 200));
+                
+                // Send regular event - should be allowed through (fallback)
+                if (ws && ws.onmessage) {
+                    ws.onmessage({
+                        data: JSON.stringify({
+                            run_id: 'test-run-3',
+                            stage: 'pipeline',
+                            event: 'start',
+                            timestamp: new Date().toISOString()
+                        })
+                    });
+                    logDiv.appendChild(log('Regular event sent after malformed snapshot', 'info'));
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const passed = events.length === 1;
+                logDiv.appendChild(log(`Events received: ${events.length}`, passed ? 'success' : 'error'));
+                logDiv.appendChild(log('Expected: 1 (event allowed through after malformed snapshot)', 'info'));
+                logDiv.appendChild(log(`Result: ${passed ? 'PASS ✓' : 'FAIL ✗'}`, passed ? 'success' : 'error'));
+                markTest(logDiv, passed);
+                
+                manager.disconnect();
+            } catch (error) {
+                logDiv.appendChild(log(`Error: ${error.message}`, 'error'));
+                markTest(logDiv, false);
+            } finally {
+                window.WebSocket = OriginalWebSocket;
+            }
+        }
+
+        // Test 4: Manual disconnect + reconnect
+        async function testDisconnectReconnect() {
+            const logDiv = createTestSection('Test 4: Manual Disconnect + Reconnect');
+            logDiv.appendChild(log('Starting test...', 'info'));
+            
+            const manager = websocketManager;
+            const events = [];
+            
+            const OriginalWebSocket = window.WebSocket;
+            window.WebSocket = MockWebSocket;
+            
+            try {
+                // Connect
+                manager.connect('test-run-4', (event) => {
+                    events.push(event);
+                    logDiv.appendChild(log(`Event received: ${event.type || event.event}`, 'success'));
+                }, true);
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                const runIdBeforeDisconnect = manager.getRunId();
+                logDiv.appendChild(log(`RunId before disconnect: ${runIdBeforeDisconnect}`, 'info'));
+                
+                // Disconnect
+                manager.disconnect();
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                const runIdAfterDisconnect = manager.getRunId();
+                logDiv.appendChild(log(`RunId after disconnect: ${runIdAfterDisconnect}`, 'info'));
+                const pass1 = runIdAfterDisconnect === null;
+                logDiv.appendChild(log(`Expected: null - ${pass1 ? 'PASS ✓' : 'FAIL ✗'}`, pass1 ? 'success' : 'error'));
+                
+                // Reconnect
+                manager.connect('test-run-4-new', (event) => {
+                    events.push(event);
+                    logDiv.appendChild(log(`Event received: ${event.type || event.event}`, 'success'));
+                }, true);
+                
+                await new Promise(resolve => setTimeout(resolve, 100));
+                const runIdAfterReconnect = manager.getRunId();
+                logDiv.appendChild(log(`RunId after reconnect: ${runIdAfterReconnect}`, 'info'));
+                const pass2 = runIdAfterReconnect === 'test-run-4-new';
+                logDiv.appendChild(log(`Expected: test-run-4-new - ${pass2 ? 'PASS ✓' : 'FAIL ✗'}`, pass2 ? 'success' : 'error'));
+                
+                const passed = pass1 && pass2;
+                logDiv.appendChild(log(`Result: ${passed ? 'PASS ✓' : 'FAIL ✗'}`, passed ? 'success' : 'error'));
+                markTest(logDiv, passed);
+                
+                manager.disconnect();
+            } catch (error) {
+                logDiv.appendChild(log(`Error: ${error.message}`, 'error'));
+                markTest(logDiv, false);
+            } finally {
+                window.WebSocket = OriginalWebSocket;
+            }
+        }
+
+        // Run all tests
+        window.runAllTests = async function() {
+            resultsDiv.innerHTML = '';
+            console.log('Starting WebSocket Manager Tests...\n');
+            
+            try {
+                await testNormalFlow();
+                await testNoSnapshot();
+                await testMalformedSnapshot();
+                await testDisconnectReconnect();
+                
+                const summary = document.createElement('div');
+                summary.className = 'test-section';
+                summary.innerHTML = '<h3>All Tests Complete</h3><p>Check individual test results above.</p>';
+                resultsDiv.appendChild(summary);
+                
+                console.log('\n=== All Tests Complete ===');
+            } catch (error) {
+                console.error('Test error:', error);
+            }
+        };
+
+        window.clearLogs = function() {
+            resultsDiv.innerHTML = '';
+        };
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "filePath": "C:\\Users\\jakej\\QTSW2\\data\\raw\\DataExport_NG_20251116_151302_UTC.csv",
+  "fileName": "DataExport_NG_20251116_151302_UTC.csv",
+  "dataType": "Minute",
+  "instrument": "NG",
+  "totalBarsProcessed": 1264,
+  "gapsDetected": 40,
+  "invalidDataSkipped": 0,
+  "fileSizeBytes": 62208,
+  "fileSizeMB": 0.06,
+  "completedAt": "2025-11-16T15:13:04.646Z"
+}

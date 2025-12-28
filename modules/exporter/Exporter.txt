@@ -1,0 +1,284 @@
+#region Using declarations
+using System;
+using System.IO;
+using System.Globalization;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Data;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class Exporter : Indicator
+    {
+        private string rootPath = @"C:\Users\jakej\QTSW2\data\raw";
+        private StreamWriter sw;
+        private string currentFilePath = null;
+
+        // Disk is the single source of truth for deduplication
+        private DateTime lastTimestampOnDiskUtc = DateTime.MinValue;
+
+        // Flush at most once per UTC minute
+        private int lastFlushedMinuteUtc = -1;
+        
+        // Track if we've entered real-time mode (to refresh timestamp from disk)
+        private bool hasEnteredRealtime = false;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "Exporter";
+                Description = "QTSW2 raw 1-minute data exporter";
+                Calculate   = Calculate.OnBarClose;
+                IsOverlay   = false;
+            }
+            else if (State == State.DataLoaded)
+            {
+                if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+                    Print("ERROR: Exporter only works on 1-minute charts.");
+            }
+            else if (State == State.Terminated)
+            {
+                CloseWriter();
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+                return;
+
+            if (CurrentBar < 1)
+                return;
+
+            try
+            {
+                // Bar OPEN time in UTC (corrects NinjaTrader close-time behavior)
+                DateTime timestampUtc =
+                    Time[0].AddMinutes(-1).ToUniversalTime();
+
+                string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                string interval   = "1m";
+
+                string yyyy = timestampUtc.ToString("yyyy");
+                string mm   = timestampUtc.ToString("MM");
+                string date = timestampUtc.ToString("yyyy-MM-dd");
+
+                string folder = Path.Combine(rootPath, instrument, interval, yyyy, mm);
+                Directory.CreateDirectory(folder);
+
+                string filePath = Path.Combine(folder, $"{instrument}_{interval}_{date}.csv");
+
+                if (currentFilePath != filePath)
+                    OpenOrSwitchFile(filePath);
+
+                if (sw == null)
+                    return;
+
+                // When entering real-time mode, refresh timestamp from disk to ensure we catch new data
+                // This handles the case where file already has recent data from previous session
+                if (State == State.Realtime && !hasEnteredRealtime)
+                {
+                    hasEnteredRealtime = true;
+                    DateTime diskTimestamp = GetLastTimestampFromFile(filePath);
+                    if (diskTimestamp > lastTimestampOnDiskUtc)
+                    {
+                        lastTimestampOnDiskUtc = diskTimestamp;
+                        Print($"Exporter: Entered real-time mode. Last timestamp on disk: {lastTimestampOnDiskUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                    }
+                }
+
+                // HARD dedupe — disk authority
+                if (timestampUtc <= lastTimestampOnDiskUtc)
+                    return;
+
+                string row = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0},{1},{2},{3},{4},{5}",
+                    timestampUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                    Open[0],
+                    High[0],
+                    Low[0],
+                    Close[0],
+                    Volume[0]
+                );
+
+                sw.WriteLine(row);
+
+                int minuteUtc = timestampUtc.Minute;
+                if (minuteUtc != lastFlushedMinuteUtc)
+                {
+                    sw.Flush();
+                    lastFlushedMinuteUtc = minuteUtc;
+                }
+
+                // Update authoritative timestamp only after successful write
+                lastTimestampOnDiskUtc = timestampUtc;
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR in OnBarUpdate: {ex.Message}");
+            }
+        }
+
+        private void OpenOrSwitchFile(string filePath)
+        {
+            CloseWriter();
+
+            bool exists = File.Exists(filePath);
+            lastTimestampOnDiskUtc = exists
+                ? GetLastTimestampFromFile(filePath)
+                : DateTime.MinValue;
+
+            // Reset real-time flag when switching files
+            hasEnteredRealtime = false;
+
+            try
+            {
+                sw = new StreamWriter(filePath, append: true);
+                currentFilePath = filePath;
+
+                if (!exists)
+                {
+                    sw.WriteLine("timestamp_utc,open,high,low,close,volume");
+                    sw.Flush();
+                }
+
+                lastFlushedMinuteUtc = -1;
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR opening file {filePath}: {ex.Message}");
+                sw = null;
+                currentFilePath = null;
+            }
+        }
+
+        private void CloseWriter()
+        {
+            if (sw != null)
+            {
+                try
+                {
+                    sw.Flush();
+                    sw.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Print($"Exporter: ERROR closing file: {ex.Message}");
+                }
+                sw = null;
+                currentFilePath = null;
+            }
+        }
+
+        private DateTime GetLastTimestampFromFile(string filePath)
+        {
+            try
+            {
+                FileInfo fi = new FileInfo(filePath);
+                if (!fi.Exists || fi.Length == 0)
+                    return DateTime.MinValue;
+
+                long bytes = Math.Min(fi.Length, 4096);
+                string tail;
+
+                using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    fs.Seek(-bytes, SeekOrigin.End);
+                    using (StreamReader sr = new StreamReader(fs))
+                        tail = sr.ReadToEnd();
+                }
+
+                string[] lines = tail.Split(
+                    new[] { '\n', '\r' },
+                    StringSplitOptions.RemoveEmptyEntries);
+
+                for (int i = lines.Length - 1; i >= 0; i--)
+                {
+                    string line = lines[i].Trim();
+                    if (line.StartsWith("timestamp_utc"))
+                        continue;
+
+                    string[] parts = line.Split(',');
+                    if (parts.Length == 0)
+                        continue;
+
+                    if (DateTime.TryParseExact(
+                        parts[0],
+                        "yyyy-MM-ddTHH:mm:ssZ",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out DateTime parsed))
+                    {
+                        return parsed;
+                    }
+                }
+
+                return DateTime.MinValue;
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR reading last timestamp: {ex.Message}");
+                return DateTime.MinValue;
+            }
+        }
+    }
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private Exporter[] cacheExporter;
+		public Exporter Exporter()
+		{
+			return Exporter(Input);
+		}
+
+		public Exporter Exporter(ISeries<double> input)
+		{
+			if (cacheExporter != null)
+				for (int idx = 0; idx < cacheExporter.Length; idx++)
+					if (cacheExporter[idx] != null &&  cacheExporter[idx].EqualsInput(input))
+						return cacheExporter[idx];
+			return CacheIndicator<Exporter>(new Exporter(), input, ref cacheExporter);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.Exporter Exporter()
+		{
+			return indicator.Exporter(Input);
+		}
+
+		public Indicators.Exporter Exporter(ISeries<double> input )
+		{
+			return indicator.Exporter(input);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.Exporter Exporter()
+		{
+			return indicator.Exporter(Input);
+		}
+
+		public Indicators.Exporter Exporter(ISeries<double> input )
+		{
+			return indicator.Exporter(input);
+		}
+	}
+}
+
+#endregion

@@ -1,0 +1,13 @@
+{
+  "status": "complete",
+  "filePath": "C:\\Users\\jakej\\QTSW2\\data\\raw\\DataExport_ES_20251116_151302_UTC.csv",
+  "fileName": "DataExport_ES_20251116_151302_UTC.csv",
+  "dataType": "Minute",
+  "instrument": "ES",
+  "totalBarsProcessed": 1319,
+  "gapsDetected": 0,
+  "invalidDataSkipped": 0,
+  "fileSizeBytes": 82223,
+  "fileSizeMB": 0.08,
+  "completedAt": "2025-11-16T15:13:04.654Z"
+}

@@ -1,0 +1,5 @@
+{"run_id": "ae54b75a-a18b-4637-a125-d01117cbcae9", "stage": "merger", "event": "start", "timestamp": "2025-12-02T17:08:53.026376", "msg": "Starting Data Merger / Consolidator"}
+{"run_id": "ae54b75a-a18b-4637-a125-d01117cbcae9", "stage": "merger", "event": "log", "timestamp": "2025-12-02T17:08:53.027237", "msg": "Found 0 analyzer folders and 0 sequencer folders", "data": {"analyzer_folders": 0, "sequencer_folders": 0}}
+{"run_id": "ae54b75a-a18b-4637-a125-d01117cbcae9", "stage": "merger", "event": "metric", "timestamp": "2025-12-02T17:08:53.027587", "msg": "Analyzer processing complete: 0/0", "data": {"analyzer_success": 0, "analyzer_total": 0}}
+{"run_id": "ae54b75a-a18b-4637-a125-d01117cbcae9", "stage": "merger", "event": "metric", "timestamp": "2025-12-02T17:08:53.028142", "msg": "Sequencer processing complete: 0/0", "data": {"sequencer_success": 0, "sequencer_total": 0}}
+{"run_id": "ae54b75a-a18b-4637-a125-d01117cbcae9", "stage": "merger", "event": "success", "timestamp": "2025-12-02T17:08:53.028797", "msg": "Merger completed: 0/0 folders processed", "data": {"total_success": 0, "total_folders": 0, "analyzer_success": 0, "sequencer_success": 0}}
