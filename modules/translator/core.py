@@ -126,15 +126,38 @@ def translate_file(
             total_count = len(df)
             mismatched_dates = timestamp_dates[mismatched].unique()
             
-            # Filter out mismatched rows (keep only data for the correct trading day)
-            df = df[~mismatched].copy()
-            
-            # Log warning for observability (but don't fail - this is expected in trading data)
-            logger.warning(
-                f"Date filter: Filename indicates {trade_date}, but {mismatched_count}/{total_count} "
-                f"timestamp(s) after UTC->Chicago conversion had date(s) {sorted(mismatched_dates)}. "
-                f"Filtered out {mismatched_count} row(s) to keep only data for trading day {trade_date}."
-            )
+            # Special case: If ALL rows are mismatched, this indicates a filename date error
+            # Auto-detect the correct trading date from the data (most common date)
+            if mismatched_count == total_count:
+                # Find the most common date in the data
+                date_counts = timestamp_dates.value_counts()
+                actual_trade_date = date_counts.index[0]  # Most common date
+                
+                logger.error(
+                    f"CRITICAL: Filename indicates {trade_date}, but ALL {total_count} timestamp(s) "
+                    f"after UTC->Chicago conversion have date {actual_trade_date}. "
+                    f"This indicates the filename date is incorrect. "
+                    f"Expected filename: {instrument}_1m_{actual_trade_date.isoformat()}.csv"
+                )
+                
+                # Use the actual trading date from the data instead of filename
+                # This prevents data loss when exporter creates files with wrong date
+                trade_date = actual_trade_date
+                logger.warning(
+                    f"Auto-correcting trading date from filename ({trade_date}) to actual data date ({actual_trade_date}). "
+                    f"All {total_count} row(s) will be kept."
+                )
+                # Don't filter - keep all rows since we've corrected the date
+            else:
+                # Partial mismatch - filter out rows that don't match filename date
+                df = df[~mismatched].copy()
+                
+                # Log warning for observability (but don't fail - this is expected in trading data)
+                logger.warning(
+                    f"Date filter: Filename indicates {trade_date}, but {mismatched_count}/{total_count} "
+                    f"timestamp(s) after UTC->Chicago conversion had date(s) {sorted(mismatched_dates)}. "
+                    f"Filtered out {mismatched_count} row(s) to keep only data for trading day {trade_date}."
+                )
 
     yyyy = f"{trade_date.year:04d}"
     mm = f"{trade_date.month:02d}"
