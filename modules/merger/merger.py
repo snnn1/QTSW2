@@ -331,8 +331,10 @@ class DataMerger:
         - Duplicate key includes Stream if present (to prevent silent overwrites of parallel streams)
         - If Stream is missing, asserts upstream invariant: one row per (Date, Time, Session, Instrument)
         - When duplicates are found, keeps the LAST occurrence (new data replaces old data)
+        - Additionally checks if profit/ExitTime/ExitPrice differ - if they do, it's an update, not a duplicate
         
         Duplicate key: Date, Time, Session, Instrument, Stream (if Stream present)
+        Update check: Profit, ExitTime, ExitPrice (if these differ, it's an update even if dedup key matches)
         """
         if df.empty:
             return df
@@ -372,12 +374,46 @@ class DataMerger:
         
         initial_count = len(df)
         
+        # Check for rows with same dedup key but different profit/ExitTime/ExitPrice (these are updates, not duplicates)
+        update_check_cols = ['Profit', 'ExitTime', 'ExitPrice']
+        available_update_cols = [col for col in update_check_cols if col in df.columns]
+        
+        true_duplicates = 0
+        updates = 0
+        
+        if available_update_cols:
+            # Group by dedup key and check if update fields differ
+            grouped = df.groupby(available_cols)
+            for key, group in grouped:
+                if len(group) > 1:
+                    # Check if update fields differ within this group
+                    is_update = False
+                    for update_col in available_update_cols:
+                        unique_values = group[update_col].dropna().unique()
+                        if len(unique_values) > 1:
+                            is_update = True
+                            updates += len(group) - 1
+                            logger.debug(f"Found update for {key}: {update_col} differs ({unique_values})")
+                            break
+                    
+                    if not is_update:
+                        # All update fields are the same - it's a true duplicate
+                        true_duplicates += len(group) - 1
+            
+            if updates > 0:
+                logger.info(f"Found {updates} rows with same dedup key but different profit/ExitTime/ExitPrice - treating as updates (will replace old data)")
+            if true_duplicates > 0:
+                logger.info(f"Found {true_duplicates} true duplicate rows (same dedup key AND same profit/ExitTime/ExitPrice)")
+        
         # Remove duplicates, keeping last occurrence (new data replaces old)
         df_deduped = df.drop_duplicates(subset=available_cols, keep='last')
         duplicates_removed = initial_count - len(df_deduped)
         
         if duplicates_removed > 0:
-            logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data (new data replaces old)")
+            if updates > 0:
+                logger.info(f"Removed {duplicates_removed} rows from analyzer data ({updates} updates, {true_duplicates} true duplicates) - new data replaces old")
+            else:
+                logger.info(f"Removed {duplicates_removed} duplicate rows from analyzer data (new data replaces old)")
         
         return df_deduped
     

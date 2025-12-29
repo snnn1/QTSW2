@@ -63,6 +63,7 @@ function AppContent() {
     breakdownLoading: workerBreakdownLoading,
     timetable: workerTimetable,
     timetableLoading: workerTimetableLoading,
+    executionTimetable: workerExecutionTimetable,
     error: workerError,
     initData: workerInitData,
     filter: workerFilter,
@@ -390,6 +391,114 @@ function AppContent() {
       setMasterLoading(false)
     }
   }, [streamFilters, workerInitData, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, availableColumns, setAvailableColumns, setSelectedColumns])
+  
+  // Update master matrix function (rolling window update)
+  const updateMasterMatrix = useCallback(async () => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    const hadExistingData = masterData.length > 0
+    
+    try {
+      // Check if backend is reachable
+      try {
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 3000)
+        const healthCheck = await fetch(`${API_BASE.replace('/api', '')}/`, { 
+          method: 'GET', 
+          signal: controller.signal 
+        })
+        clearTimeout(timeoutId)
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          setMasterError(`Backend connection timeout. Make sure the dashboard backend is running on http://localhost:${API_PORT}`)
+        } else {
+          setMasterError(`Backend not running. Please start the dashboard backend on port ${API_PORT}. Error: ` + e.message)
+        }
+        if (!hadExistingData) {
+          setMasterData([])
+        }
+        setMasterLoading(false)
+        return
+      }
+      
+      // Build stream filters for API
+      const streamFiltersApi = {}
+      Object.keys(streamFilters).forEach(streamId => {
+        const filters = streamFilters[streamId]
+        if (filters) {
+          streamFiltersApi[streamId] = {
+            exclude_days_of_week: filters.exclude_days_of_week || [],
+            exclude_days_of_month: filters.exclude_days_of_month || [],
+            exclude_times: filters.exclude_times || []
+          }
+        }
+      })
+      
+      const updateBody = {
+        mode: "window",
+        stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
+      }
+      
+      try {
+        const updateResponse = await fetch(`${API_BASE}/matrix/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updateBody)
+        })
+        
+        if (!updateResponse.ok) {
+          const errorData = await updateResponse.json()
+          setMasterError(errorData.detail || 'Failed to update master matrix')
+          setMasterLoading(false)
+          return
+        }
+        
+        await updateResponse.json()
+      } catch (error) {
+        setMasterError(`Failed to update master matrix: ${error.message}`)
+        setMasterLoading(false)
+        return
+      }
+      
+      // Load the updated matrix data
+      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=0&essential_columns_only=true&skip_cleaning=true`)
+      
+      if (!dataResponse.ok) {
+        const errorData = await dataResponse.json()
+        setMasterError(errorData.detail || 'Failed to load matrix data')
+        if (!hadExistingData) {
+          setMasterData([])
+        }
+        setMasterLoading(false)
+        return
+      }
+      
+      const data = await dataResponse.json()
+      const trades = data.data || []
+      
+      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
+        setAvailableYearsFromAPI(data.years)
+      }
+      
+      // Update master data and reinitialize worker with new data
+      setMasterData(trades)
+      setLastMergeTime(new Date()) // Track when data was updated
+      
+      if (trades.length > 0 && workerInitData) {
+        workerInitData(trades)
+      }
+      
+      setMasterError(null)
+      setMasterLoading(false)
+    } catch (error) {
+      setMasterError(`Failed to update master matrix: ${error.message}`)
+      if (!hadExistingData) {
+        setMasterData([])
+      }
+      setMasterLoading(false)
+    }
+  }, [masterData, streamFilters, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, workerInitData])
   
   // Retry loading if backend wasn't ready
   const retryLoad = useCallback(() => {
@@ -2136,7 +2245,7 @@ function AppContent() {
             </button>
             {streamFilters[streamId]?._showDomDropdown && (
               <div 
-                className="absolute z-10 w-full mt-1 bg-gray-800 border border-gray-600 rounded shadow-lg max-h-48 overflow-y-auto"
+                className="absolute top-full left-0 right-0 w-full mt-1 bg-gray-800 border border-gray-600 rounded shadow-xl max-h-48 overflow-y-auto z-20"
                 onClick={(e) => e.stopPropagation()}
                 onMouseDown={(e) => e.stopPropagation()}
               >
@@ -2496,15 +2605,21 @@ function AppContent() {
                 if (numValue === 0 || numValue === '0' || numValue === 0.0) {
                   value = isNG ? '0.000' : '0.00'
                 } else if (!isNaN(numValue) && isFinite(numValue)) {
-                  value = numValue.toFixed(decimalPlaces)
+                  // Round to avoid floating point precision errors
+                  const multiplier = Math.pow(10, decimalPlaces)
+                  const rounded = Math.round(numValue * multiplier) / multiplier
+                  value = rounded.toFixed(decimalPlaces)
                 } else {
                   value = '-'
                 }
               }
             } else if (value !== null && value !== undefined) {
               const numValue = parseFloat(value)
-              if (!isNaN(numValue)) {
-                value = numValue.toFixed(decimalPlaces)
+              if (!isNaN(numValue) && isFinite(numValue)) {
+                // Round to avoid floating point precision errors
+                const multiplier = Math.pow(10, decimalPlaces)
+                const rounded = Math.round(numValue * multiplier) / multiplier
+                value = rounded.toFixed(decimalPlaces)
               }
             }
           }
@@ -2523,11 +2638,19 @@ function AppContent() {
           // Format time slot columns
           if (col.includes(' Rolling') && value !== null && value !== undefined) {
             const numValue = parseFloat(value)
-            if (!isNaN(numValue)) value = numValue.toFixed(2)
+            if (!isNaN(numValue) && isFinite(numValue)) {
+              // Round to avoid floating point precision errors
+              const rounded = Math.round(numValue * 100) / 100
+              value = rounded.toFixed(2)
+            }
           }
           if (col.includes(' Points') && value !== null && value !== undefined) {
             const numValue = parseFloat(value)
-            if (!isNaN(numValue)) value = numValue.toFixed(0)
+            if (!isNaN(numValue) && isFinite(numValue)) {
+              // Round to avoid floating point precision errors
+              const rounded = Math.round(numValue)
+              value = rounded.toFixed(0)
+            }
           }
           
           // Determine cell styling
@@ -2630,8 +2753,16 @@ function AppContent() {
             }
             
             workerGetRows(chunks[chunkIndex], (newRows) => {
+              if (!newRows || newRows.length === 0) {
+                // No rows returned, move to next chunk
+                loadedChunks++
+                setTimeout(() => loadChunk(chunkIndex + 1), 10)
+                return
+              }
+              
               setLoadedRows(prev => {
                 const existingLength = prev.length
+                // Check if we already have enough rows (avoid duplicates)
                 if (existingLength >= currentLoaded + loadedChunks * CHUNK_SIZE + newRows.length) {
                   return prev
                 }
@@ -2649,7 +2780,7 @@ function AppContent() {
         }
       }
     }
-  }, [workerReady, workerFilteredIndices?.length, workerGetRows, loadedRows.length, loadingMoreRows])
+  }, [workerReady, workerFilteredIndices && workerFilteredIndices.length, workerGetRows, loadedRows.length, loadingMoreRows])
   
   // Load more rows function - use ref to access current loadedRows without dependency
   const loadedRowsRef = useRef([])
@@ -3322,6 +3453,34 @@ function AppContent() {
     }
   }, [workerReady, masterData.length, streamFilters, activeTab, workerCalculateTimetable, currentTradingDay])
   
+  // DEPRECATED: UI auto-save of execution timetable
+  // Execution timetable is now persisted automatically by backend when master matrix is saved.
+  // This UI save is redundant but kept for backward compatibility during transition.
+  // TODO: Remove this useEffect after confirming backend persistence works correctly.
+  // useEffect(() => {
+  //   if (workerExecutionTimetable && workerExecutionTimetable.streams && workerExecutionTimetable.streams.length > 0) {
+  //     const saveExecutionTimetable = async () => {
+  //       try {
+  //         const response = await fetch(`${API_BASE}/timetable/execution`, {
+  //           method: 'POST',
+  //           headers: {
+  //             'Content-Type': 'application/json',
+  //           },
+  //           body: JSON.stringify(workerExecutionTimetable)
+  //         })
+  //         if (!response.ok) {
+  //           console.error('Failed to save execution timetable:', await response.text())
+  //         } else {
+  //           console.log('Execution timetable saved successfully')
+  //         }
+  //       } catch (error) {
+  //         console.error('Error saving execution timetable:', error)
+  //       }
+  //     }
+  //     saveExecutionTimetable()
+  //   }
+  // }, [workerExecutionTimetable])
+  
   // Show backend connection state if not ready
   if (backendConnecting) {
     return (
@@ -3590,6 +3749,11 @@ function AppContent() {
                   <p className="text-sm text-gray-400 mt-1">
                     Sorted by: Date (newest first), Time (earliest first)
                   </p>
+                  {lastMergeTime && (
+                    <p className="text-xs text-gray-500 mt-1 font-mono">
+                      Last Updated: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({lastMergeTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })})
+                    </p>
+                  )}
                 </div>
                 <div className="flex gap-2">
                   <button
@@ -3614,7 +3778,19 @@ function AppContent() {
                         : 'bg-blue-600 hover:bg-blue-700'
                     }`}
                   >
-                    {masterLoading ? 'Loading...' : 'Rebuild Matrix'}
+                    {masterLoading ? 'Loading...' : 'Rebuild Matrix (Full)'}
+                  </button>
+                  <button
+                    onClick={() => updateMasterMatrix()}
+                    disabled={masterLoading}
+                    className={`px-4 py-2 rounded font-medium text-sm ${
+                      masterLoading
+                        ? 'bg-gray-700 cursor-not-allowed'
+                        : 'bg-green-600 hover:bg-green-700'
+                    }`}
+                    title="Reprocess last 35 trading days from merged data and append forward. Safe for overlapping pipeline exports."
+                  >
+                    {masterLoading ? 'Updating...' : 'Update Matrix (Rolling 35-Day Window)'}
                   </button>
                 </div>
               </div>

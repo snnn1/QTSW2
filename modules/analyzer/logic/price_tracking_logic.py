@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
+from datetime import datetime
 from .debug_logic import DebugManager, DebugInfo
 
 # Optional scipy import with fallback
@@ -453,8 +454,24 @@ class PriceTracker:
                 
                 # Check time expiry
                 if bar["timestamp"] >= expiry_time:
+                    # Use expiry_time as exit_time (not bar timestamp) to ensure correct TIME exit
+                    # e.g., Friday 11:00 trade expires at Monday 10:59, not Monday 11:00
+                    exit_time_for_time_expiry = expiry_time
+                    
+                    # Find the bar at expiry_time (or closest bar before it)
+                    # If bar["timestamp"] >= expiry_time, this bar might be AFTER expiry_time
+                    # We want the bar AT expiry_time, or the last bar BEFORE expiry_time
+                    bars_at_or_before_expiry = after[after["timestamp"] <= expiry_time]
+                    if len(bars_at_or_before_expiry) > 0:
+                        # Use the last bar at or before expiry_time
+                        expiry_bar = bars_at_or_before_expiry.iloc[-1]
+                        exit_price_for_time_expiry = float(expiry_bar["close"])
+                    else:
+                        # No bars at or before expiry_time - use current bar (shouldn't happen)
+                        exit_price_for_time_expiry = float(bar["close"])
+                    
                     result_classification = self._classify_result(
-                        t1_triggered, "TIME", False, entry_price, bar["timestamp"], df, direction, t1_removed
+                        t1_triggered, "TIME", False, entry_price, exit_time_for_time_expiry, df, direction, t1_removed
                     )
                     
                     # Calculate final MFE if we have MFE bars
@@ -478,21 +495,101 @@ class PriceTracker:
                     
                     # Calculate profit for time expiry
                     profit = self.calculate_profit(
-                        entry_price, float(bar["close"]), direction, result_classification,
+                        entry_price, exit_price_for_time_expiry, direction, result_classification,
                         t1_triggered, target_pts, instrument,
                         target_hit=False
                     )
                     
                     return self._create_trade_execution(
-                        float(bar["close"]), bar["timestamp"], "TIME", False, False, True,
+                        exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, True,
                         max_favorable, peak_time, peak_price, t1_triggered,
                         stop_loss_adjusted, current_stop_loss, result_classification, profit
                     )
             
-            # If we get here, trade expired
-            last_bar = after.iloc[-1]
+            # If we get here, data didn't extend to expiry_time
+            # Check if trade has actually expired (expiry_time has passed) or is still open
+            # Use the absolute last bar in the entire dataset (not just after entry_time)
+            # This ensures we get the most recent price even if new data was added
+            last_bar_in_data = df.iloc[-1]  # Absolute last bar in entire dataset
+            last_bar_after_entry = after.iloc[-1] if len(after) > 0 else None
+            
+            # Get current time in Chicago timezone
+            if expiry_time and expiry_time.tz:
+                # Use same timezone as expiry_time (should be Chicago)
+                current_time = pd.Timestamp.now(tz=expiry_time.tz)
+            else:
+                # If expiry_time doesn't have timezone, use Chicago timezone
+                current_time = pd.Timestamp.now(tz="America/Chicago")
+            
+            # Ensure expiry_time is timezone-aware (Chicago)
+            if expiry_time and expiry_time.tz is None:
+                expiry_time = expiry_time.tz_localize("America/Chicago")
+            elif expiry_time and str(expiry_time.tz) != "America/Chicago":
+                expiry_time = expiry_time.tz_convert("America/Chicago")
+            
+            # Trade is still open if expiry_time is in the future
+            if expiry_time and expiry_time > current_time:
+                # Trade hasn't expired yet - use current time and current price
+                # ExitTime = current time in Chicago (trade is still ongoing)
+                exit_time_for_time_expiry = current_time  # Current time in Chicago
+                # Use the absolute last bar's close price (most recent price in entire dataset)
+                # This ensures we get the latest price even if new data was added since entry
+                exit_price_for_time_expiry = float(last_bar_in_data["close"])  # Current/last available price from most recent bar in dataset
+                
+                # Use "TIME" as exit_reason but time_expired=False (trade still ongoing)
+                result_classification = self._classify_result(
+                    t1_triggered, "TIME", False, entry_price, exit_time_for_time_expiry, df, direction, t1_removed
+                )
+                
+                # Calculate profit based on current price (trade still open)
+                profit = self.calculate_profit(
+                    entry_price, exit_price_for_time_expiry, direction, result_classification,
+                    t1_triggered, target_pts, instrument,
+                    target_hit=False
+                )
+                
+                # Calculate final MFE
+                if mfe_end_time and len(mfe_bars) > 0:
+                    final_mfe_data = self._calculate_final_mfe(
+                        mfe_bars, entry_time, entry_price, direction, stop_loss, t1_threshold, debug_info, t1_triggered
+                    )
+                    max_favorable = final_mfe_data["peak"]
+                    peak_time = final_mfe_data["peak_time"]
+                    peak_price = final_mfe_data["peak_price"]
+                    t1_triggered = final_mfe_data["t1_triggered"]
+                else:
+                    max_favorable = max_favorable_execution
+                    peak_time = entry_time
+                    peak_price = entry_price
+                
+                # Return trade execution with current state (still open)
+                # Result = "TIME", ExitTime = current time, Profit = current price
+                return self._create_trade_execution(
+                    exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, False,  # exit_reason="TIME", time_expired=False
+                    max_favorable, peak_time, peak_price, t1_triggered,
+                    stop_loss_adjusted, current_stop_loss, result_classification, profit
+                )
+            
+            # Trade has expired (expiry_time has passed or data extends to it)
+            # Use expiry_time as exit_time (not last bar timestamp)
+            # This ensures Friday trades expire on Monday even if data doesn't extend that far
+            exit_time_for_time_expiry = expiry_time if expiry_time else last_bar["timestamp"]
+            
+            # If expiry_time is in the future relative to data but has passed in real time, use the last bar's close price
+            # Otherwise use the bar at expiry_time
+            if expiry_time and expiry_time > last_bar["timestamp"]:
+                # Data doesn't extend to expiry_time but expiry_time has passed - use last bar's close price
+                exit_price_for_time_expiry = float(last_bar["close"])
+            else:
+                # Data extends to expiry_time - find the bar at expiry_time
+                expiry_bar = after[after["timestamp"] >= expiry_time]
+                if len(expiry_bar) > 0:
+                    exit_price_for_time_expiry = float(expiry_bar.iloc[0]["close"])
+                else:
+                    exit_price_for_time_expiry = float(last_bar["close"])
+            
             result_classification = self._classify_result(
-                t1_triggered, "TIME", False, entry_price, last_bar["timestamp"], df, direction, t1_removed
+                t1_triggered, "TIME", False, entry_price, exit_time_for_time_expiry, df, direction, t1_removed
             )
             
             # Calculate final MFE if we have MFE bars
@@ -524,13 +621,13 @@ class PriceTracker:
             
             # Calculate profit for final time expiry
             profit = self.calculate_profit(
-                entry_price, float(last_bar["close"]), direction, result_classification,
+                entry_price, exit_price_for_time_expiry, direction, result_classification,
                 t1_triggered, target_pts, instrument,
                 target_hit=False
             )
             
             return self._create_trade_execution(
-                float(last_bar["close"]), last_bar["timestamp"], "TIME", False, False, True,
+                exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, True,
                 max_favorable, peak_time, peak_price, t1_triggered,
                 stop_loss_adjusted, current_stop_loss, result_classification, profit
             )
@@ -605,13 +702,21 @@ class PriceTracker:
         Calculate trade expiry time
         
         Args:
-            date: Trading date
+            date: Trading date (should be timezone-aware, Chicago time)
             time_label: Time slot (e.g., "08:00")
             session: Session (S1 or S2)
             
         Returns:
-            Expiry timestamp
+            Expiry timestamp in Chicago timezone
         """
+        # Ensure date is timezone-aware (Chicago time)
+        if date.tz is None:
+            # If naive, assume it's Chicago time and localize it
+            date = pd.Timestamp(date).tz_localize("America/Chicago")
+        elif str(date.tz) != "America/Chicago":
+            # If different timezone, convert to Chicago
+            date = date.tz_convert("America/Chicago")
+        
         # Calculate expiry time (next day same slot + 1 minute)
         if date.weekday() == 4:  # Friday
             # Friday trades expire Monday
@@ -630,6 +735,12 @@ class PriceTracker:
             second=0, 
             microsecond=0
         )
+        
+        # Ensure expiry_time is in Chicago timezone
+        if expiry_time.tz is None:
+            expiry_time = expiry_time.tz_localize("America/Chicago")
+        elif str(expiry_time.tz) != "America/Chicago":
+            expiry_time = expiry_time.tz_convert("America/Chicago")
         
         return expiry_time
     

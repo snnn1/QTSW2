@@ -22,5 +22,10 @@ DOM_BLOCKED_DAYS = {4, 16, 30}
 # SCF threshold for timetable engine
 SCF_THRESHOLD = 0.5
 
-__all__ = ['SLOT_ENDS', 'ROLLING_WINDOW_SIZE', 'DOM_BLOCKED_DAYS', 'SCF_THRESHOLD']
+# Rolling window update configuration
+MATRIX_REPROCESS_TRADING_DAYS = 35
+MATRIX_CHECKPOINT_FREQUENCY = "weekly"  # "weekly" or "monthly"
+
+__all__ = ['SLOT_ENDS', 'ROLLING_WINDOW_SIZE', 'DOM_BLOCKED_DAYS', 'SCF_THRESHOLD', 
+           'MATRIX_REPROCESS_TRADING_DAYS', 'MATRIX_CHECKPOINT_FREQUENCY']
 

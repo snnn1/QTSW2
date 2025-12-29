@@ -65,7 +65,19 @@ export default function MasterMatrixTab({
                   : 'bg-blue-600 hover:bg-blue-700'
               }`}
             >
-              {masterLoading ? 'Loading...' : 'Rebuild Matrix'}
+              {masterLoading ? 'Loading...' : 'Rebuild Matrix (Full)'}
+            </button>
+            <button
+              onClick={() => onUpdateMasterMatrix && onUpdateMasterMatrix()}
+              disabled={masterLoading}
+              className={`px-4 py-2 rounded font-medium text-sm ${
+                masterLoading
+                  ? 'bg-gray-700 cursor-not-allowed'
+                  : 'bg-green-600 hover:bg-green-700'
+              }`}
+              title="Reprocess last 35 trading days from merged data and append forward. Safe for overlapping pipeline exports."
+            >
+              {masterLoading ? 'Updating...' : 'Update Matrix (Rolling 35-Day Window)'}
             </button>
           </div>
         </div>

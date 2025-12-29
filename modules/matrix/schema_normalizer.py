@@ -99,16 +99,23 @@ def create_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with derived columns added
     """
-    # entry_time, exit_time (using Time as entry_time, exit_time would be calculated)
+    # entry_time, exit_time - map from analyzer EntryTime/ExitTime if available
     if 'entry_time' not in df.columns:
-        df['entry_time'] = df['Time'] if 'Time' in df.columns else ''
+        # Prefer EntryTime from analyzer, fallback to Time
+        if 'EntryTime' in df.columns:
+            df['entry_time'] = df['EntryTime']
+        else:
+            df['entry_time'] = df['Time'] if 'Time' in df.columns else ''
         # Fill None values to avoid comparison errors during sorting
         if df['entry_time'].dtype == 'object':
             df['entry_time'] = df['entry_time'].fillna('')
     
     if 'exit_time' not in df.columns:
-        # For now, set exit_time same as entry_time (would need actual exit logic)
-        df['exit_time'] = df['entry_time'] if 'entry_time' in df.columns else ''
+        # Use ExitTime from analyzer if available, otherwise fallback to entry_time
+        if 'ExitTime' in df.columns:
+            df['exit_time'] = df['ExitTime']
+        else:
+            df['exit_time'] = df['entry_time'] if 'entry_time' in df.columns else ''
         # Fill None values to avoid comparison errors during sorting
         if df['exit_time'].dtype == 'object':
             df['exit_time'] = df['exit_time'].fillna('')

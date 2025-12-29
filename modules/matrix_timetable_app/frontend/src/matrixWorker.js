@@ -1053,7 +1053,30 @@ self.onmessage = function(e) {
           return minsB - minsA
         })
         
-        self.postMessage({ type: 'TIMETABLE', payload: { timetable: timetableRows } })
+        // Build execution timetable format for NinjaTrader
+        const executionStreams = timetableRows.map(row => {
+          const stream = row.Stream
+          const instrument = stream.slice(0, -1) // ES1 -> ES
+          const session = stream.endsWith('1') ? 'S1' : 'S2'
+          return {
+            stream: stream,
+            instrument: instrument,
+            session: session,
+            slot_time: row.Time,
+            enabled: true
+          }
+        })
+        
+        self.postMessage({ 
+          type: 'TIMETABLE', 
+          payload: { 
+            timetable: timetableRows,
+            executionTimetable: {
+              trading_date: latestDateStr,
+              streams: executionStreams
+            }
+          } 
+        })
         break
       }
       

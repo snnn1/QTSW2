@@ -766,6 +766,19 @@ class TimetableRequest(BaseModel):
     output_dir: str = "data/timetable"
 
 
+class ExecutionTimetableStream(BaseModel):
+    stream: str
+    instrument: str
+    session: str
+    slot_time: str
+    enabled: bool
+
+
+class ExecutionTimetableRequest(BaseModel):
+    trading_date: str
+    streams: List[ExecutionTimetableStream]
+
+
 # Master Matrix endpoints moved to modules.matrix.api router
 # All matrix endpoints are now in: modules/matrix/api.py
 # - POST /api/matrix/build
@@ -803,8 +816,8 @@ async def generate_timetable(request: TimetableRequest):
                 "allowed": 0
             }
         
-        # Save timetable
-        parquet_file, json_file = engine.save_timetable(timetable_df, request.output_dir)
+        # Execution timetable (timetable_current.json) is automatically written by generate_timetable()
+        # No need to call save_timetable() - canonical file is the single source of truth
         
         # Convert DataFrame to list of dicts for JSON response
         entries = timetable_df.to_dict('records')
@@ -816,10 +829,7 @@ async def generate_timetable(request: TimetableRequest):
             "entries": entries,
             "total_entries": len(timetable_df),
             "allowed_trades": int(timetable_df['allowed'].sum()),
-            "files": {
-                "parquet": str(parquet_file),
-                "json": str(json_file)
-            }
+            "execution_file": "data/timetable/timetable_current.json"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate timetable: {str(e)}")
@@ -828,6 +838,69 @@ async def generate_timetable(request: TimetableRequest):
 # Matrix endpoints moved to modules.matrix.api router
 # - GET /api/matrix/files -> modules/matrix/api.py
 # - GET /api/matrix/data -> modules/matrix/api.py
+
+
+@app.post("/api/timetable/execution")
+async def save_execution_timetable(request: ExecutionTimetableRequest):
+    """Save execution timetable file from UI-calculated timetable."""
+    try:
+        import json
+        import pytz
+        from pathlib import Path
+        
+        output_dir = Path("data/timetable")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up old files
+        for file_path in output_dir.iterdir():
+            if file_path.name != "timetable_current.json" and file_path.name != "timetable_current.tmp":
+                try:
+                    file_path.unlink()
+                except:
+                    pass
+        
+        # Get current timestamp in America/Chicago timezone
+        chicago_tz = pytz.timezone("America/Chicago")
+        as_of = datetime.now(chicago_tz).isoformat()
+        
+        # Build execution timetable document
+        execution_timetable = {
+            'as_of': as_of,
+            'trading_date': request.trading_date,
+            'timezone': 'America/Chicago',
+            'source': 'master_matrix',
+            'streams': [s.dict() for s in request.streams]
+        }
+        
+        # Atomic write: write to temp file, then rename
+        temp_file = output_dir / "timetable_current.tmp"
+        final_file = output_dir / "timetable_current.json"
+        
+        try:
+            # Write to temporary file
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(execution_timetable, f, indent=2, ensure_ascii=False)
+            
+            # Atomic rename
+            temp_file.replace(final_file)
+            
+            return {
+                "status": "success",
+                "message": "Execution timetable saved",
+                "file": str(final_file),
+                "streams": len(request.streams)
+            }
+        except Exception as e:
+            # Clean up temp file on error
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
+            raise
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save execution timetable: {str(e)}")
 
 
 @app.get("/api/timetable/files")

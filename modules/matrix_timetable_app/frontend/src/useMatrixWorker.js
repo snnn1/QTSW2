@@ -24,6 +24,7 @@ export function useMatrixWorker() {
   const [breakdownLoading, setBreakdownLoading] = useState(false)
   const [timetable, setTimetable] = useState([])
   const [timetableLoading, setTimetableLoading] = useState(false)
+  const [executionTimetable, setExecutionTimetable] = useState(null)
   const [error, setError] = useState(null)
   
   // Initialize worker
@@ -65,6 +66,10 @@ export function useMatrixWorker() {
           case 'TIMETABLE':
             setTimetable(payload.timetable || [])
             setTimetableLoading(false)
+            // Store execution timetable for saving
+            if (payload.executionTimetable) {
+              setExecutionTimetable(payload.executionTimetable)
+            }
             break
             
           case 'ROWS':
@@ -197,6 +202,7 @@ export function useMatrixWorker() {
     breakdownLoading,
     timetable,
     timetableLoading,
+    executionTimetable,
     error,
     initData,
     filter,

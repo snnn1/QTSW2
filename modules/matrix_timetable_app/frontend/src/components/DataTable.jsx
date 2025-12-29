@@ -75,15 +75,21 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
               if (numValue === 0 || numValue === '0' || numValue === 0.0) {
                 value = isNG ? '0.000' : '0.00'
               } else if (!isNaN(numValue) && isFinite(numValue)) {
-                value = numValue.toFixed(decimalPlaces)
+                // Round to avoid floating point precision errors
+                const multiplier = Math.pow(10, decimalPlaces)
+                const rounded = Math.round(numValue * multiplier) / multiplier
+                value = rounded.toFixed(decimalPlaces)
               } else {
                 value = '-'
               }
             }
           } else if (value !== null && value !== undefined) {
             const numValue = parseFloat(value)
-            if (!isNaN(numValue)) {
-              value = numValue.toFixed(decimalPlaces)
+            if (!isNaN(numValue) && isFinite(numValue)) {
+              // Round to avoid floating point precision errors
+              const multiplier = Math.pow(10, decimalPlaces)
+              const rounded = Math.round(numValue * multiplier) / multiplier
+              value = rounded.toFixed(decimalPlaces)
             }
           }
         }
@@ -114,11 +120,19 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
         // Format time slot columns
         if (col.includes(' Rolling') && value !== null && value !== undefined) {
           const numValue = parseFloat(value)
-          if (!isNaN(numValue)) value = numValue.toFixed(2)
+          if (!isNaN(numValue) && isFinite(numValue)) {
+            // Round to avoid floating point precision errors
+            const rounded = Math.round(numValue * 100) / 100
+            value = rounded.toFixed(2)
+          }
         }
         if (col.includes(' Points') && value !== null && value !== undefined) {
           const numValue = parseFloat(value)
-          if (!isNaN(numValue)) value = numValue.toFixed(0)
+          if (!isNaN(numValue) && isFinite(numValue)) {
+            // Round to avoid floating point precision errors
+            const rounded = Math.round(numValue)
+            value = rounded.toFixed(0)
+          }
         }
         
         return (

@@ -45,8 +45,10 @@ HARD RULES:
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, Tuple
 import pandas as pd
+
+# Import List from typing for type hints (Python 3.8+ compatibility)
 
 from .utils import calculate_time_score, get_session_for_time
 from .logging_config import setup_matrix_logger
@@ -57,7 +59,86 @@ from .config import SLOT_ENDS
 # Set up logger using centralized configuration
 logger = setup_matrix_logger(__name__, console=True, level=logging.INFO)
 
-__all__ = ['apply_sequencer_logic', 'process_stream_daily', 'SLOT_ENDS']
+def apply_sequencer_logic_with_state(
+    df: pd.DataFrame,
+    stream_filters: Dict[str, Dict],
+    display_year: Optional[int] = None,
+    parallel: bool = True,
+    initial_states: Optional[Dict[str, Dict]] = None
+) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
+    """
+    Apply sequencer logic and return both DataFrame and final states for checkpointing.
+    
+    This is a wrapper around apply_sequencer_logic that also captures final sequencer state.
+    
+    Args:
+        df: DataFrame with all trades from analyzer_runs
+        stream_filters: Per-stream filter configuration
+        display_year: If provided, only return trades from this year
+        parallel: If True, process streams in parallel
+        initial_states: Optional initial states for restoration
+        
+    Returns:
+        Tuple of (DataFrame with chosen trades, final_states dict mapping stream_id to state)
+    """
+    if df.empty:
+        return df, {}
+    
+    # Pre-convert Date column once for all streams (only if needed)
+    if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
+        df = df.copy()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    
+    # Sort once by Stream and Date
+    needs_sorting = True
+    if len(df) > 1:
+        try:
+            if df['Stream'].is_monotonic_increasing and df['Date'].is_monotonic_increasing:
+                needs_sorting = False
+        except:
+            pass
+    
+    if needs_sorting:
+        for col in ['Stream', 'Date']:
+            if col in df.columns:
+                if col == 'Stream' and df[col].dtype == 'object':
+                    df[col] = df[col].fillna('')
+        df = df.sort_values(['Stream', 'Date'], kind='mergesort').reset_index(drop=True)
+    
+    unique_streams = df['Stream'].unique()
+    logger.info(f"Processing {len(unique_streams)} streams with sequencer logic (capturing state)...")
+    
+    chosen_trades = []
+    final_states = {}
+    
+    # Process streams sequentially to capture state (parallel processing makes state capture complex)
+    for stream_id in unique_streams:
+        stream_mask = df['Stream'] == stream_id
+        stream_df = df[stream_mask].copy()
+        stream_filters_for_stream = stream_filters.get(stream_id, {})
+        stream_initial_state = initial_states.get(stream_id) if initial_states else None
+        
+        stream_result = process_stream_daily(
+            stream_df, stream_id, stream_filters_for_stream, 
+            display_year, stream_initial_state, return_state=True
+        )
+        
+        if isinstance(stream_result, tuple) and len(stream_result) == 2:
+            stream_chosen_trades, stream_final_state = stream_result
+            final_states[stream_id] = stream_final_state
+        else:
+            stream_chosen_trades = stream_result
+        
+        chosen_trades.extend(stream_chosen_trades)
+    
+    if not chosen_trades:
+        return pd.DataFrame(), {}
+    
+    result_df = pd.DataFrame(chosen_trades)
+    return result_df, final_states
+
+
+__all__ = ['apply_sequencer_logic', 'apply_sequencer_logic_with_state', 'process_stream_daily', 'SLOT_ENDS']
 
 
 def decide_time_change(
@@ -139,8 +220,10 @@ def process_stream_daily(
     stream_df: pd.DataFrame,
     stream_id: str,
     stream_filters: Dict,
-    display_year: Optional[int] = None
-) -> List[Dict]:
+    display_year: Optional[int] = None,
+    initial_state: Optional[Dict] = None,
+    return_state: bool = False
+) -> Union[List[Dict], Tuple[List[Dict], Dict]]:
     """
     Process a single stream day by day, applying sequencer logic.
     
@@ -151,6 +234,15 @@ def process_stream_daily(
         stream_id: Stream ID
         stream_filters: Filter configuration for this stream
         display_year: If provided, only return trades from this year
+        initial_state: Optional initial state dict for restoration:
+            {
+                "current_time": str,
+                "current_session": str,
+                "time_slot_histories": {
+                    "07:30": [1, -1, 0, ...],
+                    ...
+                }
+            }
         
     Returns:
         List of chosen trade dictionaries
@@ -188,15 +280,45 @@ def process_stream_daily(
         )
         return []
     
-    # Initialize current_time to first selectable time
-    current_time = normalize_time(str(selectable_times[0]))
-    current_session = session
+    # Initialize current_time: use restored state or default to first selectable time
+    if initial_state:
+        restored_time = initial_state.get('current_time')
+        restored_session = initial_state.get('current_session', session)
+        if restored_time and normalize_time(str(restored_time)) in selectable_times:
+            current_time = normalize_time(str(restored_time))
+            current_session = restored_session
+            logger.info(f"Stream {stream_id}: Restored initial state: current_time={current_time}, session={current_session}")
+        else:
+            logger.warning(
+                f"Stream {stream_id}: Invalid restored current_time '{restored_time}', "
+                f"using default first selectable time"
+            )
+            current_time = normalize_time(str(selectable_times[0]))
+            current_session = session
+    else:
+        current_time = normalize_time(str(selectable_times[0]))
+        current_session = session
+    
     previous_time = None
     
     # ============================================================================
     # INITIALIZE ROLLING HISTORIES FOR ALL CANONICAL TIMES
     # ============================================================================
-    time_slot_histories = {t: [] for t in canonical_times}
+    if initial_state and 'time_slot_histories' in initial_state:
+        # Restore histories from checkpoint
+        restored_histories = initial_state['time_slot_histories']
+        time_slot_histories = {}
+        for canonical_time in canonical_times:
+            canonical_time_normalized = normalize_time(str(canonical_time))
+            # Restore if available, otherwise initialize empty
+            if canonical_time_normalized in restored_histories:
+                time_slot_histories[canonical_time_normalized] = list(restored_histories[canonical_time_normalized])
+            else:
+                time_slot_histories[canonical_time_normalized] = []
+        logger.info(f"Stream {stream_id}: Restored time_slot_histories for {len(time_slot_histories)} canonical times")
+    else:
+        # Initialize empty histories
+        time_slot_histories = {t: [] for t in canonical_times}
     
     chosen_trades = []
     
@@ -430,6 +552,15 @@ def process_stream_daily(
         if history_lengths and len(set(history_lengths)) != 1:
             raise AssertionError(f"Stream {stream_id} {date}: History length mismatch: {dict(zip(canonical_times, history_lengths))}")
     
+    # Return final state along with trades if requested
+    if return_state:
+        final_state = {
+            "current_time": current_time,
+            "current_session": current_session,
+            "time_slot_histories": {k: list(v) for k, v in time_slot_histories.items()}  # Copy lists
+        }
+        return chosen_trades, final_state
+    
     return chosen_trades
 
 
@@ -437,7 +568,8 @@ def apply_sequencer_logic(
     df: pd.DataFrame,
     stream_filters: Dict[str, Dict],
     display_year: Optional[int] = None,
-    parallel: bool = True
+    parallel: bool = True,
+    initial_states: Optional[Dict[str, Dict]] = None
 ) -> pd.DataFrame:
     """
     Apply sequencer logic to select one trade per day per stream.
@@ -455,6 +587,15 @@ def apply_sequencer_logic(
                      If None, return trades from ALL years.
                      All data is still processed to build accurate histories.
         parallel: If True (default), process streams in parallel. Set False for debugging.
+        initial_states: Optional dict mapping stream_id to initial state for restoration:
+            {
+                "ES1": {
+                    "current_time": "07:30",
+                    "current_session": "S1",
+                    "time_slot_histories": {...}
+                },
+                ...
+            }
         
     Returns:
         DataFrame with one chosen trade per day per stream
@@ -509,12 +650,15 @@ def apply_sequencer_logic(
         chosen_trades = []
         max_workers = min(len(unique_streams), mp.cpu_count())
         
-        def process_single_stream(stream_id: str) -> List[Dict]:
+        def process_single_stream(stream_id: str):
             """Process a single stream (for parallel execution)."""
             stream_mask = df['Stream'] == stream_id
-            stream_df = df[stream_mask]  # Use view, not copy (faster)
+            # CRITICAL: Must copy here because process_stream_daily modifies the DataFrame
+            # (adds Time_str, Date_normalized columns). Views would cause issues in parallel execution.
+            stream_df = df[stream_mask].copy()
             stream_filters_for_stream = stream_filters.get(stream_id, {})
-            return process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year)
+            stream_initial_state = initial_states.get(stream_id) if initial_states else None
+            return process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year, stream_initial_state, return_state=False)
         
         logger.info(f"Processing {len(unique_streams)} streams in parallel ({max_workers} workers)...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -541,8 +685,9 @@ def apply_sequencer_logic(
             stream_mask = df['Stream'] == stream_id
             stream_df = df[stream_mask]  # Use view, not copy (faster)
             stream_filters_for_stream = stream_filters.get(stream_id, {})
+            stream_initial_state = initial_states.get(stream_id) if initial_states else None
             
-            stream_chosen_trades = process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year)
+            stream_chosen_trades = process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year, stream_initial_state, return_state=False)
             chosen_trades.extend(stream_chosen_trades)
     
     if not chosen_trades:

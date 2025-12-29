@@ -160,7 +160,7 @@ export default function FiltersPanel({
           </button>
           {streamFilters[streamId]?._showDomDropdown && (
             <div 
-              className="absolute z-[9999] w-full mt-1 bg-gray-800 border border-gray-600 rounded shadow-lg max-h-48 overflow-y-auto"
+              className="absolute top-full left-0 right-0 w-full mt-1 bg-gray-800 border border-gray-600 rounded shadow-xl max-h-48 overflow-y-auto z-20"
               onClick={(e) => e.stopPropagation()}
               onMouseDown={(e) => e.stopPropagation()}
             >

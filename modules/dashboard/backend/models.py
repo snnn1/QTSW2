@@ -61,3 +61,16 @@ class TimetableRequest(BaseModel):
     analyzer_runs_dir: str = "data/analyzer_runs"
     output_dir: str = "data/timetable"
 
+
+class ExecutionTimetableStream(BaseModel):
+    stream: str
+    instrument: str
+    session: str
+    slot_time: str
+    enabled: bool
+
+
+class ExecutionTimetableRequest(BaseModel):
+    trading_date: str
+    streams: List[ExecutionTimetableStream]
+

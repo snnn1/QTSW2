@@ -15,6 +15,8 @@ from typing import List, Optional, Dict, Tuple
 from datetime import datetime, date
 import logging
 import sys
+import json
+import pytz
 
 # Import centralized config
 # Handle both direct import and relative import
@@ -359,6 +361,9 @@ class TimetableEngine:
         logger.info(f"Timetable generated: {len(timetable_df)} entries")
         logger.info(f"Allowed trades: {timetable_df['allowed'].sum()} / {len(timetable_df)}")
         
+        # Write canonical execution timetable file
+        self.write_execution_timetable(timetable_df, trade_date)
+        
         return timetable_df
     
     def save_timetable(self, timetable_df: pd.DataFrame, 
@@ -391,6 +396,279 @@ class TimetableEngine:
         logger.info(f"Saved: {json_file}")
         
         return parquet_file, json_file
+    
+    def write_execution_timetable_from_master_matrix(self, master_matrix_df: pd.DataFrame, 
+                                                      trade_date: Optional[str] = None,
+                                                      stream_filters: Optional[Dict] = None) -> None:
+        """
+        Write execution timetable from master matrix data.
+        
+        This is the authoritative persistence point - called when master matrix is finalized.
+        Generates timetable from latest date in master matrix, applying filters.
+        
+        Args:
+            master_matrix_df: Master matrix DataFrame
+            trade_date: Optional trading date (YYYY-MM-DD). If None, uses latest date in matrix.
+            stream_filters: Optional stream filters dict (for DOW/DOM filtering)
+        """
+        if master_matrix_df.empty:
+            logger.warning("Master matrix is empty, cannot generate execution timetable")
+            return
+        
+        # Get latest date from master matrix if not provided
+        if trade_date is None:
+            if 'trade_date' in master_matrix_df.columns:
+                latest_date = pd.to_datetime(master_matrix_df['trade_date']).max()
+                trade_date = latest_date.strftime('%Y-%m-%d')
+            elif 'Date' in master_matrix_df.columns:
+                latest_date = pd.to_datetime(master_matrix_df['Date']).max()
+                trade_date = latest_date.strftime('%Y-%m-%d')
+            else:
+                logger.error("Master matrix missing date columns, cannot generate execution timetable")
+                return
+        
+        trade_date_obj = pd.to_datetime(trade_date).date()
+        
+        # Filter to latest date
+        if 'trade_date' in master_matrix_df.columns:
+            latest_df = master_matrix_df[pd.to_datetime(master_matrix_df['trade_date']).dt.date == trade_date_obj].copy()
+        elif 'Date' in master_matrix_df.columns:
+            latest_df = master_matrix_df[pd.to_datetime(master_matrix_df['Date']).dt.date == trade_date_obj].copy()
+        else:
+            latest_df = master_matrix_df.copy()
+        
+        if latest_df.empty:
+            logger.warning(f"No data for date {trade_date}, cannot generate execution timetable")
+            return
+        
+        # Extract day-of-week and day-of-month for filtering
+        target_dow = trade_date_obj.weekday()  # 0=Monday, 6=Sunday
+        target_dom = trade_date_obj.day
+        
+        # Build streams array from master matrix data
+        # Only include streams that pass filters (matching UI timetable behavior)
+        streams = []
+        seen_streams = set()
+        
+        # Day names for DOW filtering (0=Monday, 6=Sunday)
+        day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        target_dow_name = day_names[target_dow]
+        
+        # Check if final_allowed column exists (authoritative filter indicator)
+        has_final_allowed = 'final_allowed' in latest_df.columns
+        
+        for _, row in latest_df.iterrows():
+            stream = row.get('Stream', '')
+            if not stream or stream in seen_streams:
+                continue
+            
+            # Check final_allowed column first (if exists, this is the authoritative filter)
+            # This column indicates which streams pass all filters in the master matrix
+            # Only include streams where final_allowed is explicitly True
+            if has_final_allowed:
+                final_allowed = row.get('final_allowed')
+                # Skip if final_allowed is False, None, NaN, or any falsy value
+                if final_allowed is False:
+                    continue  # Skip filtered-out streams (matching UI timetable behavior)
+                if pd.isna(final_allowed):
+                    continue  # Skip NaN values
+                if final_allowed is not True:
+                    continue  # Only include if explicitly True
+            
+            # Extract instrument and session from stream
+            instrument = stream[:-1] if len(stream) > 1 else ''
+            session = 'S1' if stream.endswith('1') else 'S2'
+            
+            # Get time (use Time Change if available, otherwise Time)
+            time = row.get('Time', '')
+            time_change = row.get('Time Change', '')
+            if time_change and '->' in str(time_change):
+                parts = str(time_change).split('->')
+                if len(parts) == 2:
+                    time = parts[1].strip()
+            
+            if not time:
+                continue
+            
+            # Apply stream filters (same logic as UI worker)
+            # Default to enabled, but check filters
+            enabled = True
+            
+            if stream_filters:
+                stream_filter = stream_filters.get(stream, {})
+                
+                # Check stream-specific DOW filter
+                if stream_filter.get('exclude_days_of_week'):
+                    excluded_dow = stream_filter['exclude_days_of_week']
+                    if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
+                        enabled = False
+                        continue  # Skip this stream entirely
+                
+                # Check stream-specific DOM filter
+                if enabled and stream_filter.get('exclude_days_of_month'):
+                    excluded_dom = [int(d) for d in stream_filter['exclude_days_of_month']]
+                    if target_dom in excluded_dom:
+                        enabled = False
+                        continue  # Skip this stream entirely
+                
+                # Check master filter
+                master_filter = stream_filters.get('master', {})
+                if enabled and master_filter.get('exclude_days_of_week'):
+                    excluded_dow = master_filter['exclude_days_of_week']
+                    if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
+                        enabled = False
+                        continue  # Skip this stream entirely
+                
+                if enabled and master_filter.get('exclude_days_of_month'):
+                    excluded_dom = [int(d) for d in master_filter['exclude_days_of_month']]
+                    if target_dom in excluded_dom:
+                        enabled = False
+                        continue  # Skip this stream entirely
+            
+            # Only include enabled streams (matching UI timetable)
+            if enabled:
+                streams.append({
+                    'stream': stream,
+                    'instrument': instrument,
+                    'session': session,
+                    'slot_time': time,
+                    'enabled': True
+                })
+                seen_streams.add(stream)
+        
+        # Write execution timetable file
+        self._write_execution_timetable_file(streams, trade_date)
+    
+    def _write_execution_timetable_file(self, streams: List[Dict], trade_date: str) -> None:
+        """
+        Internal method to write execution timetable file.
+        
+        Args:
+            streams: List of stream dicts with stream, instrument, session, slot_time, enabled
+            trade_date: Trading date (YYYY-MM-DD)
+        """
+        output_dir = Path("data/timetable")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up old files (keep only timetable_current.json)
+        self._cleanup_old_timetable_files(output_dir)
+        
+        # Get current timestamp in America/Chicago timezone
+        chicago_tz = pytz.timezone("America/Chicago")
+        as_of = datetime.now(chicago_tz).isoformat()
+        
+        # Build execution timetable document
+        execution_timetable = {
+            'as_of': as_of,
+            'trading_date': trade_date,
+            'timezone': 'America/Chicago',
+            'source': 'master_matrix',
+            'streams': streams
+        }
+        
+        # Atomic write: write to temp file, then rename
+        temp_file = output_dir / "timetable_current.tmp"
+        final_file = output_dir / "timetable_current.json"
+        
+        try:
+            # Write to temporary file
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(execution_timetable, f, indent=2, ensure_ascii=False)
+            
+            # Atomic rename (works on Windows and Unix)
+            temp_file.replace(final_file)
+            
+            logger.info(f"Execution timetable written: {final_file} ({len(streams)} streams)")
+        except Exception as e:
+            logger.error(f"Failed to write execution timetable: {e}")
+            # Clean up temp file on error
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except:
+                    pass
+            raise
+    
+    def write_execution_timetable(self, timetable_df: pd.DataFrame, trade_date: str) -> None:
+        """
+        Write canonical execution timetable file (timetable_current.json).
+        
+        This is the single source of truth for NinjaTrader execution.
+        Uses atomic writes to prevent partial reads.
+        
+        Args:
+            timetable_df: Timetable DataFrame
+            trade_date: Trading date (YYYY-MM-DD)
+        """
+        output_dir = Path("data/timetable")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up old files (keep only timetable_current.json)
+        self._cleanup_old_timetable_files(output_dir)
+        
+        # Build streams array - only include enabled streams from the timetable
+        # Each stream_id maps to one session: ES1->S1, ES2->S2, etc.
+        streams = []
+        
+        # Create a lookup dict from timetable_df: stream_id -> (session, slot_time, enabled)
+        enabled_streams = {}
+        for _, row in timetable_df.iterrows():
+            stream_id = row['stream_id']
+            session = row['session']
+            # Only store if this stream_id matches its natural session
+            # ES1 should only have S1 entries, ES2 should only have S2 entries
+            expected_session = "S1" if stream_id.endswith("1") else "S2"
+            if session == expected_session:
+                enabled_streams[stream_id] = {
+                    'session': session,
+                    'slot_time': row['selected_time'],
+                    'enabled': row['allowed']
+                }
+        
+        # Only include streams that are enabled (enabled=true)
+        for stream_id, stream_data in enabled_streams.items():
+            if stream_data['enabled']:
+                instrument = stream_id[:-1]  # ES1 -> ES
+                streams.append({
+                    'stream': stream_id,
+                    'instrument': instrument,
+                    'session': stream_data['session'],
+                    'slot_time': stream_data['slot_time'],
+                    'enabled': True
+                })
+        
+        # Write execution timetable file using shared method
+        self._write_execution_timetable_file(streams, trade_date)
+    
+    def _cleanup_old_timetable_files(self, output_dir: Path) -> None:
+        """
+        Remove all files in timetable directory except timetable_current.json.
+        
+        Args:
+            output_dir: Timetable output directory
+        """
+        if not output_dir.exists():
+            return
+        
+        current_file = output_dir / "timetable_current.json"
+        temp_file = output_dir / "timetable_current.tmp"
+        
+        removed_count = 0
+        for file_path in output_dir.iterdir():
+            # Skip the current file and temp file
+            if file_path.name == "timetable_current.json":
+                continue
+            if file_path.name == "timetable_current.tmp":
+                continue
+            
+            try:
+                file_path.unlink()
+                removed_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to remove old file {file_path}: {e}")
+        
+        if removed_count > 0:
+            logger.info(f"Cleaned up {removed_count} old timetable files")
 
 
 def main():

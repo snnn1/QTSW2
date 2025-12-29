@@ -6,7 +6,7 @@ stream discovery, time normalization, and RS calculations.
 """
 
 import logging
-from typing import Dict, Optional, Any, Callable
+from typing import Dict, Optional, Any, Callable, Tuple, List
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 _time_normalization_cache: Dict[str, str] = {}
 
 # Global cache for stream discovery (keyed by directory path and mtime)
-_stream_discovery_cache: Dict[str, tuple[list[str], float]] = {}  # path -> (streams, mtime)
+# Using Tuple for Python 3.8+ compatibility (instead of tuple[])
+_stream_discovery_cache: Dict[str, Tuple[List[str], float]] = {}  # path -> (streams, mtime)
 
 
 def normalize_time_cached(time_str: str) -> str:
@@ -59,7 +60,7 @@ def clear_time_cache():
     _time_normalization_cache.clear()
 
 
-def get_cached_streams(analyzer_runs_dir: Path, discover_func: Callable) -> list[str]:
+def get_cached_streams(analyzer_runs_dir: Path, discover_func: Callable) -> List[str]:
     """
     Get cached stream discovery results, or discover if cache is invalid.
     

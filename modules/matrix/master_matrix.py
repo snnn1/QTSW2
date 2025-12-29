@@ -24,7 +24,10 @@ from . import schema_normalizer
 from . import filter_engine
 from . import statistics
 from . import file_manager
-from .config import DOM_BLOCKED_DAYS
+from .config import DOM_BLOCKED_DAYS, MATRIX_REPROCESS_TRADING_DAYS, MATRIX_CHECKPOINT_FREQUENCY
+from .checkpoint_manager import CheckpointManager
+from .trading_days import find_trading_days_back, get_merged_data_date_range
+from .run_history import RunHistory
 
 # Configure logging using centralized configuration
 from .logging_config import setup_matrix_logger
@@ -597,7 +600,18 @@ class MasterMatrix:
         self._log_summary_stats(df)
         
         # Save master matrix using file_manager
-        file_manager.save_master_matrix(df, output_dir, specific_date)
+        # Execution timetable is automatically persisted by file_manager after save
+        file_manager.save_master_matrix(df, output_dir, specific_date, stream_filters=self.stream_filters)
+        
+        # Create checkpoint after successful build (for window updates)
+        if not df.empty and 'trade_date' in df.columns:
+            try:
+                max_date = df['trade_date'].max()
+                if pd.notna(max_date):
+                    max_date_str = pd.to_datetime(max_date).strftime('%Y-%m-%d')
+                    self._create_checkpoint_after_build(df, max_date_str, output_dir)
+            except Exception as e:
+                logger.warning(f"Failed to create checkpoint after build: {e}")
         
         return df
     
@@ -859,7 +873,7 @@ class MasterMatrix:
         updated_df['global_trade_id'] = range(1, len(updated_df) + 1)
         
         # Save updated matrix using file_manager
-        file_manager.save_master_matrix(updated_df, output_dir, specific_date=None)
+        file_manager.save_master_matrix(updated_df, output_dir, specific_date=None, stream_filters=self.stream_filters)
         
         total_new = len(new_df)
         update_stats['total_trades_added'] = total_new
@@ -871,6 +885,411 @@ class MasterMatrix:
         logger.info("=" * 80)
         
         return updated_df, update_stats
+    
+    def _create_checkpoint_after_build(self, df: pd.DataFrame, checkpoint_date: str, output_dir: str):
+        """
+        Create a checkpoint after successful build by capturing sequencer state.
+        
+        Args:
+            df: Master matrix DataFrame
+            checkpoint_date: Date to checkpoint (YYYY-MM-DD)
+            output_dir: Output directory (used to determine checkpoint location)
+        """
+        try:
+            # Use apply_sequencer_logic_with_state to capture final states
+            # We need to reload data and process it to get state, but we can use the existing df
+            # Actually, we need to reprocess to get state. Let's do a lightweight approach:
+            # Load all streams again and process with state capture
+            
+            logger.info(f"Creating checkpoint for date {checkpoint_date}...")
+            
+            # Load all streams and apply sequencer with state capture
+            all_data = self._load_all_streams_with_sequencer_for_state()
+            
+            if all_data.empty:
+                logger.warning("No data available for checkpoint creation")
+                return
+            
+            # Apply sequencer logic with state capture
+            apply_sequencer = self._create_sequencer_callback_with_state()
+            result_df, final_states = apply_sequencer(all_data)
+            
+            if not final_states:
+                logger.warning("No sequencer states captured for checkpoint")
+                return
+            
+            # Create checkpoint
+            checkpoint_mgr = CheckpointManager()
+            checkpoint_id = checkpoint_mgr.create_checkpoint(
+                checkpoint_date=checkpoint_date,
+                stream_states=final_states
+            )
+            
+            logger.info(f"Checkpoint {checkpoint_id} created successfully for date {checkpoint_date}")
+        except Exception as e:
+            logger.error(f"Failed to create checkpoint: {e}")
+            import traceback
+            logger.debug(f"Checkpoint creation traceback: {traceback.format_exc()}")
+    
+    def _load_all_streams_with_sequencer_for_state(self) -> pd.DataFrame:
+        """Load all streams without sequencer (for state capture)."""
+        if not self.streams or len(self.streams) == 0:
+            self.streams = stream_manager.discover_streams(self.analyzer_runs_dir)
+        
+        if not self.streams:
+            return pd.DataFrame()
+        
+        # Load all streams WITHOUT sequencer logic (we'll apply it with state capture)
+        return data_loader.load_all_streams(
+            streams=self.streams,
+            analyzer_runs_dir=self.analyzer_runs_dir,
+            start_date=None,
+            end_date=None,
+            specific_date=None,
+            wait_for_streams=True,
+            max_retries=3,
+            retry_delay_seconds=2,
+            apply_sequencer_logic=None  # Don't apply sequencer here
+        )
+    
+    def _create_sequencer_callback_with_state(self) -> Callable:
+        """Create sequencer callback that captures state."""
+        def apply_sequencer_with_state(df: pd.DataFrame, display_year: Optional[int] = None):
+            return sequencer_logic.apply_sequencer_logic_with_state(
+                df, self.stream_filters, display_year, parallel=False
+            )
+        return apply_sequencer_with_state
+    
+    def build_master_matrix_window_update(
+        self,
+        reprocess_days: Optional[int] = None,
+        output_dir: str = "data/master_matrix",
+        stream_filters: Optional[Dict[str, Dict]] = None,
+        analyzer_runs_dir: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, Dict]:
+        """
+        Perform rolling window update by reprocessing last N trading days.
+        
+        Steps:
+        1. Determine max_processed_date from latest checkpoint
+        2. Calculate reprocess_start_date (N trading days back)
+        3. Restore sequencer state as-of day before reprocess_start_date
+        4. Purge matrix outputs for dates >= reprocess_start_date
+        5. Re-run matrix build only for [reprocess_start_date ... latest_merged_date]
+        6. Persist new checkpoint and run summary
+        
+        Args:
+            reprocess_days: Number of trading days to reprocess (default from config)
+            output_dir: Directory containing matrix outputs
+            stream_filters: Per-stream filter configuration
+            analyzer_runs_dir: Override analyzer runs directory
+            
+        Returns:
+            Tuple of (updated DataFrame, run_summary dict)
+        """
+        import time
+        start_time = time.time()
+        run_id = None
+        
+        # Initialize run history
+        run_history = RunHistory()
+        
+        try:
+            logger.info("=" * 80)
+            logger.info("MASTER MATRIX: WINDOW UPDATE (Rolling Window)")
+            logger.info("=" * 80)
+            
+            # Override analyzer_runs_dir if provided
+            if analyzer_runs_dir:
+                self.analyzer_runs_dir = Path(analyzer_runs_dir)
+                self.streams = stream_manager.discover_streams(self.analyzer_runs_dir)
+            
+            # Update stream filters
+            if stream_filters:
+                self._update_stream_filters(stream_filters, merge=True)
+            
+            # Use config default if not specified
+            if reprocess_days is None:
+                reprocess_days = MATRIX_REPROCESS_TRADING_DAYS
+            
+            logger.info(f"Reprocessing last {reprocess_days} trading days")
+            
+            # Step 1: Determine max_processed_date from latest checkpoint
+            checkpoint_mgr = CheckpointManager()
+            max_processed_date = checkpoint_mgr.get_max_processed_date()
+            
+            if not max_processed_date:
+                error_msg = "No checkpoint found. Please run a full rebuild first."
+                logger.error(error_msg)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    success=False,
+                    error_message=error_msg
+                )
+                return pd.DataFrame(), {"error": error_msg}
+            
+            logger.info(f"Latest checkpoint date: {max_processed_date}")
+            
+            # Step 2: Calculate reprocess_start_date (N trading days back)
+            # Load merged data to count trading days
+            merged_data_dir = str(self.analyzer_runs_dir)
+            all_merged_data = self._load_all_streams_with_sequencer_for_state()
+            
+            if all_merged_data.empty:
+                error_msg = "No merged data available for trading day calculation"
+                logger.error(error_msg)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    success=False,
+                    error_message=error_msg
+                )
+                return pd.DataFrame(), {"error": error_msg}
+            
+            # Find reprocess_start_date
+            reprocess_start_date = find_trading_days_back(
+                all_merged_data, max_processed_date, reprocess_days
+            )
+            
+            if not reprocess_start_date:
+                error_msg = f"Insufficient history: need {reprocess_days} trading days back from {max_processed_date}"
+                logger.error(error_msg)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    reprocess_start_date=None,
+                    merged_data_max_date=None,
+                    success=False,
+                    error_message=error_msg
+                )
+                return pd.DataFrame(), {"error": error_msg}
+            
+            logger.info(f"Reprocess start date: {reprocess_start_date}")
+            
+            # Get latest merged data date
+            if 'trade_date' in all_merged_data.columns:
+                all_merged_data['trade_date'] = pd.to_datetime(all_merged_data['trade_date'], errors='coerce')
+                merged_data_max_date = all_merged_data['trade_date'].max()
+                if pd.notna(merged_data_max_date):
+                    merged_data_max_date_str = pd.to_datetime(merged_data_max_date).strftime('%Y-%m-%d')
+                else:
+                    merged_data_max_date_str = None
+            else:
+                merged_data_max_date_str = None
+            
+            logger.info(f"Merged data max date: {merged_data_max_date_str}")
+            
+            # Step 3: Restore sequencer state as-of day before reprocess_start_date
+            latest_checkpoint = checkpoint_mgr.load_latest_checkpoint()
+            if not latest_checkpoint:
+                error_msg = "Failed to load checkpoint for state restoration"
+                logger.error(error_msg)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    reprocess_start_date=reprocess_start_date,
+                    merged_data_max_date=merged_data_max_date_str,
+                    success=False,
+                    error_message=error_msg
+                )
+                return pd.DataFrame(), {"error": error_msg}
+            
+            checkpoint_restore_id = latest_checkpoint.get('checkpoint_id')
+            restored_states = latest_checkpoint.get('streams', {})
+            
+            logger.info(f"Restored sequencer state from checkpoint {checkpoint_restore_id}")
+            
+            # Step 4: Purge matrix outputs for dates >= reprocess_start_date
+            existing_df = file_manager.load_existing_matrix(output_dir)
+            rows_before_purge = len(existing_df) if not existing_df.empty else 0
+            
+            if not existing_df.empty:
+                if 'trade_date' in existing_df.columns:
+                    existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], errors='coerce')
+                    # Keep only rows before reprocess_start_date
+                    reprocess_start_dt = pd.to_datetime(reprocess_start_date)
+                    existing_df = existing_df[existing_df['trade_date'] < reprocess_start_dt].copy()
+                    rows_after_purge = len(existing_df)
+                    logger.info(f"Purged matrix outputs: {rows_before_purge} -> {rows_after_purge} rows (removed {rows_before_purge - rows_after_purge} rows)")
+                else:
+                    logger.warning("No trade_date column in existing matrix, skipping purge")
+                    existing_df = pd.DataFrame()
+            else:
+                existing_df = pd.DataFrame()
+                logger.info("No existing matrix found, starting fresh")
+            
+            # Step 5: Re-run matrix build only for [reprocess_start_date ... latest_merged_date]
+            # Load data ONLY for the window period (restored state already has histories built)
+            # The sequencer will use restored state and continue from reprocess_start_date
+            window_data_for_sequencer = self._load_all_streams_with_sequencer_for_state()
+            
+            if window_data_for_sequencer.empty:
+                logger.warning("No data available for sequencer processing")
+                # Still save the purged existing matrix
+                if not existing_df.empty:
+                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    reprocess_start_date=reprocess_start_date,
+                    merged_data_max_date=merged_data_max_date_str,
+                    checkpoint_restore_id=checkpoint_restore_id,
+                    rows_read=0,
+                    rows_written=len(existing_df),
+                    duration_seconds=time.time() - start_time,
+                    success=True
+                )
+                return existing_df, {"message": "No data available"}
+            
+            # Filter to only window period BEFORE sequencer processing
+            # This ensures sequencer only processes dates >= reprocess_start_date
+            reprocess_start_dt = pd.to_datetime(reprocess_start_date)
+            if 'Date' in window_data_for_sequencer.columns:
+                window_data_for_sequencer['Date'] = pd.to_datetime(window_data_for_sequencer['Date'], errors='coerce')
+                window_data_for_sequencer = window_data_for_sequencer[
+                    window_data_for_sequencer['Date'] >= reprocess_start_dt
+                ].copy()
+            elif 'trade_date' in window_data_for_sequencer.columns:
+                window_data_for_sequencer['trade_date'] = pd.to_datetime(window_data_for_sequencer['trade_date'], errors='coerce')
+                window_data_for_sequencer = window_data_for_sequencer[
+                    window_data_for_sequencer['trade_date'] >= reprocess_start_dt
+                ].copy()
+            
+            if window_data_for_sequencer.empty:
+                logger.warning("No data in window period after filtering")
+                # Still save the purged existing matrix
+                if not existing_df.empty:
+                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    reprocess_start_date=reprocess_start_date,
+                    merged_data_max_date=merged_data_max_date_str,
+                    checkpoint_restore_id=checkpoint_restore_id,
+                    rows_read=0,
+                    rows_written=len(existing_df),
+                    duration_seconds=time.time() - start_time,
+                    success=True
+                )
+                return existing_df, {"message": "No data in window period"}
+            
+            rows_read = len(window_data_for_sequencer)
+            logger.info(f"Loaded {rows_read} trades for window period (dates >= {reprocess_start_date})")
+            
+            # Apply sequencer logic with restored initial states
+            # This processes only the window period, starting from restored state
+            apply_sequencer = self._create_sequencer_callback_with_restored_state(restored_states)
+            window_result_df, window_final_states = apply_sequencer(window_data_for_sequencer)
+            
+            if window_result_df.empty:
+                logger.warning("No trades in window period after sequencer processing")
+                # Still save the purged existing matrix
+                if not existing_df.empty:
+                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
+                run_history.record_run(
+                    mode="window_update",
+                    requested_days=reprocess_days,
+                    reprocess_start_date=reprocess_start_date,
+                    merged_data_max_date=merged_data_max_date_str,
+                    checkpoint_restore_id=checkpoint_restore_id,
+                    rows_read=rows_read,
+                    rows_written=len(existing_df),
+                    duration_seconds=time.time() - start_time,
+                    success=True
+                )
+                return existing_df, {"message": "No trades in window period"}
+            
+            # Normalize schema and add global columns
+            window_result_df = self.normalize_schema(window_result_df)
+            window_result_df = self.add_global_columns(window_result_df)
+            
+            # Merge with existing data (before reprocess_start_date)
+            if not existing_df.empty:
+                updated_df = pd.concat([existing_df, window_result_df], ignore_index=True)
+            else:
+                updated_df = window_result_df
+            
+            # Sort and update global_trade_id
+            if 'trade_date' in updated_df.columns:
+                updated_df = updated_df.sort_values(
+                    by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
+                    ascending=[True, True, True, True],
+                    na_position='last'
+                ).reset_index(drop=True)
+            
+            updated_df['global_trade_id'] = range(1, len(updated_df) + 1)
+            
+            rows_written = len(updated_df)
+            logger.info(f"Window update complete: {rows_written} total rows ({len(window_result_df)} new)")
+            
+            # Step 6: Persist new checkpoint and run summary
+            # Save updated matrix
+            file_manager.save_master_matrix(updated_df, output_dir, None, stream_filters=self.stream_filters)
+            
+            # Create new checkpoint
+            if 'trade_date' in updated_df.columns:
+                new_max_date = updated_df['trade_date'].max()
+                if pd.notna(new_max_date):
+                    new_max_date_str = pd.to_datetime(new_max_date).strftime('%Y-%m-%d')
+                    checkpoint_mgr.create_checkpoint(
+                        checkpoint_date=new_max_date_str,
+                        stream_states=window_final_states
+                    )
+            
+            # Record run summary
+            duration = time.time() - start_time
+            run_id = run_history.record_run(
+                mode="window_update",
+                requested_days=reprocess_days,
+                reprocess_start_date=reprocess_start_date,
+                merged_data_max_date=merged_data_max_date_str,
+                checkpoint_restore_id=checkpoint_restore_id,
+                rows_read=rows_read,
+                rows_written=rows_written,
+                duration_seconds=duration,
+                success=True
+            )
+            
+            logger.info("=" * 80)
+            logger.info(f"WINDOW UPDATE COMPLETE: {rows_written} total rows, duration {duration:.2f}s")
+            logger.info("=" * 80)
+            
+            return updated_df, {
+                "run_id": run_id,
+                "status": "success",
+                "reprocess_start_date": reprocess_start_date,
+                "merged_data_max_date": merged_data_max_date_str,
+                "rows_read": rows_read,
+                "rows_written": rows_written,
+                "duration_seconds": duration
+            }
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            error_msg = str(e)
+            logger.error(f"Window update failed: {error_msg}")
+            import traceback
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            
+            run_history.record_run(
+                mode="window_update",
+                run_id=run_id,
+                requested_days=reprocess_days,
+                duration_seconds=duration,
+                success=False,
+                error_message=error_msg
+            )
+            
+            return pd.DataFrame(), {"error": error_msg, "run_id": run_id}
+    
+    def _create_sequencer_callback_with_restored_state(self, restored_states: Dict[str, Dict]) -> Callable:
+        """Create sequencer callback that uses restored initial states."""
+        def apply_sequencer_with_state(df: pd.DataFrame, display_year: Optional[int] = None):
+            return sequencer_logic.apply_sequencer_logic_with_state(
+                df, self.stream_filters, display_year, parallel=False, initial_states=restored_states
+            )
+        return apply_sequencer_with_state
 
 
 def main():

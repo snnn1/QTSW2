@@ -232,6 +232,107 @@ async def build_master_matrix(request: MatrixBuildRequest):
         raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
 
 
+class MatrixUpdateRequest(BaseModel):
+    mode: str = "window"  # "window" for rolling window update
+    reprocess_days: Optional[int] = None  # Optional override (default from config)
+    analyzer_runs_dir: str = "data/analyzed"
+    output_dir: str = "data/master_matrix"
+    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
+
+
+@router.post("/update")
+async def update_master_matrix(request: MatrixUpdateRequest):
+    """Update master matrix using rolling window update."""
+    logger.info("=" * 80)
+    logger.info("UPDATE ENDPOINT HIT!")
+    logger.info("=" * 80)
+    
+    if request.mode != "window":
+        raise HTTPException(status_code=400, detail=f"Unsupported update mode: {request.mode}")
+    
+    try:
+        # Reload module to ensure latest code
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.matrix.module_reloader import ensure_matrix_modules_reloaded
+        ensure_matrix_modules_reloaded()
+        
+        from modules.matrix.master_matrix import MasterMatrix
+        
+        # Convert stream_filters from Pydantic models to dicts
+        stream_filters_dict = None
+        if request.stream_filters:
+            stream_filters_dict = {
+                stream_id: {
+                    "exclude_days_of_week": filter_config.exclude_days_of_week,
+                    "exclude_days_of_month": filter_config.exclude_days_of_month,
+                    "exclude_times": filter_config.exclude_times
+                }
+                for stream_id, filter_config in request.stream_filters.items()
+            }
+        
+        # Initialize MasterMatrix
+        analyzer_runs_path = Path(request.analyzer_runs_dir)
+        if not analyzer_runs_path.is_absolute():
+            analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
+        
+        matrix = MasterMatrix(
+            analyzer_runs_dir=str(analyzer_runs_path),
+            stream_filters=stream_filters_dict
+        )
+        
+        # Convert output_dir to absolute path
+        output_path = Path(request.output_dir)
+        if not output_path.is_absolute():
+            output_path = QTSW2_ROOT / output_path
+        
+        # Run window update in thread pool
+        def _update_matrix_sync():
+            """Synchronous matrix update function to run in thread"""
+            return matrix.build_master_matrix_window_update(
+                reprocess_days=request.reprocess_days,
+                output_dir=str(output_path),
+                stream_filters=stream_filters_dict,
+                analyzer_runs_dir=str(analyzer_runs_path)
+            )
+        
+        updated_df, run_summary = await asyncio.to_thread(_update_matrix_sync)
+        
+        if 'error' in run_summary:
+            raise HTTPException(status_code=500, detail=run_summary['error'])
+        
+        if updated_df.empty:
+            return {
+                "status": "success",
+                "message": "Window update completed but matrix is empty",
+                **run_summary
+            }
+        
+        # Calculate summary statistics
+        stats = matrix._log_summary_stats(updated_df)
+        
+        return {
+            "status": "success",
+            "message": "Master matrix updated successfully",
+            "trades": len(updated_df),
+            "date_range": {
+                "start": str(updated_df['trade_date'].min()),
+                "end": str(updated_df['trade_date'].max())
+            },
+            "streams": sorted(updated_df['Stream'].unique().tolist()),
+            "instruments": sorted(updated_df['Instrument'].unique().tolist()),
+            "allowed_trades": int(updated_df['final_allowed'].sum()),
+            "statistics": stats,
+            **run_summary
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update master matrix: {e}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to update master matrix: {str(e)}")
+
+
 @router.get("/files")
 async def list_matrix_files():
     """List available master matrix files."""
