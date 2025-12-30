@@ -888,44 +888,6 @@ self.onmessage = function(e) {
         
         const { streamFilters = {}, currentTradingDay } = payload
         
-        // Extract day-of-week and day-of-month from current trading day
-        // JavaScript getDay(): 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
-        let targetDOWJS = null // JavaScript day-of-week (0-6)
-        let targetDOWName = null // Day name ("Monday", "Tuesday", etc.)
-        let targetDOM = null // 1-31
-        if (currentTradingDay) {
-          let dateObj = null
-          if (currentTradingDay instanceof Date) {
-            dateObj = currentTradingDay
-          } else if (typeof currentTradingDay === 'string') {
-            dateObj = parseDateCached(currentTradingDay)
-          }
-          if (dateObj) {
-            targetDOWJS = dateObj.getDay() // 0-6
-            targetDOM = dateObj.getDate() // 1-31
-            
-            // Map to day name for comparison with string filters
-            const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-            targetDOWName = dayNames[targetDOWJS]
-          }
-        }
-        
-        if (targetDOWJS === null || targetDOM === null) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
-          return
-        }
-        
-        // Diagnostic logging
-        console.log('[Worker] Timetable DOW/DOM:', {
-          targetDOWJS,
-          targetDOWName,
-          targetDOM,
-          sampleStreamFilters: Object.keys(streamFilters).slice(0, 3).reduce((acc, key) => {
-            acc[key] = streamFilters[key]?.exclude_days_of_week
-            return acc
-          }, {})
-        })
-        
         const DateColumn = self.columnarData.getColumn('Date')
         const trade_date = self.columnarData.getColumn('trade_date')
         const Stream = self.columnarData.getColumn('Stream')
@@ -958,8 +920,59 @@ self.onmessage = function(e) {
           return
         }
         
-        // Build timetable from latest date, applying filters based on current trading day's DOW/DOM
+        // Use currentTradingDay (displayed date) for DOW/DOM filtering
+        // This allows users to preview what would trade on the displayed date
+        // Data still comes from latest date in matrix, but filters are applied for displayed date
+        // JavaScript getDay(): 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+        let targetDOWJS = null // JavaScript day-of-week (0-6)
+        let targetDOWName = null // Day name ("Monday", "Tuesday", etc.)
+        let targetDOM = null // 1-31
+        
+        // Use currentTradingDay if provided, otherwise fall back to latest date in matrix
+        let filterDate = null
+        if (currentTradingDay) {
+          let dateObj = null
+          if (currentTradingDay instanceof Date) {
+            dateObj = currentTradingDay
+          } else if (typeof currentTradingDay === 'string') {
+            dateObj = parseDateCached(currentTradingDay)
+          }
+          if (dateObj) {
+            filterDate = dateObj
+          }
+        }
+        
+        // Fall back to latest date in matrix if currentTradingDay not available
+        if (!filterDate && latestDateParsed) {
+          filterDate = latestDateParsed
+        }
+        
+        if (filterDate) {
+          targetDOWJS = filterDate.getDay() // 0-6
+          targetDOM = filterDate.getDate() // 1-31
+          
+          // Map to day name for comparison with string filters
+          const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+          targetDOWName = dayNames[targetDOWJS]
+        }
+        
+        if (targetDOWJS === null || targetDOM === null) {
+          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+          return
+        }
+        
+        console.log('[Worker] Timetable filtering:', {
+          latestDateStr,
+          filterDateStr: filterDate ? filterDate.toISOString().split('T')[0] : null,
+          currentTradingDayStr: currentTradingDay ? (currentTradingDay instanceof Date ? currentTradingDay.toISOString().split('T')[0] : currentTradingDay.split('T')[0]) : null,
+          targetDOWJS,
+          targetDOWName,
+          targetDOM
+        })
+        
+        // Build timetable from latest date in matrix, applying filters based on displayed date's DOW/DOM
         const timetableRows = []
+        const seenStreams = new Set() // Track streams to avoid duplicates
         
         for (let i = 0; i < self.columnarData.length; i++) {
           const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
@@ -977,20 +990,44 @@ self.onmessage = function(e) {
           
           if (!stream || !time) continue
           
-          // Check if this stream has the target DOW filtered out
+          // Skip if we've already seen this stream (one row per stream per date)
+          if (seenStreams.has(stream)) {
+            continue
+          }
+          
+          // Determine if we should use final_allowed (only if dates match)
+          // If filtering for a different date than the matrix data, don't use final_allowed
+          // because it was calculated for the matrix date, not the displayed date
+          let useFinalAllowed = true
+          if (currentTradingDay && latestDateStr) {
+            let currentTradingDayStr = null
+            if (currentTradingDay instanceof Date) {
+              currentTradingDayStr = currentTradingDay.toISOString().split('T')[0]
+            } else if (typeof currentTradingDay === 'string') {
+              currentTradingDayStr = currentTradingDay.split('T')[0]
+            }
+            useFinalAllowed = (currentTradingDayStr === latestDateStr)
+          }
+          
+          // Check final_allowed column ONLY if dates match
+          // If dates don't match, we're previewing a different day, so apply that day's filters instead
+          if (useFinalAllowed) {
+            const FinalAllowed = self.columnarData.getColumn('final_allowed')
+            if (FinalAllowed && FinalAllowed.length > 0) {
+              if (FinalAllowed[i] === false) {
+                continue // Skip streams that are filtered out by backend
+              }
+            }
+          }
+          
+          // Check if this stream has the target DOW filtered out (for displayed date)
           const streamFilter = streamFilters[stream]
           if (streamFilter?.exclude_days_of_week?.length > 0) {
             const excludedDOW = streamFilter.exclude_days_of_week
-            // Check if filter matches either as number (JS day) or as string (day name)
             const isFiltered = excludedDOW.some(d => {
               const filterVal = typeof d === 'string' ? d : String(d)
               const filterNum = parseInt(filterVal)
-              // Match as string name or as number (JS day-of-week)
-              const matches = filterVal === targetDOWName || filterNum === targetDOWJS
-              if (stream === 'YM1' && matches) {
-                console.log('[Worker] YM1 filtered by DOW:', { filterVal, filterNum, targetDOWName, targetDOWJS, excludedDOW })
-              }
-              return matches
+              return filterVal === targetDOWName || filterNum === targetDOWJS
             })
             if (isFiltered) {
               continue // This stream has this day of week filtered out
@@ -1036,7 +1073,13 @@ self.onmessage = function(e) {
           }
           
           timetableRows.push({ Stream: stream, Time: displayTime })
+          seenStreams.add(stream) // Mark this stream as seen
         }
+        
+        console.log('[Worker] Timetable result:', {
+          totalRows: timetableRows.length,
+          streams: timetableRows.map(r => r.Stream)
+        })
         
         // Sort by time descending (latest time first, earliest time last)
         timetableRows.sort((a, b) => {

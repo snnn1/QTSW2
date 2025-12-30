@@ -31,6 +31,8 @@ export function useMatrixWorker() {
   useEffect(() => {
     let worker = null
     try {
+      // Reset worker ready state when creating new worker (important for hot reloads)
+      setWorkerReady(false)
       worker = new Worker(new URL('./matrixWorker.js', import.meta.url), { type: 'module' })
       workerRef.current = worker
       

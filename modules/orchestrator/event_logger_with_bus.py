@@ -66,11 +66,13 @@ class EventLoggerWithBus(EventLogger):
                 self.logger.info(f"EventLoggerWithBus: Emitting {stage}/{event} (run_id: {run_id[:8] if run_id else 'None'}, event_loop={self._event_loop is not None})")
         
         # Also publish to EventBus for real-time updates
+        # Mark that this event was already written to JSONL to prevent duplicate writes
         event_obj = {
             "run_id": run_id,
             "stage": stage,
             "event": event,
-            "timestamp": datetime.now(self.timezone).isoformat()
+            "timestamp": datetime.now(self.timezone).isoformat(),
+            "_jsonl_written": True  # Flag to prevent EventBus from writing duplicate
         }
         if msg is not None:
             event_obj["msg"] = msg

@@ -787,14 +787,22 @@ class PipelineOrchestrator:
                     return
             
             # Create run summary
+            # Derive stages_executed and stages_failed from metadata or use defaults
+            stages_executed = run_ctx.metadata.get("stages_executed", [])
+            if not stages_executed and run_ctx.current_stage:
+                # If no tracked stages but we have a current stage, include it
+                stages_executed = [run_ctx.current_stage.value]
+            
+            stages_failed = run_ctx.metadata.get("stages_failed", [])
+            
             summary = RunSummary(
                 run_id=run_ctx.run_id,
                 started_at=run_ctx.started_at.isoformat() if run_ctx.started_at else datetime.now(timezone.utc).isoformat(),
                 ended_at=run_ctx.updated_at.isoformat() if run_ctx.updated_at else datetime.now(timezone.utc).isoformat(),
                 result=result.value,
                 failure_reason=run_ctx.error,
-                stages_executed=run_ctx.stages_executed.copy(),
-                stages_failed=run_ctx.stages_failed.copy(),
+                stages_executed=stages_executed.copy() if isinstance(stages_executed, list) else [],
+                stages_failed=stages_failed.copy() if isinstance(stages_failed, list) else [],
                 retry_count=run_ctx.retry_count,
                 metadata=run_ctx.metadata.copy()
             )

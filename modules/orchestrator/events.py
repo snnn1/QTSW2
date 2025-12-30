@@ -179,12 +179,16 @@ class EventBus:
                     if age_minutes > self.LIVE_EVENT_WINDOW_MINUTES:
                         # Event is too old for live channel - write to JSONL only (historical storage)
                         # This is the architectural boundary: history goes to JSONL, not EventBus
-                        self._write_to_jsonl_only(event)
+                        # Only write if not already written (e.g., from EventLoggerWithBus)
+                        if not event.get("_jsonl_written", False):
+                            self._write_to_jsonl_only(event)
                         return  # Do NOT broadcast to subscribers
             except (ValueError, AttributeError, TypeError) as e:
                 # If timestamp parsing fails, reject the event (safer to drop than flood)
                 self.logger.warning(f"Event has invalid timestamp, rejecting from EventBus: {e}")
-                self._write_to_jsonl_only(event)
+                # Only write if not already written (e.g., from EventLoggerWithBus)
+                if not event.get("_jsonl_written", False):
+                    self._write_to_jsonl_only(event)
                 return
         # Scheduler events bypass age filter (always included for UI visibility)
         
@@ -238,7 +242,9 @@ class EventBus:
                         self._subscribers.remove(queue)
         
         # Write to JSONL file (historical storage - all events that pass filters)
-        self._write_to_jsonl_file(event, run_id, stage, event_type)
+        # Skip if event was already written to JSONL (e.g., from EventLoggerWithBus)
+        if not event.get("_jsonl_written", False):
+            self._write_to_jsonl_file(event, run_id, stage, event_type)
     
     def _write_to_jsonl_only(self, event: Dict):
         """

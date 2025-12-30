@@ -91,6 +91,21 @@ function AppContent() {
   const [masterError, setMasterError] = useState(null)
   const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
   
+  // Auto-update toggle (persisted in localStorage, default: enabled)
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(() => {
+    const saved = localStorage.getItem('matrix_auto_update_enabled')
+    // Default to true (enabled) if not set yet
+    if (saved === null) {
+      return true
+    }
+    return saved === 'true'
+  })
+  
+  // Save auto-update preference to localStorage
+  useEffect(() => {
+    localStorage.setItem('matrix_auto_update_enabled', String(autoUpdateEnabled))
+  }, [autoUpdateEnabled])
+  
   // Per-stream selected columns (persisted in localStorage)
   const [selectedColumns, setSelectedColumns] = useState(() => {
     const saved = localStorage.getItem('matrix_selected_columns')
@@ -292,7 +307,10 @@ function AppContent() {
       if (trades.length > 0) {
         // Only now do we replace the data - new data is successfully loaded
         setMasterData(trades)
-        setLastMergeTime(new Date()) // Track when merge data was received
+        // Use file modification time from API if available (when matrix was actually built),
+        // otherwise fall back to current time (when data was received)
+        const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
+        setLastMergeTime(mergeTime)
         
         if (trades.length > 0) {
           workerInitData(trades)
@@ -483,7 +501,10 @@ function AppContent() {
       
       // Update master data and reinitialize worker with new data
       setMasterData(trades)
-      setLastMergeTime(new Date()) // Track when data was updated
+      // Use file modification time from API if available (when matrix was actually built),
+      // otherwise fall back to current time (when data was received)
+      const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
+      setLastMergeTime(mergeTime)
       
       if (trades.length > 0 && workerInitData) {
         workerInitData(trades)
@@ -499,6 +520,28 @@ function AppContent() {
       setMasterLoading(false)
     }
   }, [masterData, streamFilters, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, workerInitData])
+  
+  // Auto-update interval (20 minutes = 1200000 ms)
+  // Use ref to track loading state so interval callback always has latest value
+  const masterLoadingRef = useRef(masterLoading)
+  useEffect(() => {
+    masterLoadingRef.current = masterLoading
+  }, [masterLoading])
+  
+  useEffect(() => {
+    if (!autoUpdateEnabled) {
+      return
+    }
+    
+    const interval = setInterval(() => {
+      // Only auto-update if not currently loading (check ref for latest value)
+      if (!masterLoadingRef.current) {
+        updateMasterMatrix()
+      }
+    }, 20 * 60 * 1000) // 20 minutes
+    
+    return () => clearInterval(interval)
+  }, [autoUpdateEnabled, updateMasterMatrix])
   
   // Retry loading if backend wasn't ready
   const retryLoad = useCallback(() => {
@@ -610,6 +653,19 @@ function AppContent() {
       loadMasterMatrix(false)
     }
   }, [backendReady, loadMasterMatrix]) // Wait for backend to be ready before loading
+  
+  // Reinitialize worker data when worker becomes ready and masterData exists
+  // This is important for hot reloads when worker is recreated
+  useEffect(() => {
+    if (workerReady && masterData.length > 0 && workerInitData) {
+      // Reinitialize worker with existing data when worker becomes ready
+      // Use a small delay to ensure worker is fully ready
+      const timeoutId = setTimeout(() => {
+        workerInitData(masterData)
+      }, 50)
+      return () => clearTimeout(timeoutId)
+    }
+  }, [workerReady, workerInitData]) // Only depend on workerReady and workerInitData to avoid loops
   
   // Apply filters in worker when filters or active tab changes
   useEffect(() => {
@@ -3446,40 +3502,44 @@ function AppContent() {
   
   // Calculate timetable in worker when needed
   useEffect(() => {
+    // Only calculate if worker is ready AND data has been initialized (masterData exists)
+    // Data reinitialization is handled by the effect above when worker becomes ready
     if (workerReady && masterData.length > 0 && workerCalculateTimetable && activeTab === 'timetable') {
-      // Calculate timetable when on timetable tab or when filters change
-      // Pass current trading day so worker can filter rows
       workerCalculateTimetable(streamFilters, currentTradingDay)
     }
   }, [workerReady, masterData.length, streamFilters, activeTab, workerCalculateTimetable, currentTradingDay])
   
-  // DEPRECATED: UI auto-save of execution timetable
-  // Execution timetable is now persisted automatically by backend when master matrix is saved.
-  // This UI save is redundant but kept for backward compatibility during transition.
-  // TODO: Remove this useEffect after confirming backend persistence works correctly.
-  // useEffect(() => {
-  //   if (workerExecutionTimetable && workerExecutionTimetable.streams && workerExecutionTimetable.streams.length > 0) {
-  //     const saveExecutionTimetable = async () => {
-  //       try {
-  //         const response = await fetch(`${API_BASE}/timetable/execution`, {
-  //           method: 'POST',
-  //           headers: {
-  //             'Content-Type': 'application/json',
-  //           },
-  //           body: JSON.stringify(workerExecutionTimetable)
-  //         })
-  //         if (!response.ok) {
-  //           console.error('Failed to save execution timetable:', await response.text())
-  //         } else {
-  //           console.log('Execution timetable saved successfully')
-  //         }
-  //       } catch (error) {
-  //         console.error('Error saving execution timetable:', error)
-  //       }
-  //     }
-  //     saveExecutionTimetable()
-  //   }
-  // }, [workerExecutionTimetable])
+  // Save execution timetable whenever UI timetable updates
+  // This ensures timetable_current.json matches exactly what the UI shows
+  useEffect(() => {
+    if (workerExecutionTimetable && workerExecutionTimetable.streams && workerExecutionTimetable.streams.length > 0) {
+      const saveExecutionTimetable = async () => {
+        try {
+          // Send timetable data to backend - backend will format it correctly
+          const requestBody = {
+            trading_date: workerExecutionTimetable.trading_date,
+            streams: workerExecutionTimetable.streams
+          }
+          
+          const response = await fetch(`${API_BASE}/timetable/execution`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(requestBody)
+          })
+          if (!response.ok) {
+            console.error('Failed to save execution timetable:', await response.text())
+          } else {
+            console.log('Execution timetable saved successfully')
+          }
+        } catch (error) {
+          console.error('Error saving execution timetable:', error)
+        }
+      }
+      saveExecutionTimetable()
+    }
+  }, [workerExecutionTimetable])
   
   // Show backend connection state if not ready
   if (backendConnecting) {
@@ -3639,7 +3699,7 @@ function AppContent() {
                   </div>
                   {lastMergeTime && (
                     <div className="mt-2 text-sm font-mono text-gray-400">
-                      Last Merge: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      Matrix Built: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({lastMergeTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })})
                     </div>
                   )}
                 </div>
@@ -3751,7 +3811,7 @@ function AppContent() {
                   </p>
                   {lastMergeTime && (
                     <p className="text-xs text-gray-500 mt-1 font-mono">
-                      Last Updated: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({lastMergeTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })})
+                      Matrix Built: {lastMergeTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })} ({lastMergeTime.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })})
                     </p>
                   )}
                 </div>
@@ -3792,6 +3852,17 @@ function AppContent() {
                   >
                     {masterLoading ? 'Updating...' : 'Update Matrix (Rolling 35-Day Window)'}
                   </button>
+                  <label className="flex items-center gap-2 px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoUpdateEnabled}
+                      onChange={(e) => setAutoUpdateEnabled(e.target.checked)}
+                      className="w-4 h-4 rounded"
+                    />
+                    <span className="text-gray-300">
+                      Auto-update every 20 min
+                    </span>
+                  </label>
                 </div>
               </div>
               

@@ -450,6 +450,17 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
             available_essential = [col for col in ESSENTIAL_COLUMNS if col in df.columns]
             df = df[available_essential]
         
+        # Get file modification time (when matrix was actually built/updated)
+        file_mtime = None
+        try:
+            if file_to_load.exists():
+                import os
+                from datetime import datetime
+                mtime_seconds = os.path.getmtime(file_to_load)
+                file_mtime = datetime.fromtimestamp(mtime_seconds).isoformat()
+        except Exception as e:
+            logger.debug(f"Could not get file modification time: {e}")
+        
         # Convert to records - use fast path for initial load if skip_cleaning is True
         if skip_cleaning:
             # Fast path: Use pandas native conversion with single pandas-level replace
@@ -539,11 +550,36 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
         
         # Years already extracted above from full dataset before limiting
         
+        # Update execution timetable when loading matrix data
+        # This ensures timetable_current.json reflects the latest matrix state
+        try:
+            # Load full dataframe (not limited) for timetable generation
+            df_full = await asyncio.to_thread(_load_parquet_sync)
+            
+            # Update execution timetable from loaded matrix
+            sys.path.insert(0, str(QTSW2_ROOT))
+            from modules.timetable.timetable_engine import TimetableEngine
+            
+            engine = TimetableEngine()
+            # Use None for trade_date to auto-detect latest date, None for stream_filters (will use defaults)
+            engine.write_execution_timetable_from_master_matrix(
+                df_full,
+                trade_date=None,  # Auto-detect latest date
+                stream_filters=None  # No stream filters available in GET request
+            )
+            logger.info("Execution timetable updated from loaded matrix data")
+        except Exception as e:
+            # Log but don't fail the data load if timetable update fails
+            logger.warning(f"Failed to update execution timetable when loading matrix data: {e}")
+            import traceback
+            logger.debug(f"Timetable update traceback: {traceback.format_exc()}")
+        
         response_data = {
             "data": records,
             "total": len(df),
             "loaded": len(records),
             "file": file_to_load.name,
+            "file_mtime": file_mtime,  # When matrix was actually built/updated
             "streams": streams,
             "instruments": instruments,
             "years": years

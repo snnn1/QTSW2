@@ -72,7 +72,7 @@ class ResultProcessor:
                 entry_time_str = str(entry_time)
         
         exit_time_str = ""
-        if exit_time is not None:
+        if exit_time is not None and not pd.isna(exit_time):
             if isinstance(exit_time, pd.Timestamp):
                 exit_time_str = exit_time.strftime("%d/%m/%y %H:%M")
             else:
@@ -135,6 +135,10 @@ class ResultProcessor:
             for col in old_columns_to_remove:
                 if col in out.columns:
                     out = out.drop(columns=[col])
+            
+            # Remove empty "SL" column if "StopLoss" exists (legacy column cleanup)
+            if 'SL' in out.columns and 'StopLoss' in out.columns:
+                out = out.drop(columns=['SL'])
         else:
             # Empty DataFrame
             out = pd.DataFrame(columns=base_columns)

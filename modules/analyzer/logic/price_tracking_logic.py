@@ -31,7 +31,7 @@ except ImportError:
 class TradeExecution:
     """Result of trade execution with MFE and break even data"""
     exit_price: float
-    exit_time: pd.Timestamp
+    exit_time: Optional[pd.Timestamp]  # None/NaT for open trades
     exit_reason: str  # "Win", "Loss", "TIME"
     target_hit: bool
     stop_hit: bool
@@ -529,16 +529,17 @@ class PriceTracker:
             
             # Trade is still open if expiry_time is in the future
             if expiry_time and expiry_time > current_time:
-                # Trade hasn't expired yet - use current time and current price
-                # ExitTime = current time in Chicago (trade is still ongoing)
-                exit_time_for_time_expiry = current_time  # Current time in Chicago
+                # Trade hasn't expired yet - exit time should be empty (trade is still ongoing)
+                # ExitTime = empty/None (trade is still open)
+                exit_time_for_time_expiry = pd.NaT  # Use NaT (Not a Time) for open trades
                 # Use the absolute last bar's close price (most recent price in entire dataset)
                 # This ensures we get the latest price even if new data was added since entry
                 exit_price_for_time_expiry = float(last_bar_in_data["close"])  # Current/last available price from most recent bar in dataset
                 
                 # Use "TIME" as exit_reason but time_expired=False (trade still ongoing)
+                # Pass None for exit_time to _classify_result since trade is still open
                 result_classification = self._classify_result(
-                    t1_triggered, "TIME", False, entry_price, exit_time_for_time_expiry, df, direction, t1_removed
+                    t1_triggered, "TIME", False, entry_price, None, df, direction, t1_removed
                 )
                 
                 # Calculate profit based on current price (trade still open)
@@ -563,9 +564,9 @@ class PriceTracker:
                     peak_price = entry_price
                 
                 # Return trade execution with current state (still open)
-                # Result = "TIME", ExitTime = current time, Profit = current price
+                # Result = "TIME", ExitTime = empty/None (trade still open), Profit = current price
                 return self._create_trade_execution(
-                    exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, False,  # exit_reason="TIME", time_expired=False
+                    exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, False,  # exit_reason="TIME", time_expired=False, exit_time=NaT
                     max_favorable, peak_time, peak_price, t1_triggered,
                     stop_loss_adjusted, current_stop_loss, result_classification, profit
                 )
@@ -1552,8 +1553,8 @@ class PriceTracker:
     def _track_post_6_5_price(self, entry_price: float, exit_time: pd.Timestamp, 
                              data: pd.DataFrame, direction: str) -> str:
         """Track price movement after 6.5 exit for Level 1 trades"""
-        if data is None or exit_time is None:
-            return "Win"  # Default to Win if no data available
+        if data is None or exit_time is None or pd.isna(exit_time):
+            return "Win"  # Default to Win if no data available or trade still open
         
         # Get data after the exit time
         post_exit_data = data[data['timestamp'] > exit_time].copy()

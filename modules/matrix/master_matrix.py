@@ -1143,18 +1143,23 @@ class MasterMatrix:
                 return existing_df, {"message": "No data available"}
             
             # Filter to only window period BEFORE sequencer processing
-            # This ensures sequencer only processes dates >= reprocess_start_date
+            # This ensures sequencer only processes dates >= reprocess_start_date AND <= merged_data_max_date
+            # This ensures we include ALL available data up to the latest date in analyzed folder
             reprocess_start_dt = pd.to_datetime(reprocess_start_date)
+            merged_data_max_dt = pd.to_datetime(merged_data_max_date_str) if merged_data_max_date_str else None
+            
             if 'Date' in window_data_for_sequencer.columns:
                 window_data_for_sequencer['Date'] = pd.to_datetime(window_data_for_sequencer['Date'], errors='coerce')
-                window_data_for_sequencer = window_data_for_sequencer[
-                    window_data_for_sequencer['Date'] >= reprocess_start_dt
-                ].copy()
+                mask = window_data_for_sequencer['Date'] >= reprocess_start_dt
+                if merged_data_max_dt is not None:
+                    mask = mask & (window_data_for_sequencer['Date'] <= merged_data_max_dt)
+                window_data_for_sequencer = window_data_for_sequencer[mask].copy()
             elif 'trade_date' in window_data_for_sequencer.columns:
                 window_data_for_sequencer['trade_date'] = pd.to_datetime(window_data_for_sequencer['trade_date'], errors='coerce')
-                window_data_for_sequencer = window_data_for_sequencer[
-                    window_data_for_sequencer['trade_date'] >= reprocess_start_dt
-                ].copy()
+                mask = window_data_for_sequencer['trade_date'] >= reprocess_start_dt
+                if merged_data_max_dt is not None:
+                    mask = mask & (window_data_for_sequencer['trade_date'] <= merged_data_max_dt)
+                window_data_for_sequencer = window_data_for_sequencer[mask].copy()
             
             if window_data_for_sequencer.empty:
                 logger.warning("No data in window period after filtering")
@@ -1175,7 +1180,24 @@ class MasterMatrix:
                 return existing_df, {"message": "No data in window period"}
             
             rows_read = len(window_data_for_sequencer)
-            logger.info(f"Loaded {rows_read} trades for window period (dates >= {reprocess_start_date})")
+            # Log date range being processed
+            if not window_data_for_sequencer.empty:
+                if 'Date' in window_data_for_sequencer.columns:
+                    date_col = 'Date'
+                elif 'trade_date' in window_data_for_sequencer.columns:
+                    date_col = 'trade_date'
+                else:
+                    date_col = None
+                
+                if date_col:
+                    min_date = window_data_for_sequencer[date_col].min()
+                    max_date = window_data_for_sequencer[date_col].max()
+                    logger.info(f"Loaded {rows_read} trades for window period (dates: {min_date.date()} to {max_date.date()})")
+                    logger.info(f"  Reprocess start: {reprocess_start_date}, Latest available: {merged_data_max_date_str}")
+                else:
+                    logger.info(f"Loaded {rows_read} trades for window period (dates >= {reprocess_start_date})")
+            else:
+                logger.warning(f"No trades loaded for window period (dates >= {reprocess_start_date})")
             
             # Apply sequencer logic with restored initial states
             # This processes only the window period, starting from restored state

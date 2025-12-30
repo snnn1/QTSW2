@@ -305,12 +305,21 @@ class DataMerger:
         Read a daily Parquet file, validating schema.
         
         Fails loudly if required columns are missing (per canonical specification).
+        Normalizes column names: renames legacy "SL" to "StopLoss" for consistency.
         """
         try:
             df = pd.read_parquet(file_path)
             if df.empty:
                 logger.warning(f"Empty file: {file_path}")
                 return None
+            
+            # Normalize column names: rename legacy "SL" to "StopLoss" if it exists
+            # This ensures consistent output schema regardless of source file age
+            if 'SL' in df.columns and 'StopLoss' not in df.columns:
+                df = df.rename(columns={'SL': 'StopLoss'})
+            elif 'SL' in df.columns and 'StopLoss' in df.columns:
+                # Both exist - drop SL, keep StopLoss
+                df = df.drop(columns=['SL'])
             
             # Validate schema - fails loudly if required columns missing
             self._validate_schema(df, file_path)
@@ -472,6 +481,7 @@ class DataMerger:
             return {}
         
         # Combine all dataframes
+        # Note: Column normalization happens in _read_daily_file, so all dataframes already have consistent schema
         combined_df = pd.concat(all_dfs, ignore_index=True)
         
         # Validate required columns exist in combined data
@@ -542,7 +552,14 @@ class DataMerger:
                 existing_df = pd.read_parquet(monthly_file)
                 logger.info(f"Loaded existing monthly file: {len(existing_df)} rows")
                 
-                # Combine with new data
+                # Normalize column names in existing file: rename legacy "SL" to "StopLoss"
+                # This ensures consistent output schema regardless of source file age
+                if 'SL' in existing_df.columns and 'StopLoss' not in existing_df.columns:
+                    existing_df = existing_df.rename(columns={'SL': 'StopLoss'})
+                elif 'SL' in existing_df.columns and 'StopLoss' in existing_df.columns:
+                    existing_df = existing_df.drop(columns=['SL'])
+                
+                # Combine with new data (both now have consistent schema)
                 combined = pd.concat([existing_df, new_data], ignore_index=True)
                 
                 # Remove duplicates
