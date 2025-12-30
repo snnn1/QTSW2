@@ -180,12 +180,7 @@ class MasterMatrix:
             Callable function that applies sequencer logic to a DataFrame
         """
         def apply_sequencer(df: pd.DataFrame, display_year: Optional[int] = None) -> pd.DataFrame:
-            # DIAGNOSTIC: Log function being called and module file path (DEBUG level for performance)
-            logger.debug("=" * 80)
-            logger.debug("CALLING SEQUENCER")
-            logger.debug(f"Function: sequencer_logic.apply_sequencer_logic")
-            logger.debug(f"Module file: {sequencer_logic.__file__}")
-            logger.debug("=" * 80)
+            # Sequencer call (debug logging removed - already verified working)
             return sequencer_logic.apply_sequencer_logic(df, self.stream_filters, display_year)
         
         return apply_sequencer
@@ -330,42 +325,11 @@ class MasterMatrix:
         # NOTE: stream_filters are already set above (before loading)
         # They were used in sequencer_logic during loading
         
-        # DIAGNOSTIC: Check Time column values before post-processing (DEBUG level - diagnostic only)
-        if 'Time' in df.columns and 'Stream' in df.columns:
-            s2_streams = ['ES2', 'NQ2', 'GC2', 'NG2', 'YM2', 'CL2']
-            logger.debug("=" * 80)
-            logger.debug("BEFORE normalize_schema/add_global_columns - Time column check:")
-            for stream in s2_streams:
-                stream_df = df[df['Stream'] == stream]
-                if not stream_df.empty:
-                    time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.debug(f"  {stream}: {dict(time_counts)}")
-            logger.debug("=" * 80)
-        
         # Normalize schema
         df = self.normalize_schema(df)
         
-        # DIAGNOSTIC: Check Time column values after normalize_schema (DEBUG level - diagnostic only)
-        if 'Time' in df.columns and 'Stream' in df.columns:
-            logger.debug("AFTER normalize_schema - Time column check:")
-            for stream in s2_streams:
-                stream_df = df[df['Stream'] == stream]
-                if not stream_df.empty:
-                    time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.debug(f"  {stream}: {dict(time_counts)}")
-        
         # Add global columns (applies filters)
         df = self.add_global_columns(df)
-        
-        # DIAGNOSTIC: Check Time column values after add_global_columns (DEBUG level - diagnostic only)
-        if 'Time' in df.columns and 'Stream' in df.columns:
-            logger.debug("AFTER add_global_columns - Time column check:")
-            for stream in s2_streams:
-                stream_df = df[df['Stream'] == stream]
-                if not stream_df.empty:
-                    time_counts = stream_df['Time'].value_counts().head(5)
-                    logger.debug(f"  {stream}: {dict(time_counts)}")
-            logger.debug("=" * 80)
         
         # SL comes from analyzer output (schema_normalizer ensures it exists with NaN if missing)
         
@@ -378,11 +342,10 @@ class MasterMatrix:
         # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
         # Ensure trade_date is datetime (not date objects) for consistent sorting
         if 'trade_date' in df.columns:
-            if df['trade_date'].dtype == 'object':
+            if df['trade_date'].dtype == 'object' or not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
                 # Convert date objects to datetime for proper sorting
-                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
-            elif not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
-                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+                from .utils import normalize_date
+                df['trade_date'] = df['trade_date'].apply(normalize_date)
         
         # Initialize date_repaired and date_repair_quality columns (will be set for invalid dates)
         if 'date_repaired' not in df.columns:
@@ -433,7 +396,7 @@ class MasterMatrix:
                                 continue
                         # If format parsing failed, try general parsing (MEDIUM CONFIDENCE)
                         if pd.isna(repaired_date):
-                            repaired_date = pd.to_datetime(str(original_date), errors='coerce')
+                            repaired_date = normalize_date(str(original_date))
                             if pd.notna(repaired_date):
                                 repair_quality = 0.7  # Medium confidence - general parsing
                     except:
@@ -518,12 +481,23 @@ class MasterMatrix:
                     if len(problematic) > 0:
                         sample_cols = ['Stream', 'Date', 'Time', 'Result'] if all(c in df.columns for c in ['Stream', 'Date', 'Time', 'Result']) else list(df.columns[:5])
                         logger.debug(f"Sample rows with None in '{col}': {problematic[sample_cols].head(3).to_dict('records')}")
-                # Replace None with empty string for string columns to avoid comparison errors
+                
+                # Handle None/NaN values based on column type
                 if df[col].dtype == 'object':
-                    df[col] = df[col].fillna('')
-                    logger.debug(f"Filled None values in '{col}' with empty string for sorting")
+                    if col == 'entry_time':
+                        # For entry_time, use a sentinel value that sorts AFTER all valid times (23:59:59)
+                        # Empty strings sort before valid times, so we use a late time instead
+                        df[col] = df[col].fillna('23:59:59')
+                        # Also replace empty strings with the sentinel
+                        df.loc[df[col] == '', col] = '23:59:59'
+                        logger.debug(f"Filled None/empty values in '{col}' with sentinel '23:59:59' for sorting")
+                    else:
+                        # For other string columns, use empty string
+                        df[col] = df[col].fillna('')
+                        logger.debug(f"Filled None values in '{col}' with empty string for sorting")
         
         # Sort with invalid dates (sentinel date 2099-12-31) at the end
+        # entry_time None/empty values are now '23:59:59' so they sort after valid times
         df = df.sort_values(
             by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
             ascending=[True, True, True, True],
@@ -574,8 +548,8 @@ class MasterMatrix:
                         prev_result = str(df.loc[prev_idx, 'Result']).upper().strip()
                         if prev_result == 'LOSS':
                             # Time changed from previous day after a loss - show on previous day (when change occurred)
-                            # Format: remove trailing whitespace for clean canonical data
-                            df.loc[prev_idx, 'Time Change'] = f"{prev_time_normalized} -> {curr_time_normalized}"
+                            # Format: show only the new time (time changed to)
+                            df.loc[prev_idx, 'Time Change'] = curr_time_normalized
                     
                     prev_idx = idx
                     prev_time_normalized = curr_time_normalized
@@ -789,10 +763,7 @@ class MasterMatrix:
                     df = pd.read_parquet(file_path)
                     if df.empty:
                         continue
-                    if 'Stream' not in df.columns:
-                        df['Stream'] = stream_id
-                    else:
-                        df['Stream'] = stream_id
+                    df['Stream'] = stream_id
                     stream_trades_list.append(df)
                 except Exception as e:
                     logger.error(f"Error loading {file_path}: {e}")
@@ -802,7 +773,7 @@ class MasterMatrix:
                 continue
             
             # Merge all historical data for sequencer accuracy
-            all_history_df = pd.concat(stream_trades_list, ignore_index=True) if len(stream_trades_list) > 1 else stream_trades_list[0]
+            all_history_df = pd.concat(stream_trades_list, ignore_index=True)
             
             # Apply sequencer logic to all historical data using shared callback
             sequencer_result = apply_sequencer(all_history_df, display_year=None)
@@ -858,9 +829,18 @@ class MasterMatrix:
                     none_count = updated_df[col].isna().sum() if hasattr(updated_df[col], 'isna') else (updated_df[col] == None).sum()
                     if none_count > 0:
                         logger.warning(f"[update_master_matrix] Column '{col}' has {none_count} None/NaN values before sorting")
-                    # Replace None with empty string for string columns to avoid comparison errors
+                    # Handle None/NaN values based on column type
                     if updated_df[col].dtype == 'object':
-                        updated_df[col] = updated_df[col].fillna('')
+                        if col == 'entry_time':
+                            # For entry_time, use a sentinel value that sorts AFTER all valid times (23:59:59)
+                            # Empty strings sort before valid times, so we use a late time instead
+                            updated_df[col] = updated_df[col].fillna('23:59:59')
+                            # Also replace empty strings with the sentinel
+                            updated_df.loc[updated_df[col] == '', col] = '23:59:59'
+                            logger.debug(f"[update_master_matrix] Filled None/empty values in '{col}' with sentinel '23:59:59' for sorting")
+                        else:
+                            # For other string columns, use empty string
+                            updated_df[col] = updated_df[col].fillna('')
                         logger.debug(f"[update_master_matrix] Filled None values in '{col}' with empty string for sorting")
             
             updated_df = updated_df.sort_values(
@@ -1234,6 +1214,12 @@ class MasterMatrix:
             
             # Sort and update global_trade_id
             if 'trade_date' in updated_df.columns:
+                # Fix entry_time empty/None values before sorting
+                if 'entry_time' in updated_df.columns and updated_df['entry_time'].dtype == 'object':
+                    # Use sentinel value '23:59:59' for empty/missing entry_time so they sort after valid times
+                    updated_df['entry_time'] = updated_df['entry_time'].fillna('23:59:59')
+                    updated_df.loc[updated_df['entry_time'] == '', 'entry_time'] = '23:59:59'
+                
                 updated_df = updated_df.sort_values(
                     by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
                     ascending=[True, True, True, True],

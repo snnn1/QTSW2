@@ -18,9 +18,14 @@ class BreakEvenResult:
 class BreakEvenManager:
     """Handles break-even trigger system and stop loss management"""
     
-    def __init__(self):
-        """Initialize break-even manager"""
-        pass
+    def __init__(self, instrument_manager=None):
+        """
+        Initialize break-even manager
+        
+        Args:
+            instrument_manager: InstrumentManager instance for profit calculations
+        """
+        self.instrument_manager = instrument_manager
     
     def check_trigger(self, peak: float, t1_threshold: float) -> bool:
         """
@@ -56,8 +61,10 @@ class BreakEvenManager:
         if t1_triggered:
             # T1 triggered: Move stop loss to break-even for all instruments
             # All instruments now use normal break-even behavior (including GC)
-            from breakout_core.config import TICK_SIZE
-            tick_size = TICK_SIZE.get(instrument.upper(), 0.25)  # Default to ES tick size
+            if not self.instrument_manager:
+                raise ValueError("InstrumentManager required for stop loss adjustment")
+            
+            tick_size = self.instrument_manager.get_tick_size(instrument.upper())
             
             if direction == "Long":
                 new_sl = entry_price - tick_size  # 1 tick below entry for long trades
@@ -98,9 +105,12 @@ class BreakEvenManager:
     def calculate_profit(self, entry_price: float, exit_price: float,
                         direction: str, result: str, 
                         t1_triggered: bool,
-                        target_pts: float) -> float:
+                        target_pts: float, instrument: str = "ES",
+                        use_display_profit: bool = False) -> float:
         """
         Calculate profit based on result and trigger
+        
+        This method now delegates to InstrumentManager.calculate_profit() for unified logic.
         
         Args:
             entry_price: Trade entry price
@@ -108,28 +118,30 @@ class BreakEvenManager:
             direction: Trade direction ("Long" or "Short")
             result: Trade result ("Win", "BE", "Loss")
             t1_triggered: Whether T1 trigger is activated
-            target_pts: Target points
+            target_pts: Target points (unscaled)
+            instrument: Trading instrument
+            use_display_profit: If True, returns display profit (ES equivalent for micro-futures)
             
         Returns:
             Calculated profit
         """
-        if result == "Win":
-            # Win trades: Use target profit
-            return target_pts
-        elif result == "BE":
-            # Break-even trades: 0 profit
+        if not self.instrument_manager:
+            raise ValueError("InstrumentManager required for profit calculation")
+        
+        # Use unified profit calculation from InstrumentManager
+        # Note: BreakEvenManager uses BE=0 logic, not BE=-tick_size
+        if result == "BE":
             return 0.0
-        else:
-            # Loss trades: Calculate actual PnL
-            if direction == "Long":
-                pnl_pts = exit_price - entry_price
-            else:
-                pnl_pts = entry_price - exit_price
-            
-            # For MES display purposes, multiply losses by 10 to show ES equivalent
-            if instrument.startswith("M") and pnl_pts < 0:
-                return pnl_pts * 10.0
-            else:
-                return pnl_pts
+        
+        return self.instrument_manager.calculate_profit(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            direction=direction,
+            result=result,
+            t1_triggered=t1_triggered,
+            target_pts=target_pts,
+            instrument=instrument.upper(),
+            use_display_profit=use_display_profit
+        )
     
     # get_trigger_thresholds moved to price_tracking_logic.py with cap functionality

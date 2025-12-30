@@ -221,3 +221,125 @@ class InstrumentManager:
     def get_regular_futures(self) -> list[Instrument]:
         """Get list of all regular futures"""
         return [inst for inst, config in self.instruments.items() if not config.is_micro]
+    
+    def get_decimal_places(self, instrument: Instrument) -> int:
+        """
+        Get number of decimal places for rounding based on tick size
+        
+        Args:
+            instrument: Trading instrument
+            
+        Returns:
+            Number of decimal places to round to
+        """
+        tick_size = self.get_tick_size(instrument)
+        
+        # Convert tick size to decimal places by counting decimal digits
+        # 0.001 -> 3 places, 0.01 -> 2 places, 0.1 -> 1 place, 0.25 -> 2 places, 1.0 -> 0 places
+        if tick_size >= 1.0:
+            return 0
+        
+        # Convert to string and count decimal places
+        tick_str = f"{tick_size:.10f}".rstrip('0').rstrip('.')
+        if '.' in tick_str:
+            return len(tick_str.split('.')[1])
+        else:
+            return 0
+    
+    def round_for_instrument(self, instrument: Instrument, value: float) -> float:
+        """
+        Round a value to the appropriate decimal places for an instrument
+        
+        Args:
+            instrument: Trading instrument
+            value: Value to round
+            
+        Returns:
+            Rounded value
+        """
+        if value is None or (isinstance(value, float) and (value != value)):  # Check for NaN
+            return value
+        
+        decimal_places = self.get_decimal_places(instrument)
+        return round(value, decimal_places)
+    
+    def calculate_profit(self, entry_price: float, exit_price: float,
+                        direction: str, result: str, 
+                        t1_triggered: bool,
+                        target_pts: float, instrument: Instrument,
+                        use_display_profit: bool = False) -> float:
+        """
+        Unified profit calculation method
+        
+        Calculates profit based on trade result, handling all result types consistently.
+        This replaces duplicate profit calculation logic scattered across multiple files.
+        
+        Args:
+            entry_price: Trade entry price
+            exit_price: Trade exit price
+            direction: Trade direction ("Long" or "Short")
+            result: Trade result ("Win", "BE", "Loss", "TIME", or numeric)
+            t1_triggered: Whether T1 trigger was activated
+            target_pts: Target points from ladder (unscaled)
+            instrument: Trading instrument
+            use_display_profit: If True, returns display profit (ES equivalent for micro-futures)
+                              If False, returns actual profit (scaled for micro-futures)
+            
+        Returns:
+            Calculated profit value
+        """
+        # Handle Win result
+        if result == "Win" or (isinstance(result, (int, float)) and result > 0):
+            # Win trades: Use target profit (scaled for micro-futures)
+            actual_profit = self.scale_profit(instrument, target_pts)
+            if use_display_profit:
+                return self.get_display_profit(instrument, actual_profit)
+            return actual_profit
+        
+        # Handle Break-Even result
+        elif result == "BE":
+            # Break-even trades: T1 triggered = 1 tick loss, otherwise 0
+            if t1_triggered:
+                tick_size = self.get_tick_size(instrument)
+                actual_profit = -tick_size
+            else:
+                actual_profit = 0.0
+            
+            if use_display_profit:
+                return self.get_display_profit(instrument, actual_profit)
+            return actual_profit
+        
+        # Handle TIME expiry result
+        elif result == "TIME":
+            # Time expiry trades: Calculate actual PnL based on exit price
+            if direction == "Long":
+                pnl_pts = exit_price - entry_price
+            else:
+                pnl_pts = entry_price - exit_price
+            
+            # Scale for micro-futures
+            actual_profit = self.scale_profit(instrument, pnl_pts)
+            
+            if use_display_profit:
+                return self.get_display_profit(instrument, actual_profit)
+            return actual_profit
+        
+        # Handle Loss result
+        elif result == "Loss":
+            # Loss trades: Calculate actual PnL
+            if direction == "Long":
+                pnl_pts = exit_price - entry_price
+            else:
+                pnl_pts = entry_price - exit_price
+            
+            # Scale for micro-futures
+            actual_profit = self.scale_profit(instrument, pnl_pts)
+            
+            # For display purposes, show ES equivalent for micro-futures losses
+            if use_display_profit and actual_profit < 0:
+                return self.get_display_profit(instrument, actual_profit)
+            
+            return actual_profit
+        
+        # Default: return 0 for unknown result types
+        return 0.0

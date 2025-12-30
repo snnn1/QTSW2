@@ -805,7 +805,7 @@ self.onmessage = function(e) {
           return
         }
         
-        const { streamFilters, streamId, returnRows = false, sortIndices = null } = payload
+        const { streamFilters, streamId, returnRows = false, sortIndices = null, requestId } = payload
         const mask = createFilterMask(self.columnarData, streamFilters || {}, streamId)
         
         // Get filtered indices
@@ -815,26 +815,46 @@ self.onmessage = function(e) {
         }
         
         // Sort indices if requested
+        // IMPORTANT: Sort in DESCENDING order (newest first) for UI display
+        // Backend sorts ascending by ['trade_date', 'entry_time', 'Instrument', 'Stream']
+        // We reverse this to show newest data at top: trade_date (desc), entry_time (desc), Instrument (asc), Stream (asc)
         if (sortIndices && filteredIndices.length > 0) {
           const DateColumn = self.columnarData.getColumn('Date')
           const trade_date = self.columnarData.getColumn('trade_date')
+          const entry_time = self.columnarData.getColumn('entry_time')
           filteredIndices.sort((a, b) => {
             const dateA = getCanonicalDateValue(trade_date, DateColumn, a)
             const dateB = getCanonicalDateValue(trade_date, DateColumn, b)
             const parsedA = parseDateCached(dateA)
             const parsedB = parseDateCached(dateB)
             if (parsedA && parsedB) {
+              // DESCENDING: parsedB - parsedA (newest dates first)
               const dateDiff = parsedB.getTime() - parsedA.getTime()
               if (dateDiff !== 0) return dateDiff
-              const timeA = self.columnarData.getColumn('Time')[a] || ''
-              const timeB = self.columnarData.getColumn('Time')[b] || ''
-              if (timeA && timeB) {
-                const [hA, mA] = timeA.split(':').map(Number)
-                const [hB, mB] = timeB.split(':').map(Number)
+              
+              // Sort by entry_time (actual trade entry time) to match backend sorting
+              // Fallback to Time column if entry_time is missing
+              const entryTimeA = entry_time?.[a] || self.columnarData.getColumn('Time')[a] || ''
+              const entryTimeB = entry_time?.[b] || self.columnarData.getColumn('Time')[b] || ''
+              
+              if (entryTimeA && entryTimeB) {
+                const [hA, mA] = entryTimeA.split(':').map(Number)
+                const [hB, mB] = entryTimeB.split(':').map(Number)
                 const minsA = (hA || 0) * 60 + (mA || 0)
                 const minsB = (hB || 0) * 60 + (mB || 0)
+                // DESCENDING: minsB - minsA (latest times first)
                 if (minsA !== minsB) return minsB - minsA
               }
+              
+              // If times are equal or missing, sort by Instrument then Stream (ascending for consistency)
+              const instrumentA = self.columnarData.getColumn('Instrument')[a] || ''
+              const instrumentB = self.columnarData.getColumn('Instrument')[b] || ''
+              const instrumentDiff = instrumentA.localeCompare(instrumentB)
+              if (instrumentDiff !== 0) return instrumentDiff
+              
+              const streamA = self.columnarData.getColumn('Stream')[a] || ''
+              const streamB = self.columnarData.getColumn('Stream')[b] || ''
+              return streamA.localeCompare(streamB)
             }
             return 0
           })
@@ -843,7 +863,8 @@ self.onmessage = function(e) {
         const response = {
           length: filteredIndices.length,
           mask: mask,
-          indices: filteredIndices
+          indices: filteredIndices,
+          requestId: requestId // Include request ID in response
         }
         
         // Optionally return rows (for initial render)
@@ -874,9 +895,9 @@ self.onmessage = function(e) {
           return
         }
         // Note: streamFilters not used here - stream filtering happens in calculateStats via streamId
-        const { streamId, contractMultiplier, contractValues, includeFilteredExecuted = true } = payload
+        const { streamId, contractMultiplier, contractValues, includeFilteredExecuted = true, requestId } = payload
         const stats = calculateStats(self.columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted)
-        self.postMessage({ type: 'STATS', payload: { stats } })
+        self.postMessage({ type: 'STATS', payload: { stats, requestId } })
         break
       }
       
@@ -886,7 +907,7 @@ self.onmessage = function(e) {
           return
         }
         
-        const { streamFilters = {}, currentTradingDay } = payload
+        const { streamFilters = {}, currentTradingDay, requestId } = payload
         
         const DateColumn = self.columnarData.getColumn('Date')
         const trade_date = self.columnarData.getColumn('trade_date')
@@ -916,7 +937,7 @@ self.onmessage = function(e) {
         }
         
         if (!latestDateStr) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [], requestId } })
           return
         }
         
@@ -957,7 +978,7 @@ self.onmessage = function(e) {
         }
         
         if (targetDOWJS === null || targetDOM === null) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [] } })
+          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [], requestId } })
           return
         }
         
@@ -1117,7 +1138,8 @@ self.onmessage = function(e) {
             executionTimetable: {
               trading_date: latestDateStr,
               streams: executionStreams
-            }
+            },
+            requestId
           } 
         })
         break
@@ -1129,7 +1151,7 @@ self.onmessage = function(e) {
           return
         }
         
-        const { streamFilters = {}, streamId = 'master', contractMultiplier = 1, contractValues = {}, breakdownType, useFiltered = false } = payload
+        const { streamFilters = {}, streamId = 'master', contractMultiplier = 1, contractValues = {}, breakdownType, useFiltered = false, requestId } = payload
         
         // Parse breakdown type (e.g., "time_before", "day_after")
         const [periodType, filterType] = breakdownType.split('_')
@@ -1159,7 +1181,7 @@ self.onmessage = function(e) {
         }
         
         if (dataIndices.length === 0) {
-          self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: {}, breakdownType } })
+          self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: {}, breakdownType, requestId } })
           return
         }
         
@@ -1275,7 +1297,7 @@ self.onmessage = function(e) {
           }
         }
         
-        self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: sortedBreakdown, breakdownType } })
+        self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: sortedBreakdown, breakdownType, requestId } })
         break
       }
       

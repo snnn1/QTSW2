@@ -50,7 +50,7 @@ import pandas as pd
 
 # Import List from typing for type hints (Python 3.8+ compatibility)
 
-from .utils import calculate_time_score, get_session_for_time
+from .utils import calculate_time_score, get_session_for_time, time_sort_key
 from .logging_config import setup_matrix_logger
 from .history_manager import update_time_slot_history, ROLLING_WINDOW_SIZE
 from .trade_selector import select_trade_for_time
@@ -198,10 +198,6 @@ def decide_time_change(
         return None
     
     # Find best other time (highest sum, tie-break to earliest)
-    def time_sort_key(time_str: str) -> tuple:
-        parts = time_str.split(':')
-        return (int(parts[0]), int(parts[1]))
-    
     sorted_others = sorted(
         other_sums.items(),
         key=lambda x: (-x[1], time_sort_key(x[0]))  # Descending sum, ascending time
@@ -491,6 +487,22 @@ def process_stream_daily(
         if trade_row is not None:
             # Convert Series to dict more efficiently
             trade_dict = dict(trade_row)
+            
+            # CRITICAL: Ensure Date is in ISO string format (YYYY-MM-DD) to match analyzer output format
+            # This prevents date formatting issues when Date is a Timestamp object
+            if 'Date' in trade_dict:
+                date_value = trade_dict['Date']
+                if isinstance(date_value, pd.Timestamp):
+                    trade_dict['Date'] = date_value.strftime('%Y-%m-%d')
+                elif pd.notna(date_value):
+                    # Try to parse and reformat if it's already a string in wrong format
+                    try:
+                        parsed_date = pd.to_datetime(date_value, errors='coerce')
+                        if pd.notna(parsed_date):
+                            trade_dict['Date'] = parsed_date.strftime('%Y-%m-%d')
+                    except:
+                        pass  # Keep original if parsing fails
+            
             # CRITICAL: Preserve original analyzer time before overwriting Time column
             # This is needed for downstream filtering (exclude_times filter needs actual trade time)
             original_time = trade_dict.get('Time', '')
@@ -506,9 +518,11 @@ def process_stream_daily(
         else:
             # Sequencer NoTrade: sequencer chose current_time but no trade exists at that slot
             # This is structural - no analyzer data at this time slot
+            # Format date as ISO string (YYYY-MM-DD) to match analyzer output format
+            date_str = date.strftime('%Y-%m-%d') if isinstance(date, pd.Timestamp) else str(date)
             trade_dict = {
                 'Stream': stream_id,
-                'Date': date,
+                'Date': date_str,
                 'Time': str(current_time).strip(),  # Still set Time to current_time (sequencer's intent)
                 'actual_trade_time': '',  # No actual trade, so no actual time
                 'Result': 'NoTrade',

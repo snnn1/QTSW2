@@ -3,6 +3,8 @@
  * Functions for calculating profit by different time periods
  */
 
+import { getProfit } from './numberUtils'
+
 /**
  * Get contract value for a trade
  */
@@ -46,14 +48,55 @@ export const parseDateValue = (dateValue) => {
 }
 
 /**
+ * Common profit calculation helper
+ * @param {Array} data - Trade data
+ * @param {Function} getKey - Function to extract key from trade (returns key or null to skip)
+ * @param {Function} sortKeys - Optional function to sort keys
+ * @param {number} contractMultiplier - Contract multiplier
+ * @returns {Object} Nested object: { key: { stream: profitDollars } }
+ */
+const calculateProfitByKey = (data, getKey, sortKeys = null, contractMultiplier = 1) => {
+  const result = {}
+  
+  data.forEach(trade => {
+    const key = getKey(trade)
+    if (key === null || key === undefined) return
+    
+    const stream = trade.Stream || 'Unknown'
+    const profit = getProfit(trade)
+    const contractValue = getContractValue(trade)
+    const profitDollars = profit * contractValue * contractMultiplier
+    
+    if (!result[key]) {
+      result[key] = {}
+    }
+    if (!result[key][stream]) {
+      result[key][stream] = 0
+    }
+    
+    result[key][stream] += profitDollars
+  })
+  
+  // Sort keys if sort function provided
+  if (sortKeys && typeof sortKeys === 'function') {
+    const sortedKeys = Object.keys(result).sort(sortKeys)
+    const orderedData = {}
+    sortedKeys.forEach(key => {
+      orderedData[key] = result[key]
+    })
+    return orderedData
+  }
+  
+  return result
+}
+
+/**
  * Calculate profit by Time slot by stream
  */
 export const calculateTimeProfit = (data, contractMultiplier = 1) => {
-  const timeData = {}
-  
-  data.forEach(trade => {
+  const getTimeKey = (trade) => {
     const time = trade.Time
-    if (!time || time === 'NA' || time === '00:00') return
+    if (!time || time === 'NA' || time === '00:00') return null
     
     // Normalize time format (ensure HH:MM format)
     let timeKey = time.toString().trim()
@@ -64,75 +107,39 @@ export const calculateTimeProfit = (data, contractMultiplier = 1) => {
       if (match) {
         timeKey = match[1]
       } else {
-        return // Skip if we can't parse the time
+        return null // Skip if we can't parse the time
       }
     }
-    
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!timeData[timeKey]) {
-      timeData[timeKey] = {}
-    }
-    if (!timeData[timeKey][stream]) {
-      timeData[timeKey][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    timeData[timeKey][stream] += profitDollars
-  })
+    return timeKey
+  }
   
-  // Sort time slots chronologically
-  const sortedTimeKeys = Object.keys(timeData).sort((a, b) => {
+  const sortTimeKeys = (a, b) => {
     const [aHour, aMin] = a.split(':').map(Number)
     const [bHour, bMin] = b.split(':').map(Number)
     if (aHour !== bHour) return aHour - bHour
     return aMin - bMin
-  })
+  }
   
-  // Return data ordered by time
-  const orderedData = {}
-  sortedTimeKeys.forEach(timeKey => {
-    orderedData[timeKey] = timeData[timeKey]
-  })
-  
-  return orderedData
+  return calculateProfitByKey(data, getTimeKey, sortTimeKeys, contractMultiplier)
 }
 
 /**
  * Calculate profit by Day of Month (DOM) by stream
  */
 export const calculateDOMProfit = (data, contractMultiplier = 1) => {
-  const domData = {}
-  
-  data.forEach(trade => {
+  const getDOMKey = (trade) => {
     const date = parseDateValue(trade.Date || trade.trade_date)
-    if (!date) return
-    
-    const dayOfMonth = date.getDate() // 1-31
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!domData[dayOfMonth]) {
-      domData[dayOfMonth] = {}
-    }
-    if (!domData[dayOfMonth][stream]) {
-      domData[dayOfMonth][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    domData[dayOfMonth][stream] += profitDollars
-  })
+    if (!date) return null
+    return date.getDate() // 1-31
+  }
+  
+  const result = calculateProfitByKey(data, getDOMKey, null, contractMultiplier)
   
   // Return data ordered by day of month (1-31)
   const orderedData = {}
   for (let day = 1; day <= 31; day++) {
-    if (domData[day]) {
-      orderedData[day] = domData[day]
+    if (result[day]) {
+      orderedData[day] = result[day]
     }
   }
   
@@ -143,38 +150,25 @@ export const calculateDOMProfit = (data, contractMultiplier = 1) => {
  * Calculate profit by Day of Week (DOW) by stream
  */
 export const calculateDailyProfit = (data, contractMultiplier = 1) => {
-  const dowData = {}
   const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
   
-  data.forEach(trade => {
+  const getDOWKey = (trade) => {
     const date = parseDateValue(trade.Date || trade.trade_date)
-    if (!date) return
+    if (!date) return null
     
     const dow = date.toLocaleDateString('en-US', { weekday: 'long' })
     // Skip weekends
-    if (!dowOrder.includes(dow)) return
-    
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!dowData[dow]) {
-      dowData[dow] = {}
-    }
-    if (!dowData[dow][stream]) {
-      dowData[dow][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    dowData[dow][stream] += profitDollars
-  })
+    if (!dowOrder.includes(dow)) return null
+    return dow
+  }
+  
+  const result = calculateProfitByKey(data, getDOWKey, null, contractMultiplier)
   
   // Return data ordered by DOW
   const orderedData = {}
   dowOrder.forEach(dow => {
-    if (dowData[dow]) {
-      orderedData[dow] = dowData[dow]
+    if (result[dow]) {
+      orderedData[dow] = result[dow]
     }
   })
   
@@ -185,92 +179,42 @@ export const calculateDailyProfit = (data, contractMultiplier = 1) => {
  * Calculate monthly profit by stream
  */
 export const calculateMonthlyProfit = (data, contractMultiplier = 1) => {
-  const monthlyData = {}
-  
-  data.forEach(trade => {
+  const getMonthKey = (trade) => {
     const date = parseDateValue(trade.Date || trade.trade_date)
-    if (!date) return
+    if (!date) return null
     
     const year = date.getFullYear()
     const month = date.getMonth() + 1 // 1-12
-    const monthKey = `${year}-${String(month).padStart(2, '0')}`
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!monthlyData[monthKey]) {
-      monthlyData[monthKey] = {}
-    }
-    if (!monthlyData[monthKey][stream]) {
-      monthlyData[monthKey][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    monthlyData[monthKey][stream] += profitDollars
-  })
+    return `${year}-${String(month).padStart(2, '0')}`
+  }
   
-  return monthlyData
+  return calculateProfitByKey(data, getMonthKey, null, contractMultiplier)
 }
 
 /**
  * Calculate daily profit by actual date (YYYY-MM-DD) by stream
  */
 export const calculateDateProfit = (data, contractMultiplier = 1) => {
-  const dateData = {}
-  
-  data.forEach(trade => {
+  const getDateKey = (trade) => {
     const date = parseDateValue(trade.Date || trade.trade_date)
-    if (!date) return
-    
-    const dateKey = date.toISOString().split('T')[0] // YYYY-MM-DD format
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!dateData[dateKey]) {
-      dateData[dateKey] = {}
-    }
-    if (!dateData[dateKey][stream]) {
-      dateData[dateKey][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    dateData[dateKey][stream] += profitDollars
-  })
+    if (!date) return null
+    return date.toISOString().split('T')[0] // YYYY-MM-DD format
+  }
   
-  return dateData
+  return calculateProfitByKey(data, getDateKey, null, contractMultiplier)
 }
 
 /**
  * Calculate yearly profit by stream
  */
 export const calculateYearlyProfit = (data, contractMultiplier = 1) => {
-  const yearlyData = {}
-  
-  data.forEach(trade => {
+  const getYearKey = (trade) => {
     const date = parseDateValue(trade.Date || trade.trade_date)
-    if (!date) return
-    
-    const year = date.getFullYear()
-    const stream = trade.Stream || 'Unknown'
-    
-    if (!yearlyData[year]) {
-      yearlyData[year] = {}
-    }
-    if (!yearlyData[year][stream]) {
-      yearlyData[year][stream] = 0
-    }
-    
-    const profit = parseFloat(trade.Profit) || 0
-    const contractValue = getContractValue(trade)
-    const profitDollars = profit * contractValue * contractMultiplier
-    
-    yearlyData[year][stream] += profitDollars
-  })
+    if (!date) return null
+    return date.getFullYear()
+  }
   
-  return yearlyData
+  return calculateProfitByKey(data, getYearKey, null, contractMultiplier)
 }
 
 

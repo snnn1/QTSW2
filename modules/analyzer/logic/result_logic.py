@@ -25,9 +25,42 @@ class TradeResult:
 class ResultProcessor:
     """Handles trade result processing and formatting"""
     
-    def __init__(self):
-        """Initialize result processor"""
-        pass
+    def __init__(self, instrument_manager=None):
+        """
+        Initialize result processor
+        
+        Args:
+            instrument_manager: InstrumentManager instance for profit calculations
+        """
+        self.instrument_manager = instrument_manager
+    
+    def _validate_time_label(self, time_label: str) -> bool:
+        """
+        Validate time label format (should be HH:MM)
+        
+        Args:
+            time_label: Time label to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if not time_label or not isinstance(time_label, str):
+            return False
+        
+        if ":" not in time_label:
+            return False
+        
+        try:
+            parts = time_label.split(":")
+            if len(parts) != 2:
+                return False
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                return False
+            return True
+        except (ValueError, IndexError):
+            return False
     
     def create_result_row(self, date: pd.Timestamp, time_label: str, target: float, 
                          peak: float, direction: str, result: str, range_sz: float, 
@@ -62,6 +95,63 @@ class ResultProcessor:
             Dictionary representing the result row
         """
         from breakout_core.utils import hhmm_to_sort_int
+        
+        # Validate time_label format
+        if not self._validate_time_label(time_label):
+            # Try to derive time_label from entry_time if available
+            if entry_time is not None and isinstance(entry_time, pd.Timestamp):
+                # Try to find the closest slot time based on entry_time
+                # Get slot ends from config to find the closest match
+                from logic.config_logic import ConfigManager
+                config_manager = ConfigManager()
+                
+                # Determine session from entry_time hour
+                # S1 slots: 07:30, 08:00, 09:00
+                # S2 slots: 09:30, 10:00, 10:30, 11:00
+                entry_hour = entry_time.hour
+                entry_minute = entry_time.minute
+                
+                # Try to match to closest slot
+                if session == "S1":
+                    slot_ends = config_manager.get_slot_ends("S1")
+                elif session == "S2":
+                    slot_ends = config_manager.get_slot_ends("S2")
+                else:
+                    slot_ends = []
+                
+                # Find the slot that entry_time falls into
+                # Entry should be at or after the slot end time
+                # Find the most recent slot that entry_time is >= to
+                best_match = None
+                best_slot_minutes = -1
+                for slot_time in slot_ends:
+                    try:
+                        slot_hour, slot_minute = map(int, slot_time.split(":"))
+                        slot_minutes = slot_hour * 60 + slot_minute
+                        entry_minutes = entry_hour * 60 + entry_minute
+                        # Find the most recent slot that entry_time is >= to
+                        # This means entry happened at or after this slot ended
+                        if entry_minutes >= slot_minutes and slot_minutes > best_slot_minutes:
+                            best_slot_minutes = slot_minutes
+                            best_match = slot_time
+                    except (ValueError, IndexError):
+                        continue
+                
+                # If no slot found where entry >= slot, use the first slot as fallback
+                if best_match is None and slot_ends:
+                    best_match = slot_ends[0]
+                
+                if best_match and self._validate_time_label(best_match):
+                    time_label = best_match
+                else:
+                    # Use empty string as last resort
+                    time_label = ""
+            else:
+                # Use empty string as fallback for invalid time_label
+                time_label = ""
+        
+        # Calculate _sortTime AFTER time_label is finalized (may have been derived from entry_time)
+        sort_time_value = hhmm_to_sort_int(time_label) if time_label and self._validate_time_label(time_label) else 0
         
         # Format EntryTime and ExitTime as DD/MM/YY HH:MM strings
         entry_time_str = ""
@@ -103,7 +193,7 @@ class ResultProcessor:
             "Instrument": instrument.upper(),
             "Session": session,
             "Profit": profit,
-            "_sortTime": hhmm_to_sort_int(time_label)
+            "_sortTime": sort_time_value
         }
         
         return row
@@ -151,13 +241,60 @@ class ResultProcessor:
         # Convert Date to datetime for proper sorting
         out["Date"] = pd.to_datetime(out["Date"])
         
+        # Filter out rows with empty/invalid Time values before deduplication
+        if "Time" in out.columns:
+            # Keep rows where Time is not empty and is valid format
+            valid_time_mask = out["Time"].apply(lambda x: self._validate_time_label(str(x)) if pd.notna(x) and str(x) else False)
+            invalid_count = (~valid_time_mask).sum()
+            if invalid_count > 0:
+                # Log warning but don't fail - just filter out invalid rows
+                import warnings
+                warnings.warn(f"Filtered out {invalid_count} rows with invalid Time values", UserWarning)
+            out = out[valid_time_mask].copy()
+        
         # Define result ranking
         rank = {"Win":5,"BE":4,"Loss":3,"TIME":2}
         out["_rank"] = out["Result"].map(rank).fillna(-1)
         
+        # Ensure _sortTime is valid for all rows before sorting
+        if "_sortTime" in out.columns and "Time" in out.columns:
+            # Recalculate _sortTime for any invalid values
+            invalid_sort_mask = (out["_sortTime"] == 0) | out["_sortTime"].isna()
+            if invalid_sort_mask.any():
+                out.loc[invalid_sort_mask, "_sortTime"] = out.loc[invalid_sort_mask, "Time"].apply(
+                    lambda x: hhmm_to_sort_int(str(x)) if self._validate_time_label(str(x)) else 0
+                )
+        
         # Sort and deduplicate - earliest first by Date and Time
         out = (out.sort_values(["Date","_sortTime","Target","_rank","Peak"], ascending=[True,True,True,False,False])
                   .drop_duplicates(subset=["Date","Time","Target","Direction","Session","Instrument"], keep="first"))
+        
+        # Round numeric columns based on instrument tick size
+        # Apply rounding per row since different instruments may be in same DataFrame
+        if self.instrument_manager and not out.empty and "Instrument" in out.columns:
+            # Price columns (EntryPrice, ExitPrice) - round based on instrument tick size
+            price_columns = ["EntryPrice", "ExitPrice"]
+            for col in price_columns:
+                if col in out.columns:
+                    out[col] = out.apply(
+                        lambda row: self.instrument_manager.round_for_instrument(
+                            row["Instrument"].upper(), 
+                            row[col]
+                        ) if pd.notna(row[col]) else row[col],
+                        axis=1
+                    )
+            
+            # Point columns (StopLoss, Target, Peak, Profit) - round based on instrument tick size
+            point_columns = ["StopLoss", "Target", "Peak", "Profit"]
+            for col in point_columns:
+                if col in out.columns:
+                    out[col] = out.apply(
+                        lambda row: self.instrument_manager.round_for_instrument(
+                            row["Instrument"].upper(), 
+                            row[col]
+                        ) if pd.notna(row[col]) else row[col],
+                        axis=1
+                    )
         
         # Final sort by Date and Time (earliest first) and cleanup
         out = out.sort_values(["Date","_sortTime"], ascending=[True,True]).drop(columns=["_sortTime","_rank"]).reset_index(drop=True)
@@ -195,9 +332,12 @@ class ResultProcessor:
     def calculate_profit_for_result(self, entry_price: float, exit_price: float,
                                   direction: str, result: str, 
                                   t1_triggered: bool,
-                                  target_pts: float, instrument: str) -> float:
+                                  target_pts: float, instrument: str,
+                                  use_display_profit: bool = False) -> float:
         """
         Calculate profit based on result and trigger
+        
+        This method now delegates to InstrumentManager.calculate_profit() for unified logic.
         
         Args:
             entry_price: Trade entry price
@@ -205,33 +345,30 @@ class ResultProcessor:
             direction: Trade direction
             result: Trade result classification
             t1_triggered: Whether T1 trigger was activated
-            target_pts: Target points
+            target_pts: Target points (unscaled)
             instrument: Trading instrument
+            use_display_profit: If True, returns display profit (ES equivalent for micro-futures)
             
         Returns:
             Calculated profit
         """
-        # Calculate base PnL
-        if direction == "Long":
-            pnl_pts = exit_price - entry_price
-        else:
-            pnl_pts = entry_price - exit_price
+        if not self.instrument_manager:
+            raise ValueError("InstrumentManager required for profit calculation")
         
-        # Scale PnL for micro-futures
-        if instrument.startswith("M"):  # Micro-futures
-            pnl_pts = pnl_pts / 10.0
-        
-        # Adjust profit based on result
-        if result == "Win":
-            # Win trades: Use target profit
-            return target_pts
-        elif result == "BE":
-            # Break-even trades: 0 profit
+        # Use unified profit calculation from InstrumentManager
+        # Note: ResultProcessor uses BE=0 logic, not BE=-tick_size
+        # So we need to handle BE differently here
+        if result == "BE":
+            # ResultProcessor expects BE to return 0, not -tick_size
             return 0.0
-        else:
-            # Loss trades: Use actual PnL (already scaled for micro-futures above)
-            # For MES display purposes, multiply losses by 10 to show ES equivalent
-            if instrument.startswith("M") and pnl_pts < 0:
-                return pnl_pts * 10.0
-            else:
-                return pnl_pts
+        
+        return self.instrument_manager.calculate_profit(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            direction=direction,
+            result=result,
+            t1_triggered=t1_triggered,
+            target_pts=target_pts,
+            instrument=instrument.upper(),
+            use_display_profit=use_display_profit
+        )

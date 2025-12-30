@@ -50,13 +50,15 @@ class StopLossConfig:
 class LossManager:
     """Handles all loss-related calculations and management"""
     
-    def __init__(self, config: StopLossConfig = None):
+    def __init__(self, config: StopLossConfig = None, instrument_manager=None):
         """
         Initialize loss manager
         
         Args:
             config: Stop loss configuration (uses defaults if None)
+            instrument_manager: InstrumentManager instance for instrument-specific calculations
         """
+        self.instrument_manager = instrument_manager
         self.config = config or StopLossConfig()
         self.daily_losses = {}  # Track daily losses by date
         self.trade_losses = []  # Track individual trade losses
@@ -113,10 +115,12 @@ class LossManager:
         Returns:
             Tuple of (new_stop_loss, adjustment_reason)
         """
+        if not self.instrument_manager:
+            raise ValueError("InstrumentManager required for stop loss adjustment")
+        
         if self.config.t1_adjustment == "break_even":
             # Move stop loss to 1 tick below break-even
-            from breakout_core.config import TICK_SIZE
-            tick_size = TICK_SIZE.get(instrument.upper(), 0.25)  # Default to ES tick size
+            tick_size = self.instrument_manager.get_tick_size(instrument.upper())
             
             if direction == "Long":
                 new_sl = entry_price - tick_size  # 1 tick below entry for long trades
@@ -136,8 +140,7 @@ class LossManager:
             
         else:
             # All instruments: 1 tick below break-even
-            from breakout_core.config import TICK_SIZE
-            tick_size = TICK_SIZE.get(instrument.upper(), 0.25)  # Default to ES tick size
+            tick_size = self.instrument_manager.get_tick_size(instrument.upper())
             
             if direction == "Long":
                 new_sl = entry_price - tick_size  # 1 tick below entry for long trades
@@ -186,9 +189,13 @@ class LossManager:
         else:
             loss_pts = exit_price - entry_price
             
-        # Scale for micro-futures
-        if instrument.startswith("M"):
-            loss_pts = loss_pts / 10.0
+        # Scale for micro-futures using InstrumentManager
+        if self.instrument_manager:
+            loss_pts = self.instrument_manager.scale_profit(instrument.upper(), loss_pts)
+        else:
+            # Fallback if InstrumentManager not available (shouldn't happen)
+            if instrument.startswith("M"):
+                loss_pts = loss_pts / 10.0
             
         return loss_pts
     

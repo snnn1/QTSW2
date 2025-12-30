@@ -67,30 +67,15 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
           const isNG = baseSymbol === 'NG'
           const decimalPlaces = isNG ? 3 : 2
           
-          if (col === 'StopLoss') {
-            if (value === null || value === undefined) {
-              value = '-'
-            } else {
-              const numValue = typeof value === 'number' ? value : parseFloat(value)
-              if (numValue === 0 || numValue === '0' || numValue === 0.0) {
-                value = isNG ? '0.000' : '0.00'
-              } else if (!isNaN(numValue) && isFinite(numValue)) {
-                // Round to avoid floating point precision errors
-                const multiplier = Math.pow(10, decimalPlaces)
-                const rounded = Math.round(numValue * multiplier) / multiplier
-                value = rounded.toFixed(decimalPlaces)
-              } else {
-                value = '-'
-              }
-            }
-          } else if (value !== null && value !== undefined) {
-            const numValue = parseFloat(value)
+          if (value !== null && value !== undefined) {
+            const numValue = typeof value === 'number' ? value : parseFloat(value)
             if (!isNaN(numValue) && isFinite(numValue)) {
-              // Round to avoid floating point precision errors
-              const multiplier = Math.pow(10, decimalPlaces)
-              const rounded = Math.round(numValue * multiplier) / multiplier
-              value = rounded.toFixed(decimalPlaces)
+              value = numValue.toFixed(decimalPlaces)
+            } else {
+              value = '-'
             }
+          } else {
+            value = '-'
           }
         }
         // Time Change
@@ -121,17 +106,13 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
         if (col.includes(' Rolling') && value !== null && value !== undefined) {
           const numValue = parseFloat(value)
           if (!isNaN(numValue) && isFinite(numValue)) {
-            // Round to avoid floating point precision errors
-            const rounded = Math.round(numValue * 100) / 100
-            value = rounded.toFixed(2)
+            value = numValue.toFixed(2)
           }
         }
         if (col.includes(' Points') && value !== null && value !== undefined) {
           const numValue = parseFloat(value)
           if (!isNaN(numValue) && isFinite(numValue)) {
-            // Round to avoid floating point precision errors
-            const rounded = Math.round(numValue)
-            value = rounded.toFixed(0)
+            value = numValue.toFixed(0)
           }
         }
         
@@ -160,19 +141,41 @@ export default function DataTable({
   loadingMoreRows,
   selectedColumns,
   activeTab,
-  onLoadMoreRows
+  onLoadMoreRows,
+  showFilteredDays = true,
+  getFilteredData = null
 }) {
   // Use worker filtered data if available (much faster - off main thread)
   let filtered = []
   let totalFiltered = 0
   
-  if (workerReady && workerFilteredIndices.length > 0) {
+  if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0) {
     // Use loaded rows (incrementally loaded as user scrolls)
-    filtered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
-    totalFiltered = filteredLength || workerFilteredIndices.length
+    let baseFiltered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
+    
+    // Apply stream filter when using worker data
+    // The worker filters by stream filters but may return multiple streams when streamId is 'master'
+    // When viewing a specific stream tab (like 'ES1'), we need to filter to that stream only
+    if (streamId && streamId !== 'master') {
+      filtered = baseFiltered.filter(row => row.Stream === streamId)
+      totalFiltered = filtered.length
+    } else {
+      filtered = baseFiltered
+      totalFiltered = filteredLength || filtered.length
+    }
   } else {
     // Fallback to main thread filtering only if worker not ready
-    filtered = data
+    if (getFilteredData && typeof getFilteredData === 'function') {
+      filtered = getFilteredData(data, streamId)
+    } else {
+      filtered = data || []
+    }
+    totalFiltered = filtered.length
+  }
+  
+  // Apply "Show/Hide Filtered Days" toggle
+  if (!showFilteredDays) {
+    filtered = filtered.filter(row => row.final_allowed !== false)
     totalFiltered = filtered.length
   }
   

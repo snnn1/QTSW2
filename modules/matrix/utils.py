@@ -5,7 +5,51 @@ This module contains helper functions for time normalization, session detection,
 and score calculation used throughout the master matrix processing pipeline.
 """
 
-from typing import Dict
+from typing import Dict, Optional
+import pandas as pd
+
+def time_sort_key(time_str: str) -> tuple:
+    """
+    Convert time string to tuple for proper chronological sorting.
+    
+    Args:
+        time_str: Time string in various formats (e.g., "7:30", "07:30")
+        
+    Returns:
+        Tuple of (hour, minute) as integers for sorting
+    """
+    normalized = normalize_time(time_str)
+    parts = normalized.split(':')
+    return (int(parts[0]), int(parts[1]))  # (hour, minute)
+
+
+def normalize_date(date_value, errors: str = 'coerce') -> Optional[pd.Timestamp]:
+    """
+    Normalize date value to pandas Timestamp.
+    
+    Handles various date formats consistently:
+    - String dates (DD/MM/YYYY, YYYY-MM-DD, etc.)
+    - Already datetime objects
+    - NaN/None values
+    
+    Args:
+        date_value: Date value in various formats
+        errors: How to handle errors ('coerce', 'raise', 'ignore')
+                Default: 'coerce' (returns NaT for invalid dates)
+        
+    Returns:
+        pandas Timestamp or NaT if invalid/coerced
+    """
+    if pd.isna(date_value) or date_value is None:
+        return pd.NaT
+    
+    # If already a Timestamp, return as-is
+    if isinstance(date_value, pd.Timestamp):
+        return date_value
+    
+    # Convert to datetime
+    return pd.to_datetime(date_value, errors=errors)
+
 
 def normalize_time(time_str: str) -> str:
     """

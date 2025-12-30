@@ -17,11 +17,19 @@ class ValidationResult:
 class ValidationManager:
     """Handles data validation and input verification"""
     
-    def __init__(self):
-        """Initialize validation manager"""
+    def __init__(self, filter_invalid_rows: bool = False, deduplicate_timestamps: bool = False):
+        """
+        Initialize validation manager
+        
+        Args:
+            filter_invalid_rows: If True, filter out invalid OHLC rows instead of just reporting errors
+            deduplicate_timestamps: If True, deduplicate timestamps (keep first) instead of just warning
+        """
         self.required_columns = {"timestamp", "open", "high", "low", "close", "instrument"}
         self.valid_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "MES", "MNQ", "MYM", "MCL", "MNG", "MGC", "MINUTEDATAEXPORT"}
         self.valid_sessions = {"S1", "S2"}
+        self.filter_invalid_rows = filter_invalid_rows
+        self.deduplicate_timestamps = deduplicate_timestamps
     
     def validate_dataframe(self, df: pd.DataFrame) -> ValidationResult:
         """
@@ -60,6 +68,17 @@ class ValidationManager:
                 if not pd.api.types.is_numeric_dtype(df[col]):
                     errors.append(f"{col} column must be numeric")
         
+        # Check for negative prices
+        if all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+            negative_prices = df[
+                (df['open'] < 0) |
+                (df['high'] < 0) |
+                (df['low'] < 0) |
+                (df['close'] < 0)
+            ]
+            if not negative_prices.empty:
+                errors.append(f"Found {len(negative_prices)} rows with negative prices")
+        
         # Check OHLC relationships
         if all(col in df.columns for col in ['high', 'low', 'open', 'close']):
             invalid_ohlc = df[
@@ -70,7 +89,10 @@ class ValidationManager:
                 (df['low'] > df['close'])
             ]
             if not invalid_ohlc.empty:
-                errors.append(f"Found {len(invalid_ohlc)} rows with invalid OHLC relationships")
+                if self.filter_invalid_rows:
+                    warnings.append(f"Found {len(invalid_ohlc)} rows with invalid OHLC relationships (will be filtered if get_cleaned_dataframe() is used)")
+                else:
+                    errors.append(f"Found {len(invalid_ohlc)} rows with invalid OHLC relationships")
         
         # Check instrument values
         if 'instrument' in df.columns:
@@ -82,7 +104,21 @@ class ValidationManager:
         if 'timestamp' in df.columns:
             duplicates = df['timestamp'].duplicated().sum()
             if duplicates > 0:
-                warnings.append(f"Found {duplicates} duplicate timestamps")
+                if self.deduplicate_timestamps:
+                    warnings.append(f"Found {duplicates} duplicate timestamps (will be deduplicated if get_cleaned_dataframe() is used)")
+                else:
+                    warnings.append(f"Found {duplicates} duplicate timestamps")
+        
+        # Check for timestamp gaps (large gaps may indicate missing data)
+        if 'timestamp' in df.columns and len(df) > 1:
+            df_sorted = df.sort_values('timestamp')
+            time_diffs = df_sorted['timestamp'].diff()
+            if pd.api.types.is_datetime64_any_dtype(time_diffs):
+                # Expected interval is 1 minute for minute data
+                expected_interval = pd.Timedelta(minutes=1)
+                large_gaps = time_diffs[time_diffs > expected_interval * 10]  # Gaps > 10 minutes
+                if len(large_gaps) > 0:
+                    warnings.append(f"Found {len(large_gaps)} timestamp gaps > 10 minutes (may indicate missing data)")
         
         # Check for missing values
         missing_values = df.isnull().sum()
@@ -91,6 +127,36 @@ class ValidationManager:
         
         is_valid = len(errors) == 0
         return ValidationResult(is_valid, errors, warnings)
+    
+    def get_cleaned_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Get cleaned DataFrame with invalid rows filtered and duplicates removed
+        
+        Args:
+            df: Original DataFrame
+            
+        Returns:
+            Cleaned DataFrame
+        """
+        # Create a copy to avoid modifying original
+        cleaned_df = df.copy()
+        
+        # Filter invalid OHLC rows if enabled
+        if self.filter_invalid_rows and all(col in cleaned_df.columns for col in ['high', 'low', 'open', 'close']):
+            invalid_ohlc = cleaned_df[
+                (cleaned_df['high'] < cleaned_df['low']) |
+                (cleaned_df['high'] < cleaned_df['open']) |
+                (cleaned_df['high'] < cleaned_df['close']) |
+                (cleaned_df['low'] > cleaned_df['open']) |
+                (cleaned_df['low'] > cleaned_df['close'])
+            ]
+            cleaned_df = cleaned_df[~cleaned_df.index.isin(invalid_ohlc.index)]
+        
+        # Deduplicate timestamps if enabled
+        if self.deduplicate_timestamps and 'timestamp' in cleaned_df.columns:
+            cleaned_df = cleaned_df.drop_duplicates(subset=['timestamp'], keep='first')
+        
+        return cleaned_df
     
     def validate_run_params(self, params) -> ValidationResult:
         """
@@ -189,8 +255,10 @@ class ValidationManager:
             errors.append(f"Range size mismatch: provided {range_size}, calculated {calculated_size}")
         
         # Check if range size is reasonable
-        if range_size <= 0:
-            errors.append("Range size must be positive")
+        if range_size < 0:
+            errors.append("Range size cannot be negative")
+        elif range_size == 0:
+            warnings.append("Range size is zero (high == low) - may cause issues in calculations")
         elif range_size > 1000:  # Arbitrary large value
             warnings.append("Range size seems unusually large")
         

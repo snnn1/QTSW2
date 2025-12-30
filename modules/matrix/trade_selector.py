@@ -14,7 +14,7 @@ import sys
 from typing import List, Optional, Dict
 import pandas as pd
 
-from .utils import get_session_for_time, normalize_time
+from .utils import get_session_for_time, normalize_time, time_sort_key
 from .config import SLOT_ENDS
 
 logger = logging.getLogger(__name__)
@@ -107,12 +107,6 @@ def get_available_times(stream_df: pd.DataFrame, exclude_times_str: List[str], s
             available_times.append(normalized_canonical)
     
     # Sort chronologically (should already be sorted in slot_ends, but ensure it)
-    def time_sort_key(time_str: str) -> tuple:
-        """Convert time string to tuple for proper chronological sorting"""
-        normalized = normalize_time(time_str)
-        parts = normalized.split(':')
-        return (int(parts[0]), int(parts[1]))  # (hour, minute)
-    
     available_times = sorted(available_times, key=time_sort_key)
     
     return available_times

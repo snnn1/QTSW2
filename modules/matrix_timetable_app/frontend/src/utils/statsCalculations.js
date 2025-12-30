@@ -4,6 +4,7 @@
  */
 
 import { getContractValue } from './profitCalculations'
+import { getProfit } from './numberUtils'
 
 /**
  * Format currency value
@@ -39,16 +40,16 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const winLossTrades = wins + losses
   const winRate = winLossTrades > 0 ? (wins / winLossTrades * 100) : 0
   
-  const totalProfit = filtered.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0)
+  const totalProfit = filtered.reduce((sum, t) => sum + getProfit(t), 0)
   const avgProfit = totalProfit / totalTrades
   
   const winningTrades = filtered.filter(t => t.Result === 'Win')
   const losingTrades = filtered.filter(t => t.Result === 'Loss')
   const avgWin = winningTrades.length > 0 
-    ? winningTrades.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0) / winningTrades.length 
+    ? winningTrades.reduce((sum, t) => sum + getProfit(t), 0) / winningTrades.length 
     : 0
   const avgLoss = losingTrades.length > 0 
-    ? Math.abs(losingTrades.reduce((sum, t) => sum + (parseFloat(t.Profit) || 0), 0) / losingTrades.length)
+    ? Math.abs(losingTrades.reduce((sum, t) => sum + getProfit(t), 0) / losingTrades.length)
     : 0
   const rrRatio = avgLoss > 0 ? avgWin / avgLoss : (avgWin > 0 ? Infinity : 0)
   
@@ -73,7 +74,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   // Calculate total profit in dollars
   const totalProfitDollars = filtered.reduce((sum, t) => {
-    const profit = parseFloat(t.Profit) || 0
+    const profit = getProfit(t)
     const contractValue = getContractValue(t)
     return sum + (profit * contractValue * contractMultiplier)
   }, 0)
@@ -107,11 +108,11 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   // Profit Factor
   const grossProfitDollars = winningTrades.reduce((sum, t) => {
-    const profit = Math.max(0, parseFloat(t.Profit) || 0)
+    const profit = Math.max(0, getProfit(t))
     return sum + (profit * getContractValue(t) * contractMultiplier)
   }, 0)
   const grossLossDollars = Math.abs(losingTrades.reduce((sum, t) => {
-    const profit = Math.min(0, parseFloat(t.Profit) || 0)
+    const profit = Math.min(0, getProfit(t))
     return sum + (profit * getContractValue(t) * contractMultiplier)
   }, 0))
   const profitFactor = grossLossDollars > 0 ? grossProfitDollars / grossLossDollars : (grossProfitDollars > 0 ? Infinity : 0)
@@ -122,7 +123,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   let maxDrawdownDollars = 0
   
   sortedByDate.forEach(trade => {
-    const profit = parseFloat(trade.Profit) || 0
+    const profit = getProfit(trade)
     const contractValue = getContractValue(trade)
     const profitDollars = profit * contractValue * contractMultiplier
     
@@ -171,7 +172,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
           if (!tradesByDate.has(dateKey)) {
             tradesByDate.set(dateKey, 0)
           }
-          const profit = parseFloat(trade.Profit) || 0
+          const profit = getProfit(trade)
           const contractValue = getContractValue(trade)
           tradesByDate.set(dateKey, tradesByDate.get(dateKey) + (profit * contractValue * contractMultiplier))
         }
@@ -183,7 +184,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     dailyReturnsDollars = Array.from(tradesByDate.values())
   } else {
     dailyReturnsDollars = filtered.map(t => {
-      const profit = parseFloat(t.Profit) || 0
+      const profit = getProfit(t)
       return profit * getContractValue(t) * contractMultiplier
     })
   }
@@ -217,14 +218,12 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const tradesWithProfit = filtered.filter(t => t.Result !== 'NoTrade')
   const bestTrade = tradesWithProfit.length > 0 
     ? tradesWithProfit.reduce((best, t) => {
-        const profit = parseFloat(t.Profit) || 0
-        return profit > (parseFloat(best.Profit) || 0) ? t : best
+        return getProfit(t) > getProfit(best) ? t : best
       }, tradesWithProfit[0])
     : null
   const worstTrade = tradesWithProfit.length > 0
     ? tradesWithProfit.reduce((worst, t) => {
-        const profit = parseFloat(t.Profit) || 0
-        return profit < (parseFloat(worst.Profit) || 0) ? t : worst
+        return getProfit(t) < getProfit(worst) ? t : worst
       }, tradesWithProfit[0])
     : null
   
@@ -234,7 +233,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const perTradePnLDollars = sortedByDate
     .filter(trade => trade.Result !== 'NoTrade')
     .map(trade => {
-      const profit = parseFloat(trade.Profit) || 0
+      const profit = getProfit(trade)
       const contractValue = getContractValue(trade)
       return profit * contractValue * contractMultiplier
     })
@@ -381,7 +380,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   let runningEquity = 0
   sortedByDate.forEach((trade, idx) => {
-    const profit = parseFloat(trade.Profit) || 0
+    const profit = getProfit(trade)
     const contractValue = getContractValue(trade)
     const profitDollars = profit * contractValue * contractMultiplier
     runningEquity += profitDollars
@@ -445,7 +444,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
       if (isNaN(dateObj.getTime())) return
       
       const monthKey = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}`
-      const profit = parseFloat(trade.Profit) || 0
+      const profit = getProfit(trade)
       const contractValue = getContractValue(trade)
       const profitDollars = profit * contractValue * contractMultiplier
       
@@ -485,7 +484,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
       }
       
       if (dateKey) {
-        const profit = parseFloat(trade.Profit) || 0
+        const profit = getProfit(trade)
         const contractValue = getContractValue(trade)
         const profitDollars = profit * contractValue * contractMultiplier
         

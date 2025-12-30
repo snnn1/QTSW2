@@ -12,6 +12,8 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 from .debug_logic import DebugManager, DebugInfo
+from .instrument_logic import InstrumentManager
+from .config_logic import ConfigManager
 
 # Optional scipy import with fallback
 try:
@@ -50,7 +52,9 @@ class TradeExecution:
 class PriceTracker:
     """Handles real-time price tracking, trade execution, MFE calculation, and break even logic"""
     
-    def __init__(self, debug_manager: DebugManager = None):
+    def __init__(self, debug_manager: DebugManager = None, 
+                 instrument_manager: InstrumentManager = None,
+                 config_manager: ConfigManager = None):
         """
         Initialize PriceTracker with Method 1: Actual Historical Data Analysis
         
@@ -60,8 +64,12 @@ class PriceTracker:
         
         Args:
             debug_manager: Debug manager for logging
+            instrument_manager: Instrument manager for tick sizes and scaling
+            config_manager: Configuration manager for market close time
         """
         self.debug_manager = debug_manager or DebugManager(False)
+        self.instrument_manager = instrument_manager or InstrumentManager()
+        self.config_manager = config_manager or ConfigManager()
     
     def execute_trade(self, df: pd.DataFrame, entry_time: pd.Timestamp,
                      entry_price: float, direction: str, target_level: float,
@@ -128,8 +136,19 @@ class PriceTracker:
             # Get bars after entry time (including after market close for detection)
             after = df[df["timestamp"] >= entry_time].copy()
             
-            # Define market close time (16:00)
-            market_close = entry_time.replace(hour=16, minute=0, second=0, microsecond=0)
+            # Define market close time (configurable via ConfigManager)
+            # CRITICAL: Create market_close timestamp properly preserving timezone
+            market_close_time_str = self.config_manager.get_market_close_time()  # e.g., "16:00"
+            market_close_hour, market_close_minute = map(int, market_close_time_str.split(":"))
+            # Convert entry_time to pandas Timestamp if it's not already
+            entry_time_pd = pd.Timestamp(entry_time) if not isinstance(entry_time, pd.Timestamp) else entry_time
+            if entry_time_pd.tz is not None:
+                # Timezone-aware: create market close timestamp in same timezone
+                date_str = entry_time_pd.strftime('%Y-%m-%d')
+                market_close = pd.Timestamp(f"{date_str} {market_close_hour:02d}:{market_close_minute:02d}:00", tz=entry_time_pd.tz)
+            else:
+                # Naive timestamp: use replace directly
+                market_close = entry_time_pd.replace(hour=market_close_hour, minute=market_close_minute, second=0, microsecond=0)
             
             # Check if entry happened after market close
             if entry_time > market_close:
@@ -191,8 +210,9 @@ class PriceTracker:
                 # Debug: Print MFE tracking info
                 if self.debug_manager.is_debug_enabled():
                     first_bar = mfe_bars.iloc[0]['timestamp'] if len(mfe_bars) > 0 else None
-                    last_bar = mfe_bars.iloc[-1]['timestamp'] if len(mfe_bars) > 0 else None
-                    self.debug_manager.print_mfe_debug(entry_time, mfe_end_time, len(mfe_bars), first_bar, last_bar)
+                    last_bar_timestamp = mfe_bars.iloc[-1]['timestamp'] if len(mfe_bars) > 0 else None
+                    last_bar = mfe_bars.iloc[-1] if len(mfe_bars) > 0 else None
+                    self.debug_manager.print_mfe_debug(entry_time, mfe_end_time, len(mfe_bars), first_bar, last_bar_timestamp)
                     
                     # Additional debug: Show data availability (no emojis to avoid Windows encoding errors)
                     try:
@@ -574,20 +594,27 @@ class PriceTracker:
             # Trade has expired (expiry_time has passed or data extends to it)
             # Use expiry_time as exit_time (not last bar timestamp)
             # This ensures Friday trades expire on Monday even if data doesn't extend that far
-            exit_time_for_time_expiry = expiry_time if expiry_time else last_bar["timestamp"]
-            
-            # If expiry_time is in the future relative to data but has passed in real time, use the last bar's close price
-            # Otherwise use the bar at expiry_time
-            if expiry_time and expiry_time > last_bar["timestamp"]:
-                # Data doesn't extend to expiry_time but expiry_time has passed - use last bar's close price
-                exit_price_for_time_expiry = float(last_bar["close"])
+            # Get last bar from after (bars after entry time) for fallback
+            last_bar_after = after.iloc[-1] if len(after) > 0 else None
+            if last_bar_after is None:
+                # Fallback: use entry time and price if no after bars
+                exit_time_for_time_expiry = expiry_time if expiry_time else entry_time
+                exit_price_for_time_expiry = entry_price
             else:
-                # Data extends to expiry_time - find the bar at expiry_time
-                expiry_bar = after[after["timestamp"] >= expiry_time]
-                if len(expiry_bar) > 0:
-                    exit_price_for_time_expiry = float(expiry_bar.iloc[0]["close"])
+                exit_time_for_time_expiry = expiry_time if expiry_time else last_bar_after["timestamp"]
+                
+                # If expiry_time is in the future relative to data but has passed in real time, use the last bar's close price
+                # Otherwise use the bar at expiry_time
+                if expiry_time and expiry_time > last_bar_after["timestamp"]:
+                    # Data doesn't extend to expiry_time but expiry_time has passed - use last bar's close price
+                    exit_price_for_time_expiry = float(last_bar_after["close"])
                 else:
-                    exit_price_for_time_expiry = float(last_bar["close"])
+                    # Data extends to expiry_time - find the bar at expiry_time
+                    expiry_bar = after[after["timestamp"] >= expiry_time]
+                    if len(expiry_bar) > 0:
+                        exit_price_for_time_expiry = float(expiry_bar.iloc[0]["close"])
+                    else:
+                        exit_price_for_time_expiry = float(last_bar_after["close"])
             
             result_classification = self._classify_result(
                 t1_triggered, "TIME", False, entry_price, exit_time_for_time_expiry, df, direction, t1_removed
@@ -1496,11 +1523,7 @@ class PriceTracker:
         """Adjust stop loss for T1 trigger"""
         # All instruments now use normal break-even behavior
         # Move stop loss to 1 tick below break-even
-        tick_sizes = {
-            "ES": 0.25, "NQ": 0.25, "YM": 1.0, "CL": 0.01, "NG": 0.001, "GC": 0.1,
-            "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "MCL": 0.01, "MNG": 0.001, "MGC": 0.1
-        }
-        tick_size = tick_sizes.get(instrument.upper(), 0.25)  # Default to ES tick size
+        tick_size = self.instrument_manager.get_tick_size(instrument.upper())
         
         if direction == "Long":
             return entry_price - tick_size  # 1 tick below entry for long trades
@@ -1703,72 +1726,37 @@ class PriceTracker:
                         direction: str, result: str, 
                         t1_triggered: bool,
                         target_pts: float, instrument: str = "ES",
-                        target_hit: bool = False) -> float:
+                        target_hit: bool = False, use_display_profit: bool = False) -> float:
         """
         Calculate profit based on result and trigger
+        
+        This method now delegates to InstrumentManager.calculate_profit() for unified logic.
         
         Args:
             entry_price: Trade entry price
             exit_price: Trade exit price
             direction: Trade direction ("Long" or "Short")
-            result: Trade result ("Win", "BE", "Loss")
+            result: Trade result ("Win", "BE", "Loss", "TIME")
             t1_triggered: Whether T1 trigger is activated
-            target_pts: Target points
+            target_pts: Target points (unscaled)
             instrument: Trading instrument
-            target_hit: Whether target was hit
+            target_hit: Whether target was hit (unused, kept for compatibility)
+            use_display_profit: If True, returns display profit (ES equivalent for micro-futures)
             
         Returns:
             Calculated profit
         """
-        # Calculate base PnL
-        if direction == "Long":
-            pnl_pts = exit_price - entry_price
-        else:
-            pnl_pts = entry_price - exit_price
-        
-        # Scale PnL for micro-futures
-        if instrument.startswith("M"):  # Micro-futures
-            pnl_pts = pnl_pts / 10.0
-        
-        # Adjust profit based on result
-        if result == "Win":
-            # Full target hit
-            return target_pts
-        elif isinstance(result, (int, float)) and result > 0:
-            # Numeric result = full target profit
-            return target_pts
-        elif result == "BE":
-            # Break-even trades: T1 triggered = 1 tick loss
-            tick_sizes = {
-                "ES": 0.25, "NQ": 0.25, "YM": 1.0, "CL": 0.01, "NG": 0.001, "GC": 0.1,
-                "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "MCL": 0.01, "MNG": 0.001, "MGC": 0.1
-            }
-            tick_size = tick_sizes.get(instrument.upper(), 0.25)  # Default to ES tick size
-            return -tick_size  # 1 tick loss
-        elif result == "TIME":
-            # Time expiry trades: Calculate actual PnL based on exit price
-            if direction == "Long":
-                pnl_pts = exit_price - entry_price
-            else:
-                pnl_pts = entry_price - exit_price
-            
-            # Scale for micro-futures
-            if instrument.startswith("M"):
-                pnl_pts = pnl_pts / 10.0
-            
-            return pnl_pts
-        elif result == "Loss":
-            # Loss trades: Calculate actual PnL
-            if direction == "Long":
-                pnl_pts = exit_price - entry_price
-            else:
-                pnl_pts = entry_price - exit_price
-            
-            # For MES display purposes, multiply losses by 10 to show ES equivalent
-            if instrument.startswith("M") and pnl_pts < 0:
-                return pnl_pts * 10.0
-            else:
-                return pnl_pts
+        # Use unified profit calculation from InstrumentManager
+        return self.instrument_manager.calculate_profit(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            direction=direction,
+            result=result,
+            t1_triggered=t1_triggered,
+            target_pts=target_pts,
+            instrument=instrument.upper(),
+            use_display_profit=use_display_profit
+        )
     
     def _classify_post_6_5_behavior(self, after_bars: pd.DataFrame, stop_hit_time: pd.Timestamp,
                                    entry_price: float, direction: str, target_pts: float,
@@ -1791,11 +1779,7 @@ class PriceTracker:
         """
         target = target_pts  # Full target (10.0 points)
         # Calculate 1 tick below entry based on instrument
-        tick_sizes = {
-            "ES": 0.25, "NQ": 0.25, "YM": 1.0, "CL": 0.01, "NG": 0.001, "GC": 0.1,
-            "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "MCL": 0.01, "MNG": 0.001, "MGC": 0.1
-        }
-        tick_size = tick_sizes.get(instrument.upper(), 0.25)  # Default to ES tick size
+        tick_size = self.instrument_manager.get_tick_size(instrument.upper())
         below_entry_1_tick = -tick_size  # 1 tick below entry
         
         if self.debug_manager.is_debug_enabled():

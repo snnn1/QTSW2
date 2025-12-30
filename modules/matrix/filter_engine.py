@@ -57,9 +57,15 @@ def add_global_columns(
     df['month'] = df['Date'].dt.month
     
     # session_index (1 for S1, 2 for S2)
-    df['session_index'] = df['Session'].apply(
-        lambda x: 1 if str(x).upper() == 'S1' else 2 if str(x).upper() == 'S2' else None
-    )
+    def get_session_index(session):
+        session_upper = str(session).upper()
+        if session_upper == 'S1':
+            return 1
+        elif session_upper == 'S2':
+            return 2
+        return None
+    
+    df['session_index'] = df['Session'].apply(get_session_index)
     
     # is_two_stream (true for *2 streams)
     df['is_two_stream'] = df['Stream'].str.endswith('2')

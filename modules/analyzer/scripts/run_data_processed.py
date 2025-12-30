@@ -11,16 +11,20 @@ import datetime
 # Add the parent directory to the path so we can import breakout_core
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from logic.config_logic import RunParams
-from breakout_core.config import SLOT_ENDS
+from logic.config_logic import RunParams, ConfigManager
 from breakout_core.engine import run_strategy
 
 def parse_slots(args_slots, sessions):
     # args_slots like ["S1:07:30","S1:08:00","S2:09:30"]
+    # Use ConfigManager for slot ends instead of breakout_core.config
+    config_manager = ConfigManager()
     enabled = {s: [] for s in ["S1","S2"]}
     for s in sessions:
         enabled.setdefault(s, [])
     if not args_slots:
+        # If no slots specified, use all slots from config
+        for sess in sessions:
+            enabled[sess] = config_manager.get_slot_ends(sess)
         return enabled
     for token in args_slots:
         if ":" not in token:
@@ -31,9 +35,10 @@ def parse_slots(args_slots, sessions):
             continue
         enabled.setdefault(sess, [])
         enabled[sess].append(end.strip())
-    # ensure validity vs SLOT_ENDS
+    # ensure validity vs ConfigManager slot ends
     for sess in list(enabled.keys()):
-        enabled[sess] = [e for e in enabled[sess] if e in SLOT_ENDS[sess]]
+        valid_slots = config_manager.get_slot_ends(sess)
+        enabled[sess] = [e for e in enabled[sess] if e in valid_slots]
     return enabled
 
 def load_folder(folder: str) -> pd.DataFrame:

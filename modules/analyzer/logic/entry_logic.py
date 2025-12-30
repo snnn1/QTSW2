@@ -7,6 +7,7 @@ import pandas as pd
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from .loss_logic import LossManager, StopLossConfig
+from .config_logic import ConfigManager
 
 @dataclass
 class EntryResult:
@@ -20,14 +21,21 @@ class EntryResult:
 class EntryDetector:
     """Handles trade entry detection and validation"""
     
-    def __init__(self, loss_config: StopLossConfig = None):
+    def __init__(self, loss_config: StopLossConfig = None, debug: bool = False,
+                 config_manager: ConfigManager = None, instrument_manager=None):
         """
         Initialize entry detector
         
         Args:
             loss_config: Loss management configuration
+            debug: Enable debug output for entry detection
+            config_manager: Configuration manager for market close time
+            instrument_manager: InstrumentManager instance for instrument-specific calculations
         """
-        self.loss_manager = LossManager(loss_config)
+        self.loss_manager = LossManager(loss_config, instrument_manager=instrument_manager)
+        self.debug = debug
+        self.config_manager = config_manager or ConfigManager()
+        self.instrument_manager = instrument_manager
     
     def detect_entry(self, df: pd.DataFrame, range_result, 
                     brk_long: float, brk_short: float,
@@ -47,18 +55,47 @@ class EntryDetector:
             EntryResult object with entry details
         """
         try:
-            # Get data after range period (including after market close for detection)
-            post = df[df["timestamp"] >= end_ts].copy()
+            # Convert end_ts to pandas Timestamp if it's not already
+            end_ts_pd = pd.Timestamp(end_ts) if not isinstance(end_ts, pd.Timestamp) else end_ts
             
-            if post.empty:
-                return EntryResult(None, None, None, False, None)
-            
-            # Define market close time (16:00) for the same day as the slot
-            market_close = end_ts.replace(hour=16, minute=0, second=0, microsecond=0)
-            
-            # Check for immediate entry conditions
+            # Check for immediate entry conditions FIRST (before checking post data)
+            # This allows immediate entries even when post data is empty
             immediate_long = freeze_close >= brk_long
             immediate_short = freeze_close <= brk_short
+            
+            if immediate_long and immediate_short:
+                # Both conditions met - use first breakout by timestamp
+                result = self._handle_dual_immediate_entry(freeze_close, brk_long, brk_short)
+                # Set entry_time and breakout_time to end_ts for immediate entries
+                return EntryResult(result.entry_direction, result.entry_price, end_ts_pd, True, end_ts_pd)
+            elif immediate_long:
+                return EntryResult("Long", brk_long, end_ts_pd, True, end_ts_pd)
+            elif immediate_short:
+                return EntryResult("Short", brk_short, end_ts_pd, True, end_ts_pd)
+            
+            # Get data after range period (including after market close for detection)
+            # Ensure timestamp column is pandas Timestamp type for comparison
+            if len(df) > 0 and 'timestamp' in df.columns:
+                # Convert timestamp column to pandas Timestamp if needed
+                df_timestamps = pd.to_datetime(df["timestamp"])
+                post = df[df_timestamps >= end_ts_pd].copy()
+            else:
+                post = pd.DataFrame(columns=df.columns if not df.empty else ['timestamp', 'open', 'high', 'low', 'close'])
+            
+            if post.empty:
+                return EntryResult("NoTrade", None, None, False, None)
+            
+            # Define market close time (configurable via ConfigManager) for the same day as the slot
+            # CRITICAL: Create market_close timestamp properly preserving timezone
+            market_close_time_str = self.config_manager.get_market_close_time()  # e.g., "16:00"
+            market_close_hour, market_close_minute = map(int, market_close_time_str.split(":"))
+            if end_ts_pd.tz is not None:
+                # Timezone-aware: create market close timestamp in same timezone
+                date_str = end_ts_pd.strftime('%Y-%m-%d')
+                market_close = pd.Timestamp(f"{date_str} {market_close_hour:02d}:{market_close_minute:02d}:00", tz=end_ts_pd.tz)
+            else:
+                # Naive timestamp: use replace directly
+                market_close = end_ts_pd.replace(hour=market_close_hour, minute=market_close_minute, second=0, microsecond=0)
             
             if immediate_long and immediate_short:
                 # Both conditions met - use first breakout by timestamp
@@ -75,13 +112,17 @@ class EntryDetector:
             long_time = long_breakout["timestamp"].min() if not long_breakout.empty else None
             short_time = short_breakout["timestamp"].min() if not short_breakout.empty else None
             
-            # Check if breakouts happened after market close (16:00)
+            # Check if breakouts happened after market close
             long_after_close = long_time is not None and long_time > market_close
             short_after_close = short_time is not None and short_time > market_close
             
             # Filter out breakouts that happened after market close
             valid_long_time = long_time if not long_after_close else None
             valid_short_time = short_time if not short_after_close else None
+            
+            # DEBUG: Log entry detection details for troubleshooting (when debug enabled)
+            # Note: Detailed debug output can be enabled via debug parameter in EntryDetector
+            # This debug block has been removed - use debug logging instead of hardcoded date checks
             
             # If no valid breakouts before market close, return NoTrade
             if valid_long_time is None and valid_short_time is None:

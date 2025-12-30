@@ -29,6 +29,7 @@ class ConfigManager:
             "S2": ["09:30","10:00","10:30","11:00"],
         }
         self.slot_start = {"S1":"02:00","S2":"08:00"}
+        self.market_close_time = "16:00"  # Market close time in HH:MM format (Chicago time)
         
         self.tick_size: Dict[Instrument, float] = {
             "ES": 0.25, "NQ": 0.25, "YM": 1.0, "CL": 0.01, "NG": 0.001, "GC": 0.1,
@@ -55,7 +56,18 @@ class ConfigManager:
         return self.tick_size[instrument]
     
     def get_target_ladder(self, instrument: Instrument) -> Tuple[float,...]:
-        """Get target ladder for an instrument"""
+        """
+        Get target ladder for an instrument
+        
+        DEPRECATED: Use InstrumentManager.get_target_ladder() instead.
+        This method is kept for backward compatibility but should use InstrumentManager.
+        """
+        import warnings
+        warnings.warn(
+            "ConfigManager.get_target_ladder() is deprecated. Use InstrumentManager.get_target_ladder() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         return self.target_ladder[instrument]
     
     def get_slot_ends(self, session: str) -> List[str]:
@@ -67,14 +79,40 @@ class ConfigManager:
         return self.slot_start.get(session, "02:00")
     
     def get_target_profit(self, instrument: Instrument, target_value: float) -> float:
-        """Get the actual profit for a target value, accounting for micro-futures scaling"""
+        """
+        Get the actual profit for a target value, accounting for micro-futures scaling
+        
+        DEPRECATED: Use InstrumentManager.get_target_profit() instead.
+        This method is kept for backward compatibility but delegates to InstrumentManager.
+        """
+        # This method should not be used directly - InstrumentManager handles this
+        # Keeping for backward compatibility but should be removed in future
+        import warnings
+        warnings.warn(
+            "ConfigManager.get_target_profit() is deprecated. Use InstrumentManager.get_target_profit() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        # For now, delegate to InstrumentManager if available, otherwise use old logic
+        # This is a temporary bridge until all callers are updated
         if instrument.startswith("M"):  # Micro-futures
             return target_value / 10.0  # Micro-futures are 1/10th the size
         else:
             return target_value  # Regular futures use the target value as-is
     
     def get_base_target(self, instrument: Instrument) -> float:
-        """Get base target for an instrument (first level)"""
+        """
+        Get base target for an instrument (first level)
+        
+        DEPRECATED: Use InstrumentManager.get_base_target() instead.
+        This method is kept for backward compatibility but should use InstrumentManager.
+        """
+        import warnings
+        warnings.warn(
+            "ConfigManager.get_base_target() is deprecated. Use InstrumentManager.get_base_target() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         return self.target_ladder[instrument][0]
     
     def get_stream_tag(self, instrument: str, session: str) -> str:
@@ -100,6 +138,10 @@ class ConfigManager:
             return True
         except Exception:
             return False
+    
+    def get_market_close_time(self) -> str:
+        """Get market close time in HH:MM format"""
+        return self.market_close_time
     
     def get_slot_config(self) -> Dict:
         """Get slot configuration dictionary"""

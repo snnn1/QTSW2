@@ -62,6 +62,32 @@ def _process_single_range(
     stream = streamS1 if sess == "S1" else streamS2
     time_label = R.end_label
     
+    # Validate end_label - ensure it exists and is not empty
+    if not time_label or time_label == "":
+        if debug:
+            print(f"WARNING: Missing end_label for range {R.date} {R.session}, skipping")
+        return None
+    
+    # Validate time_label format (should be HH:MM)
+    if not isinstance(time_label, str) or ":" not in time_label:
+        if debug:
+            print(f"WARNING: Invalid time_label format '{time_label}' for range {R.date} {R.session}, skipping")
+        return None
+    
+    # Validate HH:MM format
+    try:
+        parts = time_label.split(":")
+        if len(parts) != 2:
+            raise ValueError("Invalid format")
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            raise ValueError("Invalid time values")
+    except (ValueError, IndexError):
+        if debug:
+            print(f"WARNING: Invalid time_label format '{time_label}' for range {R.date} {R.session}, skipping")
+        return None
+    
     # Get data for trade execution (24 hours) and MFE calculation (until next day same slot)
     day_df = df[(df["timestamp"] >= R.end_ts) & (df["timestamp"] < R.end_ts + pd.Timedelta(hours=24))].copy()
     
@@ -98,7 +124,7 @@ def _process_single_range(
         mfe_df = day_df.copy()
     
     # Use base target only (no levels)
-    target_pts = config_manager.get_base_target(inst)
+    target_pts = instrument_manager.get_base_target(inst)
     
     brk_long = utility_manager.round_to_tick(R.range_high + ticksz, ticksz)
     brk_short = utility_manager.round_to_tick(R.range_low - ticksz, ticksz)
@@ -276,7 +302,7 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
             
             # Use base target only (no levels)
             config_manager = ConfigManager()
-            target_pts = config_manager.get_base_target(rp.instrument)
+            target_pts = instrument_manager.get_base_target(rp.instrument)
             
             if rp.write_no_trade_rows:
                 no_trade_row = {
@@ -354,9 +380,11 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
     range_detector = RangeDetector(config_manager.get_slot_config())
     
     # Initialize components
-    entry_detector = EntryDetector()
-    price_tracker = PriceTracker(debug_manager=debug_manager)
-    result_processor = ResultProcessor()
+    entry_detector = EntryDetector(config_manager=config_manager, instrument_manager=instrument_manager)
+    price_tracker = PriceTracker(debug_manager=debug_manager, 
+                                 instrument_manager=instrument_manager,
+                                 config_manager=config_manager)
+    result_processor = ResultProcessor(instrument_manager=instrument_manager)
     
     # Validate inputs
     validation_result = validation_manager.validate_dataframe(df)
@@ -530,7 +558,10 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
     # Recreate _sortTime from Time column for proper sorting (process_results drops it)
     if not results_df.empty and "Time" in results_df.columns:
         from breakout_core.utils import hhmm_to_sort_int
-        results_df["_sortTime"] = results_df["Time"].apply(hhmm_to_sort_int)
+        # Only calculate _sortTime for valid Time values, use 0 for invalid/empty
+        results_df["_sortTime"] = results_df["Time"].apply(
+            lambda x: hhmm_to_sort_int(str(x)) if pd.notna(x) and str(x) and ":" in str(x) else 0
+        )
     
     # Ensure Date is datetime for proper sorting (process_results converts it back to string)
     if not results_df.empty and "Date" in results_df.columns:
