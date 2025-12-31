@@ -63,6 +63,7 @@ class EventBus:
     # Progress, metrics, file-level, translator/analyzer internals must never go to EventBus
     LIVE_EVENT_TYPES = {
         "scheduler/start",
+        "scheduler/scheduled_run_started",  # Scheduler-triggered run notification
         "scheduler/success", 
         "scheduler/failed",
         "pipeline/start",

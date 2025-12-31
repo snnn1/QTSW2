@@ -35,8 +35,8 @@ def _discover_streams_impl(analyzer_runs_dir: Path) -> List[str]:
         logger.warning(f"Analyzer runs directory not found: {analyzer_runs_dir}")
         return streams
     
-    # Pattern: ES1, GC2, CL1, etc. (2 letters + 1 or 2)
-    stream_pattern = re.compile(r'^([A-Z]{2})([12])$')
+    # Pattern: ES1, GC2, CL1, RTY1, RTY2, etc. (2-3 letters + 1 or 2)
+    stream_pattern = re.compile(r'^([A-Z]{2,3})([12])$')
     
     for item in analyzer_runs_dir.iterdir():
         if not item.is_dir():
@@ -55,7 +55,7 @@ def _discover_streams_impl(analyzer_runs_dir: Path) -> List[str]:
 def discover_streams(analyzer_runs_dir: Path) -> List[str]:
     """
     Auto-discover streams by scanning analyzer_runs directory.
-    Looks for subdirectories matching stream patterns (ES1, ES2, GC1, etc.).
+    Looks for subdirectories matching stream patterns (ES1, ES2, GC1, RTY1, RTY2, etc.).
     
     Uses caching if available to avoid repeated filesystem scans.
     
@@ -63,7 +63,7 @@ def discover_streams(analyzer_runs_dir: Path) -> List[str]:
         analyzer_runs_dir: Path to analyzer_runs directory
         
     Returns:
-        List of stream IDs found (e.g., ["ES1", "ES2", "GC1", ...])
+        List of stream IDs found (e.g., ["ES1", "ES2", "GC1", "RTY1", "RTY2", ...])
     """
     if _use_cache:
         streams = get_cached_streams(analyzer_runs_dir, _discover_streams_impl)

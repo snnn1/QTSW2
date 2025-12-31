@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
 from breakout_core.engine import run_strategy
 from logic.config_logic import RunParams
+from logic.instrument_logic import InstrumentManager
 
 # Custom triggers removed - using default T1 trigger (65% of target)
 
@@ -352,14 +353,19 @@ def main():
                     range_size = range_high - range_low
                     freeze_close = df_date[df_date['timestamp'] == end_time]['close'].iloc[-1] if len(df_date[df_date['timestamp'] == end_time]) > 0 else "N/A"
                     
+                    # Get instrument tick size
+                    instrument = slot_data['instrument'].iloc[0] if 'instrument' in slot_data.columns and len(slot_data) > 0 else "ES"
+                    instrument_manager = InstrumentManager()
+                    tick_size = instrument_manager.get_tick_size(instrument) if instrument_manager.validate_instrument(instrument) else 0.25
+                    
                     st.write(f"Range High: {range_high}")
                     st.write(f"Range Low: {range_low}")
                     st.write(f"Range Size: {range_size}")
                     st.write(f"Freeze Close at {inspect_time}: {freeze_close}")
                     
-                    # Show breakout levels (using ES tick size for display)
-                    brk_long = range_high + 0.25  # ES tick size
-                    brk_short = range_low - 0.25
+                    # Show breakout levels (using instrument tick size)
+                    brk_long = range_high + tick_size
+                    brk_short = range_low - tick_size
                     st.write(f"Breakout Long: {brk_long}")
                     st.write(f"Breakout Short: {brk_short}")
             else:
@@ -475,9 +481,14 @@ def main():
                         else:
                             st.error("No freeze close found at 08:00")
                     
+                    # Get instrument tick size
+                    instrument = slot_data['instrument'].iloc[0] if 'instrument' in slot_data.columns and len(slot_data) > 0 else "ES"
+                    instrument_manager = InstrumentManager()
+                    tick_size = instrument_manager.get_tick_size(instrument) if instrument_manager.validate_instrument(instrument) else 0.25
+                    
                     # Calculate breakout levels
-                    brk_long = range_high + 0.25  # ES tick size
-                    brk_short = range_low - 0.25
+                    brk_long = range_high + tick_size
+                    brk_short = range_low - tick_size
                     st.write(f"**Breakout Levels:**")
                     st.write(f"Long Breakout: {brk_long}")
                     st.write(f"Short Breakout: {brk_short}")
@@ -522,7 +533,12 @@ def main():
     # ---------------------------------------------------------------
     # Run button
     # ---------------------------------------------------------------
-    if st.button("Run Analyzer"):
+    # Run Analysis Button
+    # ---------------------------------------------------------------
+    st.markdown("---")
+    st.header("🚀 Run Analysis")
+    
+    if st.button("Run Analyzer", type="primary", use_container_width=True):
         if not selected_slots:
             st.error("Please select at least one time slot.")
             return
@@ -709,7 +725,20 @@ def main():
         
         if not all_results:
             print("No results generated for any instrument")
-            st.warning("No results generated.")
+            st.error("❌ No results generated for any instrument.")
+            st.info("""
+            **Possible reasons:**
+            - No data found for selected instrument(s)
+            - No ranges detected (check if data contains valid trading days and session times)
+            - All trades resulted in NoTrade (no breakouts occurred)
+            - Data validation failed
+            
+            **Check:**
+            1. Verify data file contains the selected instrument
+            2. Check that data covers the selected time slots
+            3. Enable Debug Mode to see detailed processing output
+            4. Check terminal/console for error messages
+            """)
             return
 
         print(f"Combining results from {len(all_results)} instruments...")

@@ -91,7 +91,7 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
           const profitValue = parseFloat(row.Profit) || 0
           const symbol = row.Symbol || row.Instrument || 'ES'
           const contractValues = {
-            'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100
+            'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100, 'RTY': 50
           }
           const contractValue = contractValues[symbol.toUpperCase()] || 50
           const dollarValue = profitValue * contractValue

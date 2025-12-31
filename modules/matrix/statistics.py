@@ -105,6 +105,7 @@ def _ensure_profit_dollars_column(df: pd.DataFrame) -> pd.DataFrame:
             "MNQ": 2.0,
             "YM": 5.0,
             "MYM": 0.5,
+            "RTY": 50.0,
         }
         
         def get_contract_value(instrument_str):

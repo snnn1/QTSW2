@@ -6,7 +6,7 @@ Handles instrument-specific calculations and logic
 from typing import Dict, Tuple, Literal
 from dataclasses import dataclass
 
-Instrument = Literal["ES","NQ","YM","CL","NG","GC","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"]
+Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"]
 
 @dataclass
 class InstrumentConfig:
@@ -30,6 +30,7 @@ class InstrumentManager:
             "CL": InstrumentConfig(0.01, (0.5,0.75,1.0,1.25,1.5,1.75,2.0), False, "CL", 1.0),
             "NG": InstrumentConfig(0.001, (0.05,0.075,0.10,0.125,0.15,0.175,0.20), False, "NG", 1.0),
             "GC": InstrumentConfig(0.1, (5,7.5,10,12.5,15,17.5,20), False, "GC", 1.0),
+            "RTY": InstrumentConfig(0.10, (10,), False, "RTY", 1.0),
             
             # Micro futures (1/10th size)
             "MES": InstrumentConfig(0.25, (10,15,20,25,30,35,40), True, "ES", 0.1),

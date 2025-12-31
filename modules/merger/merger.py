@@ -104,6 +104,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 DATA_DIR = BASE_DIR / "data"
 ANALYZER_TEMP_DIR = DATA_DIR / "analyzer_temp"
+MANUAL_ANALYZER_RUNS_DIR = DATA_DIR / "manual_analyzer_runs"
 ANALYZER_RUNS_DIR = DATA_DIR / "analyzed"
 PROCESSED_LOG_FILE = DATA_DIR / "merger_processed.json"
 
@@ -135,6 +136,7 @@ class DataMerger:
         # Base directories only - instrument/session directories created lazily
         directories = [
             ANALYZER_TEMP_DIR,
+            MANUAL_ANALYZER_RUNS_DIR,
             ANALYZER_RUNS_DIR,
         ]
         for directory in directories:
@@ -213,6 +215,147 @@ class DataMerger:
     def _is_folder_processed(self, folder_type: str, folder_path: str) -> bool:
         """Check if a daily folder has already been processed."""
         return folder_path in self.processed_log.get(folder_type, [])
+    
+    def process_manual_analyzer_folder(self, daily_folder: Path) -> bool:
+        """
+        Process a single manual analyzer daily folder.
+        
+        This is the same as process_analyzer_folder but tracks it separately
+        in the processed log under 'manual_analyzer' key.
+        """
+        folder_path_str = str(daily_folder)
+        
+        # Get Parquet files first to check if folder has content
+        parquet_files = self._get_parquet_files(daily_folder)
+        
+        # If folder is marked as processed but has files, allow reprocessing
+        if self._is_folder_processed("manual_analyzer", folder_path_str):
+            if parquet_files:
+                logger.info(f"Folder {daily_folder.name} marked as processed but contains {len(parquet_files)} file(s). Removing from processed log to allow reprocessing.")
+                if folder_path_str in self.processed_log.get("manual_analyzer", []):
+                    self.processed_log["manual_analyzer"].remove(folder_path_str)
+                    self._save_processed_log()
+            else:
+                logger.info(f"Skipping already processed manual analyzer folder (empty): {daily_folder}")
+                return True
+        
+        # Validate folder name format (must be YYYY-MM-DD)
+        try:
+            datetime.strptime(daily_folder.name, "%Y-%m-%d")
+        except ValueError:
+            logger.error(f"Invalid date format in folder name: {daily_folder.name}. Expected YYYY-MM-DD format.")
+            return False
+        
+        # Get Parquet files
+        parquet_files = self._get_parquet_files(daily_folder)
+        if not parquet_files:
+            logger.warning(f"No Parquet files found in {daily_folder}")
+            return False
+        
+        logger.info(f"Processing manual analyzer folder {daily_folder.name}: {len(parquet_files)} files")
+        
+        # Merge daily files by instrument (same logic as regular analyzer)
+        try:
+            merged_data = self._merge_daily_files(parquet_files, "analyzer")
+        except ValueError as e:
+            error_msg = (
+                f"SCHEMA VALIDATION FAILED for manual analyzer folder {daily_folder.name}: {e}. "
+                f"Merger does not infer missing strategy attributes - analyzer must provide all required fields. "
+                f"Required columns: {self.REQUIRED_COLUMNS}"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg) from e
+        except Exception as e:
+            logger.error(f"Unexpected error merging files in {daily_folder.name}: {e}")
+            return False
+        
+        if not merged_data:
+            logger.warning(f"No valid data found in manual analyzer folder {daily_folder.name}")
+            return False
+        
+        # Write monthly files for each (instrument, session) combination
+        success_count = 0
+        for (instrument, session), df in merged_data.items():
+            # Validate Instrument column
+            if 'Instrument' in df.columns:
+                unique_instruments = df['Instrument'].dropna().unique()
+                unique_instruments_str = [str(inst).upper().strip() for inst in unique_instruments]
+                if instrument not in unique_instruments_str:
+                    logger.error(f"CRITICAL: Instrument mismatch! Expected {instrument} but found {unique_instruments_str} in data. Skipping this group.")
+                    continue
+                if len(unique_instruments_str) > 1:
+                    logger.error(f"CRITICAL: Mixed instruments found in grouped data! Expected {instrument} but found {unique_instruments_str}. Skipping this group.")
+                    continue
+            
+            if 'Date' not in df.columns:
+                error_msg = (
+                    f"REQUIRED COLUMN MISSING: Date column not found for {instrument} {session}. "
+                    f"Required columns: {self.REQUIRED_COLUMNS}."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            try:
+                # Validate and parse dates
+                date_series = pd.to_datetime(df['Date'], errors='coerce')
+                invalid_mask = date_series.isna()
+                if invalid_mask.any():
+                    invalid_count = invalid_mask.sum()
+                    invalid_examples = df.loc[invalid_mask, 'Date'].head(5).tolist()
+                    error_msg = (
+                        f"INVALID DATE VALUES found for {instrument} {session}: "
+                        f"{invalid_count} row(s) with unparseable dates. Examples: {invalid_examples}."
+                    )
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+                
+                df['Date'] = date_series
+                df['Year'] = df['Date'].dt.year
+                df['Month'] = df['Date'].dt.month
+                
+                # Group by year and month
+                for (year, month), month_df in df.groupby(['Year', 'Month']):
+                    year = int(year)
+                    month = int(month)
+                    
+                    month_df_clean = month_df.drop(columns=['Year', 'Month'])
+                    monthly_file = self._get_monthly_file_path(instrument, session, year, month, "analyzer")
+                    
+                    # Merge with existing monthly file
+                    combined_df = self._merge_with_existing_monthly_file(month_df_clean, monthly_file, "analyzer")
+                    
+                    # Validate combined data
+                    if 'Instrument' in combined_df.columns:
+                        combined_instruments = combined_df['Instrument'].dropna().unique()
+                        combined_instruments_str = [str(inst).upper().strip() for inst in combined_instruments]
+                        if instrument not in combined_instruments_str or len(combined_instruments_str) > 1:
+                            logger.error(f"CRITICAL: After merging, instrument mismatch detected! Expected {instrument} but found {combined_instruments_str}. Skipping write.")
+                            continue
+                    
+                    # Write monthly file
+                    try:
+                        self._write_monthly_file(combined_df, monthly_file)
+                        success_count += 1
+                        logger.info(f"Created monthly file for {instrument}{session[-1]} - {year}-{month:02d}: {len(combined_df)} rows (from manual run)")
+                    except Exception as e:
+                        logger.error(f"Error writing monthly file for {instrument}{session[-1]} {year}-{month:02d}: {e}")
+            except ValueError:
+                raise
+            except Exception as e:
+                error_msg = f"Error processing dates for {instrument} {session}: {e}."
+                logger.error(error_msg)
+                raise ValueError(error_msg) from e
+        
+        if success_count > 0:
+            # Mark folder as processed (under 'manual_analyzer' key)
+            self._mark_folder_processed("manual_analyzer", folder_path_str)
+            
+            # Note: We don't delete manual analyzer folders (they're kept for reference)
+            logger.info(f"Processed manual analyzer folder: {daily_folder} (kept for reference)")
+            
+            return True
+        
+        return False
     
     def _get_daily_folders(self, temp_dir: Path) -> List[Path]:
         """Get all daily folders (YYYY-MM-DD format) from temp directory."""
@@ -779,7 +922,7 @@ class DataMerger:
         logger.info("Starting Data Merger / Consolidator")
         logger.info("=" * 60)
         
-        # Process analyzer folders
+        # Process analyzer folders (from pipeline runs)
         analyzer_folders = self._get_daily_folders(ANALYZER_TEMP_DIR)
         logger.info(f"Found {len(analyzer_folders)} analyzer daily folders")
         

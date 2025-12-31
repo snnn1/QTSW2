@@ -26,7 +26,7 @@ class ValidationManager:
             deduplicate_timestamps: If True, deduplicate timestamps (keep first) instead of just warning
         """
         self.required_columns = {"timestamp", "open", "high", "low", "close", "instrument"}
-        self.valid_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "MES", "MNQ", "MYM", "MCL", "MNG", "MGC", "MINUTEDATAEXPORT"}
+        self.valid_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "RTY", "MES", "MNQ", "MYM", "MCL", "MNG", "MGC", "MINUTEDATAEXPORT"}
         self.valid_sessions = {"S1", "S2"}
         self.filter_invalid_rows = filter_invalid_rows
         self.deduplicate_timestamps = deduplicate_timestamps
@@ -94,9 +94,11 @@ class ValidationManager:
                 else:
                     errors.append(f"Found {len(invalid_ohlc)} rows with invalid OHLC relationships")
         
-        # Check instrument values
+        # Check instrument values (case-insensitive comparison, strip whitespace)
         if 'instrument' in df.columns:
-            invalid_instruments = set(df['instrument'].unique()) - self.valid_instruments
+            df_instruments_upper = {str(inst).strip().upper() if isinstance(inst, str) else str(inst).strip().upper() for inst in df['instrument'].unique()}
+            valid_instruments_upper = {inst.upper() for inst in self.valid_instruments}
+            invalid_instruments = df_instruments_upper - valid_instruments_upper
             if invalid_instruments:
                 errors.append(f"Invalid instruments found: {sorted(invalid_instruments)}")
         
@@ -171,11 +173,14 @@ class ValidationManager:
         errors = []
         warnings = []
         
-        # Check instrument
+        # Check instrument (case-insensitive comparison)
         if not hasattr(params, 'instrument'):
             errors.append("Missing instrument parameter")
-        elif params.instrument not in self.valid_instruments:
-            errors.append(f"Invalid instrument: {params.instrument}")
+        else:
+            instrument_upper = params.instrument.upper() if isinstance(params.instrument, str) else str(params.instrument).upper()
+            valid_instruments_upper = {inst.upper() for inst in self.valid_instruments}
+            if instrument_upper not in valid_instruments_upper:
+                errors.append(f"Invalid instrument: {params.instrument}")
         
         # Check sessions
         if hasattr(params, 'enabled_sessions'):

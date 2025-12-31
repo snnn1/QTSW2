@@ -1,5 +1,5 @@
 {
-  "default_instruments": ["ES", "NQ", "YM", "CL", "NG", "GC"],
+  "default_instruments": ["ES", "NQ", "YM", "CL", "NG", "GC", "RTY"],
   "instruments": {
     "ES": {
       "name": "E-mini S&P 500",
@@ -23,6 +23,10 @@
     },
     "GC": {
       "name": "Gold",
+      "sessions": ["S1", "S2"]
+    },
+    "RTY": {
+      "name": "E-mini Russell 2000",
       "sessions": ["S1", "S2"]
     }
   }

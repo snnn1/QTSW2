@@ -795,6 +795,12 @@ self.onmessage = function(e) {
     switch (type) {
       case 'INIT_DATA': {
         self.columnarData = new ColumnarData(payload.data)
+        // Clear profit breakdown cache when data is reinitialized
+        if (!self.profitBreakdownCache) {
+          self.profitBreakdownCache = new Map()
+        } else {
+          self.profitBreakdownCache.clear()
+        }
         self.postMessage({ type: 'DATA_INITIALIZED', payload: { length: self.columnarData.length } })
         break
       }
@@ -1151,10 +1157,38 @@ self.onmessage = function(e) {
           return
         }
         
+        // Initialize cache if it doesn't exist
+        if (!self.profitBreakdownCache) {
+          self.profitBreakdownCache = new Map()
+        }
+        
         const { streamFilters = {}, streamId = 'master', contractMultiplier = 1, contractValues = {}, breakdownType, useFiltered = false, requestId } = payload
         
         // Parse breakdown type (e.g., "time_before", "day_after")
         const [periodType, filterType] = breakdownType.split('_')
+        
+        // Create cache key from parameters that affect the breakdown result
+        const cacheKey = JSON.stringify({
+          periodType,
+          useFiltered,
+          streamId,
+          contractMultiplier,
+          streamFilters
+        })
+        
+        // Check cache first
+        if (self.profitBreakdownCache.has(cacheKey)) {
+          const cachedResult = self.profitBreakdownCache.get(cacheKey)
+          self.postMessage({ 
+            type: 'PROFIT_BREAKDOWN', 
+            payload: { 
+              breakdown: cachedResult, 
+              breakdownType, 
+              requestId 
+            } 
+          })
+          return
+        }
         
         // Get data indices based on filtering
         let dataIndices = []
@@ -1237,7 +1271,14 @@ self.onmessage = function(e) {
             } else if (periodType === 'dom') {
               periodKey = parsed.getDate() // 1-31
             } else if (periodType === 'date') {
-              periodKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+              // Optimize: if trade_date is already in YYYY-MM-DD format, use it directly
+              const tradeDateValue = trade_date[i]
+              if (tradeDateValue && typeof tradeDateValue === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(tradeDateValue.trim())) {
+                periodKey = tradeDateValue.trim()
+              } else {
+                // Fall back to parsing Date column
+                periodKey = parsed.toISOString().split('T')[0] // YYYY-MM-DD
+              }
             } else if (periodType === 'month') {
               const year = parsed.getFullYear()
               const month = parsed.getMonth() + 1
@@ -1296,6 +1337,9 @@ self.onmessage = function(e) {
             sortedBreakdown = breakdownData
           }
         }
+        
+        // Cache the result before sending
+        self.profitBreakdownCache.set(cacheKey, sortedBreakdown)
         
         self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: sortedBreakdown, breakdownType, requestId } })
         break

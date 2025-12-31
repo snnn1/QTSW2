@@ -51,6 +51,9 @@ function AppContent() {
   const [isPending, startTransition] = useTransition()
   const deferredActiveTab = useDeferredValue(activeTab)
   
+  // Use deferredActiveTab for data table rendering to align with worker filtering
+  const tableTab = deferredActiveTab
+  const isSwitchingTab = activeTab !== deferredActiveTab
   
   // Track if initial load has been attempted to prevent reload loops
   const hasLoadedRef = useRef(false)
@@ -613,7 +616,9 @@ function AppContent() {
         const controller = new AbortController()
         const requestTimeout = setTimeout(() => controller.abort(), 2000) // 2s timeout per request
         
-        const response = await fetch(`${API_BASE}/matrix/test`, {
+        // Try /health endpoint first (more reliable), fallback to /api/matrix/test
+        const baseUrl = API_BASE.replace('/api', '')
+        const response = await fetch(`${baseUrl}/health`, {
           method: 'GET',
           signal: controller.signal
         })
@@ -658,17 +663,18 @@ function AppContent() {
       }
     })
     
-    // Set timeout for max retry window (12 seconds)
+    // Set timeout for max retry window (30 seconds - increased for slower startup)
     timeoutId = setTimeout(() => {
       if (!isCancelled && !isReady) {
         setBackendConnecting(false)
-        setBackendConnectionError('Backend did not respond within 12 seconds. Please check if the backend is running.')
+        const baseUrl = API_BASE.replace('/api', '')
+        setBackendConnectionError(`Backend did not respond within 30 seconds. Please check if the backend is running on ${baseUrl}. Make sure you started the backend using RUN_MASTER_MATRIX.bat`)
         if (pollInterval) {
           clearInterval(pollInterval)
           pollInterval = null
         }
       }
-    }, 12000)
+    }, 30000)
     
     return () => {
       isCancelled = true
@@ -731,10 +737,16 @@ function AppContent() {
         const streamId = deferredActiveTab === 'timetable' ? 'master' : deferredActiveTab
         const cacheKey = getCacheKey(deferredActiveTab, streamFilters)
         
+        // Track which tab this filter is for
+        workerFilteredRowsTabRef.current = deferredActiveTab
+        
         // Check cache first for filtered rows
         const cachedResult = filterCacheRef.current.get(cacheKey)
         
-        if (!cachedResult) {
+        if (cachedResult && cachedResult.rows) {
+          // Use cached results - populate loadedRows immediately to prevent showing stale workerFilteredRows
+          setLoadedRows(cachedResult.rows)
+        } else {
           // Request initial rows for table rendering (first 100 rows, sorted)
           const returnRows = deferredActiveTab !== 'timetable' // Return rows for data table tabs
           workerFilter(streamFilters, streamId, returnRows, true) // sortIndices = true
@@ -2040,16 +2052,23 @@ function AppContent() {
   const [loadedRows, setLoadedRows] = useState([])
   const [loadingMoreRows, setLoadingMoreRows] = useState(false)
   
+  // State to limit Day tab to 200 days by default for performance
+  const [showAllDays, setShowAllDays] = useState(false)
+  
   // Cache filtered results when they arrive from worker
   useEffect(() => {
     if (workerReady && workerFilteredRows && workerFilteredRows.length > 0 && deferredActiveTab) {
       const breakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year', 'timetable']
       if (!breakdownTabs.includes(deferredActiveTab)) {
-        const cacheKey = getCacheKey(deferredActiveTab, streamFilters)
-        filterCacheRef.current.set(cacheKey, {
-          rows: workerFilteredRows,
-          timestamp: Date.now()
-        })
+        // Only cache if workerFilteredRows matches the current tab
+        // This ensures we don't cache stale data from a previous tab
+        if (workerFilteredRowsTabRef.current === deferredActiveTab) {
+          const cacheKey = getCacheKey(deferredActiveTab, streamFilters)
+          filterCacheRef.current.set(cacheKey, {
+            rows: workerFilteredRows,
+            timestamp: Date.now()
+          })
+        }
       }
     }
   }, [workerFilteredRows, deferredActiveTab, streamFilters, workerReady, getCacheKey])
@@ -2062,16 +2081,37 @@ function AppContent() {
   // Update loaded rows when worker filtered rows change
   // Reset loadedRows when stream/activeTab changes to prevent stale data
   const prevActiveTabRef = useRef(deferredActiveTab)
+  // Track which tab the current workerFilteredRows belongs to
+  const workerFilteredRowsTabRef = useRef(null)
+  
+  // Clear loadedRows immediately when activeTab changes (not deferred)
+  // This prevents stale data from being displayed while deferredActiveTab catches up
+  const prevActiveTabImmediateRef = useRef(activeTab)
   useEffect(() => {
-    // Reset loadedRows when activeTab changes (stream switch)
+    if (prevActiveTabImmediateRef.current !== activeTab) {
+      setLoadedRows([])
+      workerFilteredRowsTabRef.current = null
+      prevActiveTabImmediateRef.current = activeTab
+    }
+  }, [activeTab])
+  
+  useEffect(() => {
+    // Reset loadedRows when deferredActiveTab changes (stream switch)
     if (prevActiveTabRef.current !== deferredActiveTab) {
       setLoadedRows([])
       prevActiveTabRef.current = deferredActiveTab
+      // Clear the tracked tab when switching tabs to prevent using stale data
+      workerFilteredRowsTabRef.current = null
     }
     
+    // Only use workerFilteredRows if it belongs to the current tab
     if (workerReady && workerFilteredRows && workerFilteredRows.length > 0) {
-      // Set loadedRows when we get new filtered rows (worker re-filtered)
-      setLoadedRows(workerFilteredRows)
+      // Check if workerFilteredRows matches the current tab
+      if (workerFilteredRowsTabRef.current === deferredActiveTab) {
+        // Set loadedRows when we get new filtered rows (worker re-filtered)
+        setLoadedRows(workerFilteredRows)
+      }
+      // If workerFilteredRows doesn't match current tab, ignore it (it's stale)
     }
   }, [workerReady, workerFilteredRows, deferredActiveTab])
   
@@ -2195,7 +2235,7 @@ function AppContent() {
   }
   
   // Render profit breakdown tables
-  const renderProfitTable = (data, periodType) => {
+  const renderProfitTable = (data, periodType, limitDays = null) => {
     // Wrap in try-catch to prevent white screen on errors
     try {
     // Ensure data is always an object (never undefined or null)
@@ -2259,7 +2299,13 @@ function AppContent() {
         })
       : Object.keys(data).sort()
     
-    if (sortedPeriods.length === 0) {
+    // Limit to most recent N days for date tab if limitDays is specified
+    let displayPeriods = sortedPeriods
+    if (periodType === 'date' && limitDays !== null && limitDays > 0 && sortedPeriods.length > limitDays) {
+      displayPeriods = sortedPeriods.slice(0, limitDays)
+    }
+    
+    if (displayPeriods.length === 0) {
       return (
         <div className="text-center py-8 text-gray-400">
           No data available
@@ -2291,7 +2337,7 @@ function AppContent() {
               </tr>
             </thead>
             <tbody>
-              {sortedPeriods.map(period => {
+              {displayPeriods.map(period => {
                 const periodData = data[period] || {}
                 if (!periodData || typeof periodData !== 'object') return null
                 let total = 0
@@ -2331,7 +2377,7 @@ function AppContent() {
               <tr className="bg-gray-800 font-semibold">
                 <td className="p-3 border border-gray-700">Total</td>
                 {sortedStreams.map(stream => {
-                  const streamTotal = sortedPeriods.reduce((sum, period) => {
+                  const streamTotal = displayPeriods.reduce((sum, period) => {
                     const periodData = data[period]
                     return sum + ((periodData && periodData[stream]) || 0)
                   }, 0)
@@ -2344,14 +2390,14 @@ function AppContent() {
                   )
                 })}
                 <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
-                  sortedPeriods.reduce((sum, period) => {
+                  displayPeriods.reduce((sum, period) => {
                     const periodData = data[period]
                     if (!periodData || typeof periodData !== 'object') return sum
                     return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
                   }, 0) > 0 ? 'text-green-400' : 'text-red-400'
                 }`}>
                   {formatCurrency(
-                    sortedPeriods.reduce((sum, period) => {
+                    displayPeriods.reduce((sum, period) => {
                       const periodData = data[period]
                       if (!periodData || typeof periodData !== 'object') return sum
                       return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
@@ -2382,7 +2428,7 @@ function AppContent() {
               </tr>
             </thead>
             <tbody>
-              {sortedPeriods.map(period => {
+              {displayPeriods.map(period => {
                 const periodData = data[period] || {}
                 if (!periodData || typeof periodData !== 'object') return null
                 let total = 0
@@ -2420,7 +2466,7 @@ function AppContent() {
               <tr className="bg-gray-800 font-semibold">
                 <td className="p-3 border border-gray-700">Total</td>
                 {sortedStreams.map(stream => {
-                  const streamTotal = sortedPeriods.reduce((sum, period) => {
+                  const streamTotal = displayPeriods.reduce((sum, period) => {
                     const periodData = data[period]
                     return sum + ((periodData && periodData[stream]) || 0)
                   }, 0)
@@ -2433,14 +2479,14 @@ function AppContent() {
                   )
                 })}
                 <td className={`p-3 border border-gray-700 text-right bg-gray-700 ${
-                  sortedPeriods.reduce((sum, period) => {
+                  displayPeriods.reduce((sum, period) => {
                     const periodData = data[period]
                     if (!periodData || typeof periodData !== 'object') return sum
                     return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
                   }, 0) > 0 ? 'text-green-400' : 'text-red-400'
                 }`}>
                   {formatCurrency(
-                    sortedPeriods.reduce((sum, period) => {
+                    displayPeriods.reduce((sum, period) => {
                       const periodData = data[period]
                       if (!periodData || typeof periodData !== 'object') return sum
                       return sum + Object.values(periodData).reduce((s, v) => s + (v || 0), 0)
@@ -2471,7 +2517,8 @@ function AppContent() {
   }, [workerStats, activeTab, formatWorkerStats])
   
   // Get filtered data length from worker
-  const filteredDataLength = filteredLength || 0
+  // Only use filteredLength if it matches the current tableTab to prevent stale counts
+  const filteredDataLength = (workerFilteredRowsTabRef.current === tableTab ? filteredLength : null) || 0
   
   // Note: Profit breakdown calculations still use old filtering for now
   // TODO: Move these to worker for better performance
@@ -2513,13 +2560,20 @@ function AppContent() {
         prevBreakdownTabRef.current = activeTab
         const streamId = 'master' // Breakdowns always use master stream
         
-        // Calculate "before filters" (using all data)
-        // The worker will send back with breakdownType: `${activeTab}_before`
-        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
-        
-        // Calculate "after filters" (using filtered data)
-        // The worker will send back with breakdownType: `${activeTab}_after`
-        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+        // For date tab, calculate "after filters" first for better perceived performance
+        // Then defer "before filters" slightly to prioritize showing filtered results
+        if (activeTab === 'date') {
+          // Calculate "after filters" first (most commonly viewed)
+          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+          // Defer "before filters" by a small delay to improve perceived responsiveness
+          setTimeout(() => {
+            calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
+          }, 100)
+        } else {
+          // For other tabs, calculate both immediately
+          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
+          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+        }
       } else {
         // Not on a breakdown tab, clear the previous tab reference
         prevBreakdownTabRef.current = null
@@ -2921,7 +2975,17 @@ function AppContent() {
                 <>
                   {/* After Filters */}
                   <div className="mb-8">
-                    <h3 className="text-lg font-semibold mb-4 text-green-400">After Filters</h3>
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-lg font-semibold text-green-400">After Filters</h3>
+                      {activeTab === 'date' && (
+                        <button
+                          onClick={() => setShowAllDays(!showAllDays)}
+                          className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700 text-gray-300"
+                        >
+                          {showAllDays ? 'Show Recent 200 Days' : 'Show All Days'}
+                        </button>
+                      )}
+                    </div>
                     {renderProfitTable(
                       (() => {
                         const data = activeTab === 'time' ? memoizedTimeProfitAfter :
@@ -2932,13 +2996,24 @@ function AppContent() {
                           memoizedYearProfitAfter
                         return data || {}
                       })(),
-                      activeTab
+                      activeTab,
+                      activeTab === 'date' && !showAllDays ? 200 : null
                     )}
                   </div>
                   
                   {/* Before Filters */}
                   <div>
-                    <h3 className="text-lg font-semibold mb-4 text-blue-400">Before Filters</h3>
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-lg font-semibold text-blue-400">Before Filters</h3>
+                      {activeTab === 'date' && (
+                        <button
+                          onClick={() => setShowAllDays(!showAllDays)}
+                          className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700 text-gray-300"
+                        >
+                          {showAllDays ? 'Show Recent 200 Days' : 'Show All Days'}
+                        </button>
+                      )}
+                    </div>
                     {renderProfitTable(
                       (() => {
                         const data = activeTab === 'time' ? memoizedTimeProfitBefore :
@@ -2949,14 +3024,15 @@ function AppContent() {
                           memoizedYearProfitBefore
                         return data || {}
                       })(),
-                      activeTab
+                      activeTab,
+                      activeTab === 'date' && !showAllDays ? 200 : null
                     )}
                   </div>
                 </>
               )}
             </div>
           </div>
-        ) : activeTab === 'master' ? (
+        ) : tableTab === 'master' ? (
           <div className="space-y-4">
             <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-4">
@@ -3125,13 +3201,18 @@ function AppContent() {
                   <div className="mb-4 text-sm text-gray-400">
                     Showing {filteredDataLength || 0} of {filteredDataLength || 0} trades
                   </div>
+                  {isSwitchingTab && (
+                    <div className="text-center py-4 text-gray-400 text-sm">
+                      Switching to Masterstream...
+                    </div>
+                  )}
                   <DataTable
                     data={masterData}
                     streamId="master"
-                    workerReady={workerReady}
-                    workerFilteredRows={workerFilteredRows}
-                    workerFilteredIndices={workerFilteredIndices}
-                    filteredLength={filteredLength}
+                    workerReady={workerReady && tableTab === 'master'}
+                    workerFilteredRows={workerFilteredRowsTabRef.current === 'master' ? workerFilteredRows : null}
+                    workerFilteredIndices={workerFilteredRowsTabRef.current === 'master' ? workerFilteredIndices : null}
+                    filteredLength={workerFilteredRowsTabRef.current === 'master' ? filteredLength : null}
                     loadedRows={loadedRows}
                     loadingMoreRows={loadingMoreRows}
                     selectedColumns={selectedColumns}
@@ -3222,17 +3303,22 @@ function AppContent() {
                   <div className="mb-4 text-sm text-gray-400">
                     Showing {filteredDataLength || 0} of {filteredDataLength || 0} trades
                   </div>
+                  {isSwitchingTab && (
+                    <div className="text-center py-4 text-gray-400 text-sm">
+                      Switching to {activeTab}...
+                    </div>
+                  )}
                   <DataTable
                     data={masterData}
-                    streamId={activeTab}
-                    workerReady={workerReady}
-                    workerFilteredRows={workerFilteredRows}
-                    workerFilteredIndices={workerFilteredIndices}
-                    filteredLength={filteredLength}
+                    streamId={tableTab}
+                    workerReady={workerReady && workerFilteredRowsTabRef.current === tableTab}
+                    workerFilteredRows={workerFilteredRowsTabRef.current === tableTab ? workerFilteredRows : null}
+                    workerFilteredIndices={workerFilteredRowsTabRef.current === tableTab ? workerFilteredIndices : null}
+                    filteredLength={workerFilteredRowsTabRef.current === tableTab ? filteredLength : null}
                     loadedRows={loadedRows}
                     loadingMoreRows={loadingMoreRows}
                     selectedColumns={selectedColumns}
-                    activeTab={activeTab}
+                    activeTab={tableTab}
                     onLoadMoreRows={loadMoreRows}
                     showFilteredDays={showFilteredDays}
                     getFilteredData={getFilteredData}

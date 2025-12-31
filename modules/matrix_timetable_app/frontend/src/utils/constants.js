@@ -2,7 +2,7 @@
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 export const API_BASE = `http://localhost:${API_PORT}/api`
 
-export const STREAMS = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2']
+export const STREAMS = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2', 'RTY1', 'RTY2']
 
 export const DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
 

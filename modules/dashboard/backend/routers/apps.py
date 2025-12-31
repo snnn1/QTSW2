@@ -3,6 +3,7 @@ Streamlit application launcher endpoints
 """
 import subprocess
 import logging
+import sys
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from typing import Dict
@@ -17,6 +18,9 @@ QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 TRANSLATOR_APP = QTSW2_ROOT / "scripts" / "translate_raw_app.py"
 ANALYZER_APP = QTSW2_ROOT / "modules" / "analyzer" / "analyzer_app" / "app.py"
 SEQUENTIAL_APP = QTSW2_ROOT / "sequential_processor" / "sequential_processor_app.py"
+
+# Parallel analyzer script (the one used in the pipeline)
+PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 
 # React app (matrix timetable app)
 MATRIX_APP_DIR = QTSW2_ROOT / "matrix_timetable_app" / "frontend"
@@ -41,19 +45,73 @@ async def start_translator_app() -> Dict:
 
 @router.post("/analyzer/start")
 async def start_analyzer_app() -> Dict:
-    """Start the analyzer Streamlit app"""
+    """Start the parallel analyzer script (same as used in pipeline)"""
     try:
-        if not ANALYZER_APP.exists():
-            raise HTTPException(status_code=404, detail="Analyzer app not found")
+        if not PARALLEL_ANALYZER_SCRIPT.exists():
+            raise HTTPException(status_code=404, detail=f"Parallel analyzer script not found at {PARALLEL_ANALYZER_SCRIPT}")
         
-        subprocess.Popen(
-            ["streamlit", "run", str(ANALYZER_APP)],
-            cwd=str(QTSW2_ROOT)
+        # Detect available instruments from translated data
+        translated_dir = QTSW2_ROOT / "data" / "translated"
+        instruments = set()
+        
+        if translated_dir.exists():
+            # Look for instrument directories (e.g., data/translated/ES/, data/translated/NQ/)
+            for item in translated_dir.iterdir():
+                if item.is_dir() and len(item.name) <= 4:
+                    # Check if it has parquet files
+                    parquet_files = list(item.rglob("*.parquet"))
+                    if parquet_files:
+                        instruments.add(item.name.upper())
+        
+        if not instruments:
+            # Fallback: try data/processed or data/data_processed
+            for alt_dir in [QTSW2_ROOT / "data" / "processed", QTSW2_ROOT / "data" / "data_processed"]:
+                if alt_dir.exists():
+                    for item in alt_dir.iterdir():
+                        if item.is_dir() and len(item.name) <= 4:
+                            parquet_files = list(item.rglob("*.parquet"))
+                            if parquet_files:
+                                instruments.add(item.name.upper())
+        
+        if not instruments:
+            raise HTTPException(
+                status_code=400,
+                detail="No instruments found in translated/processed data. Please run the translator first."
+            )
+        
+        instruments_list = sorted(list(instruments))
+        logger.info(f"Starting parallel analyzer for instruments: {', '.join(instruments_list)}")
+        
+        # Build command for parallel analyzer
+        analyzer_cmd = [
+            sys.executable,
+            str(PARALLEL_ANALYZER_SCRIPT),
+            "--folder", str(translated_dir if translated_dir.exists() else QTSW2_ROOT / "data" / "data_processed"),
+            "--instruments"
+        ] + instruments_list
+        
+        # Start the analyzer process
+        process = subprocess.Popen(
+            analyzer_cmd,
+            cwd=str(QTSW2_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
         )
-        return {"status": "started", "app": "analyzer"}
+        
+        logger.info(f"Started parallel analyzer process (PID: {process.pid}) for {len(instruments_list)} instrument(s)")
+        
+        return {
+            "status": "started",
+            "app": "analyzer",
+            "instruments": instruments_list,
+            "process_id": process.pid
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to start analyzer app: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to start analyzer: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to start analyzer: {str(e)}")
 
 
 @router.post("/sequential/start")

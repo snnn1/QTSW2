@@ -13,7 +13,8 @@ const CONTRACT_VALUES = {
   'YM': 5,
   'CL': 1000,
   'NG': 10000,
-  'GC': 100
+  'GC': 100,
+  'RTY': 50
 }
 
 export function useMatrixWorker() {
@@ -212,6 +213,12 @@ export function useMatrixWorker() {
       // #endregion
       return
     }
+    
+    // Clear previous filter outputs to prevent stale data from being displayed
+    // This ensures the UI doesn't show data from a previous tab while filtering
+    setFilteredLength(0)
+    setFilteredIndices([])
+    setFilteredRows([])
     
     // Increment request ID and track active request
     activeRequestIdRef.current += 1

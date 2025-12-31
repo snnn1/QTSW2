@@ -17,7 +17,8 @@ export const getContractValue = (trade) => {
     'YM': 5,
     'CL': 1000,
     'NG': 10000,
-    'GC': 100
+    'GC': 100,
+    'RTY': 50
   }
   return contractValues[baseSymbol] || 50 // Default to ES if unknown
 }

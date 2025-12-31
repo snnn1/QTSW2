@@ -370,7 +370,21 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
         - All enabled slots are processed independently
         - Uses base target only (first level of target ladder)
     """
+    import sys
+    # Print to stderr so it shows immediately even when stdout is redirected
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+    
+    log(f"\n{'='*70}")
+    log(f"RUN_STRATEGY CALLED")
+    log(f"{'='*70}")
+    log(f"Instrument: {rp.instrument}")
+    log(f"Input DataFrame shape: {df.shape}")
+    log(f"Input DataFrame columns: {list(df.columns)}")
+    log(f"{'='*70}\n")
+    
     # Initialize logic components
+    log("Initializing components...")
     config_manager = ConfigManager()
     utility_manager = UtilityManager()
     validation_manager = ValidationManager()
@@ -378,16 +392,21 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
     time_manager = TimeManager()
     debug_manager = DebugManager(debug)
     range_detector = RangeDetector(config_manager.get_slot_config())
+    log("Components initialized.")
     
     # Initialize components
+    log("Initializing entry detector, price tracker, result processor...")
     entry_detector = EntryDetector(config_manager=config_manager, instrument_manager=instrument_manager)
     price_tracker = PriceTracker(debug_manager=debug_manager, 
                                  instrument_manager=instrument_manager,
                                  config_manager=config_manager)
     result_processor = ResultProcessor(instrument_manager=instrument_manager)
+    log("Components initialized.")
     
     # Validate inputs
+    log("Validating DataFrame...")
     validation_result = validation_manager.validate_dataframe(df)
+    log(f"Validation result: Valid={validation_result.is_valid}, Errors={validation_result.errors}")
     if not validation_result.is_valid:
         raise ValueError(f"Data validation failed: {validation_result.errors}")
     
@@ -405,11 +424,37 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
     # Start performance monitoring
     debug_manager.start_timer()
 
-    df = df[df["instrument"].str.upper() == inst.upper()].copy()
-    if df.empty:
-        if debug:
-            print(f"DEBUG: No data found for instrument {inst.upper()}")
+    # Filter data for the specific instrument
+    log(f"\n{'='*70}")
+    log(f"FILTERING DATA FOR INSTRUMENT: {inst.upper()}")
+    log(f"{'='*70}")
+    
+    # Check available instruments BEFORE filtering
+    if 'instrument' in df.columns:
+        available_instruments = sorted(df['instrument'].str.upper().unique().tolist())
+        log(f"Available instruments in data: {available_instruments}")
+        log(f"Rows before filtering: {len(df):,}")
+    else:
+        log(f"ERROR: 'instrument' column not found in data!")
+        log(f"Columns in data: {list(df.columns)}")
         return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
+    
+    df = df[df["instrument"].str.upper() == inst.upper()].copy()
+    
+    log(f"Rows after filtering for {inst.upper()}: {len(df):,}")
+    
+    if df.empty:
+        log(f"\n{'='*70}")
+        log(f"ERROR: No data found for instrument {inst.upper()}")
+        log(f"{'='*70}")
+        log(f"  Requested instrument: {inst.upper()}")
+        log(f"  Available instruments: {available_instruments}")
+        log(f"  This instrument may not exist in the data file.")
+        log(f"{'='*70}\n")
+        return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
+    
+    log(f"Date range in filtered data: {df['timestamp'].min()} to {df['timestamp'].max()}")
+    log(f"{'='*70}\n")
 
     # Data is already in correct timezone (America/Chicago) - handled by translator
 
@@ -421,15 +466,35 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
         print(f"DEBUG: Enabled slots: {rp.enabled_slots}")
         print(f"DEBUG: Trade days: {rp.trade_days}")
 
+    log("Building slot ranges...")
     ranges = range_detector.build_slot_ranges(df, rp, debug)
     
-    print(f"Found {len(ranges)} slot ranges")
+    log(f"\n{'='*70}")
+    log(f"RANGE DETECTION COMPLETE")
+    log(f"{'='*70}")
+    log(f"Found {len(ranges)} slot ranges")
+    
     if len(ranges) == 0:
-        print(f"ERROR: No ranges found - this is why no results will be generated")
-        print(f"  Check if data contains valid trading days and session times")
+        log(f"\nERROR: No ranges found - this is why no results will be generated")
+        log(f"  Check if data contains valid trading days and session times")
         return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
     
-    print(f"Starting trade execution for {len(ranges)} ranges...")
+    # Show date range that will be processed
+    if ranges:
+        dates = sorted(set(r.date.date() for r in ranges))
+        print(f"Date range: {dates[0]} to {dates[-1]} ({len(dates)} trading days)")
+        print(f"Unique dates: {len(dates)}")
+        if len(dates) <= 10:
+            print(f"Dates: {', '.join(str(d) for d in dates)}")
+        else:
+            print(f"First 5 dates: {', '.join(str(d) for d in dates[:5])} ...")
+            print(f"Last 5 dates: {', '.join(str(d) for d in dates[-5:])}")
+    
+    log(f"\n{'='*70}")
+    log(f"STARTING TRADE EXECUTION")
+    log(f"{'='*70}")
+    log(f"Processing {len(ranges)} ranges...")
+    log(f"{'='*70}\n")
     
     # Determine if we should use parallel processing
     # Use parallel for large datasets (> 100 ranges) and when not in debug mode
@@ -491,44 +556,72 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
         progress_interval = 500  # Log every 500 ranges
         last_logged_date = None  # Track last logged date to only log once per day
         slots_per_day = {}  # Track slots processed per day: {date: set(slots)}
+        trades_per_day = {}  # Track trades generated per day: {date: int}
+        day_start_row_count = {}  # Track row count at start of each day
         
         for R in ranges:
             ranges_processed += 1
             
-            # Log progress periodically
-            if ranges_processed == 1 or ranges_processed % progress_interval == 0 or ranges_processed == len(ranges):
-                print(f"Processing range {ranges_processed}/{len(ranges)}: {len(rows)} trades generated")
+            # Extract date and time label - needed for both logging and processing
+            try:
+                current_date = R.date.date()
+                time_label = R.end_label
+            except Exception as e:
+                # If we can't get date/label, skip logging but continue processing
+                log(f"WARNING: Could not extract date/label for range {ranges_processed}: {e}")
+                current_date = None
+                time_label = None
             
-            # Also log every 1000 ranges for very large datasets
-            if ranges_processed % 1000 == 0:
-                print(f"Progress: {ranges_processed}/{len(ranges)} ranges ({ranges_processed*100//len(ranges)}%), {len(rows)} trades")
-            
-            # Debug: Track slots per day and log summary when date changes
-            if debug:
+            # Only do date-based logging if we have a valid date
+            if current_date is not None:
                 try:
-                    current_date = R.date.date()
-                    time_label = R.end_label
-                    
                     # Track slots for current date
                     if current_date not in slots_per_day:
                         slots_per_day[current_date] = set()
+                        trades_per_day[current_date] = 0
+                        day_start_row_count[current_date] = len(rows)
+                    
                     if time_label:
                         slots_per_day[current_date].add(time_label)
                     
-                    # Log when date changes (once per day)
+                    # Log when date changes (once per day) - ALWAYS log, not just in debug mode
                     if last_logged_date != current_date:
                         # Log summary for previous day if it exists
-                        if last_logged_date is not None and last_logged_date in slots_per_day:
+                        if last_logged_date is not None:
                             prev_slots = sorted(slots_per_day[last_logged_date])
+                            prev_trades = trades_per_day[last_logged_date]
+                            prev_row_start = day_start_row_count[last_logged_date]
+                            prev_row_end = len(rows)
+                            prev_trades_this_day = prev_row_end - prev_row_start
+                            
                             slots_str = ", ".join(prev_slots) if prev_slots else "none"
-                            print(f"Completed date {last_logged_date}: processed slots {slots_str}")
+                            print(f"\n{'='*70}")
+                            print(f"✓ COMPLETED DATE: {last_logged_date}")
+                            print(f"  Slots processed: {slots_str}")
+                            print(f"  Ranges processed: {len([r for r in ranges[:ranges_processed] if r.date.date() == last_logged_date])}")
+                            print(f"  Trades generated: {prev_trades_this_day} (Total so far: {prev_row_end})")
+                            print(f"{'='*70}\n")
                         
-                        # Start new day
-                        print(f"\nProcessing date: {current_date}")
+                        # Start new day - ALWAYS log
+                        day_ranges = len([r for r in ranges if r.date.date() == current_date])
+                        print(f"\n{'#'*70}")
+                        print(f"PROCESSING DATE: {current_date} ({day_ranges} ranges)")
+                        print(f"{'#'*70}")
                         last_logged_date = current_date
-                except Exception:
-                    # Silently skip if encoding error
-                    pass
+                    
+                    # Log progress periodically (every 500 ranges or at milestones)
+                    if ranges_processed == 1 or ranges_processed % progress_interval == 0 or ranges_processed == len(ranges):
+                        current_day_trades = len(rows) - day_start_row_count.get(current_date, 0)
+                        log(f"  Progress: Range {ranges_processed}/{len(ranges)} | Date: {current_date} | Slot: {time_label} | Trades today: {current_day_trades} | Total trades: {len(rows)}")
+                    
+                    # Also log every 1000 ranges for very large datasets
+                    if ranges_processed % 1000 == 0:
+                        current_day_trades = len(rows) - day_start_row_count.get(current_date, 0)
+                        log(f"  Milestone: {ranges_processed}/{len(ranges)} ranges ({ranges_processed*100//len(ranges)}%) | Trades today: {current_day_trades} | Total trades: {len(rows)}")
+                        
+                except Exception as e:
+                    # Log error but continue processing
+                    log(f"WARNING: Error logging date info for range {ranges_processed}: {e}")
             
             # Process single range
             result = _process_single_range(
@@ -539,15 +632,51 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
             
             if result is not None:
                 rows.append(result)
+                # Update trades count for current day after adding result
+                if current_date is not None and current_date in trades_per_day:
+                    trades_per_day[current_date] = len(rows) - day_start_row_count[current_date]
         
-        # Log final day's summary if debug is enabled
-        if debug and last_logged_date is not None and last_logged_date in slots_per_day:
+        # Log final day's summary - ALWAYS log, not just in debug mode
+        if last_logged_date is not None:
             try:
-                final_slots = sorted(slots_per_day[last_logged_date])
+                final_slots = sorted(slots_per_day.get(last_logged_date, set()))
+                final_trades = trades_per_day.get(last_logged_date, 0)
+                final_row_start = day_start_row_count.get(last_logged_date, 0)
+                final_row_end = len(rows)
+                final_trades_this_day = final_row_end - final_row_start
+                
                 slots_str = ", ".join(final_slots) if final_slots else "none"
-                print(f"Completed date {last_logged_date}: processed slots {slots_str}")
-            except Exception:
-                pass
+                log(f"\n{'='*70}")
+                log(f"COMPLETED DATE: {last_logged_date}")
+                log(f"  Slots processed: {slots_str}")
+                log(f"  Trades generated: {final_trades_this_day} (Total: {final_row_end})")
+                log(f"{'='*70}\n")
+            except Exception as e:
+                log(f"WARNING: Error logging final day summary: {e}")
+        
+        # Print comprehensive summary of all days processed
+        if slots_per_day:
+            log(f"\n{'#'*70}")
+            log(f"PROCESSING SUMMARY - ALL DAYS")
+            log(f"{'#'*70}")
+            total_days = len(slots_per_day)
+            total_ranges_processed = ranges_processed
+            total_trades_generated = len(rows)
+            
+            log(f"\nTotal days processed: {total_days}")
+            log(f"Total ranges processed: {total_ranges_processed}")
+            log(f"Total trades generated: {total_trades_generated}")
+            log(f"\nBreakdown by date:")
+            log(f"{'Date':<12} {'Slots':<30} {'Trades':<10}")
+            log(f"{'-'*70}")
+            
+            for date in sorted(slots_per_day.keys()):
+                slots = sorted(slots_per_day[date])
+                slots_str = ", ".join(slots) if slots else "none"
+                day_trades = trades_per_day.get(date, 0)
+                log(f"{str(date):<12} {slots_str:<30} {day_trades:<10}")
+            
+            log(f"{'#'*70}\n")
 
     # End performance monitoring
     total_time = debug_manager.end_timer()

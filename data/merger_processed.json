@@ -19,9 +19,13 @@
     "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-27",
     "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-28",
     "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-29",
-    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-30"
+    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-30",
+    "C:\\Users\\jakej\\QTSW2\\data\\analyzer_temp\\2025-12-31"
   ],
   "sequencer": [
     "C:\\Users\\jakej\\QTSW2\\data\\sequencer_temp\\2025-11-21"
+  ],
+  "manual_analyzer": [
+    "C:\\Users\\jakej\\QTSW2\\data\\manual_analyzer_runs\\2025-12-31"
   ]
 }
