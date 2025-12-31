@@ -181,21 +181,24 @@ class ProcessSupervisor:
             
             time.sleep(0.5)
         
-        # Get remaining output
+        # IMPORTANT: For fast-failing processes, the reader threads may still be draining
+        # output when the process exits. We join first, then drain queues to avoid
+        # dropping critical stderr (e.g., argparse usage errors) for short-lived runs.
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
+        # Drain any remaining output after threads complete
         try:
             while True:
                 stdout_lines.append(stdout_queue.get_nowait())
         except queue.Empty:
             pass
-        
+
         try:
             while True:
                 stderr_lines.append(stderr_queue.get_nowait())
         except queue.Empty:
             pass
-        
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
         
         execution_time = time.time() - start_time
         
@@ -207,7 +210,7 @@ class ProcessSupervisor:
         success = (process.returncode == 0) or (was_terminated and not timed_out)
         
         return ProcessResult(
-            returncode=process.returncode or 0,
+            returncode=process.returncode if process.returncode is not None else 0,
             stdout=''.join(stdout_lines),
             stderr=''.join(stderr_lines),
             stdout_tail=stdout_tail,

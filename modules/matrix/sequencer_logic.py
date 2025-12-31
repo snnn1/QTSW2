@@ -427,17 +427,12 @@ def process_stream_daily(
             # Don't select a trade at an excluded time - return NoTrade instead
             trade_row = None
         else:
-            # Get available_times (selectable_times) and exclude_times_str for the function call
-            available_times = selectable_times
-            exclude_times_str = stream_filters.get('exclude_times', [])
+            # Call select_trade_for_time with only the required parameters
+            # Note: excluded times should already be filtered from date_df before calling
             trade_row = select_trade_for_time(
                 date_df, 
                 current_time, 
-                current_session,
-                available_times,
-                exclude_times_str,
-                stream_id,
-                date
+                current_session
             )
         
         old_time_for_today = str(current_time).strip()

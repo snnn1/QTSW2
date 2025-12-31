@@ -4,7 +4,8 @@ export function getDefaultFilters() {
     exclude_days_of_week: [],
     exclude_days_of_month: [],
     exclude_times: [],
-    include_years: []
+    include_years: [],
+    include_streams: [] // Only for master stream - empty means all streams included
   }
 }
 
@@ -25,7 +26,8 @@ export function loadAllFilters() {
           exclude_days_of_week: Array.isArray(filters.exclude_days_of_week) ? filters.exclude_days_of_week : [],
           exclude_days_of_month: Array.isArray(filters.exclude_days_of_month) ? filters.exclude_days_of_month : [],
           exclude_times: Array.isArray(filters.exclude_times) ? filters.exclude_times : [],
-          include_years: Array.isArray(filters.include_years) ? filters.include_years : []
+          include_years: Array.isArray(filters.include_years) ? filters.include_years : [],
+          include_streams: Array.isArray(filters.include_streams) ? filters.include_streams : []
         }
       })
       return validated

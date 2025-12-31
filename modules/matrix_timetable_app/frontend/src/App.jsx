@@ -20,7 +20,9 @@ import { calculateStats as calculateStatsUtil } from './utils/statsCalculations'
 import { useMatrixFilters } from './hooks/useMatrixFilters'
 import { useMatrixData } from './hooks/useMatrixData'
 import { useColumnSelection } from './hooks/useColumnSelection'
+import { useMatrixController } from './hooks/useMatrixController'
 import DataTable from './components/DataTable'
+import * as matrixApi from './api/matrixApi'
 
 // API base URL - can be overridden via environment variable
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
@@ -45,7 +47,6 @@ function App() {
 function AppContent() {
   const [activeTab, setActiveTab] = useState('timetable') // 'timetable', 'master', or stream ID
   const [currentTime, setCurrentTime] = useState(new Date())
-  const [lastMergeTime, setLastMergeTime] = useState(null)
   
   // React 18 optimizations for tab switching
   const [isPending, startTransition] = useTransition()
@@ -55,19 +56,8 @@ function AppContent() {
   const tableTab = deferredActiveTab
   const isSwitchingTab = activeTab !== deferredActiveTab
   
-  // Track if initial load has been attempted to prevent reload loops
-  const hasLoadedRef = useRef(false)
-  
   // Debounce timer ref for tab switching
   const tabDebounceTimerRef = useRef(null)
-  
-  // Cache for filtered results per tab
-  const filterCacheRef = useRef(new Map())
-  
-  // Generate cache key from tab and filters
-  const getCacheKey = useCallback((tabId, filters) => {
-    return `${tabId}_${JSON.stringify(filters)}`
-  }, [])
   
   // Wrapper for setActiveTab that uses startTransition and debouncing
   const handleTabChange = useCallback((newTab) => {
@@ -95,30 +85,6 @@ function AppContent() {
     }
   }, [])
   
-  // Web Worker for all heavy computations
-  const {
-    workerReady,
-    filteredLength,
-    filterMask,
-    filteredIndices: workerFilteredIndices,
-    filteredRows: workerFilteredRows,
-    stats: workerStats,
-    statsLoading,
-    profitBreakdown: workerProfitBreakdown,
-    breakdownType: workerBreakdownType,
-    breakdownLoading: workerBreakdownLoading,
-    timetable: workerTimetable,
-    timetableLoading: workerTimetableLoading,
-    executionTimetable: workerExecutionTimetable,
-    error: workerError,
-    initData: workerInitData,
-    filter: workerFilter,
-    calculateStats: workerCalculateStats,
-    getRows: workerGetRows,
-    calculateProfitBreakdown,
-    calculateTimetable: workerCalculateTimetable
-  } = useMatrixWorker()
-  
   // Use existing hooks for filter state management
   const {
     streamFilters,
@@ -131,12 +97,6 @@ function AppContent() {
   const [backendConnecting, setBackendConnecting] = useState(true)
   const [backendConnectionError, setBackendConnectionError] = useState(null)
   
-  // Keep local state for complex logic (loadMasterMatrix, toggleColumn, etc. have complex implementations)
-  const [masterData, setMasterData] = useState([])
-  const [masterLoading, setMasterLoading] = useState(false)
-  const [masterError, setMasterError] = useState(null)
-  const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
-  
   // Auto-update toggle (persisted in localStorage, default: enabled)
   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(() => {
     const saved = localStorage.getItem('matrix_auto_update_enabled')
@@ -145,6 +105,79 @@ function AppContent() {
       return true
     }
     return saved === 'true'
+  })
+  
+  // Include filtered executed trades in stats (default: true)
+  const [includeFilteredExecuted, setIncludeFilteredExecuted] = useState(() => {
+    const saved = localStorage.getItem('matrix_include_filtered_executed')
+    return saved !== null ? JSON.parse(saved) : true
+  })
+  
+  // Track previous includeFilteredExecuted to detect changes and force refetch
+  const prevIncludeFilteredExecutedRef = useRef(includeFilteredExecuted)
+  
+  // Contract multiplier for master stream (default 1 contract)
+  const [masterContractMultiplier, setMasterContractMultiplier] = useState(() => {
+    const saved = localStorage.getItem('matrix_master_contract_multiplier')
+    return saved ? parseFloat(saved) || 1 : 1
+  })
+  
+  // Show/Hide filtered days toggle (default: ON/show filtered days)
+  const [showFilteredDays, setShowFilteredDays] = useState(() => {
+    const saved = localStorage.getItem('matrix_show_filtered_days')
+    if (saved !== null) {
+      return saved === 'true'
+    }
+    return true // Default: show filtered days
+  })
+  
+  // Matrix controller hook - handles all matrix orchestration
+  const {
+    // Backend data state
+    masterData,
+    masterLoading,
+    masterError,
+    availableYearsFromAPI,
+    lastMergeTime,
+    availableColumns,
+    setAvailableColumns,
+    // Backend stats
+    backendStatsFull,
+    backendStatsMultiplier,
+    masterStatsLoading,
+    setBackendStatsFull,
+    setBackendStatsMultiplier,
+    // Worker state
+    workerReady,
+    filteredLength,
+    workerFilteredIndices,
+    workerFilteredRows,
+    workerStats,
+    statsLoading,
+    workerProfitBreakdown,
+    workerBreakdownType,
+    breakdownLoading: workerBreakdownLoading,
+    workerTimetable,
+    timetableLoading: workerTimetableLoading,
+    workerExecutionTimetable,
+    workerError,
+    // Worker functions
+    workerGetRows,
+    calculateProfitBreakdown,
+    workerCalculateTimetable,
+    // Controller functions
+    loadMasterMatrix,
+    updateMasterMatrix,
+    refetchMasterStats,
+    hasLoadedRef
+  } = useMatrixController({
+    streamFilters,
+    masterContractMultiplier,
+    includeFilteredExecuted,
+    activeTab,
+    deferredActiveTab,
+    autoUpdateEnabled,
+    showFilteredDays
   })
   
   // Save auto-update preference to localStorage
@@ -168,33 +201,17 @@ function AppContent() {
   // Column selector visibility
   const [showColumnSelector, setShowColumnSelector] = useState(false)
   
-  // Show/Hide filtered days toggle (default: ON/show filtered days)
-  const [showFilteredDays, setShowFilteredDays] = useState(() => {
-    const saved = localStorage.getItem('matrix_show_filtered_days')
-    if (saved !== null) {
-      return saved === 'true'
-    }
-    return true // Default: show filtered days
-  })
-  
   // Save showFilteredDays to localStorage when it changes
   useEffect(() => {
     localStorage.setItem('matrix_show_filtered_days', String(showFilteredDays))
   }, [showFilteredDays])
   
-  // Filtered data indices (from worker mask)
-  const [filteredIndices, setFilteredIndices] = useState([])
-  
-  // Available columns (detected from data)
-  const [availableColumns, setAvailableColumns] = useState([])
-  
-  // Include filtered executed trades in stats (default: true)
-  const [includeFilteredExecuted, setIncludeFilteredExecuted] = useState(() => {
-    const saved = localStorage.getItem('matrix_include_filtered_executed')
-    return saved !== null ? JSON.parse(saved) : true
-  })
-  
   // Stats visibility per stream
+  // Full-dataset stats from backend (calculated from all rows, not just loaded subset)
+  // backendStatsFull is now managed by useMatrixController
+  const [backendStreamStats, setBackendStreamStats] = useState({}) // Map of streamId -> stats
+  const [backendStreamStatsLoading, setBackendStreamStatsLoading] = useState({}) // Map of streamId -> loading state
+  
   const [showStats, setShowStats] = useState(() => {
     const saved = localStorage.getItem('matrix_show_stats')
     if (saved) {
@@ -207,12 +224,19 @@ function AppContent() {
     return {}
   })
   
-  // Per-stream filters (persisted in localStorage)
-  // Contract multiplier for master stream (default 1 contract)
-  const [masterContractMultiplier, setMasterContractMultiplier] = useState(() => {
-    const saved = localStorage.getItem('matrix_master_contract_multiplier')
-    return saved ? parseFloat(saved) || 1 : 1
+  // Show/hide filters per stream (persisted in localStorage)
+  const [showFilters, setShowFilters] = useState(() => {
+    const saved = localStorage.getItem('matrix_show_filters')
+    if (saved) {
+      try {
+        return JSON.parse(saved)
+      } catch {
+        return {}
+      }
+    }
+    return {}
   })
+  
   // Temporary input value for multiplier (doesn't trigger recalculations)
   const [multiplierInput, setMultiplierInput] = useState(() => {
     const saved = localStorage.getItem('matrix_master_contract_multiplier')
@@ -233,369 +257,75 @@ function AppContent() {
     if (node) observerRef.current.observe(node)
   }, [masterLoading])
   
-  // Load master matrix function - defined early so it can be used in useEffect
-  const loadMasterMatrix = useCallback(async (rebuild = false, rebuildStream = null) => {
-    setMasterLoading(true)
-    setMasterError(null)
-    
-    // Preserve existing data during rebuild/load - only replace when new data is successfully loaded
-    const hadExistingData = masterData.length > 0
-    
-    try {
-      // Check if backend is reachable
-      try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 3000)
-        const healthCheck = await fetch(`${API_BASE.replace('/api', '')}/`, { 
-          method: 'GET', 
-          signal: controller.signal 
-        })
-        clearTimeout(timeoutId)
-      } catch (e) {
-        if (e.name === 'AbortError') {
-          setMasterError(`Backend connection timeout. Make sure the dashboard backend is running on http://localhost:${API_PORT}`)
-        } else {
-          setMasterError(`Backend not running. Please start the dashboard backend on port ${API_PORT}. Error: ` + e.message)
+  // Setup columns when data loads (UI-specific logic)
+  useEffect(() => {
+    if (masterData.length > 0 && availableColumns.length === 0) {
+      const cols = Object.keys(masterData[0])
+      const hiddenColumns = [
+        'global_trade_id', 'filter_reasons', 'onr_high', 'onr_low', 'onr',
+        'scf_s1', 'scf_s2', 'prewindow_high_s1', 'prewindow_low_s1', 'prewindow_range_s1',
+        'session_high_s1', 'session_low_s1', 'session_range_s1', 'prewindow_high_s2',
+        'prewindow_low_s2', 'prewindow_range_s2', 'session_high_s2', 'session_low_s2',
+        'session_range_s2', 'onr_q1', 'onr_q2', 'onr_q3', 'onr_bucket', 'entry_time',
+        'exit_time', 'entry_price', 'exit_price', 'R', 'pnl', 'rs_value', 'selected_time',
+        'time_bucket', 'trade_date', 'day_of_month', 'dow', 'dow_full', 'month',
+        'session_index', 'is_two_stream', 'dom_blocked', 'final_allowed', 'SL'
+      ]
+      const displayableCols = cols.filter(col => {
+        if (col.includes(' Points') || col.includes(' Rolling')) {
+          return true
         }
-        // Only clear data if we had no existing data (initial load failure)
-        if (!hadExistingData) {
-          setMasterData([])
-        }
-        setMasterLoading(false)
-        return
+        return !col.startsWith('_') && !hiddenColumns.includes(col)
+      })
+      
+      if (displayableCols.includes('Profit') && !displayableCols.includes('Profit ($)')) {
+        displayableCols.push('Profit ($)')
       }
       
-      // If rebuild requested, build matrix first
-      if (rebuild) {
-        // Build stream filters for API
-        const streamFiltersApi = {}
-        Object.keys(streamFilters).forEach(streamId => {
-          const filters = streamFilters[streamId]
-          if (filters) {
-            streamFiltersApi[streamId] = {
-              exclude_days_of_week: filters.exclude_days_of_week || [],
-              exclude_days_of_month: filters.exclude_days_of_month || [],
-              exclude_times: filters.exclude_times || []
-            }
-          }
-        })
-        
-        const visibleYearsSet = new Set()
-        Object.keys(streamFilters).forEach(id => {
-          const f = streamFilters[id]
-          if (f && Array.isArray(f.include_years)) {
-            f.include_years.forEach(y => {
-              const num = parseInt(y)
-              if (!isNaN(num)) {
-                visibleYearsSet.add(num)
-              }
-            })
-          }
-        })
-        const visibleYears = Array.from(visibleYearsSet).sort((a, b) => a - b)
-        
-        const buildBody = {
-          stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
-        }
-        if (visibleYears.length > 0) {
-          buildBody.visible_years = visibleYears
-        }
-        buildBody.warmup_months = 1
-        if (rebuildStream) {
-          buildBody.streams = [rebuildStream]
-        }
-        
-        try {
-          const buildResponse = await fetch(`${API_BASE}/matrix/build`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildBody)
-          })
-          
-          if (!buildResponse.ok) {
-            const errorData = await buildResponse.json()
-            setMasterError(errorData.detail || 'Failed to build master matrix')
-            // Preserve existing data if rebuild fails
-            setMasterLoading(false)
-            return
-          }
-          
-          await buildResponse.json()
-        } catch (error) {
-          setMasterError(`Failed to build master matrix: ${error.message}`)
-          // Preserve existing data if rebuild fails
-          setMasterLoading(false)
-          return
-        }
-      }
-      
-      // Load the matrix data (NO LIMIT - load all trades)
-      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=0&essential_columns_only=true&skip_cleaning=true`)
-      
-      if (!dataResponse.ok) {
-        const errorData = await dataResponse.json()
-        setMasterError(errorData.detail || 'Failed to load matrix data')
-        // Only clear data if we had no existing data (initial load failure)
-        if (!hadExistingData) {
-          setMasterData([])
-        }
-        setMasterLoading(false)
-        return
-      }
-      
-      const data = await dataResponse.json()
-      const trades = data.data || []
-      
-      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
-        setAvailableYearsFromAPI(data.years)
-      }
-      
-      if (trades.length > 0) {
-        // Only now do we replace the data - new data is successfully loaded
-        setMasterData(trades)
-        // Use file modification time from API if available (when matrix was actually built),
-        // otherwise fall back to current time (when data was received)
-        const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
-        setLastMergeTime(mergeTime)
-        
-        if (trades.length > 0) {
-          workerInitData(trades)
-        }
-        
-        if (availableColumns.length === 0) {
-          const cols = Object.keys(trades[0])
-          const hiddenColumns = [
-            'global_trade_id', 'filter_reasons', 'onr_high', 'onr_low', 'onr',
-            'scf_s1', 'scf_s2', 'prewindow_high_s1', 'prewindow_low_s1', 'prewindow_range_s1',
-            'session_high_s1', 'session_low_s1', 'session_range_s1', 'prewindow_high_s2',
-            'prewindow_low_s2', 'prewindow_range_s2', 'session_high_s2', 'session_low_s2',
-            'session_range_s2', 'onr_q1', 'onr_q2', 'onr_q3', 'onr_bucket', 'entry_time',
-            'exit_time', 'entry_price', 'exit_price', 'R', 'pnl', 'rs_value', 'selected_time',
-            'time_bucket', 'trade_date', 'day_of_month', 'dow', 'dow_full', 'month',
-            'session_index', 'is_two_stream', 'dom_blocked', 'final_allowed', 'SL'  // Hide old SL column, use StopLoss instead
-          ]
-          const displayableCols = cols.filter(col => {
-            if (col.includes(' Points') || col.includes(' Rolling')) {
-              return true
-            }
-            return !col.startsWith('_') && !hiddenColumns.includes(col)
-          })
-          
-          if (displayableCols.includes('Profit') && !displayableCols.includes('Profit ($)')) {
-            displayableCols.push('Profit ($)')
-          }
-          
-          DEFAULT_COLUMNS.forEach(col => {
-            if (!displayableCols.includes(col)) {
-              displayableCols.push(col)
-            }
-          })
-          
-          const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
-          setAvailableColumns(displayableCols)
-          
-          setSelectedColumns(prev => {
-            const updated = { ...prev }
-            let changed = false
-            
-            const getDefaultColumns = () => {
-              return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
-            }
-            
-            // Remove 'SL' from selected columns if it exists (replaced by 'StopLoss')
-            Object.keys(updated).forEach(tabId => {
-              if (Array.isArray(updated[tabId]) && updated[tabId].includes('SL')) {
-                updated[tabId] = updated[tabId].filter(col => col !== 'SL')
-                changed = true
-              }
-            })
-            
-            const defaultCols = getDefaultColumns()
-            if (JSON.stringify(updated['master']) !== JSON.stringify(defaultCols)) {
-              updated['master'] = defaultCols
-              changed = true
-            }
-            
-            STREAMS.forEach(stream => {
-              if (!updated[stream] || updated[stream].length === 0) {
-                updated[stream] = getDefaultColumns()
-                changed = true
-              }
-            })
-            
-            if (changed) {
-              localStorage.setItem('matrix_selected_columns', JSON.stringify(updated))
-            }
-            return updated
-          })
-        }
-        
-        setMasterError(null)
-      } else {
-        // Only clear data if we had no existing data
-        if (!hadExistingData) {
-          setMasterData([])
-          setMasterError('No data found. Click "Rebuild Matrix" to build it.')
-        } else {
-          // If we had existing data but new load returned empty, keep existing data and show warning
-          setMasterError('Warning: Load returned no data. Previous data preserved.')
-        }
-      }
-    } catch (error) {
-      if (error.name === 'TypeError' && error.message.includes('fetch')) {
-        setMasterError(`Cannot connect to backend. Make sure the dashboard backend is running on http://localhost:${API_PORT}`)
-      } else {
-        setMasterError('Failed to load master matrix: ' + error.message)
-      }
-      // Only clear data if we had no existing data (initial load failure)
-      if (!hadExistingData) {
-        setMasterData([])
-      }
-    } finally {
-      setMasterLoading(false)
-    }
-  }, [streamFilters, workerInitData, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, availableColumns, setAvailableColumns, setSelectedColumns])
-  
-  // Update master matrix function (rolling window update)
-  const updateMasterMatrix = useCallback(async () => {
-    setMasterLoading(true)
-    setMasterError(null)
-    
-    const hadExistingData = masterData.length > 0
-    
-    try {
-      // Check if backend is reachable
-      try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 3000)
-        const healthCheck = await fetch(`${API_BASE.replace('/api', '')}/`, { 
-          method: 'GET', 
-          signal: controller.signal 
-        })
-        clearTimeout(timeoutId)
-      } catch (e) {
-        if (e.name === 'AbortError') {
-          setMasterError(`Backend connection timeout. Make sure the dashboard backend is running on http://localhost:${API_PORT}`)
-        } else {
-          setMasterError(`Backend not running. Please start the dashboard backend on port ${API_PORT}. Error: ` + e.message)
-        }
-        if (!hadExistingData) {
-          setMasterData([])
-        }
-        setMasterLoading(false)
-        return
-      }
-      
-      // Build stream filters for API
-      const streamFiltersApi = {}
-      Object.keys(streamFilters).forEach(streamId => {
-        const filters = streamFilters[streamId]
-        if (filters) {
-          streamFiltersApi[streamId] = {
-            exclude_days_of_week: filters.exclude_days_of_week || [],
-            exclude_days_of_month: filters.exclude_days_of_month || [],
-            exclude_times: filters.exclude_times || []
-          }
+      DEFAULT_COLUMNS.forEach(col => {
+        if (!displayableCols.includes(col)) {
+          displayableCols.push(col)
         }
       })
       
-      const updateBody = {
-        mode: "window",
-        stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
-      }
+      setAvailableColumns(displayableCols)
       
-      try {
-        const updateResponse = await fetch(`${API_BASE}/matrix/update`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(updateBody)
+      const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
+      setSelectedColumns(prev => {
+        const updated = { ...prev }
+        let changed = false
+        
+        const getDefaultColumns = () => {
+          return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
+        }
+        
+        Object.keys(updated).forEach(tabId => {
+          if (Array.isArray(updated[tabId]) && updated[tabId].includes('SL')) {
+            updated[tabId] = updated[tabId].filter(col => col !== 'SL')
+            changed = true
+          }
         })
         
-        if (!updateResponse.ok) {
-          const errorData = await updateResponse.json()
-          setMasterError(errorData.detail || 'Failed to update master matrix')
-          setMasterLoading(false)
-          return
+        const defaultCols = getDefaultColumns()
+        if (JSON.stringify(updated['master']) !== JSON.stringify(defaultCols)) {
+          updated['master'] = defaultCols
+          changed = true
         }
         
-        await updateResponse.json()
-      } catch (error) {
-        setMasterError(`Failed to update master matrix: ${error.message}`)
-        setMasterLoading(false)
-        return
-      }
-      
-      // Load the updated matrix data
-      const dataResponse = await fetch(`${API_BASE}/matrix/data?limit=0&essential_columns_only=true&skip_cleaning=true`)
-      
-      if (!dataResponse.ok) {
-        const errorData = await dataResponse.json()
-        setMasterError(errorData.detail || 'Failed to load matrix data')
-        if (!hadExistingData) {
-          setMasterData([])
+        STREAMS.forEach(stream => {
+          if (!updated[stream] || updated[stream].length === 0) {
+            updated[stream] = getDefaultColumns()
+            changed = true
+          }
+        })
+        
+        if (changed) {
+          localStorage.setItem('matrix_selected_columns', JSON.stringify(updated))
         }
-        setMasterLoading(false)
-        return
-      }
-      
-      const data = await dataResponse.json()
-      const trades = data.data || []
-      
-      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
-        setAvailableYearsFromAPI(data.years)
-      }
-      
-      // Clear filter cache when data is updated (new data means cache is stale)
-      filterCacheRef.current.clear()
-      
-      // Update master data and reinitialize worker with new data
-      setMasterData(trades)
-      // Use file modification time from API if available (when matrix was actually built),
-      // otherwise fall back to current time (when data was received)
-      const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
-      setLastMergeTime(mergeTime)
-      
-      // Reinitialize worker with new data (wait a bit to ensure state updates)
-      // Worker will also be reinitialized automatically via useEffect when masterData changes
-      if (trades.length > 0 && workerInitData && workerReady) {
-        // Use setTimeout to ensure masterData state has updated
-        setTimeout(() => {
-          workerInitData(trades)
-        }, 100)
-      }
-      
-      setMasterError(null)
-      setMasterLoading(false)
-    } catch (error) {
-      setMasterError(`Failed to update master matrix: ${error.message}`)
-      if (!hadExistingData) {
-        setMasterData([])
-      }
-      setMasterLoading(false)
+        return updated
+      })
     }
-  }, [masterData, streamFilters, setMasterData, setMasterLoading, setMasterError, setAvailableYearsFromAPI, workerInitData, workerReady])
-  
-  // Auto-update interval (20 minutes = 1200000 ms)
-  // Use ref to track loading state so interval callback always has latest value
-  const masterLoadingRef = useRef(masterLoading)
-  useEffect(() => {
-    masterLoadingRef.current = masterLoading
-  }, [masterLoading])
-  
-  useEffect(() => {
-    if (!autoUpdateEnabled) {
-      return
-    }
-    
-    const interval = setInterval(() => {
-      // Only auto-update if not currently loading (check ref for latest value)
-      if (!masterLoadingRef.current) {
-        updateMasterMatrix()
-      }
-    }, 20 * 60 * 1000) // 20 minutes
-    
-    return () => clearInterval(interval)
-  }, [autoUpdateEnabled, updateMasterMatrix])
+  }, [masterData, availableColumns.length, setAvailableColumns, setSelectedColumns])
   
   // Retry loading if backend wasn't ready
   const retryLoad = useCallback(() => {
@@ -711,57 +441,116 @@ function AppContent() {
     }
   }, [backendReady, loadMasterMatrix]) // Wait for backend to be ready before loading
   
-  // Reinitialize worker data when worker becomes ready and masterData exists
-  // This is important for hot reloads when worker is recreated and when data is updated
+  // Refetch master stats when includeFilteredExecuted changes
+  // This ensures backendStatsFull always reflects the current toggle state with full-history data
   useEffect(() => {
-    if (workerReady && masterData.length > 0 && workerInitData) {
-      // Reinitialize worker with existing data when worker becomes ready or data changes
-      // Use a small delay to ensure worker is fully ready
-      const timeoutId = setTimeout(() => {
-        workerInitData(masterData)
-      }, 50)
-      return () => clearTimeout(timeoutId)
+    const prevValue = prevIncludeFilteredExecutedRef.current
+    
+    // Only refetch if the value actually changed (not on initial mount) and we have data loaded
+    if (prevValue !== undefined && prevValue !== includeFilteredExecuted && masterData.length > 0 && refetchMasterStats) {
+      console.log(`[Master Stats] Toggle changed: ${prevValue} -> ${includeFilteredExecuted}, refetching stats...`)
+      // Clear individual stream stats (they need to be refetched with new setting)
+      setBackendStreamStats({})
+      setBackendStreamStatsLoading({})
+      
+      // Refetch master stats with new includeFilteredExecuted setting
+      // Pass the new value directly to avoid closure issues
+      refetchMasterStats(includeFilteredExecuted)
     }
-  }, [workerReady, workerInitData, masterData.length]) // Include masterData.length to reinitialize when data updates
+    
+    // Update ref after processing
+    prevIncludeFilteredExecutedRef.current = includeFilteredExecuted
+  }, [includeFilteredExecuted, masterData.length, refetchMasterStats])
   
-  // Apply filters in worker when filters or active tab changes
+  // Refetch master stats when stream filters change
   useEffect(() => {
-    try {
-      // Breakdown tabs (time, day, dom, date, month, year) don't use data table filtering
-      const breakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year', 'timetable']
-      if (breakdownTabs.includes(deferredActiveTab)) {
-        return // Don't run filtering for breakdown tabs
+    const masterFilters = streamFilters['master'] || {}
+    const masterIncludeStreams = masterFilters.include_streams || []
+    
+    // Refetch stats when stream filter changes (if we have data loaded)
+    if (masterData.length > 0 && refetchMasterStats) {
+      console.log(`[Master Stats] Stream filter changed, refetching stats... (include_streams: ${masterIncludeStreams.length > 0 ? masterIncludeStreams.join(',') : 'all'})`)
+      refetchMasterStats(includeFilteredExecuted)
+    }
+  }, [streamFilters['master']?.include_streams, masterData.length, refetchMasterStats, includeFilteredExecuted])
+  
+  // Fetch backend stats for individual streams (full dataset)
+  // CRITICAL: Always fetch backend stats for individual streams to ensure stats cover ALL data
+  useEffect(() => {
+    // Only fetch for individual stream tabs (not 'master' or 'timetable')
+    if (deferredActiveTab && deferredActiveTab !== 'master' && deferredActiveTab !== 'timetable') {
+      const streamId = deferredActiveTab
+      
+      // Check if includeFilteredExecuted just changed - if so, force refetch
+      const includeFilteredJustChanged = prevIncludeFilteredExecutedRef.current !== includeFilteredExecuted
+      
+      // Check if we already have stats for this stream with the current settings
+      // But don't skip if includeFilteredExecuted just changed (cache was cleared)
+      if (backendStreamStats[streamId] && !backendStreamStatsLoading[streamId] && !includeFilteredJustChanged) {
+        console.log(`[Stream Stats] Already have stats for ${streamId}, skipping fetch`)
+        return // Already fetched
       }
       
-      if (workerReady && masterData.length > 0 && workerFilter) {
-        const streamId = deferredActiveTab === 'timetable' ? 'master' : deferredActiveTab
-        const cacheKey = getCacheKey(deferredActiveTab, streamFilters)
-        
-        // Track which tab this filter is for
-        workerFilteredRowsTabRef.current = deferredActiveTab
-        
-        // Check cache first for filtered rows
-        const cachedResult = filterCacheRef.current.get(cacheKey)
-        
-        if (cachedResult && cachedResult.rows) {
-          // Use cached results - populate loadedRows immediately to prevent showing stale workerFilteredRows
-          setLoadedRows(cachedResult.rows)
-        } else {
-          // Request initial rows for table rendering (first 100 rows, sorted)
-          const returnRows = deferredActiveTab !== 'timetable' // Return rows for data table tabs
-          workerFilter(streamFilters, streamId, returnRows, true) // sortIndices = true
-        }
-        
-        // Always recalculate stats (even if filter cache exists)
-        // Stats depend on multiplier, so they need to be updated whenever multiplier changes
-        if (deferredActiveTab !== 'timetable' && workerCalculateStats) {
-          workerCalculateStats(streamFilters, streamId, masterContractMultiplier, includeFilteredExecuted)
+      // Don't refetch if already loading
+      if (backendStreamStatsLoading[streamId]) {
+        console.log(`[Stream Stats] Already fetching stats for ${streamId}, waiting...`)
+        return
+      }
+      
+      console.log(`[Stream Stats] Fetching backend stats for stream ${streamId} (includeFilteredExecuted=${includeFilteredExecuted})`)
+      
+      // Set loading state
+      setBackendStreamStatsLoading(prev => ({ ...prev, [streamId]: true }))
+      
+      // Fetch stats from backend
+      const fetchStreamStats = async () => {
+        try {
+          const response = await fetch(`${API_BASE}/matrix/stream-stats`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              stream_id: streamId,
+              include_filtered_executed: includeFilteredExecuted,
+              contract_multiplier: 1.0 // Individual streams use 1.0 multiplier
+            })
+          })
+          
+          if (response.ok) {
+            const data = await response.json()
+            console.log(`[Stream Stats] Received stats for ${streamId}:`, data.stats ? 'present' : 'missing')
+            if (data.stats) {
+              setBackendStreamStats(prev => ({
+                ...prev,
+                [streamId]: data.stats
+              }))
+              console.log(`[Stream Stats] Updated backendStreamStats for ${streamId}`, {
+                totalTrades: data.stats?.sample_counts?.executed_trades_total,
+                totalProfit: data.stats?.performance_trade_metrics?.total_profit
+              })
+            } else {
+              console.warn(`[Stream Stats] No stats in response for ${streamId}`)
+            }
+          } else {
+            const errorText = await response.text()
+            console.error(`[Stream Stats] Failed to fetch stats for stream ${streamId}:`, errorText)
+            // Don't set loading to false on error - let user see the error state
+          }
+        } catch (error) {
+          console.error(`[Stream Stats] Error fetching stats for stream ${streamId}:`, error)
+        } finally {
+          setBackendStreamStatsLoading(prev => ({ ...prev, [streamId]: false }))
         }
       }
-    } catch (error) {
-      console.error('Error in filter useEffect:', error)
+      
+      fetchStreamStats()
     }
-  }, [streamFilters, deferredActiveTab, masterContractMultiplier, workerReady, masterData.length, workerFilter, workerCalculateStats, includeFilteredExecuted, getCacheKey])
+    
+    // NOTE: Master stream stats come from backendStatsFull (from initial data load) or worker stats
+    // The /matrix/stream-stats endpoint doesn't support stream_id='master' - it only works for individual streams
+    // When includeFilteredExecuted changes, worker stats are recalculated (handled in useMatrixController)
+    // backendStatsFull is cleared when includeFilteredExecuted changes, forcing use of worker stats
+  }, [deferredActiveTab, includeFilteredExecuted, backendStreamStats, backendStreamStatsLoading]) // Include dependencies to track state
+  
   
   // Save filters to localStorage whenever they change
   useEffect(() => {
@@ -773,17 +562,56 @@ function AppContent() {
     localStorage.setItem('matrix_show_stats', JSON.stringify(showStats))
   }, [showStats])
   
+  // Save filters visibility to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem('matrix_show_filters', JSON.stringify(showFilters))
+  }, [showFilters])
+  
   // Save includeFilteredExecuted to localStorage whenever it changes
   useEffect(() => {
     localStorage.setItem('matrix_include_filtered_executed', JSON.stringify(includeFilteredExecuted))
   }, [includeFilteredExecuted])
+  
+  // Track the multiplier used for backend stats to detect changes
+  // backendStatsMultiplier is now managed by useMatrixController
+  const prevMultiplierRef = useRef(masterContractMultiplier)
   
   // Save contract multiplier to localStorage whenever it changes
   useEffect(() => {
     localStorage.setItem('matrix_master_contract_multiplier', masterContractMultiplier.toString())
     // Sync input value when multiplier changes (e.g., from localStorage on mount)
     setMultiplierInput(masterContractMultiplier)
-  }, [masterContractMultiplier])
+    
+    // Check if multiplier actually changed (not just initial mount)
+    const multiplierChanged = prevMultiplierRef.current !== masterContractMultiplier
+    prevMultiplierRef.current = masterContractMultiplier
+    
+    // If multiplier changed and we have backend stats, reload stats to get updated values
+    if (multiplierChanged && backendStatsFull !== null && backendStatsMultiplier !== null) {
+      // Reload stats with new multiplier
+          const reloadStats = async () => {
+            try {
+              setMasterLoading(true)
+              const data = await matrixApi.getMatrixData({
+                limit: 10000,
+                order: 'newest',
+                essentialColumnsOnly: true,
+                skipCleaning: true,
+                contractMultiplier: masterContractMultiplier
+              })
+              if (data.stats_full) {
+                setBackendStatsFull(data.stats_full)
+                setBackendStatsMultiplier(masterContractMultiplier)
+              }
+            } catch (error) {
+              console.error('Failed to reload stats with new multiplier:', error.message)
+            } finally {
+              setMasterLoading(false)
+            }
+          }
+      reloadStats()
+    }
+  }, [masterContractMultiplier, backendStatsMultiplier, backendStatsFull])
   
   // Use imported utility functions - wrap to pass masterContractMultiplier
   const calculateTimeProfitLocal = useCallback((data = masterData) => 
@@ -808,6 +636,13 @@ function AppContent() {
   
   const toggleStats = (streamId) => {
     setShowStats(prev => ({
+      ...prev,
+      [streamId]: !prev[streamId]
+    }))
+  }
+  
+  const toggleFilters = (streamId) => {
+    setShowFilters(prev => ({
       ...prev,
       [streamId]: !prev[streamId]
     }))
@@ -919,12 +754,22 @@ function AppContent() {
     
     // Get master filters if they exist
     const masterFilterSets = getFilterSets(streamFilters['master'])
+    const masterFilters = streamFilters['master'] || {}
+    const masterIncludeStreams = masterFilters.include_streams || []
+    const hasMasterStreamFilter = masterIncludeStreams.length > 0
     
     // Single pass through data with all filters applied
     for (const row of data) {
       // Filter by stream first (fastest check)
       if (streamId && streamId !== 'master' && row.Stream !== streamId) {
         continue
+      }
+      
+      // Apply master stream inclusion filter (if master tab and filter is set)
+      if (streamId === 'master' && hasMasterStreamFilter) {
+        if (!masterIncludeStreams.includes(row.Stream)) {
+          continue
+        }
       }
       
       // Get filters for this row's stream
@@ -1248,13 +1093,197 @@ function AppContent() {
   }, [])
   
   const renderStats = (streamId, precomputedStats = null) => {
-    // Always use worker stats when available, only fallback if worker not ready
+    // Prefer backend stats (full dataset) for master stream, then worker stats, then fallback
+    // CRITICAL: Backend stats always take precedence over precomputed stats (which come from worker)
     let stats = null
     try {
-      if (precomputedStats) {
+      // Show loading state for master stats when refetching
+      if (streamId === 'master' && masterStatsLoading) {
+        return (
+          <div className="bg-gray-900 rounded-lg p-4 mb-4">
+            <p className="text-gray-400 text-sm">Refreshing full-history statistics...</p>
+          </div>
+        )
+      }
+      
+      // For master stream: ALWAYS prefer backendStatsFull (full-history stats) when available
+      // backendStatsFull is now computed with the correct includeFilteredExecuted setting
+      if (streamId === 'master' && backendStatsFull && formatWorkerStats) {
+        // Use backendStatsFull - it contains full-history stats with correct includeFilteredExecuted setting
+        console.log(`[Master Stats] Using backendStatsFull (full-history) with includeFilteredExecuted=${includeFilteredExecuted}`)
+        stats = formatWorkerStats(backendStatsFull, streamId)
+        
+        // Dev-only sanity check: Compare backend vs worker stats when both available
+        if (workerReady && workerStats && formatWorkerStats && import.meta.env.DEV) {
+          try {
+            const workerFormatted = formatWorkerStats(workerStats, streamId)
+            const backendProfit = parseFloat(stats?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const workerProfit = parseFloat(workerFormatted?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const backendTrades = stats?.totalTrades || 0
+            const workerTrades = workerFormatted?.totalTrades || 0
+            
+            // Check for significant differences (>5% or >100 trades)
+            const profitDiff = Math.abs(backendProfit - workerProfit)
+            const profitDiffPercent = backendProfit !== 0 ? (profitDiff / Math.abs(backendProfit)) * 100 : 0
+            const tradesDiff = Math.abs(backendTrades - workerTrades)
+            
+            if (profitDiffPercent > 5 || tradesDiff > 100) {
+              console.warn(`[Stats Sanity Check] ${streamId}: Backend (full-history) vs Worker (10k rows) stats differ`, {
+                backend: { profit: backendProfit, trades: backendTrades },
+                worker: { profit: workerProfit, trades: workerTrades },
+                diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
+                note: 'Using backendStatsFull (full-history) - worker stats are from partial loaded data (10k rows)'
+              })
+            } else {
+              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+                profitDiff: profitDiff.toFixed(2),
+                tradesDiff
+              })
+            }
+          } catch (checkError) {
+            // Silently ignore sanity check errors in dev
+            console.debug('[Stats Sanity Check] Error:', checkError)
+          }
+        }
+      } else if (streamId !== 'master' && backendStreamStats[streamId] && formatWorkerStats) {
+        // For individual streams, ALWAYS prefer backend stats (full dataset) over precomputed worker stats
+        const backendStats = backendStreamStats[streamId]
+        console.log(`[Stream Stats] Using backend stats for ${streamId} (full dataset) - overriding precomputed worker stats`)
+        stats = formatWorkerStats(backendStats, streamId)
+        
+        // Dev-only sanity check: Compare backend vs worker stats when both available
+        if (precomputedStats && import.meta.env.DEV) {
+          try {
+            const backendProfit = parseFloat(stats?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const workerProfit = parseFloat(precomputedStats?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const backendTrades = stats?.totalTrades || 0
+            const workerTrades = precomputedStats?.totalTrades || 0
+            
+            const profitDiff = Math.abs(backendProfit - workerProfit)
+            const profitDiffPercent = backendProfit !== 0 ? (profitDiff / Math.abs(backendProfit)) * 100 : 0
+            const tradesDiff = Math.abs(backendTrades - workerTrades)
+            
+            if (profitDiffPercent > 5 || tradesDiff > 100) {
+              console.warn(`[Stats Sanity Check] ${streamId}: Backend vs Worker stats differ`, {
+                backend: { profit: backendProfit, trades: backendTrades },
+                worker: { profit: workerProfit, trades: workerTrades },
+                diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
+                note: 'Using backend stats (full dataset) - worker stats are from partial loaded data'
+              })
+            }
+          } catch (checkError) {
+            console.debug('[Stats Sanity Check] Error:', checkError)
+          }
+        }
+      } else if (precomputedStats && streamId === 'master') {
+        // Fallback for master: Use worker stats only if backendStatsFull not available yet
+        // This should rarely happen since backendStatsFull is fetched on initial load
+        console.warn(`[Master Stats] Falling back to worker stats - backendStatsFull not available yet`)
         stats = precomputedStats
+      } else if (precomputedStats && streamId !== 'master') {
+        // Use precomputed stats only for non-master streams if no backend stats available
+        stats = precomputedStats
+        
+        // Dev-only sanity check: Compare backend vs worker stats when both available
+        if (workerReady && workerStats && formatWorkerStats && import.meta.env.DEV) {
+          try {
+            const workerFormatted = formatWorkerStats(workerStats, streamId)
+            const backendProfit = parseFloat(stats?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const workerProfit = parseFloat(workerFormatted?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const backendTrades = stats?.totalTrades || 0
+            const workerTrades = workerFormatted?.totalTrades || 0
+            
+            // Check for significant differences (>5% or >100 trades)
+            const profitDiff = Math.abs(backendProfit - workerProfit)
+            const profitDiffPercent = backendProfit !== 0 ? (profitDiff / Math.abs(backendProfit)) * 100 : 0
+            const tradesDiff = Math.abs(backendTrades - workerTrades)
+            
+            if (profitDiffPercent > 5 || tradesDiff > 100) {
+              console.warn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
+                backend: { profit: backendProfit, trades: backendTrades },
+                worker: { profit: workerProfit, trades: workerTrades },
+                diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
+                note: 'Worker stats may be from partial dataset (filtered view)'
+              })
+            } else {
+              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+                profitDiff: profitDiff.toFixed(2),
+                tradesDiff
+              })
+            }
+          } catch (checkError) {
+            // Silently ignore sanity check errors in dev
+            console.debug('[Stats Sanity Check] Error:', checkError)
+          }
+        }
+      } else if (backendStreamStats[streamId] && formatWorkerStats) {
+        // Use backend stats (full dataset) for individual streams
+        // CRITICAL: Backend stats cover ALL data in the parquet file, not just loaded rows
+        const backendStats = backendStreamStats[streamId]
+        console.log(`[Stream Stats] Using backend stats for ${streamId} (full dataset)`)
+        console.log(`[Stream Stats] Backend stats structure:`, {
+          has_sample_counts: !!backendStats.sample_counts,
+          has_performance_trade_metrics: !!backendStats.performance_trade_metrics,
+          total_profit: backendStats.performance_trade_metrics?.total_profit,
+          executed_trades: backendStats.sample_counts?.executed_trades_total
+        })
+        stats = formatWorkerStats(backendStats, streamId)
+        console.log(`[Stream Stats] Formatted stats:`, {
+          totalTrades: stats?.totalTrades,
+          totalProfitDollars: stats?.totalProfitDollars,
+          winRate: stats?.winRate
+        })
+        
+        // Dev-only sanity check: Compare backend vs worker stats when both available
+        if (workerReady && workerStats && formatWorkerStats && import.meta.env.DEV) {
+          try {
+            const workerFormatted = formatWorkerStats(workerStats, streamId)
+            const backendProfit = parseFloat(stats?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const workerProfit = parseFloat(workerFormatted?.totalProfitDollars?.replace(/[^0-9.-]/g, '') || 0)
+            const backendTrades = stats?.totalTrades || 0
+            const workerTrades = workerFormatted?.totalTrades || 0
+            
+            // Check for significant differences (>5% or >100 trades)
+            const profitDiff = Math.abs(backendProfit - workerProfit)
+            const profitDiffPercent = backendProfit !== 0 ? (profitDiff / Math.abs(backendProfit)) * 100 : 0
+            const tradesDiff = Math.abs(backendTrades - workerTrades)
+            
+            if (profitDiffPercent > 5 || tradesDiff > 100) {
+              console.warn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
+                backend: { profit: backendProfit, trades: backendTrades },
+                worker: { profit: workerProfit, trades: workerTrades },
+                diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
+                note: 'Worker stats may be from partial dataset (filtered view)'
+              })
+            } else {
+              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+                profitDiff: profitDiff.toFixed(2),
+                tradesDiff
+              })
+            }
+          } catch (checkError) {
+            // Silently ignore sanity check errors in dev
+            console.debug('[Stats Sanity Check] Error:', checkError)
+          }
+        }
+      } else if (backendStreamStatsLoading[streamId]) {
+        // Backend stats are being fetched - show loading instead of wrong worker stats
+        return (
+          <div className="bg-gray-900 rounded-lg p-4 mb-4">
+            <p className="text-gray-400 text-sm">Loading full-dataset statistics...</p>
+          </div>
+        )
       } else if (workerReady && workerStats && formatWorkerStats) {
-        // Use worker stats (much faster - computed off main thread)
+        // Use worker stats (computed from loaded rows - filtered view) ONLY if backend stats aren't available
+        // For individual streams, backend stats should always be used - worker stats are incomplete
+        if (streamId !== 'master') {
+          console.warn(`[Stream Stats] WARNING: Using worker stats for ${streamId} - backend stats not available. Stats may be incomplete (only showing ${workerStats?.sample_counts?.executed_trades_total || 'unknown'} trades from loaded data).`)
+          console.warn(`[Stream Stats] Backend stats state:`, {
+            hasBackendStats: !!backendStreamStats[streamId],
+            isLoading: !!backendStreamStatsLoading[streamId],
+            streamId
+          })
+        }
         stats = formatWorkerStats(workerStats, streamId)
       } else if (!workerReady) {
         // Only fallback to main thread if worker not ready yet
@@ -1358,13 +1387,19 @@ function AppContent() {
               <span className="text-sm text-gray-400 mr-3">Include filtered executed trades</span>
               <div 
                 className="relative cursor-pointer"
-                onClick={() => setIncludeFilteredExecuted(!includeFilteredExecuted)}
+                onClick={() => {
+                  const newValue = !includeFilteredExecuted
+                  console.log(`[Toggle] Button clicked: ${includeFilteredExecuted} -> ${newValue}`)
+                  setIncludeFilteredExecuted(newValue)
+                }}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault()
-                    setIncludeFilteredExecuted(!includeFilteredExecuted)
+                    const newValue = !includeFilteredExecuted
+                    console.log(`[Toggle] Keyboard activated: ${includeFilteredExecuted} -> ${newValue}`)
+                    setIncludeFilteredExecuted(newValue)
                   }
                 }}
               >
@@ -1372,7 +1407,10 @@ function AppContent() {
                   type="checkbox"
                   className="sr-only"
                   checked={includeFilteredExecuted}
-                  onChange={(e) => setIncludeFilteredExecuted(e.target.checked)}
+                  onChange={(e) => {
+                    console.log(`[Toggle] Checkbox changed: ${includeFilteredExecuted} -> ${e.target.checked}`)
+                    setIncludeFilteredExecuted(e.target.checked)
+                  }}
                   readOnly
                 />
                 <div className={`block w-14 h-8 rounded-full ${includeFilteredExecuted ? 'bg-green-500' : 'bg-gray-600'}`}></div>
@@ -1643,7 +1681,8 @@ function AppContent() {
     const hasFilters = (filters.exclude_days_of_week && filters.exclude_days_of_week.length > 0) || 
                       (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) || 
                       (filters.exclude_times && filters.exclude_times.length > 0) ||
-                      (filters.include_years && filters.include_years.length > 0)
+                      (filters.include_years && filters.include_years.length > 0) ||
+                      (streamId === 'master' && filters.include_streams && filters.include_streams.length > 0)
     
     return (
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -1654,7 +1693,95 @@ function AppContent() {
           )}
         </div>
         
-        <div className={`grid grid-cols-1 md:grid-cols-4 gap-6`}>
+        <div className={`grid grid-cols-1 md:grid-cols-${streamId === 'master' ? '5' : '4'} gap-6`}>
+          {/* Stream Filters - Only for Master */}
+          {streamId === 'master' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-xs font-medium text-gray-400">Include Streams</label>
+                {filters.include_streams && filters.include_streams.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setStreamFilters(prev => {
+                        const updated = { ...prev }
+                        if (updated[streamId]) {
+                          updated[streamId] = {
+                            ...updated[streamId],
+                            include_streams: []
+                          }
+                        } else {
+                          updated[streamId] = {
+                            exclude_days_of_week: [],
+                            exclude_days_of_month: [],
+                            exclude_times: [],
+                            include_years: [],
+                            include_streams: []
+                          }
+                        }
+                        return updated
+                      })
+                    }}
+                    className="text-xs text-blue-400 hover:text-blue-300 underline"
+                    title="Show all streams"
+                  >
+                    Show All
+                  </button>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-1 max-h-32 overflow-y-auto">
+                {STREAMS.map(stream => {
+                  const isSelected = filters.include_streams && filters.include_streams.includes(stream)
+                  return (
+                    <button
+                      key={stream}
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        const current = filters.include_streams || []
+                        const newStreams = isSelected
+                          ? current.filter(s => s !== stream)
+                          : [...current, stream]
+                        setStreamFilters(prev => {
+                          const updated = { ...prev }
+                          if (!updated[streamId]) {
+                            updated[streamId] = getDefaultFilters()
+                          }
+                          updated[streamId] = {
+                            ...updated[streamId],
+                            include_streams: newStreams
+                          }
+                          return updated
+                        })
+                      }}
+                      className={`px-2 py-1 text-xs rounded cursor-pointer ${
+                        isSelected
+                          ? 'bg-green-600 text-white'
+                          : 'bg-gray-700 hover:bg-gray-600'
+                      }`}
+                    >
+                      {stream}
+                    </button>
+                  )
+                })}
+              </div>
+              {filters.include_streams && filters.include_streams.length > 0 && (
+                <div className="mt-2 text-xs text-gray-400">
+                  Selected: {filters.include_streams.sort().join(', ')}
+                  {filters.include_streams.length === 0 && ' (All streams)'}
+                </div>
+              )}
+              {(!filters.include_streams || filters.include_streams.length === 0) && (
+                <div className="mt-2 text-xs text-gray-500">
+                  All streams included
+                </div>
+              )}
+            </div>
+          )}
+          
           {/* Years Filter */}
           <div className="space-y-2">
             <div className="flex items-center justify-between mb-2">
@@ -2055,29 +2182,6 @@ function AppContent() {
   // State to limit Day tab to 200 days by default for performance
   const [showAllDays, setShowAllDays] = useState(false)
   
-  // Cache filtered results when they arrive from worker
-  useEffect(() => {
-    if (workerReady && workerFilteredRows && workerFilteredRows.length > 0 && deferredActiveTab) {
-      const breakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year', 'timetable']
-      if (!breakdownTabs.includes(deferredActiveTab)) {
-        // Only cache if workerFilteredRows matches the current tab
-        // This ensures we don't cache stale data from a previous tab
-        if (workerFilteredRowsTabRef.current === deferredActiveTab) {
-          const cacheKey = getCacheKey(deferredActiveTab, streamFilters)
-          filterCacheRef.current.set(cacheKey, {
-            rows: workerFilteredRows,
-            timestamp: Date.now()
-          })
-        }
-      }
-    }
-  }, [workerFilteredRows, deferredActiveTab, streamFilters, workerReady, getCacheKey])
-  
-  // Invalidate cache when filters change
-  useEffect(() => {
-    filterCacheRef.current.clear()
-  }, [streamFilters])
-  
   // Update loaded rows when worker filtered rows change
   // Reset loadedRows when stream/activeTab changes to prevent stale data
   const prevActiveTabRef = useRef(deferredActiveTab)
@@ -2095,6 +2199,16 @@ function AppContent() {
     }
   }, [activeTab])
   
+  // Clear loadedRows when showFilteredDays changes to force reload with new filter
+  const prevShowFilteredDaysRef = useRef(showFilteredDays)
+  useEffect(() => {
+    if (prevShowFilteredDaysRef.current !== showFilteredDays) {
+      setLoadedRows([])
+      workerFilteredRowsTabRef.current = null
+      prevShowFilteredDaysRef.current = showFilteredDays
+    }
+  }, [showFilteredDays])
+  
   useEffect(() => {
     // Reset loadedRows when deferredActiveTab changes (stream switch)
     if (prevActiveTabRef.current !== deferredActiveTab) {
@@ -2106,17 +2220,29 @@ function AppContent() {
     
     // Only use workerFilteredRows if it belongs to the current tab
     if (workerReady && workerFilteredRows && workerFilteredRows.length > 0) {
-      // Check if workerFilteredRows matches the current tab
-      if (workerFilteredRowsTabRef.current === deferredActiveTab) {
+      // If workerFilteredRowsTabRef is null or matches current tab, accept the rows
+      // This handles both initial load and re-filtering (e.g., when showFilteredDays changes)
+      if (workerFilteredRowsTabRef.current === null || workerFilteredRowsTabRef.current === deferredActiveTab) {
         // Set loadedRows when we get new filtered rows (worker re-filtered)
         setLoadedRows(workerFilteredRows)
+        // Track which tab these rows belong to
+        workerFilteredRowsTabRef.current = deferredActiveTab
       }
       // If workerFilteredRows doesn't match current tab, ignore it (it's stale)
     }
   }, [workerReady, workerFilteredRows, deferredActiveTab])
   
   // Auto-load ALL rows when filtered indices change (no limit)
+  // Track previous showFilteredDays to detect changes and reset loading
+  const prevShowFilteredDaysForLoadingRef = useRef(showFilteredDays)
   useEffect(() => {
+    // If showFilteredDays changed, reset loadedRows to force reload with new filter
+    if (prevShowFilteredDaysForLoadingRef.current !== showFilteredDays) {
+      setLoadedRows([])
+      prevShowFilteredDaysForLoadingRef.current = showFilteredDays
+      return // Wait for new filtered indices before loading
+    }
+    
     if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0 && workerGetRows) {
       const currentLoaded = loadedRows.length
       if (currentLoaded < workerFilteredIndices.length && !loadingMoreRows) {
@@ -2167,7 +2293,7 @@ function AppContent() {
         }
       }
     }
-  }, [workerReady, workerFilteredIndices && workerFilteredIndices.length, workerGetRows, loadedRows.length, loadingMoreRows])
+  }, [workerReady, workerFilteredIndices && workerFilteredIndices.length, workerGetRows, loadedRows.length, loadingMoreRows, showFilteredDays])
   
   // Load more rows function - use ref to access current loadedRows without dependency
   const loadedRowsRef = useRef([])
@@ -2548,38 +2674,99 @@ function AppContent() {
   // Track previous breakdown tab to clear old breakdown types when switching
   const prevBreakdownTabRef = useRef(null)
   
-  // Calculate profit breakdowns in worker when needed (lazy - only when tab is active)
+  // Calculate profit breakdowns - use backend for full-dataset breakdowns (DOW/DOM/TIME), worker for filtered view (date/month/year)
   // Use activeTab (not deferredActiveTab) for breakdowns since they're less performance-critical
   // and we want them to trigger immediately when user clicks a breakdown tab
   useEffect(() => {
-    if (workerReady && masterData.length > 0 && calculateProfitBreakdown) {
-      const activeBreakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year']
-      
-      // Only calculate if we're on a breakdown tab
-      if (activeBreakdownTabs.includes(activeTab)) {
-        prevBreakdownTabRef.current = activeTab
-        const streamId = 'master' // Breakdowns always use master stream
-        
-        // For date tab, calculate "after filters" first for better perceived performance
-        // Then defer "before filters" slightly to prioritize showing filtered results
-        if (activeTab === 'date') {
-          // Calculate "after filters" first (most commonly viewed)
-          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
-          // Defer "before filters" by a small delay to improve perceived responsiveness
-          setTimeout(() => {
-            calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
-          }, 100)
-        } else {
-          // For other tabs, calculate both immediately
-          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
-          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+    const activeBreakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year']
+    
+    // Only calculate if we're on a breakdown tab
+    if (!activeBreakdownTabs.includes(activeTab)) {
+      prevBreakdownTabRef.current = null
+      return
+    }
+    
+    prevBreakdownTabRef.current = activeTab
+    const streamId = 'master' // Breakdowns always use master stream
+    
+    // For DOW, DOM, and TIME tabs, fetch from backend (full dataset)
+    // For other tabs (date, month, year), use worker (filtered view is fine)
+    if (activeTab === 'day' || activeTab === 'dom' || activeTab === 'time') {
+      // Fetch full-dataset breakdowns from backend
+      const fetchBreakdownFromBackend = async (useFiltered) => {
+        try {
+          let breakdownType
+          if (activeTab === 'day') {
+            breakdownType = 'dow'
+          } else if (activeTab === 'dom') {
+            breakdownType = 'dom'
+          } else if (activeTab === 'time') {
+            breakdownType = 'time'
+          }
+          
+          // Get master stream inclusion filter
+          const masterFilters = streamFilters['master'] || {}
+          const masterIncludeStreams = masterFilters.include_streams || []
+          const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
+          
+          console.log(`[Breakdown] Fetching ${breakdownType} breakdown from backend (useFiltered=${useFiltered}, streamInclude=${streamIncludeParam})`)
+          const data = await matrixApi.getProfitBreakdown({
+            breakdownType,
+            streamFilters,
+            useFiltered,
+            contractMultiplier: masterContractMultiplier,
+            streamInclude: streamIncludeParam
+          })
+          
+          if (data && data.breakdown) {
+            const suffix = useFiltered ? 'after' : 'before'
+            // Verify breakdown format - should be {time: {stream: profit}} for time tab
+            if (activeTab === 'time') {
+              const sampleKey = Object.keys(data.breakdown)[0]
+              if (sampleKey && typeof data.breakdown[sampleKey] === 'object') {
+                const sampleValue = data.breakdown[sampleKey]
+                const hasStreamKeys = Object.keys(sampleValue).some(key => !['profit', 'trades'].includes(key))
+                if (!hasStreamKeys) {
+                  console.error(`[Breakdown] ERROR: Time breakdown has wrong format. Expected {time: {stream: profit}}, got:`, sampleValue)
+                } else {
+                  console.log(`[Breakdown] Time breakdown format verified: ${sampleKey} has streams:`, Object.keys(sampleValue))
+                }
+              }
+            }
+            setProfitBreakdowns(prev => ({
+              ...prev,
+              [`${activeTab}_${suffix}`]: data.breakdown
+            }))
+            console.log(`[Breakdown] Updated ${activeTab}_${suffix} breakdown from backend (${Object.keys(data.breakdown).length} entries)`)
+          } else {
+            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`)
+          }
+        } catch (error) {
+          console.error(`Failed to fetch ${activeTab} breakdown from backend:`, error)
         }
+      }
+      
+      // Fetch both before and after filters
+      fetchBreakdownFromBackend(false) // before filters
+      fetchBreakdownFromBackend(true)  // after filters
+    } else if (workerReady && masterData.length > 0 && calculateProfitBreakdown) {
+      // For other tabs (time, date, month, year), use worker
+      // For date tab, calculate "after filters" first for better perceived performance
+      // Then defer "before filters" slightly to prioritize showing filtered results
+      if (activeTab === 'date') {
+        // Calculate "after filters" first (most commonly viewed)
+        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
+        // Defer "before filters" by a small delay to improve perceived responsiveness
+        setTimeout(() => {
+          calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
+        }, 100)
       } else {
-        // Not on a breakdown tab, clear the previous tab reference
-        prevBreakdownTabRef.current = null
+        // For other tabs, calculate both immediately
+        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_before`, false)
+        calculateProfitBreakdown(streamFilters, streamId, masterContractMultiplier, `${activeTab}_after`, true)
       }
     }
-  }, [workerReady, masterData.length, masterContractMultiplier, streamFilters, activeTab, calculateProfitBreakdown])
+  }, [workerReady, masterData.length, masterContractMultiplier, streamFilters, activeTab, calculateProfitBreakdown, streamFilters['master']?.include_streams])
   
   // Memoized profit breakdowns (fallback to main thread if worker not ready)
   const memoizedTimeProfitBefore = useMemo(() => {
@@ -2707,26 +2894,13 @@ function AppContent() {
     if (workerExecutionTimetable && workerExecutionTimetable.streams && workerExecutionTimetable.streams.length > 0) {
       const saveExecutionTimetable = async () => {
         try {
-          // Send timetable data to backend - backend will format it correctly
-          const requestBody = {
-            trading_date: workerExecutionTimetable.trading_date,
+          await matrixApi.saveExecutionTimetable({
+            tradingDate: workerExecutionTimetable.trading_date,
             streams: workerExecutionTimetable.streams
-          }
-          
-          const response = await fetch(`${API_BASE}/timetable/execution`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(requestBody)
           })
-          if (!response.ok) {
-            console.error('Failed to save execution timetable:', await response.text())
-          } else {
-            console.log('Execution timetable saved successfully')
-          }
+          console.log('Execution timetable saved successfully')
         } catch (error) {
-          console.error('Error saving execution timetable:', error)
+          console.error('Error saving execution timetable:', error.message)
         }
       }
       saveExecutionTimetable()
@@ -3149,12 +3323,50 @@ function AppContent() {
                     className="w-24 px-3 py-2 bg-gray-800 border border-gray-700 rounded text-white focus:outline-none focus:border-blue-500"
                   />
                   <button
-                    onClick={() => {
+                    onClick={async () => {
                       const value = parseFloat(multiplierInput)
                       if (!isNaN(value) && value > 0) {
                         const clamped = Math.max(0.1, Math.min(100, value))
+                        // Update multiplier state
                         setMasterContractMultiplier(clamped)
                         setMultiplierInput(clamped)
+                        
+                        // Immediately reload stats with new multiplier
+                        // Clear existing backend stats first to force refresh
+                        setBackendStatsFull(null)
+                        try {
+                          setMasterLoading(true)
+                          console.log(`Reloading stats with contract_multiplier=${clamped}`)
+                          const data = await matrixApi.getMatrixData({
+                            limit: 10000,
+                            order: 'newest',
+                            essentialColumnsOnly: true,
+                            skipCleaning: true,
+                            contractMultiplier: clamped
+                          })
+                          if (data) {
+                            console.log('Received stats_full:', data.stats_full ? 'present' : 'missing')
+                            if (data.stats_full) {
+                              // Check if total profit changed to verify multiplier was applied
+                              const oldTotalProfit = backendStatsFull?.performance_trade_metrics?.total_profit || 0
+                              const newTotalProfit = data.stats_full?.performance_trade_metrics?.total_profit || 0
+                              console.log(`Total profit: ${oldTotalProfit} -> ${newTotalProfit} (expected ratio: ${clamped / (masterContractMultiplier || 1)})`)
+                              
+                              setBackendStatsFull(data.stats_full)
+                              setBackendStatsMultiplier(clamped)
+                              console.log('Updated backendStatsFull with new multiplier')
+                            } else {
+                              console.warn('No stats_full in response')
+                            }
+                          } else {
+                            const errorData = await dataResponse.json().catch(() => ({ detail: 'Unknown error' }))
+                            console.error('Failed to reload stats:', errorData)
+                          }
+                        } catch (error) {
+                          console.error('Failed to reload stats with new multiplier:', error)
+                        } finally {
+                          setMasterLoading(false)
+                        }
                       } else {
                         // Reset to current value if invalid
                         setMultiplierInput(masterContractMultiplier)
@@ -3171,8 +3383,17 @@ function AppContent() {
                 </div>
               </div>
               
-              {/* Filters for Master */}
-              {renderFilters('master')}
+              {/* Filters Toggle for Master */}
+              <div className="mb-4">
+                <button
+                  onClick={() => toggleFilters('master')}
+                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-800 hover:bg-gray-800 rounded text-left"
+                >
+                  <span className="font-medium">Filters for Master</span>
+                  <span>{showFilters['master'] ? '▼' : '▶'}</span>
+                </button>
+                {showFilters['master'] && renderFilters('master')}
+              </div>
               
               {masterLoading ? (
                 <div className="text-center py-8">Loading master matrix...</div>
@@ -3207,6 +3428,7 @@ function AppContent() {
                     </div>
                   )}
                   <DataTable
+                    key={`master-${showFilteredDays}`}
                     data={masterData}
                     streamId="master"
                     workerReady={workerReady && tableTab === 'master'}
@@ -3272,8 +3494,17 @@ function AppContent() {
                 {showStats[activeTab] && renderStats(activeTab, memoizedActiveTabStats)}
               </div>
               
-              {/* Filters */}
-              {renderFilters(activeTab)}
+              {/* Filters Toggle */}
+              <div className="mb-4">
+                <button
+                  onClick={() => toggleFilters(activeTab)}
+                  className="flex items-center justify-between w-full px-4 py-2 bg-gray-800 hover:bg-gray-800 rounded text-left"
+                >
+                  <span className="font-medium">Filters for {activeTab}</span>
+                  <span>{showFilters[activeTab] ? '▼' : '▶'}</span>
+                </button>
+                {showFilters[activeTab] && renderFilters(activeTab)}
+              </div>
               
               {/* Data Table */}
               {masterLoading ? (
@@ -3309,6 +3540,7 @@ function AppContent() {
                     </div>
                   )}
                   <DataTable
+                    key={`${tableTab}-${showFilteredDays}`}
                     data={masterData}
                     streamId={tableTab}
                     workerReady={workerReady && workerFilteredRowsTabRef.current === tableTab}

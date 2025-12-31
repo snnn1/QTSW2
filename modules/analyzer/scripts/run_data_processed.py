@@ -95,7 +95,7 @@ def load_folder(folder: str) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folder", required=True, help="Path to data_processed folder")
-    ap.add_argument("--instrument", required=True, choices=["ES","NQ","YM","CL","NG","GC","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"])
+    ap.add_argument("--instrument", required=True, choices=["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"])
     ap.add_argument("--sessions", nargs="*", default=["S1","S2"], choices=["S1","S2"])
     ap.add_argument("--slots", nargs="*", default=[], help="Tokens like S1:07:30 S1:08:00 S2:09:30 ...")
     ap.add_argument("--days", nargs="*", default=["Mon","Tue","Wed","Thu","Fri"], choices=["Mon","Tue","Wed","Thu","Fri"])

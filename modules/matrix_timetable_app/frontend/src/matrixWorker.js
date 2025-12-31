@@ -1,42 +1,81 @@
 // Web Worker for Matrix Data Processing
 // Handles all heavy computations: filtering, stats, aggregations
 
+// Import message contract (note: workers can't use ES6 imports directly, so we'll use string matching)
+// The contract file defines constants that we'll match against
+
+// Shared empty array to avoid allocations for missing columns
+const EMPTY_COLUMN_ARRAY = Object.freeze([])
+
+// Message types (must match contract.js)
+const WORKER_MESSAGE_TYPES = {
+  INIT_DATA: 'INIT_DATA',
+  FILTER: 'FILTER',
+  GET_ROWS: 'GET_ROWS',
+  CALCULATE_STATS: 'CALCULATE_STATS',
+  CALCULATE_PROFIT_BREAKDOWN: 'CALCULATE_PROFIT_BREAKDOWN',
+  CALCULATE_TIMETABLE: 'CALCULATE_TIMETABLE'
+}
+
+const WORKER_RESPONSE_TYPES = {
+  DATA_INITIALIZED: 'DATA_INITIALIZED',
+  FILTERED: 'FILTERED',
+  ROWS: 'ROWS',
+  STATS: 'STATS',
+  PROFIT_BREAKDOWN: 'PROFIT_BREAKDOWN',
+  TIMETABLE: 'TIMETABLE',
+  ERROR: 'ERROR'
+}
+
 class ColumnarData {
   constructor(data) {
     if (!data || data.length === 0) {
       this.columns = {}
       this.length = 0
+      this._precomputed = null
       return
     }
     
     this.length = data.length
     
-    // Harden column discovery: collect ALL column names from ALL rows in a single pass
-    // This ensures we don't silently drop columns that appear in later rows
+    // Step 1: Discover all column names in a single pass (O(rows))
     const columnNamesSet = new Set()
     for (let idx = 0; idx < this.length; idx++) {
       const row = data[idx]
       if (row && typeof row === 'object') {
-        Object.keys(row).forEach(colName => {
-          columnNamesSet.add(colName)
-        })
+        // Use Object.keys for faster iteration than for...in
+        const keys = Object.keys(row)
+        for (let k = 0; k < keys.length; k++) {
+          columnNamesSet.add(keys[k])
+        }
       }
     }
     
     const columnNames = Array.from(columnNamesSet)
     
-    // Initialize columns
+    // Step 2: Initialize all column arrays upfront (O(columns))
     this.columns = {}
-    columnNames.forEach(colName => {
-      this.columns[colName] = new Array(this.length)
-    })
+    for (let c = 0; c < columnNames.length; c++) {
+      this.columns[columnNames[c]] = new Array(this.length)
+    }
     
-    // Single pass through data, extract all columns at once
+    // Step 3: Extract values in a single pass (O(rows × avg_columns_per_row))
+    // This is faster than O(rows × total_columns) because we only iterate columns that exist in each row
     for (let idx = 0; idx < this.length; idx++) {
       const row = data[idx]
-      for (const colName of columnNames) {
-        this.columns[colName][idx] = row?.[colName] ?? null
+      if (row && typeof row === 'object') {
+        // Extract only columns that exist in this row
+        const keys = Object.keys(row)
+        for (let k = 0; k < keys.length; k++) {
+          const colName = keys[k]
+          if (this.columns[colName]) {
+            this.columns[colName][idx] = row[colName] ?? null
+          }
+        }
+        // Fill null for columns that don't exist in this row (only for known columns)
+        // Actually, we can skip this - undefined access will return undefined which we handle as null
       }
+      // If row is null/undefined, columns remain undefined (treated as null in getColumn)
     }
     
     // Assert required columns exist
@@ -45,10 +84,57 @@ class ColumnarData {
     if (missingColumns.length > 0) {
       throw new Error(`ColumnarData: Missing required columns: ${missingColumns.join(', ')}. Available columns: ${columnNames.slice(0, 20).join(', ')}${columnNames.length > 20 ? '...' : ''}`)
     }
+    
+    // Step 4: Precompute filter/sort keys for performance
+    this._precomputed = this._precomputeKeys()
+  }
+  
+  _precomputeKeys() {
+    const DateColumn = this.getColumn('Date')
+    const trade_date = this.getColumn('trade_date')
+    const entry_time = this.getColumn('entry_time')
+    const Time = this.getColumn('Time')
+    
+    const years = new Array(this.length)
+    const dateTimestamps = new Array(this.length) // For sorting
+    const entryMinutes = new Array(this.length) // For sorting
+    
+    for (let i = 0; i < this.length; i++) {
+      // Precompute year
+      const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
+      if (dateValue) {
+        const parsed = parseDateCached(dateValue)
+        if (parsed) {
+          years[i] = parsed.getFullYear()
+          dateTimestamps[i] = parsed.getTime()
+        } else {
+          years[i] = null
+          dateTimestamps[i] = 0
+        }
+      } else {
+        years[i] = null
+        dateTimestamps[i] = 0
+      }
+      
+      // Precompute entry minutes for sorting
+      const timeValue = entry_time?.[i] || Time[i] || ''
+      if (timeValue && timeValue !== 'NA' && timeValue !== '00:00') {
+        const [h, m] = timeValue.split(':').map(Number)
+        entryMinutes[i] = (h || 0) * 60 + (m || 0)
+      } else {
+        entryMinutes[i] = 0
+      }
+    }
+    
+    return { years, dateTimestamps, entryMinutes }
   }
   
   getColumn(name) {
-    return this.columns[name] || new Array(this.length).fill(null)
+    const col = this.columns[name]
+    if (col) return col
+    // Return shared empty array for missing columns (avoids per-call allocation)
+    // Note: Callers should check length, but most code already handles undefined/null
+    return EMPTY_COLUMN_ARRAY
   }
   
   getRow(index) {
@@ -106,6 +192,25 @@ function parseDateCached(dateValue) {
   return parsed
 }
 
+// ISO week helpers (for weekly aggregation)
+function _getISOWeekKey(dateObj) {
+  // Returns "YYYY-Www" using ISO week date (weeks start Monday)
+  if (!dateObj || isNaN(dateObj.getTime())) return null
+
+  // Create a copy in UTC to avoid timezone edge cases with toISOString day boundaries
+  const d = new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()))
+  // ISO week day: Monday=1...Sunday=7
+  const dayNum = d.getUTCDay() || 7
+  // Set to Thursday in current week to determine ISO year
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum)
+
+  const isoYear = d.getUTCFullYear()
+  const yearStart = new Date(Date.UTC(isoYear, 0, 1))
+  // Week number: number of weeks between yearStart and Thursday-of-week
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7)
+  return `${isoYear}-W${String(weekNo).padStart(2, '0')}`
+}
+
 // ---------------------------------------------------------------------
 // Statistics (EXECUTED TRADES DOMAIN)
 // ---------------------------------------------------------------------
@@ -129,12 +234,14 @@ function isNoTrade(resultNorm) {
 }
 
 // Helper function to get canonical date value (prefer trade_date over Date)
+// NOTE: Backend provides trade_date as a parseable canonical date (ISO format or datetime),
+// so we prefer it over the Date column to avoid parsing inconsistencies in day-based metrics
 function getCanonicalDateValue(trade_date, DateColumn, index) {
-  // Standardize: prefer trade_date, fallback to Date
+  // Standardize: prefer trade_date (canonical from backend), fallback to Date
   return trade_date[index] ?? DateColumn[index] ?? null
 }
 
-function calculateStats(columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted = true) {
+function calculateStats(columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted = true, baseIndices = null) {
   if (columnarData.length === 0) {
     return {
       sample_counts: {
@@ -160,13 +267,19 @@ function calculateStats(columnarData, streamId, contractMultiplier, contractValu
   const FinalAllowed = columnarData.getColumn('final_allowed')
   const Time = columnarData.getColumn('Time')
 
-  // Filter by stream if specified (not 'master')
+  // Use pre-filtered indices if provided (e.g., from year filtering), otherwise filter by stream
   let dataIndices = []
-  for (let i = 0; i < columnarData.length; i++) {
-    if (streamId && streamId !== 'master' && Stream[i] !== streamId) {
-      continue
+  if (baseIndices && baseIndices.length > 0) {
+    // Use provided indices (already filtered by stream + year filters)
+    dataIndices = baseIndices
+  } else {
+    // Fallback: filter by stream if specified (not 'master')
+    for (let i = 0; i < columnarData.length; i++) {
+      if (streamId && streamId !== 'master' && Stream[i] !== streamId) {
+        continue
+      }
+      dataIndices.push(i)
     }
-    dataIndices.push(i)
   }
 
   // Normalize results and identify executed trades and NoTrade
@@ -602,6 +715,41 @@ function _calculateDailyMetrics(
     return _emptyDailyMetrics()
   }
 
+  // Daily win rate (by day outcome, not by trade outcome)
+  // win_day: dailyPnL > 0, loss_day: dailyPnL < 0, be_day: dailyPnL == 0
+  let dailyWinDays = 0
+  let dailyLossDays = 0
+  let dailyBeDays = 0
+  for (const pnl of dailyPnL) {
+    if (pnl > 0) dailyWinDays++
+    else if (pnl < 0) dailyLossDays++
+    else dailyBeDays++
+  }
+  const dailyWinLossDays = dailyWinDays + dailyLossDays
+  const dailyWinRate = dailyWinLossDays > 0 ? (dailyWinDays / dailyWinLossDays) * 100 : 0.0
+
+  // Weekly win rate (by week outcome) from dailyPnL aggregated into ISO weeks
+  const weeklyPnLMap = new Map() // weekKey -> sumPnL
+  for (let idx = 0; idx < dates.length; idx++) {
+    const dateStr = dates[idx]
+    if (!dateStr) continue
+    const parsed = parseDateCached(dateStr)
+    if (!parsed) continue
+    const weekKey = _getISOWeekKey(parsed)
+    if (!weekKey) continue
+    weeklyPnLMap.set(weekKey, (weeklyPnLMap.get(weekKey) || 0) + dailyPnL[idx])
+  }
+  let weeklyWinWeeks = 0
+  let weeklyLossWeeks = 0
+  let weeklyBeWeeks = 0
+  for (const pnl of weeklyPnLMap.values()) {
+    if (pnl > 0) weeklyWinWeeks++
+    else if (pnl < 0) weeklyLossWeeks++
+    else weeklyBeWeeks++
+  }
+  const weeklyWinLossWeeks = weeklyWinWeeks + weeklyLossWeeks
+  const weeklyWinRate = weeklyWinLossWeeks > 0 ? (weeklyWinWeeks / weeklyWinLossWeeks) * 100 : 0.0
+
   // Behavioral averages use active_trading_days (days with ≥1 trade in stats sample)
   // avg_trades_per_active_day = stats_sample_trade_count / active_trading_days
   const avgTradesPerDay = activeTradingDays > 0 ? statsSampleTradeCount / activeTradingDays : 0.0
@@ -707,6 +855,14 @@ function _calculateDailyMetrics(
   return {
     executed_trading_days: dailyPnL.length, // Days in stats sample daily PnL series (for reference)
     allowed_trading_days: activeTradingDays, // Active trading days (used for behavioral averages)
+    daily_win_rate: Math.round(dailyWinRate * 10) / 10,
+    daily_win_days: dailyWinDays,
+    daily_loss_days: dailyLossDays,
+    daily_be_days: dailyBeDays,
+    weekly_win_rate: Math.round(weeklyWinRate * 10) / 10,
+    weekly_win_weeks: weeklyWinWeeks,
+    weekly_loss_weeks: weeklyLossWeeks,
+    weekly_be_weeks: weeklyBeWeeks,
     avg_trades_per_day: Math.round(avgTradesPerDay * 100) / 100,
     profit_per_day: Math.round(profitPerDay * 100) / 100,
     profit_per_week: Math.round(profitPerWeek * 100) / 100,
@@ -722,67 +878,124 @@ function _calculateDailyMetrics(
 
 // ---------------------------------------------------------------------
 // Minimal filtering (stream + year only, NOT DOW/DOM - those are already marked in backend)
+// Optimized: directly build filteredIndices without allocating a mask array
+// When showFilteredDays is false, exclude rows with final_allowed === false
 // ---------------------------------------------------------------------
-function createFilterMask(columnarData, streamFilters, streamId) {
+function createFilteredIndices(columnarData, streamFilters, streamId, showFilteredDays = true) {
   const length = columnarData.length
-  const mask = new Array(length).fill(true)
+  const filteredIndices = []
   const Stream = columnarData.getColumn('Stream')
-  const DateColumn = columnarData.getColumn('Date')
-  const trade_date = columnarData.getColumn('trade_date')
+  const FinalAllowed = showFilteredDays ? null : columnarData.getColumn('final_allowed')
 
-  // Extract years for filtering
-  const years = new Array(length)
-  for (let i = 0; i < length; i++) {
-    const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
-    if (dateValue) {
-      const parsed = parseDateCached(dateValue)
-      years[i] = parsed ? parsed.getFullYear() : null
-    } else {
-      years[i] = null
+  // Use precomputed years if available (much faster)
+  const precomputed = columnarData._precomputed
+  const years = precomputed ? precomputed.years : (() => {
+    // Fallback: compute on the fly if not precomputed
+    const DateColumn = columnarData.getColumn('Date')
+    const trade_date = columnarData.getColumn('trade_date')
+    const yearsArr = new Array(length)
+    for (let i = 0; i < length; i++) {
+      const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
+      if (dateValue) {
+        const parsed = parseDateCached(dateValue)
+        yearsArr[i] = parsed ? parsed.getFullYear() : null
+      } else {
+        yearsArr[i] = null
+      }
+    }
+    return yearsArr
+  })()
+
+  // Precompute year sets once (not per row)
+  const streamYearSets = {}
+  const masterYearSet = streamFilters['master']?.include_years?.length > 0
+    ? new Set(streamFilters['master'].include_years)
+    : null
+  
+  // Build year sets for each stream filter
+  for (const streamKey in streamFilters) {
+    const filter = streamFilters[streamKey]
+    if (filter?.include_years?.length > 0) {
+      streamYearSets[streamKey] = new Set(filter.include_years)
     }
   }
+  
+  // Get master stream inclusion filter
+  const masterFilters = streamFilters['master'] || {}
+  const masterIncludeStreams = masterFilters.include_streams || []
+  const hasMasterStreamFilter = masterIncludeStreams.length > 0
 
+  // Single pass: directly build filteredIndices without mask array
   for (let i = 0; i < length; i++) {
     // Filter by stream if specified
     if (streamId && streamId !== 'master' && Stream[i] !== streamId) {
-      mask[i] = false
-      continue
+      continue // Skip this row
+    }
+    
+    // Apply master stream inclusion filter (if master tab and filter is set)
+    if (streamId === 'master' && hasMasterStreamFilter) {
+      if (!masterIncludeStreams.includes(Stream[i])) {
+        continue // Skip this row - stream not included
+      }
     }
 
     // Apply year filters only (DOW/DOM already marked with final_allowed=False in backend)
     const rowStream = Stream[i]
+    const year = years[i]
+    let passesFilter = true
+    
     if (streamId === 'master' || !streamId) {
-      const streamFilter = streamFilters[rowStream]
-      if (streamFilter?.include_years?.length > 0) {
-        const yearSet = new Set(streamFilter.include_years)
-        if (years[i] === null || !yearSet.has(years[i])) {
-          mask[i] = false
-          continue
+      // Check stream-specific year filter
+      const streamYearSet = streamYearSets[rowStream]
+      if (streamYearSet && streamYearSet.size > 0) {
+        // Only exclude if year is explicitly not in the set (allow null years if no filter is set)
+        if (year !== null && !streamYearSet.has(year)) {
+          passesFilter = false
+        }
+        // If year is null and we have a year filter, exclude it (can't match any year)
+        if (year === null) {
+          passesFilter = false
         }
       }
       
-      // Master-specific year filter
-      const masterFilter = streamFilters['master']
-      if (masterFilter?.include_years?.length > 0) {
-        const yearSet = new Set(masterFilter.include_years)
-        if (years[i] === null || !yearSet.has(years[i])) {
-          mask[i] = false
-          continue
+      // Check master-specific year filter
+      if (passesFilter && masterYearSet && masterYearSet.size > 0) {
+        // Only exclude if year is explicitly not in the set
+        if (year !== null && !masterYearSet.has(year)) {
+          passesFilter = false
+        }
+        // If year is null and we have a year filter, exclude it
+        if (year === null) {
+          passesFilter = false
         }
       }
     } else if (streamId && streamId !== 'master') {
-      const streamFilter = streamFilters[streamId]
-      if (streamFilter?.include_years?.length > 0) {
-        const yearSet = new Set(streamFilter.include_years)
-        if (years[i] === null || !yearSet.has(years[i])) {
-          mask[i] = false
-          continue
+      // Check stream-specific year filter
+      const streamYearSet = streamYearSets[streamId]
+      if (streamYearSet && streamYearSet.size > 0) {
+        // Only exclude if year is explicitly not in the set
+        if (year !== null && !streamYearSet.has(year)) {
+          passesFilter = false
+        }
+        // If year is null and we have a year filter, exclude it
+        if (year === null) {
+          passesFilter = false
         }
       }
     }
+    
+    if (passesFilter) {
+      // If showFilteredDays is false, exclude rows with final_allowed === false
+      if (!showFilteredDays && FinalAllowed) {
+        if (FinalAllowed[i] === false) {
+          continue // Skip this row - it's a filtered day
+        }
+      }
+      filteredIndices.push(i)
+    }
   }
 
-  return mask
+  return filteredIndices
 }
 
 // ---------------------------------------------------------------------
@@ -793,7 +1006,7 @@ self.onmessage = function(e) {
   
   try {
     switch (type) {
-      case 'INIT_DATA': {
+      case WORKER_MESSAGE_TYPES.INIT_DATA: {
         self.columnarData = new ColumnarData(payload.data)
         // Clear profit breakdown cache when data is reinitialized
         if (!self.profitBreakdownCache) {
@@ -801,23 +1014,50 @@ self.onmessage = function(e) {
         } else {
           self.profitBreakdownCache.clear()
         }
-        self.postMessage({ type: 'DATA_INITIALIZED', payload: { length: self.columnarData.length } })
+        // Clear filter cache when data is reinitialized (new data means old filters are stale)
+        if (!self.filterCache) {
+          self.filterCache = new Map()
+        } else {
+          self.filterCache.clear()
+        }
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.DATA_INITIALIZED, payload: { length: self.columnarData.length } })
         break
       }
       
-      case 'FILTER': {
+      case WORKER_MESSAGE_TYPES.FILTER: {
         if (!self.columnarData) {
           self.postMessage({ type: 'ERROR', payload: { message: 'FILTER: Data not initialized', operation: 'FILTER' } })
           return
         }
         
-        const { streamFilters, streamId, returnRows = false, sortIndices = null, requestId } = payload
-        const mask = createFilterMask(self.columnarData, streamFilters || {}, streamId)
+        const { streamFilters, streamId, returnRows = false, sortIndices = null, showFilteredDays = true, requestId } = payload
         
-        // Get filtered indices
-        const filteredIndices = []
-        for (let i = 0; i < mask.length; i++) {
-          if (mask[i]) filteredIndices.push(i)
+        // Check cache first - optimize key generation by only including relevant filter parts
+        // Include showFilteredDays in cache key since it affects which rows are included
+        const relevantFilters = {}
+        const filters = streamFilters || {}
+        for (const key in filters) {
+          const filter = filters[key]
+          if (filter?.include_years?.length > 0) {
+            relevantFilters[key] = { include_years: filter.include_years }
+          }
+          // Include stream filter for master
+          if (key === 'master' && filter?.include_streams?.length > 0) {
+            if (!relevantFilters[key]) relevantFilters[key] = {}
+            relevantFilters[key].include_streams = filter.include_streams
+          }
+        }
+        const cacheKey = JSON.stringify({ streamId, streamFilters: relevantFilters, showFilteredDays })
+        if (!self.filterCache) {
+          self.filterCache = new Map()
+        }
+        
+        let filteredIndices = self.filterCache.get(cacheKey)
+        if (!filteredIndices) {
+          // Build filtered indices directly (no mask array)
+          filteredIndices = createFilteredIndices(self.columnarData, streamFilters || {}, streamId, showFilteredDays)
+          // Cache the result
+          self.filterCache.set(cacheKey, filteredIndices)
         }
         
         // Sort indices if requested
@@ -825,91 +1065,148 @@ self.onmessage = function(e) {
         // Backend sorts ascending by ['trade_date', 'entry_time', 'Instrument', 'Stream']
         // We reverse this to show newest data at top: trade_date (desc), entry_time (desc), Instrument (asc), Stream (asc)
         if (sortIndices && filteredIndices.length > 0) {
-          const DateColumn = self.columnarData.getColumn('Date')
-          const trade_date = self.columnarData.getColumn('trade_date')
-          const entry_time = self.columnarData.getColumn('entry_time')
-          filteredIndices.sort((a, b) => {
-            const dateA = getCanonicalDateValue(trade_date, DateColumn, a)
-            const dateB = getCanonicalDateValue(trade_date, DateColumn, b)
-            const parsedA = parseDateCached(dateA)
-            const parsedB = parseDateCached(dateB)
-            if (parsedA && parsedB) {
-              // DESCENDING: parsedB - parsedA (newest dates first)
-              const dateDiff = parsedB.getTime() - parsedA.getTime()
+          // Use precomputed sort keys if available (much faster)
+          const precomputed = self.columnarData._precomputed
+          const dateTimestamps = precomputed ? precomputed.dateTimestamps : null
+          const entryMinutes = precomputed ? precomputed.entryMinutes : null
+          
+          const Instrument = self.columnarData.getColumn('Instrument')
+          const Stream = self.columnarData.getColumn('Stream')
+          
+          if (dateTimestamps && entryMinutes) {
+            // Fast path: use precomputed keys
+            filteredIndices.sort((a, b) => {
+              // DESCENDING: newest dates first
+              const dateDiff = dateTimestamps[b] - dateTimestamps[a]
               if (dateDiff !== 0) return dateDiff
               
-              // Sort by entry_time (actual trade entry time) to match backend sorting
-              // Fallback to Time column if entry_time is missing
-              const entryTimeA = entry_time?.[a] || self.columnarData.getColumn('Time')[a] || ''
-              const entryTimeB = entry_time?.[b] || self.columnarData.getColumn('Time')[b] || ''
+              // DESCENDING: latest times first
+              const timeDiff = entryMinutes[b] - entryMinutes[a]
+              if (timeDiff !== 0) return timeDiff
               
-              if (entryTimeA && entryTimeB) {
-                const [hA, mA] = entryTimeA.split(':').map(Number)
-                const [hB, mB] = entryTimeB.split(':').map(Number)
-                const minsA = (hA || 0) * 60 + (mA || 0)
-                const minsB = (hB || 0) * 60 + (mB || 0)
-                // DESCENDING: minsB - minsA (latest times first)
-                if (minsA !== minsB) return minsB - minsA
-              }
-              
-              // If times are equal or missing, sort by Instrument then Stream (ascending for consistency)
-              const instrumentA = self.columnarData.getColumn('Instrument')[a] || ''
-              const instrumentB = self.columnarData.getColumn('Instrument')[b] || ''
+              // Ascending: Instrument then Stream
+              const instrumentA = Instrument[a] || ''
+              const instrumentB = Instrument[b] || ''
               const instrumentDiff = instrumentA.localeCompare(instrumentB)
               if (instrumentDiff !== 0) return instrumentDiff
               
-              const streamA = self.columnarData.getColumn('Stream')[a] || ''
-              const streamB = self.columnarData.getColumn('Stream')[b] || ''
+              const streamA = Stream[a] || ''
+              const streamB = Stream[b] || ''
               return streamA.localeCompare(streamB)
-            }
-            return 0
-          })
+            })
+          } else {
+            // Fallback: compute on the fly (slower but works if precomputed not available)
+            const DateColumn = self.columnarData.getColumn('Date')
+            const trade_date = self.columnarData.getColumn('trade_date')
+            const entry_time = self.columnarData.getColumn('entry_time')
+            const Time = self.columnarData.getColumn('Time')
+            
+            filteredIndices.sort((a, b) => {
+              const dateA = getCanonicalDateValue(trade_date, DateColumn, a)
+              const dateB = getCanonicalDateValue(trade_date, DateColumn, b)
+              const parsedA = parseDateCached(dateA)
+              const parsedB = parseDateCached(dateB)
+              if (parsedA && parsedB) {
+                // DESCENDING: parsedB - parsedA (newest dates first)
+                const dateDiff = parsedB.getTime() - parsedA.getTime()
+                if (dateDiff !== 0) return dateDiff
+                
+                // Sort by entry_time (actual trade entry time) to match backend sorting
+                // Fallback to Time column if entry_time is missing
+                const entryTimeA = entry_time?.[a] || Time[a] || ''
+                const entryTimeB = entry_time?.[b] || Time[b] || ''
+                
+                if (entryTimeA && entryTimeB) {
+                  const [hA, mA] = entryTimeA.split(':').map(Number)
+                  const [hB, mB] = entryTimeB.split(':').map(Number)
+                  const minsA = (hA || 0) * 60 + (mA || 0)
+                  const minsB = (hB || 0) * 60 + (mB || 0)
+                  // DESCENDING: minsB - minsA (latest times first)
+                  if (minsA !== minsB) return minsB - minsA
+                }
+                
+                // If times are equal or missing, sort by Instrument then Stream (ascending for consistency)
+                const instrumentA = Instrument[a] || ''
+                const instrumentB = Instrument[b] || ''
+                const instrumentDiff = instrumentA.localeCompare(instrumentB)
+                if (instrumentDiff !== 0) return instrumentDiff
+                
+                const streamA = Stream[a] || ''
+                const streamB = Stream[b] || ''
+                return streamA.localeCompare(streamB)
+              }
+              return 0
+            })
+          }
         }
         
         const response = {
           length: filteredIndices.length,
-          mask: mask,
           indices: filteredIndices,
           requestId: requestId // Include request ID in response
         }
         
-        // Optionally return rows (for initial render)
-        // REMOVED LIMIT: Return all filtered rows, not just 100
-        // Virtual scrolling will handle rendering efficiently
+        // Optionally return rows (for initial render) - limit to small window for performance
+        // Only return first 200 rows to get table rendering started quickly
+        // All other rows will be loaded incrementally via GET_ROWS as user scrolls
+        const INITIAL_ROW_WINDOW = 200
         if (returnRows && filteredIndices.length > 0) {
-          response.rows = self.columnarData.getRows(filteredIndices)
+          const initialIndices = filteredIndices.slice(0, Math.min(INITIAL_ROW_WINDOW, filteredIndices.length))
+          response.rows = self.columnarData.getRows(initialIndices)
         }
         
-        self.postMessage({ type: 'FILTERED', payload: response })
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.FILTERED, payload: response })
         break
       }
       
-      case 'GET_ROWS': {
+      case WORKER_MESSAGE_TYPES.GET_ROWS: {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'GET_ROWS: Data not initialized', operation: 'GET_ROWS' } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: 'GET_ROWS: Data not initialized', operation: 'GET_ROWS' } })
           return
         }
         const { indices } = payload
         const rows = self.columnarData.getRows(indices)
-        self.postMessage({ type: 'ROWS', payload: { rows } })
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.ROWS, payload: { rows } })
         break
       }
       
-      case 'CALCULATE_STATS': {
+      case WORKER_MESSAGE_TYPES.CALCULATE_STATS: {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'CALCULATE_STATS: Data not initialized', operation: 'CALCULATE_STATS' } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: 'CALCULATE_STATS: Data not initialized', operation: 'CALCULATE_STATS' } })
           return
         }
-        // Note: streamFilters not used here - stream filtering happens in calculateStats via streamId
-        const { streamId, contractMultiplier, contractValues, includeFilteredExecuted = true, requestId } = payload
-        const stats = calculateStats(self.columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted)
-        self.postMessage({ type: 'STATS', payload: { stats, requestId } })
+        const { streamFilters, streamId, contractMultiplier, contractValues, includeFilteredExecuted = true, requestId } = payload
+        
+        // Apply year filtering (include_years) if specified in streamFilters
+        // This ensures stats match the table's filtered dataset
+        let statsIndices = null
+        if (streamFilters && Object.keys(streamFilters).length > 0) {
+          // Check if any stream has include_years filter
+          let hasYearFilter = false
+          for (const key in streamFilters) {
+            const filter = streamFilters[key]
+            if (filter?.include_years?.length > 0) {
+              hasYearFilter = true
+              break
+            }
+          }
+          
+          if (hasYearFilter) {
+            // Use createFilteredIndices to get year-filtered indices
+            // For stats, always exclude filtered days from base indices (they're handled separately via includeFilteredExecuted)
+            statsIndices = createFilteredIndices(self.columnarData, streamFilters || {}, streamId, false)
+          }
+        }
+        
+        // Pass pre-filtered indices to calculateStats (or null to use default stream filtering)
+        const stats = calculateStats(self.columnarData, streamId, contractMultiplier, contractValues, includeFilteredExecuted, statsIndices)
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.STATS, payload: { stats, requestId } })
         break
       }
       
-      case 'CALCULATE_TIMETABLE': {
+      case WORKER_MESSAGE_TYPES.CALCULATE_TIMETABLE: {
         if (!self.columnarData) {
-          self.postMessage({ type: 'ERROR', payload: { message: 'CALCULATE_TIMETABLE: Data not initialized', operation: 'CALCULATE_TIMETABLE' } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: 'CALCULATE_TIMETABLE: Data not initialized', operation: 'CALCULATE_TIMETABLE' } })
           return
         }
         
@@ -943,7 +1240,7 @@ self.onmessage = function(e) {
         }
         
         if (!latestDateStr) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [], requestId } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.TIMETABLE, payload: { timetable: [], requestId } })
           return
         }
         
@@ -984,7 +1281,7 @@ self.onmessage = function(e) {
         }
         
         if (targetDOWJS === null || targetDOM === null) {
-          self.postMessage({ type: 'TIMETABLE', payload: { timetable: [], requestId } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.TIMETABLE, payload: { timetable: [], requestId } })
           return
         }
         
@@ -1138,7 +1435,7 @@ self.onmessage = function(e) {
         })
         
         self.postMessage({ 
-          type: 'TIMETABLE', 
+          type: WORKER_RESPONSE_TYPES.TIMETABLE, 
           payload: { 
             timetable: timetableRows,
             executionTimetable: {
@@ -1180,7 +1477,7 @@ self.onmessage = function(e) {
         if (self.profitBreakdownCache.has(cacheKey)) {
           const cachedResult = self.profitBreakdownCache.get(cacheKey)
           self.postMessage({ 
-            type: 'PROFIT_BREAKDOWN', 
+            type: WORKER_RESPONSE_TYPES.PROFIT_BREAKDOWN, 
             payload: { 
               breakdown: cachedResult, 
               breakdownType, 
@@ -1194,14 +1491,11 @@ self.onmessage = function(e) {
         let dataIndices = []
         if (useFiltered) {
           // Use filtered data (apply stream/year filters AND final_allowed)
-          const mask = createFilterMask(self.columnarData, streamFilters, streamId)
-          const FinalAllowed = self.columnarData.getColumn('final_allowed')
-          for (let i = 0; i < mask.length; i++) {
-            // Must pass the mask AND have final_allowed !== false
-            if (mask[i] && FinalAllowed[i] !== false) {
-              dataIndices.push(i)
-            }
-          }
+          // Get year-filtered indices using createFilteredIndices
+          // Pass showFilteredDays=false to exclude filtered days (final_allowed === false)
+          const filteredIndices = createFilteredIndices(self.columnarData, streamFilters || {}, streamId, false)
+          // All indices returned already have final_allowed !== false, so use them directly
+          dataIndices = filteredIndices
         } else {
           // Use all data
           for (let i = 0; i < self.columnarData.length; i++) {
@@ -1215,7 +1509,7 @@ self.onmessage = function(e) {
         }
         
         if (dataIndices.length === 0) {
-          self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: {}, breakdownType, requestId } })
+          self.postMessage({ type: WORKER_RESPONSE_TYPES.PROFIT_BREAKDOWN, payload: { breakdown: {}, breakdownType, requestId } })
           return
         }
         
@@ -1341,12 +1635,12 @@ self.onmessage = function(e) {
         // Cache the result before sending
         self.profitBreakdownCache.set(cacheKey, sortedBreakdown)
         
-        self.postMessage({ type: 'PROFIT_BREAKDOWN', payload: { breakdown: sortedBreakdown, breakdownType, requestId } })
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.PROFIT_BREAKDOWN, payload: { breakdown: sortedBreakdown, breakdownType, requestId } })
         break
       }
       
       default:
-        self.postMessage({ type: 'ERROR', payload: { message: `Unknown message type: ${type}`, operation: 'UNKNOWN', messageType: type } })
+        self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: `Unknown message type: ${type}`, operation: 'UNKNOWN', messageType: type } })
     }
   } catch (err) {
     const dataInfo = self.columnarData 

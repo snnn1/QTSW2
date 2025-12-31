@@ -43,342 +43,121 @@ class MatrixBuildRequest(BaseModel):
     streams: Optional[List[str]] = None  # If provided, only rebuild these streams
 
 
+class BreakdownRequest(BaseModel):
+    breakdown_type: str  # "day", "dom", "time", "date", "month", "year"
+    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
+    use_filtered: bool = False  # If True, apply filters; if False, use all data
+    contract_multiplier: float = 1.0
+    stream_include: Optional[List[str]] = None  # List of streams to include (None = all streams)
+
+
+class StreamStatsRequest(BaseModel):
+    stream_id: str  # e.g., "ES1", "ES2", "GC1", etc.
+    include_filtered_executed: bool = False  # If True, include filtered executed trades
+    contract_multiplier: float = 1.0
+
+
 # ============================================================
 # Endpoints
 # ============================================================
 
 @router.post("/build")
 async def build_master_matrix(request: MatrixBuildRequest):
-    """Build master matrix from all streams."""
-    # Get logger first
-    logger.info("=" * 80)
-    logger.info("BUILD ENDPOINT HIT!")
-    logger.info("=" * 80)
-    
-    # Write directly to master_matrix.log FIRST (before module reload) - FORCE IT
-    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """Build or rebuild the master matrix from analyzer runs."""
     try:
-        master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
-        # Open in append mode, write immediately, force flush
-        f = open(master_matrix_log, 'a', encoding='utf-8')
-        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
-        f.write(f"{timestamp} - INFO - BUILD ENDPOINT HIT!\n")
-        f.write(f"{timestamp} - INFO - {'=' * 80}\n")
-        f.flush()
-        if hasattr(f, 'fileno'):
-            try:
-                import os
-                os.fsync(f.fileno())
-            except:
-                pass
-        f.close()
-        # Also print to stderr to confirm
-        print(f"[DEBUG] Wrote BUILD ENDPOINT HIT to {master_matrix_log}", file=sys.stderr, flush=True)
-    except Exception as e:
-        error_msg = f"ERROR writing to master_matrix.log: {e}"
-        logger.error(error_msg)
-        print(error_msg, file=sys.stderr, flush=True)
-    
-    # RELOAD MODULE FIRST - before anything else
-    try:
-        sys.path.insert(0, str(QTSW2_ROOT))
-        
-        # Use centralized module reloader to ensure latest code is loaded
-        from modules.matrix.module_reloader import ensure_matrix_modules_reloaded
-        ensure_matrix_modules_reloaded()
-        
-        # Import from modules.matrix.master_matrix
         from modules.matrix.master_matrix import MasterMatrix
         
-        # Verify the signature
-        sig = inspect.signature(MasterMatrix.__init__)
-        params = list(sig.parameters.keys())
-        logger.info(f"MasterMatrix signature: {params}")
+        matrix = MasterMatrix(analyzer_runs_dir=request.analyzer_runs_dir)
         
-    except Exception as e:
-        logger.error(f"ERROR loading MasterMatrix module: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load MasterMatrix module: {e}")
-    
-    # Write to master_matrix.log using the master_matrix logger (after successful reload)
-    master_matrix_logger = logging.getLogger('modules.matrix.master_matrix')
-    master_matrix_logger.info("BUILD ENDPOINT CALLED - Master Matrix import successful")
-    master_matrix_logger.info("About to process stream_filters")
-    
-    # Convert stream_filters from Pydantic models to dicts
-    stream_filters_dict = None
-    if request.stream_filters:
-        stream_filters_dict = {
-            stream_id: {
-                "exclude_days_of_week": filter_config.exclude_days_of_week,
-                "exclude_days_of_month": filter_config.exclude_days_of_month,
-                "exclude_times": filter_config.exclude_times
-            }
-            for stream_id, filter_config in request.stream_filters.items()
-        }
-    
-    # Write debug info to master matrix log using logger
-    master_matrix_logger.info("=" * 80)
-    master_matrix_logger.info("BUILDING MASTER MATRIX - FILTER DEBUG")
-    master_matrix_logger.info(f"Streams to rebuild: {request.streams}")
-    master_matrix_logger.info(f"Stream filters received: {stream_filters_dict}")
-    if stream_filters_dict:
-        for stream_id, filters in stream_filters_dict.items():
-            exclude_times = filters.get('exclude_times', [])
-            if exclude_times:
-                master_matrix_logger.info(f"  {stream_id}: exclude_times = {exclude_times}")
-    master_matrix_logger.info("=" * 80)
-    
-    logger.info("=" * 80)
-    logger.info("[DEBUG] BUILDING MASTER MATRIX")
-    logger.info(f"[DEBUG] Streams: {request.streams}")
-    logger.info(f"[DEBUG] Filters: {stream_filters_dict}")
-    if stream_filters_dict:
-        for stream_id, filters in stream_filters_dict.items():
-            exclude_times = filters.get('exclude_times', [])
-            if exclude_times:
-                logger.info(f"[DEBUG]   {stream_id}: exclude_times = {exclude_times}")
-    logger.info("=" * 80)
-    
-    try:
-        # Initialize MasterMatrix
-        logger.info("About to create MasterMatrix instance")
-        
-        # Only pass parameters that exist in the signature
-        sig = inspect.signature(MasterMatrix.__init__)
-        valid_params = set(sig.parameters.keys()) - {'self'}
-        logger.info(f"MasterMatrix valid parameters: {valid_params}")
-        
-        # Build kwargs only with valid parameters
-        init_kwargs = {}
-        if "analyzer_runs_dir" in valid_params:
-            # Convert relative path to absolute path
-            analyzer_runs_path = Path(request.analyzer_runs_dir)
-            if not analyzer_runs_path.is_absolute():
-                analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
-            init_kwargs["analyzer_runs_dir"] = str(analyzer_runs_path)
-        if "stream_filters" in valid_params and stream_filters_dict is not None:
-            init_kwargs["stream_filters"] = stream_filters_dict
-        
-        logger.info(f"Creating MasterMatrix with kwargs: {init_kwargs}")
-        
-        try:
-            matrix = MasterMatrix(**init_kwargs)
-            logger.info("MasterMatrix created successfully")
-        except TypeError as e:
-            error_str = str(e)
-            logger.error(f"TypeError creating MasterMatrix: {error_str}")
-            logger.error(f"init_kwargs passed: {init_kwargs}")
-            logger.error(f"Valid params: {valid_params}")
-            raise HTTPException(status_code=500, detail=error_str)
-        
-        print("Calling build_master_matrix...", file=sys.stderr)
-        sys.stderr.flush()
-        logger.info("Calling build_master_matrix...")
-        
-        # Convert analyzer_runs_dir to absolute path for build_master_matrix call
-        analyzer_runs_path = Path(request.analyzer_runs_dir)
-        if not analyzer_runs_path.is_absolute():
-            analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
-        
-        # Run heavy matrix build in thread pool to avoid blocking FastAPI event loop
-        def _build_matrix_sync():
-            """Synchronous matrix build function to run in thread"""
-            return matrix.build_master_matrix(
-                start_date=request.start_date,
-                end_date=request.end_date,
-                specific_date=request.specific_date,
-                output_dir=request.output_dir,
-                stream_filters=stream_filters_dict,
-                analyzer_runs_dir=str(analyzer_runs_path),
-                streams=request.streams
-            )
-        
-        # Execute in thread pool (non-blocking for event loop)
-        master_df = await asyncio.to_thread(_build_matrix_sync)
-        
-        print(f"Build complete. Trades: {len(master_df)}", file=sys.stderr)
-        sys.stderr.flush()
-        logger.info(f"Build complete. Trades: {len(master_df)}")
-        
-        if master_df.empty:
-            return {
-                "status": "success",
-                "message": "Master matrix built but is empty",
-                "trades": 0,
-                "streams": [],
-                "instruments": []
-            }
-        
-        # Calculate summary statistics
-        stats = matrix._log_summary_stats(master_df)
-        
-        return {
-            "status": "success",
-            "message": "Master matrix built successfully",
-            "trades": len(master_df),
-            "date_range": {
-                "start": str(master_df['trade_date'].min()),
-                "end": str(master_df['trade_date'].max())
-            },
-            "streams": sorted(master_df['Stream'].unique().tolist()),
-            "instruments": sorted(master_df['Instrument'].unique().tolist()),
-            "allowed_trades": int(master_df['final_allowed'].sum()),
-            "statistics": stats
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to build master matrix: {str(e)}")
-
-
-class MatrixUpdateRequest(BaseModel):
-    mode: str = "window"  # "window" for rolling window update
-    reprocess_days: Optional[int] = None  # Optional override (default from config)
-    analyzer_runs_dir: str = "data/analyzed"
-    output_dir: str = "data/master_matrix"
-    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
-
-
-@router.post("/update")
-async def update_master_matrix(request: MatrixUpdateRequest):
-    """Update master matrix using rolling window update."""
-    logger.info("=" * 80)
-    logger.info("UPDATE ENDPOINT HIT!")
-    logger.info("=" * 80)
-    
-    if request.mode != "window":
-        raise HTTPException(status_code=400, detail=f"Unsupported update mode: {request.mode}")
-    
-    try:
-        # Reload module to ensure latest code
-        sys.path.insert(0, str(QTSW2_ROOT))
-        from modules.matrix.module_reloader import ensure_matrix_modules_reloaded
-        ensure_matrix_modules_reloaded()
-        
-        from modules.matrix.master_matrix import MasterMatrix
-        
-        # Convert stream_filters from Pydantic models to dicts
+        # Convert stream filters format if provided
         stream_filters_dict = None
         if request.stream_filters:
-            stream_filters_dict = {
-                stream_id: {
+            stream_filters_dict = {}
+            for stream_id, filter_config in request.stream_filters.items():
+                stream_filters_dict[stream_id] = {
                     "exclude_days_of_week": filter_config.exclude_days_of_week,
                     "exclude_days_of_month": filter_config.exclude_days_of_month,
                     "exclude_times": filter_config.exclude_times
                 }
-                for stream_id, filter_config in request.stream_filters.items()
-            }
         
-        # Initialize MasterMatrix
-        analyzer_runs_path = Path(request.analyzer_runs_dir)
-        if not analyzer_runs_path.is_absolute():
-            analyzer_runs_path = QTSW2_ROOT / analyzer_runs_path
-        
-        matrix = MasterMatrix(
-            analyzer_runs_dir=str(analyzer_runs_path),
-            stream_filters=stream_filters_dict
+        matrix.build_master_matrix(
+            start_date=request.start_date,
+            end_date=request.end_date,
+            specific_date=request.specific_date,
+            output_dir=request.output_dir,
+            stream_filters=stream_filters_dict,
+            streams=request.streams
         )
         
-        # Convert output_dir to absolute path
-        output_path = Path(request.output_dir)
-        if not output_path.is_absolute():
-            output_path = QTSW2_ROOT / output_path
-        
-        # Run window update in thread pool
-        def _update_matrix_sync():
-            """Synchronous matrix update function to run in thread"""
-            return matrix.build_master_matrix_window_update(
-                reprocess_days=request.reprocess_days,
-                output_dir=str(output_path),
-                stream_filters=stream_filters_dict,
-                analyzer_runs_dir=str(analyzer_runs_path)
-            )
-        
-        updated_df, run_summary = await asyncio.to_thread(_update_matrix_sync)
-        
-        if 'error' in run_summary:
-            raise HTTPException(status_code=500, detail=run_summary['error'])
-        
-        if updated_df.empty:
-            return {
-                "status": "success",
-                "message": "Window update completed but matrix is empty",
-                **run_summary
-            }
-        
-        # Calculate summary statistics
-        stats = matrix._log_summary_stats(updated_df)
-        
-        return {
-            "status": "success",
-            "message": "Master matrix updated successfully",
-            "trades": len(updated_df),
-            "date_range": {
-                "start": str(updated_df['trade_date'].min()),
-                "end": str(updated_df['trade_date'].max())
-            },
-            "streams": sorted(updated_df['Stream'].unique().tolist()),
-            "instruments": sorted(updated_df['Instrument'].unique().tolist()),
-            "allowed_trades": int(updated_df['final_allowed'].sum()),
-            "statistics": stats,
-            **run_summary
-        }
-    except HTTPException:
-        raise
+        return {"status": "success", "message": "Master matrix built successfully"}
     except Exception as e:
-        logger.error(f"Failed to update master matrix: {e}")
-        import traceback
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to update master matrix: {str(e)}")
+        logger.error(f"Error building master matrix: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/files")
-async def list_matrix_files():
-    """List available master matrix files."""
+@router.post("/update")
+async def update_master_matrix(request: MatrixBuildRequest):
+    """Update the master matrix with new analyzer runs (rolling window)."""
     try:
-        # Check both possible locations
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        from modules.matrix.master_matrix import MasterMatrix
         
-        # Collect files
-        parquet_files = []
-        if root_matrix_dir.exists():
-            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
+        matrix = MasterMatrix(analyzer_runs_dir=request.analyzer_runs_dir)
         
-        # Remove duplicates and sort by modification time
-        parquet_files = sorted(set(parquet_files), key=lambda p: p.stat().st_mtime, reverse=True)
+        # Convert stream filters format if provided
+        stream_filters_dict = None
+        if request.stream_filters:
+            stream_filters_dict = {}
+            for stream_id, filter_config in request.stream_filters.items():
+                stream_filters_dict[stream_id] = {
+                    "exclude_days_of_week": filter_config.exclude_days_of_week,
+                    "exclude_days_of_month": filter_config.exclude_days_of_month,
+                    "exclude_times": filter_config.exclude_times
+                }
         
-        files = []
-        for file_path in parquet_files:
-            files.append({
-                "name": file_path.name,
-                "path": str(file_path),
-                "size": file_path.stat().st_size,
-                "modified": datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
-            })
+        matrix.update_master_matrix(
+            output_dir=request.output_dir,
+            stream_filters=stream_filters_dict,
+            analyzer_runs_dir=request.analyzer_runs_dir
+        )
         
-        return {"files": files[:20]}  # Return last 20 files
+        return {"status": "success", "message": "Master matrix updated successfully"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list matrix files: {str(e)}")
+        logger.error(f"Error updating master matrix: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/data")
-async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essential_columns_only: bool = True, skip_cleaning: bool = False):
+async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, order: str = "newest", essential_columns_only: bool = True, skip_cleaning: bool = False, contract_multiplier: float = 1.0, include_filtered_executed: bool = False, stream_include: Optional[str] = None):
     """Get master matrix data from the most recent file or specified file.
     
     Args:
         file_path: Optional path to specific file
-        limit: Maximum number of rows to return (0 = no limit, default 0 to return all trades)
+        limit: Maximum number of rows to return (default 10000 for fast initial load, 0 = no limit)
+        order: Sort order - "newest" (newest first, default) or "oldest" (canonical ascending order)
         essential_columns_only: If True, return only essential columns for faster initial load (default True)
         skip_cleaning: If True, skip expensive per-value sanitization for faster initial load (default False)
+        contract_multiplier: Contract size multiplier (e.g., 2.0 for trading 2 contracts, default 1.0)
+        include_filtered_executed: If True, include filtered executed trades in stats_full calculation (default False)
+        stream_include: Comma-separated list of streams to include (e.g., "ES1,ES2"). If None or empty, all streams included.
     """
+    # Parse stream_include into list
+    stream_include_list = None
+    if stream_include:
+        stream_include_list = [s.strip() for s in stream_include.split(',') if s.strip()]
+        if len(stream_include_list) == 0:
+            stream_include_list = None
+    
+    logger.info(f"GET /api/matrix/data called with contract_multiplier={contract_multiplier}, include_filtered_executed={include_filtered_executed}, stream_include={stream_include_list}")
+    
     try:
         import pandas as pd
         
-        # Check both possible locations
+        # Determine file to load
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
         
-        # Collect files from both locations
+        if not root_matrix_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
+        
         parquet_files = []
         if root_matrix_dir.exists():
             parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
@@ -389,10 +168,53 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
             if not file_to_load.exists():
                 raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         else:
-            # Find most recent file
+            # Find most recent file by parsing timestamp from filename
+            # Reject future-dated files (beyond 1 day tolerance) to avoid selecting invalid files
             if parquet_files:
-                parquet_files = sorted(parquet_files, key=lambda p: p.stat().st_mtime, reverse=True)
-                file_to_load = parquet_files[0]
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                max_future_tolerance = timedelta(days=1)
+                
+                def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
+                    """Parse timestamp from filename like master_matrix_YYYYMMDD_HHMMSS.parquet"""
+                    import re
+                    pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
+                    match = pattern.search(file_path.name)
+                    if match:
+                        try:
+                            date_str = match.group(1) + match.group(2)  # YYYYMMDDHHMMSS
+                            return datetime.strptime(date_str, '%Y%m%d%H%M%S')
+                        except ValueError:
+                            return None
+                    return None
+                
+                # Separate files with valid timestamps from those without
+                files_with_timestamp = []
+                files_without_timestamp = []
+                
+                for f in parquet_files:
+                    ts = parse_timestamp_from_filename(f)
+                    if ts:
+                        # Reject files dated more than 1 day in the future
+                        if ts <= now + max_future_tolerance:
+                            files_with_timestamp.append((ts, f))
+                        else:
+                            logger.warning(f"Rejecting future-dated file: {f.name} (timestamp: {ts})")
+                    else:
+                        files_without_timestamp.append(f)
+                
+                if files_with_timestamp:
+                    # Sort by timestamp descending (newest first)
+                    files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
+                    file_to_load = files_with_timestamp[0][1]
+                    logger.info(f"Selected latest file by timestamp: {file_to_load.name}")
+                elif files_without_timestamp:
+                    # Fallback to mtime if no valid timestamps found
+                    files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    file_to_load = files_without_timestamp[0]
+                    logger.warning(f"No valid timestamped files found, using mtime fallback: {file_to_load.name}")
+                else:
+                    raise HTTPException(status_code=404, detail=f"No valid master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
             else:
                 raise HTTPException(status_code=404, detail=f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
         
@@ -410,6 +232,42 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
         if df.empty:
             raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
         
+        # Store full dataframe before any limiting/processing
+        df_full = df.copy()
+        
+        # Apply stream inclusion filter if specified (before stats calculation)
+        if stream_include_list and 'Stream' in df_full.columns:
+            original_len = len(df_full)
+            df_full = df_full[df_full['Stream'].isin(stream_include_list)].copy()
+            logger.info(f"Applied stream_include filter: {original_len} -> {len(df_full)} rows (streams: {stream_include_list})")
+        
+        # Calculate stats from FULL dataset BEFORE limiting (so stats reflect all history)
+        # CRITICAL: Always calculate stats_full from df_full to ensure stats cover ALL available data
+        # Even if limit=0, we still calculate stats_full separately to maintain consistency
+        stats_full = None
+        try:
+            from modules.matrix.master_matrix import MasterMatrix
+            from modules.matrix import statistics
+            # Calculate stats directly using statistics module to ensure proper data preparation
+            # Use include_filtered_executed parameter from request to match UI toggle state
+            # Apply contract_multiplier to match user's contract size setting
+            # IMPORTANT: Use df_full (before limiting) for stats calculation, and ensure ProfitDollars is recomputed with multiplier
+            # The statistics module will properly prepare the dataframe (normalize results, ensure columns, etc.)
+            # Make a copy to avoid modifying the original df
+            df_for_stats = df_full.copy()
+            # Force recomputation of ProfitDollars with the correct multiplier by dropping it if it exists
+            if "ProfitDollars" in df_for_stats.columns:
+                df_for_stats = df_for_stats.drop(columns=["ProfitDollars"])
+            stats_full = statistics.calculate_summary_stats(df_for_stats, include_filtered_executed=include_filtered_executed, contract_multiplier=contract_multiplier)
+            total_profit = stats_full.get('performance_trade_metrics', {}).get('total_profit', 'N/A') if stats_full else 'N/A'
+            total_rows = len(df_full)
+            logger.info(f"Calculated full-dataset stats from {total_rows} total rows: {len(stats_full) if stats_full else 0} metrics (contract_multiplier={contract_multiplier}, include_filtered_executed={include_filtered_executed}, total_profit={total_profit})")
+        except Exception as e:
+            logger.error(f"CRITICAL: Could not calculate full-dataset stats - stats will be incomplete: {e}")
+            import traceback
+            logger.error(f"Stats calculation traceback: {traceback.format_exc()}")
+            stats_full = None
+        
         # Extract years from FULL dataset BEFORE limiting (so we see all available years)
         years = []
         if 'trade_date' in df.columns:
@@ -424,181 +282,122 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
                     logger.error(f"Error sorting years: {e}, values: {year_values[:10]}")
                     years = sorted(year_values, reverse=True) if year_values else []
         
-        # Apply limit (assume MasterMatrix output is already correctly sorted)
+        # Apply limit and ordering
         # limit=0 means no limit - return all trades
         if limit > 0:
-            df = df.head(limit)
+            if order == "newest":
+                # Sort by trade_date descending to get newest rows first
+                # Ensure trade_date is datetime for proper sorting
+                if 'trade_date' in df.columns:
+                    df = df.copy()
+                    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+                    df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
+                elif 'Date' in df.columns:
+                    df = df.copy()
+                    df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
+                    df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
+                else:
+                    logger.warning("No date column found for newest-first sorting, using tail() fallback")
+                    df = df.tail(limit)
+            else:
+                df = df.head(limit)
         
-        # Strict essential columns list for initial load (no dynamic additions)
-        # Identity: Date, trade_date, Stream, Instrument
-        # Ordering: Time, EntryTime, ExitTime
-        # Outcome: Result, Profit, final_allowed
-        # Trading details: Target, Range, StopLoss, Peak
-        # Minimal context: Session, Direction, DOW
-        ESSENTIAL_COLUMNS = [
-            'Date', 'trade_date', 'Stream', 'Instrument',  # Identity
-            'Time', 'EntryTime', 'ExitTime',  # Ordering
-            'Result', 'Profit', 'final_allowed',  # Outcome
-            'Target', 'Range', 'StopLoss', 'Peak',  # Trading details
-            'Session', 'Direction', 'DOW',  # Minimal context
-            'Time Change'  # Essential for sequencer visualization
-        ]
-        
-        # Reduce columns for faster initial load (strict list only, no dynamic additions)
+        # Reduce columns if requested (for faster initial load)
         if essential_columns_only:
-            # Only keep columns that exist in the dataframe
-            available_essential = [col for col in ESSENTIAL_COLUMNS if col in df.columns]
-            df = df[available_essential]
+            # Include all columns that the frontend expects in DEFAULT_COLUMNS
+            essential_cols = [
+                'Date', 'trade_date', 'Stream', 'Instrument', 'Profit', 'Result', 'Time',
+                'EntryTime', 'ExitTime', 'Session', 'Direction', 'Target', 'Range', 
+                'StopLoss', 'Peak', 'Time Change',
+                'final_allowed', 'ProfitDollars', 'day_of_month', 'dow', 'dow_full', 'month', 'year'
+            ]
+            # Only include columns that exist in the dataframe
+            available_cols = [col for col in essential_cols if col in df.columns]
+            # Always include all columns that exist (don't drop any)
+            df = df[available_cols]
         
-        # Get file modification time (when matrix was actually built/updated)
-        file_mtime = None
-        try:
-            if file_to_load.exists():
-                import os
-                from datetime import datetime
-                mtime_seconds = os.path.getmtime(file_to_load)
-                file_mtime = datetime.fromtimestamp(mtime_seconds).isoformat()
-        except Exception as e:
-            logger.debug(f"Could not get file modification time: {e}")
+        # Get file modification time for cache/version checking
+        file_mtime = file_to_load.stat().st_mtime
         
-        # Convert to records - use fast path for initial load if skip_cleaning is True
-        if skip_cleaning:
-            # Fast path: Use pandas native conversion with single pandas-level replace
-            # Replace all NaN/NA values at DataFrame level (O(n) not O(n×m))
-            import numpy as np
-            # Replace pd.NA and NaN with None in a single operation
-            df_cleaned = df.replace({pd.NA: None, np.nan: None})
-            # Convert datetime columns to strings for JSON serialization
-            # This ensures pandas Timestamp objects are converted before to_dict('records')
-            for col in df_cleaned.columns:
-                if pd.api.types.is_datetime64_any_dtype(df_cleaned[col]):
-                    df_cleaned[col] = df_cleaned[col].astype(str).replace('NaT', None)
-            records = df_cleaned.to_dict('records')
-            # Also handle any Timestamp objects that might still be in the records (defensive)
+        # Extract date ranges for debugging/metadata
+        full_min_trade_date = None
+        full_max_trade_date = None
+        returned_min_trade_date = None
+        returned_max_trade_date = None
+        
+        if 'trade_date' in df_full.columns:
+            df_full['trade_date'] = pd.to_datetime(df_full['trade_date'], errors='coerce')
+            full_min_trade_date = df_full['trade_date'].min()
+            full_max_trade_date = df_full['trade_date'].max()
+        
+        if 'trade_date' in df.columns:
+            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+            returned_min_trade_date = df['trade_date'].min()
+            returned_max_trade_date = df['trade_date'].max()
+        
+        # Ensure ProfitDollars column exists in the returned dataframe (for frontend use)
+        # CRITICAL: Drop existing ProfitDollars first to force recalculation with correct contract values
+        if "ProfitDollars" in df.columns:
+            df = df.drop(columns=["ProfitDollars"])
+        from modules.matrix import statistics
+        df = statistics._ensure_profit_dollars_column(df, contract_multiplier=contract_multiplier)
+        
+        # Clean data if requested (expensive operation, can be skipped for faster initial load)
+        if not skip_cleaning:
+            # Convert to records and clean values
+            records = df.to_dict('records')
+            # Clean each record (handle NaN, None, etc.)
+            cleaned_records = []
+            for record in records:
+                cleaned = {}
+                for key, value in record.items():
+                    if pd.isna(value):
+                        cleaned[key] = None
+                    elif isinstance(value, (pd.Timestamp, pd.DatetimeIndex)):
+                        cleaned[key] = value.isoformat() if hasattr(value, 'isoformat') else str(value)
+                    elif isinstance(value, (int, float)) and (pd.isna(value) or pd.isinf(value)):
+                        cleaned[key] = None
+                    else:
+                        cleaned[key] = value
+                cleaned_records.append(cleaned)
+            records = cleaned_records
+        else:
+            # Skip cleaning - just convert to records (faster)
+            records = df.to_dict('records')
+            # Still need to handle datetime serialization
             for record in records:
                 for key, value in record.items():
-                    if isinstance(value, pd.Timestamp):
-                        record[key] = str(value)
-                    elif value is pd.NaT:
+                    if isinstance(value, (pd.Timestamp, pd.DatetimeIndex)):
+                        record[key] = value.isoformat() if hasattr(value, 'isoformat') else str(value)
+                    elif pd.isna(value):
                         record[key] = None
-        else:
-            # Full sanitization path (for exports, full dataset requests)
-            import numpy as np
-            
-            # Convert to records first
-            records = df.to_dict('records')
-            
-            # Clean all values to ensure JSON compliance
-            def clean_value(v):
-                """Clean a value to be JSON-compliant"""
-                # Handle None
-                if v is None:
-                    return None
-                
-                # Handle pandas Timestamp objects - convert to string
-                if pd.api.types.is_datetime64_any_dtype(type(v)) or isinstance(v, pd.Timestamp):
-                    return str(v)
-                
-                # Handle float values (NaN, Infinity, out-of-range)
-                if isinstance(v, float):
-                    # Check for NaN
-                    if pd.isna(v) or np.isnan(v):
-                        return None
-                    # Check for Infinity
-                    if np.isinf(v):
-                        return None
-                    # Check if float is too large for JSON (JSON max is ~1.797e308)
-                    if abs(v) > 1e308:
-                        return None
-                
-                # Handle numpy types that might cause issues
-                if isinstance(v, (np.integer, np.floating)):
-                    # Convert numpy types to Python native types
-                    if np.isnan(v) or np.isinf(v):
-                        return None
-                    return v.item() if hasattr(v, 'item') else float(v)
-                
-                return v
-            
-            # Clean all values in records
-            records = [{k: clean_value(v) for k, v in record.items()} for record in records]
         
-        # Get metadata - handle None values to avoid comparison errors
-        streams = []
-        if 'Stream' in df.columns:
-            stream_values = df['Stream'].unique().tolist()
-            # Filter out None values before sorting
-            stream_values = [s for s in stream_values if s is not None and pd.notna(s)]
-            if stream_values:
-                try:
-                    streams = sorted(stream_values)
-                except Exception as e:
-                    logger.error(f"Error sorting streams: {e}, values: {stream_values[:10]}")
-                    streams = stream_values  # Return unsorted if sorting fails
-        
-        instruments = []
-        if 'Instrument' in df.columns:
-            instrument_values = df['Instrument'].unique().tolist()
-            # Filter out None values before sorting
-            instrument_values = [i for i in instrument_values if i is not None and pd.notna(i)]
-            if instrument_values:
-                try:
-                    instruments = sorted(instrument_values)
-                except Exception as e:
-                    logger.error(f"Error sorting instruments: {e}, values: {instrument_values[:10]}")
-                    instruments = instrument_values  # Return unsorted if sorting fails
-        
-        # Years already extracted above from full dataset before limiting
-        
-        # Update execution timetable when loading matrix data
-        # This ensures timetable_current.json reflects the latest matrix state
-        try:
-            # Load full dataframe (not limited) for timetable generation
-            df_full = await asyncio.to_thread(_load_parquet_sync)
-            
-            # Update execution timetable from loaded matrix
-            sys.path.insert(0, str(QTSW2_ROOT))
-            from modules.timetable.timetable_engine import TimetableEngine
-            
-            engine = TimetableEngine()
-            # Use None for trade_date to auto-detect latest date, None for stream_filters (will use defaults)
-            engine.write_execution_timetable_from_master_matrix(
-                df_full,
-                trade_date=None,  # Auto-detect latest date
-                stream_filters=None  # No stream filters available in GET request
-            )
-            logger.info("Execution timetable updated from loaded matrix data")
-        except Exception as e:
-            # Log but don't fail the data load if timetable update fails
-            logger.warning(f"Failed to update execution timetable when loading matrix data: {e}")
-            import traceback
-            logger.debug(f"Timetable update traceback: {traceback.format_exc()}")
+        # Extract unique streams and instruments from FULL dataset (before limiting)
+        streams = sorted(df_full['Stream'].unique().tolist()) if 'Stream' in df_full.columns else []
+        instruments = sorted(df_full['Instrument'].unique().tolist()) if 'Instrument' in df_full.columns else []
         
         response_data = {
             "data": records,
-            "total": len(df),
+            "total": len(df_full), # Total rows in the full parquet file
             "loaded": len(records),
             "file": file_to_load.name,
-            "file_mtime": file_mtime,  # When matrix was actually built/updated
+            "file_mtime": file_mtime,
             "streams": streams,
             "instruments": instruments,
-            "years": years
+            "years": years,
+            "stats_full": stats_full,
+            "full_min_trade_date": str(full_min_trade_date) if full_min_trade_date is not None else None,
+            "full_max_trade_date": str(full_max_trade_date) if full_max_trade_date is not None else None,
+            "returned_min_trade_date": str(returned_min_trade_date) if returned_min_trade_date is not None else None,
+            "returned_max_trade_date": str(returned_max_trade_date) if returned_max_trade_date is not None else None
         }
         
         # Use orjson for faster JSON serialization if available
         try:
             import orjson
-            # orjson handles NaN/None automatically, but Timestamp objects need to be strings
-            # We convert datetime columns to strings above, but handle any remaining Timestamp objects
-            json_bytes = orjson.dumps(
-                response_data,
-                option=orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_SERIALIZE_DATACLASS | orjson.OPT_PASSTHROUGH_DATETIME
-            )
-            return Response(content=json_bytes, media_type="application/json")
-        except (ImportError, TypeError) as e:
-            # Fallback to standard JSON serialization if orjson fails (e.g., Timestamp not handled)
-            # FastAPI's JSONResponse will handle serialization via Pydantic
-            logger.debug(f"orjson serialization failed, using JSONResponse fallback: {e}")
+            return JSONResponse(content=response_data, media_type="application/json")
+        except ImportError:
+            import json
             return JSONResponse(content=response_data, media_type="application/json")
     except Exception as e:
         import traceback
@@ -609,12 +408,386 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 0, essen
         raise HTTPException(status_code=500, detail=f"Failed to load matrix data: {error_detail}")
 
 
-@router.get("/test")
-async def test_matrix_endpoint():
-    """Test endpoint for matrix API."""
-    return {
-        "status": "success",
-        "message": "Matrix API is working",
-        "module": "modules.matrix.api"
-    }
+@router.post("/breakdown")
+async def calculate_profit_breakdown(request: BreakdownRequest):
+    """Calculate profit breakdowns (DOW, DOM, time, etc.) from the full dataset.
+    
+    This endpoint calculates breakdowns from ALL data in the parquet file, not just the loaded subset.
+    """
+    try:
+        import pandas as pd
+        
+        # Find latest matrix file (same logic as /data endpoint)
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        
+        if not root_matrix_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
+        
+        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        
+        if not parquet_files:
+            raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
+        
+        # Find latest file by timestamp or mtime
+        from datetime import datetime, timedelta
+        import re
+        now = datetime.now()
+        max_future_tolerance = timedelta(days=1)
+        
+        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
+            pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
+            match = pattern.search(file_path.name)
+            if match:
+                try:
+                    date_str = match.group(1) + match.group(2)
+                    return datetime.strptime(date_str, '%Y%m%d%H%M%S')
+                except ValueError:
+                    return None
+            return None
+        
+        files_with_timestamp = []
+        files_without_timestamp = []
+        
+        for f in parquet_files:
+            ts = parse_timestamp_from_filename(f)
+            if ts and ts <= now + max_future_tolerance:
+                files_with_timestamp.append((ts, f))
+            else:
+                files_without_timestamp.append(f)
+        
+        if files_with_timestamp:
+            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
+            file_to_load = files_with_timestamp[0][1]
+        elif files_without_timestamp:
+            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            file_to_load = files_without_timestamp[0]
+        else:
+            raise HTTPException(status_code=404, detail="No valid master matrix files found")
+        
+        # Load full dataset
+        def _load_parquet_sync():
+            return pd.read_parquet(file_to_load)
+        
+        df = await asyncio.to_thread(_load_parquet_sync)
+        
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
+        
+        # Apply stream inclusion filter if specified (before other processing)
+        if request.stream_include and len(request.stream_include) > 0 and 'Stream' in df.columns:
+            original_len = len(df)
+            df = df[df['Stream'].isin(request.stream_include)].copy()
+            logger.info(f"Applied stream_include filter to breakdown: {original_len} -> {len(df)} rows (streams: {request.stream_include})")
+        
+        # Prepare dataframe
+        from modules.matrix import statistics
+        df = statistics._ensure_final_allowed(df)
+        df = statistics._normalize_results(df)
+        df = statistics._ensure_profit_column(df)
+        df = statistics._ensure_profit_dollars_column(df, contract_multiplier=request.contract_multiplier)
+        df = statistics._ensure_date_column(df)
+        
+        # Apply filters if requested
+        if request.use_filtered and request.stream_filters:
+            logger.info(f"Applying filters: use_filtered={request.use_filtered}, stream_filters keys={list(request.stream_filters.keys())}")
+            # Apply stream filters - when 'master' is used, apply filters to all streams
+            # Otherwise, apply filters per stream
+            mask = pd.Series([True] * len(df))
+            
+            # Check if we have 'master' filters (apply to all streams)
+            master_filters = request.stream_filters.get('master')
+            if master_filters:
+                # Apply master filters to all rows
+                if master_filters.exclude_days_of_week:
+                    if 'dow_full' in df.columns:
+                        mask = mask & ~df['dow_full'].isin(master_filters.exclude_days_of_week)
+                    elif 'dow' in df.columns:
+                        dow_map = {'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3, 'Friday': 4, 'Saturday': 5, 'Sunday': 6}
+                        exclude_dow_nums = [dow_map.get(d, -1) for d in master_filters.exclude_days_of_week]
+                        mask = mask & ~df['dow'].isin(exclude_dow_nums)
+                
+                if master_filters.exclude_days_of_month:
+                    if 'day_of_month' in df.columns:
+                        mask = mask & ~df['day_of_month'].isin(master_filters.exclude_days_of_month)
+                
+                if master_filters.exclude_times:
+                    if 'Time' in df.columns:
+                        mask = mask & ~df['Time'].isin(master_filters.exclude_times)
+            
+            # Apply per-stream filters (for specific streams)
+            for stream_id, filter_config in request.stream_filters.items():
+                if stream_id == 'master':
+                    continue  # Already handled above
+                
+                # Create stream-specific mask
+                stream_rows = df['Stream'] == stream_id
+                stream_mask = pd.Series([True] * len(df))
+                
+                if filter_config.exclude_days_of_week:
+                    if 'dow_full' in df.columns:
+                        stream_mask = stream_mask & ~df['dow_full'].isin(filter_config.exclude_days_of_week)
+                    elif 'dow' in df.columns:
+                        dow_map = {'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3, 'Friday': 4, 'Saturday': 5, 'Sunday': 6}
+                        exclude_dow_nums = [dow_map.get(d, -1) for d in filter_config.exclude_days_of_week]
+                        stream_mask = stream_mask & ~df['dow'].isin(exclude_dow_nums)
+                
+                if filter_config.exclude_days_of_month:
+                    if 'day_of_month' in df.columns:
+                        stream_mask = stream_mask & ~df['day_of_month'].isin(filter_config.exclude_days_of_month)
+                
+                if filter_config.exclude_times:
+                    if 'Time' in df.columns:
+                        stream_mask = stream_mask & ~df['Time'].isin(filter_config.exclude_times)
+                
+                # Apply stream-specific filters only to that stream's rows
+                mask = mask & (~stream_rows | stream_mask)
+            
+            # Also apply final_allowed filter
+            if 'final_allowed' in df.columns:
+                mask = mask & (df['final_allowed'] != False)
+            
+            original_len = len(df)
+            df = df[mask].copy()
+            logger.info(f"After filtering: {len(df)} rows remaining (from {original_len} total)")
+        
+        # Calculate breakdown based on type
+        breakdown = {}
+        
+        if request.breakdown_type in ['day', 'dow']:
+            # Day of week breakdown - format matches frontend worker output
+            # Group by both DOW and Stream to show each stream's data separately
+            if 'dow_full' in df.columns and 'Stream' in df.columns:
+                grouped = df.groupby(['dow_full', 'Stream'])['ProfitDollars'].sum().reset_index()
+                for _, row in grouped.iterrows():
+                    dow = str(row['dow_full'])
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    if dow not in breakdown:
+                        breakdown[dow] = {}
+                    breakdown[dow][stream] = profit
+            elif 'dow' in df.columns and 'Stream' in df.columns:
+                dow_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                grouped = df.groupby(['dow', 'Stream'])['ProfitDollars'].sum().reset_index()
+                for _, row in grouped.iterrows():
+                    dow_num = int(row['dow'])
+                    dow_name = dow_names[dow_num] if 0 <= dow_num < len(dow_names) else f'Day{dow_num}'
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    if dow_name not in breakdown:
+                        breakdown[dow_name] = {}
+                    breakdown[dow_name][stream] = profit
+        
+        elif request.breakdown_type == 'dom':
+            # Day of month breakdown - format matches frontend worker output
+            # Group by both DOM and Stream to show each stream's data separately
+            if 'day_of_month' in df.columns and 'Stream' in df.columns:
+                grouped = df.groupby(['day_of_month', 'Stream'])['ProfitDollars'].sum().reset_index()
+                for _, row in grouped.iterrows():
+                    dom = int(row['day_of_month'])
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    if dom not in breakdown:
+                        breakdown[dom] = {}
+                    breakdown[dom][stream] = profit
+        
+        elif request.breakdown_type == 'time':
+            # Time breakdown - format matches frontend worker output (grouped by Time and Stream)
+            # Returns: {"08:00": {"ES1": 1000, "ES2": 2000}, "09:00": {...}}
+            if 'Time' in df.columns and 'Stream' in df.columns:
+                # Filter out invalid times
+                valid_df = df[df['Time'].notna() & (df['Time'] != 'NA') & (df['Time'] != '00:00')].copy()
+                
+                # Group by both Time and Stream to show each stream's data separately
+                grouped = valid_df.groupby(['Time', 'Stream'])['ProfitDollars'].sum().reset_index()
+                
+                for _, row in grouped.iterrows():
+                    time = str(row['Time']).strip()
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    
+                    if time not in breakdown:
+                        breakdown[time] = {}
+                    breakdown[time][stream] = profit
+                
+                logger.info(f"Time breakdown: {len(breakdown)} time slots, streams: {set([s for slots in breakdown.values() for s in slots.keys()])}")
+        
+        elif request.breakdown_type == 'month':
+            # Month breakdown
+            if 'month' in df.columns:
+                grouped = df.groupby('month')['ProfitDollars'].agg(['sum', 'count']).to_dict('index')
+                for month, data in grouped.items():
+                    breakdown[int(month)] = {
+                        'profit': float(data['sum']),
+                        'trades': int(data['count'])
+                    }
+        
+        elif request.breakdown_type == 'year':
+            # Year breakdown
+            if 'trade_date' in df.columns:
+                df['year'] = pd.to_datetime(df['trade_date']).dt.year
+                grouped = df.groupby('year')['ProfitDollars'].agg(['sum', 'count']).to_dict('index')
+                for year, data in grouped.items():
+                    breakdown[int(year)] = {
+                        'profit': float(data['sum']),
+                        'trades': int(data['count'])
+                    }
+        
+        return {
+            "breakdown": breakdown,
+            "breakdown_type": request.breakdown_type,
+            "total_rows": len(df),
+            "contract_multiplier": request.contract_multiplier
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating profit breakdown: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.post("/stream-stats")
+async def get_stream_stats(request: StreamStatsRequest):
+    """Get statistics for a specific stream using the full dataset."""
+    try:
+        import pandas as pd
+        from modules.matrix import statistics
+        
+        # Find latest matrix file (same logic as /data endpoint)
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        
+        if not root_matrix_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
+        
+        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        
+        if not parquet_files:
+            raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
+        
+        # Use same file selection logic as /data endpoint
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        max_future_tolerance = timedelta(days=1)
+        
+        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
+            try:
+                # Extract timestamp from filename: master_matrix_YYYYMMDD_HHMMSS.parquet
+                name = file_path.stem
+                if '_' in name:
+                    parts = name.split('_')
+                    if len(parts) >= 3:
+                        date_str = parts[2]  # YYYYMMDD
+                        time_str = parts[3] if len(parts) > 3 else "000000"  # HHMMSS
+                        timestamp_str = f"{date_str}_{time_str}"
+                        return datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+            except Exception:
+                pass
+            return None
+        
+        files_with_timestamp = []
+        files_without_timestamp = []
+        
+        for f in parquet_files:
+            ts = parse_timestamp_from_filename(f)
+            if ts and ts <= now + max_future_tolerance:
+                files_with_timestamp.append((ts, f))
+            else:
+                files_without_timestamp.append(f)
+        
+        if files_with_timestamp:
+            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
+            file_to_load = files_with_timestamp[0][1]
+        elif files_without_timestamp:
+            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            file_to_load = files_without_timestamp[0]
+        else:
+            raise HTTPException(status_code=404, detail="No valid master matrix files found")
+        
+        # Load full dataset (no limit, no column filtering - get everything)
+        def _load_parquet_sync():
+            return pd.read_parquet(file_to_load)
+        
+        df = await asyncio.to_thread(_load_parquet_sync)
+        
+        logger.info(f"Loaded full parquet file: {len(df)} total rows")
+        
+        if df.empty:
+            raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
+        
+        # Filter to specific stream
+        if 'Stream' not in df.columns:
+            raise HTTPException(status_code=400, detail="Stream column not found in data")
+        
+        stream_df = df[df['Stream'] == request.stream_id].copy()
+        
+        logger.info(f"Filtered to stream {request.stream_id}: {len(stream_df)} rows (should be full dataset for this stream)")
+        
+        if stream_df.empty:
+            return JSONResponse(content={
+                "stream_id": request.stream_id,
+                "stats": None,
+                "message": f"No data found for stream {request.stream_id}"
+            }, media_type="application/json")
+        
+        # Prepare dataframe
+        df_for_stats = statistics._ensure_final_allowed(stream_df)
+        df_for_stats = statistics._normalize_results(df_for_stats)
+        df_for_stats = statistics._ensure_profit_column(df_for_stats)
+        
+        # CRITICAL: Force recomputation of ProfitDollars with the correct contract values and multiplier
+        # We MUST drop and recalculate to ensure correct values
+        if "ProfitDollars" in df_for_stats.columns:
+            df_for_stats = df_for_stats.drop(columns=["ProfitDollars"])
+        
+        # Calculate stats for this stream (this will recalculate ProfitDollars with correct contract values)
+        logger.info(f"Calculating stats for stream {request.stream_id}: {len(stream_df)} rows (full dataset), contract_multiplier={request.contract_multiplier}")
+        
+        stats = statistics.calculate_summary_stats(
+            df_for_stats,
+            include_filtered_executed=request.include_filtered_executed,
+            contract_multiplier=request.contract_multiplier
+        )
+        
+        total_profit = stats.get('performance_trade_metrics', {}).get('total_profit', 'N/A') if stats else 'N/A'
+        executed_trades = stats.get('sample_counts', {}).get('executed_trades_total', 'N/A') if stats else 'N/A'
+        logger.info(f"Calculated stats for stream {request.stream_id}: total_profit={total_profit}, executed_trades={executed_trades}")
+        
+        return JSONResponse(content={
+            "stream_id": request.stream_id,
+            "stats": stats,
+            "contract_multiplier": request.contract_multiplier
+        }, media_type="application/json")
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        import traceback
+        logger.error(f"Error calculating stream stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to calculate stream stats: {str(e)}")
+
+
+@router.get("/files")
+async def list_matrix_files():
+    """List available master matrix files."""
+    try:
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        
+        if not root_matrix_dir.exists():
+            return {"files": []}
+        
+        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        
+        files_info = []
+        for f in parquet_files:
+            stat = f.stat()
+            files_info.append({
+                "name": f.name,
+                "size": stat.st_size,
+                "mtime": stat.st_mtime
+            })
+        
+        # Sort by mtime descending (newest first)
+        files_info.sort(key=lambda x: x["mtime"], reverse=True)
+        
+        return {"files": files_info}
+    except Exception as e:
+        logger.error(f"Error listing matrix files: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

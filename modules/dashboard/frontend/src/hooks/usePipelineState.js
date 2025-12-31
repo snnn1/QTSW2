@@ -100,15 +100,15 @@ export async function getPipelineStatus() {
 /* -------------------------------------------------------
    Start pipeline
 ------------------------------------------------------- */
-export async function startPipeline() {
-  console.log('[API] Calling POST /api/pipeline/start')
+export async function startPipeline(manualOverride = false) {
+  console.log('[API] Calling POST /api/pipeline/start', { manualOverride })
   try {
   const res = await fetchWithTimeout(
     `${API_BASE}/pipeline/start`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ manual: true }),
+      body: JSON.stringify({ manual: true, manual_override: manualOverride }),
     },
     15000
   )
@@ -547,12 +547,12 @@ export function usePipelineState() {
   }, [wsEvents])
 
   // Start pipeline
-  const handleStartPipeline = useCallback(async () => {
+  const handleStartPipeline = useCallback(async (manualOverride = false) => {
     // #region agent log BTN4
     const _clickTime = Date.now();
-    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'button clicked',data:{isStarting,isRunning:pipelineStatus.isRunning,state:pipelineStatus.state,runId:pipelineStatus.runId},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
+    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'button clicked',data:{isStarting,isRunning:pipelineStatus.isRunning,state:pipelineStatus.state,runId:pipelineStatus.runId,manualOverride},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
     // #endregion
-    console.log('[Pipeline] Start button clicked', { isStarting, isRunning: pipelineStatus.isRunning, state: pipelineStatus.state })
+    console.log('[Pipeline] Start button clicked', { isStarting, isRunning: pipelineStatus.isRunning, state: pipelineStatus.state, manualOverride })
     
     if (isStarting || pipelineStatus.isRunning) {
       console.log('[Pipeline] Start blocked - already starting or running')
@@ -567,8 +567,8 @@ export function usePipelineState() {
     fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'setIsStarting(true)',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
     // #endregion
     try {
-      console.log('[Pipeline] Calling startPipeline API...')
-      const result = await startPipeline()
+      console.log('[Pipeline] Calling startPipeline API...', { manualOverride })
+      const result = await startPipeline(manualOverride)
       console.log('[Pipeline] Start API response:', result)
       
       if (result && result.run_id) {
@@ -625,10 +625,34 @@ export function usePipelineState() {
       fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'start error',data:{error:error.message,api_duration_ms:Date.now()-_clickTime},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
       // #endregion
       setIsStarting(false)  // Reset on error
-      setAlertInfo({
-        type: 'error',
-        message: error.message || 'Failed to start pipeline',
-      })
+      
+      // Check if this is a health override requirement
+      const errorMsg = error.message || ''
+      const requiresOverride = errorMsg.includes('requires override') || errorMsg.includes('health is unstable') || errorMsg.includes('health is degraded')
+      
+      if (requiresOverride && !manualOverride) {
+        // Prompt user to override
+        const shouldOverride = window.confirm(
+          'Pipeline health is unstable/degraded. Recent runs have failed.\n\n' +
+          'Do you want to override the health check and run anyway?\n\n' +
+          'Click OK to override and run, or Cancel to abort.'
+        )
+        
+        if (shouldOverride) {
+          // Retry with override
+          return handleStartPipeline(true)
+        } else {
+          setAlertInfo({
+            type: 'warning',
+            message: 'Pipeline start cancelled. Health check requires override.',
+          })
+        }
+      } else {
+        setAlertInfo({
+          type: 'error',
+          message: error.message || 'Failed to start pipeline',
+        })
+      }
     }
     // REMOVED: finally block that was resetting isStarting too early
     // isStarting will be reset when updatePipelineStatus detects pipeline has finished

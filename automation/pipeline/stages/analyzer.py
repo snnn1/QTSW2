@@ -129,6 +129,32 @@ class AnalyzerService:
             self.logger.warning(result.error_message)
             self.event_logger.emit(run_id, "analyzer", "log", result.error_message)
             return result
+
+        # Filter down to instruments supported by the parallel analyzer runner CLI.
+        # Without this, adding new instruments to data/translated (e.g., RTY) can cause
+        # the analyzer runner to exit immediately (argparse "invalid choice" → exit code 2),
+        # which then cascades into "unstable health" and policy-gated runs.
+        supported_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "RTY"}
+        unsupported = sorted(i for i in instruments if i not in supported_instruments)
+        if unsupported:
+            self.logger.warning(
+                f"Analyzer: skipping unsupported instrument(s) discovered in input folder: {', '.join(unsupported)}"
+            )
+            # Emit a single log event (avoid per-file spam)
+            self.event_logger.emit(
+                run_id,
+                "analyzer",
+                "log",
+                f"Skipping unsupported instrument(s): {', '.join(unsupported)}"
+            )
+            instruments = set(i for i in instruments if i in supported_instruments)
+        
+        if not instruments:
+            result.status = "skipped"
+            result.error_message = "No supported instruments found in translated data"
+            self.logger.warning(result.error_message)
+            self.event_logger.emit(run_id, "analyzer", "log", result.error_message)
+            return result
         
         instruments_list = sorted(list(instruments))
         self.logger.info(f"Analyzer input folder: {input_folder}")

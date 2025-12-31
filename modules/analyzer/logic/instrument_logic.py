@@ -5,6 +5,7 @@ Handles instrument-specific calculations and logic
 
 from typing import Dict, Tuple, Literal
 from dataclasses import dataclass
+import pandas as pd
 
 Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"]
 

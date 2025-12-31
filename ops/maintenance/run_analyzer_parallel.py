@@ -67,6 +67,11 @@ ANALYZER_SCRIPT = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_pr
 DATA_PROCESSED = QTSW2_ROOT / "data" / "data_processed"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 
+# Keep this in sync with what the analyzer supports (see modules/analyzer/* config).
+# IMPORTANT: If this list is too strict, the pipeline analyzer stage can fail fast with exit code 2
+# due to argparse rejecting unknown instruments.
+SUPPORTED_INSTRUMENTS = ["ES", "NQ", "YM", "CL", "NG", "GC", "RTY"]
+
 def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script: Path, run_id: Optional[str] = None) -> Tuple[str, bool, str]:
     """
     Run analyzer for a single instrument.
@@ -314,7 +319,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Run analyzer for multiple instruments in parallel")
     parser.add_argument("--instruments", nargs="+", required=True,
-                       choices=["ES", "NQ", "YM", "CL", "NG", "GC"],
+                       choices=SUPPORTED_INSTRUMENTS,
                        help="List of instruments to process")
     parser.add_argument("--workers", type=int, default=None,
                        help="Number of parallel workers (default: auto-detect)")

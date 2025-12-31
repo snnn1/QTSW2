@@ -97,13 +97,13 @@ export async function getPipelineStatus() {
   }
 }
 
-export async function startPipeline() {
+export async function startPipeline(manualOverride = false) {
   const res = await fetchWithTimeout(
     `${API_BASE}/pipeline/start`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ manual: true }),
+      body: JSON.stringify({ manual: true, manual_override: manualOverride }),
     },
     30000
   )

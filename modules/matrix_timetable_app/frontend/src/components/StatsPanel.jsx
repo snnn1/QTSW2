@@ -85,6 +85,18 @@ export default function StatsPanel({ streamId, stats, loading, error, noData }) 
               <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
             </div>
             <div>
+              <div className="text-xs text-gray-400 mb-1">Daily Win Rate</div>
+              <div className="text-lg font-semibold text-green-400">
+                {stats.dailyWinRate !== null && stats.dailyWinRate !== undefined ? `${stats.dailyWinRate}%` : 'N/A'}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Weekly Win Rate</div>
+              <div className="text-lg font-semibold text-green-400">
+                {stats.weeklyWinRate !== null && stats.weeklyWinRate !== undefined ? `${stats.weeklyWinRate}%` : 'N/A'}
+              </div>
+            </div>
+            <div>
               <div className="text-xs text-gray-400 mb-1">Wins</div>
               <div className="text-lg font-semibold text-green-400">{stats.wins}</div>
             </div>

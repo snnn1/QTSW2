@@ -1,9 +1,44 @@
 """
 Statistics calculation and reporting for Master Matrix.
 
-CRITICAL GUARANTEES (NEW):
+CRITICAL GUARANTEES:
+================================================================================
+FILTERING AFFECTS ALL METRICS (RISK AND BEHAVIORAL):
+- All metrics follow the include_filtered_executed toggle:
+  → If include_filtered_executed == True: Metrics computed on ALL executed trades (executed_all)
+  → If include_filtered_executed == False: Metrics computed on ALLOWED executed trades only (executed_selected)
+
+RISK METRICS (now follow filtering):
+- Sharpe ratio: Computed on executed_selected (follows toggle)
+- Sortino ratio: Computed on executed_selected (follows toggle)
+- Calmar ratio: Computed on executed_selected (follows toggle)
+- Daily volatility: Computed on executed_selected (follows toggle)
+- Daily max drawdown: Computed on executed_selected (follows toggle)
+- Time-to-recovery: Computed on executed_selected (follows toggle)
+- Monthly return std dev: Computed on executed_selected (follows toggle)
+
+BEHAVIORAL METRICS (follow filtering):
+- Win rate: Computed on executed_selected (follows toggle)
+- Avg profit per trade: Computed on executed_selected
+- Avg trades per day: Computed on executed_selected / active_trading_days
+- Profit per active day: Computed on executed_selected / active_trading_days
+- Profit projections (week/month/year): Computed on executed_selected / active_trading_days
+
+DATASET DEFINITIONS:
+- executed_all: ALL rows where is_executed_trade == True (includes filtered + allowed)
+  
+- executed_selected: 
+  → If include_filtered_executed == True: Same as executed_all
+  → If include_filtered_executed == False: executed_all where final_allowed == True
+  → Used for ALL metrics (risk and behavioral) - follows the toggle
+
+DAY COUNT:
+- active_trading_days: Derived from executed_selected (activity-based)
+- All metrics use active_trading_days for day-based calculations
+================================================================================
+
+ADDITIONAL GUARANTEES:
 - Performance/risk stats computed on EXECUTED TRADES ONLY (Win, Loss, BE, TIME)
-- final_allowed is for UI visibility, not stats sample (unless include_filtered_executed=False)
 - TIME results treated as executed trades everywhere
 - Consistent units: per-trade metrics use trade sequence, Sharpe/Sortino use daily PnL series
 - NoTrade excluded from performance stats
@@ -91,35 +126,50 @@ def _ensure_profit_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _ensure_profit_dollars_column(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_profit_dollars_column(df: pd.DataFrame, contract_multiplier: float = 1.0) -> pd.DataFrame:
     """
-    Ensure ProfitDollars column exists. If not, create from Profit using contract multipliers.
+    Ensure ProfitDollars column exists. ALWAYS recompute from Profit to ensure contract_multiplier is applied correctly.
+    
+    Args:
+        df: DataFrame to process
+        contract_multiplier: Multiplier for contract size (e.g., 2.0 for trading 2 contracts)
     """
     df = df.copy()
-    if "ProfitDollars" not in df.columns:
-        # Try to compute from Profit and Instrument
-        contract_values = {
-            "ES": 50.0,
-            "MES": 5.0,
-            "NQ": 20.0,
-            "MNQ": 2.0,
-            "YM": 5.0,
-            "MYM": 0.5,
-            "RTY": 50.0,
-        }
-        
-        def get_contract_value(instrument_str):
-            if pd.isna(instrument_str) or instrument_str is None:
-                return 50.0  # Default to ES
-            inst_str = str(instrument_str).strip().upper()
-            # Remove year suffix if present (e.g., "ES2" -> "ES")
-            base_inst = inst_str.rstrip("0123456789")
-            return contract_values.get(base_inst, 50.0)
-        
-        df["ProfitDollars"] = df.apply(
-            lambda row: (row.get("Profit", 0.0) or 0.0) * get_contract_value(row.get("Instrument")),
-            axis=1
-        )
+    
+    # Complete contract value map (dollars per point)
+    contract_values = {
+        "ES": 50.0,
+        "MES": 5.0,
+        "NQ": 10.0,
+        "MNQ": 2.0,
+        "YM": 5.0,
+        "MYM": 0.5,
+        "RTY": 50.0,
+        "CL": 1000.0,  # Crude Oil
+        "NG": 10000.0,  # Natural Gas
+        "GC": 100.0,  # Gold
+    }
+    
+    def get_contract_value(instrument_str):
+        if pd.isna(instrument_str) or instrument_str is None:
+            return 50.0  # Default to ES
+        inst_str = str(instrument_str).strip().upper()
+        # Remove trailing digits if present (e.g., "ES2" -> "ES", "NQ1" -> "NQ")
+        base_inst = inst_str.rstrip("0123456789")
+        contract_val = contract_values.get(base_inst, 50.0)
+        # Debug logging for NQ streams to verify contract value
+        if base_inst == "NQ" and contract_val != 10.0:
+            logger.warning(f"NQ contract value mismatch: got {contract_val}, expected 10.0 for instrument {instrument_str}")
+        return contract_val
+    
+    # ALWAYS recompute ProfitDollars from Profit to ensure contract_multiplier is applied correctly
+    # This ensures that even if ProfitDollars exists in the DataFrame (from previous calculations),
+    # we always use the current multiplier value
+    df["ProfitDollars"] = df.apply(
+        lambda row: (row.get("Profit", 0.0) or 0.0) * get_contract_value(row.get("Instrument")) * contract_multiplier,
+        axis=1
+    )
+    
     df["ProfitDollars"] = pd.to_numeric(df["ProfitDollars"], errors='coerce').fillna(0.0)
     return df
 
@@ -142,7 +192,8 @@ def _ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_summary_stats(
     df: pd.DataFrame,
-    include_filtered_executed: bool = True
+    include_filtered_executed: bool = True,
+    contract_multiplier: float = 1.0
 ) -> Dict:
     """
     Calculate and log summary statistics for the master matrix.
@@ -166,7 +217,7 @@ def calculate_summary_stats(
     df = _ensure_final_allowed(df)
     df = _normalize_results(df)
     df = _ensure_profit_column(df)
-    df = _ensure_profit_dollars_column(df)
+    df = _ensure_profit_dollars_column(df, contract_multiplier=contract_multiplier)
     df = _ensure_date_column(df)
     
     # Add is_executed_trade flag
@@ -198,55 +249,77 @@ def calculate_summary_stats(
     }
     
     # ========================================================================
-    # CALCULATE DAY COUNTS
-    # - executed_trading_days: from ALL executed trades (for reporting)
-    # - allowed_trading_days: from stats sample (days actually traded in stats)
+    # STEP 1: ESTABLISH TWO EXPLICIT DATASETS
     # ========================================================================
-    executed_day_counts = _calculate_day_counts(executed_df)
-    executed_trading_days = executed_day_counts["executed_trading_days"]
+    # executed_all: ALL executed trades (filtered + allowed) - AUTHORITATIVE RISK UNIVERSE
+    executed_all = executed_df.copy()
     
-    # ========================================================================
-    # SELECT STATS SAMPLE: Executed trades (optionally filtered by final_allowed)
-    # ========================================================================
+    # executed_selected: Selected executed trades based on include_filtered_executed flag
+    # - If include_filtered_executed == True: Same as executed_all
+    # - If include_filtered_executed == False: Only allowed executed trades
+    # This is the BEHAVIORAL / REPORTING SAMPLE
     if include_filtered_executed:
-        stats_sample = executed_df
+        executed_selected = executed_all.copy()
     else:
-        stats_sample = executed_df[executed_df["final_allowed"]]
+        executed_selected = executed_all[executed_all["final_allowed"]].copy()
     
-    if len(stats_sample) == 0:
-        logger.warning("No executed trades in stats sample")
+    if len(executed_selected) == 0:
+        logger.warning("No executed trades in executed_selected")
+        # Still calculate risk metrics from executed_all even if selected is empty
+        executed_day_counts = _calculate_day_counts(executed_all)
+        executed_trading_days = executed_day_counts["executed_trading_days"]
         return {
             "sample_counts": sample_counts,
             "performance_trade_metrics": _empty_trade_metrics(),
             "performance_daily_metrics": _empty_daily_metrics(),
-            "day_counts": {"executed_trading_days": executed_trading_days, "allowed_trading_days": 0},
+            "day_counts": {
+                "executed_trading_days": executed_trading_days,  # Risk calendar days
+                "active_trading_days": 0,  # Behavioral activity days
+            },
         }
     
     # ========================================================================
-    # ACTIVE TRADING DAYS: Count unique days from stats sample ONLY
-    # A day is active if and only if it contains ≥1 trade in the stats sample
-    # When toggle OFF: Days with only filtered trades are NOT counted
-    # When toggle ON: All days with executed trades are counted
+    # STEP 2: DAY COUNTING
     # ========================================================================
-    active_trading_days = _count_unique_days(stats_sample)
-    stats_sample_trade_count = len(stats_sample)
+    # active_trading_days: Derived from executed_selected (follows toggle)
+    # All metrics (risk and behavioral) use active_trading_days
+    active_trading_days = _count_unique_days(executed_selected)
+    executed_selected_trade_count = len(executed_selected)
+    
+    # Also calculate executed_trading_days from executed_all for reference/comparison
+    executed_day_counts = _calculate_day_counts(executed_all)
+    executed_trading_days = executed_day_counts["executed_trading_days"]
     
     # ========================================================================
-    # PERFORMANCE TRADE METRICS (per-trade, computed on executed trades only)
+    # PERFORMANCE TRADE METRICS (per-trade, computed on executed_selected)
     # ========================================================================
-    performance_trade_metrics = _calculate_trade_metrics(stats_sample)
+    performance_trade_metrics = _calculate_trade_metrics(executed_selected)
     
     # ========================================================================
-    # PERFORMANCE DAILY METRICS (daily aggregation, computed on executed trades only)
-    # Behavioral averages use active_trading_days (from stats sample ONLY)
-    # Risk metrics (Sharpe/Sortino/Calmar) use daily PnL series from stats sample
+    # STEP 3: DAILY METRIC COMPUTATION
     # ========================================================================
-    performance_daily_metrics = _calculate_daily_metrics(
-        stats_sample,
+    # A) Risk daily metrics - now computed from executed_selected (follows toggle)
+    risk_daily_metrics = _calculate_risk_daily_metrics(executed_selected)
+    
+    # B) Behavioral daily metrics - computed from executed_selected
+    behavioral_daily_metrics = _calculate_behavioral_daily_metrics(
+        executed_selected,
         active_trading_days=active_trading_days,
         total_profit=performance_trade_metrics["total_profit"],
-        stats_sample_trade_count=stats_sample_trade_count
+        executed_selected_trade_count=executed_selected_trade_count
     )
+    
+    # Merge risk and behavioral metrics
+    performance_daily_metrics = {**risk_daily_metrics, **behavioral_daily_metrics}
+    
+    # ========================================================================
+    # VALIDATION ASSERTIONS
+    # ========================================================================
+    # Basic sanity checks
+    assert len(executed_all) >= len(executed_selected), "executed_all must contain all executed trades"
+    assert active_trading_days == _count_unique_days(executed_selected), "active_trading_days must be from executed_selected"
+    assert executed_trading_days == _count_unique_days(executed_all), "executed_trading_days must be from executed_all"
+    assert executed_trading_days >= active_trading_days, "Total trading days must be >= active trading days"
     
     # ========================================================================
     # LOGGING
@@ -257,7 +330,7 @@ def calculate_summary_stats(
     logger.info(f"Total Rows: {total_rows} | Allowed: {allowed_rows} | Filtered: {filtered_rows}")
     logger.info(f"Executed Trades: Total={executed_trades_total} | Allowed={executed_trades_allowed} | Filtered={executed_trades_filtered}")
     logger.info(f"NoTrade Rows: {notrade_total}")
-    logger.info(f"Stats Sample: {len(stats_sample)} executed trades (include_filtered={include_filtered_executed})")
+    logger.info(f"Executed Selected: {executed_selected_trade_count} executed trades (include_filtered={include_filtered_executed})")
     logger.info("Performance Trade Metrics:")
     logger.info(f"  Wins: {performance_trade_metrics['wins']} | Losses: {performance_trade_metrics['losses']} | BE: {performance_trade_metrics['be']} | TIME: {performance_trade_metrics['time']}")
     logger.info(f"  Win Rate: {performance_trade_metrics['win_rate']:.1f}%")
@@ -265,13 +338,14 @@ def calculate_summary_stats(
     logger.info(f"  Avg Profit / Trade: {performance_trade_metrics['mean_pnl_per_trade']:.2f}")
     logger.info(f"  Risk-Reward: {performance_trade_metrics['rr_ratio']:.2f}")
     logger.info("Performance Daily Metrics:")
-    logger.info(f"  Executed Trading Days: {executed_trading_days} (all executed trades, for reference)")
-    logger.info(f"  Active Trading Days: {active_trading_days} (days with ≥1 trade in stats sample)")
-    logger.info(f"  Stats Sample: {stats_sample_trade_count} trades across {active_trading_days} active days")
+    logger.info(f"  Executed Trading Days (all): {executed_trading_days} (from executed_all, for reference)")
+    logger.info(f"  Active Trading Days (selected): {active_trading_days} (from executed_selected, used for metrics)")
+    logger.info(f"  Executed Selected: {executed_selected_trade_count} trades across {active_trading_days} active days")
     logger.info(f"  Avg Trades Per Active Day: {performance_daily_metrics['avg_trades_per_day']:.2f}")
     logger.info(f"  Profit Per Active Day: {performance_daily_metrics['profit_per_day']:.2f}")
-    logger.info(f"  Sharpe Ratio: {performance_daily_metrics['sharpe_ratio']:.2f}")
-    logger.info(f"  Sortino Ratio: {performance_daily_metrics['sortino_ratio']:.2f}")
+    logger.info(f"  Sharpe Ratio: {performance_daily_metrics['sharpe_ratio']:.2f} (computed on executed_selected, follows toggle)")
+    logger.info(f"  Sortino Ratio: {performance_daily_metrics['sortino_ratio']:.2f} (computed on executed_selected, follows toggle)")
+    logger.info(f"  Calmar Ratio: {performance_daily_metrics['calmar_ratio']:.2f} (computed on executed_selected, follows toggle)")
     logger.info("=" * 80)
     
     return {
@@ -279,8 +353,9 @@ def calculate_summary_stats(
         "performance_trade_metrics": performance_trade_metrics,
         "performance_daily_metrics": performance_daily_metrics,
         "day_counts": {
-            "executed_trading_days": executed_trading_days,  # All executed trades (for reference)
-            "allowed_trading_days": active_trading_days,  # Active days from stats sample (for behavioral metrics)
+            "executed_trading_days": executed_trading_days,  # Total trading days (from executed_all, for reference)
+            "active_trading_days": active_trading_days,  # Active trading days (from executed_selected, used for metrics)
+            "allowed_trading_days": active_trading_days,  # Alias for active_trading_days (for frontend compatibility)
         },
     }
 
@@ -507,66 +582,74 @@ def _count_unique_days(df: pd.DataFrame) -> int:
     return len(unique_days)
 
 
-def _calculate_daily_metrics(
-    executed_df: pd.DataFrame,
-    active_trading_days: int,
-    total_profit: float,
-    stats_sample_trade_count: int
+def _calculate_risk_daily_metrics(
+    executed_selected: pd.DataFrame
 ) -> Dict:
     """
-    Calculate daily aggregation performance metrics from executed trades DataFrame.
+    Calculate RISK daily metrics from SELECTED executed trades (executed_selected).
     
-    Uses Option 1: Actual calendar months for monthly metrics.
-    
-    CRITICAL: Behavioral averages (profit_per_day, avg_trades_per_day) use active_trading_days,
-    which is computed from the stats sample ONLY. A day is active if and only if it contains
-    ≥1 trade in the stats sample. Days with zero trades in the stats sample are NOT counted.
-    
-    Risk metrics (Sharpe/Sortino/Calmar) use daily PnL series from executed_df (stats sample).
+    These metrics now follow the include_filtered_executed toggle:
+    - Sharpe ratio
+    - Sortino ratio
+    - Calmar ratio
+    - Daily volatility
+    - Daily max drawdown
+    - Time-to-recovery
+    - Monthly return std dev
     
     Args:
-        executed_df: DataFrame containing ONLY executed trades in stats sample, must have trade_date column
-        active_trading_days: Count of active trading days (unique days in stats sample, for behavioral averages)
-        total_profit: Total profit from stats sample (for profit_per_day calculation)
-        stats_sample_trade_count: Count of trades in stats sample (for avg_trades_per_day)
+        executed_selected: DataFrame containing SELECTED executed trades (may be filtered based on toggle), must have trade_date column
         
     Returns:
-        Dictionary of daily metrics
+        Dictionary of RISK daily metrics (follows filtering toggle)
     """
-    if executed_df.empty:
-        return _empty_daily_metrics()
+    if executed_selected.empty:
+        return {
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "calmar_ratio": 0.0,
+            "time_to_recovery_days": 0,
+            "monthly_return_stddev": 0.0,
+            "max_drawdown_daily": 0.0,
+        }
     
     # Ensure trade_date exists
-    if "trade_date" not in executed_df.columns:
-        logger.warning("trade_date column missing, cannot calculate daily metrics")
-        return _empty_daily_metrics()
+    if "trade_date" not in executed_selected.columns:
+        logger.warning("trade_date column missing, cannot calculate risk daily metrics")
+        return {
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "calmar_ratio": 0.0,
+            "time_to_recovery_days": 0,
+            "monthly_return_stddev": 0.0,
+            "max_drawdown_daily": 0.0,
+        }
     
     # Remove rows with invalid dates
-    valid_dates = executed_df["trade_date"].notna()
-    daily_df = executed_df[valid_dates].copy()
+    valid_dates = executed_selected["trade_date"].notna()
+    daily_df = executed_selected[valid_dates].copy()
     
     if daily_df.empty:
-        return _empty_daily_metrics()
+        return {
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "calmar_ratio": 0.0,
+            "time_to_recovery_days": 0,
+            "monthly_return_stddev": 0.0,
+            "max_drawdown_daily": 0.0,
+        }
     
     # Profit column (use ProfitDollars if available, else Profit)
     profit_col = "ProfitDollars" if "ProfitDollars" in daily_df.columns else "Profit"
     
-    # Group by trading day (date only, not time) - for risk metrics (daily PnL series)
-    # OPTIMIZED: Use sort=False for faster groupby when order doesn't matter
+    # Group by trading day (date only, not time) - RISK METRICS NOW FOLLOW TOGGLE (use executed_selected)
     daily_df["trade_date_only"] = daily_df["trade_date"].dt.date
     daily_pnl = daily_df.groupby("trade_date_only", sort=False)[profit_col].sum().reset_index()
     daily_pnl.columns = ["date", "pnl"]
     
-    # Behavioral averages use active_trading_days (days with ≥1 trade in stats sample)
-    # avg_trades_per_active_day = stats_sample_trade_count / active_trading_days
-    avg_trades_per_day = (stats_sample_trade_count / active_trading_days) if active_trading_days > 0 else 0.0
-    
-    # profit_per_active_day = total_profit / active_trading_days
-    profit_per_day = (total_profit / active_trading_days) if active_trading_days > 0 else 0.0
-    
     # Sharpe/Sortino ratios (annualized using 252 trading days)
     daily_returns = daily_pnl["pnl"].values
-    mean_daily_return = float(np.mean(daily_returns))
+    mean_daily_return = float(np.mean(daily_returns)) if len(daily_returns) > 0 else 0.0
     std_daily_return = float(np.std(daily_returns)) if len(daily_returns) > 1 else 0.0
     
     trading_days_per_year = 252
@@ -581,7 +664,6 @@ def _calculate_daily_metrics(
     sortino_ratio = annualized_return / annualized_downside_vol if annualized_downside_vol > 0 else 0.0
     
     # Time to recovery (trading days, not calendar days)
-    # Count as difference in trading day index, not calendar day difference
     cumulative_pnl = daily_pnl["pnl"].cumsum()
     running_max = cumulative_pnl.expanding().max()
     drawdown = cumulative_pnl - running_max
@@ -604,13 +686,11 @@ def _calculate_daily_metrics(
                 drawdown_start_idx = None
     
     # Monthly return std dev (Option 1: actual calendar months)
-    # OPTIMIZED: Use sort=False for faster groupby
     daily_df["year_month"] = daily_df["trade_date"].dt.to_period("M")
     monthly_pnl = daily_df.groupby("year_month", sort=False)[profit_col].sum()
     monthly_return_stddev = float(monthly_pnl.std()) if len(monthly_pnl) > 1 else 0.0
     
     # Calmar ratio (annualized return / max drawdown)
-    # Annualized return from daily aggregation (use mean daily return from PnL series for consistency with Sharpe/Sortino)
     mean_daily_return_for_annualization = float(np.mean(daily_returns)) if len(daily_returns) > 0 else 0.0
     annual_return_from_daily = mean_daily_return_for_annualization * trading_days_per_year
     # Max drawdown from daily cumulative PnL series
@@ -620,24 +700,63 @@ def _calculate_daily_metrics(
     max_drawdown_from_daily = float(abs(drawdown_daily.min())) if not drawdown_daily.empty else 0.0
     calmar_ratio = annual_return_from_daily / max_drawdown_from_daily if max_drawdown_from_daily > 0 else 0.0
     
+    return {
+        "sharpe_ratio": round(sharpe_ratio, 2),
+        "sortino_ratio": round(sortino_ratio, 2),
+        "calmar_ratio": round(calmar_ratio, 2),
+        "time_to_recovery_days": int(time_to_recovery_days),
+        "monthly_return_stddev": round(monthly_return_stddev, 2),
+        "max_drawdown_daily": round(max_drawdown_from_daily, 2),
+    }
+
+
+def _calculate_behavioral_daily_metrics(
+    executed_selected: pd.DataFrame,
+    active_trading_days: int,
+    total_profit: float,
+    executed_selected_trade_count: int
+) -> Dict:
+    """
+    Calculate BEHAVIORAL daily metrics from SELECTED executed trades (executed_selected).
+    
+    These metrics MAY be affected by filtering:
+    - Avg trades per day
+    - Profit per active day
+    - Profit projections (week/month/year)
+    
+    Args:
+        executed_selected: DataFrame containing SELECTED executed trades (may be filtered), must have trade_date column
+        active_trading_days: Count of active trading days (activity-based, from executed_selected)
+        total_profit: Total profit from executed_selected (for profit_per_day calculation)
+        executed_selected_trade_count: Count of trades in executed_selected (for avg_trades_per_day)
+        
+    Returns:
+        Dictionary of BEHAVIORAL daily metrics (may vary with filtering)
+    """
+    if executed_selected.empty or active_trading_days == 0:
+        return {
+            "avg_trades_per_day": 0.0,
+            "profit_per_day": 0.0,
+            "profit_per_week": 0.0,
+            "profit_per_month": 0.0,
+            "profit_per_year": 0.0,
+        }
+    
+    # Behavioral averages use active_trading_days (days with ≥1 trade in executed_selected)
+    avg_trades_per_day = (executed_selected_trade_count / active_trading_days) if active_trading_days > 0 else 0.0
+    profit_per_day = (total_profit / active_trading_days) if active_trading_days > 0 else 0.0
+    
     # Projected metrics (from profit_per_day)
     profit_per_week = profit_per_day * 5
     profit_per_month = profit_per_day * 21
     profit_per_year = profit_per_day * 252
     
     return {
-        "executed_trading_days": int(len(daily_pnl)),  # Days in stats sample daily PnL series (for reference)
-        "allowed_trading_days": int(active_trading_days),  # Active trading days (used for behavioral averages)
         "avg_trades_per_day": round(avg_trades_per_day, 2),
         "profit_per_day": round(profit_per_day, 2),
         "profit_per_week": round(profit_per_week, 2),
         "profit_per_month": round(profit_per_month, 2),
         "profit_per_year": round(profit_per_year, 2),
-        "sharpe_ratio": round(sharpe_ratio, 2),
-        "sortino_ratio": round(sortino_ratio, 2),
-        "calmar_ratio": round(calmar_ratio, 2),
-        "time_to_recovery_days": int(time_to_recovery_days),
-        "monthly_return_stddev": round(monthly_return_stddev, 2),
     }
 
 
@@ -648,9 +767,34 @@ def calculate_stream_stats(
     """
     Calculate per-stream statistics.
     
-    NEW BEHAVIOR:
-    - Stats computed on executed trades only
-    - include_filtered_executed controls whether filtered executed trades are included
+    IMPORTANT: STREAM STATS ARE BEHAVIORAL SUMMARIES ONLY
+    
+    Stream stats are behavioral summaries that reflect profitability and trade counts
+    per stream. They are NOT risk-adjusted metrics.
+    
+    CRITICAL WARNINGS:
+    - Stream stats are affected by filtering (include_filtered_executed flag)
+    - Stream stats do NOT include Sharpe/Sortino/Calmar ratios
+    - Stream stats MUST NOT be compared to system-level risk metrics
+    - Filtering affects stream stats by design (this is intentional)
+    
+    These stats are useful for:
+    - Comparing profitability across streams
+    - Understanding trade volume per stream
+    - Identifying which streams contribute most to overall profit
+    
+    These stats are NOT useful for:
+    - Risk-adjusted performance comparison
+    - Volatility analysis
+    - Drawdown analysis
+    
+    For risk-adjusted metrics, use calculate_summary_stats() which provides
+    system-level Sharpe/Sortino/Calmar computed on the full executed universe.
+    
+    Args:
+        df: DataFrame containing trades
+        include_filtered_executed: If True, include filtered executed trades in stats.
+                                   If False, only include allowed executed trades.
     """
     df = _ensure_final_allowed(df)
     df = _normalize_results(df)

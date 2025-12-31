@@ -1,30 +1,49 @@
-import { useCallback } from 'react'
+import { useCallback, useMemo, memo } from 'react'
 import { List } from 'react-window'
 import { getFilteredColumns } from '../utils/columnUtils'
 import { DEFAULT_COLUMNS } from '../utils/constants'
 import { sortColumnsByDefaultOrder } from '../utils/columnUtils'
 
+// Memoized formatters to avoid per-cell allocations
+const currencyFormatter = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 0
+})
+
+const dateFormatter = new Intl.DateTimeFormat('en-US', {
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+  weekday: 'short'
+})
+
+const dowFormatter = new Intl.DateTimeFormat('en-US', { weekday: 'short' })
+
 // Row component for virtual scrolling
-function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices }) {
-  // If row not loaded yet, show loading placeholder
-  if (index >= rows.length && workerFilteredIndices && index < totalFiltered) {
-    return (
-      <div style={style} className="flex border-b border-gray-700 bg-gray-800">
-        {columnsToShow.map(col => (
-          <div 
-            key={col} 
-            className="p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm" 
-            style={{ width: `${getColumnWidth(col)}px` }}
-          >
-            <span className="text-gray-500">...</span>
-          </div>
-        ))}
-      </div>
-    )
-  }
-  
+function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices, showFilteredDays = true }) {
+  // If row not loaded yet (sparse array), show loading placeholder
   const row = rows[index]
-  if (!row) return null
+  if (!row || row === undefined) {
+    // Check if this index is within filtered range
+    if (workerFilteredIndices && index < totalFiltered) {
+      return (
+        <div style={style} className="flex border-b border-gray-700 bg-gray-800">
+          {columnsToShow.map(col => (
+            <div 
+              key={col} 
+              className="p-2 border-r border-gray-700 flex-shrink-0 text-left text-sm" 
+              style={{ width: `${getColumnWidth(col)}px` }}
+            >
+              <span className="text-gray-500">...</span>
+            </div>
+          ))}
+        </div>
+      )
+    }
+    return null
+  }
   
   return (
     <div 
@@ -40,7 +59,16 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
           value = row['Instrument'] || ''
         }
         if (col === 'Date' && value) {
-          value = new Date(value).toLocaleDateString()
+          try {
+            const date = new Date(value)
+            if (!isNaN(date.getTime())) {
+              value = date.toLocaleDateString() // Use cached formatter would be better but this is fine
+            } else {
+              value = '-'
+            }
+          } catch {
+            value = '-'
+          }
         }
         // Calculate DOW (Day of Week) from Date
         if (col === 'DOW') {
@@ -49,7 +77,7 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
             try {
               const date = new Date(dateValue)
               if (!isNaN(date.getTime())) {
-                value = date.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase()
+                value = dowFormatter.format(date).toUpperCase()
               } else {
                 value = '-'
               }
@@ -86,21 +114,19 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
             value = ''
           }
         }
-        // Format dollar columns
+        // Format dollar columns (use memoized formatter)
         if (col === 'Profit ($)') {
           const profitValue = parseFloat(row.Profit) || 0
           const symbol = row.Symbol || row.Instrument || 'ES'
+          const baseSymbol = symbol.replace(/\d+$/, '').toUpperCase() // Remove trailing numbers
+          // NOTE: Contract values must match modules/matrix/statistics.py
           const contractValues = {
-            'ES': 50, 'NQ': 10, 'YM': 5, 'CL': 1000, 'NG': 10000, 'GC': 100, 'RTY': 50
+            'ES': 50, 'MES': 5, 'NQ': 10, 'MNQ': 2, 'YM': 5, 'MYM': 0.5,
+            'CL': 1000, 'NG': 10000, 'GC': 100, 'RTY': 50
           }
-          const contractValue = contractValues[symbol.toUpperCase()] || 50
+          const contractValue = contractValues[baseSymbol] || 50
           const dollarValue = profitValue * contractValue
-          value = new Intl.NumberFormat('en-US', {
-            style: 'currency',
-            currency: 'USD',
-            minimumFractionDigits: 0,
-            maximumFractionDigits: 0
-          }).format(dollarValue)
+          value = currencyFormatter.format(dollarValue)
         }
         // Format time slot columns
         if (col.includes(' Rolling') && value !== null && value !== undefined) {
@@ -130,7 +156,7 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
   )
 }
 
-export default function DataTable({
+const DataTable = memo(function DataTable({
   data,
   streamId,
   workerReady,
@@ -151,16 +177,20 @@ export default function DataTable({
   
   if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0) {
     // Use loaded rows (incrementally loaded as user scrolls)
+    // Handle sparse array: loadedRows may have holes (undefined entries) for unloaded rows
     let baseFiltered = loadedRows.length > 0 ? loadedRows : (workerFilteredRows || [])
     
     // Apply stream filter when using worker data
     // The worker filters by stream filters but may return multiple streams when streamId is 'master'
     // When viewing a specific stream tab (like 'ES1'), we need to filter to that stream only
+    // Note: Filter out undefined entries (unloaded rows) - they'll show as placeholders
     if (streamId && streamId !== 'master') {
-      filtered = baseFiltered.filter(row => row.Stream === streamId)
+      filtered = baseFiltered.filter(row => row && row.Stream === streamId)
       totalFiltered = filtered.length
     } else {
+      // Keep sparse structure - undefined entries will show as loading placeholders
       filtered = baseFiltered
+      // Use filteredLength from worker (authoritative count), fallback to array length
       totalFiltered = filteredLength || filtered.length
     }
   } else {
@@ -174,10 +204,42 @@ export default function DataTable({
   }
   
   // Apply "Show/Hide Filtered Days" toggle
+  // When showFilteredDays is true (default), show ALL rows including those with final_allowed === false
+  // When showFilteredDays is false, hide rows with final_allowed === false
+  // NOTE: Worker should already filter by final_allowed, but we add a safety check here to ensure
+  // no filtered days slip through (e.g., if worker cache is stale or there's a race condition)
   if (!showFilteredDays) {
-    filtered = filtered.filter(row => row.final_allowed !== false)
-    totalFiltered = filtered.length
+    // Filter out rows with final_allowed === false
+    // Create a new dense array (indices will shift, but that's okay for virtualization)
+    const originalLength = filtered.length
+    const filteredArray = []
+    let filteredOutCount = 0
+    
+    for (let i = 0; i < filtered.length; i++) {
+      const row = filtered[i]
+      // Keep undefined entries (unloaded rows) and rows that aren't filtered out
+      if (row === undefined || row === null) {
+        filteredArray.push(row)
+      } else if (row.final_allowed !== false) {
+        filteredArray.push(row)
+      } else {
+        filteredOutCount++
+      }
+    }
+    
+    filtered = filteredArray
+    
+    // Adjust totalFiltered count based on how many rows were filtered out
+    if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0 && originalLength > 0) {
+      // Estimate: if X% of loaded rows were filtered out, assume same % of total
+      const filterRatio = filteredOutCount / originalLength
+      totalFiltered = Math.max(0, Math.floor(totalFiltered * (1 - filterRatio)))
+    } else {
+      // For non-worker data, use filtered array length directly
+      totalFiltered = filtered.length
+    }
   }
+  // When showFilteredDays is true, show all rows (including final_allowed === false)
   
   if (totalFiltered === 0) {
     return (
@@ -251,7 +313,7 @@ export default function DataTable({
         rowCount={totalFiltered} // Use total filtered count, not just loaded rows
         rowHeight={35} // Fixed row height
         rowComponent={TableRow}
-        rowProps={{ rows: filtered, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices }}
+        rowProps={{ rows: filtered, columnsToShow, streamId, getColumnWidth, totalFiltered, workerFilteredIndices, showFilteredDays }}
         overscanCount={10} // Render 10 extra rows for smooth scrolling
         style={{ height: 600, width: `${totalWidth}px` }} // Fixed height and width for virtual list
         onRowsRendered={({ startIndex, stopIndex }) => {
@@ -268,5 +330,7 @@ export default function DataTable({
       )}
     </div>
   )
-}
+})
+
+export default DataTable
 

@@ -27,14 +27,16 @@ const normalizeResult = (result) => {
 }
 
 /**
- * Check if result is an executed trade (WIN, LOSS, BE, BREAKEVEN)
- * Excludes NoTrade and TIME from executed trades
+ * Check if result is an executed trade (WIN, LOSS, BE, BREAKEVEN, TIME)
+ * Excludes NoTrade from executed trades
+ * NOTE: TIME is included as an executed trade to match backend/worker semantics
  */
 const isExecutedTrade = (resultNorm) => {
   return resultNorm === 'WIN' || 
          resultNorm === 'LOSS' || 
          resultNorm === 'BE' || 
-         resultNorm === 'BREAKEVEN'
+         resultNorm === 'BREAKEVEN' ||
+         resultNorm === 'TIME'
 }
 
 /**
@@ -42,6 +44,20 @@ const isExecutedTrade = (resultNorm) => {
  */
 const isNoTrade = (resultNorm) => {
   return resultNorm === 'NOTRADE'
+}
+
+/**
+ * ISO week key helper (YYYY-Www) for weekly aggregation
+ */
+const getISOWeekKey = (dateObj) => {
+  if (!dateObj || isNaN(dateObj.getTime())) return null
+  const d = new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()))
+  const dayNum = d.getUTCDay() || 7 // Mon=1..Sun=7
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum) // Thursday
+  const isoYear = d.getUTCFullYear()
+  const yearStart = new Date(Date.UTC(isoYear, 0, 1))
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7)
+  return `${isoYear}-W${String(weekNo).padStart(2, '0')}`
 }
 
 /**
@@ -58,7 +74,8 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   const filtered = filteredData
   
-  // Normalize results and separate executed trades from NoTrade and TIME
+  // Normalize results and separate executed trades from NoTrade
+  // NOTE: TIME is included as an executed trade to match backend/worker semantics
   const executedTrades = []
   let noTradeCount = 0
   let timeCount = 0
@@ -67,16 +84,17 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     const resultNorm = normalizeResult(trade.Result)
     if (isNoTrade(resultNorm)) {
       noTradeCount++
-    } else if (resultNorm === 'TIME') {
-      timeCount++
-      // TIME is excluded from executed trades
     } else if (isExecutedTrade(resultNorm)) {
       executedTrades.push(trade)
+      // Track TIME separately for display, but include in executed trades
+      if (resultNorm === 'TIME') {
+        timeCount++
+      }
     }
     // Note: Any other results are excluded from both counts
   })
   
-  // totalTrades = only executed trades (excludes NoTrade and TIME)
+  // totalTrades = only executed trades (excludes NoTrade, includes TIME)
   const totalTrades = executedTrades.length
   
   // Count wins, losses, break-even from executed trades only
@@ -172,7 +190,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }, 0))
   const profitFactor = grossLossDollars > 0 ? grossProfitDollars / grossLossDollars : (grossProfitDollars > 0 ? Infinity : 0)
   
-  // Rolling Drawdown calculation (only executed trades, excludes NoTrade and TIME)
+  // Rolling Drawdown calculation (only executed trades, excludes NoTrade, includes TIME)
   let runningProfitDollars = 0
   let peakDollars = 0
   let maxDrawdownDollars = 0
@@ -201,7 +219,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const maxDrawdownDollarsPositive = Math.abs(maxDrawdownDollars)
   const maxDrawdown = maxDrawdownDollarsPositive > 0 ? maxDrawdownDollarsPositive / 50 : 0
   
-  // Sharpe Ratio calculation (only executed trades, excludes NoTrade and TIME)
+  // Sharpe Ratio calculation (only executed trades, excludes NoTrade, includes TIME)
   const tradingDaysPerYear = 252
   let dailyReturnsDollars = []
   
@@ -280,7 +298,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const annualReturnDollars = totalDays > 0 ? (totalProfitDollars / totalDays) * tradingDaysPerYear : 0
   const calmarRatio = maxDrawdownDollarsPositive > 0 ? annualReturnDollars / maxDrawdownDollarsPositive : 0
   
-  // Best and worst trades (only executed trades, excludes NoTrade and TIME)
+  // Best and worst trades (only executed trades, excludes NoTrade, includes TIME)
   const bestTrade = executedTrades.length > 0 
     ? executedTrades.reduce((best, t) => {
         const profit = parseFloat(t.Profit) || 0
@@ -296,7 +314,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   
   const avgTradesPerDay = totalDays > 0 ? totalTrades / totalDays : 0
   
-  // Per-trade PnL calculations (only executed trades, excludes NoTrade and TIME)
+  // Per-trade PnL calculations (only executed trades, excludes NoTrade, includes TIME)
   const perTradePnLDollars = sortedByDate
     .filter(trade => isExecutedTrade(normalizeResult(trade.Result)))
     .map(trade => {
@@ -489,7 +507,7 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     }
   }
   
-  // Monthly Return Std Dev (only executed trades, excludes NoTrade and TIME)
+  // Monthly Return Std Dev (only executed trades, excludes NoTrade, includes TIME)
   const monthlyReturns = new Map()
   sortedByDate.forEach((trade) => {
     // Only include executed trades
@@ -540,8 +558,9 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     : 0
   const monthlyReturnStdDev = Math.sqrt(monthlyReturnVariance)
   
-  // Profit per Day (only executed trades, excludes NoTrade and TIME)
+  // Profit per Day (only executed trades, excludes NoTrade, includes TIME)
   const dailyProfits = new Map()
+  const weeklyProfits = new Map() // ISO week -> profit dollars
   sortedByDate.forEach((trade) => {
     // Only include executed trades
     if (!isExecutedTrade(normalizeResult(trade.Result))) return
@@ -550,13 +569,30 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     
     try {
       let dateKey
+      let dateObj = null
       if (typeof dateValue === 'string' && dateValue.includes('/')) {
         dateKey = dateValue.split(' ')[0]
+        // Try parse DD/MM/YYYY first, then MM/DD/YYYY
+        const parts = dateKey.split('/')
+        if (parts.length === 3) {
+          const dd = parseInt(parts[0])
+          const mm = parseInt(parts[1])
+          const yyyy = parseInt(parts[2])
+          const d1 = new Date(yyyy, (mm || 1) - 1, dd || 1)
+          dateObj = !isNaN(d1.getTime()) ? d1 : null
+          if (!dateObj) {
+            const d2 = new Date(yyyy, (dd || 1) - 1, mm || 1)
+            dateObj = !isNaN(d2.getTime()) ? d2 : null
+          }
+        }
       } else if (typeof dateValue === 'string' && dateValue.includes('-')) {
         dateKey = dateValue.split(' ')[0].split('T')[0]
+        const d = new Date(dateKey)
+        dateObj = !isNaN(d.getTime()) ? d : null
       } else {
         const d = new Date(dateValue)
         dateKey = isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+        dateObj = isNaN(d.getTime()) ? null : d
       }
       
       if (dateKey) {
@@ -568,6 +604,16 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
           dailyProfits.set(dateKey, 0)
         }
         dailyProfits.set(dateKey, dailyProfits.get(dateKey) + profitDollars)
+
+        if (!dateObj) {
+          // Best effort parse for dateKey if we didn't already get a Date object
+          const fallback = new Date(dateKey)
+          dateObj = !isNaN(fallback.getTime()) ? fallback : null
+        }
+        const weekKey = dateObj ? getISOWeekKey(dateObj) : null
+        if (weekKey) {
+          weeklyProfits.set(weekKey, (weeklyProfits.get(weekKey) || 0) + profitDollars)
+        }
       }
     } catch {
       // Skip invalid dates
@@ -578,6 +624,25 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const profitPerDay = dailyProfitsArray.length > 0
     ? dailyProfitsArray.reduce((sum, profit) => sum + profit, 0) / dailyProfitsArray.length
     : 0
+
+  // Daily / Weekly win rates (by day/week outcome, not trade outcome)
+  let dailyWinDays = 0
+  let dailyLossDays = 0
+  dailyProfitsArray.forEach(pnl => {
+    if (pnl > 0) dailyWinDays++
+    else if (pnl < 0) dailyLossDays++
+  })
+  const dailyWinLossDays = dailyWinDays + dailyLossDays
+  const dailyWinRate = dailyWinLossDays > 0 ? (dailyWinDays / dailyWinLossDays) * 100 : 0
+
+  let weeklyWinWeeks = 0
+  let weeklyLossWeeks = 0
+  Array.from(weeklyProfits.values()).forEach(pnl => {
+    if (pnl > 0) weeklyWinWeeks++
+    else if (pnl < 0) weeklyLossWeeks++
+  })
+  const weeklyWinLossWeeks = weeklyWinWeeks + weeklyLossWeeks
+  const weeklyWinRate = weeklyWinLossWeeks > 0 ? (weeklyWinWeeks / weeklyWinLossWeeks) * 100 : 0
   
   // Skewness
   const n = perTradePnLDollars.length
@@ -599,13 +664,13 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   }
   
   return {
-    totalTrades, // Only executed trades (excludes NoTrade and TIME)
+    totalTrades, // Only executed trades (excludes NoTrade, includes TIME)
     totalDays,
     avgTradesPerDay: avgTradesPerDay.toFixed(2),
     wins,
     losses,
     breakEven,
-    timeTrades: timeCount, // TIME trades count (for display only, excluded from all calculations)
+    timeTrades: timeCount, // TIME trades count (for display only, included in executed trades)
     noTrade: noTradeCount, // NoTrade count (for display only, excluded from all calculations)
     winRate: winRate.toFixed(1),
     totalProfit: totalProfit.toFixed(2),
@@ -637,6 +702,8 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
     timeToRecoveryDays: streamId === 'master' ? timeToRecoveryDays : null,
     monthlyReturnStdDev: streamId === 'master' ? formatCurrency(monthlyReturnStdDev) : null,
     profitPerDay: streamId === 'master' ? formatCurrency(profitPerDay) : null,
+    dailyWinRate: streamId === 'master' ? dailyWinRate.toFixed(1) : null,
+    weeklyWinRate: streamId === 'master' ? weeklyWinRate.toFixed(1) : null,
     skewness: streamId === 'master' ? skewness.toFixed(3) : null,
     kurtosis: streamId === 'master' ? kurtosis.toFixed(3) : null
   }
