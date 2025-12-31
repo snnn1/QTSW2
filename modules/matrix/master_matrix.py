@@ -246,9 +246,9 @@ class MasterMatrix:
         """Add global columns using filter_engine module."""
         return filter_engine.add_global_columns(df, self.stream_filters, self.dom_blocked_days)
     
-    def _log_summary_stats(self, df: pd.DataFrame, include_filtered_executed: bool = True) -> Dict:
+    def _log_summary_stats(self, df: pd.DataFrame) -> Dict:
         """Calculate and log summary statistics using statistics module."""
-        return statistics.calculate_summary_stats(df, include_filtered_executed=include_filtered_executed)
+        return statistics.calculate_summary_stats(df)
     
     def build_master_matrix(self, start_date: Optional[str] = None,
                            end_date: Optional[str] = None,
@@ -333,8 +333,9 @@ class MasterMatrix:
         
         # SL comes from analyzer output (schema_normalizer ensures it exists with NaN if missing)
         
-        # Ensure Time Change column exists (will be calculated after sorting)
+        # Ensure Time Change column exists (should already be there from _apply_sequencer_logic)
         if 'Time Change' not in df.columns:
+            logger.warning("Time Change column missing, adding with empty values")
             df['Time Change'] = ''
         
         # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
