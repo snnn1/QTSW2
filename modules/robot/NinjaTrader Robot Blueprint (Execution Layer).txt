@@ -1,0 +1,553 @@
+NinjaTrader Robot Blueprint (Execution Layer)
+
+This is the formal, implementation-grade blueprint for the Robot. It is written as a contract/spec. The Robot is an execution engine that interprets the daily timetable and places/manage orders using Analyzer-equivalent semantics.
+
+1) Purpose and Scope
+Purpose
+
+Execute a pre-decided daily trading plan produced upstream. The Robot is a deterministic interpreter of data/timetable/timetable_current.json.
+
+Hard Scope
+
+Executes at most one trade per stream per trading_date
+
+Consumes timetable as single source of truth
+
+Uses Analyzer-equivalent semantics for:
+
+Range building
+
+Breakout detection
+
+Stop placement
+
+Target placement
+
+Break-even rule: 65% of target → stop to BE with 1-tick buffer (your convention)
+
+Supports multiple enabled streams per instrument and allows simultaneous positions across streams (including opposing directions), fully isolated by stream-level order tracking
+
+Fail-closed: missing/invalid inputs → do nothing (no new risk)
+
+Explicit Non-Goals
+
+Slot selection/switching
+
+Any learning or adaptation
+
+Dynamic targets/stops (beyond fixed BE)
+
+Risk scaling
+
+“Smart” holiday detection (upstream owns tradability)
+
+2) Execution Contract: Timetable File
+Path
+
+data/timetable/timetable_current.json
+Written atomically upstream (temp → rename). Robot treats it as the sole execution contract.
+
+Required fields
+
+trading_date (YYYY-MM-DD, America/Chicago) — controls execution
+
+timezone (must be "America/Chicago")
+
+as_of (ISO timestamp; informational only)
+
+streams[] with:
+
+stream (e.g., ES1, ES2)
+
+instrument (e.g., ES)
+
+session (S1/S2; logging/segmentation only)
+
+slot_time (HH:MM, Chicago; defines range end)
+
+enabled (bool)
+
+Robot invariants
+
+Robot executes only when trading_date == today’s Chicago date
+
+Robot ignores as_of for execution gating (use for logging only)
+
+timezone must equal America/Chicago; otherwise skip all execution
+
+3) Trading Day Authority and Holidays
+
+Tradability is upstream-owned (Matrix/UI).
+
+If timetable enables a stream on a holiday, Robot will attempt execution. This is correct under the contract.
+
+To suppress holidays/early closes, upstream must:
+
+disable all streams, or
+
+not publish a timetable for that trading_date.
+
+4) Time Handling (Chicago → UTC)
+Principle
+
+Chicago is canonical; NinjaTrader clock uses UTC. Robot converts slot datetimes daily using DST-aware timezone conversion.
+
+Rule
+
+For each stream directive:
+
+Combine trading_date + slot_time in America/Chicago → local datetime
+
+Convert to UTC → slot_time_utc
+
+All “wait until slot end” logic is performed in UTC, but logged in both Chicago and UTC.
+
+Determinism requirement
+
+No hardcoded UTC offsets. Conversion must be real timezone math (DST-safe).
+
+5) Range Semantics
+Range window
+
+Per stream:
+
+range_start_time is fixed by session configuration (Robot config; must match Analyzer)
+
+range_end_time is slot_time from timetable
+
+Range calculation
+
+During [start, end):
+
+range_high = max(bar.high)
+
+range_low = min(bar.low)
+
+range_size is expressed in instrument points (same units as target_pts and tick_size).
+At slot_time:
+
+Range locks permanently for that stream/day.
+
+Breakout levels
+
+Breakout trigger levels (Analyzer parity — CRITICAL)
+
+The Robot must use Analyzer breakout levels (±1 tick), not the raw range boundary:
+
+brk_long = range_high + tick_size
+
+brk_short = range_low - tick_size
+
+Where tick_size is the instrument tick size and MUST match the Analyzer configuration exactly.
+
+All entry logic must reference brk_long / brk_short (breakout trigger levels), not range_high / range_low.
+
+Tick rounding (Analyzer parity)
+
+All breakout trigger levels MUST be rounded to the instrument tick size using the same rounding method as the Analyzer before order placement.
+
+No recalculation after lock.
+
+NON-NEGOTIABLE INVARIANT (Analyzer parity):
+Breakout triggers are always range ± 1 tick. Any deviation requires an Analyzer change first.
+
+6) Stream Isolation and Simultaneous Positions (Critical)
+Correct invariant
+
+One trade per stream per day, not per instrument.
+
+Multiple streams on the same instrument may:
+
+place brackets simultaneously,
+
+open positions simultaneously,
+
+open opposing positions simultaneously (netting is broker/account behavior and allowed).
+
+Implementation requirement
+
+All order identity, OCO grouping, and lifecycle tracking must be namespaced by stream (and trading_date) so streams cannot interfere.
+
+Robot must not use net position as an entry gate. Net position is informational only.
+
+7) Order Model
+Entry style
+
+Analyzer-equivalent breakout entry (Authoritative semantics)
+
+Entry triggers are based on breakout trigger levels (brk_long / brk_short), not the range boundary.
+
+A trade triggers when price trades at or beyond the breakout trigger level:
+
+- Long triggers when price trades >= brk_long
+- Short triggers when price trades <= brk_short
+
+If price is already beyond the trigger at evaluation time, enter immediately at the first available price.
+
+Do not require bar close or confirmation.
+
+Bracket model per stream
+
+After range lock:
+
+Place two entry brackets:
+
+Long bracket (entry + attached stop + attached target)
+
+Short bracket (entry + attached stop + attached target)
+
+Entry brackets are placed immediately after the range locks at slot_time, provided current_time < market_close_time.
+
+These two entry brackets are OCO within the stream only.
+
+Once one side fills:
+
+The opposite entry bracket cancels (stream-local OCO)
+
+Protective stop and target remain live (OCO with each other)
+
+Stop loss (Analyzer parity)
+
+Initial stop distance = sl_points = min(range_size, 3 × target_pts); stop price = entry ∓ sl_points.
+
+Partial fills
+
+Robot completes the fill (no cancel remainder)
+
+Protective orders are sized to the filled quantity
+
+OCO integrity preserved for the filled quantity
+
+8) Break-Even Rule (Mechanical)
+
+When price reaches 65% of target distance from entry:
+
+Move stop to BE with 1-tick buffer per your rule:
+
+“Move stop-loss to 1 tick below entry” (your convention)
+
+Trigger once per stream trade
+
+Log BE trigger time and price
+
+No other stop adjustments (no trailing).
+
+9) “No Trade” Outcomes and Cutoffs
+
+A stream can legitimately produce no trade.
+
+Blueprint requirement:
+
+Entry cutoff (Analyzer parity — CRITICAL)
+
+Entry eligibility is gated by market close time, not session end.
+
+Default market close time: 16:00 America/Chicago.
+This value MUST be configurable and MUST match Analyzer configuration exactly.
+
+Robot rule:
+
+If current_time >= market_close_time → no new entries allowed.
+
+If no entry has filled by market close, the stream is marked NO_TRADE and DONE.
+
+Existing positions continue to be managed normally until stop/target or forced flatten.
+
+Rationale:
+
+Prevents late-day random entries
+
+Keeps day accounting clean
+
+Ensures determinism
+
+10) Forced Flatten (No Overnight)
+Default policy
+
+Forced flatten is always enabled (execution constraint).
+
+Behavior at flatten time (e.g., 5 minutes before close; configurable)
+
+For each instrument:
+
+Cancel any working orders owned by the Robot (across all streams)
+
+If any position exists, close it (market exit or your standard liquidation method)
+
+Log forced flatten action per stream impacted
+
+If already flat and no working orders, still log “flatten check OK”
+
+Prop firm variation is handled by config (turn off only if you explicitly allow holds).
+
+Clarification: Entry Cutoff vs Forced Flatten (Intentional separation)
+
+- Entry cutoff (Analyzer logic): No new entries at or after market_close_time (default 16:00 CT).
+- Forced flatten (execution constraint): Close all positions and cancel orders at a configured flatten time (e.g., 15:55 CT).
+
+These are distinct and intentional. Entry cutoff does NOT flatten positions; forced flatten does.
+
+11) Timetable Reactivity (Live Updates)
+
+Robot must react to timetable changes to reflect time changes and enable/disable decisions, while preserving per-stream idempotency.
+
+Watch policy
+
+Monitor file modification (or hash) and reload on change.
+
+Apply policy per stream
+
+Each stream/day has a commit point:
+
+Before commit: timetable updates can modify enabled/slot_time for that stream/day
+
+After commit: ignore updates for that stream/day (do not resurrect or re-arm)
+
+Commit point occurs at earliest of:
+
+Entry filled
+
+Stream marked NO_TRADE by market close cutoff (market_close_time)
+
+Forced flatten ends the stream
+
+This ensures:
+
+Robot is responsive to upstream time changes
+
+Robot does not rewrite executed history mid-day
+
+12) Restart and Recovery (Quant-Recommended Hybrid)
+
+On strategy start/restart:
+
+Step 1: Load timetable and validate
+
+If invalid → stand down.
+
+Step 2: Reconcile with live account state
+
+For each instrument the robot manages:
+
+If an open position exists:
+
+Enter RECOVERY-MANAGE mode
+
+Recreate/verify protective orders as needed
+
+Only resume stream execution if the robot can confidently reconcile per-stream state from journal + live orders/executions; otherwise block new entries for that instrument for the rest of the day (still ensure protection).
+
+If flat:
+
+Resume for streams not yet committed today
+
+Step 3: Duplicate prevention
+
+Persist a minimal per-stream day journal (local file) so restart does not double-enter:
+
+trading_date
+
+stream
+
+committed flag
+
+entry_filled flag
+
+order ids / execution ids if available
+If journal missing/unreliable, fall back to account/order inspection; if still ambiguous, fail closed.
+
+13) State Machine (Per Stream)
+
+Per stream per trading_date:
+
+IDLE
+No valid directive for today.
+
+ARMED
+Valid directive enabled; waiting for range start.
+
+RANGE_BUILDING
+Tracking range high/low.
+
+RANGE_LOCKED
+Range frozen at slot_time; ready to place/watch brackets.
+
+BRACKETS_PLACED / ENTRY_WORKING
+Long/short entry brackets live (stream-local OCO).
+
+IN_POSITION
+Protective stop/target live; BE monitoring active.
+
+DONE
+Terminal: TARGET, STOP, BE_STOP, FORCED_FLATTEN, NO_TRADE, ERROR_STANDDOWN.
+
+Intra-stream re-arming prohibition (Hard rule)
+
+Once a stream enters DONE for a trading_date, it must never re-enter ARMED for that trading_date under any circumstances.
+
+RECOVERY-MANAGE
+Restart-only: ensure protection and exit safely.
+
+14) Logging and Audit (Minimum Required)
+
+Robot must write one append-only log per executed stream/day (JSONL preferred) plus optional human-readable summary.
+
+Required fields (your list)
+
+Date
+
+DOW
+
+Time (slot_time Chicago)
+
+EntryTime
+
+ExitTime
+
+Instrument
+
+Stream
+
+Session
+
+Direction
+
+Target
+
+Range
+
+Stop Loss
+
+Peak
+
+Result
+
+Profit
+
+Time Change
+
+Profit ($)
+
+Mandatory additions for traceability
+
+trading_date
+
+as_of
+
+slot_time_utc
+
+range_start_time (Chicago)
+
+range_end_time (Chicago)
+
+range_high
+
+range_low
+
+entry_price_fill
+
+exit_price_fill
+
+exit_reason (TARGET/STOP/BE_STOP/FORCED_FLATTEN/NO_TRADE/REJECT/ERROR)
+
+committed (bool; whether the stream/day reached a terminal commit point)
+
+commit_reason (ENTRY_FILLED | NO_TRADE_MARKET_CLOSE | FORCED_FLATTEN)
+
+timetable_hash (hash at commit)
+
+order_ids (entry/stop/target) or equivalent references
+
+error_message (if any)
+
+These logs are your forensic guarantee: every live trade is explainable.
+
+15) Acceptance Tests (Robot Must Pass)
+
+Stale timetable
+
+trading_date != today → no orders, no trades.
+
+Timezone mismatch
+
+timezone != America/Chicago → no orders, no trades.
+
+Timetable update before commit
+
+slot_time changes mid-morning for an uncommitted stream → stream uses new slot_time.
+
+Timetable update after commit
+
+enabled flips after entry fill → ignored; stream completes normally.
+
+Simultaneous same-instrument trades
+
+ES2 long opens; ES1 short opens later; both positions coexist; each has independent stop/target; correct exits per stream.
+
+Partial fill
+
+entry partially fills → robot completes fill; protective orders sized correctly.
+
+Forced flatten
+
+position open at flatten time → robot exits and cancels orders; logs forced flatten.
+
+Restart in position
+
+restart occurs while ES1 in position → robot restores protection and does not duplicate entry.
+
+No-trade cutoff (market close)
+
+no breakout by market_close_time → stream logs NO_TRADE and does nothing further.
+
+16) Required Configuration Knobs (Must Match Analyzer)
+
+To finalize implementation, these must be set explicitly:
+
+S1 range start time (Chicago)
+Value: "02:00"
+Source: modules/analyzer/logic/config_logic.py, ConfigManager.slot_start["S1"]
+
+S2 range start time (Chicago)
+Value: "08:00"
+Source: modules/analyzer/logic/config_logic.py, ConfigManager.slot_start["S2"]
+
+Tick size per instrument (must match Analyzer exactly)
+Values:
+  ES, NQ, MES, MNQ: 0.25
+  YM, MYM: 1.0
+  CL, MCL: 0.01
+  NG, MNG: 0.001
+  GC, MGC: 0.1
+  RTY, M2K: 0.10
+Source: modules/analyzer/logic/config_logic.py, ConfigManager.tick_size dictionary
+CRITICAL: All breakout trigger levels use these exact tick sizes. Tick rounding must match Analyzer's UtilityManager.round_to_tick() method.
+
+Market close time (Chicago) — default 16:00; must match Analyzer exactly
+Value: "16:00"
+Source: modules/analyzer/logic/config_logic.py, ConfigManager.market_close_time
+Usage: Entry cutoff - no new entries allowed if current_time >= market_close_time
+
+Forced flatten time per instrument/session (Chicago)
+Recommended: "15:55" (5 minutes before market close)
+Note: This is a Robot-specific execution constraint, not an Analyzer parameter. The Analyzer does not execute live trades, so forced flatten is not part of Analyzer logic. However, it must be configured for Robot execution safety.
+Usage: At flatten time, cancel all working orders and close all positions. Distinct from entry cutoff.
+
+Entry execution method (e.g., stop orders vs market-on-touch) is an implementation detail, but the entry semantics above must match the Analyzer exactly.
+
+NON-NEGOTIABLE INVARIANT (Analyzer parity):
+Entry cutoff is always market close time. Any deviation requires an Analyzer change first.
+
+Reference: See modules/robot/ROBOT_CONFIGURATION_KNOBS.md for complete configuration details and parity verification.
+
+Bottom Line Contract
+
+Timetable decides what/when.
+
+Robot executes, isolated per stream, DST-correct, fail-closed, restart-safe.
+
+Multiple concurrent positions per instrument are allowed because the unit of execution is the stream, not the instrument.
+
+Every action is auditable back to timetable + deterministic mechanics.
+
+The five configuration knobs above are now explicitly provided with exact values from the Analyzer implementation. This blueprint is immediately implementable.
