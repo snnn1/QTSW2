@@ -1,0 +1,120 @@
+{
+  "spec_name": "analyzer_robot_parity",
+  "spec_revision": "2026-01-01",
+  "scope": "Execution semantics parity between Analyzer and NinjaTrader Robot",
+  "governance": {
+    "rule": "Analyzer execution change -> update this spec -> update robot",
+    "notes": [
+      "This spec is the canonical parity contract.",
+      "Do not change Robot semantics without an Analyzer change first."
+    ]
+  },
+  "stream_mapping": {
+    "description": "Analyzer stream tags are derived from instrument + session.",
+    "rule": "S1 => <INSTRUMENT>1, S2 => <INSTRUMENT>2"
+  },
+  "timezone": "America/Chicago",
+  "sessions": {
+    "S1": {
+      "range_start_time": "02:00",
+      "slot_end_times": ["07:30", "08:00", "09:00"]
+    },
+    "S2": {
+      "range_start_time": "08:00",
+      "slot_end_times": ["09:30", "10:00", "10:30", "11:00"]
+    }
+  },
+  "entry_cutoff": {
+    "type": "MARKET_CLOSE",
+    "market_close_time": "16:00",
+    "rule": "If breakout occurs after market_close_time, treat as NoTrade (no entry)."
+  },
+  "breakout": {
+    "offset_ticks": 1,
+    "formula": {
+      "brk_long": "range_high + tick_size",
+      "brk_short": "range_low - tick_size"
+    },
+    "tick_rounding": {
+      "method": "utility_round_to_tick",
+      "definition": "Must match modules/analyzer/logic/utility_logic.py:UtilityManager.round_to_tick exactly (no substitution).",
+      "implementation_note": "Use the same algorithm as UtilityManager.round_to_tick; do not substitute.",
+      "tie_behavior_note": "If Analyzer uses bankers rounding on .5 ties, Robot must match; otherwise Robot must match Analyzer’s defined behavior exactly."
+    }
+  },
+  "timetable_validation": {
+    "slot_time_validation": {
+      "rule": "Robot must validate timetable slot_time is in the allowed slot_end_times list for that stream’s session; otherwise fail closed (skip that stream/day).",
+      "allowed_slot_end_times_source": "sessions.<S1|S2>.slot_end_times"
+    }
+  },
+  "entry_semantics": {
+    "freeze_close_definition": "Analyzer’s price at range lock timestamp (must match analyzer; do not reinterpret).",
+    "immediate_entry_at_lock": {
+      "long_condition": "freeze_close >= brk_long",
+      "short_condition": "freeze_close <= brk_short"
+    },
+    "breakout_detection": {
+      "long_condition": "high >= brk_long",
+      "short_condition": "low <= brk_short"
+    },
+    "confirmation": "NONE",
+    "equality_allowed": true
+  },
+  "target": {
+    "target_pts_source": "base_target",
+    "target_price": {
+      "long": "entry + target_pts",
+      "short": "entry - target_pts"
+    }
+  },
+  "stop_loss": {
+    "sl_points_formula": "min(range_size, 3 * target_pts)",
+    "stop_price": {
+      "long": "entry - sl_points",
+      "short": "entry + sl_points"
+    }
+  },
+  "break_even": {
+    "trigger_pct_of_target": 0.65,
+    "trigger_threshold": "target_pts * 0.65",
+    "stop_offset_ticks": 1,
+    "stop_price_after_trigger": {
+      "long": "entry - tick_size",
+      "short": "entry + tick_size"
+    },
+    "trigger_rearms": false
+  },
+  "instruments": {
+    "ES": { "tick_size": 0.25, "base_target": 10.0, "is_micro": false, "base_instrument": "ES", "scaling_factor": 1.0 },
+    "NQ": { "tick_size": 0.25, "base_target": 50.0, "is_micro": false, "base_instrument": "NQ", "scaling_factor": 1.0 },
+    "YM": { "tick_size": 1.0, "base_target": 100.0, "is_micro": false, "base_instrument": "YM", "scaling_factor": 1.0 },
+    "CL": { "tick_size": 0.01, "base_target": 0.5, "is_micro": false, "base_instrument": "CL", "scaling_factor": 1.0 },
+    "NG": { "tick_size": 0.001, "base_target": 0.05, "is_micro": false, "base_instrument": "NG", "scaling_factor": 1.0 },
+    "GC": { "tick_size": 0.1, "base_target": 5.0, "is_micro": false, "base_instrument": "GC", "scaling_factor": 1.0 },
+    "RTY": { "tick_size": 0.1, "base_target": 10.0, "is_micro": false, "base_instrument": "RTY", "scaling_factor": 1.0 },
+    "MES": { "tick_size": 0.25, "base_target": 10.0, "is_micro": true, "base_instrument": "ES", "scaling_factor": 0.1 },
+    "MNQ": { "tick_size": 0.25, "base_target": 50.0, "is_micro": true, "base_instrument": "NQ", "scaling_factor": 0.1 },
+    "MYM": { "tick_size": 1.0, "base_target": 100.0, "is_micro": true, "base_instrument": "YM", "scaling_factor": 0.1 },
+    "MCL": { "tick_size": 0.01, "base_target": 0.5, "is_micro": true, "base_instrument": "CL", "scaling_factor": 0.1 },
+    "MNG": { "tick_size": 0.001, "base_target": 0.05, "is_micro": true, "base_instrument": "NG", "scaling_factor": 0.1 },
+    "MGC": { "tick_size": 0.1, "base_target": 5.0, "is_micro": true, "base_instrument": "GC", "scaling_factor": 0.1 },
+    "M2K": { "tick_size": 0.1, "base_target": 10.0, "is_micro": true, "base_instrument": "RTY", "scaling_factor": 0.1 }
+  },
+  "non_trading_symbols": {
+    "MINUTEDATAEXPORT": {
+      "note": "Analyzer helper/export symbol. Not intended for live trading by the Robot."
+    }
+  },
+  "sources": [
+    { "file": "modules/analyzer/logic/instrument_logic.py", "purpose": "tick sizes, ladders, micro scaling, stream tag mapping" },
+    { "file": "modules/analyzer/logic/config_logic.py", "purpose": "S1/S2 range starts, slot end times, market close time" },
+    { "file": "modules/analyzer/logic/range_logic.py", "purpose": "range window definition and filtering [start,end)" },
+    { "file": "modules/analyzer/breakout_core/engine.py", "purpose": "breakout level computation and tick rounding before entry" },
+    { "file": "modules/analyzer/logic/utility_logic.py", "purpose": "round_to_tick rounding definition" },
+    { "file": "modules/analyzer/logic/entry_logic.py", "purpose": "entry detection, immediate entry, market close cutoff" },
+    { "file": "modules/analyzer/logic/loss_logic.py", "purpose": "initial stop-loss formula" },
+    { "file": "modules/analyzer/logic/price_tracking_logic.py", "purpose": "T1 (65%) trigger and BE stop adjustment (±1 tick)" }
+  ]
+}
+
