@@ -7,6 +7,7 @@ import asyncio
 import importlib
 import inspect
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -355,7 +356,7 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
                         cleaned[key] = None
                     elif isinstance(value, (pd.Timestamp, pd.DatetimeIndex)):
                         cleaned[key] = value.isoformat() if hasattr(value, 'isoformat') else str(value)
-                    elif isinstance(value, (int, float)) and (pd.isna(value) or pd.isinf(value)):
+                    elif isinstance(value, (int, float)) and (pd.isna(value) or math.isinf(value)):
                         cleaned[key] = None
                     else:
                         cleaned[key] = value

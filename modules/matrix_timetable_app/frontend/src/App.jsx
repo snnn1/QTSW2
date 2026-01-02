@@ -1041,6 +1041,9 @@ function AppContent() {
         sharpeRatio: pdm.sharpe_ratio ? pdm.sharpe_ratio.toFixed(2) : '0.00',
         sortinoRatio: pdm.sortino_ratio ? pdm.sortino_ratio.toFixed(2) : '0.00',
         timeToRecoveryDays: streamId === 'master' ? pdm.time_to_recovery_days : null,
+        avgDrawdownDollars: streamId === 'master' ? formatCurrency(pdm.avg_drawdown_daily || 0) : null,
+        avgDrawdownDurationDays: streamId === 'master' ? (pdm.avg_drawdown_duration_days ? pdm.avg_drawdown_duration_days.toFixed(1) : '0.0') : null,
+        drawdownEpisodesPerYear: streamId === 'master' ? (pdm.drawdown_episodes_per_year ? pdm.drawdown_episodes_per_year.toFixed(2) : '0.00') : null,
         monthlyReturnStdDev: streamId === 'master' ? formatCurrency(pdm.monthly_return_stddev || 0) : null,
         profitPerTrade: formatCurrency(ptm.mean_pnl_per_trade || 0),
         calmarRatio: pdm.calmar_ratio ? pdm.calmar_ratio.toFixed(2) : '0.00',
@@ -1080,6 +1083,9 @@ function AppContent() {
       var95: streamId === 'master' ? formatCurrency(rawStats.var95 || 0) : null,
       cvar95: streamId === 'master' ? formatCurrency(rawStats.cvar95 || 0) : null,
       timeToRecoveryDays: streamId === 'master' ? (rawStats.timeToRecovery || 0) : null,
+      avgDrawdownDollars: streamId === 'master' ? formatCurrency(rawStats.avgDrawdownDollars || 0) : null,
+      avgDrawdownDurationDays: streamId === 'master' ? (rawStats.avgDrawdownDurationDays ? parseFloat(rawStats.avgDrawdownDurationDays).toFixed(1) : '0.0') : null,
+      drawdownEpisodesPerYear: streamId === 'master' ? (rawStats.drawdownEpisodesPerYear ? parseFloat(rawStats.drawdownEpisodesPerYear).toFixed(2) : '0.00') : null,
       monthlyReturnStdDev: streamId === 'master' ? formatCurrency(rawStats.monthlyReturnStdDev || 0) : null,
       profitPerDay: streamId === 'master' ? formatCurrency(rawStats.profitPerDay || 0) : null,
       profitPerWeek: streamId === 'master' ? formatCurrency(rawStats.profitPerWeek || 0) : null,
@@ -1552,7 +1558,7 @@ function AppContent() {
           {/* Section 3: Drawdowns & Stability */}
           <div className="mb-4 pt-4 border-t border-gray-700">
             <h4 className="text-sm font-semibold mb-3 text-gray-300">Drawdowns & Stability</h4>
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
               <div>
                 <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
                 <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
@@ -1560,6 +1566,18 @@ function AppContent() {
               <div>
                 <div className="text-xs text-gray-400 mb-1">Time-to-Recovery (Days)</div>
                 <div className="text-lg font-semibold">{stats.timeToRecoveryDays ?? 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Average Drawdown ($)</div>
+                <div className="text-lg font-semibold text-red-400">{stats.avgDrawdownDollars || 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Avg Drawdown Duration (Days)</div>
+                <div className="text-lg font-semibold">{stats.avgDrawdownDurationDays ?? 'N/A'}</div>
+              </div>
+              <div>
+                <div className="text-xs text-gray-400 mb-1">Drawdown Frequency (per Year)</div>
+                <div className="text-lg font-semibold">{stats.drawdownEpisodesPerYear ?? 'N/A'}</div>
               </div>
               <div>
                 <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
@@ -3060,6 +3078,18 @@ function AppContent() {
           >
             Year
           </button>
+          <button
+            onClick={() => {
+              handleTabChange('stats');
+            }}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'stats'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Stats
+          </button>
           </div>
         </div>
         
@@ -3124,6 +3154,27 @@ function AppContent() {
                       </tbody>
                     </table>
                   </div>
+              )}
+            </div>
+          </div>
+        ) : activeTab === 'stats' ? (
+          <div className="space-y-6">
+            <div className="bg-gray-900 rounded-lg p-6">
+              <h2 className="text-xl font-semibold mb-6">Statistics & Analysis</h2>
+              {masterLoading ? (
+                <div className="text-center py-8">Loading data...</div>
+              ) : masterError ? (
+                <div className="text-center py-8 text-red-400">
+                  <div className="mb-4">{masterError}</div>
+                  <button
+                    onClick={retryLoad}
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded"
+                  >
+                    Retry Load
+                  </button>
+                </div>
+              ) : (
+                <WorstDaysTable contractMultiplier={masterContractMultiplier} />
               )}
             </div>
           </div>
@@ -3560,6 +3611,142 @@ function AppContent() {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+// Component to display the 50 worst days by profit
+function WorstDaysTable({ contractMultiplier = 1 }) {
+  const [worstDays, setWorstDays] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
+  
+  useEffect(() => {
+    const fetchWorstDays = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        // Fetch ALL data from backend (limit: 0 means no limit)
+        const data = await matrixApi.getMatrixData({
+          limit: 0, // Get all data
+          order: 'oldest', // Get in chronological order
+          essentialColumnsOnly: false, // Get all columns
+          skipCleaning: false,
+          contractMultiplier: contractMultiplier,
+          includeFilteredExecuted: false,
+          streamInclude: null // Get all streams
+        })
+        
+        const trades = data.data || []
+        
+        if (trades.length === 0) {
+          setWorstDays([])
+          setLoading(false)
+          return
+        }
+        
+        // Calculate daily profit using the existing utility
+        const dailyProfit = calculateDateProfit(trades, contractMultiplier)
+        
+        // Sum profits across all streams for each date
+        const dailyTotals = Object.keys(dailyProfit).map(date => {
+          const streams = dailyProfit[date]
+          const totalProfit = Object.values(streams).reduce((sum, profit) => sum + profit, 0)
+          return {
+            date,
+            totalProfit,
+            streams: Object.keys(streams).length,
+            streamDetails: streams
+          }
+        })
+        
+        // Sort by profit (ascending - worst first) and take top 50
+        const sorted = dailyTotals
+          .sort((a, b) => a.totalProfit - b.totalProfit)
+          .slice(0, 50)
+        
+        setWorstDays(sorted)
+      } catch (err) {
+        console.error('Error fetching worst days:', err)
+        setError(err.message)
+      } finally {
+        setLoading(false)
+      }
+    }
+    
+    fetchWorstDays()
+  }, [contractMultiplier])
+  
+  const formatCurrency = (value) => {
+    if (value === null || value === undefined || isNaN(value)) return '$0.00'
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(value)
+  }
+  
+  const formatDate = (dateStr) => {
+    try {
+      const date = new Date(dateStr + 'T00:00:00')
+      return date.toLocaleDateString('en-US', { 
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric'
+      })
+    } catch {
+      return dateStr
+    }
+  }
+  
+  if (loading) {
+    return <div className="text-center py-8 text-gray-400">Loading worst days from full dataset...</div>
+  }
+  
+  if (error) {
+    return <div className="text-center py-8 text-red-400">Error loading data: {error}</div>
+  }
+  
+  if (worstDays.length === 0) {
+    return <div className="text-center py-8 text-gray-400">No data available</div>
+  }
+  
+  return (
+    <div>
+      <h3 className="text-lg font-semibold mb-4">50 Worst Trading Days by Profit</h3>
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse">
+          <thead>
+            <tr className="bg-gray-800">
+              <th className="px-4 py-3 text-left font-semibold">Rank</th>
+              <th className="px-4 py-3 text-left font-semibold">Date</th>
+              <th className="px-4 py-3 text-right font-semibold">Total Profit</th>
+              <th className="px-4 py-3 text-center font-semibold">Streams</th>
+            </tr>
+          </thead>
+          <tbody>
+            {worstDays.map((day, index) => (
+              <tr 
+                key={day.date} 
+                className={`border-b border-gray-700 hover:bg-gray-800 ${
+                  day.totalProfit < 0 ? 'text-red-400' : 'text-gray-300'
+                }`}
+              >
+                <td className="px-4 py-3 font-medium">{index + 1}</td>
+                <td className="px-4 py-3">{formatDate(day.date)}</td>
+                <td className={`px-4 py-3 text-right font-mono ${
+                  day.totalProfit < 0 ? 'text-red-400' : day.totalProfit > 0 ? 'text-green-400' : 'text-gray-400'
+                }`}>
+                  {formatCurrency(day.totalProfit)}
+                </td>
+                <td className="px-4 py-3 text-center text-gray-400">{day.streams}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   )

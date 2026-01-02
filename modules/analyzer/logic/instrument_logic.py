@@ -7,7 +7,7 @@ from typing import Dict, Tuple, Literal
 from dataclasses import dataclass
 import pandas as pd
 
-Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","MINUTEDATAEXPORT"]
+Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","M2K","MINUTEDATAEXPORT"]
 
 @dataclass
 class InstrumentConfig:
@@ -40,6 +40,9 @@ class InstrumentManager:
             "MCL": InstrumentConfig(0.01, (0.5,0.75,1.0,1.25,1.5,1.75,2.0), True, "CL", 0.1),
             "MNG": InstrumentConfig(0.001, (0.05,0.075,0.10,0.125,0.15,0.175,0.20), True, "NG", 0.1),
             "MGC": InstrumentConfig(0.1, (5,7.5,10,12.5,15,17.5,20), True, "GC", 0.1),
+            # Micro Russell (1/10th size). Standard symbol: M2K.
+            # Tick size matches RTY; scaling_factor controls profit scaling.
+            "M2K": InstrumentConfig(0.10, (10,), True, "RTY", 0.1),
             
             # Data export format
             "MINUTEDATAEXPORT": InstrumentConfig(0.25, (10,15,20,25,30,35,40), False, "ES", 1.0),

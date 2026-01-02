@@ -412,6 +412,9 @@ def _empty_daily_metrics() -> Dict:
         "sortino_ratio": 0.0,
         "calmar_ratio": 0.0,
         "time_to_recovery_days": 0,
+        "avg_drawdown_daily": 0.0,
+        "avg_drawdown_duration_days": 0.0,
+        "drawdown_episodes_per_year": 0.0,
         "monthly_return_stddev": 0.0,
     }
 
@@ -609,6 +612,9 @@ def _calculate_risk_daily_metrics(
             "sortino_ratio": 0.0,
             "calmar_ratio": 0.0,
             "time_to_recovery_days": 0,
+            "avg_drawdown_daily": 0.0,
+            "avg_drawdown_duration_days": 0.0,
+            "drawdown_episodes_per_year": 0.0,
             "monthly_return_stddev": 0.0,
             "max_drawdown_daily": 0.0,
         }
@@ -621,6 +627,9 @@ def _calculate_risk_daily_metrics(
             "sortino_ratio": 0.0,
             "calmar_ratio": 0.0,
             "time_to_recovery_days": 0,
+            "avg_drawdown_daily": 0.0,
+            "avg_drawdown_duration_days": 0.0,
+            "drawdown_episodes_per_year": 0.0,
             "monthly_return_stddev": 0.0,
             "max_drawdown_daily": 0.0,
         }
@@ -635,6 +644,9 @@ def _calculate_risk_daily_metrics(
             "sortino_ratio": 0.0,
             "calmar_ratio": 0.0,
             "time_to_recovery_days": 0,
+            "avg_drawdown_daily": 0.0,
+            "avg_drawdown_duration_days": 0.0,
+            "drawdown_episodes_per_year": 0.0,
             "monthly_return_stddev": 0.0,
             "max_drawdown_daily": 0.0,
         }
@@ -669,9 +681,11 @@ def _calculate_risk_daily_metrics(
     drawdown = cumulative_pnl - running_max
     
     # Find longest recovery period (from drawdown start to new peak)
+    # Also track all drawdown episodes for average duration and frequency calculations
     time_to_recovery_days = 0
     in_drawdown = False
     drawdown_start_idx = None
+    drawdown_episodes = []  # List of episode durations in days
     
     for idx in range(len(drawdown)):
         if drawdown.iloc[idx] < 0:
@@ -682,8 +696,35 @@ def _calculate_risk_daily_metrics(
             if in_drawdown and drawdown_start_idx is not None:
                 recovery_days = idx - drawdown_start_idx
                 time_to_recovery_days = max(time_to_recovery_days, recovery_days)
+                drawdown_episodes.append(recovery_days)  # Track this episode
                 in_drawdown = False
                 drawdown_start_idx = None
+    
+    # Handle case where drawdown extends to end of data
+    if in_drawdown and drawdown_start_idx is not None:
+        recovery_days = len(drawdown) - drawdown_start_idx
+        time_to_recovery_days = max(time_to_recovery_days, recovery_days)
+        drawdown_episodes.append(recovery_days)
+    
+    # Average drawdown: mean of absolute drawdown values on drawdown days only
+    drawdown_days_only = drawdown[drawdown < 0]
+    avg_drawdown_daily = float(abs(drawdown_days_only).mean()) if len(drawdown_days_only) > 0 else 0.0
+    
+    # Average drawdown duration: mean of all drawdown episode durations
+    avg_drawdown_duration_days = float(np.mean(drawdown_episodes)) if len(drawdown_episodes) > 0 else 0.0
+    
+    # Drawdown frequency: episodes per year
+    # Calculate total trading years from date range
+    if len(daily_pnl) > 0 and "date" in daily_pnl.columns:
+        # Convert date objects to datetime for calculation
+        from datetime import datetime as dt
+        dates = pd.to_datetime(daily_pnl["date"])
+        date_range = dates.max() - dates.min()
+        total_days = date_range.days + 1  # +1 to include both start and end days
+        total_trading_years = total_days / 365.25  # Account for leap years
+        drawdown_episodes_per_year = len(drawdown_episodes) / total_trading_years if total_trading_years > 0 else 0.0
+    else:
+        drawdown_episodes_per_year = 0.0
     
     # Monthly return std dev (Option 1: actual calendar months)
     daily_df["year_month"] = daily_df["trade_date"].dt.to_period("M")
@@ -705,6 +746,9 @@ def _calculate_risk_daily_metrics(
         "sortino_ratio": round(sortino_ratio, 2),
         "calmar_ratio": round(calmar_ratio, 2),
         "time_to_recovery_days": int(time_to_recovery_days),
+        "avg_drawdown_daily": round(avg_drawdown_daily, 2),
+        "avg_drawdown_duration_days": round(avg_drawdown_duration_days, 1),
+        "drawdown_episodes_per_year": round(drawdown_episodes_per_year, 2),
         "monthly_return_stddev": round(monthly_return_stddev, 2),
         "max_drawdown_daily": round(max_drawdown_from_daily, 2),
     }

@@ -157,6 +157,18 @@ export default function StatsPanel({ streamId, stats, loading, error, noData }) 
               <div className="text-lg font-semibold">{stats.timeToRecoveryDays ?? 'N/A'}</div>
             </div>
             <div>
+              <div className="text-xs text-gray-400 mb-1">Average Drawdown ($)</div>
+              <div className="text-lg font-semibold text-red-400">{stats.avgDrawdownDollars || 'N/A'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Avg Drawdown Duration (Days)</div>
+              <div className="text-lg font-semibold">{stats.avgDrawdownDurationDays ?? 'N/A'}</div>
+            </div>
+            <div>
+              <div className="text-xs text-gray-400 mb-1">Drawdown Frequency (per Year)</div>
+              <div className="text-lg font-semibold">{stats.drawdownEpisodesPerYear ?? 'N/A'}</div>
+            </div>
+            <div>
               <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
               <div className="text-lg font-semibold text-red-400">{stats.maxConsecutiveLosses ?? 'N/A'}</div>
             </div>

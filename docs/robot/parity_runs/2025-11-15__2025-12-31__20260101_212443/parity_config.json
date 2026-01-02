@@ -1,0 +1,32 @@
+{
+  "start_date": "2025-11-15",
+  "end_date": "2025-12-31",
+  "instruments": null,
+  "mode": "load_existing_analyzer",
+  "robot_source": "harness",
+  "fail_on_entry_time": false,
+  "entry_time_tolerance_seconds": 60,
+  "parity_spec_revision": "2026-01-01",
+  "parity_spec_name": "analyzer_robot_parity",
+  "snapshot_manifest": {
+    "start_date": "2025-11-15",
+    "end_date": "2025-12-31",
+    "instruments": [
+      "CL",
+      "ES",
+      "GC",
+      "NG",
+      "NQ",
+      "RTY",
+      "YM"
+    ],
+    "total_files": 207,
+    "total_rows": 156117,
+    "source_path": "data\\translated",
+    "created_at": "2026-01-01T21:24:29.862005",
+    "commit_hash": "cca2163e83396138652b1d5c13e7e1548eb494fe",
+    "read_only": true,
+    "note": "This snapshot is read-only. Do not modify files in this directory."
+  },
+  "data_source": "data/translated_test"
+}

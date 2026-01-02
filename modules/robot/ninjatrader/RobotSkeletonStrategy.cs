@@ -4,13 +4,12 @@
 // This file intentionally avoids being part of any build in this repo.
 // Copy into a NinjaTrader 8 strategy project and wire references to the core engine.
 
-#if NINJATRADER
 using System;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 using QTSW2.Robot.Core;
 
-namespace NinjaTrader.Custom.Strategies
+namespace NinjaTrader.NinjaScript.Strategies
 {
     public class RobotSkeletonStrategy : Strategy
     {
@@ -27,7 +26,8 @@ namespace NinjaTrader.Custom.Strategies
             else if (State == State.DataLoaded)
             {
                 var projectRoot = QTSW2.Robot.Core.ProjectRootResolver.ResolveProjectRoot();
-                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2));
+                // Default to DRYRUN mode for Step-3; can be made configurable via strategy parameters
+                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), RobotMode.DRYRUN);
                 _engine.Start();
             }
             else if (State == State.Terminated)
@@ -41,10 +41,22 @@ namespace NinjaTrader.Custom.Strategies
             if (_engine is null) return;
             if (CurrentBar < 1) return;
 
-            // NinjaTrader Times[0][0] is in exchange time; convert to UTC if needed.
-            // For skeleton: treat bar time as UTC if you feed UTC. Otherwise convert explicitly.
+            // NinjaTrader Times[0][0] is in exchange time (typically Chicago time for futures).
+            // Convert to UTC deterministically using TimeService conversion logic.
+            // Times[0][0] is a DateTime representing the bar's timestamp in exchange timezone.
             var nowUtc = DateTimeOffset.UtcNow;
-            var barUtc = nowUtc; // TODO: map NT bar time to UTC deterministically
+            
+            // Convert bar time from exchange time to UTC
+            // Times[0][0] is DateTimeKind.Unspecified, representing exchange local time (Chicago)
+            // We need to interpret it as Chicago time and convert to UTC (DST-aware)
+            var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
+            
+            // Create DateTimeOffset with Chicago timezone, then convert to UTC
+            // Note: This assumes Times[0][0] is already in Chicago time (which is standard for futures)
+            // If your data feed uses a different timezone, adjust accordingly
+            var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+            var barChicagoOffset = new DateTimeOffset(barExchangeTime, chicagoTz.GetUtcOffset(barExchangeTime));
+            var barUtc = barChicagoOffset.ToUniversalTime();
 
             var high = (decimal)High[0];
             var low = (decimal)Low[0];
@@ -57,5 +69,4 @@ namespace NinjaTrader.Custom.Strategies
         }
     }
 }
-#endif
 

@@ -26,7 +26,7 @@ class ValidationManager:
             deduplicate_timestamps: If True, deduplicate timestamps (keep first) instead of just warning
         """
         self.required_columns = {"timestamp", "open", "high", "low", "close", "instrument"}
-        self.valid_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "RTY", "MES", "MNQ", "MYM", "MCL", "MNG", "MGC", "MINUTEDATAEXPORT"}
+        self.valid_instruments = {"ES", "NQ", "YM", "CL", "NG", "GC", "RTY", "MES", "MNQ", "MYM", "MCL", "MNG", "MGC", "M2K", "MINUTEDATAEXPORT"}
         self.valid_sessions = {"S1", "S2"}
         self.filter_invalid_rows = filter_invalid_rows
         self.deduplicate_timestamps = deduplicate_timestamps

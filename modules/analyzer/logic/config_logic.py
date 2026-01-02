@@ -6,7 +6,7 @@ Handles configuration management and parameter validation
 from pydantic import BaseModel, Field
 from typing import List, Literal, Dict, Tuple, Optional
 
-Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC"]
+Instrument = Literal["ES","NQ","YM","CL","NG","GC","RTY","MES","MNQ","MYM","MCL","MNG","MGC","M2K"]
 
 class RunParams(BaseModel):
     """Run parameters for the breakout strategy"""
@@ -33,7 +33,7 @@ class ConfigManager:
         
         self.tick_size: Dict[Instrument, float] = {
             "ES": 0.25, "NQ": 0.25, "YM": 1.0, "CL": 0.01, "NG": 0.001, "GC": 0.1, "RTY": 0.10,
-            "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "MCL": 0.01, "MNG": 0.001, "MGC": 0.1
+            "MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "MCL": 0.01, "MNG": 0.001, "MGC": 0.1, "M2K": 0.10
         }
         
         self.target_ladder: Dict[Instrument, Tuple[float,...]] = {
@@ -50,6 +50,7 @@ class ConfigManager:
             "MCL": (0.5,0.75,1.0,1.25,1.5,1.75,2.0),
             "MNG": (0.05,0.075,0.10,0.125,0.15,0.175,0.20),
             "MGC": (5,7.5,10,12.5,15,17.5,20),
+            "M2K": (10,),
         }
     
     def get_tick_size(self, instrument: Instrument) -> float:

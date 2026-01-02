@@ -86,6 +86,16 @@ export default function TabNavigation({ activeTab, setActiveTab }) {
       >
         Year
       </button>
+      <button
+        onClick={() => setActiveTab('stats')}
+        className={`px-4 py-2 font-medium whitespace-nowrap ${
+          activeTab === 'stats'
+            ? 'border-b-2 border-blue-500 text-blue-400'
+            : 'text-gray-400 hover:text-gray-300'
+        }`}
+      >
+        Stats
+      </button>
     </div>
   )
 }

@@ -1,0 +1,12 @@
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Debug\net8.0\Robot.Core.deps.json
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Debug\net8.0\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Debug\net8.0\Robot.Core.pdb
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.AssemblyInfoInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.AssemblyInfo.cs
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.csproj.CoreCompileInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.sourcelink.json
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\refint\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\Robot.Core.pdb
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Debug\net8.0\ref\Robot.Core.dll

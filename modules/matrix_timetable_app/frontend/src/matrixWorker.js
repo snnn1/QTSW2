@@ -1244,32 +1244,39 @@ self.onmessage = function(e) {
           return
         }
         
-        // Use currentTradingDay (displayed date) for DOW/DOM filtering
-        // This allows users to preview what would trade on the displayed date
-        // Data still comes from latest date in matrix, but filters are applied for displayed date
+        // Use currentTradingDay (displayed date) as the trading_date in output
+        // For data filtering: use displayed date if it exists in data, otherwise fall back to latest date
         // JavaScript getDay(): 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
         let targetDOWJS = null // JavaScript day-of-week (0-6)
         let targetDOWName = null // Day name ("Monday", "Tuesday", etc.)
         let targetDOM = null // 1-31
+        let tradingDateStr = null // The date to use for trading_date in output JSON
+        let filterDateStr = null // The date to use for filtering data rows
         
-        // Use currentTradingDay if provided, otherwise fall back to latest date in matrix
-        let filterDate = null
+        // Parse currentTradingDay if provided
+        let currentTradingDayDate = null
+        let currentTradingDayStr = null
         if (currentTradingDay) {
-          let dateObj = null
           if (currentTradingDay instanceof Date) {
-            dateObj = currentTradingDay
+            currentTradingDayDate = currentTradingDay
+            currentTradingDayStr = currentTradingDay.toISOString().split('T')[0]
           } else if (typeof currentTradingDay === 'string') {
-            dateObj = parseDateCached(currentTradingDay)
-          }
-          if (dateObj) {
-            filterDate = dateObj
+            currentTradingDayDate = parseDateCached(currentTradingDay)
+            currentTradingDayStr = currentTradingDay.split('T')[0]
           }
         }
         
-        // Fall back to latest date in matrix if currentTradingDay not available
-        if (!filterDate && latestDateParsed) {
-          filterDate = latestDateParsed
-        }
+        // Always use currentTradingDay as trading_date in output if provided
+        tradingDateStr = currentTradingDayStr || latestDateStr
+        
+        // Check if displayed date exists in the data
+        const displayedDateExists = currentTradingDayStr && dateStrings.has(currentTradingDayStr)
+        
+        // For filtering: use displayed date if it exists in data, otherwise use latest date
+        filterDateStr = (displayedDateExists && currentTradingDayStr) ? currentTradingDayStr : latestDateStr
+        
+        // Use currentTradingDay for DOW/DOM filtering if provided, otherwise fall back to latest date
+        let filterDate = currentTradingDayDate || latestDateParsed
         
         if (filterDate) {
           targetDOWJS = filterDate.getDay() // 0-6
@@ -1280,21 +1287,24 @@ self.onmessage = function(e) {
           targetDOWName = dayNames[targetDOWJS]
         }
         
-        if (targetDOWJS === null || targetDOM === null) {
+        if (targetDOWJS === null || targetDOM === null || !tradingDateStr || !filterDateStr) {
           self.postMessage({ type: WORKER_RESPONSE_TYPES.TIMETABLE, payload: { timetable: [], requestId } })
           return
         }
         
         console.log('[Worker] Timetable filtering:', {
           latestDateStr,
-          filterDateStr: filterDate ? filterDate.toISOString().split('T')[0] : null,
-          currentTradingDayStr: currentTradingDay ? (currentTradingDay instanceof Date ? currentTradingDay.toISOString().split('T')[0] : currentTradingDay.split('T')[0]) : null,
+          tradingDateStr,
+          filterDateStr,
+          displayedDateExists,
+          filterDateStrUsed: filterDateStr,
+          currentTradingDayStr,
           targetDOWJS,
           targetDOWName,
           targetDOM
         })
         
-        // Build timetable from latest date in matrix, applying filters based on displayed date's DOW/DOM
+        // Build timetable from filterDateStr (displayed date if exists in data, otherwise latest date)
         const timetableRows = []
         const seenStreams = new Set() // Track streams to avoid duplicates
         
@@ -1306,7 +1316,7 @@ self.onmessage = function(e) {
           if (!parsed) continue
           
           const dayKey = parsed.toISOString().split('T')[0]
-          if (dayKey !== latestDateStr) continue // Only use latest date
+          if (dayKey !== filterDateStr) continue // Use filterDateStr (displayed date if exists, otherwise latest date)
           
           const stream = Stream[i] || ''
           const time = Time[i] || ''
@@ -1323,14 +1333,8 @@ self.onmessage = function(e) {
           // If filtering for a different date than the matrix data, don't use final_allowed
           // because it was calculated for the matrix date, not the displayed date
           let useFinalAllowed = true
-          if (currentTradingDay && latestDateStr) {
-            let currentTradingDayStr = null
-            if (currentTradingDay instanceof Date) {
-              currentTradingDayStr = currentTradingDay.toISOString().split('T')[0]
-            } else if (typeof currentTradingDay === 'string') {
-              currentTradingDayStr = currentTradingDay.split('T')[0]
-            }
-            useFinalAllowed = (currentTradingDayStr === latestDateStr)
+          if (filterDateStr && latestDateStr) {
+            useFinalAllowed = (filterDateStr === latestDateStr)
           }
           
           // Check final_allowed column ONLY if dates match
@@ -1439,7 +1443,7 @@ self.onmessage = function(e) {
           payload: { 
             timetable: timetableRows,
             executionTimetable: {
-              trading_date: latestDateStr,
+              trading_date: tradingDateStr,
               streams: executionStreams
             },
             requestId
