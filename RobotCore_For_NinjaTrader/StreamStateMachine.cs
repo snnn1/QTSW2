@@ -99,15 +99,15 @@ public sealed class StreamStateMachine
         if (!TimeService.TryParseDateOnly(tradingDate, out var dateOnly))
             throw new InvalidOperationException($"Invalid trading_date '{tradingDate}'");
 
-        var rangeStartChicago = spec.Sessions[Session].RangeStartTime;
+        var rangeStartChicago = spec.sessions[Session].range_start_time;
         RangeStartUtc = time.ConvertChicagoLocalToUtc(dateOnly, rangeStartChicago);
         SlotTimeUtc = time.ConvertChicagoLocalToUtc(dateOnly, SlotTimeChicago);
-        MarketCloseUtc = time.ConvertChicagoLocalToUtc(dateOnly, spec.EntryCutoff.MarketCloseTime);
+        MarketCloseUtc = time.ConvertChicagoLocalToUtc(dateOnly, spec.entry_cutoff.market_close_time);
 
         if (!spec.TryGetInstrument(Instrument, out var inst))
             throw new InvalidOperationException($"Instrument not found in parity spec: {Instrument}");
-        _tickSize = inst.TickSize;
-        _baseTarget = inst.BaseTarget;
+        _tickSize = inst.tick_size;
+        _baseTarget = inst.base_target;
 
         var existing = journals.TryLoad(tradingDate, Stream);
         _journal = existing ?? new StreamJournal
@@ -164,10 +164,10 @@ public sealed class StreamStateMachine
         }
 
         // Recompute UTC times for the new trading_date
-        var rangeStartChicago = _spec.Sessions[Session].RangeStartTime;
+        var rangeStartChicago = _spec.sessions[Session].range_start_time;
         RangeStartUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, rangeStartChicago);
         SlotTimeUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, SlotTimeChicago);
-        MarketCloseUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, _spec.EntryCutoff.MarketCloseTime);
+        MarketCloseUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, _spec.entry_cutoff.market_close_time);
 
         // Replace journal with one for the new trading_date
         if (existingJournal != null)
@@ -404,7 +404,7 @@ public sealed class StreamStateMachine
                     brk_long_rounded = _brkLongRounded,
                     brk_short_rounded = _brkShortRounded,
                     tick_size = _tickSize,
-                    rounding_method_name = _spec.Breakout.TickRounding.Method
+                    rounding_method_name = _spec.breakout.tick_rounding.method
                 }));
         }
         else
@@ -418,7 +418,7 @@ public sealed class StreamStateMachine
                     brk_short_unrounded = _brkShortRaw,
                     tick_size = _tickSize,
                     rounding_required = true,
-                    rounding_method = _spec.Breakout.TickRounding.Method
+                    rounding_method = _spec.breakout.tick_rounding.method
                 }));
         }
     }

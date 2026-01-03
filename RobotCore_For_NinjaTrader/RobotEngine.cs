@@ -56,9 +56,12 @@ public sealed class RobotEngine
         try
         {
             _spec = ParitySpec.LoadFromFile(_specPath);
-            _time = new TimeService(_spec.Timezone);
+            // Debug log: confirm spec_name was loaded
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
+                new { spec_name = _spec.spec_name }));
+            _time = new TimeService(_spec.timezone);
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
-                new { spec_name = _spec.SpecName, spec_revision = _spec.SpecRevision, timezone = _spec.Timezone }));
+                new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
         }
         catch (Exception ex)
         {
@@ -320,7 +323,7 @@ public sealed class RobotEngine
                 continue;
             }
 
-            if (!_spec.Sessions.ContainsKey(session))
+            if (!_spec.sessions.ContainsKey(session))
             {
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_SESSION", out var count2)) count2 = 0;
@@ -331,7 +334,7 @@ public sealed class RobotEngine
             }
 
             // slot_time validation (fail closed per stream)
-            var allowed = _spec.Sessions[session].SlotEndTimes;
+            var allowed = _spec.sessions[session].slot_end_times;
             if (!allowed.Contains(slotTimeChicago))
             {
                 skippedCount++;

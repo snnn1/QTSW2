@@ -55,12 +55,12 @@ public sealed class RiskGate
         }
 
         // Gate 4: Within allowed session window
-        if (string.IsNullOrEmpty(slotTimeChicago) || !_spec.Sessions.ContainsKey(session))
+        if (string.IsNullOrEmpty(slotTimeChicago) || !_spec.sessions.ContainsKey(session))
         {
             return (false, "INVALID_SESSION_OR_SLOT_TIME");
         }
 
-        var allowedSlots = _spec.Sessions[session].SlotEndTimes;
+        var allowedSlots = _spec.sessions[session].slot_end_times;
         if (!allowedSlots.Contains(slotTimeChicago))
         {
             return (false, "SLOT_TIME_NOT_ALLOWED");

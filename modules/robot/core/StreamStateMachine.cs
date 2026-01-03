@@ -102,7 +102,7 @@ public sealed class StreamStateMachine
         var rangeStartChicago = spec.Sessions[Session].RangeStartTime;
         RangeStartUtc = time.ConvertChicagoLocalToUtc(dateOnly, rangeStartChicago);
         SlotTimeUtc = time.ConvertChicagoLocalToUtc(dateOnly, SlotTimeChicago);
-        MarketCloseUtc = time.ConvertChicagoLocalToUtc(dateOnly, spec.EntryCutoff.MarketCloseTime);
+        MarketCloseUtc = time.ConvertChicagoLocalToUtc(dateOnly, spec.EntryCutoff.market_close_time);
 
         if (!spec.TryGetInstrument(Instrument, out var inst))
             throw new InvalidOperationException($"Instrument not found in parity spec: {Instrument}");
@@ -167,7 +167,7 @@ public sealed class StreamStateMachine
         var rangeStartChicago = _spec.Sessions[Session].RangeStartTime;
         RangeStartUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, rangeStartChicago);
         SlotTimeUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, SlotTimeChicago);
-        MarketCloseUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, _spec.EntryCutoff.MarketCloseTime);
+        MarketCloseUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, _spec.EntryCutoff.market_close_time);
 
         // Replace journal with one for the new trading_date
         if (existingJournal != null)

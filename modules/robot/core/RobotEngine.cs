@@ -56,9 +56,12 @@ public sealed class RobotEngine
         try
         {
             _spec = ParitySpec.LoadFromFile(_specPath);
+            // Debug log: confirm spec_name was loaded
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
+                new { spec_name = _spec.spec_name }));
             _time = new TimeService(_spec.Timezone);
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
-                new { spec_name = _spec.SpecName, spec_revision = _spec.SpecRevision, timezone = _spec.Timezone }));
+                new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.Timezone }));
         }
         catch (Exception ex)
         {

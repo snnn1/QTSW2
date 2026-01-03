@@ -6,23 +6,23 @@ namespace QTSW2.Robot.Core;
 
 public sealed class ParitySpec
 {
-    public string SpecName { get; set; } = "";
+    public string spec_name { get; set; } = null!;
 
-    public string SpecRevision { get; set; } = "";
+    public string spec_revision { get; set; } = "";
 
-    public string Timezone { get; set; } = "";
+    public string timezone { get; set; } = "";
 
-    public Dictionary<string, ParitySession> Sessions { get; set; } = new();
+    public Dictionary<string, ParitySession> sessions { get; set; } = new();
 
-    public EntryCutoff EntryCutoff { get; set; } = new();
+    public EntryCutoff entry_cutoff { get; set; } = new();
 
-    public BreakoutSpec Breakout { get; set; } = new();
+    public BreakoutSpec breakout { get; set; } = new();
 
-    public TimetableValidation TimetableValidation { get; set; } = new();
+    public TimetableValidation timetable_validation { get; set; } = new();
 
-    public Dictionary<string, ParityInstrument> Instruments { get; set; } = new();
+    public Dictionary<string, ParityInstrument> instruments { get; set; } = new();
 
-    public Dictionary<string, object>? NonTradingSymbols { get; set; }
+    public Dictionary<string, object>? non_trading_symbols { get; set; }
 
     public static ParitySpec LoadFromFile(string path)
     {
@@ -34,126 +34,128 @@ public sealed class ParitySpec
 
     public void ValidateOrThrow()
     {
-        if (SpecName != "analyzer_robot_parity")
-            throw new InvalidOperationException($"spec_name invalid: '{SpecName}'");
+        if (string.IsNullOrWhiteSpace(spec_name))
+            throw new InvalidOperationException("spec_name invalid: spec_name is required and cannot be empty.");
+        if (spec_name != "analyzer_robot_parity")
+            throw new InvalidOperationException($"spec_name invalid: '{spec_name}'");
 
-        if (string.IsNullOrWhiteSpace(SpecRevision))
+        if (string.IsNullOrWhiteSpace(spec_revision))
             throw new InvalidOperationException("spec_revision missing.");
 
-        if (Timezone != "America/Chicago")
-            throw new InvalidOperationException($"timezone must be 'America/Chicago' (got '{Timezone}').");
+        if (timezone != "America/Chicago")
+            throw new InvalidOperationException($"timezone must be 'America/Chicago' (got '{timezone}').");
 
-        if (Sessions is null || Sessions.Count == 0)
+        if (sessions is null || sessions.Count == 0)
             throw new InvalidOperationException("sessions missing/empty.");
 
-        if (!Sessions.ContainsKey("S1") || !Sessions.ContainsKey("S2"))
+        if (!sessions.ContainsKey("S1") || !sessions.ContainsKey("S2"))
             throw new InvalidOperationException("sessions must include S1 and S2.");
 
-        EntryCutoff.ValidateOrThrow();
-        Breakout.ValidateOrThrow();
-        TimetableValidation.ValidateOrThrow();
+        entry_cutoff.ValidateOrThrow();
+        breakout.ValidateOrThrow();
+        timetable_validation.ValidateOrThrow();
 
-        if (Instruments is null || Instruments.Count == 0)
+        if (instruments is null || instruments.Count == 0)
             throw new InvalidOperationException("instruments missing/empty.");
     }
 
     public bool TryGetInstrument(string instrument, out ParityInstrument inst)
-        => Instruments.TryGetValue(instrument.ToUpperInvariant(), out inst!);
+        => instruments.TryGetValue(instrument.ToUpperInvariant(), out inst!);
 
 }
 
 public sealed class ParitySession
 {
-    public string RangeStartTime { get; set; } = "";
+    public string range_start_time { get; set; } = "";
 
-    public List<string> SlotEndTimes { get; set; } = new();
+    public List<string> slot_end_times { get; set; } = new();
 }
 
 public sealed class EntryCutoff
 {
-    public string Type { get; set; } = "";
+    public string type { get; set; } = "";
 
-    public string MarketCloseTime { get; set; } = "";
+    public string market_close_time { get; set; } = "";
 
-    public string? Rule { get; set; }
+    public string? rule { get; set; }
 
     public void ValidateOrThrow()
     {
-        if (Type != "MARKET_CLOSE")
-            throw new InvalidOperationException($"entry_cutoff.type must be MARKET_CLOSE (got '{Type}').");
-        if (string.IsNullOrWhiteSpace(MarketCloseTime))
+        if (type != "MARKET_CLOSE")
+            throw new InvalidOperationException($"entry_cutoff.type must be MARKET_CLOSE (got '{type}').");
+        if (string.IsNullOrWhiteSpace(market_close_time))
             throw new InvalidOperationException("entry_cutoff.market_close_time missing.");
     }
 }
 
 public sealed class BreakoutSpec
 {
-    public int OffsetTicks { get; set; }
+    public int offset_ticks { get; set; }
 
-    public TickRounding TickRounding { get; set; } = new();
+    public TickRounding tick_rounding { get; set; } = new();
 
     public void ValidateOrThrow()
     {
-        if (OffsetTicks != 1)
-            throw new InvalidOperationException($"breakout.offset_ticks must be 1 for analyzer parity (got {OffsetTicks}).");
-        TickRounding.ValidateOrThrow();
+        if (offset_ticks != 1)
+            throw new InvalidOperationException($"breakout.offset_ticks must be 1 for analyzer parity (got {offset_ticks}).");
+        tick_rounding.ValidateOrThrow();
     }
 }
 
 public sealed class TickRounding
 {
-    public string Method { get; set; } = "";
+    public string method { get; set; } = "";
 
-    public string? Definition { get; set; }
+    public string? definition { get; set; }
 
-    public string? ImplementationNote { get; set; }
+    public string? implementation_note { get; set; }
 
-    public string? TieBehaviorNote { get; set; }
+    public string? tie_behavior_note { get; set; }
 
     public void ValidateOrThrow()
     {
-        if (Method != "utility_round_to_tick")
-            throw new InvalidOperationException($"breakout.tick_rounding.method must be utility_round_to_tick (got '{Method}').");
-        if (string.IsNullOrWhiteSpace(Definition))
+        if (method != "utility_round_to_tick")
+            throw new InvalidOperationException($"breakout.tick_rounding.method must be utility_round_to_tick (got '{method}').");
+        if (string.IsNullOrWhiteSpace(definition))
             throw new InvalidOperationException("breakout.tick_rounding.definition missing.");
     }
 }
 
 public sealed class TimetableValidation
 {
-    public SlotTimeValidation SlotTimeValidation { get; set; } = new();
+    public SlotTimeValidation slot_time_validation { get; set; } = new();
 
     public void ValidateOrThrow()
     {
-        SlotTimeValidation.ValidateOrThrow();
+        slot_time_validation.ValidateOrThrow();
     }
 }
 
 public sealed class SlotTimeValidation
 {
-    public string Rule { get; set; } = "";
+    public string rule { get; set; } = "";
 
-    public string AllowedSlotEndTimesSource { get; set; } = "";
+    public string allowed_slot_end_times_source { get; set; } = "";
 
     public void ValidateOrThrow()
     {
-        if (string.IsNullOrWhiteSpace(Rule))
+        if (string.IsNullOrWhiteSpace(rule))
             throw new InvalidOperationException("timetable_validation.slot_time_validation.rule missing.");
-        if (string.IsNullOrWhiteSpace(AllowedSlotEndTimesSource))
+        if (string.IsNullOrWhiteSpace(allowed_slot_end_times_source))
             throw new InvalidOperationException("timetable_validation.slot_time_validation.allowed_slot_end_times_source missing.");
     }
 }
 
 public sealed class ParityInstrument
 {
-    public decimal TickSize { get; set; }
+    public decimal tick_size { get; set; }
 
-    public decimal BaseTarget { get; set; }
+    public decimal base_target { get; set; }
 
-    public bool IsMicro { get; set; }
+    public bool is_micro { get; set; }
 
-    public string BaseInstrument { get; set; } = "";
+    public string base_instrument { get; set; } = "";
 
-    public decimal ScalingFactor { get; set; }
+    public decimal scaling_factor { get; set; }
 }
 

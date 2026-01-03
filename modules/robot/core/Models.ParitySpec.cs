@@ -6,9 +6,9 @@ namespace QTSW2.Robot.Core;
 
 public sealed class ParitySpec
 {
-    public string SpecName { get; set; } = "";
+    public string spec_name { get; set; } = null!;
 
-    public string SpecRevision { get; set; } = "";
+    public string spec_revision { get; set; } = "";
 
     public string Timezone { get; set; } = "";
 
@@ -34,10 +34,12 @@ public sealed class ParitySpec
 
     public void ValidateOrThrow()
     {
-        if (SpecName != "analyzer_robot_parity")
-            throw new InvalidOperationException($"spec_name invalid: '{SpecName}'");
+        if (string.IsNullOrWhiteSpace(spec_name))
+            throw new InvalidOperationException("spec_name invalid: spec_name is required and cannot be empty.");
+        if (spec_name != "analyzer_robot_parity")
+            throw new InvalidOperationException($"spec_name invalid: '{spec_name}'");
 
-        if (string.IsNullOrWhiteSpace(SpecRevision))
+        if (string.IsNullOrWhiteSpace(spec_revision))
             throw new InvalidOperationException("spec_revision missing.");
 
         if (Timezone != "America/Chicago")
@@ -71,17 +73,17 @@ public sealed class ParitySession
 
 public sealed class EntryCutoff
 {
-    public string Type { get; set; } = "";
+    public string type { get; set; } = "";
 
-    public string MarketCloseTime { get; set; } = "";
+    public string market_close_time { get; set; } = "";
 
-    public string? Rule { get; set; }
+    public string? rule { get; set; }
 
     public void ValidateOrThrow()
     {
-        if (Type != "MARKET_CLOSE")
-            throw new InvalidOperationException($"entry_cutoff.type must be MARKET_CLOSE (got '{Type}').");
-        if (string.IsNullOrWhiteSpace(MarketCloseTime))
+        if (type != "MARKET_CLOSE")
+            throw new InvalidOperationException($"entry_cutoff.type must be MARKET_CLOSE (got '{type}').");
+        if (string.IsNullOrWhiteSpace(market_close_time))
             throw new InvalidOperationException("entry_cutoff.market_close_time missing.");
     }
 }
