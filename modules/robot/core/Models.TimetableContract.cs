@@ -37,6 +37,18 @@ public sealed class TimetableStream
     public string SlotTime { get; set; } = "";
 
     public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Reason why stream is blocked (if Enabled = false).
+    /// Examples: "dom_blocked_5", "scf_blocked", "no_rs_data", "not_in_master_matrix"
+    /// </summary>
+    public string? BlockReason { get; set; }
+
+    /// <summary>
+    /// Decision time (sequencer intent) - the time slot the sequencer would use if enabled.
+    /// Always present even if stream is blocked, representing current sequencer state.
+    /// </summary>
+    public string DecisionTime { get; set; } = "";
 }
 
 public sealed class TimetableMetadata

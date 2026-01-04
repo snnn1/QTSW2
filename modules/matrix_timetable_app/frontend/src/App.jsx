@@ -2898,13 +2898,102 @@ function AppContent() {
   }, [currentTradingDay])
   
   // Calculate timetable in worker when needed
+  // If displayed date doesn't exist in master matrix, read from backend-generated timetable_current.json
   useEffect(() => {
-    // Only calculate if worker is ready AND data has been initialized (masterData exists)
-    // Data reinitialization is handled by the effect above when worker becomes ready
-    if (workerReady && masterData.length > 0 && workerCalculateTimetable && deferredActiveTab === 'timetable') {
+    if (deferredActiveTab !== 'timetable' || !currentTradingDay) return
+    
+    // Check if displayed date exists in master matrix
+    const displayedDateStr = currentTradingDay.toISOString().split('T')[0]
+    const dateExistsInMatrix = masterData.some(row => {
+      const rowDate = row.Date || row.trade_date
+      if (!rowDate) return false
+      const rowDateStr = rowDate instanceof Date 
+        ? rowDate.toISOString().split('T')[0]
+        : rowDate.split('T')[0]
+      return rowDateStr === displayedDateStr
+    })
+    
+    // If date doesn't exist in matrix, try to read from backend-generated timetable_current.json
+    // This file is generated with RS calculation and contains all streams
+    if (!dateExistsInMatrix && workerReady) {
+      console.log('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
+      const loadFromBackend = async () => {
+        try {
+          const timetable = await matrixApi.getCurrentTimetable()
+          if (timetable && timetable.trading_date === displayedDateStr && timetable.streams) {
+            // Convert backend format to worker format
+            const timetableRows = timetable.streams
+              .filter(s => s.enabled === true) // Only enabled for display
+              .map(s => ({
+                Stream: s.stream,
+                Time: s.slot_time || s.decision_time || '',
+                Enabled: s.enabled,
+                BlockReason: s.block_reason || null
+              }))
+            
+            // Update worker timetable state directly (bypass worker calculation)
+            // We need to access the setTimetable function from useMatrixWorker
+            // For now, trigger backend generation which will update the file
+            const generateResponse = await fetch(`http://localhost:8000/api/timetable/generate`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ date: displayedDateStr })
+            })
+            if (generateResponse.ok) {
+              // After generation, trigger worker calculation which will now use the updated file
+              // Or better: read the file again and update state
+              const updatedTimetable = await matrixApi.getCurrentTimetable()
+              if (updatedTimetable && updatedTimetable.streams) {
+                const updatedRows = updatedTimetable.streams
+                  .filter(s => s.enabled === true)
+                  .map(s => ({
+                    Stream: s.stream,
+                    Time: s.slot_time || s.decision_time || '',
+                    Enabled: s.enabled,
+                    BlockReason: s.block_reason || null
+                  }))
+                // Note: We can't directly set worker state here, so we'll let the worker
+                // recalculate after the file is updated. The worker should read from the file.
+                console.log('[Timetable] Generated via backend, triggering worker recalculation')
+                if (workerCalculateTimetable) {
+                  // Small delay to ensure file is written
+                  setTimeout(() => {
+                    workerCalculateTimetable(streamFilters, currentTradingDay)
+                  }, 100)
+                }
+              }
+            }
+          } else if (timetable && timetable.trading_date !== displayedDateStr) {
+            // File exists but for different date - generate for displayed date
+            console.log('[Timetable] File exists for different date, generating for:', displayedDateStr)
+            await fetch(`http://localhost:8000/api/timetable/generate`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ date: displayedDateStr })
+            })
+            if (workerCalculateTimetable) {
+              setTimeout(() => {
+                workerCalculateTimetable(streamFilters, currentTradingDay)
+              }, 100)
+            }
+          }
+        } catch (error) {
+          console.warn('[Timetable] Backend read failed, using worker:', error)
+          // Fall through to worker calculation
+          if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
+            workerCalculateTimetable(streamFilters, currentTradingDay)
+          }
+        }
+      }
+      loadFromBackend()
+      return
+    }
+    
+    // Normal path: Use worker calculation from master matrix
+    if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
       workerCalculateTimetable(streamFilters, currentTradingDay)
     }
-  }, [workerReady, masterData.length, streamFilters, deferredActiveTab, workerCalculateTimetable, currentTradingDay])
+  }, [workerReady, masterData.length, streamFilters, deferredActiveTab, workerCalculateTimetable, currentTradingDay, masterData])
   
   // Save execution timetable whenever UI timetable updates
   // This ensures timetable_current.json matches exactly what the UI shows
@@ -3145,12 +3234,14 @@ function AppContent() {
                         </tr>
                       </thead>
                       <tbody>
-                        {workerTimetable.map((row, idx) => (
-                          <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
-                            <td className="px-4 py-3">{row.Stream}</td>
-                            <td className="px-4 py-3 font-mono">{row.Time}</td>
-                          </tr>
-                        ))}
+                        {workerTimetable
+                          .filter(row => row.Enabled !== false) // UI filters out disabled streams (presentation layer)
+                          .map((row, idx) => (
+                            <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
+                              <td className="px-4 py-3">{row.Stream}</td>
+                              <td className="px-4 py-3 font-mono">{row.Time}</td>
+                            </tr>
+                          ))}
                       </tbody>
                     </table>
                   </div>

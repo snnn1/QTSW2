@@ -322,34 +322,48 @@ class TimetableEngine:
             
             # Process both sessions
             for session in ["S1", "S2"]:
+                # Initialize SCF values (used for filtering)
+                scf_s1, scf_s2 = None, None
+                
                 # Select best time based on RS
                 selected_time, time_reason = self.select_best_time(stream_id, session)
                 
+                # CRITICAL: If time selection fails, use default time and mark as blocked
+                # NEVER skip streams - all streams must be present in timetable
                 if selected_time is None:
-                    continue
-                
-                # Get SCF values
-                scf_s1, scf_s2 = self.get_scf_values(stream_id, trade_date_obj)
-                
-                # Check filters
-                allowed, filter_reason = self.check_filters(
-                    trade_date_obj, stream_id, session, scf_s1, scf_s2
-                )
-                
-                # Combine reasons
-                if not allowed:
-                    reason = filter_reason
+                    # Use first available time slot as default (sequencer intent)
+                    available_times = self.session_time_slots.get(session, [])
+                    selected_time = available_times[0] if available_times else ""
+                    block_reason = "no_rs_data"
+                    allowed = False
+                    final_reason = f"{time_reason}_{block_reason}"
                 else:
-                    reason = time_reason
+                    block_reason = None
+                    # Get SCF values for filtering
+                    scf_s1, scf_s2 = self.get_scf_values(stream_id, trade_date_obj)
+                    
+                    # Check filters
+                    allowed, filter_reason = self.check_filters(
+                        trade_date_obj, stream_id, session, scf_s1, scf_s2
+                    )
+                    
+                    # Combine reasons
+                    if not allowed:
+                        final_reason = filter_reason
+                        block_reason = filter_reason
+                    else:
+                        final_reason = time_reason
                 
+                # ALWAYS append - never skip (timetable must contain all streams)
                 timetable_rows.append({
                     'trade_date': trade_date,
                     'symbol': instrument,
                     'stream_id': stream_id,
                     'session': session,
                     'selected_time': selected_time,
-                    'reason': reason,
+                    'reason': final_reason,
                     'allowed': allowed,
+                    'block_reason': block_reason,
                     'scf_s1': scf_s1,
                     'scf_s2': scf_s2,
                     'day_of_month': trade_date_obj.day,
@@ -446,8 +460,9 @@ class TimetableEngine:
         target_dom = trade_date_obj.day
         
         # Build streams array from master matrix data
-        # Only include streams that pass filters (matching UI timetable behavior)
-        streams = []
+        # CRITICAL: Must include ALL 12 streams (complete execution contract)
+        # Streams not in master matrix or filtered are included with enabled=false
+        streams_dict = {}  # stream_id -> stream_entry
         seen_streams = set()
         
         # Day names for DOW filtering (0=Monday, 6=Sunday)
@@ -457,23 +472,13 @@ class TimetableEngine:
         # Check if final_allowed column exists (authoritative filter indicator)
         has_final_allowed = 'final_allowed' in latest_df.columns
         
+        # First pass: Process streams that exist in master matrix
         for _, row in latest_df.iterrows():
             stream = row.get('Stream', '')
             if not stream or stream in seen_streams:
                 continue
             
-            # Check final_allowed column first (if exists, this is the authoritative filter)
-            # This column indicates which streams pass all filters in the master matrix
-            # Only include streams where final_allowed is explicitly True
-            if has_final_allowed:
-                final_allowed = row.get('final_allowed')
-                # Skip if final_allowed is False, None, NaN, or any falsy value
-                if final_allowed is False:
-                    continue  # Skip filtered-out streams (matching UI timetable behavior)
-                if pd.isna(final_allowed):
-                    continue  # Skip NaN values
-                if final_allowed is not True:
-                    continue  # Only include if explicitly True
+            seen_streams.add(stream)
             
             # Extract instrument and session from stream
             instrument = stream[:-1] if len(stream) > 1 else ''
@@ -487,54 +492,91 @@ class TimetableEngine:
                 if len(parts) == 2:
                     time = parts[1].strip()
             
+            # If no time, use default for session
             if not time:
-                continue
+                available_times = self.session_time_slots.get(session, [])
+                time = available_times[0] if available_times else ""
             
-            # Apply stream filters (same logic as UI worker)
-            # Default to enabled, but check filters
-            enabled = True
+            # Check final_allowed column first (if exists, this is the authoritative filter)
+            if has_final_allowed:
+                final_allowed = row.get('final_allowed')
+                # If final_allowed is False/NaN/None, mark as blocked
+                if final_allowed is not True:
+                    enabled = False
+                    block_reason = f"master_matrix_filtered_{final_allowed}"
+                else:
+                    enabled = True
+                    block_reason = None
+            else:
+                # No final_allowed column - check filters manually
+                enabled = True
+                block_reason = None
+                
+                if stream_filters:
+                    stream_filter = stream_filters.get(stream, {})
+                    
+                    # Check stream-specific DOW filter
+                    if stream_filter.get('exclude_days_of_week'):
+                        excluded_dow = stream_filter['exclude_days_of_week']
+                        if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
+                            enabled = False
+                            block_reason = f"dow_filter_{target_dow_name.lower()}"
+                    
+                    # Check stream-specific DOM filter
+                    if enabled and stream_filter.get('exclude_days_of_month'):
+                        excluded_dom = [int(d) for d in stream_filter['exclude_days_of_month']]
+                        if target_dom in excluded_dom:
+                            enabled = False
+                            block_reason = f"dom_filter_{target_dom}"
+                    
+                    # Check master filter
+                    master_filter = stream_filters.get('master', {})
+                    if enabled and master_filter.get('exclude_days_of_week'):
+                        excluded_dow = master_filter['exclude_days_of_week']
+                        if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
+                            enabled = False
+                            block_reason = f"master_dow_filter_{target_dow_name.lower()}"
+                    
+                    if enabled and master_filter.get('exclude_days_of_month'):
+                        excluded_dom = [int(d) for d in master_filter['exclude_days_of_month']]
+                        if target_dom in excluded_dom:
+                            enabled = False
+                            block_reason = f"master_dom_filter_{target_dom}"
             
-            if stream_filters:
-                stream_filter = stream_filters.get(stream, {})
+            # Always include stream (enabled or blocked)
+            stream_entry = {
+                'stream': stream,
+                'instrument': instrument,
+                'session': session,
+                'slot_time': time,
+                'decision_time': time,  # Sequencer intent (same as slot_time)
+                'enabled': enabled
+            }
+            if block_reason:
+                stream_entry['block_reason'] = block_reason
+            streams_dict[stream] = stream_entry
+        
+        # Second pass: Ensure ALL 12 streams are present (add missing ones as blocked)
+        for stream_id in self.streams:
+            if stream_id not in streams_dict:
+                # Stream not in master matrix - add as blocked
+                instrument = stream_id[:-1] if len(stream_id) > 1 else ''
+                session = 'S1' if stream_id.endswith('1') else 'S2'
+                available_times = self.session_time_slots.get(session, [])
+                default_time = available_times[0] if available_times else ""
                 
-                # Check stream-specific DOW filter
-                if stream_filter.get('exclude_days_of_week'):
-                    excluded_dow = stream_filter['exclude_days_of_week']
-                    if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
-                        enabled = False
-                        continue  # Skip this stream entirely
-                
-                # Check stream-specific DOM filter
-                if enabled and stream_filter.get('exclude_days_of_month'):
-                    excluded_dom = [int(d) for d in stream_filter['exclude_days_of_month']]
-                    if target_dom in excluded_dom:
-                        enabled = False
-                        continue  # Skip this stream entirely
-                
-                # Check master filter
-                master_filter = stream_filters.get('master', {})
-                if enabled and master_filter.get('exclude_days_of_week'):
-                    excluded_dow = master_filter['exclude_days_of_week']
-                    if any(d == target_dow_name or d == str(target_dow) for d in excluded_dow):
-                        enabled = False
-                        continue  # Skip this stream entirely
-                
-                if enabled and master_filter.get('exclude_days_of_month'):
-                    excluded_dom = [int(d) for d in master_filter['exclude_days_of_month']]
-                    if target_dom in excluded_dom:
-                        enabled = False
-                        continue  # Skip this stream entirely
-            
-            # Only include enabled streams (matching UI timetable)
-            if enabled:
-                streams.append({
-                    'stream': stream,
+                streams_dict[stream_id] = {
+                    'stream': stream_id,
                     'instrument': instrument,
                     'session': session,
-                    'slot_time': time,
-                    'enabled': True
-                })
-                seen_streams.add(stream)
+                    'slot_time': default_time,
+                    'decision_time': default_time,  # Sequencer intent
+                    'enabled': False,
+                    'block_reason': 'not_in_master_matrix'
+                }
+        
+        # Convert dict to list (all 12 streams guaranteed)
+        streams = list(streams_dict.values())
         
         # Write execution timetable file
         self._write_execution_timetable_file(streams, trade_date)
@@ -544,7 +586,7 @@ class TimetableEngine:
         Internal method to write execution timetable file.
         
         Args:
-            streams: List of stream dicts with stream, instrument, session, slot_time, enabled
+            streams: List of stream dicts with stream, instrument, session, slot_time, enabled, block_reason (optional)
             trade_date: Trading date (YYYY-MM-DD)
         """
         output_dir = Path("data/timetable")
@@ -556,6 +598,12 @@ class TimetableEngine:
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
         as_of = datetime.now(chicago_tz).isoformat()
+        
+        # Ensure all streams have decision_time (sequencer intent) - same as slot_time
+        # This represents what the sequencer would use even if stream is blocked
+        for stream in streams:
+            if 'decision_time' not in stream:
+                stream['decision_time'] = stream.get('slot_time', '')
         
         # Build execution timetable document
         execution_timetable = {
@@ -606,12 +654,13 @@ class TimetableEngine:
         # Clean up old files (keep only timetable_current.json)
         self._cleanup_old_timetable_files(output_dir)
         
-        # Build streams array - only include enabled streams from the timetable
+        # Build streams array - include ALL streams (enabled and blocked)
         # Each stream_id maps to one session: ES1->S1, ES2->S2, etc.
+        # CRITICAL: Timetable must contain complete execution contract - all 12 streams
         streams = []
         
-        # Create a lookup dict from timetable_df: stream_id -> (session, slot_time, enabled)
-        enabled_streams = {}
+        # Create a lookup dict from timetable_df: stream_id -> (session, slot_time, enabled, block_reason)
+        all_streams = {}
         for _, row in timetable_df.iterrows():
             stream_id = row['stream_id']
             session = row['session']
@@ -619,23 +668,28 @@ class TimetableEngine:
             # ES1 should only have S1 entries, ES2 should only have S2 entries
             expected_session = "S1" if stream_id.endswith("1") else "S2"
             if session == expected_session:
-                enabled_streams[stream_id] = {
+                all_streams[stream_id] = {
                     'session': session,
                     'slot_time': row['selected_time'],
-                    'enabled': row['allowed']
+                    'enabled': row['allowed'],
+                    'block_reason': row.get('block_reason')  # May be None if enabled
                 }
         
-        # Only include streams that are enabled (enabled=true)
-        for stream_id, stream_data in enabled_streams.items():
-            if stream_data['enabled']:
-                instrument = stream_id[:-1]  # ES1 -> ES
-                streams.append({
-                    'stream': stream_id,
-                    'instrument': instrument,
-                    'session': stream_data['session'],
-                    'slot_time': stream_data['slot_time'],
-                    'enabled': True
-                })
+        # Include ALL streams - enabled and blocked (complete execution contract)
+        for stream_id, stream_data in all_streams.items():
+            instrument = stream_id[:-1]  # ES1 -> ES
+            stream_entry = {
+                'stream': stream_id,
+                'instrument': instrument,
+                'session': stream_data['session'],
+                'slot_time': stream_data['slot_time'],
+                'decision_time': stream_data['slot_time'],  # Sequencer intent (same as slot_time)
+                'enabled': stream_data['enabled']  # Can be False
+            }
+            # Add block_reason if stream is blocked
+            if stream_data.get('block_reason'):
+                stream_entry['block_reason'] = stream_data['block_reason']
+            streams.append(stream_entry)
         
         # Write execution timetable file using shared method
         self._write_execution_timetable_file(streams, trade_date)

@@ -1272,10 +1272,13 @@ self.onmessage = function(e) {
         // Check if displayed date exists in the data
         const displayedDateExists = currentTradingDayStr && dateStrings.has(currentTradingDayStr)
         
-        // For filtering: use displayed date if it exists in data, otherwise use latest date
-        filterDateStr = (displayedDateExists && currentTradingDayStr) ? currentTradingDayStr : latestDateStr
+        // CRITICAL FIX: Always use displayed date for timetable generation
+        // If displayed date doesn't exist in matrix, we still generate timetable for that date
+        // with all streams present (some may be disabled due to no data)
+        filterDateStr = currentTradingDayStr || latestDateStr
         
-        // Use currentTradingDay for DOW/DOM filtering if provided, otherwise fall back to latest date
+        // Always use currentTradingDay for DOW/DOM filtering (not latest date)
+        // This ensures filters are applied for the displayed date, not the data date
         let filterDate = currentTradingDayDate || latestDateParsed
         
         if (filterDate) {
@@ -1301,12 +1304,25 @@ self.onmessage = function(e) {
           currentTradingDayStr,
           targetDOWJS,
           targetDOWName,
-          targetDOM
+          targetDOM,
+          note: displayedDateExists ? 'Using matrix data' : 'Displayed date not in matrix - will include all streams with default times'
         })
         
-        // Build timetable from filterDateStr (displayed date if exists in data, otherwise latest date)
+        // CRITICAL: If displayed date doesn't exist in matrix, we can't determine enabled status from matrix data
+        // In this case, we should still include all streams but they'll be marked appropriately
+        // The backend-generated timetable_current.json should be used instead, but for now we'll
+        // include all streams with default times when date doesn't exist
+        
+        // Build timetable for displayed date (tradingDateStr)
+        // CRITICAL: Must include ALL 12 streams (complete execution contract)
+        // Filtered streams are marked with enabled=false, not skipped
         const timetableRows = []
-        const seenStreams = new Set() // Track streams to avoid duplicates
+        const seenStreams = new Map() // stream -> { Stream, Time, Enabled, BlockReason }
+        
+        // First pass: Process streams from master matrix data
+        // If displayed date exists in data, use that date's data
+        // If not, we'll still include all streams but mark them as disabled
+        const dataDateToUse = displayedDateExists ? currentTradingDayStr : latestDateStr
         
         for (let i = 0; i < self.columnarData.length; i++) {
           const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
@@ -1316,7 +1332,9 @@ self.onmessage = function(e) {
           if (!parsed) continue
           
           const dayKey = parsed.toISOString().split('T')[0]
-          if (dayKey !== filterDateStr) continue // Use filterDateStr (displayed date if exists, otherwise latest date)
+          // Use dataDateToUse: displayed date if exists, otherwise latest date
+          // But filters are always applied for displayed date (currentTradingDay)
+          if (dayKey !== dataDateToUse) continue
           
           const stream = Stream[i] || ''
           const time = Time[i] || ''
@@ -1329,67 +1347,6 @@ self.onmessage = function(e) {
             continue
           }
           
-          // Determine if we should use final_allowed (only if dates match)
-          // If filtering for a different date than the matrix data, don't use final_allowed
-          // because it was calculated for the matrix date, not the displayed date
-          let useFinalAllowed = true
-          if (filterDateStr && latestDateStr) {
-            useFinalAllowed = (filterDateStr === latestDateStr)
-          }
-          
-          // Check final_allowed column ONLY if dates match
-          // If dates don't match, we're previewing a different day, so apply that day's filters instead
-          if (useFinalAllowed) {
-            const FinalAllowed = self.columnarData.getColumn('final_allowed')
-            if (FinalAllowed && FinalAllowed.length > 0) {
-              if (FinalAllowed[i] === false) {
-                continue // Skip streams that are filtered out by backend
-              }
-            }
-          }
-          
-          // Check if this stream has the target DOW filtered out (for displayed date)
-          const streamFilter = streamFilters[stream]
-          if (streamFilter?.exclude_days_of_week?.length > 0) {
-            const excludedDOW = streamFilter.exclude_days_of_week
-            const isFiltered = excludedDOW.some(d => {
-              const filterVal = typeof d === 'string' ? d : String(d)
-              const filterNum = parseInt(filterVal)
-              return filterVal === targetDOWName || filterNum === targetDOWJS
-            })
-            if (isFiltered) {
-              continue // This stream has this day of week filtered out
-            }
-          }
-          
-          // Check if this stream has the target DOM filtered out
-          if (streamFilter?.exclude_days_of_month?.length > 0) {
-            const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
-            if (excludedDOM.includes(targetDOM)) {
-              continue // This stream has this day of month filtered out
-            }
-          }
-          
-          // Check master stream filters
-          const masterFilter = streamFilters['master']
-          if (masterFilter?.exclude_days_of_week?.length > 0) {
-            const excludedDOW = masterFilter.exclude_days_of_week
-            const isFiltered = excludedDOW.some(d => {
-              const filterVal = typeof d === 'string' ? d : String(d)
-              const filterNum = parseInt(filterVal)
-              return filterVal === targetDOWName || filterNum === targetDOWJS
-            })
-            if (isFiltered) {
-              continue
-            }
-          }
-          if (masterFilter?.exclude_days_of_month?.length > 0) {
-            const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
-            if (excludedDOM.includes(targetDOM)) {
-              continue
-            }
-          }
-          
           // Use Time Change if available, otherwise use Time
           // Time Change format is like "09:30 -> 10:00", extract the target time (after ->)
           let displayTime = time
@@ -1400,9 +1357,162 @@ self.onmessage = function(e) {
             }
           }
           
-          timetableRows.push({ Stream: stream, Time: displayTime })
-          seenStreams.add(stream) // Mark this stream as seen
+          // Check filters and determine enabled status
+          // CRITICAL: Filters are always applied for displayed date (currentTradingDay), not data date
+          let enabled = true
+          let blockReason = null
+          
+          // Only use final_allowed if we're using data from the displayed date
+          // If using latest date's data for a different displayed date, ignore final_allowed
+          // because it was calculated for the data date, not the displayed date
+          if (displayedDateExists) {
+            const FinalAllowed = self.columnarData.getColumn('final_allowed')
+            if (FinalAllowed && FinalAllowed.length > 0) {
+              if (FinalAllowed[i] === false) {
+                enabled = false
+                blockReason = 'master_matrix_filtered'
+              }
+            }
+          }
+          // If displayed date doesn't exist, we can't determine enabled status from matrix
+          // Keep enabled=true initially, filters below will determine final status
+          // Note: Backend-generated timetable_current.json should be used for accurate RS-based selection
+          
+          // Check if this stream has the target DOW filtered out (for displayed date)
+          const streamFilter = streamFilters[stream]
+          if (enabled && streamFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = streamFilter.exclude_days_of_week
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              return filterVal === targetDOWName || filterNum === targetDOWJS
+            })
+            if (isFiltered) {
+              enabled = false
+              blockReason = `dow_filter_${targetDOWName.toLowerCase()}`
+            }
+          }
+          
+          // Check if this stream has the target DOM filtered out
+          if (enabled && streamFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              enabled = false
+              blockReason = `dom_filter_${targetDOM}`
+            }
+          }
+          
+          // Check master stream filters
+          const masterFilter = streamFilters['master']
+          if (enabled && masterFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = masterFilter.exclude_days_of_week
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              return filterVal === targetDOWName || filterNum === targetDOWJS
+            })
+            if (isFiltered) {
+              enabled = false
+              blockReason = `master_dow_filter_${targetDOWName.toLowerCase()}`
+            }
+          }
+          if (enabled && masterFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              enabled = false
+              blockReason = `master_dom_filter_${targetDOM}`
+            }
+          }
+          
+          // ALWAYS include stream (enabled or blocked)
+          seenStreams.set(stream, {
+            Stream: stream,
+            Time: displayTime,
+            Enabled: enabled,
+            BlockReason: blockReason
+          })
         }
+        
+        // Second pass: Ensure ALL 12 streams are present (add missing ones as blocked)
+        const allStreams = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2']
+        const sessionTimeSlots = {
+          'S1': ['07:30', '08:00', '09:00'],
+          'S2': ['09:30', '10:00', '10:30', '11:00']
+        }
+        
+        for (const streamId of allStreams) {
+          if (!seenStreams.has(streamId)) {
+            // Stream not in master matrix for this date
+            const session = streamId.endsWith('1') ? 'S1' : 'S2'
+            const defaultTime = sessionTimeSlots[session]?.[0] || ''
+            
+            // If displayed date doesn't exist in matrix, we can't determine enabled status
+            // Default to enabled=true, filters will determine final status
+            // Backend-generated timetable_current.json should be used for accurate RS-based selection
+            let enabled = true
+            let blockReason = null
+            
+            // Apply filters for displayed date even if stream not in matrix
+            const streamFilter = streamFilters[streamId]
+            if (streamFilter?.exclude_days_of_week?.length > 0) {
+              const excludedDOW = streamFilter.exclude_days_of_week
+              const isFiltered = excludedDOW.some(d => {
+                const filterVal = typeof d === 'string' ? d : String(d)
+                const filterNum = parseInt(filterVal)
+                return filterVal === targetDOWName || filterNum === targetDOWJS
+              })
+              if (isFiltered) {
+                enabled = false
+                blockReason = `dow_filter_${targetDOWName.toLowerCase()}`
+              }
+            }
+            
+            if (enabled && streamFilter?.exclude_days_of_month?.length > 0) {
+              const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
+              if (excludedDOM.includes(targetDOM)) {
+                enabled = false
+                blockReason = `dom_filter_${targetDOM}`
+              }
+            }
+            
+            const masterFilter = streamFilters['master']
+            if (enabled && masterFilter?.exclude_days_of_week?.length > 0) {
+              const excludedDOW = masterFilter.exclude_days_of_week
+              const isFiltered = excludedDOW.some(d => {
+                const filterVal = typeof d === 'string' ? d : String(d)
+                const filterNum = parseInt(filterVal)
+                return filterVal === targetDOWName || filterNum === targetDOWJS
+              })
+              if (isFiltered) {
+                enabled = false
+                blockReason = `master_dow_filter_${targetDOWName.toLowerCase()}`
+              }
+            }
+            
+            if (enabled && masterFilter?.exclude_days_of_month?.length > 0) {
+              const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
+              if (excludedDOM.includes(targetDOM)) {
+                enabled = false
+                blockReason = `master_dom_filter_${targetDOM}`
+              }
+            }
+            
+            // If still enabled but no data, mark as needing backend generation
+            if (enabled && !displayedDateExists) {
+              blockReason = 'requires_backend_rs_calculation'
+            }
+            
+            seenStreams.set(streamId, {
+              Stream: streamId,
+              Time: defaultTime,
+              Enabled: enabled,
+              BlockReason: blockReason
+            })
+          }
+        }
+        
+        // Convert map to array (all 12 streams guaranteed)
+        timetableRows.push(...Array.from(seenStreams.values()))
         
         console.log('[Worker] Timetable result:', {
           totalRows: timetableRows.length,
@@ -1425,17 +1535,23 @@ self.onmessage = function(e) {
         })
         
         // Build execution timetable format for NinjaTrader
+        // Include ALL streams (enabled and blocked) - complete execution contract
         const executionStreams = timetableRows.map(row => {
           const stream = row.Stream
           const instrument = stream.slice(0, -1) // ES1 -> ES
           const session = stream.endsWith('1') ? 'S1' : 'S2'
-          return {
+          const entry = {
             stream: stream,
             instrument: instrument,
             session: session,
             slot_time: row.Time,
-            enabled: true
+            decision_time: row.Time, // Sequencer intent (same as slot_time)
+            enabled: row.Enabled !== false // Default to true if not explicitly false
           }
+          if (row.BlockReason) {
+            entry.block_reason = row.BlockReason
+          }
+          return entry
         })
         
         self.postMessage({ 

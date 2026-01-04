@@ -903,6 +903,24 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save execution timetable: {str(e)}")
 
 
+@app.get("/api/timetable/current")
+async def get_current_timetable():
+    """Get current execution timetable file (timetable_current.json)."""
+    try:
+        timetable_file = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+        if not timetable_file.exists():
+            raise HTTPException(status_code=404, detail="timetable_current.json not found")
+        
+        with open(timetable_file, 'r', encoding='utf-8') as f:
+            timetable = json.load(f)
+        
+        return timetable
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read timetable: {str(e)}")
+
+
 @app.get("/api/timetable/files")
 async def list_timetable_files():
     """List available timetable files."""

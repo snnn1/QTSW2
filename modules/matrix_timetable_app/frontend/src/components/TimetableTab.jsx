@@ -53,12 +53,14 @@ export default function TimetableTab({
                 </tr>
               </thead>
               <tbody>
-                {workerTimetable.map((row, idx) => (
-                  <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
-                    <td className="px-4 py-3">{row.Stream}</td>
-                    <td className="px-4 py-3 font-mono">{row.Time}</td>
-                  </tr>
-                ))}
+                {workerTimetable
+                  .filter(row => row.Enabled !== false) // UI filters out disabled streams (presentation layer)
+                  .map((row, idx) => (
+                    <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
+                      <td className="px-4 py-3">{row.Stream}</td>
+                      <td className="px-4 py-3 font-mono">{row.Time}</td>
+                    </tr>
+                  ))}
               </tbody>
             </table>
           </div>

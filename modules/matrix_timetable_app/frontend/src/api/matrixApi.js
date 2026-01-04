@@ -201,6 +201,43 @@ export async function getProfitBreakdown({
 }
 
 /**
+ * Generate timetable for a trading day (uses RS calculation)
+ */
+export async function generateTimetable({ date, analyzerRunsDir = 'data/analyzed', scfThreshold = 0.5 }) {
+  const response = await fetch(`${API_BASE}/timetable/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      date,
+      analyzer_runs_dir: analyzerRunsDir,
+      scf_threshold: scfThreshold
+    })
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to generate timetable')
+  }
+
+  return await response.json()
+}
+
+/**
+ * Get current execution timetable file
+ */
+export async function getCurrentTimetable() {
+  const response = await fetch(`${API_BASE}/timetable/current`)
+  
+  if (!response.ok) {
+    return null
+  }
+  
+  return await response.json()
+}
+
+/**
  * Save execution timetable
  */
 export async function saveExecutionTimetable({ tradingDate, streams }) {
