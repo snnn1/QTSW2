@@ -8,29 +8,212 @@ public sealed class RobotLogger
 {
     private readonly string _jsonlPath;
     private readonly object _lock = new();
+    private DateTime _lastErrorLogTime = DateTime.MinValue;
+    private const int ERROR_LOG_INTERVAL_SECONDS = 10;
+    private readonly string _instanceId; // Unique instance identifier to prevent shared file writes
+    private readonly string _projectRoot;
+    private readonly string? _customLogDir;
+    private RobotLoggingService? _loggingService; // Optional reference to singleton service for ENGINE logs
 
-    public RobotLogger(string projectRoot, string? customLogDir = null)
+    public RobotLogger(string projectRoot, string? customLogDir = null, string? instrument = null, RobotLoggingService? loggingService = null)
     {
+        _projectRoot = projectRoot;
+        _customLogDir = customLogDir;
+        _loggingService = loggingService;
+        
+        var dir = customLogDir ?? Path.Combine(projectRoot, "logs", "robot");
+        Directory.CreateDirectory(dir);
+
+        // Generate unique instance ID to prevent shared file writes in fallback mode
+        // Note: Using Substring instead of range operator for .NET Framework compatibility
+        var guidStr = Guid.NewGuid().ToString("N");
+        _instanceId = guidStr.Substring(0, 8);
+
         if (customLogDir != null)
         {
-            Directory.CreateDirectory(customLogDir);
-            _jsonlPath = Path.Combine(customLogDir, "robot_dryrun.jsonl");
+            _jsonlPath = Path.Combine(dir, $"robot_dryrun_{_instanceId}.jsonl");
+        }
+        else if (!string.IsNullOrWhiteSpace(instrument))
+        {
+            // Per-instrument log file with instance ID: robot_ES_<instance>.jsonl
+            var sanitizedInstrument = SanitizeFileName(instrument);
+            _jsonlPath = Path.Combine(dir, $"robot_{sanitizedInstrument}_{_instanceId}.jsonl");
         }
         else
         {
-            var dir = Path.Combine(projectRoot, "logs", "robot");
-            Directory.CreateDirectory(dir);
-            _jsonlPath = Path.Combine(dir, "robot_skeleton.jsonl");
+            _jsonlPath = Path.Combine(dir, $"robot_skeleton_{_instanceId}.jsonl");
         }
+    }
+
+    /// <summary>
+    /// Set the logging service reference (called after service is created).
+    /// </summary>
+    public void SetLoggingService(RobotLoggingService? service)
+    {
+        _loggingService = service;
+    }
+
+    private static string SanitizeFileName(string instrument)
+    {
+        // Remove invalid filename characters and ensure safe for filesystem
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var sanitized = instrument;
+        foreach (var c in invalidChars)
+        {
+            sanitized = sanitized.Replace(c, '_');
+        }
+        return sanitized.ToUpperInvariant();
     }
 
     public void Write(object evt)
     {
-        var line = JsonUtil.Serialize(evt);
-        lock (_lock)
+        // CRITICAL RULE: ALL logs SHOULD go through RobotLoggingService singleton for proper routing.
+        // - ENGINE events (stream == "__engine__") → robot_ENGINE.jsonl
+        // - Execution events (has intent_id) → robot_<instrument>.jsonl (per-instrument)
+        // - Stream events → robot_<instrument>.jsonl (per-instrument)
+        // 
+        // If service is unavailable:
+        // - ENGINE events are DROPPED (never written synchronously to shared files)
+        // - Other events fall back to per-instance files (safe, no contention)
+        
+        // Try to route through async service first (preferred path)
+        if (_loggingService == null)
         {
-            File.AppendAllText(_jsonlPath, line + Environment.NewLine);
+            _loggingService = RobotLoggingService.GetInstance(_projectRoot, _customLogDir);
         }
+
+        if (_loggingService != null)
+        {
+            try
+            {
+                // Convert to RobotLogEvent and route through service
+                var logEvent = ConvertToRobotLogEvent(evt);
+                if (logEvent != null)
+                {
+                    _loggingService.Log(logEvent);
+                    return; // Successfully routed through service
+                }
+            }
+            catch
+            {
+                // Conversion failed - fall through to sync logger for non-ENGINE events
+            }
+        }
+
+        // Check if this is an ENGINE event (for fallback behavior)
+        bool isEngineEvent = false;
+        if (evt is Dictionary<string, object?> dict)
+        {
+            if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr && streamStr == "__engine__")
+            {
+                isEngineEvent = true;
+            }
+        }
+
+        if (isEngineEvent)
+        {
+            // Service unavailable - DROP ENGINE log (never write to shared files)
+            // This prevents file lock contention when multiple engines run simultaneously
+            return;
+        }
+
+        // Non-ENGINE events: fallback to per-instance file (safe, no contention)
+        // CRITICAL: This fallback should only be used when async logging service is unavailable.
+        // Each instance writes to a unique file (via _instanceId) to prevent file lock contention.
+        try
+        {
+            var line = JsonUtil.Serialize(evt);
+            lock (_lock)
+            {
+                File.AppendAllText(_jsonlPath, line + Environment.NewLine);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Rate-limited error reporting: log to NinjaTrader internal log once per N seconds
+            var now = DateTime.UtcNow;
+            if ((now - _lastErrorLogTime).TotalSeconds >= ERROR_LOG_INTERVAL_SECONDS)
+            {
+                _lastErrorLogTime = now;
+                // Note: In NinjaTrader context, this would use Log() or Print()
+                // For now, we'll write to a separate error log file with instance ID
+                try
+                {
+                    var errorLogPath = Path.Combine(Path.GetDirectoryName(_jsonlPath) ?? "", $"robot_logging_errors_{_instanceId}.txt");
+                    var errorMsg = $"[{now:yyyy-MM-dd HH:mm:ss} UTC] [Instance {_instanceId}] Logging error: {ex.Message}\n";
+                    File.AppendAllText(errorLogPath, errorMsg);
+                }
+                catch
+                {
+                    // Silently fail if we can't even write the error log
+                }
+            }
+            // Do NOT throw - OnBarUpdate must not crash due to logging failures
+        }
+    }
+
+    /// <summary>
+    /// Convert old event dictionary format to RobotLogEvent.
+    /// Returns null if conversion fails.
+    /// </summary>
+    private RobotLogEvent? ConvertToRobotLogEvent(object evt)
+    {
+        if (!(evt is Dictionary<string, object?> dict))
+            return null;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        if (dict.TryGetValue("ts_utc", out var tsObj) && tsObj is string tsStr && DateTimeOffset.TryParse(tsStr, out var parsed))
+        {
+            utcNow = parsed;
+        }
+
+        var level = "INFO";
+        var eventType = dict.TryGetValue("event_type", out var et) ? et?.ToString() ?? "" : "";
+        if (eventType.Contains("ERROR") || eventType.Contains("FAIL") || eventType.Contains("INVALID") || eventType.Contains("VIOLATION"))
+            level = "ERROR";
+        else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
+            level = "WARN";
+
+        var source = "RobotEngine";
+        if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr)
+        {
+            if (streamStr == "__engine__")
+                source = "RobotEngine";
+            else if (streamStr.StartsWith("EXECUTION") || dict.ContainsKey("intent_id"))
+                source = "ExecutionAdapter";
+            else
+                source = "StreamStateMachine";
+        }
+
+        var instrument = dict.TryGetValue("instrument", out var inst) ? inst?.ToString() ?? "" : "";
+        var message = eventType;
+        
+        // Extract data payload
+        var data = new Dictionary<string, object?>();
+        if (dict.TryGetValue("data", out var dataObj))
+        {
+            if (dataObj is Dictionary<string, object?> dataDict)
+            {
+                foreach (var kvp in dataDict)
+                    data[kvp.Key] = kvp.Value;
+            }
+            else if (dataObj != null)
+            {
+                data["payload"] = dataObj;
+            }
+        }
+
+        // Include additional context fields in data
+        foreach (var kvp in dict)
+        {
+            if (kvp.Key != "ts_utc" && kvp.Key != "ts_chicago" && kvp.Key != "event_type" && 
+                kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream")
+            {
+                data[kvp.Key] = kvp.Value;
+            }
+        }
+
+        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, data: data.Count > 0 ? data : null);
     }
 }
 
@@ -76,7 +259,7 @@ public static class RobotEvents
         object? extra = null
     )
     {
-        var chicagoNow = time.GetChicagoNow(utcNow);
+        var chicagoNow = time.ConvertUtcToChicago(utcNow);
         return new Dictionary<string, object?>
         {
             ["ts_utc"] = utcNow.ToString("o"),

@@ -10,7 +10,8 @@ using QTSW2.Robot.Core.Execution;
 public sealed class RobotEngine
 {
     private readonly string _root;
-    private readonly RobotLogger _log;
+    private readonly RobotLogger _log; // Kept for backward compatibility during migration
+    private readonly RobotLoggingService? _loggingService; // New async logging service (Fix B)
     private readonly JournalStore _journals;
     private readonly FilePoller _timetablePoller;
 
@@ -31,11 +32,20 @@ public sealed class RobotEngine
     private readonly KillSwitch _killSwitch;
     private readonly ExecutionSummary _executionSummary;
 
-    public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null)
+    public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, bool useAsyncLogging = true)
     {
         _root = projectRoot;
         _executionMode = executionMode;
-        _log = new RobotLogger(projectRoot, customLogDir);
+        
+        // Initialize async logging service (Fix B) - singleton per project root to prevent file lock contention
+        if (useAsyncLogging)
+        {
+            _loggingService = RobotLoggingService.GetOrCreate(projectRoot, customLogDir);
+        }
+        
+        // Create logger with service reference so ENGINE logs route through singleton
+        _log = new RobotLogger(projectRoot, customLogDir, instrument, _loggingService);
+        
         _journals = new JournalStore(projectRoot);
         _timetablePoller = new FilePoller(timetablePollInterval);
 
@@ -51,21 +61,25 @@ public sealed class RobotEngine
     public void Start()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE"));
+        
+        // Start async logging service if enabled (Fix B)
+        _loggingService?.Start();
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE"));
 
         try
         {
             _spec = ParitySpec.LoadFromFile(_specPath);
             // Debug log: confirm spec_name was loaded
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
                 new { spec_name = _spec.spec_name }));
             _time = new TimeService(_spec.Timezone);
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
                 new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.Timezone }));
         }
         catch (Exception ex)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE", new { error = ex.Message }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE", new { error = ex.Message }));
             throw;
         }
 
@@ -75,7 +89,7 @@ public sealed class RobotEngine
 
         // Log execution mode and adapter
         var adapterType = _executionAdapter.GetType().Name;
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
             new { mode = _executionMode.ToString(), adapter = adapterType }));
 
         // Load timetable immediately (fail closed if invalid)
@@ -85,7 +99,7 @@ public sealed class RobotEngine
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "ENGINE_STOP", state: "ENGINE"));
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "ENGINE_STOP", state: "ENGINE"));
         
         // Write execution summary if not DRYRUN
         if (_executionMode != ExecutionMode.DRYRUN)
@@ -96,9 +110,12 @@ public sealed class RobotEngine
             var summaryPath = Path.Combine(summaryDir, $"summary_{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.json");
             var json = JsonUtil.Serialize(summary);
             File.WriteAllText(summaryPath, json);
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
                 new { summary_path = summaryPath }));
         }
+        
+        // Release reference to async logging service (Fix B) - singleton will dispose when all references released
+        _loggingService?.Release();
     }
 
     public void Tick(DateTimeOffset utcNow)
@@ -133,13 +150,13 @@ public sealed class RobotEngine
             if (TimeService.TryParseDateOnly(barTradingDateStr, out var newTradingDate))
             {
                 // Log trading day rollover
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
                     new
                     {
                         previous_trading_date = previousTradingDate ?? "UNSET",
                         new_trading_date = barTradingDateStr,
                         bar_timestamp_utc = barUtc.ToString("o"),
-                        bar_timestamp_chicago = _time.GetChicagoNow(barUtc).ToString("o")
+                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
                     }));
 
                 // Update all stream state machines to use the new trading_date
@@ -161,7 +178,7 @@ public sealed class RobotEngine
                 if (File.Exists(_timetablePath))
                 {
                     var timetable = TimetableContract.LoadFromFile(_timetablePath);
-                    isReplay = timetable.Metadata?.Replay == true;
+                    isReplay = timetable.metadata?.replay == true;
                 }
             }
             catch
@@ -172,14 +189,14 @@ public sealed class RobotEngine
             if (isReplay)
             {
                 // In replay mode, trading_date mismatch after rollover is a critical error
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
                     new
                     {
                         error = "TRADING_DATE_MISMATCH",
                         engine_trading_date = _activeTradingDate,
                         bar_derived_trading_date = barTradingDateStr,
                         bar_timestamp_utc = barUtc.ToString("o"),
-                        bar_timestamp_chicago = _time.GetChicagoNow(barUtc).ToString("o"),
+                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o"),
                         message = "Engine trading_date does not match bar-derived trading_date after rollover. Replay aborted."
                     }));
                 StandDown();
@@ -202,7 +219,7 @@ public sealed class RobotEngine
         var poll = _timetablePoller.Poll(_timetablePath, utcNow);
         if (poll.Error is not null)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = poll.Error }));
             StandDown();
             return;
@@ -220,24 +237,24 @@ public sealed class RobotEngine
         }
         catch (Exception ex)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "PARSE_ERROR", error = ex.Message }));
             StandDown();
             return;
         }
 
-        if (!TimeService.TryParseDateOnly(timetable.TradingDate, out var tradingDate))
+        if (!TimeService.TryParseDateOnly(timetable.trading_date, out var tradingDate))
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = "BAD_TRADING_DATE", trading_date = timetable.TradingDate }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                new { reason = "BAD_TRADING_DATE", trading_date = timetable.trading_date }));
             StandDown();
             return;
         }
 
-        if (timetable.Timezone != "America/Chicago")
+        if (timetable.timezone != "America/Chicago")
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = "TIMEZONE_MISMATCH", timezone = timetable.Timezone }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                new { reason = "TIMEZONE_MISMATCH", timezone = timetable.timezone }));
             StandDown();
             return;
         }
@@ -246,13 +263,13 @@ public sealed class RobotEngine
         
         // For replay timetables (metadata.replay = true), allow trading_date <= chicagoToday
         // For live timetables, require exact match (trading_date == chicagoToday)
-        var isReplayTimetable = timetable.Metadata?.Replay == true;
+        var isReplayTimetable = timetable.metadata?.replay == true;
         if (isReplayTimetable)
         {
             if (tradingDate > chicagoToday)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                    new { reason = "REPLAY_TRADING_DATE_FUTURE", trading_date = timetable.TradingDate, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                    new { reason = "REPLAY_TRADING_DATE_FUTURE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
                 StandDown();
                 return;
             }
@@ -262,38 +279,42 @@ public sealed class RobotEngine
             // Live timetable: require exact date match (fail closed on stale timetable)
             if (tradingDate != chicagoToday)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                    new { reason = "STALE_TRADING_DATE", trading_date = timetable.TradingDate, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                    new { reason = "STALE_TRADING_DATE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
                 StandDown();
                 return;
             }
         }
 
-        _activeTradingDate = timetable.TradingDate;
+        _activeTradingDate = timetable.trading_date;
 
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
             new 
             { 
                 previous_hash = previousHash,
                 new_hash = _lastTimetableHash,
-                enabled_stream_count = timetable.Streams.Count(s => s.Enabled),
-                total_stream_count = timetable.Streams.Count
+                enabled_stream_count = timetable.streams.Count(s => s.enabled),
+                total_stream_count = timetable.streams.Count
             }));
 
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_LOADED", state: "ENGINE",
-            new { streams = timetable.Streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_LOADED", state: "ENGINE",
+            new { streams = timetable.streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
         
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
-            new { trading_date = timetable.TradingDate, is_replay = isReplayTimetable }));
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
+            new { trading_date = timetable.trading_date, is_replay = isReplayTimetable }));
 
         ApplyTimetable(timetable, tradingDate, utcNow);
     }
 
     private void ApplyTimetable(TimetableContract timetable, DateOnly tradingDate, DateTimeOffset utcNow)
     {
-        if (_spec is null || _time is null || _activeTradingDate is null || _lastTimetableHash is null) return;
+        // CRITICAL FIX: Use tradingDate parameter instead of _activeTradingDate to allow streams
+        // to be created even after StandDown() clears _activeTradingDate.
+        // _activeTradingDate is set just before this call, but if StandDown() was called earlier,
+        // we still want to create streams from a valid timetable.
+        if (_spec is null || _time is null || _lastTimetableHash is null) return;
 
-        var incoming = timetable.Streams.Where(s => s.Enabled).ToList();
+        var incoming = timetable.streams.Where(s => s.enabled).ToList();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var streamIdOccurrences = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
@@ -304,7 +325,7 @@ public sealed class RobotEngine
 
         foreach (var directive in incoming)
         {
-            var streamId = directive.Stream;
+            var streamId = directive.stream;
             
             // Track stream ID occurrences for duplicate detection
             if (!string.IsNullOrWhiteSpace(streamId))
@@ -314,19 +335,22 @@ public sealed class RobotEngine
                 streamIdOccurrences[streamId] = count + 1;
             }
             
-            var instrument = (directive.Instrument ?? "").ToUpperInvariant();
-            var session = directive.Session ?? "";
-            var slotTimeChicago = directive.SlotTime ?? "";
+            var instrument = (directive.instrument ?? "").ToUpperInvariant();
+            var session = directive.session ?? "";
+            var slotTimeChicago = directive.slot_time ?? "";
             DateTimeOffset? slotTimeUtc = null;
             try
             {
-                if (!string.IsNullOrWhiteSpace(slotTimeChicago) && TimeService.TryParseDateOnly(_activeTradingDate, out var td))
-                    slotTimeUtc = _time.ConvertChicagoLocalToUtc(td, slotTimeChicago);
+                // CRITICAL FIX: Use tradingDate parameter instead of _activeTradingDate
+                if (!string.IsNullOrWhiteSpace(slotTimeChicago))
+                    slotTimeUtc = _time.ConvertChicagoLocalToUtc(tradingDate, slotTimeChicago);
             }
             catch
             {
                 slotTimeUtc = null;
             }
+
+            var tradingDateStr = tradingDate.ToString("yyyy-MM-dd"); // Use parameter, not _activeTradingDate
 
             if (string.IsNullOrWhiteSpace(streamId) ||
                 string.IsNullOrWhiteSpace(instrument) ||
@@ -336,7 +360,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("MISSING_FIELDS", out var count)) count = 0;
                 skippedReasons["MISSING_FIELDS"] = count + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId ?? "", instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "MISSING_FIELDS", stream_id = streamId, instrument = instrument, session = session, slot_time = slotTimeChicago }));
                 continue;
             }
@@ -346,7 +370,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_SESSION", out var count2)) count2 = 0;
                 skippedReasons["UNKNOWN_SESSION"] = count2 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_SESSION", stream_id = streamId, session = session }));
                 continue;
             }
@@ -358,7 +382,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("INVALID_SLOT_TIME", out var count3)) count3 = 0;
                 skippedReasons["INVALID_SLOT_TIME"] = count3 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "INVALID_SLOT_TIME", stream_id = streamId, slot_time = slotTimeChicago, allowed_times = allowed }));
                 continue;
             }
@@ -368,7 +392,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_INSTRUMENT", out var count4)) count4 = 0;
                 skippedReasons["UNKNOWN_INSTRUMENT"] = count4 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_INSTRUMENT", stream_id = streamId, instrument = instrument }));
                 continue;
             }
@@ -380,16 +404,16 @@ public sealed class RobotEngine
             {
                 if (sm.Committed)
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                         "UPDATE_IGNORED_COMMITTED", "ENGINE", new { reason = "STREAM_COMMITTED" }));
                     continue;
                 }
 
                 // Apply updates only for uncommitted streams
-                if (string.IsNullOrWhiteSpace(directive.SlotTime))
+                if (string.IsNullOrWhiteSpace(directive.slot_time))
                 {
                     // Fail closed: skip update if slot_time is null/empty
-                    _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, sm.SlotTimeChicago, null,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, sm.SlotTimeChicago, null,
                         "STREAM_UPDATE_SKIPPED", "ENGINE", new 
                         { 
                             reason = "EMPTY_SLOT_TIME",
@@ -398,17 +422,19 @@ public sealed class RobotEngine
                         }));
                     continue;
                 }
-                sm.ApplyDirectiveUpdate(directive.SlotTime, tradingDate, utcNow);
+                sm.ApplyDirectiveUpdate(directive.slot_time, tradingDate, utcNow);
             }
             else
             {
-                // New stream
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, _activeTradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal);
+                // New stream - use tradingDateStr instead of _activeTradingDate
+                // Note: IBarProvider is null for live/SIM modes (bars come via OnBar). For DRYRUN mode with historical replay, 
+                // IBarProvider would be passed here if available, but currently RobotEngine doesn't maintain one.
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDateStr, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: null);
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                         "STREAM_SKIPPED", "ENGINE", new { reason = "ALREADY_COMMITTED_JOURNAL" }));
                     continue;
                 }
@@ -422,7 +448,7 @@ public sealed class RobotEngine
         {
             if (kvp.Value > 1)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "DUPLICATE_STREAM_ID", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "DUPLICATE_STREAM_ID", state: "ENGINE",
                     new
                     {
                         stream_id = kvp.Key,
@@ -433,7 +459,7 @@ public sealed class RobotEngine
         }
 
         // Log parsing summary
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_PARSING_COMPLETE", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_PARSING_COMPLETE", state: "ENGINE",
             new { 
                 total_enabled = incoming.Count, 
                 accepted = acceptedCount, 
@@ -451,5 +477,96 @@ public sealed class RobotEngine
         _streams.Clear();
         _activeTradingDate = null;
     }
+
+    /// <summary>
+    /// Unified logging method: converts old event format to RobotLogEvent and logs via async service (Fix B) or fallback to sync logger.
+    /// </summary>
+    private void LogEvent(object evt)
+    {
+        // Try async logging service first (Fix B)
+        if (_loggingService != null && evt is Dictionary<string, object?> dict)
+        {
+            try
+            {
+                var logEvent = ConvertToRobotLogEvent(dict);
+                _loggingService.Log(logEvent);
+                return; // Successfully logged via async service
+            }
+            catch
+            {
+                // Fall through to sync logger on conversion error
+            }
+        }
+
+        // Fallback to synchronous logger (backward compatibility)
+        _log.Write(evt);
+    }
+
+    /// <summary>
+    /// Convert old event dictionary format to RobotLogEvent.
+    /// Handles EngineBase, Base, and ExecutionBase event types.
+    /// </summary>
+    private RobotLogEvent ConvertToRobotLogEvent(Dictionary<string, object?> dict)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        if (dict.TryGetValue("ts_utc", out var tsObj) && tsObj is string tsStr && DateTimeOffset.TryParse(tsStr, out var parsed))
+        {
+            utcNow = parsed;
+        }
+
+        var level = "INFO";
+        var eventType = dict.TryGetValue("event_type", out var et) ? et?.ToString() ?? "" : "";
+        if (eventType.Contains("ERROR") || eventType.Contains("FAIL") || eventType.Contains("INVALID") || eventType.Contains("VIOLATION"))
+            level = "ERROR";
+        else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
+            level = "WARN";
+
+        // Determine source based on stream field
+        var source = "RobotEngine";
+        if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr)
+        {
+            if (streamStr == "__engine__")
+                source = "RobotEngine";
+            else if (streamStr.StartsWith("EXECUTION") || dict.ContainsKey("intent_id"))
+                source = "ExecutionAdapter";
+            else
+                source = "StreamStateMachine";
+        }
+
+        var instrument = dict.TryGetValue("instrument", out var inst) ? inst?.ToString() ?? "" : "";
+        var message = eventType; // Use event_type as message
+        
+        // Extract data payload - include all non-standard fields in data
+        var data = new Dictionary<string, object?>();
+        if (dict.TryGetValue("data", out var dataObj))
+        {
+            if (dataObj is Dictionary<string, object?> dataDict)
+            {
+                foreach (var kvp in dataDict)
+                    data[kvp.Key] = kvp.Value;
+            }
+            else if (dataObj != null)
+            {
+                data["payload"] = dataObj;
+            }
+        }
+
+        // Include additional context fields in data
+        foreach (var kvp in dict)
+        {
+            if (kvp.Key != "ts_utc" && kvp.Key != "ts_chicago" && kvp.Key != "event_type" && 
+                kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream")
+            {
+                data[kvp.Key] = kvp.Value;
+            }
+        }
+
+        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, data: data.Count > 0 ? data : null);
+    }
+
+    /// <summary>
+    /// Expose logging service for components that need direct access (e.g., adapters).
+    /// </summary>
+    internal RobotLoggingService? GetLoggingService() => _loggingService;
 }
 

@@ -17,11 +17,24 @@ public sealed class TimeService
 
     public DateTimeOffset GetUtcNow() => DateTimeOffset.UtcNow;
 
+    /// <summary>
+    /// Convert UTC DateTimeOffset to Chicago timezone.
+    /// CRITICAL: This is a pure timezone conversion, not "now" - input must be UTC.
+    /// </summary>
+    /// <param name="utcTime">UTC DateTimeOffset to convert</param>
+    /// <returns>DateTimeOffset in Chicago timezone</returns>
+    public DateTimeOffset ConvertUtcToChicago(DateTimeOffset utcTime)
+        => TimeZoneInfo.ConvertTime(utcTime, _chicagoTz);
+
+    /// <summary>
+    /// DEPRECATED: Use ConvertUtcToChicago instead. This name is misleading.
+    /// </summary>
+    [Obsolete("Use ConvertUtcToChicago instead - this name implies 'now' but it's a converter")]
     public DateTimeOffset GetChicagoNow(DateTimeOffset utcNow)
-        => TimeZoneInfo.ConvertTime(utcNow, _chicagoTz);
+        => ConvertUtcToChicago(utcNow);
 
     public DateOnly GetChicagoDateToday(DateTimeOffset utcNow)
-        => DateOnly.FromDateTime(GetChicagoNow(utcNow).DateTime);
+        => DateOnly.FromDateTime(ConvertUtcToChicago(utcNow).DateTime);
 
     public DateTimeOffset ConvertChicagoLocalToUtc(DateOnly tradingDate, string hhmm)
     {

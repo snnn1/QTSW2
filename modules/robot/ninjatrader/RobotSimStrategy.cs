@@ -45,7 +45,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Initialize RobotEngine in SIM mode
                 var projectRoot = ProjectRootResolver.ResolveProjectRoot();
-                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM);
+                var instrumentName = Instrument.MasterInstrument.Name;
+                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: instrumentName);
                 _engine.Start();
 
                 // Get the adapter instance and wire NT context
@@ -88,16 +89,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             Log($"NT context wired to adapter: Account={Account.Name}, Instrument={Instrument.MasterInstrument.Name}", LogLevel.Information);
         }
 
+        private DateTime _lastDiagnosticLogBarTime = DateTime.MinValue;
+        private const int DIAGNOSTIC_LOG_RATE_LIMIT_MINUTES = 1; // Log once per minute max
+
         protected override void OnBarUpdate()
         {
             if (_engine is null || !_simAccountVerified) return;
             if (CurrentBar < 1) return;
 
-            // Convert bar time from exchange time to UTC
+            // DIAGNOSTIC: Capture raw NinjaTrader bar timestamp before any conversion
             var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
+            var barRawNtTime = barExchangeTime;
+            var barRawNtKind = barExchangeTime.Kind.ToString();
+            
+            // Convert bar time from exchange time to UTC
             var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
             var barChicagoOffset = new DateTimeOffset(barExchangeTime, chicagoTz.GetUtcOffset(barExchangeTime));
             var barUtc = barChicagoOffset.ToUniversalTime();
+            
+            // DIAGNOSTIC: Capture conversion details
+            var barAssumedUtc = barUtc;
+            var barAssumedUtcKind = barUtc.DateTime.Kind.ToString();
+
+            // DIAGNOSTIC: Rate-limited logging to verify NT timestamp behavior
+            var timeSinceLastLog = (barExchangeTime - _lastDiagnosticLogBarTime).TotalMinutes;
+            if (timeSinceLastLog >= DIAGNOSTIC_LOG_RATE_LIMIT_MINUTES || _lastDiagnosticLogBarTime == DateTime.MinValue)
+            {
+                _lastDiagnosticLogBarTime = barExchangeTime;
+                Log($"DIAGNOSTIC: Raw NT Bar Time: {barExchangeTime:o}, Kind: {barExchangeTime.Kind}, Converted UTC: {barUtc:o}, Chicago Offset: {barChicagoOffset.Offset}", LogLevel.Debug);
+            }
 
             var high = (decimal)High[0];
             var low = (decimal)Low[0];

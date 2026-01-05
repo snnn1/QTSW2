@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace QTSW2.Robot.Core;
 
@@ -35,6 +37,11 @@ public sealed class StreamStateMachine
     public DateTimeOffset RangeStartUtc { get; private set; }
     public DateTimeOffset SlotTimeUtc { get; private set; }
     public DateTimeOffset MarketCloseUtc { get; private set; }
+    
+    // Chicago time boundaries for range computation (authoritative for bar filtering)
+    // CRITICAL: These are DateTimeOffset values in Chicago timezone, not strings
+    private DateTimeOffset RangeStartChicagoTime { get; set; }
+    private DateTimeOffset SlotTimeChicagoTime { get; set; }
 
     private readonly TimeService _time;
     private readonly ParitySpec _spec;
@@ -48,6 +55,12 @@ public sealed class StreamStateMachine
     private readonly IExecutionAdapter? _executionAdapter;
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
+    private readonly IBarProvider? _barProvider; // Optional: for DRYRUN mode to query historical bars
+
+    // Bar buffer for retrospective range computation (live mode)
+    private readonly List<Bar> _barBuffer = new();
+    private readonly object _barBufferLock = new();
+    private bool _rangeComputed = false; // Flag to prevent multiple range computations
 
     private decimal? _lastCloseBeforeLock;
 
@@ -78,7 +91,8 @@ public sealed class StreamStateMachine
         ExecutionMode executionMode = ExecutionMode.DRYRUN,
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
-        ExecutionJournal? executionJournal = null
+        ExecutionJournal? executionJournal = null,
+        IBarProvider? barProvider = null // Optional: for DRYRUN mode to query historical bars
     )
     {
         _time = time;
@@ -90,11 +104,12 @@ public sealed class StreamStateMachine
         _executionAdapter = executionAdapter;
         _riskGate = riskGate;
         _executionJournal = executionJournal;
+        _barProvider = barProvider;
 
-        Stream = directive.Stream;
-        Instrument = directive.Instrument.ToUpperInvariant();
-        Session = directive.Session;
-        SlotTimeChicago = directive.SlotTime;
+        Stream = directive.stream;
+        Instrument = directive.instrument.ToUpperInvariant();
+        Session = directive.session;
+        SlotTimeChicago = directive.slot_time;
 
         if (!TimeService.TryParseDateOnly(tradingDate, out var dateOnly))
             throw new InvalidOperationException($"Invalid trading_date '{tradingDate}'");
@@ -103,6 +118,11 @@ public sealed class StreamStateMachine
         RangeStartUtc = time.ConvertChicagoLocalToUtc(dateOnly, rangeStartChicago);
         SlotTimeUtc = time.ConvertChicagoLocalToUtc(dateOnly, SlotTimeChicago);
         MarketCloseUtc = time.ConvertChicagoLocalToUtc(dateOnly, spec.entry_cutoff.market_close_time);
+        
+        // Store Chicago time boundaries explicitly for range computation
+        // CRITICAL: Bar filtering uses Chicago time, not UTC, to match trading session semantics
+        RangeStartChicagoTime = time.ConvertUtcToChicago(RangeStartUtc);
+        SlotTimeChicagoTime = time.ConvertUtcToChicago(SlotTimeUtc);
 
         if (!spec.TryGetInstrument(Instrument, out var inst))
             throw new InvalidOperationException($"Instrument not found in parity spec: {Instrument}");
@@ -130,6 +150,7 @@ public sealed class StreamStateMachine
         // Allowed only if not committed
         SlotTimeChicago = newSlotTimeChicago;
         SlotTimeUtc = _time.ConvertChicagoLocalToUtc(tradingDate, newSlotTimeChicago);
+        SlotTimeChicagoTime = _time.ConvertUtcToChicago(SlotTimeUtc); // Update Chicago time boundary
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, "UPDATE_APPLIED", State.ToString(),
             new { slot_time_chicago = SlotTimeChicago, slot_time_utc = SlotTimeUtc.ToString("o") }));
     }
@@ -167,6 +188,10 @@ public sealed class StreamStateMachine
         var rangeStartChicago = _spec.sessions[Session].range_start_time;
         RangeStartUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, rangeStartChicago);
         SlotTimeUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, SlotTimeChicago);
+        
+        // Update Chicago time boundaries
+        RangeStartChicagoTime = _time.ConvertUtcToChicago(RangeStartUtc);
+        SlotTimeChicagoTime = _time.ConvertUtcToChicago(SlotTimeUtc);
         MarketCloseUtc = _time.ConvertChicagoLocalToUtc(newTradingDate, _spec.entry_cutoff.market_close_time);
 
         // Replace journal with one for the new trading_date
@@ -206,6 +231,13 @@ public sealed class StreamStateMachine
         _brkShortRaw = null;
         _brkLongRounded = null;
         _brkShortRounded = null;
+        _rangeComputed = false;
+        
+        // Clear bar buffer on reset
+        lock (_barBufferLock)
+        {
+            _barBuffer.Clear();
+        }
 
         // Reset state to ARMED if we were in a mid-day state (preserve committed state)
         if (!_journal.Committed && State != StreamState.IDLE && State != StreamState.ARMED)
@@ -256,17 +288,82 @@ public sealed class StreamStateMachine
                 break;
 
             case StreamState.RANGE_BUILDING:
-                if (utcNow >= SlotTimeUtc)
+                if (utcNow >= SlotTimeUtc && !_rangeComputed)
                 {
-                    // Range lock: freeze close is last seen bar close <= slot_time_utc
-                    FreezeClose = _lastCloseBeforeLock;
-                    FreezeCloseSource = "BAR_CLOSE";
+                    // REFACTORED: Compute range retrospectively from completed session data
+                    // Do NOT build incrementally - treat session window as closed dataset
+                    var computeStart = DateTimeOffset.UtcNow;
+                    
+                    // Log time conversion method info once per stream
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "RANGE_COMPUTE_START", State.ToString(),
+                        new
+                        {
+                            range_start_utc = RangeStartUtc.ToString("o"),
+                            range_end_utc = SlotTimeUtc.ToString("o"),
+                            slot_time_chicago = SlotTimeChicago,
+                            time_conversion_method = "ConvertUtcToChicago",
+                            time_conversion_note = "Pure timezone converter (UTC -> Chicago), not 'now'"
+                        }));
 
+                    var rangeResult = ComputeRangeRetrospectively(utcNow);
+                    
+                    if (!rangeResult.Success)
+                    {
+                        // Range data missing - mark stream as NO_TRADE for the day
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "RANGE_DATA_MISSING", State.ToString(),
+                            new
+                            {
+                                range_start_utc = RangeStartUtc.ToString("o"),
+                                range_end_utc = SlotTimeUtc.ToString("o"),
+                                reason = rangeResult.Reason,
+                                bar_count = rangeResult.BarCount,
+                                message = "Full range window data unavailable - stream marked NO_TRADE"
+                            }));
+                        
+                        // Commit stream as NO_TRADE
+                        Commit(utcNow, "NO_TRADE_RANGE_DATA_MISSING", "RANGE_DATA_MISSING");
+                        break;
+                    }
+
+                    // Range computed successfully - set values atomically
+                    RangeHigh = rangeResult.RangeHigh;
+                    RangeLow = rangeResult.RangeLow;
+                    FreezeClose = rangeResult.FreezeClose;
+                    FreezeCloseSource = rangeResult.FreezeCloseSource;
+                    _rangeComputed = true;
+
+                    var computeDuration = (DateTimeOffset.UtcNow - computeStart).TotalMilliseconds;
+
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "RANGE_COMPUTE_COMPLETE", State.ToString(),
+                        new
+                        {
+                            range_high = RangeHigh,
+                            range_low = RangeLow,
+                            range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                            freeze_close = FreezeClose,
+                            freeze_close_source = FreezeCloseSource,
+                            bar_count = rangeResult.BarCount,
+                            duration_ms = computeDuration,
+                            // CRITICAL: Log both UTC and Chicago times for auditability
+                            first_bar_utc = rangeResult.FirstBarUtc?.ToString("o"),
+                            last_bar_utc = rangeResult.LastBarUtc?.ToString("o"),
+                            first_bar_chicago = rangeResult.FirstBarChicago?.ToString("o"),
+                            last_bar_chicago = rangeResult.LastBarChicago?.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            range_end_chicago = SlotTimeChicagoTime.ToString("o"),
+                            range_start_utc = RangeStartUtc.ToString("o"),
+                            range_end_utc = SlotTimeUtc.ToString("o")
+                        }));
+
+                    // Transition to RANGE_LOCKED (range is guaranteed to be non-null)
                     Transition(utcNow, StreamState.RANGE_LOCKED, "RANGE_LOCKED", new
                     {
                         range_high = RangeHigh,
                         range_low = RangeLow,
-                        range_size = (RangeHigh is not null && RangeLow is not null) ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                        range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
                         freeze_close = FreezeClose,
                         freeze_close_source = FreezeCloseSource
                     });
@@ -280,7 +377,7 @@ public sealed class StreamStateMachine
                             {
                                 range_high = RangeHigh,
                                 range_low = RangeLow,
-                                range_size = (RangeHigh is not null && RangeLow is not null) ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                                range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
                                 freeze_close = FreezeClose,
                                 freeze_close_source = FreezeCloseSource,
                                 slot_time_chicago = SlotTimeChicago,
@@ -290,34 +387,24 @@ public sealed class StreamStateMachine
 
                     ComputeBreakoutLevelsAndLog(utcNow);
 
-                    // Dry-run: Check for immediate entry at lock
-                    if (_executionMode == ExecutionMode.DRYRUN && FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
+                    // Check for immediate entry at lock (all execution modes)
+                    if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
                     {
                         CheckImmediateEntryAtLock(utcNow);
                     }
 
-                    if (utcNow < MarketCloseUtc && _executionMode == ExecutionMode.DRYRUN) // SKELETON mode removed, treat as DRYRUN
+                    // Log intended brackets (all execution modes)
+                    if (utcNow < MarketCloseUtc)
                         LogIntendedBracketsPlaced(utcNow);
                 }
                 break;
 
             case StreamState.RANGE_LOCKED:
-                if (_executionMode == ExecutionMode.DRYRUN && !_entryDetected)
+                // Check for market close cutoff (all execution modes)
+                if (!_entryDetected && utcNow >= MarketCloseUtc)
                 {
-                    // Dry-run: Check for market close cutoff
-                    if (utcNow >= MarketCloseUtc)
-                    {
-                        LogNoTradeMarketClose(utcNow);
-                        Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
-                    }
-                }
-                // SKELETON mode removed - all execution modes now use same logic
-                {
-                    // Skeleton: only commit at market close
-                    if (utcNow >= MarketCloseUtc)
-                    {
-                        Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
-                    }
+                    LogNoTradeMarketClose(utcNow);
+                    Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
                 }
                 break;
 
@@ -352,26 +439,143 @@ public sealed class StreamStateMachine
         Transition(utcNow, StreamState.RECOVERY_MANAGE, "RECOVERY_MANAGE", new { reason });
     }
 
+    private DateTimeOffset _lastExecutionGateEvalBarUtc = DateTimeOffset.MinValue;
+    private const int EXECUTION_GATE_EVAL_RATE_LIMIT_SECONDS = 60; // Log once per minute max
+
     public void OnBar(DateTimeOffset barUtc, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
     {
+        // REFACTORED: Do NOT build range incrementally
+        // Only buffer bars for retrospective computation when slot time is reached
         if (State == StreamState.RANGE_BUILDING)
         {
-            // Track range only for bars that fall within [range_start, slot_time)
-            if (barUtc < RangeStartUtc || barUtc >= SlotTimeUtc) return;
-
-            RangeHigh = RangeHigh is null ? high : Math.Max(RangeHigh.Value, high);
-            RangeLow = RangeLow is null ? low : Math.Min(RangeLow.Value, low);
-            _lastCloseBeforeLock = close;
-
-            // Optional RANGE_UPDATE (throttling left to engine; we won't spam here)
+            // CRITICAL: Convert bar timestamp to Chicago time explicitly
+            // Do NOT assume barUtc is UTC or Chicago - conversion must be explicit
+            var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
+            
+            // Buffer bars that fall within [range_start, slot_time) using Chicago time comparison
+            // Range window is defined in Chicago time to match trading session semantics
+            if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
+            {
+                lock (_barBufferLock)
+                {
+                    _barBuffer.Add(new Bar(barUtc, close, high, low, close, null));
+                }
+            }
+            // Bars at/after slot time are for breakout detection (handled in RANGE_LOCKED state)
         }
-        else if (State == StreamState.RANGE_LOCKED && _executionMode == ExecutionMode.DRYRUN && !_entryDetected)
+        else if (State == StreamState.RANGE_LOCKED)
         {
-            // Dry-run: Check for breakout after lock (before market close)
-            if (barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            // DIAGNOSTIC: Log execution gate evaluation (rate-limited)
+            var barChicago = _time.ConvertUtcToChicago(barUtc);
+            var timeSinceLastEval = (barUtc - _lastExecutionGateEvalBarUtc).TotalSeconds;
+            if (timeSinceLastEval >= EXECUTION_GATE_EVAL_RATE_LIMIT_SECONDS || _lastExecutionGateEvalBarUtc == DateTimeOffset.MinValue)
+            {
+                _lastExecutionGateEvalBarUtc = barUtc;
+                LogExecutionGateEval(barUtc, barChicago, utcNow);
+            }
+
+            // Check for breakout after lock (before market close) - FIXED: Now works for all execution modes
+            if (!_entryDetected && barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
                 CheckBreakoutEntry(barUtc, high, low, utcNow);
             }
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic: Log execution gate evaluation to identify which gate is blocking execution.
+    /// </summary>
+    private void LogExecutionGateEval(DateTimeOffset barUtc, DateTimeOffset barChicago, DateTimeOffset utcNow)
+    {
+        var barChicagoTime = barChicago.ToString("HH:mm:ss");
+        var slotTimeUtcParsed = SlotTimeUtc;
+        var slotReached = barUtc >= slotTimeUtcParsed;
+        var slotTimeChicagoStr = SlotTimeChicago ?? "";
+        
+        // Evaluate all gates
+        var realtimeOk = true; // Assume realtime if we're getting bars
+        var tradingDay = TradingDate ?? "";
+        var session = Session ?? "";
+        var sessionActive = !string.IsNullOrEmpty(session) && _spec.sessions.ContainsKey(session);
+        var timetableEnabled = true; // Timetable is validated at engine level
+        var streamArmed = State != StreamState.IDLE;
+        var stateOk = State == StreamState.RANGE_LOCKED;
+        var entryDetectionModeOk = true; // FIXED: Now works for all modes
+        var executionModeOk = _executionMode != ExecutionMode.DRYRUN; // SIM/LIVE can execute
+        
+        // Check if we can detect entries (this was the bug - only DRYRUN could detect)
+        var canDetectEntries = stateOk && !_entryDetected && slotReached && 
+                               barUtc < MarketCloseUtc && 
+                               _brkLongRounded.HasValue && _brkShortRounded.HasValue;
+        
+        // Final allowed: all gates must pass
+        var finalAllowed = realtimeOk && 
+                          !string.IsNullOrEmpty(tradingDay) &&
+                          sessionActive &&
+                          slotReached &&
+                          timetableEnabled &&
+                          streamArmed &&
+                          stateOk &&
+                          entryDetectionModeOk &&
+                          executionModeOk &&
+                          canDetectEntries;
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "EXECUTION_GATE_EVAL", State.ToString(),
+            new
+            {
+                bar_timestamp_chicago = barChicagoTime,
+                bar_timestamp_utc = barUtc.ToString("o"),
+                slot_time_chicago = slotTimeChicagoStr,
+                slot_time_utc = slotTimeUtcParsed.ToString("o"),
+                realtime_ok = realtimeOk,
+                trading_day = tradingDay,
+                session = session,
+                session_active = sessionActive,
+                slot_reached = slotReached,
+                timetable_enabled = timetableEnabled,
+                stream_armed = streamArmed,
+                state_ok = stateOk,
+                state = State.ToString(),
+                entry_detection_mode_ok = entryDetectionModeOk,
+                execution_mode = _executionMode.ToString(),
+                execution_mode_ok = executionModeOk,
+                can_detect_entries = canDetectEntries,
+                entry_detected = _entryDetected,
+                breakout_levels_computed = _brkLongRounded.HasValue && _brkShortRounded.HasValue,
+                final_allowed = finalAllowed
+            }));
+
+        // INVARIANT CHECK: If slot time has passed and execution should be allowed but isn't, log ERROR
+        // Estimate bar interval (typically 1 minute for NG)
+        var estimatedBarIntervalMinutes = 1;
+        var barInterval = TimeSpan.FromMinutes(estimatedBarIntervalMinutes);
+        var slotTimePlusInterval = slotTimeUtcParsed.Add(barInterval);
+        
+        if (barUtc >= slotTimePlusInterval && !finalAllowed && executionModeOk && stateOk && slotReached)
+        {
+            // This should not happen - execution should be allowed by now
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "EXECUTION_GATE_INVARIANT_VIOLATION", State.ToString(),
+                new
+                {
+                    error = "EXECUTION_SHOULD_BE_ALLOWED_BUT_IS_NOT",
+                    bar_timestamp_chicago = barChicagoTime,
+                    slot_time_chicago = slotTimeChicagoStr,
+                    slot_time_utc = slotTimeUtcParsed.ToString("o"),
+                    bar_interval_minutes = estimatedBarIntervalMinutes,
+                    realtime_ok = realtimeOk,
+                    trading_day = tradingDay,
+                    session_active = sessionActive,
+                    slot_reached = slotReached,
+                    timetable_enabled = timetableEnabled,
+                    stream_armed = streamArmed,
+                    can_detect_entries = canDetectEntries,
+                    entry_detected = _entryDetected,
+                    breakout_levels_computed = _brkLongRounded.HasValue && _brkShortRounded.HasValue,
+                    execution_mode = _executionMode.ToString(),
+                    message = "Slot time has passed but execution is not allowed. Check gate states above."
+                }));
         }
     }
 
@@ -389,12 +593,12 @@ public sealed class StreamStateMachine
         _brkLongRaw = RangeHigh.Value + _tickSize;
         _brkShortRaw = RangeLow.Value - _tickSize;
 
-        // Round using Analyzer-equivalent method
+        // Round using Analyzer-equivalent method (ALL execution modes need rounded levels)
+        _brkLongRounded = UtilityRoundToTick.RoundToTick(_brkLongRaw.Value, _tickSize);
+        _brkShortRounded = UtilityRoundToTick.RoundToTick(_brkShortRaw.Value, _tickSize);
+
         if (_executionMode == ExecutionMode.DRYRUN)
         {
-            _brkLongRounded = UtilityRoundToTick.RoundToTick(_brkLongRaw.Value, _tickSize);
-            _brkShortRounded = UtilityRoundToTick.RoundToTick(_brkShortRaw.Value, _tickSize);
-
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "DRYRUN_BREAKOUT_LEVELS", State.ToString(),
                 new
@@ -409,15 +613,16 @@ public sealed class StreamStateMachine
         }
         else
         {
-            // Skeleton mode: log unrounded
+            // SIM/LIVE mode: log rounded levels (needed for execution)
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "BREAKOUT_LEVELS_COMPUTED", State.ToString(),
                 new
                 {
-                    brk_long_unrounded = _brkLongRaw,
-                    brk_short_unrounded = _brkShortRaw,
+                    brk_long_raw = _brkLongRaw,
+                    brk_short_raw = _brkShortRaw,
+                    brk_long_rounded = _brkLongRounded,
+                    brk_short_rounded = _brkShortRounded,
                     tick_size = _tickSize,
-                    rounding_required = true,
                     rounding_method = _spec.breakout.tick_rounding.method
                 }));
         }
@@ -429,6 +634,158 @@ public sealed class StreamStateMachine
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "INTENDED_BRACKETS_PLACED", State.ToString(),
             new { brackets_intended = true, note = "Skeleton does not place orders." }));
+    }
+
+    /// <summary>
+    /// REFACTORED: Compute range retrospectively from completed session data.
+    /// Queries all bars in [RangeStartChicagoTime, SlotTimeChicagoTime) and computes range in one pass.
+    /// CRITICAL: Bar filtering uses Chicago time, not UTC, to match trading session semantics.
+    /// </summary>
+    private (bool Success, decimal? RangeHigh, decimal? RangeLow, decimal? FreezeClose, string FreezeCloseSource, int BarCount, string? Reason, DateTimeOffset? FirstBarUtc, DateTimeOffset? LastBarUtc, DateTimeOffset? FirstBarChicago, DateTimeOffset? LastBarChicago) ComputeRangeRetrospectively(DateTimeOffset utcNow)
+    {
+        var bars = new List<Bar>();
+        
+        // Try to get bars from IBarProvider (DRYRUN mode) or bar buffer (live mode)
+        if (_barProvider != null)
+        {
+            // DRYRUN mode: Query bars from provider (provider uses UTC, we'll filter by Chicago time)
+            try
+            {
+                bars.AddRange(_barProvider.GetBars(Instrument, RangeStartUtc, SlotTimeUtc));
+            }
+            catch (Exception ex)
+            {
+                return (false, null, null, null, "UNSET", 0, $"BAR_PROVIDER_ERROR: {ex.Message}", null, null, null, null);
+            }
+        }
+        else
+        {
+            // Live mode: Use buffered bars
+            lock (_barBufferLock)
+            {
+                bars.AddRange(_barBuffer);
+            }
+        }
+
+        // CRITICAL: Filter bars using Chicago time, not UTC
+        // Convert each bar timestamp to Chicago time explicitly
+        // OPTIMIZATION: Store Chicago time with bar to avoid redundant conversion in freeze close loop
+        var filteredBars = new List<Bar>();
+        var barChicagoTimes = new Dictionary<Bar, DateTimeOffset>(); // Cache Chicago time per bar
+        DateTimeOffset? firstBarRawUtc = null;
+        DateTimeOffset? lastBarRawUtc = null;
+        DateTimeOffset? firstBarChicago = null;
+        DateTimeOffset? lastBarChicago = null;
+        string? firstBarRawUtcKind = null;
+        string? lastBarRawUtcKind = null;
+        
+        foreach (var bar in bars)
+        {
+            // DIAGNOSTIC: Capture raw timestamp as received (assumed UTC)
+            // bar.TimestampUtc is what we receive - we assume it's UTC but need to verify
+            var barRawUtc = bar.TimestampUtc;
+            var barRawUtcKind = barRawUtc.DateTime.Kind.ToString();
+            
+            // Convert to Chicago time for filtering
+            // DIAGNOSTIC: This conversion assumes bar.TimestampUtc is UTC
+            var barChicagoTime = _time.ConvertUtcToChicago(barRawUtc);
+            
+            // Range window is defined in Chicago time: [RangeStartChicagoTime, SlotTimeChicagoTime)
+            if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
+            {
+                filteredBars.Add(bar);
+                barChicagoTimes[bar] = barChicagoTime; // Cache Chicago time for reuse
+                
+                // Capture diagnostic info for first and last filtered bars
+                if (firstBarRawUtc == null)
+                {
+                    firstBarRawUtc = barRawUtc;
+                    firstBarRawUtcKind = barRawUtcKind;
+                    firstBarChicago = barChicagoTime;
+                }
+                lastBarRawUtc = barRawUtc;
+                lastBarRawUtcKind = barRawUtcKind;
+                lastBarChicago = barChicagoTime;
+            }
+        }
+        
+        bars = filteredBars;
+
+        if (bars.Count == 0)
+        {
+            return (false, null, null, null, "UNSET", 0, "NO_BARS_IN_WINDOW", null, null, null, null);
+        }
+
+        // Sort by timestamp (should already be sorted, but ensure correctness)
+        bars.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+        
+        // DIAGNOSTIC: Log RANGE_WINDOW_AUDIT with timestamp conversion details
+        if (firstBarRawUtc.HasValue && lastBarRawUtc.HasValue)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_WINDOW_AUDIT", State.ToString(),
+                new
+                {
+                    first_bar_raw_nt_time = firstBarRawUtc.Value.ToString("o"),
+                    first_bar_raw_nt_kind = firstBarRawUtcKind,
+                    first_bar_assumed_utc = firstBarRawUtc.Value.ToString("o"),
+                    first_bar_assumed_utc_kind = firstBarRawUtc.Value.DateTime.Kind.ToString(),
+                    first_bar_chicago = firstBarChicago?.ToString("o"),
+                    first_bar_chicago_offset = firstBarChicago?.Offset.ToString(),
+                    last_bar_raw_nt_time = lastBarRawUtc.Value.ToString("o"),
+                    last_bar_raw_nt_kind = lastBarRawUtcKind,
+                    last_bar_assumed_utc = lastBarRawUtc.Value.ToString("o"),
+                    last_bar_assumed_utc_kind = lastBarRawUtc.Value.DateTime.Kind.ToString(),
+                    last_bar_chicago = lastBarChicago?.ToString("o"),
+                    last_bar_chicago_offset = lastBarChicago?.Offset.ToString(),
+                    conversion_method = "ConvertUtcToChicago",
+                    conversion_note = "Assumes bar.TimestampUtc is UTC (as received from NinjaTrader after conversion)"
+                }));
+        }
+
+        // Compute range in one pass
+        decimal rangeHigh = bars[0].High;
+        decimal rangeLow = bars[0].Low;
+        decimal? freezeClose = null;
+        DateTimeOffset? lastBarBeforeSlotUtc = null;
+        DateTimeOffset? lastBarBeforeSlotChicago = null;
+
+        foreach (var bar in bars)
+        {
+            rangeHigh = Math.Max(rangeHigh, bar.High);
+            rangeLow = Math.Min(rangeLow, bar.Low);
+            
+            // Find last bar close before slot time (for freeze close)
+            // Use Chicago time comparison to match trading session semantics
+            // OPTIMIZATION: Reuse cached Chicago time instead of converting again
+            var barChicagoTime = barChicagoTimes[bar];
+            if (barChicagoTime < SlotTimeChicagoTime)
+            {
+                freezeClose = bar.Close;
+                lastBarBeforeSlotUtc = bar.TimestampUtc;
+                lastBarBeforeSlotChicago = barChicagoTime;
+            }
+        }
+
+        // Validate range was computed successfully
+        if (rangeHigh < rangeLow)
+        {
+            return (false, null, null, null, "UNSET", bars.Count, "INVALID_RANGE_HIGH_LOW", bars[0].TimestampUtc, bars[bars.Count - 1].TimestampUtc, _time.ConvertUtcToChicago(bars[0].TimestampUtc), _time.ConvertUtcToChicago(bars[bars.Count - 1].TimestampUtc));
+        }
+
+        // Validate we have a freeze close
+        if (!freezeClose.HasValue || !lastBarBeforeSlotUtc.HasValue)
+        {
+            return (false, null, null, null, "UNSET", bars.Count, "NO_FREEZE_CLOSE", bars[0].TimestampUtc, bars[bars.Count - 1].TimestampUtc, _time.ConvertUtcToChicago(bars[0].TimestampUtc), _time.ConvertUtcToChicago(bars[bars.Count - 1].TimestampUtc));
+        }
+
+        // Return first and last bar timestamps in both UTC and Chicago time for auditability
+        // Reuse diagnostic variables (already set to first/last filtered bars)
+        var firstBarUtc = bars[0].TimestampUtc;
+        var lastBarUtc = bars[bars.Count - 1].TimestampUtc;
+        // firstBarChicago and lastBarChicago are already set during filtering above
+
+        return (true, rangeHigh, rangeLow, freezeClose, "BAR_CLOSE", bars.Count, null, firstBarUtc, lastBarUtc, firstBarChicago, lastBarChicago);
     }
 
     private void Commit(DateTimeOffset utcNow, string commitReason, string eventType)
@@ -542,7 +899,7 @@ public sealed class StreamStateMachine
                 intended_trade = true,
                 direction = direction,
                 entry_time_utc = entryTimeUtc.ToString("o"),
-                entry_time_chicago = _time.GetChicagoNow(entryTimeUtc).ToString("o"),
+                entry_time_chicago = _time.ConvertUtcToChicago(entryTimeUtc).ToString("o"),
                 entry_price = entryPrice,
                 trigger_reason = triggerReason
             }));
@@ -621,6 +978,18 @@ public sealed class StreamStateMachine
             _riskGate.LogBlocked(intentId, Instrument, reason ?? "UNKNOWN", utcNow);
             return;
         }
+
+        // All checks passed - log execution allowed (permanent state-transition log)
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "EXECUTION_ALLOWED", State.ToString(),
+            new
+            {
+                intent_id = intentId,
+                direction = direction,
+                entry_price = entryPrice,
+                trigger_reason = triggerReason,
+                note = "All gates passed, submitting entry order"
+            }));
 
         // All checks passed - submit entry order
         if (_executionAdapter == null)

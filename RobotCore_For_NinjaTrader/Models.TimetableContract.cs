@@ -6,17 +6,17 @@ namespace QTSW2.Robot.Core;
 
 public sealed class TimetableContract
 {
-    public string? AsOf { get; set; }
+    public string? as_of { get; set; }
 
-    public string TradingDate { get; set; } = "";
+    public string trading_date { get; set; } = "";
 
-    public string Timezone { get; set; } = "";
+    public string timezone { get; set; } = "";
 
-    public string? Source { get; set; }
+    public string? source { get; set; }
 
-    public TimetableMetadata? Metadata { get; set; }
+    public TimetableMetadata? metadata { get; set; }
 
-    public List<TimetableStream> Streams { get; set; } = new();
+    public List<TimetableStream> streams { get; set; } = new();
 
     public static TimetableContract LoadFromFile(string path)
     {
@@ -28,18 +28,18 @@ public sealed class TimetableContract
 
 public sealed class TimetableStream
 {
-    public string Stream { get; set; } = "";
+    public string stream { get; set; } = "";
 
-    public string Instrument { get; set; } = "";
+    public string instrument { get; set; } = "";
 
-    public string Session { get; set; } = "";
+    public string session { get; set; } = "";
 
-    public string SlotTime { get; set; } = "";
+    public string slot_time { get; set; } = "";
 
-    public bool Enabled { get; set; }
+    public bool enabled { get; set; }
 }
 
 public sealed class TimetableMetadata
 {
-    public bool? Replay { get; set; }
+    public bool? replay { get; set; }
 }
