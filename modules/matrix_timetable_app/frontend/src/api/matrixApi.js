@@ -79,40 +79,6 @@ export async function buildMatrix({ streamFilters = {}, visibleYears = [], rebui
   return await response.json()
 }
 
-/**
- * Update master matrix (rolling window)
- */
-export async function updateMatrix({ streamFilters = {} }) {
-  const streamFiltersApi = {}
-  Object.keys(streamFilters).forEach(streamId => {
-    const filters = streamFilters[streamId]
-    if (filters) {
-      streamFiltersApi[streamId] = {
-        exclude_days_of_week: filters.exclude_days_of_week || [],
-        exclude_days_of_month: filters.exclude_days_of_month || [],
-        exclude_times: filters.exclude_times || []
-      }
-    }
-  })
-
-  const updateBody = {
-    mode: 'window',
-    stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
-  }
-
-  const response = await fetch(`${API_BASE}/matrix/update`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(updateBody)
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json()
-    throw new Error(errorData.detail || 'Failed to update master matrix')
-  }
-
-  return await response.json()
-}
 
 /**
  * Get matrix data
@@ -255,6 +221,87 @@ export async function saveExecutionTimetable({ tradingDate, streams }) {
   if (!response.ok) {
     const errorText = await response.text()
     throw new Error(`Failed to save execution timetable: ${errorText}`)
+  }
+
+  return await response.json()
+}
+
+/**
+ * Reload latest matrix file from disk (without rebuilding)
+ * This immediately reflects the current disk state.
+ */
+/**
+ * Resequence master matrix (rolling resequence)
+ * @param {Object} options - Resequence options
+ * @param {Object} options.streamFilters - Stream filter configuration
+ * @param {number} options.resequenceDays - Number of trading days to resequence (default 40)
+ */
+export async function resequenceMatrix({ streamFilters = {}, resequenceDays = 40 }) {
+  const streamFiltersApi = {}
+  Object.keys(streamFilters).forEach(streamId => {
+    const filters = streamFilters[streamId]
+    if (filters) {
+      streamFiltersApi[streamId] = {
+        exclude_days_of_week: filters.exclude_days_of_week || [],
+        exclude_days_of_month: filters.exclude_days_of_month || [],
+        exclude_times: filters.exclude_times || []
+      }
+    }
+  })
+
+  const resequenceBody = {
+    resequence_days: resequenceDays,
+    stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null
+  }
+
+  const response = await fetch(`${API_BASE}/matrix/resequence`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(resequenceBody)
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to resequence master matrix')
+  }
+
+  return await response.json()
+}
+
+export async function reloadLatestMatrix() {
+  const response = await fetch(`${API_BASE}/matrix/reload_latest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  })
+
+  if (!response.ok) {
+    let errorMessage = 'Failed to reload latest matrix'
+    try {
+      const errorData = await response.json()
+      errorMessage = errorData.detail || errorMessage
+    } catch {
+      // If response isn't JSON, use status text
+      errorMessage = `${errorMessage}: ${response.status} ${response.statusText}`
+    }
+    throw new Error(errorMessage)
+  }
+
+  return await response.json()
+}
+
+/**
+ * Get matrix freshness metadata (analyzer vs matrix build times)
+ */
+export async function getMatrixFreshness(analyzerRunsDir = 'data/analyzed') {
+  const params = new URLSearchParams({
+    analyzer_runs_dir: analyzerRunsDir
+  })
+
+  const response = await fetch(`${API_BASE}/matrix/freshness?${params}`)
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to get matrix freshness')
   }
 
   return await response.json()

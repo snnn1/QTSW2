@@ -2,8 +2,12 @@
 Price Tracking Logic Module
 Handles real-time price monitoring, trade execution, MFE calculation, and break even logic
 
-This module now uses Method 1: Actual Historical Data Analysis for all break-even logic,
-providing the most accurate representation of what actually happened in the market.
+IMPORTANT: Intra-bar execution order is unknowable with OHLC data alone.
+This module uses a deterministic, conservative proxy rule to resolve intra-bar execution.
+Auditability and reproducibility are prioritized over simulated realism.
+
+The system does not claim to represent "what actually happened" or provide "realistic execution."
+Instead, it provides a consistent, auditable resolution rule that favors conservative outcomes.
 """
 
 import pandas as pd
@@ -56,11 +60,11 @@ class PriceTracker:
                  instrument_manager: InstrumentManager = None,
                  config_manager: ConfigManager = None):
         """
-        Initialize PriceTracker with Method 1: Actual Historical Data Analysis
+        Initialize PriceTracker with deterministic intra-bar execution rule.
         
-        This tracker uses real historical OHLC data to determine which level
-        (target or stop) is hit first, providing the most accurate representation
-        possible without tick data.
+        This tracker uses OHLC data with a deterministic, conservative proxy rule
+        to resolve intra-bar execution order. The rule prioritizes auditability
+        and reproducibility over simulated realism.
         
         Args:
             debug_manager: Debug manager for logging
@@ -324,11 +328,11 @@ class PriceTracker:
                     except Exception:
                         pass
                 
-                # Check what gets hit first: target or stop loss using realistic execution analysis
+                # Check what gets hit first: target or stop loss using deterministic intra-bar execution rule
                 target_hit_first = False
                 stop_hit_first = False
                 
-                # Use realistic intra-bar execution analysis instead of always prioritizing targets
+                # Use deterministic intra-bar execution rule to resolve which level is hit first
                 execution_result = self._simulate_intra_bar_execution(
                     bar, entry_price, direction, target_level, current_stop_loss, entry_time,
                     t1_triggered, t1_triggered_previous_bar
@@ -368,6 +372,13 @@ class PriceTracker:
                         print(f"TARGET HIT FIRST: {current_favorable:.2f} >= {target_pts:.2f}")
                         print(f"Exit with {target_pts:.2f} points profit")
                     
+                    # Determine correct exit price for target hit
+                    # Precedence: execution_result.exit_price if exists, else target_level
+                    if execution_result and "exit_price" in execution_result:
+                        target_exit_price = float(execution_result["exit_price"])
+                    else:
+                        target_exit_price = target_level
+                    
                     # Calculate final MFE if we have MFE bars
                     if mfe_end_time and len(mfe_bars) > 0:
                         final_mfe_data = self._calculate_final_mfe(
@@ -396,21 +407,21 @@ class PriceTracker:
                     # Log trade info
                     self.debug_manager.log_trade_info(debug_info)
                     
-                    # Calculate profit (full target)
+                    # Calculate profit (full target) using correct exit price
                     profit = self.calculate_profit(
-                        entry_price, current_stop_loss, direction, result_classification,
+                        entry_price, target_exit_price, direction, result_classification,
                         t1_triggered, target_pts, instrument,
                         target_hit=True
                     )
                     
                     return self._create_trade_execution(
-                        current_stop_loss, bar["timestamp"], exit_reason, True, False, False,
+                        target_exit_price, bar["timestamp"], exit_reason, True, False, False,
                         max_favorable, peak_time, peak_price, t1_triggered,
                         stop_loss_adjusted, current_stop_loss, result_classification, profit
                     )
                 
                 elif stop_hit_first:
-                    # Stop loss hit - use exit price from execution result (actual stop loss level)
+                    # Stop loss hit - use exit price from execution result (stop loss level)
                     exit_price_from_execution = execution_result.get("exit_price", current_stop_loss)
                     
                     if t1_triggered:
@@ -454,7 +465,7 @@ class PriceTracker:
                         self.debug_manager.print_trade_debug(debug_info)
                     self.debug_manager.log_trade_info(debug_info)
                     
-                    # Calculate profit using exit price from execution (actual stop loss level)
+                    # Calculate profit using exit price from execution (stop loss level)
                     profit = self.calculate_profit(
                         entry_price, exit_price_from_execution, direction, result_classification,
                         t1_triggered, target_pts, instrument,
@@ -473,6 +484,84 @@ class PriceTracker:
                 t1_triggered_previous_bar = t1_triggered
                 
                 # Check time expiry
+                if bar["timestamp"] >= expiry_time:
+                    # Before exiting with TIME, check if break-even stop loss was hit in any bar before or at expiry
+                    # This handles cases where break-even stop was hit but execution_result was None
+                    if t1_triggered and stop_loss_adjusted:
+                        # Check all bars at or before expiry time to see if break-even stop loss was hit
+                        # Include current bar in case break-even stop was hit exactly at expiry
+                        bars_at_or_before_expiry = after[after["timestamp"] <= expiry_time]
+                        be_stop_hit = False
+                        be_stop_hit_time = None
+                        
+                        for _, prev_bar in bars_at_or_before_expiry.iterrows():
+                            prev_low = float(prev_bar["low"])
+                            prev_high = float(prev_bar["high"])
+                            
+                            if direction == "Long":
+                                if prev_low <= current_stop_loss:
+                                    be_stop_hit = True
+                                    be_stop_hit_time = prev_bar["timestamp"]
+                                    break
+                            else:
+                                if prev_high >= current_stop_loss:
+                                    be_stop_hit = True
+                                    be_stop_hit_time = prev_bar["timestamp"]
+                                    break
+                        
+                        if be_stop_hit:
+                            # Break-even stop loss was hit before expiry - exit with BE instead of TIME
+                            exit_price_from_execution = current_stop_loss
+                            exit_reason = "BE"
+                            result_classification = self._classify_result(
+                                t1_triggered, exit_reason, False, entry_price, be_stop_hit_time, df, direction, t1_removed
+                            )
+                            
+                            if self.debug_manager.is_debug_enabled():
+                                print(f"[FIX] Break-even stop loss was hit at {be_stop_hit_time} before time expiry - exiting with BE instead of TIME")
+                            
+                            # Calculate final MFE if we have MFE bars
+                            if mfe_end_time and len(mfe_bars) > 0:
+                                final_mfe_data = self._calculate_final_mfe(
+                                    mfe_bars, entry_time, entry_price, direction, stop_loss, t1_threshold, debug_info,
+                                    t1_triggered
+                                )
+                                mfe_peak = final_mfe_data["peak"]
+                                peak_time = final_mfe_data["peak_time"]
+                                peak_price = final_mfe_data["peak_price"]
+                                t1_triggered = final_mfe_data["t1_triggered"]
+                                
+                                if mfe_peak == 0.0 and max_favorable_execution > 0.0:
+                                    max_favorable = max_favorable_execution
+                                    if self.debug_manager.is_debug_enabled():
+                                        print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                                else:
+                                    max_favorable = mfe_peak
+                            
+                            # Update debug info
+                            debug_info.peak_value = max_favorable
+                            debug_info.peak_time = peak_time
+                            debug_info.stop_loss_hit = True
+                            debug_info.stop_loss_hit_time = be_stop_hit_time
+                            
+                            if self.debug_manager.is_debug_enabled():
+                                self.debug_manager.print_trade_debug(debug_info)
+                            self.debug_manager.log_trade_info(debug_info)
+                            
+                            # Calculate profit
+                            profit = self.calculate_profit(
+                                entry_price, exit_price_from_execution, direction, result_classification,
+                                t1_triggered, target_pts, instrument,
+                                target_hit=False
+                            )
+                            
+                            return self._create_trade_execution(
+                                exit_price_from_execution, be_stop_hit_time, exit_reason, False, True, False,
+                                max_favorable, peak_time, peak_price, t1_triggered,
+                                stop_loss_adjusted, current_stop_loss, result_classification, profit
+                            )
+                
+                # Check time expiry (original logic continues if BE stop wasn't hit)
                 if bar["timestamp"] >= expiry_time:
                     # Use expiry_time as exit_time (not bar timestamp) to ensure correct TIME exit
                     # e.g., Friday 11:00 trade expires at Monday 10:59, not Monday 11:00
@@ -527,7 +616,7 @@ class PriceTracker:
                     )
             
             # If we get here, data didn't extend to expiry_time
-            # Check if trade has actually expired (expiry_time has passed) or is still open
+            # Check if trade has expired (expiry_time has passed) or is still open
             # Use the absolute last bar in the entire dataset (not just after entry_time)
             # This ensures we get the most recent price even if new data was added
             last_bar_in_data = df.iloc[-1]  # Absolute last bar in entire dataset
@@ -592,6 +681,85 @@ class PriceTracker:
                 )
             
             # Trade has expired (expiry_time has passed or data extends to it)
+            # Before exiting with TIME, check if break-even stop loss was hit in any bar before expiry
+            # This handles cases where break-even stop was hit but execution_result was None
+            if t1_triggered and stop_loss_adjusted:
+                # Check all bars at or before expiry time to see if break-even stop loss was hit
+                bars_at_or_before_expiry = after[after["timestamp"] <= expiry_time]
+                be_stop_hit = False
+                be_stop_hit_time = None
+                
+                for _, prev_bar in bars_at_or_before_expiry.iterrows():
+                    prev_low = float(prev_bar["low"])
+                    prev_high = float(prev_bar["high"])
+                    
+                    if direction == "Long":
+                        if prev_low <= current_stop_loss:
+                            be_stop_hit = True
+                            be_stop_hit_time = prev_bar["timestamp"]
+                            break
+                    else:
+                        if prev_high >= current_stop_loss:
+                            be_stop_hit = True
+                            be_stop_hit_time = prev_bar["timestamp"]
+                            break
+                
+                if be_stop_hit:
+                    # Break-even stop loss was hit before expiry - exit with BE instead of TIME
+                    exit_price_from_execution = current_stop_loss
+                    exit_reason = "BE"
+                    result_classification = self._classify_result(
+                        t1_triggered, exit_reason, False, entry_price, be_stop_hit_time, df, direction, t1_removed
+                    )
+                    
+                    if self.debug_manager.is_debug_enabled():
+                        print(f"[FIX] Break-even stop loss was hit at {be_stop_hit_time} before time expiry (after loop path) - exiting with BE instead of TIME")
+                    
+                    # Calculate final MFE if we have MFE bars
+                    if mfe_end_time and len(mfe_bars) > 0:
+                        final_mfe_data = self._calculate_final_mfe(
+                            mfe_bars, entry_time, entry_price, direction, stop_loss, t1_threshold, debug_info,
+                            t1_triggered
+                        )
+                        mfe_peak = final_mfe_data["peak"]
+                        peak_time = final_mfe_data["peak_time"]
+                        peak_price = final_mfe_data["peak_price"]
+                        t1_triggered = final_mfe_data["t1_triggered"]
+                        
+                        if mfe_peak == 0.0 and max_favorable_execution > 0.0:
+                            max_favorable = max_favorable_execution
+                            if self.debug_manager.is_debug_enabled():
+                                print(f"[FIX] PEAK FIX: MFE peak=0, using execution peak={max_favorable_execution:.2f}")
+                        else:
+                            max_favorable = mfe_peak
+                    else:
+                        max_favorable = max_favorable_execution
+                        peak_time = entry_time
+                        peak_price = entry_price
+                    
+                    # Update debug info
+                    debug_info.peak_value = max_favorable
+                    debug_info.peak_time = peak_time
+                    debug_info.stop_loss_hit = True
+                    debug_info.stop_loss_hit_time = be_stop_hit_time
+                    
+                    if self.debug_manager.is_debug_enabled():
+                        self.debug_manager.print_trade_debug(debug_info)
+                    self.debug_manager.log_trade_info(debug_info)
+                    
+                    # Calculate profit
+                    profit = self.calculate_profit(
+                        entry_price, exit_price_from_execution, direction, result_classification,
+                        t1_triggered, target_pts, instrument,
+                        target_hit=False
+                    )
+                    
+                    return self._create_trade_execution(
+                        exit_price_from_execution, be_stop_hit_time, exit_reason, False, True, False,
+                        max_favorable, peak_time, peak_price, t1_triggered,
+                        stop_loss_adjusted, current_stop_loss, result_classification, profit
+                    )
+            
             # Use expiry_time as exit_time (not last bar timestamp)
             # This ensures Friday trades expire on Monday even if data doesn't extend that far
             # Get last bar from after (bars after entry time) for fallback
@@ -920,25 +1088,37 @@ class PriceTracker:
                                     direction: str, target_level: float, 
                                     stop_loss: float, entry_time: pd.Timestamp, 
                                     t1_triggered: bool = False,
-                                    t1_triggered_previous_bar: bool = False) -> dict:
+                                    t1_triggered_previous_bar: bool = False) -> Optional[dict]:
         """
-        Use actual historical data to determine which level is hit first
+        ARCHITECTURAL INVARIANT:
+        Intra-bar execution order is unknowable with OHLC data alone.
+        This function must remain deterministic and conservative.
+        Tie-break behavior is intentional and documented.
         
-        This method uses real historical price data to determine whether the target 
-        or stop loss is hit first, providing the most accurate representation.
+        Deterministic intra-bar execution using close-distance rule.
+        
+        SINGLE CANONICAL RULE: When both target and stop are hit within the same OHLC bar,
+        compute absolute distance from bar close price to target_level and stop_loss.
+        Whichever distance is smaller is considered hit first.
+        If distances are exactly equal, break ties deterministically in favor of STOP (conservative bias).
+        
+        This rule is deterministic, reproducible, and auditable. No randomness, simulation, or volatility modeling.
+        This is a conservative proxy rule, not a claim about actual execution order.
         
         Args:
             bar: OHLC bar data
-            entry_price: Trade entry price
-            direction: Trade direction
-            target_level: Target level
-            stop_loss: Stop loss level
+            entry_price: Trade entry price (not used in rule, kept for compatibility)
+            direction: Trade direction ("Long" or "Short")
+            target_level: Target level price
+            stop_loss: Stop loss level price
             entry_time: Entry timestamp
+            t1_triggered: Whether T1 is triggered in current bar
+            t1_triggered_previous_bar: Whether T1 was triggered in previous bar
             
         Returns:
-            Dictionary with execution results
+            Dictionary with execution results, or None if no execution
         """
-        high, low, open_price, close_price = float(bar["high"]), float(bar["low"]), float(bar["open"]), float(bar["close"])
+        high, low, close_price = float(bar["high"]), float(bar["low"]), float(bar["close"])
         
         # Determine if target and stop are both possible in this bar
         target_possible = False
@@ -947,39 +1127,31 @@ class PriceTracker:
         if direction == "Long":
             target_possible = high >= target_level
             stop_possible = low <= stop_loss
-        else:
+        else:  # Short
             target_possible = low <= target_level
             stop_possible = high >= stop_loss
         
-        # If target is possible, always use close price analysis to determine execution
-        # This ensures realistic results even when stop doesn't reach the low
-        if target_possible:
-            # Always analyze actual price movement when target is possible
-            # This ensures we get realistic execution results based on close price analysis
-            return self._analyze_actual_price_movement(
-                bar, entry_price, direction, target_level, stop_loss, entry_time
-            )
-        
-        # If only stop is possible, check stop loss (unless T1 just triggered in this bar)
-        elif stop_possible:
-            if t1_triggered and not t1_triggered_previous_bar:
-                # T1 just triggered in this bar - don't check stop in same bar
-                return None
-            else:
-                # T1 triggered in previous bar or no triggers - check stop loss
+        # Handle T1 trigger logic: don't check stop if T1 just triggered in this bar
+        if stop_possible and t1_triggered and not t1_triggered_previous_bar:
+            # T1 just triggered in this bar - don't check stop in same bar
+            if target_possible:
+                # Only target is checked
                 return {
-                    "exit_price": stop_loss,  # Exact stop loss level
+                    "exit_price": target_level,
                     "exit_time": entry_time,
-                    "exit_reason": "Loss",
-                    "target_hit": False,
-                    "stop_hit": True,
+                    "exit_reason": "Win",
+                    "target_hit": True,
+                    "stop_hit": False,
                     "time_expired": False
                 }
+            else:
+                # Neither target nor stop checked (T1 protection)
+                return None
         
-        # If only target is possible
-        elif target_possible:
+        # Case 1: Only target is possible
+        if target_possible and not stop_possible:
             return {
-                "exit_price": target_level,  # Exact target level
+                "exit_price": target_level,
                 "exit_time": entry_time,
                 "exit_reason": "Win",
                 "target_hit": True,
@@ -987,10 +1159,10 @@ class PriceTracker:
                 "time_expired": False
             }
         
-        # If only stop is possible
-        elif stop_possible:
+        # Case 2: Only stop is possible
+        if stop_possible and not target_possible:
             return {
-                "exit_price": stop_loss,  # Exact stop loss level
+                "exit_price": stop_loss,
                 "exit_time": entry_time,
                 "exit_reason": "Loss",
                 "target_hit": False,
@@ -998,190 +1170,49 @@ class PriceTracker:
                 "time_expired": False
             }
         
-        # Neither target nor stop hit in this bar
+        # Case 3: Both target and stop are possible - use close-distance rule
+        if target_possible and stop_possible:
+            # Compute absolute distance from close to target and stop
+            target_distance = abs(close_price - target_level)
+            stop_distance = abs(close_price - stop_loss)
+            
+            # Whichever distance is smaller wins
+            # If distances are exactly equal, break tie in favor of STOP (conservative bias)
+            if target_distance < stop_distance:
+                # Target is closer - target hits first
+                return {
+                    "exit_price": target_level,
+                    "exit_time": entry_time,
+                    "exit_reason": "Win",
+                    "target_hit": True,
+                    "stop_hit": False,
+                    "time_expired": False
+                }
+            else:
+                # Stop is closer OR equal (tie-break favors STOP) - stop hits first
+                return {
+                    "exit_price": stop_loss,
+                    "exit_time": entry_time,
+                    "exit_reason": "Loss",
+                    "target_hit": False,
+                    "stop_hit": True,
+                    "time_expired": False
+                }
+        
+        # Case 4: Neither target nor stop hit in this bar
         return None
     
-    def _calculate_simple_execution_order(self, bar: pd.Series, entry_price: float,
-                                        direction: str, target_level: float,
-                                        stop_loss: float, entry_time: pd.Timestamp) -> dict:
-        """
-        Simple execution order calculation (original logic)
-        Always prioritizes target over stop when both are possible
-        """
-        return {
-            "exit_price": target_level,
-            "exit_time": entry_time + pd.Timedelta(minutes=1),
-            "exit_reason": "Win",
-            "target_hit": True,
-            "stop_hit": False,
-            "time_expired": False
-        }
-    
-    def _analyze_actual_price_movement(self, bar: pd.Series, entry_price: float,
-                                     direction: str, target_level: float,
-                                     stop_loss: float, entry_time: pd.Timestamp) -> dict:
-        """
-        Analyze actual historical price movement to determine which level is hit first
-        
-        This method uses real historical data to determine whether the target or stop loss
-        is hit first, providing the most accurate representation of what actually happened.
-        
-        Args:
-            bar: OHLC bar data
-            entry_price: Trade entry price
-            direction: Trade direction
-            target_level: Target level
-            stop_loss: Stop loss level
-            entry_time: Entry timestamp
-            
-        Returns:
-            Dictionary with execution results based on actual price movement
-        """
-        high, low, open_price, close_price = float(bar["high"]), float(bar["low"]), float(bar["open"]), float(bar["close"])
-        
-        if direction == "Long":
-            # For long trades, check if target hits first
-            if self._target_hits_first_long(open_price, high, low, close_price, target_level, stop_loss):
-                return {
-                    "exit_price": target_level,
-                    "exit_time": entry_time,
-                    "exit_reason": "Win",
-                    "target_hit": True,
-                    "stop_hit": False,
-                    "time_expired": False
-                }
-            else:
-                return {
-                    "exit_price": stop_loss,
-                    "exit_time": entry_time,
-                    "exit_reason": "Loss",
-                    "target_hit": False,
-                    "stop_hit": True,
-                    "time_expired": False
-                }
-        else:  # Short
-            # For short trades, check if target hits first
-            if self._target_hits_first_short(open_price, high, low, close_price, target_level, stop_loss):
-                return {
-                    "exit_price": target_level,
-                    "exit_time": entry_time,
-                    "exit_reason": "Win",
-                    "target_hit": True,
-                    "stop_hit": False,
-                    "time_expired": False
-                }
-            else:
-                return {
-                    "exit_price": stop_loss,
-                    "exit_time": entry_time,
-                    "exit_reason": "Loss",
-                    "target_hit": False,
-                    "stop_hit": True,
-                    "time_expired": False
-                }
-    
-    def _target_hits_first_long(self, open_price: float, high: float, low: float, 
-                              close: float, target_level: float, stop_loss: float) -> bool:
-        """
-        Determine if target hits first for long trades using actual price movement
-        
-        Args:
-            open_price: Bar open price
-            high: Bar high price
-            low: Bar low price
-            close: Bar close price
-            target_level: Target level
-            stop_loss: Stop loss level
-            
-        Returns:
-            True if target hits first, False if stop hits first
-        """
-        # If price opens above target, target hits immediately
-        if open_price >= target_level:
-            return True
-        
-        # If price opens below stop, stop hits immediately
-        if open_price <= stop_loss:
-            return False
-        
-        # If price opens between target and stop, analyze movement
-        if high >= target_level and low <= stop_loss:
-            # Both are hit - use price tracking to determine which hits first
-            # For long trades: if close is closer to target, target wins; if closer to stop, stop wins
-            target_distance = abs(close - target_level)
-            stop_distance = abs(close - stop_loss)
-            
-            if target_distance <= stop_distance:
-                # Close is closer to target - target hits first
-                return True
-            else:
-                # Close is closer to stop - stop hits first
-                return False
-        
-        # If only target is hit
-        if high >= target_level:
-            return True
-        
-        # If only stop is hit
-        if low <= stop_loss:
-            return False
-        
-        # Neither hit
-        return False
-    
-    def _target_hits_first_short(self, open_price: float, high: float, low: float, 
-                               close: float, target_level: float, stop_loss: float) -> bool:
-        """
-        Determine if target hits first for short trades using actual price movement
-        
-        Args:
-            open_price: Bar open price
-            high: Bar high price
-            low: Bar low price
-            close: Bar close price
-            target_level: Target level
-            stop_loss: Stop loss level
-            
-        Returns:
-            True if target hits first, False if stop hits first
-        """
-        # If price opens below target, target hits immediately
-        if open_price <= target_level:
-            return True
-        
-        # If price opens above stop, stop hits immediately
-        if open_price >= stop_loss:
-            return False
-        
-        # If price opens between target and stop, analyze movement
-        if low <= target_level and high >= stop_loss:
-            # Both are hit - use price tracking to determine which hits first
-            # For short trades: if close is closer to target, target wins; if closer to stop, stop wins
-            target_distance = abs(close - target_level)
-            stop_distance = abs(close - stop_loss)
-            
-            if target_distance <= stop_distance:
-                # Close is closer to target - target hits first
-                return True
-            else:
-                # Close is closer to stop - stop hits first
-                return False
-        
-        # If only target is hit
-        if low <= target_level:
-            return True
-        
-        # If only stop is hit
-        if high >= stop_loss:
-            return False
-        
-        # Neither hit
-        return False
+    # REMOVED: Old execution methods replaced by deterministic close-distance rule
+    # The following methods are no longer used and have been replaced by _simulate_intra_bar_execution:
+    # - _calculate_simple_execution_order
+    # - _analyze_actual_price_movement
+    # - _target_hits_first_long
+    # - _target_hits_first_short
     
     def _simulate_realistic_entry(self, bar: pd.Series, breakout_level: float, 
                                 direction: str, tick_size: float = 0.25) -> dict:
         """
-        Simulate realistic entry execution at breakout level
+        Determine entry execution at breakout level using deterministic rule
         
         Args:
             bar: OHLC bar data
@@ -1204,7 +1235,7 @@ class PriceTracker:
         if not breakout_possible:
             return None
         
-        # Simulate realistic entry price (no slippage)
+        # Determine entry price at breakout level (no slippage)
         if direction == "Long":
             # For long breakouts, entry at breakout level
             entry_price = breakout_level
@@ -1230,293 +1261,18 @@ class PriceTracker:
         }
     
     
-    def _simulate_brownian_bridge_execution(self, open_price: float, high: float, 
-                                          low: float, close_price: float,
-                                          entry_price: float, direction: str,
-                                          target_level: float, stop_loss: float,
-                                          entry_time: pd.Timestamp) -> dict:
-        """
-        Simulate price execution using Brownian Bridge model
-        
-        The Brownian Bridge constrains a random walk between the open and close prices,
-        ensuring it hits the high and low at some point, providing realistic intra-bar simulation.
-        """
-        # Calculate bar characteristics
-        bar_range = high - low
-        price_change = close_price - open_price
-        
-        # Estimate volatility using stochastic volatility model
-        volatility = self._estimate_stochastic_volatility(open_price, high, low, close_price)
-        
-        # Simulate multiple price paths to determine hit probabilities
-        n_simulations = 1000
-        target_hits = 0
-        stop_hits = 0
-        
-        for _ in range(n_simulations):
-            # Generate Brownian Bridge path
-            path = self._generate_brownian_bridge_path(
-                open_price, close_price, high, low, volatility
-            )
-            
-            # Check which level is hit first in this path
-            if direction == "Long":
-                target_hit = any(price >= target_level for price in path)
-                stop_hit = any(price <= stop_loss for price in path)
-            else:
-                target_hit = any(price <= target_level for price in path)
-                stop_hit = any(price >= stop_loss for price in path)
-            
-            if target_hit and stop_hit:
-                # Both hit - determine order by finding first occurrence
-                target_time = next(i for i, price in enumerate(path) 
-                                 if (direction == "Long" and price >= target_level) or
-                                    (direction == "Short" and price <= target_level))
-                stop_time = next(i for i, price in enumerate(path) 
-                               if (direction == "Long" and price <= stop_loss) or
-                                  (direction == "Short" and price >= stop_loss))
-                
-                if target_time < stop_time:
-                    target_hits += 1
-                else:
-                    stop_hits += 1
-            elif target_hit:
-                target_hits += 1
-            elif stop_hit:
-                stop_hits += 1
-        
-        # Determine execution based on simulation results
-        target_probability = target_hits / n_simulations
-        stop_probability = stop_hits / n_simulations
-        
-        # Use probability threshold for decision
-        if target_probability > stop_probability:
-            return {
-                "exit_price": target_level,
-                "exit_time": entry_time,
-                "exit_reason": "Win",
-                "target_hit": True,
-                "stop_hit": False,
-                "time_expired": False
-            }
-        else:
-            return {
-                "exit_price": stop_loss,
-                "exit_time": entry_time,
-                "exit_reason": "Loss",
-                "target_hit": False,
-                "stop_hit": True,
-                "time_expired": False
-            }
-    
-    def _generate_brownian_bridge_path(self, open_price: float, close_price: float,
-                                     high: float, low: float, volatility: float,
-                                     n_steps: int = 100) -> list:
-        """
-        Generate a Brownian Bridge path constrained by OHLC data
-        
-        This creates a realistic price path that:
-        1. Starts at open_price
-        2. Ends at close_price  
-        3. Hits the high and low at some point
-        4. Follows realistic price movement patterns
-        """
-        # Create time grid
-        t = np.linspace(0, 1, n_steps)
-        
-        # Generate standard Brownian motion using numpy
-        dt = t[1] - t[0]
-        dW = np.random.normal(0, np.sqrt(dt), n_steps)
-        W = np.cumsum(dW)
-        
-        # Create Brownian Bridge: B(t) = W(t) - t*W(1)
-        # This ensures B(0) = 0 and B(1) = 0
-        bridge = W - t * W[-1]
-        
-        # Scale to match price movement
-        price_path = open_price + bridge * (close_price - open_price)
-        
-        # Ensure the path hits high and low
-        # Find the point where high is hit
-        high_idx = np.argmax(price_path)
-        if price_path[high_idx] < high:
-            # Adjust to ensure high is hit
-            price_path[high_idx] = high
-        
-        # Find the point where low is hit  
-        low_idx = np.argmin(price_path)
-        if price_path[low_idx] > low:
-            # Adjust to ensure low is hit
-            price_path[low_idx] = low
-        
-        # Add some noise to make it more realistic
-        noise = np.random.normal(0, volatility * 0.1, n_steps)
-        price_path += noise
-        
-        # Ensure path stays within bounds
-        price_path = np.clip(price_path, low, high)
-        
-        return price_path.tolist()
-    
-    def _estimate_stochastic_volatility(self, open_price: float, high: float, 
-                                      low: float, close_price: float) -> float:
-        """
-        Estimate volatility using stochastic volatility model
-        
-        This method uses multiple volatility estimators to create a more accurate
-        volatility estimate for the Brownian Bridge simulation.
-        """
-        # Garman-Klass volatility estimator (more accurate than simple range)
-        # Uses OHLC data to estimate volatility
-        log_hl = np.log(high / low)
-        log_co = np.log(close_price / open_price)
-        
-        # Garman-Klass estimator
-        gk_vol = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
-        gk_vol = max(gk_vol, 0)  # Ensure non-negative
-        
-        # Parkinson volatility estimator (uses high-low only)
-        parkinson_vol = (log_hl ** 2) / (4 * np.log(2))
-        
-        # Rogers-Satchell volatility estimator (includes open-close)
-        rs_vol = log_hl * (np.log(high / close_price) + np.log(low / close_price))
-        rs_vol = max(rs_vol, 0)  # Ensure non-negative
-        
-        # Yang-Zhang volatility estimator (most comprehensive)
-        # This is a simplified version - full YZ requires multiple periods
-        yz_vol = gk_vol + 0.5 * (log_co ** 2)
-        
-        # Combine estimators with weights (empirically determined)
-        combined_vol = (0.3 * gk_vol + 0.2 * parkinson_vol + 
-                       0.2 * rs_vol + 0.3 * yz_vol)
-        
-        # Convert to standard deviation
-        volatility = np.sqrt(combined_vol) if combined_vol > 0 else abs(close_price - open_price) / 4.0
-        
-        # Ensure reasonable bounds
-        price_level = (open_price + close_price) / 2
-        min_vol = price_level * 0.001  # 0.1% minimum
-        max_vol = price_level * 0.05   # 5% maximum
-        
-        return np.clip(volatility, min_vol, max_vol)
-    
-    def _simulate_ml_based_execution(self, bar: pd.Series, entry_price: float,
-                                   direction: str, target_level: float,
-                                   stop_loss: float, entry_time: pd.Timestamp) -> dict:
-        """
-        Simulate execution using machine learning approach
-        
-        This method uses historical pattern recognition to predict the most likely
-        execution path based on OHLC features and market conditions.
-        """
-        high, low, open_price, close_price = float(bar["high"]), float(bar["low"]), float(bar["open"]), float(bar["close"])
-        
-        # Extract features for ML prediction
-        features = self._extract_ml_features(open_price, high, low, close_price, entry_price, direction)
-        
-        # Use rule-based ML approach (simplified)
-        # In practice, this would use a trained model
-        target_probability = self._predict_execution_probability(features, target_level, stop_loss, direction)
-        
-        if target_probability > 0.5:
-            return {
-                "exit_price": target_level,
-                "exit_time": entry_time,
-                "exit_reason": "Win",
-                "target_hit": True,
-                "stop_hit": False,
-                "time_expired": False
-            }
-        else:
-            return {
-                "exit_price": stop_loss,
-                "exit_time": entry_time,
-                "exit_reason": "Loss",
-                "target_hit": False,
-                "stop_hit": True,
-                "time_expired": False
-            }
-    
-    def _extract_ml_features(self, open_price: float, high: float, low: float, 
-                           close_price: float, entry_price: float, direction: str) -> dict:
-        """Extract features for machine learning prediction"""
-        bar_range = high - low
-        price_change = close_price - open_price
-        
-        # Basic price features
-        features = {
-            'bar_range': bar_range,
-            'price_change': price_change,
-            'price_change_pct': price_change / open_price if open_price > 0 else 0,
-            'bar_range_pct': bar_range / open_price if open_price > 0 else 0,
-            'close_position': (close_price - low) / bar_range if bar_range > 0 else 0.5,
-            'entry_position': (entry_price - low) / bar_range if bar_range > 0 else 0.5,
-            'momentum': 1 if price_change > 0 else -1,
-            'volatility': bar_range / open_price if open_price > 0 else 0
-        }
-        
-        # Direction-specific features
-        if direction == "Long":
-            features['target_distance'] = (high - entry_price) / bar_range if bar_range > 0 else 0
-            features['stop_distance'] = (entry_price - low) / bar_range if bar_range > 0 else 0
-        else:
-            features['target_distance'] = (entry_price - low) / bar_range if bar_range > 0 else 0
-            features['stop_distance'] = (high - entry_price) / bar_range if bar_range > 0 else 0
-        
-        return features
-    
-    def _predict_execution_probability(self, features: dict, target_level: float, 
-                                     stop_loss: float, direction: str) -> float:
-        """
-        Predict execution probability using rule-based ML approach
-        
-        This is a simplified version. In practice, this would use a trained model
-        with historical tick data to predict execution probabilities.
-        """
-        # Rule-based prediction based on features
-        target_prob = 0.5  # Base probability
-        
-        # Distance factor (closer = more likely)
-        if features['target_distance'] < features['stop_distance']:
-            target_prob += 0.2
-        
-        # Momentum factor
-        if direction == "Long" and features['momentum'] > 0:
-            target_prob += 0.15
-        elif direction == "Short" and features['momentum'] < 0:
-            target_prob += 0.15
-        
-        # Position factor (closer to extremes = more likely)
-        if features['close_position'] > 0.7:  # Close near high
-            if direction == "Long":
-                target_prob += 0.1
-        elif features['close_position'] < 0.3:  # Close near low
-            if direction == "Short":
-                target_prob += 0.1
-        
-        # Volatility factor (higher volatility = more uncertainty)
-        if features['volatility'] > 0.02:  # High volatility
-            target_prob -= 0.1
-        
-        # Ensure probability is between 0 and 1
-        return np.clip(target_prob, 0.0, 1.0)
-    
-    def _calculate_simple_execution_order(self, bar: pd.Series, entry_price: float,
-                                        direction: str, target_level: float,
-                                        stop_loss: float, entry_time: pd.Timestamp) -> dict:
-        """
-        Simple execution order calculation (original method)
-        
-        This is the fallback method that prioritizes target over stop.
-        """
-        return {
-            "exit_price": target_level,
-            "exit_time": entry_time + pd.Timedelta(minutes=1),
-            "exit_reason": "Win",
-            "target_hit": True,
-            "stop_hit": False,
-            "time_expired": False
-        }
+    # REMOVED: Probabilistic and heuristic execution methods
+    # The following methods have been removed as they violate the deterministic requirement:
+    # - _simulate_brownian_bridge_execution (probabilistic/stochastic)
+    # - _generate_brownian_bridge_path (probabilistic/stochastic)
+    # - _estimate_stochastic_volatility (probabilistic/stochastic)
+    # - _simulate_ml_based_execution (ML/heuristic)
+    # - _extract_ml_features (ML/heuristic)
+    # - _predict_execution_probability (ML/heuristic)
+    # - _calculate_simple_execution_order (fallback method, no longer needed)
+    #
+    # All intra-bar execution now uses the single deterministic close-distance rule
+    # implemented in _simulate_intra_bar_execution.
     
     def _adjust_stop_loss_t1(self, entry_price: float, direction: str, 
                             target_pts: float, instrument: str) -> float:
@@ -1543,6 +1299,16 @@ class PriceTracker:
                 print(f"   Exit reason: {exit_reason}, Target hit: {target_hit}")
             except Exception:
                 pass
+        
+        # Explicit BE check: if exit_reason is "BE", return immediately
+        # Do not rely solely on t1_triggered to infer BE
+        if exit_reason == "BE":
+            if self.debug_manager.is_debug_enabled():
+                try:
+                    print(f"   -> BE (explicit exit reason)")
+                except Exception:
+                    pass
+            return "BE"
         
         # Check if target was hit first - this overrides everything
         if target_hit:
@@ -1617,12 +1383,14 @@ class PriceTracker:
                 be_hit = low <= be_price
                 
                 if target_hit and be_hit:
-                    # Both hit in same bar - use close price to determine which hit first
+                    # Both hit in same bar - use deterministic close-distance rule
+                    # Tie-break favors BE (conservative bias, same as STOP in main execution)
                     close = bar['close']
                     target_distance = abs(close - target_price)
                     be_distance = abs(close - be_price)
                     
-                    if target_distance <= be_distance:
+                    if target_distance < be_distance:
+                        # Target is closer - target hits first
                         if self.debug_manager.is_debug_enabled():
                             try:
                                 print(f"  WIN: Both hit, close closer to target at {close}")
@@ -1630,9 +1398,10 @@ class PriceTracker:
                                 pass
                         return "Win"
                     else:
+                        # BE is closer OR equal (tie-break favors BE) - BE hits first
                         if self.debug_manager.is_debug_enabled():
                             try:
-                                print(f"  BE: Both hit, close closer to BE at {close}")
+                                print(f"  BE: Both hit, close closer to BE (or tie) at {close}")
                             except Exception:
                                 pass
                         return "BE"
@@ -1656,12 +1425,14 @@ class PriceTracker:
                 be_hit = high >= be_price
                 
                 if target_hit and be_hit:
-                    # Both hit in same bar - use close price to determine which hit first
+                    # Both hit in same bar - use deterministic close-distance rule
+                    # Tie-break favors BE (conservative bias, same as STOP in main execution)
                     close = bar['close']
                     target_distance = abs(close - target_price)
                     be_distance = abs(close - be_price)
                     
-                    if target_distance <= be_distance:
+                    if target_distance < be_distance:
+                        # Target is closer - target hits first
                         if self.debug_manager.is_debug_enabled():
                             try:
                                 print(f"  WIN: Both hit, close closer to target at {close}")
@@ -1669,9 +1440,10 @@ class PriceTracker:
                                 pass
                         return "Win"
                     else:
+                        # BE is closer OR equal (tie-break favors BE) - BE hits first
                         if self.debug_manager.is_debug_enabled():
                             try:
-                                print(f"  BE: Both hit, close closer to BE at {close}")
+                                print(f"  BE: Both hit, close closer to BE (or tie) at {close}")
                             except Exception:
                                 pass
                         return "BE"

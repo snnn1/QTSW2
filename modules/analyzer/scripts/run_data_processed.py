@@ -41,31 +41,74 @@ def parse_slots(args_slots, sessions):
         enabled[sess] = [e for e in enabled[sess] if e in valid_slots]
     return enabled
 
-def load_folder(folder: str) -> pd.DataFrame:
+def load_folder(folder: str, instrument: str = None) -> pd.DataFrame:
     p = pathlib.Path(folder)
     if not p.exists() or not p.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
     parts = []
     # Recursively search for parquet files in subdirectories
     # Translator outputs files in structure like: {folder}/{instrument}/1m/YYYY/MM/{instrument}_1m_{date}.parquet
-    parquet_files = sorted(p.rglob("*.parquet"))
+    print(f"[LOAD] Starting file discovery for instrument: {instrument}", file=sys.stderr, flush=True)
+    if instrument:
+        # Filter by instrument BEFORE loading - much faster and uses less memory
+        # Look for files in {folder}/{instrument}/1m/... or files matching {instrument}_*.parquet
+        instrument_upper = instrument.upper()
+        parquet_files = []
+        # First try instrument subdirectory structure
+        instrument_dir = p / instrument_upper / "1m"
+        print(f"[LOAD] Checking directory: {instrument_dir}", file=sys.stderr, flush=True)
+        if instrument_dir.exists():
+            print(f"[LOAD] Directory exists, scanning for parquet files...", file=sys.stderr, flush=True)
+            # OPTIMIZED: Iterate year/month structure instead of rglob (much faster)
+            # Structure: {instrument}/1m/{year}/{month}/{file}.parquet
+            parquet_files = []
+            year_dirs = sorted([d for d in instrument_dir.iterdir() if d.is_dir() and d.name.isdigit() and len(d.name) == 4])
+            print(f"[LOAD] Found {len(year_dirs)} year directories", file=sys.stderr, flush=True)
+            for year_dir in year_dirs:
+                month_dirs = sorted([d for d in year_dir.iterdir() if d.is_dir()])
+                for month_dir in month_dirs:
+                    files = sorted(month_dir.glob("*.parquet"))
+                    parquet_files.extend(files)
+                    if len(parquet_files) % 500 == 0:
+                        print(f"[LOAD] Found {len(parquet_files)} files so far...", file=sys.stderr, flush=True)
+            print(f"[LOAD] Found {len(parquet_files)} files total in {instrument_dir}", file=sys.stderr, flush=True)
+        # Also check for files matching instrument pattern in root or subdirs
+        if not parquet_files:
+            print(f"[LOAD] No files in subdirectory, searching for {instrument_upper}_*.parquet pattern...", file=sys.stderr, flush=True)
+            all_files = list(p.rglob(f"{instrument_upper}_*.parquet"))
+            all_files.sort()
+            parquet_files = [f for f in all_files if instrument_upper in f.name]
+            print(f"[LOAD] Found {len(parquet_files)} files matching pattern", file=sys.stderr, flush=True)
+    else:
+        # Load all files if no instrument specified (backward compatibility)
+        print(f"[LOAD] No instrument specified, loading all parquet files...", file=sys.stderr, flush=True)
+        parquet_files = list(p.rglob("*.parquet"))
+        parquet_files.sort()
     
     if not parquet_files:
         raise SystemExit(f"No CSV/Parquet files found under {folder}")
     
-    print(f"Found {len(parquet_files)} parquet file(s) to load")
+    print(f"Found {len(parquet_files)} parquet file(s) to load", flush=True)
     
     total_size_mb = 0
+    # Show progress every 100 files to avoid slowing down with thousands of files
+    progress_interval = max(1, len(parquet_files) // 100) if len(parquet_files) > 100 else 1
+    
     for i, f in enumerate(parquet_files, 1):
         file_size_mb = f.stat().st_size / (1024 * 1024)
         total_size_mb += file_size_mb
-        print(f"Loading file {i}/{len(parquet_files)}: {f.name} ({file_size_mb:.1f} MB)")
+        
+        # Only print progress every N files to avoid slowdown
+        if i % progress_interval == 0 or i == 1 or i == len(parquet_files):
+            print(f"Loading file {i}/{len(parquet_files)} ({i*100//len(parquet_files)}%): {f.name} ({file_size_mb:.1f} MB)", flush=True)
+        
         try:
             df = pd.read_parquet(f)
-            print(f"  Loaded {len(df):,} rows from {f.name}")
+            if i % progress_interval == 0 or i == 1 or i == len(parquet_files):
+                print(f"  Loaded {len(df):,} rows from {f.name}", flush=True)
             parts.append(df)
         except Exception as e:
-            print(f"  ERROR loading {f.name}: {e}")
+            print(f"  ERROR loading {f.name}: {e}", flush=True)
             raise
     
     print(f"Total data size: {total_size_mb:.1f} MB across {len(parquet_files)} file(s)")
@@ -106,7 +149,7 @@ def main():
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
     args = ap.parse_args()
 
-    df = load_folder(args.folder)
+    df = load_folder(args.folder, instrument=args.instrument)
     
     # Debug output
     if args.debug:
@@ -256,6 +299,13 @@ def main():
         
         pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         
+        # Validate empty DataFrame (validation allows empty DataFrames)
+        from modules.analyzer.validation import validate_before_write
+        try:
+            validate_before_write(res, out_path)
+        except ValueError as e:
+            raise ValueError(f"Analyzer output validation failed: {e}") from e
+        
         # Save empty DataFrame with correct schema
         res.to_parquet(out_path, index=False, compression='snappy')
         print(f"Empty results saved to {out_path}")
@@ -287,6 +337,13 @@ def main():
         out_path = analyzer_temp_dir / f"{desc_filename}.parquet"
     
     pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    # Validate analyzer output before write (Invariant 1 & 2: Valid dates, datetime dtype)
+    from modules.analyzer.validation import validate_before_write
+    try:
+        validate_before_write(res, out_path)
+    except ValueError as e:
+        raise ValueError(f"Analyzer output validation failed: {e}") from e
     
     # Save as parquet file (for sequential processor compatibility)
     res.to_parquet(out_path, index=False, compression='snappy')

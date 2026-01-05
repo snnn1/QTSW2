@@ -87,6 +87,7 @@ async def build_master_matrix(request: MatrixBuildRequest):
             specific_date=request.specific_date,
             output_dir=request.output_dir,
             stream_filters=stream_filters_dict,
+            analyzer_runs_dir=request.analyzer_runs_dir,
             streams=request.streams
         )
         
@@ -96,9 +97,29 @@ async def build_master_matrix(request: MatrixBuildRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/update")
-async def update_master_matrix(request: MatrixBuildRequest):
-    """Update the master matrix with new analyzer runs (rolling window)."""
+
+
+class ResequenceRequest(BaseModel):
+    resequence_days: int = 40
+    analyzer_runs_dir: str = "data/analyzed"
+    output_dir: str = "data/master_matrix"
+    stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
+
+
+@router.post("/resequence")
+async def resequence_master_matrix(request: ResequenceRequest):
+    """Perform rolling resequence: remove window rows and resequence from checkpoint state.
+    
+    Behavior:
+    1. Discover all analyzer output from data/analyzed/ (full disk scan)
+    2. Compute resequence_start_date = today - N trading days
+    3. Load existing master matrix
+    4. Remove all rows where trade_date >= resequence_start_date
+    5. Restore sequencer state from checkpoint immediately before resequence_start_date
+    6. Run sequencer forward using analyzer data for dates >= resequence_start_date
+    7. Append newly sequenced rows to preserved historical matrix rows
+    8. Save single new master matrix file
+    """
     try:
         from modules.matrix.master_matrix import MasterMatrix
         
@@ -115,15 +136,217 @@ async def update_master_matrix(request: MatrixBuildRequest):
                     "exclude_times": filter_config.exclude_times
                 }
         
-        matrix.update_master_matrix(
+        logger.info(f"ROLLING RESEQUENCE: Resequencing last {request.resequence_days} trading days")
+        
+        df, summary = matrix.build_master_matrix_rolling_resequence(
+            resequence_days=request.resequence_days,
             output_dir=request.output_dir,
             stream_filters=stream_filters_dict,
             analyzer_runs_dir=request.analyzer_runs_dir
         )
         
-        return {"status": "success", "message": "Master matrix updated successfully"}
+        if "error" in summary:
+            raise HTTPException(status_code=500, detail=summary["error"])
+        
+        return {
+            "status": "success",
+            "message": f"Rolling resequence complete: {summary.get('rows_preserved', 0)} preserved + {summary.get('rows_resequenced', 0)} resequenced",
+            "summary": summary
+        }
     except Exception as e:
-        logger.error(f"Error updating master matrix: {e}", exc_info=True)
+        logger.error(f"Error resequencing master matrix: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _get_latest_analyzer_write_time(analyzer_runs_dir: Path) -> Optional[float]:
+    """Get the latest modification time of any file in the analyzer output directory.
+    
+    Returns:
+        Unix timestamp (float) of the most recently modified file, or None if directory doesn't exist or is empty.
+    """
+    if not analyzer_runs_dir.exists():
+        return None
+    
+    latest_mtime = None
+    
+    # Check all parquet files in all stream subdirectories
+    for stream_dir in analyzer_runs_dir.iterdir():
+        if stream_dir.is_dir():
+            for parquet_file in stream_dir.glob("*.parquet"):
+                mtime = parquet_file.stat().st_mtime
+                if latest_mtime is None or mtime > latest_mtime:
+                    latest_mtime = mtime
+    
+    return latest_mtime
+
+
+@router.post("/reload_latest")
+async def reload_latest_matrix():
+    """Reload the most recent matrix file from disk without rebuilding.
+    
+    This endpoint simply finds and returns the latest matrix file metadata,
+    allowing the frontend to immediately see the current disk state.
+    """
+    try:
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        
+        if not root_matrix_dir.exists():
+            logger.warning(f"Matrix directory does not exist: {root_matrix_dir}")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Master matrix directory not found: {root_matrix_dir.resolve()}. Please build the matrix first."
+            )
+        
+        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        
+        if not parquet_files:
+            logger.warning(f"No matrix files found in: {root_matrix_dir}")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No master matrix files found in {root_matrix_dir.resolve()}. Please build the matrix first using 'Rebuild Matrix' button."
+            )
+        
+        # Find most recent file by parsing timestamp from filename
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        max_future_tolerance = timedelta(days=1)
+        
+        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
+            """Parse timestamp from filename like master_matrix_YYYYMMDD_HHMMSS.parquet"""
+            import re
+            pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
+            match = pattern.search(file_path.name)
+            if match:
+                try:
+                    date_str = match.group(1) + match.group(2)  # YYYYMMDDHHMMSS
+                    return datetime.strptime(date_str, '%Y%m%d%H%M%S')
+                except ValueError:
+                    return None
+            return None
+        
+        # Separate files with valid timestamps from those without
+        files_with_timestamp = []
+        files_without_timestamp = []
+        
+        for f in parquet_files:
+            ts = parse_timestamp_from_filename(f)
+            if ts:
+                # Reject files dated more than 1 day in the future
+                if ts <= now + max_future_tolerance:
+                    files_with_timestamp.append((ts, f))
+                else:
+                    logger.warning(f"Rejecting future-dated file: {f.name} (timestamp: {ts})")
+            else:
+                files_without_timestamp.append(f)
+        
+        if files_with_timestamp:
+            # Sort by timestamp descending (newest first)
+            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
+            file_to_load = files_with_timestamp[0][1]
+            logger.info(f"Selected latest file by timestamp: {file_to_load.name}")
+        elif files_without_timestamp:
+            # Fallback to mtime if no valid timestamps found
+            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            file_to_load = files_without_timestamp[0]
+            logger.warning(f"No valid timestamped files found, using mtime fallback: {file_to_load.name}")
+        else:
+            raise HTTPException(status_code=404, detail=f"No valid master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
+        
+        file_mtime = file_to_load.stat().st_mtime
+        matrix_file_id = file_to_load.name
+        
+        return {
+            "status": "success",
+            "matrix_file_id": matrix_file_id,
+            "file": file_to_load.name,
+            "file_mtime": file_mtime,
+            "message": "Latest matrix file identified. Use GET /api/matrix/data to load it."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reloading latest matrix: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/freshness")
+async def get_matrix_freshness(analyzer_runs_dir: str = "data/analyzed"):
+    """Get freshness metadata comparing analyzer output vs matrix build time.
+    
+    Returns:
+        Dictionary with latest_analyzer_write_time, latest_matrix_build_time, and staleness indicators.
+    """
+    try:
+        analyzer_dir = QTSW2_ROOT / analyzer_runs_dir
+        latest_analyzer_write_time = _get_latest_analyzer_write_time(analyzer_dir)
+        
+        # Get latest matrix file modification time
+        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+        latest_matrix_build_time = None
+        matrix_file_id = None
+        
+        if root_matrix_dir.exists():
+            parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+            if parquet_files:
+                # Find most recent file
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                max_future_tolerance = timedelta(days=1)
+                
+                def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
+                    import re
+                    pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
+                    match = pattern.search(file_path.name)
+                    if match:
+                        try:
+                            date_str = match.group(1) + match.group(2)
+                            return datetime.strptime(date_str, '%Y%m%d%H%M%S')
+                        except ValueError:
+                            return None
+                    return None
+                
+                files_with_timestamp = []
+                files_without_timestamp = []
+                
+                for f in parquet_files:
+                    ts = parse_timestamp_from_filename(f)
+                    if ts and ts <= now + max_future_tolerance:
+                        files_with_timestamp.append((ts, f))
+                    else:
+                        files_without_timestamp.append(f)
+                
+                if files_with_timestamp:
+                    files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
+                    latest_file = files_with_timestamp[0][1]
+                elif files_without_timestamp:
+                    files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    latest_file = files_without_timestamp[0]
+                else:
+                    latest_file = None
+                
+                if latest_file:
+                    latest_matrix_build_time = latest_file.stat().st_mtime
+                    matrix_file_id = latest_file.name
+        
+        # Determine staleness
+        is_stale = False
+        staleness_message = None
+        if latest_analyzer_write_time is not None and latest_matrix_build_time is not None:
+            if latest_analyzer_write_time > latest_matrix_build_time:
+                is_stale = True
+                staleness_seconds = latest_analyzer_write_time - latest_matrix_build_time
+                staleness_minutes = staleness_seconds / 60
+                staleness_message = f"Analyzer has newer data than Matrix (analyzer is {staleness_minutes:.1f} minutes newer)"
+        
+        return {
+            "latest_analyzer_write_time": latest_analyzer_write_time,
+            "latest_matrix_build_time": latest_matrix_build_time,
+            "matrix_file_id": matrix_file_id,
+            "is_stale": is_stale,
+            "staleness_message": staleness_message
+        }
+    except Exception as e:
+        logger.error(f"Error getting freshness metadata: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -320,6 +543,9 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         # Get file modification time for cache/version checking
         file_mtime = file_to_load.stat().st_mtime
         
+        # Generate stable file ID (filename) for change detection
+        matrix_file_id = file_to_load.name
+        
         # Extract date ranges for debugging/metadata
         full_min_trade_date = None
         full_max_trade_date = None
@@ -374,14 +600,25 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
                         record[key] = None
         
         # Extract unique streams and instruments from FULL dataset (before limiting)
-        streams = sorted(df_full['Stream'].unique().tolist()) if 'Stream' in df_full.columns else []
-        instruments = sorted(df_full['Instrument'].unique().tolist()) if 'Instrument' in df_full.columns else []
+        # Filter out None values before sorting to avoid comparison errors
+        if 'Stream' in df_full.columns:
+            stream_values = [s for s in df_full['Stream'].unique().tolist() if s is not None and pd.notna(s)]
+            streams = sorted(stream_values)
+        else:
+            streams = []
+        
+        if 'Instrument' in df_full.columns:
+            instrument_values = [i for i in df_full['Instrument'].unique().tolist() if i is not None and pd.notna(i)]
+            instruments = sorted(instrument_values)
+        else:
+            instruments = []
         
         response_data = {
             "data": records,
             "total": len(df_full), # Total rows in the full parquet file
             "loaded": len(records),
             "file": file_to_load.name,
+            "matrix_file_id": matrix_file_id,  # Stable file identifier for change detection
             "file_mtime": file_mtime,
             "streams": streams,
             "instruments": instruments,

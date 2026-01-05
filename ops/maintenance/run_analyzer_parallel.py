@@ -121,26 +121,36 @@ def run_analyzer_instrument(instrument: str, data_folder: Path, analyzer_script:
             env=process_env  # Pass environment to ensure PIPELINE_RUN is inherited
         )
         
-        # Collect output (last 50 lines for error reporting)
+        # Collect output (last 50 lines for error reporting) AND stream progress in real-time
         stdout_lines = []
         stderr_lines = []
         max_lines = 50
         
-        def collect_output(stream, lines_list):
+        def collect_output(stream, lines_list, prefix=""):
+            # Only print progress if NOT running via pipeline (no PIPELINE_EVENT_LOG set)
+            # This prevents cluttering dashboard events - pipeline handles its own logging
+            is_pipeline_run = bool(os.environ.get("PIPELINE_EVENT_LOG"))
             for line in iter(stream.readline, ''):
                 if line:
-                    lines_list.append(line.rstrip())
+                    line_stripped = line.rstrip()
+                    lines_list.append(line_stripped)
                     if len(lines_list) > max_lines:
                         lines_list.pop(0)
+                    # Only print progress in CLI mode (not pipeline mode) to avoid dashboard noise
+                    if not is_pipeline_run:
+                        print(f"[{instrument}] {prefix}{line_stripped}", flush=True)
         
         import threading
-        stdout_thread = threading.Thread(target=collect_output, args=(process.stdout, stdout_lines), daemon=True)
-        stderr_thread = threading.Thread(target=collect_output, args=(process.stderr, stderr_lines), daemon=True)
+        stdout_thread = threading.Thread(target=collect_output, args=(process.stdout, stdout_lines, ""), daemon=True)
+        stderr_thread = threading.Thread(target=collect_output, args=(process.stderr, stderr_lines, "[stderr] "), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
         
-        # Wait for completion
+        # Wait for completion and ensure threads finish
         returncode = process.wait()
+        # Give threads a moment to finish reading any remaining output
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
         finish_time = time.time()
         elapsed = finish_time - start_time
         finish_timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(finish_time))

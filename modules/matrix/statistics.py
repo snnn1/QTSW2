@@ -848,7 +848,9 @@ def calculate_stream_stats(
     
     stream_stats: Dict[str, Dict] = {}
     
-    for stream in sorted(df["Stream"].unique()):
+    # Filter out None values before sorting to avoid comparison errors
+    stream_values = [s for s in df["Stream"].unique() if s is not None and pd.notna(s)]
+    for stream in sorted(stream_values):
         stream_df = df[df["Stream"] == stream]
         executed_df = stream_df[stream_df["is_executed_trade"]]
         

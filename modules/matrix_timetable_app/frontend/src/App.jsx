@@ -141,6 +141,9 @@ function AppContent() {
     lastMergeTime,
     availableColumns,
     setAvailableColumns,
+    // File change detection
+    matrixFileId,
+    matrixFreshness,
     // Backend stats
     backendStatsFull,
     backendStatsMultiplier,
@@ -167,7 +170,8 @@ function AppContent() {
     workerCalculateTimetable,
     // Controller functions
     loadMasterMatrix,
-    updateMasterMatrix,
+    resequenceMasterMatrix,
+    reloadLatestMatrix,
     refetchMasterStats,
     hasLoadedRef
   } = useMatrixController({
@@ -2899,25 +2903,40 @@ function AppContent() {
   
   // Calculate timetable in worker when needed
   // If displayed date doesn't exist in master matrix, read from backend-generated timetable_current.json
+  // IMPORTANT: Check matrix freshness before calculating timetable
   useEffect(() => {
     if (deferredActiveTab !== 'timetable' || !currentTradingDay) return
     
-    // Check if displayed date exists in master matrix
-    const displayedDateStr = currentTradingDay.toISOString().split('T')[0]
-    const dateExistsInMatrix = masterData.some(row => {
-      const rowDate = row.Date || row.trade_date
-      if (!rowDate) return false
-      const rowDateStr = rowDate instanceof Date 
-        ? rowDate.toISOString().split('T')[0]
-        : rowDate.split('T')[0]
-      return rowDateStr === displayedDateStr
-    })
-    
-    // If date doesn't exist in matrix, try to read from backend-generated timetable_current.json
-    // This file is generated with RS calculation and contains all streams
-    if (!dateExistsInMatrix && workerReady) {
-      console.log('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
-      const loadFromBackend = async () => {
+    // Check matrix freshness - refuse to calculate timetable if matrix is stale
+    const checkFreshnessAndCalculate = async () => {
+      if (matrixFreshness && matrixFreshness.is_stale) {
+        console.warn('[Timetable] Matrix is stale, reloading before calculating timetable')
+        // Reload latest matrix first
+        try {
+          await reloadLatestMatrix()
+          // After reload, the useEffect will trigger again with fresh data
+          return
+        } catch (error) {
+          console.error('[Timetable] Failed to reload matrix:', error)
+          // Continue anyway - better than blocking
+        }
+      }
+      
+      // Check if displayed date exists in master matrix
+      const displayedDateStr = currentTradingDay.toISOString().split('T')[0]
+      const dateExistsInMatrix = masterData.some(row => {
+        const rowDate = row.Date || row.trade_date
+        if (!rowDate) return false
+        const rowDateStr = rowDate instanceof Date 
+          ? rowDate.toISOString().split('T')[0]
+          : rowDate.split('T')[0]
+        return rowDateStr === displayedDateStr
+      })
+      
+      // If date doesn't exist in matrix, try to read from backend-generated timetable_current.json
+      // This file is generated with RS calculation and contains all streams
+      if (!dateExistsInMatrix && workerReady) {
+        console.log('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
         try {
           const timetable = await matrixApi.getCurrentTimetable()
           if (timetable && timetable.trading_date === displayedDateStr && timetable.streams) {
@@ -2984,16 +3003,17 @@ function AppContent() {
             workerCalculateTimetable(streamFilters, currentTradingDay)
           }
         }
+        return
       }
-      loadFromBackend()
-      return
+      
+      // Normal path: Use worker calculation from master matrix
+      if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
+        workerCalculateTimetable(streamFilters, currentTradingDay)
+      }
     }
     
-    // Normal path: Use worker calculation from master matrix
-    if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
-      workerCalculateTimetable(streamFilters, currentTradingDay)
-    }
-  }, [workerReady, masterData.length, streamFilters, deferredActiveTab, workerCalculateTimetable, currentTradingDay, masterData])
+    checkFreshnessAndCalculate()
+  }, [workerReady, masterData.length, streamFilters, deferredActiveTab, workerCalculateTimetable, currentTradingDay, masterData, matrixFreshness, reloadLatestMatrix])
   
   // Save execution timetable whenever UI timetable updates
   // This ensures timetable_current.json matches exactly what the UI shows
@@ -3052,6 +3072,27 @@ function AppContent() {
   return (
     <div className="min-h-screen bg-black text-gray-100">
       <div className="container mx-auto px-4 py-8">
+        {/* Freshness Warning Banner */}
+        {matrixFreshness && matrixFreshness.is_stale && (
+          <div className="mb-4 p-4 bg-yellow-900 border border-yellow-700 rounded-lg">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <span className="text-yellow-400 font-semibold">⚠️ Stale Data Warning</span>
+                <span className="text-yellow-300 text-sm">
+                  {matrixFreshness.staleness_message || 'Analyzer has newer data than Matrix — UI may be stale.'}
+                </span>
+              </div>
+              <button
+                onClick={() => reloadLatestMatrix()}
+                disabled={masterLoading}
+                className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 rounded text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {masterLoading ? 'Refreshing...' : 'Refresh Data'}
+              </button>
+            </div>
+          </div>
+        )}
+        
         {/* Sticky Header with Title and Tabs */}
         <div className="sticky top-0 z-20 bg-black pt-4 pb-2 -mx-4 px-4">
           {/* Tabs */}
@@ -3378,27 +3419,40 @@ function AppContent() {
                     {showFilteredDays ? '✓' : ''} Filtered Days
                   </button>
                   <button
-                    onClick={() => loadMasterMatrix(true)}
-                    disabled={masterLoading}
-                    className={`px-4 py-2 rounded font-medium text-sm ${
-                      masterLoading
-                        ? 'bg-gray-700 cursor-not-allowed'
-                        : 'bg-blue-600 hover:bg-blue-700'
-                    }`}
-                  >
-                    {masterLoading ? 'Loading...' : 'Rebuild Matrix (Full)'}
-                  </button>
-                  <button
-                    onClick={() => updateMasterMatrix()}
+                    onClick={() => resequenceMasterMatrix(40)}
                     disabled={masterLoading}
                     className={`px-4 py-2 rounded font-medium text-sm ${
                       masterLoading
                         ? 'bg-gray-700 cursor-not-allowed'
                         : 'bg-green-600 hover:bg-green-700'
-                    }`}
-                    title="Reprocess last 35 trading days from merged data and append forward. Safe for overlapping pipeline exports."
+                    } text-white`}
+                    title="Rolling resequence (default): Removes last 40 trading days, restores sequencer state from checkpoint, and resequences from analyzer output. No stale rows preserved in window."
                   >
-                    {masterLoading ? 'Updating...' : 'Update Matrix (Rolling 35-Day Window)'}
+                    {masterLoading ? 'Resequencing...' : 'Resequence Last 40 Days'}
+                  </button>
+                  <button
+                    onClick={() => matrixApi.buildMatrix({ streamFilters })}
+                    disabled={masterLoading}
+                    className={`px-4 py-2 rounded font-medium text-sm ${
+                      masterLoading
+                        ? 'bg-gray-700 cursor-not-allowed'
+                        : 'bg-red-600 hover:bg-red-700'
+                    } text-white`}
+                    title="Full rebuild (destructive): Rebuilds entire matrix from scratch. Use only for recovery or when resequence fails."
+                  >
+                    {masterLoading ? 'Rebuilding...' : 'Full Rebuild'}
+                  </button>
+                  <button
+                    onClick={() => reloadLatestMatrix()}
+                    disabled={masterLoading}
+                    className={`px-4 py-2 rounded font-medium text-sm ${
+                      masterLoading
+                        ? 'bg-gray-700 cursor-not-allowed'
+                        : 'bg-blue-600 hover:bg-blue-700'
+                    } text-white`}
+                    title="Reload latest matrix file from disk immediately (no rebuild). Use this to see new analyzer data right away."
+                  >
+                    {masterLoading ? 'Refreshing...' : 'Refresh Data'}
                   </button>
                   <label className="flex items-center gap-2 px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700 cursor-pointer">
                     <input

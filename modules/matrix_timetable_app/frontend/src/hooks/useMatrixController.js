@@ -33,6 +33,11 @@ export function useMatrixController({
   const [lastMergeTime, setLastMergeTime] = useState(null)
   const [availableColumns, setAvailableColumns] = useState([])
   
+  // File change detection
+  const [matrixFileId, setMatrixFileId] = useState(null)
+  const [matrixFreshness, setMatrixFreshness] = useState(null)
+  const lastMatrixFileIdRef = useRef(null)
+  
   // Backend stats state
   const [backendStatsFull, setBackendStatsFull] = useState(null)
   const [backendStatsMultiplier, setBackendStatsMultiplier] = useState(null)
@@ -143,9 +148,24 @@ export function useMatrixController({
       }
       
       if (trades.length > 0) {
+        // Detect file change
+        const currentFileId = data.matrix_file_id || data.file || null
+        const fileChanged = lastMatrixFileIdRef.current !== null && 
+                            lastMatrixFileIdRef.current !== currentFileId
+        
+        if (fileChanged) {
+          console.log(`[Matrix] File changed during load: ${lastMatrixFileIdRef.current} -> ${currentFileId}`)
+        }
+        
         setMasterData(trades)
-        const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
+        const mergeTime = data.file_mtime ? new Date(data.file_mtime * 1000) : new Date()
         setLastMergeTime(mergeTime)
+        
+        // Update file ID tracking
+        if (currentFileId) {
+          setMatrixFileId(currentFileId)
+          lastMatrixFileIdRef.current = currentFileId
+        }
         
         // Initialize worker with new data
         if (trades.length > 0) {
@@ -269,79 +289,6 @@ export function useMatrixController({
     }
   }, [masterContractMultiplier, includeFilteredExecuted, streamFilters])
   
-  // Update master matrix function (rolling window update)
-  const updateMasterMatrix = useCallback(async () => {
-    setMasterLoading(true)
-    setMasterError(null)
-    
-    const hadExistingData = masterData.length > 0
-    
-    try {
-      // Check if backend is reachable
-      const healthCheck = await matrixApi.checkBackendHealth(3000)
-      if (!healthCheck.success) {
-        setMasterError(healthCheck.error)
-        if (!hadExistingData) {
-          setMasterData([])
-        }
-        setMasterLoading(false)
-        return
-      }
-      
-      // Update matrix
-      try {
-        await matrixApi.updateMatrix({ streamFilters })
-      } catch (error) {
-        setMasterError(error.message)
-        setMasterLoading(false)
-        return
-      }
-      
-      // Get master stream inclusion filter
-      const masterFilters = streamFilters['master'] || {}
-      const masterIncludeStreams = masterFilters.include_streams || []
-      const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
-      
-      // Load the updated matrix data
-      const data = await matrixApi.getMatrixData({
-        limit: 10000,
-        order: 'newest',
-        essentialColumnsOnly: true,
-        skipCleaning: true,
-        contractMultiplier: masterContractMultiplier,
-        includeFilteredExecuted: includeFilteredExecuted,
-        streamInclude: streamIncludeParam
-      })
-      
-      const trades = data.data || []
-      
-      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
-        setAvailableYearsFromAPI(data.years)
-      }
-      
-      // Update master data and reinitialize worker
-      setMasterData(trades)
-      const mergeTime = data.file_mtime ? new Date(data.file_mtime) : new Date()
-      setLastMergeTime(mergeTime)
-      
-      // Reinitialize worker with new data
-      if (trades.length > 0 && workerInitData && workerReady) {
-        setTimeout(() => {
-          workerInitData(trades)
-        }, 100)
-      }
-      
-      setMasterError(null)
-      setMasterLoading(false)
-    } catch (error) {
-      setMasterError(`Failed to update master matrix: ${error.message}`)
-      if (!hadExistingData) {
-        setMasterData([])
-      }
-      setMasterLoading(false)
-    }
-  }, [masterData, streamFilters, masterContractMultiplier, workerInitData, workerReady])
-  
   // Reinitialize worker data when worker becomes ready and masterData exists
   useEffect(() => {
     if (workerReady && masterData.length > 0 && workerInitData) {
@@ -397,7 +344,162 @@ export function useMatrixController({
     showFilteredDays
   ])
   
-  // Auto-update interval
+  // Resequence master matrix (rolling resequence)
+  const resequenceMasterMatrix = useCallback(async (resequenceDays = 40) => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    try {
+      // Check if backend is reachable
+      const healthCheck = await matrixApi.checkBackendHealth(3000)
+      if (!healthCheck.success) {
+        setMasterError(healthCheck.error)
+        setMasterLoading(false)
+        return
+      }
+      
+      const resequenceInfo = await matrixApi.resequenceMatrix({
+        streamFilters,
+        resequenceDays
+      })
+      
+      console.log(`[Matrix] Rolling resequence complete:`, resequenceInfo.summary)
+      
+      // Reload matrix data after resequence
+      await loadMasterMatrix()
+      
+      // Refetch stats
+      await refetchMasterStats()
+      
+      setMasterLoading(false)
+    } catch (error) {
+      console.error('[Matrix] Resequence error:', error)
+      setMasterError(error.message || 'Failed to resequence matrix')
+      setMasterLoading(false)
+    }
+  }, [streamFilters, loadMasterMatrix, refetchMasterStats])
+
+  // Reload latest matrix from disk (without rebuilding)
+  // IMPORTANT: Always reloads data, even if file ID hasn't changed, because the file content may have been updated
+  const reloadLatestMatrix = useCallback(async () => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    try {
+      // Check if backend is reachable
+      const healthCheck = await matrixApi.checkBackendHealth(3000)
+      if (!healthCheck.success) {
+        setMasterError(healthCheck.error)
+        setMasterLoading(false)
+        return
+      }
+      
+      // Reload latest file metadata to check for file changes
+      const reloadInfo = await matrixApi.reloadLatestMatrix()
+      
+      // Check if file changed
+      const fileChanged = lastMatrixFileIdRef.current !== null && 
+                          lastMatrixFileIdRef.current !== reloadInfo.matrix_file_id
+      
+      if (fileChanged) {
+        console.log(`[Matrix] File changed: ${lastMatrixFileIdRef.current} -> ${reloadInfo.matrix_file_id}`)
+      } else {
+        console.log(`[Matrix] Reloading data from same file: ${reloadInfo.matrix_file_id}`)
+      }
+      
+      // ALWAYS reload data when user clicks refresh, regardless of file change
+      // The file content may have been updated even if filename is the same
+      const masterFilters = streamFilters['master'] || {}
+      const masterIncludeStreams = masterFilters.include_streams || []
+      const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
+      
+      // Load data - when file changes, load more rows to see affected date window
+      // Calculate date range from existing data to determine affected window
+      let limit = 10000
+      if (fileChanged && masterData.length > 0) {
+        // Find the most recent date in current data
+        const recentDates = masterData
+          .map(row => {
+            const date = row.Date || row.trade_date
+            if (!date) return null
+            return date instanceof Date ? date : new Date(date)
+          })
+          .filter(d => d && !isNaN(d.getTime()))
+          .sort((a, b) => b - a)
+        
+        if (recentDates.length > 0) {
+          // Load enough rows to cover last 60 days (approximately 3000-4000 rows)
+          // This ensures we see changes in the affected window
+          limit = 5000
+          console.log(`[Matrix] File changed, loading ${limit} rows to show affected date window`)
+        }
+      }
+      
+      // Force reload by adding a cache-busting timestamp to ensure fresh data
+      const data = await matrixApi.getMatrixData({
+        limit: limit,
+        order: 'newest',
+        essentialColumnsOnly: true,
+        skipCleaning: true,
+        contractMultiplier: masterContractMultiplier,
+        includeFilteredExecuted: includeFilteredExecuted,
+        streamInclude: streamIncludeParam
+      })
+      
+      const trades = data.data || []
+      
+      if (data.years && Array.isArray(data.years) && data.years.length > 0) {
+        setAvailableYearsFromAPI(data.years)
+      }
+      
+      // Update state - this will trigger UI refresh
+      setMasterData(trades)
+      const mergeTime = data.file_mtime ? new Date(data.file_mtime * 1000) : new Date()
+      setLastMergeTime(mergeTime)
+      
+      // Update file ID
+      if (data.matrix_file_id || data.file) {
+        setMatrixFileId(data.matrix_file_id || data.file)
+        lastMatrixFileIdRef.current = data.matrix_file_id || data.file
+      }
+      
+      // Reinitialize worker with fresh data
+      if (trades.length > 0 && workerInitData && workerReady) {
+        setTimeout(() => {
+          workerInitData(trades)
+        }, 100)
+      }
+      
+      setMasterError(null)
+      console.log(`[Matrix] Successfully reloaded ${trades.length} rows from file: ${data.matrix_file_id || data.file}`)
+    } catch (error) {
+      setMasterError(`Failed to reload latest matrix: ${error.message}`)
+      console.error('[Matrix] Reload error:', error)
+    } finally {
+      setMasterLoading(false)
+    }
+  }, [streamFilters, masterContractMultiplier, includeFilteredExecuted, masterData, workerInitData, workerReady])
+  
+  // Check matrix freshness periodically
+  useEffect(() => {
+    const checkFreshness = async () => {
+      try {
+        const freshness = await matrixApi.getMatrixFreshness()
+        setMatrixFreshness(freshness)
+      } catch (error) {
+        console.warn('[Matrix] Failed to check freshness:', error)
+      }
+    }
+    
+    // Check immediately
+    checkFreshness()
+    
+    // Check every 2 minutes
+    const interval = setInterval(checkFreshness, 2 * 60 * 1000)
+    return () => clearInterval(interval)
+  }, [])
+  
+  // Auto-update interval (fallback - file change detection is primary)
   const masterLoadingRef = useRef(masterLoading)
   useEffect(() => {
     masterLoadingRef.current = masterLoading
@@ -410,12 +512,13 @@ export function useMatrixController({
     
     const interval = setInterval(() => {
       if (!masterLoadingRef.current) {
-        updateMasterMatrix()
+        // Check for file changes first via reloadLatestMatrix
+        reloadLatestMatrix()
       }
-    }, 20 * 60 * 1000) // 20 minutes
+    }, 20 * 60 * 1000) // 20 minutes - fallback safety net
     
     return () => clearInterval(interval)
-  }, [autoUpdateEnabled, updateMasterMatrix])
+  }, [autoUpdateEnabled, reloadLatestMatrix])
   
   return {
     // Backend data state
@@ -426,6 +529,10 @@ export function useMatrixController({
     lastMergeTime,
     availableColumns,
     setAvailableColumns,
+    
+    // File change detection
+    matrixFileId,
+    matrixFreshness,
     
     // Backend stats
     backendStatsFull,
@@ -456,7 +563,8 @@ export function useMatrixController({
     
     // Controller functions
     loadMasterMatrix,
-    updateMasterMatrix,
+    resequenceMasterMatrix,
+    reloadLatestMatrix,
     refetchMasterStats,
     hasLoadedRef
   }

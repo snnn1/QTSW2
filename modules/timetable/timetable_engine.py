@@ -63,6 +63,25 @@ class TimetableEngine:
         
         # Available time slots by session (from centralized config - SINGLE SOURCE OF TRUTH)
         self.session_time_slots = SLOT_ENDS
+        
+        # File list cache to avoid repeated rglob() calls
+        self._file_list_cache = {}
+    
+    def _get_parquet_files(self, stream_dir: Path) -> List[Path]:
+        """
+        Get parquet files for a stream directory with caching.
+        
+        Args:
+            stream_dir: Stream directory path
+            
+        Returns:
+            Sorted list of parquet files (most recent first)
+        """
+        if stream_dir not in self._file_list_cache:
+            self._file_list_cache[stream_dir] = sorted(
+                stream_dir.rglob("*.parquet"), reverse=True
+            )
+        return self._file_list_cache[stream_dir]
     
     def calculate_rs_for_stream(self, stream_id: str, session: str, 
                                lookback_days: int = 13) -> Dict[str, float]:
@@ -88,8 +107,8 @@ class TimetableEngine:
         if not stream_dir.exists():
             return {}
         
-        # Find most recent parquet files
-        parquet_files = sorted(stream_dir.rglob("*.parquet"), reverse=True)
+        # Find most recent parquet files (using cache)
+        parquet_files = self._get_parquet_files(stream_dir)
         
         if not parquet_files:
             return {}
@@ -262,8 +281,8 @@ class TimetableEngine:
         file_path = stream_dir / str(year) / file_pattern
         
         if not file_path.exists():
-            # Try alternative patterns
-            parquet_files = list(stream_dir.rglob("*.parquet"))
+            # Try alternative patterns (using cache)
+            parquet_files = self._get_parquet_files(stream_dir)
             for pf in parquet_files:
                 try:
                     df = pd.read_parquet(pf)
@@ -314,6 +333,12 @@ class TimetableEngine:
         logger.info(f"GENERATING TIMETABLE FOR {trade_date}")
         logger.info("=" * 80)
         
+        # OPTIMIZATION: Pre-load all SCF values once (batch loading)
+        # SCF values are per-stream, not per-session, so we can load once and reuse
+        scf_cache = {}
+        for stream_id in self.streams:
+            scf_cache[stream_id] = self.get_scf_values(stream_id, trade_date_obj)
+        
         timetable_rows = []
         
         for stream_id in self.streams:
@@ -322,8 +347,8 @@ class TimetableEngine:
             
             # Process both sessions
             for session in ["S1", "S2"]:
-                # Initialize SCF values (used for filtering)
-                scf_s1, scf_s2 = None, None
+                # Get SCF values from cache (pre-loaded above)
+                scf_s1, scf_s2 = scf_cache[stream_id]
                 
                 # Select best time based on RS
                 selected_time, time_reason = self.select_best_time(stream_id, session)
@@ -339,9 +364,6 @@ class TimetableEngine:
                     final_reason = f"{time_reason}_{block_reason}"
                 else:
                     block_reason = None
-                    # Get SCF values for filtering
-                    scf_s1, scf_s2 = self.get_scf_values(stream_id, trade_date_obj)
-                    
                     # Check filters
                     allowed, filter_reason = self.check_filters(
                         trade_date_obj, stream_id, session, scf_s1, scf_s2

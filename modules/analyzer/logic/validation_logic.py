@@ -69,6 +69,8 @@ class ValidationManager:
                     errors.append(f"{col} column must be numeric")
         
         # Check for negative prices
+        # Note: CL (Crude Oil) can have negative prices historically (e.g., April 2020)
+        # So we allow negative prices for CL/MCL but warn for others
         if all(col in df.columns for col in ['open', 'high', 'low', 'close']):
             negative_prices = df[
                 (df['open'] < 0) |
@@ -77,7 +79,21 @@ class ValidationManager:
                 (df['close'] < 0)
             ]
             if not negative_prices.empty:
-                errors.append(f"Found {len(negative_prices)} rows with negative prices")
+                # Check if instrument is CL or MCL (which can have negative prices)
+                instruments_with_negative = set()
+                if 'instrument' in df.columns:
+                    instruments_with_negative = set(negative_prices['instrument'].str.upper().unique())
+                
+                # CL and MCL can have negative prices (historically valid)
+                allowed_negative_instruments = {'CL', 'MCL'}
+                has_allowed_negative = bool(instruments_with_negative & allowed_negative_instruments)
+                
+                if has_allowed_negative:
+                    # For CL/MCL, just warn (negative prices are historically valid)
+                    warnings.append(f"Found {len(negative_prices)} rows with negative prices (allowed for CL/MCL - historically valid)")
+                else:
+                    # For other instruments, error (negative prices are invalid)
+                    errors.append(f"Found {len(negative_prices)} rows with negative prices")
         
         # Check OHLC relationships
         if all(col in df.columns for col in ['high', 'low', 'open', 'close']):

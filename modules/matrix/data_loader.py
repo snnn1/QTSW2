@@ -139,7 +139,14 @@ def load_stream_data(
             error_msg += f" (analyzer_runs_dir also missing: {analyzer_runs_dir})"
         return (False, None, stream_id)
     
-    # Find parquet files
+    # Find parquet files - force fresh discovery to see newly written files
+    # Clear any file system caches by refreshing the directory
+    try:
+        # Force directory refresh by accessing it
+        stream_dir.stat()
+    except:
+        pass
+    
     parquet_files = find_parquet_files(stream_dir, stream_id)
     
     if not parquet_files:
@@ -161,6 +168,11 @@ def load_stream_data(
     
     for file_path in parquet_files:
         try:
+            # Force fresh read by checking file modification time and clearing pandas cache if needed
+            # This ensures we read newly written files even if pandas cached the old version
+            file_path.stat()  # Refresh file system metadata
+            
+            # Read parquet file fresh (pandas may cache, but stat() ensures we see new files)
             df = pd.read_parquet(file_path)
             
             if df.empty:

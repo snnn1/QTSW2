@@ -25,7 +25,7 @@ if not exist "%MASTER_MATRIX_LOG%" (
 REM ================================================
 REM Step 1: Check port availability
 REM ================================================
-echo [1/5] Checking port availability...
+echo [1/6] Checking port availability...
 echo.
 
 REM Check if port 8000 (backend) is already in use
@@ -83,7 +83,7 @@ echo.
 REM ================================================
 REM Step 2: Start backend
 REM ================================================
-echo [2/5] Starting backend...
+echo [2/6] Starting backend...
 start "Master Matrix Backend" cmd /k "cd /d %PROJECT_ROOT% && python -m uvicorn modules.dashboard.backend.main:app --host 0.0.0.0 --port 8000"
 echo Backend process started. Waiting for it to initialize...
 timeout /t 2 /nobreak >nul
@@ -92,7 +92,7 @@ echo.
 REM ================================================
 REM Step 3: Health check with retries
 REM ================================================
-echo [3/5] Waiting for backend to be ready...
+echo [3/6] Waiting for backend to be ready...
 set "BACKEND_READY=0"
 set "MAX_ATTEMPTS=60"
 set "ATTEMPT=0"
@@ -146,18 +146,83 @@ goto :health_check_loop
 echo.
 
 REM ================================================
-REM Step 4: Open browser (only after backend ready)
+REM Step 4: Start frontend (only after backend ready)
 REM ================================================
-echo [4/5] Opening browser...
-start http://localhost:5174
-timeout /t 1 /nobreak >nul
+echo [4/6] Starting frontend...
+start "Master Matrix Frontend" cmd /k "cd /d %PROJECT_ROOT%\matrix_timetable_app\frontend && npm run dev"
+echo Frontend process started. Waiting for it to initialize...
+timeout /t 2 /nobreak >nul
 echo.
 
 REM ================================================
-REM Step 5: Start frontend (only after backend ready)
+REM Step 5: Frontend readiness check with retries
 REM ================================================
-echo [5/5] Starting frontend...
-echo Frontend will run in this window...
+echo [5/6] Waiting for frontend to be ready...
+set "FRONTEND_READY=0"
+set "MAX_ATTEMPTS=60"
+set "ATTEMPT=0"
+
+:frontend_check_loop
+set /a ATTEMPT+=1
+
+REM Show progress indicator
+if %ATTEMPT% leq 10 (
+    echo Checking frontend... (attempt !ATTEMPT!/!MAX_ATTEMPTS!)
+) else if %ATTEMPT% equ 20 (
+    echo Still waiting for frontend... (attempt !ATTEMPT!/!MAX_ATTEMPTS!)
+) else if %ATTEMPT% equ 40 (
+    echo Frontend is taking longer than expected... (attempt !ATTEMPT!/!MAX_ATTEMPTS!)
+)
+
+REM Check if port 5174 is listening
+REM Try PowerShell method first, fallback to netstat
+powershell -Command "$port5174 = Get-NetTCPConnection -LocalPort 5174 -ErrorAction SilentlyContinue; if ($port5174) { exit 0 } else { exit 1 }" >nul 2>&1
+if %ERRORLEVEL% equ 0 (
+    echo Frontend is ready!
+    set "FRONTEND_READY=1"
+    goto :frontend_ready
+)
+
+REM PowerShell check failed - try netstat fallback
+netstat -an | findstr ":5174" | findstr "LISTENING" >nul 2>&1
+if %ERRORLEVEL% equ 0 (
+    echo Frontend is ready!
+    set "FRONTEND_READY=1"
+    goto :frontend_ready
+)
+
+REM Check if we've exceeded max attempts
+if %ATTEMPT% geq %MAX_ATTEMPTS% (
+    echo.
+    echo ================================================
+    echo ERROR: Frontend failed to start!
+    echo.
+    echo Frontend did not respond after 60 seconds.
+    echo.
+    echo Troubleshooting:
+    echo   1. Check the "Master Matrix Frontend" window for errors
+    echo   2. Verify Node.js and npm are installed
+    echo   3. Check if port 5174 is accessible
+    echo   4. Try running: cd %PROJECT_ROOT%\matrix_timetable_app\frontend ^&^& npm install
+    echo ================================================
+    echo.
+    pause
+    exit /b 1
+)
+
+REM Wait 1 second before retry
+timeout /t 1 /nobreak >nul
+goto :frontend_check_loop
+
+:frontend_ready
+echo.
+
+REM ================================================
+REM Step 6: Open browser (only after frontend ready)
+REM ================================================
+echo [6/6] Opening browser...
+start http://localhost:5174
+timeout /t 1 /nobreak >nul
 echo.
 
 echo.
@@ -165,14 +230,11 @@ echo ================================================
 echo Master Matrix is ready!
 echo.
 echo Backend:  http://localhost:8000 (running in separate window)
-echo Frontend: http://localhost:5174 (output shown below)
+echo Frontend: http://localhost:5174 (running in separate window)
 echo.
 echo Browser should open automatically.
 echo.
-echo Press Ctrl+C to stop frontend (backend will keep running).
 echo Close the "Master Matrix Backend" window to stop backend.
+echo Close the "Master Matrix Frontend" window to stop frontend.
 echo ================================================
 echo.
-
-cd /d "%PROJECT_ROOT%\matrix_timetable_app\frontend"
-npm run dev

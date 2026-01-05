@@ -806,6 +806,14 @@ def main():
             if col in final_copy.columns:
                 final_copy[col] = final_copy[col].astype(str)
         
+        # Validate analyzer output before write (Invariant 1 & 2: Valid dates, datetime dtype)
+        from modules.analyzer.validation import validate_before_write
+        try:
+            validate_before_write(final_copy, parquet_path)
+        except ValueError as e:
+            st.error(f"Analyzer output validation failed: {e}")
+            raise
+        
         final_copy.to_parquet(parquet_path, index=False)
         
         # Save CSV with descriptive header (only if requested)

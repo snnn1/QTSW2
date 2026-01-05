@@ -140,14 +140,13 @@ class MasterMatrix:
         logger.info(f"Limiting load to streams: {streams_to_load}")
         
         # Load only the requested streams
+        # Note: Sequencer logic already filters by stream list, so no additional filtering needed
         new_df = self._load_all_streams_with_sequencer(start_date=None, end_date=None, specific_date=None)
         
-        # Double-check: filter to only the streams we wanted (safety check)
-        if not new_df.empty:
-            new_df = new_df[new_df['Stream'].isin(streams_to_load)].copy()
-            logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
-        else:
+        if new_df.empty:
             logger.warning(f"[WARNING] No trades loaded for streams: {streams_to_load}")
+        else:
+            logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
             for stream_id in streams_to_load:
                 stream_filters = self.stream_filters.get(stream_id, {})
                 exclude_times = stream_filters.get('exclude_times', [])
@@ -348,154 +347,45 @@ class MasterMatrix:
                 from .utils import normalize_date
                 df['trade_date'] = df['trade_date'].apply(normalize_date)
         
-        # Initialize date_repaired and date_repair_quality columns (will be set for invalid dates)
+        # Initialize date_repaired and date_repair_quality columns (for backward compatibility)
+        # Note: With analyzer contract enforcement, invalid dates should not occur
+        # But we keep these columns for existing data compatibility
         if 'date_repaired' not in df.columns:
             df['date_repaired'] = False
         if 'date_repair_quality' not in df.columns:
             df['date_repair_quality'] = 1.0  # 1.0 = original date was valid, no repair needed
         
-        # Handle rows with invalid trade_date - preserve them instead of removing
+        # Handle rows with invalid trade_date - preserve with sentinel date only
+        # CONTRACT ENFORCEMENT: AnalyzerOutputValidator ensures all dates are valid
+        # This code path should rarely execute, but preserves rows for sorting stability
         valid_dates = df['trade_date'].notna()
         if not valid_dates.all():
             invalid_count = (~valid_dates).sum()
             invalid_df = df[~valid_dates].copy()
             invalid_percentage = invalid_count / len(df) * 100
             
-            # Report per-stream breakdown for better diagnostics
+            # Log warning - invalid dates should not occur with contract enforcement
             if 'Stream' in df.columns:
                 invalid_by_stream = invalid_df.groupby('Stream').size()
                 for stream_id, count in invalid_by_stream.items():
-                    logger.warning(f"[WARNING] {stream_id} has {count} trades with invalid trade_date! Attempting to repair...")
-                    # Log sample of invalid dates for this stream for debugging
-                    stream_invalid = invalid_df[invalid_df['Stream'] == stream_id]
-                    if 'Date' in stream_invalid.columns:
-                        sample_dates = stream_invalid['Date'].head(5).tolist()
-                        logger.debug(f"  Sample invalid dates for {stream_id}: {sample_dates}")
+                    logger.error(
+                        f"[CONTRACT VIOLATION] {stream_id} has {count} trades with invalid trade_date! "
+                        f"This violates analyzer output contract (Invariant 1). "
+                        f"Preserving rows with sentinel date for sorting stability."
+                    )
             
-            # Attempt to repair invalid dates with quality scoring
-            repaired_count = 0
-            repair_quality_scores = []  # Track repair confidence (0.0-1.0)
-            
+            # Preserve rows with sentinel date (no repair attempts - analyzer should provide valid dates)
             for idx in invalid_df.index:
-                original_date = invalid_df.loc[idx, 'Date'] if 'Date' in invalid_df.columns else None
-                
-                # Try to repair: attempt multiple strategies with quality scoring
-                repaired_date = None
-                repair_quality = 0.0  # 0.0 = low confidence, 1.0 = high confidence
-                
-                # Strategy 1: Try parsing Date column again with different formats (HIGH CONFIDENCE)
-                if original_date is not None and pd.notna(original_date):
-                    try:
-                        # Try common date formats
-                        for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y%m%d']:
-                            try:
-                                repaired_date = pd.to_datetime(str(original_date), format=fmt, errors='coerce')
-                                if pd.notna(repaired_date):
-                                    repair_quality = 0.9  # High confidence - exact format match
-                                    break
-                            except:
-                                continue
-                        # If format parsing failed, try general parsing (MEDIUM CONFIDENCE)
-                        if pd.isna(repaired_date):
-                            repaired_date = normalize_date(str(original_date))
-                            if pd.notna(repaired_date):
-                                repair_quality = 0.7  # Medium confidence - general parsing
-                    except:
-                        pass
-                
-                # Strategy 2: Infer from adjacent valid dates (MEDIUM CONFIDENCE)
-                if pd.isna(repaired_date) and 'Stream' in invalid_df.columns:
-                    stream_id = invalid_df.loc[idx, 'Stream']
-                    if 'Stream' in df.columns:
-                        stream_valid = df[valid_dates & (df['Stream'] == stream_id)]
-                    else:
-                        stream_valid = df[valid_dates]
-                    if not stream_valid.empty and 'trade_date' in stream_valid.columns:
-                        # Use median date from same stream as fallback
-                        median_date = stream_valid['trade_date'].median()
-                        if pd.notna(median_date):
-                            repaired_date = median_date
-                            repair_quality = 0.5  # Medium-low confidence - inferred from stream
-                
-                # Strategy 3: Use a default date (first valid date in dataset) as last resort (LOW CONFIDENCE)
-                if pd.isna(repaired_date):
-                    valid_dates_in_df = df[valid_dates]['trade_date'] if valid_dates.any() else pd.Series()
-                    if not valid_dates_in_df.empty:
-                        repaired_date = valid_dates_in_df.min()
-                        repair_quality = 0.2  # Low confidence - global fallback
-                
-                # Update if repair succeeded
-                if pd.notna(repaired_date):
-                    df.loc[idx, 'trade_date'] = repaired_date
-                    df.loc[idx, 'date_repaired'] = True
-                    df.loc[idx, 'date_repair_quality'] = repair_quality  # Store quality score
-                    repair_quality_scores.append(repair_quality)
-                    repaired_count += 1
-                else:
-                    # Mark as unrepaired but keep the row
-                    df.loc[idx, 'date_repaired'] = False
-                    df.loc[idx, 'date_repair_quality'] = 0.0  # Failed repair
-                    # Set to a sentinel date (far future) so it sorts last but is preserved
-                    df.loc[idx, 'trade_date'] = pd.Timestamp('2099-12-31')
+                df.loc[idx, 'date_repaired'] = False
+                df.loc[idx, 'date_repair_quality'] = 0.0  # Failed - should not occur
+                # Set to sentinel date (far future) so it sorts last but is preserved
+                df.loc[idx, 'trade_date'] = pd.Timestamp('2099-12-31')
             
-            # Calculate average repair quality
-            avg_repair_quality = sum(repair_quality_scores) / len(repair_quality_scores) if repair_quality_scores else 0.0
-            
-            # Preserve original Date column for debugging
-            if 'Date' in invalid_df.columns and 'original_date' not in df.columns:
-                df['original_date'] = df['Date']
-            
-            # Log results with quality scoring
-            unrepaired_count = invalid_count - repaired_count
-            logger.warning(
-                f"Found {invalid_count} rows with invalid trade_date out of {len(df)} total rows ({invalid_percentage:.1f}%). "
-                f"Repaired {repaired_count} (avg quality: {avg_repair_quality:.2f}), {unrepaired_count} could not be repaired but were preserved."
+            logger.error(
+                f"[CONTRACT VIOLATION] Found {invalid_count} rows with invalid trade_date ({invalid_percentage:.1f}%). "
+                f"Analyzer output contract requires valid dates (Invariant 1). "
+                f"Rows preserved with sentinel date for sorting stability."
             )
-            
-            # Alert user if significant data quality issues
-            if invalid_percentage > 1.0:
-                logger.error(
-                    f"⚠️ CRITICAL: {invalid_percentage:.1f}% of data had invalid dates! "
-                    f"All rows have been preserved (repaired or marked). "
-                    f"Please investigate the source data quality."
-                )
-            
-            # Warn if repair quality is low (many dates inferred rather than parsed)
-            if repaired_count > 0 and avg_repair_quality < 0.5:
-                logger.warning(
-                    f"⚠️ WARNING: Low date repair quality ({avg_repair_quality:.2f}). "
-                    f"Many dates were inferred rather than parsed. "
-                    f"Please verify date column format in source data."
-                )
-            
-            # All rows are now preserved (either repaired or marked with sentinel date)
-        
-        # Debug: Check for None values in sort columns before sorting
-        sort_columns = ['trade_date', 'entry_time', 'Instrument', 'Stream']
-        for col in sort_columns:
-            if col in df.columns:
-                none_count = df[col].isna().sum() if hasattr(df[col], 'isna') else (df[col] == None).sum()
-                if none_count > 0:
-                    logger.warning(f"Column '{col}' has {none_count} None/NaN values before sorting")
-                    # Log sample of problematic rows
-                    problematic = df[df[col].isna()] if hasattr(df[col], 'isna') else df[df[col] == None]
-                    if len(problematic) > 0:
-                        sample_cols = ['Stream', 'Date', 'Time', 'Result'] if all(c in df.columns for c in ['Stream', 'Date', 'Time', 'Result']) else list(df.columns[:5])
-                        logger.debug(f"Sample rows with None in '{col}': {problematic[sample_cols].head(3).to_dict('records')}")
-                
-                # Handle None/NaN values based on column type
-                if df[col].dtype == 'object':
-                    if col == 'entry_time':
-                        # For entry_time, use a sentinel value that sorts AFTER all valid times (23:59:59)
-                        # Empty strings sort before valid times, so we use a late time instead
-                        df[col] = df[col].fillna('23:59:59')
-                        # Also replace empty strings with the sentinel
-                        df.loc[df[col] == '', col] = '23:59:59'
-                        logger.debug(f"Filled None/empty values in '{col}' with sentinel '23:59:59' for sorting")
-                    else:
-                        # For other string columns, use empty string
-                        df[col] = df[col].fillna('')
-                        logger.debug(f"Filled None values in '{col}' with empty string for sorting")
         
         # Sort with invalid dates (sentinel date 2099-12-31) at the end
         # entry_time None/empty values are now '23:59:59' so they sort after valid times
@@ -603,269 +493,6 @@ class MasterMatrix:
         
         return self.master_df.copy()
     
-    def update_master_matrix(self, output_dir: str = "data/master_matrix",
-                            stream_filters: Optional[Dict[str, Dict]] = None,
-                            analyzer_runs_dir: Optional[str] = None) -> Tuple[pd.DataFrame, Dict]:
-        """
-        Update master matrix by adding only new dates (after latest date per stream).
-        For sequencer accuracy, reprocesses the last full year of data per stream.
-        
-        Args:
-            output_dir: Directory containing existing master matrix and where to save updated one
-            stream_filters: Per-stream filter configuration
-            analyzer_runs_dir: Override analyzer runs directory (optional)
-            
-        Returns:
-            Tuple of (updated DataFrame, update_stats dict with counts of new trades per stream)
-        """
-        # High-signal INFO logs only (update start)
-        logger.info("=" * 80)
-        logger.info("UPDATING MASTER MATRIX - Adding new dates only")
-        logger.info("=" * 80)
-        
-        # Override analyzer_runs_dir if provided
-        if analyzer_runs_dir:
-            self.analyzer_runs_dir = Path(analyzer_runs_dir)
-            self.streams = stream_manager.discover_streams(self.analyzer_runs_dir)
-        
-        # Update stream filters
-        if stream_filters:
-            self._update_stream_filters(stream_filters, merge=True)
-        
-        # Load existing master matrix using file_manager
-        existing_df = file_manager.load_existing_matrix(output_dir)
-        
-        if existing_df.empty:
-            logger.warning("No existing master matrix found. Use build_master_matrix() instead.")
-            return pd.DataFrame(), {}
-        
-        # Ensure trade_date is datetime
-        if 'trade_date' in existing_df.columns:
-            if not pd.api.types.is_datetime64_any_dtype(existing_df['trade_date']):
-                existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'])
-        elif 'Date' in existing_df.columns:
-            existing_df['trade_date'] = pd.to_datetime(existing_df['Date'])
-        else:
-            logger.error("No date column found in existing matrix!")
-            return existing_df, {}
-        
-        # Find latest date per stream in existing matrix
-        latest_dates = {}
-        for stream_id in existing_df['Stream'].unique():
-            stream_data = existing_df[existing_df['Stream'] == stream_id]
-            latest_date = stream_data['trade_date'].max()
-            latest_dates[stream_id] = latest_date
-            logger.info(f"Stream {stream_id}: Latest date = {latest_date.date()}")
-        
-        # Find streams with new data and determine date ranges to process
-        streams_to_update = []
-        update_ranges = {}  # stream_id -> (start_date, end_date)
-        update_stats = {}
-        
-        for stream_id in self.streams:
-            stream_dir = self.analyzer_runs_dir / stream_id
-            if not stream_dir.exists():
-                continue
-            
-            # Find all parquet files for this stream
-            parquet_files = []
-            for year_dir in sorted(stream_dir.iterdir()):
-                if not year_dir.is_dir():
-                    continue
-                year_dir_name = year_dir.name
-                if len(year_dir_name) == 4 and year_dir_name.isdigit():
-                    monthly_files = sorted(year_dir.glob(f"{stream_id}_an_*.parquet"))
-                    parquet_files.extend(monthly_files)
-            
-            if not parquet_files:
-                continue
-            
-            # Check for new dates in files
-            latest_existing_date = latest_dates.get(stream_id, None)
-            if latest_existing_date is None:
-                # Stream not in existing matrix - need to add it (but this is more like rebuild)
-                logger.info(f"Stream {stream_id} not in existing matrix - will add all data")
-                streams_to_update.append(stream_id)
-                update_ranges[stream_id] = (None, None)  # Process all data
-                continue
-            
-            # Check files for dates after latest_existing_date
-            has_new_data = False
-            earliest_new_date = None
-            latest_new_date = None
-            
-            for file_path in parquet_files:
-                try:
-                    # Quick check: prefer trade_date (canonical), fallback to Date for backward compatibility
-                    df_check = pd.read_parquet(file_path)
-                    if df_check.empty:
-                        continue
-                    
-                    # Prefer trade_date (canonical), fallback to Date
-                    date_col = 'trade_date' if 'trade_date' in df_check.columns else ('Date' if 'Date' in df_check.columns else None)
-                    if date_col is None:
-                        continue
-                    
-                    df_check[date_col] = pd.to_datetime(df_check[date_col])
-                    new_dates = df_check[df_check[date_col] > latest_existing_date]
-                    
-                    if not new_dates.empty:
-                        has_new_data = True
-                        file_min = new_dates['Date'].min()
-                        file_max = new_dates['Date'].max()
-                        if earliest_new_date is None or file_min < earliest_new_date:
-                            earliest_new_date = file_min
-                        if latest_new_date is None or file_max > latest_new_date:
-                            latest_new_date = file_max
-                except Exception as e:
-                    logger.debug(f"Error checking {file_path}: {e}")
-                    continue
-            
-            if has_new_data:
-                # For sequencer accuracy: reprocess last full year + new dates
-                # Calculate start of last full year from latest_existing_date
-                year_start = pd.Timestamp(latest_existing_date.year - 1, 1, 1)
-                # But we only want to add dates after latest_existing_date
-                process_start = year_start  # Start from last full year for sequencer accuracy
-                process_end = latest_new_date  # End at latest new date
-                
-                streams_to_update.append(stream_id)
-                update_ranges[stream_id] = (process_start.strftime('%Y-%m-%d'), process_end.strftime('%Y-%m-%d'))
-                logger.info(f"Stream {stream_id}: New dates found from {earliest_new_date.date()} to {latest_new_date.date()}")
-                logger.info(f"  Will reprocess from {process_start.date()} (last full year) to {process_end.date()} for sequencer accuracy")
-        
-        if not streams_to_update:
-            logger.info("No new data found. Matrix is up to date.")
-            return existing_df, {"message": "No new data found", "streams_updated": 0}
-        
-        logger.info(f"Found {len(streams_to_update)} stream(s) with new data: {streams_to_update}")
-        
-        # Process each stream: load ALL historical data for sequencer accuracy, then filter to only new dates
-        # REFACTORED: Use shared sequencer callback instead of duplicating logic
-        all_new_trades = []
-        apply_sequencer = self._create_sequencer_callback()
-        
-        for stream_id in streams_to_update:
-            logger.info(f"Processing stream {stream_id}...")
-            
-            # Load ALL historical data for this stream (needed for accurate sequencer logic)
-            # Use data_loader for consistency with _load_all_streams_with_sequencer
-            stream_trades_list = []
-            stream_dir = self.analyzer_runs_dir / stream_id
-            parquet_files = data_loader.find_parquet_files(stream_dir, stream_id)
-            
-            if not parquet_files:
-                logger.warning(f"Stream {stream_id}: No parquet files found")
-                continue
-            
-            # Load all historical data for sequencer accuracy
-            for file_path in parquet_files:
-                try:
-                    df = pd.read_parquet(file_path)
-                    if df.empty:
-                        continue
-                    df['Stream'] = stream_id
-                    stream_trades_list.append(df)
-                except Exception as e:
-                    logger.error(f"Error loading {file_path}: {e}")
-                    continue
-            
-            if not stream_trades_list:
-                continue
-            
-            # Merge all historical data for sequencer accuracy
-            all_history_df = pd.concat(stream_trades_list, ignore_index=True)
-            
-            # Apply sequencer logic to all historical data using shared callback
-            sequencer_result = apply_sequencer(all_history_df, display_year=None)
-            
-            # Filter to only new dates (after latest_existing_date)
-            latest_existing = latest_dates.get(stream_id)
-            if latest_existing:
-                # trade_date is canonical; Date is fallback only
-                if 'trade_date' not in sequencer_result.columns:
-                    if 'Date' in sequencer_result.columns:
-                        # Fallback: derive trade_date from Date (for backward compatibility)
-                        sequencer_result['trade_date'] = pd.to_datetime(sequencer_result['Date'])
-                    else:
-                        logger.warning(f"Stream {stream_id}: No date column found in sequencer result")
-                        continue
-                else:
-                    sequencer_result['trade_date'] = pd.to_datetime(sequencer_result['trade_date'])
-                
-                new_trades = sequencer_result[sequencer_result['trade_date'] > latest_existing]
-            else:
-                # Stream not in existing matrix - add all
-                new_trades = sequencer_result
-            
-            if not new_trades.empty:
-                all_new_trades.append(new_trades)
-                update_stats[stream_id] = len(new_trades)
-                logger.info(f"  Added {len(new_trades)} new trades for stream {stream_id}")
-            else:
-                logger.info(f"  No new trades after sequencer logic for stream {stream_id}")
-        
-        if not all_new_trades:
-            logger.info("No new trades to add after processing.")
-            return existing_df, {"message": "No new trades found", "streams_updated": 0, "trades_added": 0}
-        
-        # Merge new trades
-        new_df = pd.concat(all_new_trades, ignore_index=True) if len(all_new_trades) > 1 else all_new_trades[0]
-        
-        # Normalize schema and add global columns
-        new_df = self.normalize_schema(new_df)
-        new_df = self.add_global_columns(new_df)
-        
-        # Merge with existing data
-        updated_df = pd.concat([existing_df, new_df], ignore_index=True)
-        
-        # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
-        # Output from update_master_matrix() is fully sorted by: trade_date, entry_time, Instrument, Stream
-        # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
-        if 'trade_date' in updated_df.columns:
-            # Debug: Check for None values in sort columns before sorting
-            sort_columns = ['trade_date', 'entry_time', 'Instrument', 'Stream']
-            for col in sort_columns:
-                if col in updated_df.columns:
-                    none_count = updated_df[col].isna().sum() if hasattr(updated_df[col], 'isna') else (updated_df[col] == None).sum()
-                    if none_count > 0:
-                        logger.warning(f"[update_master_matrix] Column '{col}' has {none_count} None/NaN values before sorting")
-                    # Handle None/NaN values based on column type
-                    if updated_df[col].dtype == 'object':
-                        if col == 'entry_time':
-                            # For entry_time, use a sentinel value that sorts AFTER all valid times (23:59:59)
-                            # Empty strings sort before valid times, so we use a late time instead
-                            updated_df[col] = updated_df[col].fillna('23:59:59')
-                            # Also replace empty strings with the sentinel
-                            updated_df.loc[updated_df[col] == '', col] = '23:59:59'
-                            logger.debug(f"[update_master_matrix] Filled None/empty values in '{col}' with sentinel '23:59:59' for sorting")
-                        else:
-                            # For other string columns, use empty string
-                            updated_df[col] = updated_df[col].fillna('')
-                        logger.debug(f"[update_master_matrix] Filled None values in '{col}' with empty string for sorting")
-            
-            updated_df = updated_df.sort_values(
-                by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
-                ascending=[True, True, True, True],
-                na_position='last'
-            ).reset_index(drop=True)
-        
-        # Update global_trade_id
-        updated_df['global_trade_id'] = range(1, len(updated_df) + 1)
-        
-        # Save updated matrix using file_manager
-        file_manager.save_master_matrix(updated_df, output_dir, specific_date=None, stream_filters=self.stream_filters)
-        
-        total_new = len(new_df)
-        update_stats['total_trades_added'] = total_new
-        update_stats['streams_updated'] = len(streams_to_update)
-        update_stats['message'] = f"Added {total_new} new trades from {len(streams_to_update)} stream(s)"
-        
-        logger.info("=" * 80)
-        logger.info(f"UPDATE COMPLETE: Added {total_new} new trades from {len(streams_to_update)} stream(s)")
-        logger.info("=" * 80)
-        
-        return updated_df, update_stats
     
     def _create_checkpoint_after_build(self, df: pd.DataFrame, checkpoint_date: str, output_dir: str):
         """
@@ -941,356 +568,6 @@ class MasterMatrix:
             )
         return apply_sequencer_with_state
     
-    def build_master_matrix_window_update(
-        self,
-        reprocess_days: Optional[int] = None,
-        output_dir: str = "data/master_matrix",
-        stream_filters: Optional[Dict[str, Dict]] = None,
-        analyzer_runs_dir: Optional[str] = None
-    ) -> Tuple[pd.DataFrame, Dict]:
-        """
-        Perform rolling window update by reprocessing last N trading days.
-        
-        Steps:
-        1. Determine max_processed_date from latest checkpoint
-        2. Calculate reprocess_start_date (N trading days back)
-        3. Restore sequencer state as-of day before reprocess_start_date
-        4. Purge matrix outputs for dates >= reprocess_start_date
-        5. Re-run matrix build only for [reprocess_start_date ... latest_merged_date]
-        6. Persist new checkpoint and run summary
-        
-        Args:
-            reprocess_days: Number of trading days to reprocess (default from config)
-            output_dir: Directory containing matrix outputs
-            stream_filters: Per-stream filter configuration
-            analyzer_runs_dir: Override analyzer runs directory
-            
-        Returns:
-            Tuple of (updated DataFrame, run_summary dict)
-        """
-        import time
-        start_time = time.time()
-        run_id = None
-        
-        # Initialize run history
-        run_history = RunHistory()
-        
-        try:
-            logger.info("=" * 80)
-            logger.info("MASTER MATRIX: WINDOW UPDATE (Rolling Window)")
-            logger.info("=" * 80)
-            
-            # Override analyzer_runs_dir if provided
-            if analyzer_runs_dir:
-                self.analyzer_runs_dir = Path(analyzer_runs_dir)
-                self.streams = stream_manager.discover_streams(self.analyzer_runs_dir)
-            
-            # Update stream filters
-            if stream_filters:
-                self._update_stream_filters(stream_filters, merge=True)
-            
-            # Use config default if not specified
-            if reprocess_days is None:
-                reprocess_days = MATRIX_REPROCESS_TRADING_DAYS
-            
-            logger.info(f"Reprocessing last {reprocess_days} trading days")
-            
-            # Step 1: Determine max_processed_date from latest checkpoint
-            checkpoint_mgr = CheckpointManager()
-            max_processed_date = checkpoint_mgr.get_max_processed_date()
-            
-            if not max_processed_date:
-                error_msg = "No checkpoint found. Please run a full rebuild first."
-                logger.error(error_msg)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    success=False,
-                    error_message=error_msg
-                )
-                return pd.DataFrame(), {"error": error_msg}
-            
-            logger.info(f"Latest checkpoint date: {max_processed_date}")
-            
-            # Step 2: Calculate reprocess_start_date (N trading days back)
-            # Load merged data to count trading days
-            merged_data_dir = str(self.analyzer_runs_dir)
-            all_merged_data = self._load_all_streams_with_sequencer_for_state()
-            
-            if all_merged_data.empty:
-                error_msg = "No merged data available for trading day calculation"
-                logger.error(error_msg)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    success=False,
-                    error_message=error_msg
-                )
-                return pd.DataFrame(), {"error": error_msg}
-            
-            # Find reprocess_start_date
-            reprocess_start_date = find_trading_days_back(
-                all_merged_data, max_processed_date, reprocess_days
-            )
-            
-            if not reprocess_start_date:
-                error_msg = f"Insufficient history: need {reprocess_days} trading days back from {max_processed_date}"
-                logger.error(error_msg)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    reprocess_start_date=None,
-                    merged_data_max_date=None,
-                    success=False,
-                    error_message=error_msg
-                )
-                return pd.DataFrame(), {"error": error_msg}
-            
-            logger.info(f"Reprocess start date: {reprocess_start_date}")
-            
-            # Get latest merged data date
-            if 'trade_date' in all_merged_data.columns:
-                all_merged_data['trade_date'] = pd.to_datetime(all_merged_data['trade_date'], errors='coerce')
-                merged_data_max_date = all_merged_data['trade_date'].max()
-                if pd.notna(merged_data_max_date):
-                    merged_data_max_date_str = pd.to_datetime(merged_data_max_date).strftime('%Y-%m-%d')
-                else:
-                    merged_data_max_date_str = None
-            else:
-                merged_data_max_date_str = None
-            
-            logger.info(f"Merged data max date: {merged_data_max_date_str}")
-            
-            # Step 3: Restore sequencer state as-of day before reprocess_start_date
-            latest_checkpoint = checkpoint_mgr.load_latest_checkpoint()
-            if not latest_checkpoint:
-                error_msg = "Failed to load checkpoint for state restoration"
-                logger.error(error_msg)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    reprocess_start_date=reprocess_start_date,
-                    merged_data_max_date=merged_data_max_date_str,
-                    success=False,
-                    error_message=error_msg
-                )
-                return pd.DataFrame(), {"error": error_msg}
-            
-            checkpoint_restore_id = latest_checkpoint.get('checkpoint_id')
-            restored_states = latest_checkpoint.get('streams', {})
-            
-            logger.info(f"Restored sequencer state from checkpoint {checkpoint_restore_id}")
-            
-            # Step 4: Purge matrix outputs for dates >= reprocess_start_date
-            existing_df = file_manager.load_existing_matrix(output_dir)
-            rows_before_purge = len(existing_df) if not existing_df.empty else 0
-            
-            if not existing_df.empty:
-                if 'trade_date' in existing_df.columns:
-                    existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], errors='coerce')
-                    # Keep only rows before reprocess_start_date
-                    reprocess_start_dt = pd.to_datetime(reprocess_start_date)
-                    existing_df = existing_df[existing_df['trade_date'] < reprocess_start_dt].copy()
-                    rows_after_purge = len(existing_df)
-                    logger.info(f"Purged matrix outputs: {rows_before_purge} -> {rows_after_purge} rows (removed {rows_before_purge - rows_after_purge} rows)")
-                else:
-                    logger.warning("No trade_date column in existing matrix, skipping purge")
-                    existing_df = pd.DataFrame()
-            else:
-                existing_df = pd.DataFrame()
-                logger.info("No existing matrix found, starting fresh")
-            
-            # Step 5: Re-run matrix build only for [reprocess_start_date ... latest_merged_date]
-            # Load data ONLY for the window period (restored state already has histories built)
-            # The sequencer will use restored state and continue from reprocess_start_date
-            window_data_for_sequencer = self._load_all_streams_with_sequencer_for_state()
-            
-            if window_data_for_sequencer.empty:
-                logger.warning("No data available for sequencer processing")
-                # Still save the purged existing matrix
-                if not existing_df.empty:
-                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    reprocess_start_date=reprocess_start_date,
-                    merged_data_max_date=merged_data_max_date_str,
-                    checkpoint_restore_id=checkpoint_restore_id,
-                    rows_read=0,
-                    rows_written=len(existing_df),
-                    duration_seconds=time.time() - start_time,
-                    success=True
-                )
-                return existing_df, {"message": "No data available"}
-            
-            # Filter to only window period BEFORE sequencer processing
-            # This ensures sequencer only processes dates >= reprocess_start_date AND <= merged_data_max_date
-            # This ensures we include ALL available data up to the latest date in analyzed folder
-            reprocess_start_dt = pd.to_datetime(reprocess_start_date)
-            merged_data_max_dt = pd.to_datetime(merged_data_max_date_str) if merged_data_max_date_str else None
-            
-            if 'Date' in window_data_for_sequencer.columns:
-                window_data_for_sequencer['Date'] = pd.to_datetime(window_data_for_sequencer['Date'], errors='coerce')
-                mask = window_data_for_sequencer['Date'] >= reprocess_start_dt
-                if merged_data_max_dt is not None:
-                    mask = mask & (window_data_for_sequencer['Date'] <= merged_data_max_dt)
-                window_data_for_sequencer = window_data_for_sequencer[mask].copy()
-            elif 'trade_date' in window_data_for_sequencer.columns:
-                window_data_for_sequencer['trade_date'] = pd.to_datetime(window_data_for_sequencer['trade_date'], errors='coerce')
-                mask = window_data_for_sequencer['trade_date'] >= reprocess_start_dt
-                if merged_data_max_dt is not None:
-                    mask = mask & (window_data_for_sequencer['trade_date'] <= merged_data_max_dt)
-                window_data_for_sequencer = window_data_for_sequencer[mask].copy()
-            
-            if window_data_for_sequencer.empty:
-                logger.warning("No data in window period after filtering")
-                # Still save the purged existing matrix
-                if not existing_df.empty:
-                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    reprocess_start_date=reprocess_start_date,
-                    merged_data_max_date=merged_data_max_date_str,
-                    checkpoint_restore_id=checkpoint_restore_id,
-                    rows_read=0,
-                    rows_written=len(existing_df),
-                    duration_seconds=time.time() - start_time,
-                    success=True
-                )
-                return existing_df, {"message": "No data in window period"}
-            
-            rows_read = len(window_data_for_sequencer)
-            # Log date range being processed
-            if not window_data_for_sequencer.empty:
-                if 'Date' in window_data_for_sequencer.columns:
-                    date_col = 'Date'
-                elif 'trade_date' in window_data_for_sequencer.columns:
-                    date_col = 'trade_date'
-                else:
-                    date_col = None
-                
-                if date_col:
-                    min_date = window_data_for_sequencer[date_col].min()
-                    max_date = window_data_for_sequencer[date_col].max()
-                    logger.info(f"Loaded {rows_read} trades for window period (dates: {min_date.date()} to {max_date.date()})")
-                    logger.info(f"  Reprocess start: {reprocess_start_date}, Latest available: {merged_data_max_date_str}")
-                else:
-                    logger.info(f"Loaded {rows_read} trades for window period (dates >= {reprocess_start_date})")
-            else:
-                logger.warning(f"No trades loaded for window period (dates >= {reprocess_start_date})")
-            
-            # Apply sequencer logic with restored initial states
-            # This processes only the window period, starting from restored state
-            apply_sequencer = self._create_sequencer_callback_with_restored_state(restored_states)
-            window_result_df, window_final_states = apply_sequencer(window_data_for_sequencer)
-            
-            if window_result_df.empty:
-                logger.warning("No trades in window period after sequencer processing")
-                # Still save the purged existing matrix
-                if not existing_df.empty:
-                    file_manager.save_master_matrix(existing_df, output_dir, None, stream_filters=self.stream_filters)
-                run_history.record_run(
-                    mode="window_update",
-                    requested_days=reprocess_days,
-                    reprocess_start_date=reprocess_start_date,
-                    merged_data_max_date=merged_data_max_date_str,
-                    checkpoint_restore_id=checkpoint_restore_id,
-                    rows_read=rows_read,
-                    rows_written=len(existing_df),
-                    duration_seconds=time.time() - start_time,
-                    success=True
-                )
-                return existing_df, {"message": "No trades in window period"}
-            
-            # Normalize schema and add global columns
-            window_result_df = self.normalize_schema(window_result_df)
-            window_result_df = self.add_global_columns(window_result_df)
-            
-            # Merge with existing data (before reprocess_start_date)
-            if not existing_df.empty:
-                updated_df = pd.concat([existing_df, window_result_df], ignore_index=True)
-            else:
-                updated_df = window_result_df
-            
-            # Sort and update global_trade_id
-            if 'trade_date' in updated_df.columns:
-                # Fix entry_time empty/None values before sorting
-                if 'entry_time' in updated_df.columns and updated_df['entry_time'].dtype == 'object':
-                    # Use sentinel value '23:59:59' for empty/missing entry_time so they sort after valid times
-                    updated_df['entry_time'] = updated_df['entry_time'].fillna('23:59:59')
-                    updated_df.loc[updated_df['entry_time'] == '', 'entry_time'] = '23:59:59'
-                
-                updated_df = updated_df.sort_values(
-                    by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
-                    ascending=[True, True, True, True],
-                    na_position='last'
-                ).reset_index(drop=True)
-            
-            updated_df['global_trade_id'] = range(1, len(updated_df) + 1)
-            
-            rows_written = len(updated_df)
-            logger.info(f"Window update complete: {rows_written} total rows ({len(window_result_df)} new)")
-            
-            # Step 6: Persist new checkpoint and run summary
-            # Save updated matrix
-            file_manager.save_master_matrix(updated_df, output_dir, None, stream_filters=self.stream_filters)
-            
-            # Create new checkpoint
-            if 'trade_date' in updated_df.columns:
-                new_max_date = updated_df['trade_date'].max()
-                if pd.notna(new_max_date):
-                    new_max_date_str = pd.to_datetime(new_max_date).strftime('%Y-%m-%d')
-                    checkpoint_mgr.create_checkpoint(
-                        checkpoint_date=new_max_date_str,
-                        stream_states=window_final_states
-                    )
-            
-            # Record run summary
-            duration = time.time() - start_time
-            run_id = run_history.record_run(
-                mode="window_update",
-                requested_days=reprocess_days,
-                reprocess_start_date=reprocess_start_date,
-                merged_data_max_date=merged_data_max_date_str,
-                checkpoint_restore_id=checkpoint_restore_id,
-                rows_read=rows_read,
-                rows_written=rows_written,
-                duration_seconds=duration,
-                success=True
-            )
-            
-            logger.info("=" * 80)
-            logger.info(f"WINDOW UPDATE COMPLETE: {rows_written} total rows, duration {duration:.2f}s")
-            logger.info("=" * 80)
-            
-            return updated_df, {
-                "run_id": run_id,
-                "status": "success",
-                "reprocess_start_date": reprocess_start_date,
-                "merged_data_max_date": merged_data_max_date_str,
-                "rows_read": rows_read,
-                "rows_written": rows_written,
-                "duration_seconds": duration
-            }
-            
-        except Exception as e:
-            duration = time.time() - start_time
-            error_msg = str(e)
-            logger.error(f"Window update failed: {error_msg}")
-            import traceback
-            logger.debug(f"Traceback: {traceback.format_exc()}")
-            
-            run_history.record_run(
-                mode="window_update",
-                run_id=run_id,
-                requested_days=reprocess_days,
-                duration_seconds=duration,
-                success=False,
-                error_message=error_msg
-            )
-            
-            return pd.DataFrame(), {"error": error_msg, "run_id": run_id}
     
     def _create_sequencer_callback_with_restored_state(self, restored_states: Dict[str, Dict]) -> Callable:
         """Create sequencer callback that uses restored initial states."""
@@ -1299,6 +576,40 @@ class MasterMatrix:
                 df, self.stream_filters, display_year, parallel=False, initial_states=restored_states
             )
         return apply_sequencer_with_state
+    
+    def build_master_matrix_rolling_resequence(
+        self,
+        resequence_days: int = 40,
+        output_dir: str = "data/master_matrix",
+        stream_filters: Optional[Dict[str, Dict]] = None,
+        analyzer_runs_dir: Optional[str] = None
+    ) -> Tuple[pd.DataFrame, Dict]:
+        """
+        Perform rolling resequence: remove window rows and resequence from checkpoint state.
+        
+        Behavior:
+        1. Discover all analyzer output from data/analyzed/ (full disk scan)
+        2. Compute resequence_start_date = today - N trading days
+        3. Load existing master matrix
+        4. Remove all rows where trade_date >= resequence_start_date
+        5. Restore sequencer state from checkpoint immediately before resequence_start_date
+        6. Run sequencer forward using analyzer data for dates >= resequence_start_date
+        7. Append newly sequenced rows to preserved historical matrix rows
+        8. Save single new master matrix file
+        
+        Args:
+            resequence_days: Number of trading days to resequence (default 40)
+            output_dir: Directory containing matrix outputs
+            stream_filters: Per-stream filter configuration
+            analyzer_runs_dir: Override analyzer runs directory
+            
+        Returns:
+            Tuple of (updated DataFrame, run_summary dict)
+        """
+        from .master_matrix_rolling_resequence import build_master_matrix_rolling_resequence
+        return build_master_matrix_rolling_resequence(
+            self, resequence_days, output_dir, stream_filters, analyzer_runs_dir
+        )
 
 
 def main():
@@ -1332,8 +643,10 @@ def main():
         print("=" * 80)
         print(f"Total trades: {len(master_df)}")
         print(f"Date range: {master_df['trade_date'].min()} to {master_df['trade_date'].max()}")
-        print(f"Streams: {sorted(master_df['Stream'].unique())}")
-        print(f"Instruments: {sorted(master_df['Instrument'].unique())}")
+        stream_values = [s for s in master_df['Stream'].unique() if s is not None and pd.notna(s)]
+        instrument_values = [i for i in master_df['Instrument'].unique() if i is not None and pd.notna(i)]
+        print(f"Streams: {sorted(stream_values)}")
+        print(f"Instruments: {sorted(instrument_values)}")
         
         # Calculate and display stats
         stats = matrix._log_summary_stats(master_df)

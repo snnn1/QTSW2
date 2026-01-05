@@ -6,6 +6,9 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Global kill switch: non-negotiable safety control.
 /// If enabled, blocks ALL order execution (SIM and LIVE).
+/// 
+/// FAIL-CLOSED BEHAVIOR: If the kill switch file cannot be read or parsed,
+/// the kill switch defaults to ENABLED (blocking execution) for safety.
 /// </summary>
 public sealed class KillSwitch
 {
@@ -38,9 +41,18 @@ public sealed class KillSwitch
 
         if (!File.Exists(_killSwitchPath))
         {
-            // Kill switch file doesn't exist = disabled (fail open for safety)
-            _cachedState = new KillSwitchState { Enabled = false, Message = null };
-            return false;
+            // Kill switch file doesn't exist = enabled (fail closed for safety)
+            _cachedState = new KillSwitchState { Enabled = true, Message = "Kill switch file not found - execution blocked by default" };
+            _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ERROR_FAIL_CLOSED", "ENGINE",
+                new
+                {
+                    enabled = true,
+                    reason = "FILE_NOT_FOUND",
+                    message = "Kill switch file does not exist",
+                    kill_switch_path = _killSwitchPath,
+                    note = "Execution blocked by default - fail-closed behavior activated for safety"
+                }));
+            return true;
         }
 
         try
@@ -50,21 +62,41 @@ public sealed class KillSwitch
             
             if (state == null)
             {
-                _cachedState = new KillSwitchState { Enabled = false, Message = null };
-                return false;
+                // Deserialization returned null = enabled (fail closed for safety)
+                _cachedState = new KillSwitchState { Enabled = true, Message = "Kill switch file deserialization failed - execution blocked by default" };
+                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ERROR_FAIL_CLOSED", "ENGINE",
+                    new
+                    {
+                        enabled = true,
+                        reason = "DESERIALIZATION_NULL",
+                        message = "Kill switch file deserialization returned null",
+                        kill_switch_path = _killSwitchPath,
+                        note = "Execution blocked by default - fail-closed behavior activated for safety"
+                    }));
+                return true;
             }
 
             _cachedState = state;
 
             if (state.Enabled)
             {
-                // Log kill switch active (once per check period)
-                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ACTIVE", "ENGINE",
+                // Log kill switch enabled (once per check period)
+                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ENABLED", "ENGINE",
                     new
                     {
                         enabled = true,
                         message = state.Message ?? "Kill switch is active",
-                        note = "All order execution is blocked"
+                        note = "Execution blocked by kill switch"
+                    }));
+            }
+            else
+            {
+                // Log kill switch disabled (once per check period)
+                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_DISABLED", "ENGINE",
+                    new
+                    {
+                        enabled = false,
+                        message = "Execution allowed; kill switch disabled"
                     }));
             }
 
@@ -72,16 +104,20 @@ public sealed class KillSwitch
         }
         catch (Exception ex)
         {
-            // If kill switch file is corrupted, treat as disabled (fail open)
-            _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ERROR", "ENGINE",
+            // If kill switch file is corrupted or unreadable, treat as enabled (fail closed for safety)
+            _cachedState = new KillSwitchState { Enabled = true, Message = $"Kill switch read error: {ex.Message} - execution blocked by default" };
+            _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ERROR_FAIL_CLOSED", "ENGINE",
                 new
                 {
+                    enabled = true,
+                    reason = "READ_ERROR",
                     error = ex.Message,
-                    note = "Treating kill switch as disabled due to error"
+                    error_type = ex.GetType().Name,
+                    kill_switch_path = _killSwitchPath,
+                    message = "Kill switch state could not be determined",
+                    note = "Execution blocked by default - fail-closed behavior activated for safety"
                 }));
-            
-            _cachedState = new KillSwitchState { Enabled = false, Message = null };
-            return false;
+            return true;
         }
     }
 }

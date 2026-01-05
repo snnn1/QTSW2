@@ -662,7 +662,23 @@ public sealed class StreamStateMachine
             if (adapterType?.Name == "NinjaTraderSimAdapter")
             {
                 var registerMethod = adapterType.GetMethod("RegisterIntent", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                registerMethod?.Invoke(_executionAdapter, new object[] { intent });
+                if (registerMethod != null)
+                {
+                    registerMethod.Invoke(_executionAdapter, new object[] { intent });
+                }
+                else
+                {
+                    // Intent registration failed - protective orders may not be submitted automatically
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "INTENT_REGISTRATION_FAILED",
+                        new
+                        {
+                            trading_date = TradingDate,
+                            stream = Stream,
+                            adapter_type = adapterType?.Name ?? "UNKNOWN",
+                            reason = "REGISTER_INTENT_METHOD_NOT_FOUND",
+                            note = "Protective orders may need to be submitted manually"
+                        }));
+                }
             }
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "ENTRY_SUBMITTED",

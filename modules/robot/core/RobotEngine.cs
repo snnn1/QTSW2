@@ -210,9 +210,8 @@ public sealed class RobotEngine
 
         if (!force && !poll.Changed) return;
 
+        var previousHash = _lastTimetableHash;
         _lastTimetableHash = poll.Hash;
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_UPDATED", state: "ENGINE",
-            new { timetable_hash = _lastTimetableHash }));
 
         TimetableContract timetable;
         try
@@ -272,6 +271,15 @@ public sealed class RobotEngine
 
         _activeTradingDate = timetable.TradingDate;
 
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
+            new 
+            { 
+                previous_hash = previousHash,
+                new_hash = _lastTimetableHash,
+                enabled_stream_count = timetable.Streams.Count(s => s.Enabled),
+                total_stream_count = timetable.Streams.Count
+            }));
+
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.TradingDate, eventType: "TIMETABLE_LOADED", state: "ENGINE",
             new { streams = timetable.Streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
         
@@ -287,6 +295,7 @@ public sealed class RobotEngine
 
         var incoming = timetable.Streams.Where(s => s.Enabled).ToList();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var streamIdOccurrences = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
         // Log timetable parsing stats
         int acceptedCount = 0;
@@ -296,6 +305,15 @@ public sealed class RobotEngine
         foreach (var directive in incoming)
         {
             var streamId = directive.Stream;
+            
+            // Track stream ID occurrences for duplicate detection
+            if (!string.IsNullOrWhiteSpace(streamId))
+            {
+                if (!streamIdOccurrences.TryGetValue(streamId, out var count))
+                    count = 0;
+                streamIdOccurrences[streamId] = count + 1;
+            }
+            
             var instrument = (directive.Instrument ?? "").ToUpperInvariant();
             var session = directive.Session ?? "";
             var slotTimeChicago = directive.SlotTime ?? "";
@@ -371,6 +389,13 @@ public sealed class RobotEngine
                 if (string.IsNullOrWhiteSpace(directive.SlotTime))
                 {
                     // Fail closed: skip update if slot_time is null/empty
+                    _log.Write(RobotEvents.Base(_time, utcNow, _activeTradingDate, streamId, instrument, session, sm.SlotTimeChicago, null,
+                        "STREAM_UPDATE_SKIPPED", "ENGINE", new 
+                        { 
+                            reason = "EMPTY_SLOT_TIME",
+                            previous_slot_time = sm.SlotTimeChicago,
+                            note = "Update skipped due to empty slot_time in timetable"
+                        }));
                     continue;
                 }
                 sm.ApplyDirectiveUpdate(directive.SlotTime, tradingDate, utcNow);
@@ -389,6 +414,21 @@ public sealed class RobotEngine
                 }
 
                 newSm.Arm(utcNow);
+            }
+        }
+
+        // Log duplicate stream IDs if detected
+        foreach (var kvp in streamIdOccurrences)
+        {
+            if (kvp.Value > 1)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "DUPLICATE_STREAM_ID", state: "ENGINE",
+                    new
+                    {
+                        stream_id = kvp.Key,
+                        occurrence_count = kvp.Value,
+                        note = "Duplicate stream ID detected in timetable - last occurrence will be used"
+                    }));
             }
         }
 
