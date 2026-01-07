@@ -116,7 +116,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (timeSinceLastLog >= DIAGNOSTIC_LOG_RATE_LIMIT_MINUTES || _lastDiagnosticLogBarTime == DateTime.MinValue)
             {
                 _lastDiagnosticLogBarTime = barExchangeTime;
-                Log($"DIAGNOSTIC: Raw NT Bar Time: {barExchangeTime:o}, Kind: {barExchangeTime.Kind}, Converted UTC: {barUtc:o}, Chicago Offset: {barChicagoOffset.Offset}", LogLevel.Debug);
+                Log($"DIAGNOSTIC: Raw NT Bar Time: {barExchangeTime:o}, Kind: {barExchangeTime.Kind}, Converted UTC: {barUtc:o}, Chicago Offset: {barChicagoOffset.Offset}", LogLevel.Information);
             }
 
             var high = (decimal)High[0];

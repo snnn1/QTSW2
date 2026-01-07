@@ -11,6 +11,16 @@ import datetime
 # Add the parent directory to the path so we can import breakout_core
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Add QTSW2 root to path so we can import modules.analyzer.validation
+# Script is at modules/analyzer/scripts/run_data_processed.py, so go up 3 levels to QTSW2 root
+# Level 1: scripts -> analyzer, Level 2: analyzer -> modules, Level 3: modules -> QTSW2
+script_dir = os.path.dirname(os.path.abspath(__file__))  # modules/analyzer/scripts
+analyzer_dir = os.path.dirname(script_dir)  # modules/analyzer
+modules_dir = os.path.dirname(analyzer_dir)  # modules
+qtsw2_root = os.path.dirname(modules_dir)  # QTSW2 root
+if qtsw2_root not in sys.path:
+    sys.path.insert(0, qtsw2_root)
+
 from logic.config_logic import RunParams, ConfigManager
 from breakout_core.engine import run_strategy
 

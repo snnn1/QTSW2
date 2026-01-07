@@ -36,7 +36,14 @@ public sealed class TimeService
     public DateOnly GetChicagoDateToday(DateTimeOffset utcNow)
         => DateOnly.FromDateTime(ConvertUtcToChicago(utcNow).DateTime);
 
-    public DateTimeOffset ConvertChicagoLocalToUtc(DateOnly tradingDate, string hhmm)
+    /// <summary>
+    /// Construct a DateTimeOffset in Chicago timezone directly (authoritative).
+    /// This is the primary method for creating Chicago times - UTC is derived from this.
+    /// </summary>
+    /// <param name="tradingDate">Trading date</param>
+    /// <param name="hhmm">Time in HH:MM format</param>
+    /// <returns>DateTimeOffset in Chicago timezone with correct DST offset</returns>
+    public DateTimeOffset ConstructChicagoTime(DateOnly tradingDate, string hhmm)
     {
         // tradingDate + hhmm interpreted as America/Chicago local time (DST-aware)
         var parts = hhmm.Split(':');
@@ -47,9 +54,31 @@ public sealed class TimeService
         var hour = int.Parse(parts[0], CultureInfo.InvariantCulture);
         var minute = int.Parse(parts[1], CultureInfo.InvariantCulture);
 
-        var localUnspecified = new DateTime(tradingDate.Year, tradingDate.Month, tradingDate.Day, hour, minute, 0, DateTimeKind.Unspecified);
-        var utc = TimeZoneInfo.ConvertTimeToUtc(localUnspecified, _chicagoTz);
-        return new DateTimeOffset(utc, TimeSpan.Zero);
+        // Construct DateTime in Chicago timezone with DST-aware offset
+        var localDateTime = new DateTime(tradingDate.Year, tradingDate.Month, tradingDate.Day, hour, minute, 0, DateTimeKind.Unspecified);
+        var chicagoOffset = _chicagoTz.GetUtcOffset(localDateTime);
+        return new DateTimeOffset(localDateTime, chicagoOffset);
+    }
+
+    /// <summary>
+    /// Convert Chicago time to UTC (derived representation).
+    /// Use ConstructChicagoTime first, then call ToUniversalTime() or this method.
+    /// </summary>
+    /// <param name="chicagoTime">DateTimeOffset in Chicago timezone</param>
+    /// <returns>DateTimeOffset in UTC</returns>
+    public DateTimeOffset ConvertChicagoToUtc(DateTimeOffset chicagoTime)
+        => chicagoTime.ToUniversalTime();
+
+    /// <summary>
+    /// DEPRECATED: Use ConstructChicagoTime + ConvertChicagoToUtc instead.
+    /// This method constructs Chicago time then converts to UTC, which is fine,
+    /// but the round-trip pattern (Chicago→UTC→Chicago) should be avoided.
+    /// </summary>
+    [Obsolete("Prefer ConstructChicagoTime + ConvertChicagoToUtc for clarity. This method is kept for backward compatibility.")]
+    public DateTimeOffset ConvertChicagoLocalToUtc(DateOnly tradingDate, string hhmm)
+    {
+        var chicagoTime = ConstructChicagoTime(tradingDate, hhmm);
+        return chicagoTime.ToUniversalTime();
     }
 
     public static bool TryParseDateOnly(string yyyyMmDd, out DateOnly date)

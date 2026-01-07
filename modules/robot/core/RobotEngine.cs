@@ -22,7 +22,7 @@ public sealed class RobotEngine
     private string _timetablePath = "";
 
     private string? _lastTimetableHash;
-    private string? _activeTradingDate;
+    private DateOnly? _activeTradingDate; // PHASE 3: Store as DateOnly (authoritative), convert to string only for logging/journal
 
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
@@ -31,6 +31,10 @@ public sealed class RobotEngine
     private readonly ExecutionJournal _executionJournal;
     private readonly KillSwitch _killSwitch;
     private readonly ExecutionSummary _executionSummary;
+
+    // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
+    private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
+    private const int BAR_HEARTBEAT_RATE_LIMIT_MINUTES = 1; // Log once per instrument per minute
 
     public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, bool useAsyncLogging = true)
     {
@@ -99,7 +103,8 @@ public sealed class RobotEngine
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "ENGINE_STOP", state: "ENGINE"));
+        var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "ENGINE_STOP", state: "ENGINE"));
         
         // Write execution summary if not DRYRUN
         if (_executionMode != ExecutionMode.DRYRUN)
@@ -110,7 +115,8 @@ public sealed class RobotEngine
             var summaryPath = Path.Combine(summaryDir, $"summary_{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.json");
             var json = JsonUtil.Serialize(summary);
             File.WriteAllText(summaryPath, json);
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
                 new { summary_path = summaryPath }));
         }
         
@@ -136,40 +142,62 @@ public sealed class RobotEngine
     {
         if (_spec is null || _time is null) return;
 
-        // In replay mode, derive trading_date from bar timestamp (bar-derived date is authoritative)
+        // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
+        // This fires regardless of stream state or existence - pure observability
+        var shouldLogHeartbeat = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastHeartbeat) ||
+                                (utcNow - lastHeartbeat).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
+        
+        if (shouldLogHeartbeat)
+        {
+            _lastBarHeartbeatPerInstrument[instrument] = utcNow;
+            var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
+                new
+                {
+                    instrument = instrument,
+                    raw_bar_time = barUtc.ToString("o"),
+                    raw_bar_time_kind = barUtc.DateTime.Kind.ToString(),
+                    utc_time = barUtc.ToString("o"),
+                    chicago_time = barChicagoTime.ToString("o"),
+                    chicago_offset = barChicagoTime.Offset.ToString(),
+                    close_price = close,
+                    note = "engine-level diagnostic"
+                }));
+        }
+
+        // PHASE 3: Derive trading_date from bar timestamp (bar-derived date is authoritative)
+        // Parse once, store as DateOnly
         var barChicagoDate = _time.GetChicagoDateToday(barUtc);
-        var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
 
         // Check if trading_date needs to roll over to a new day
-        if (_activeTradingDate != barTradingDateStr)
+        if (_activeTradingDate != barChicagoDate)
         {
             // Trading date rollover: update engine trading_date and notify all streams
             var previousTradingDate = _activeTradingDate;
-            _activeTradingDate = barTradingDateStr;
+            _activeTradingDate = barChicagoDate;
 
-            if (TimeService.TryParseDateOnly(barTradingDateStr, out var newTradingDate))
-            {
-                // Log trading day rollover
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
-                    new
-                    {
-                        previous_trading_date = previousTradingDate ?? "UNSET",
-                        new_trading_date = barTradingDateStr,
-                        bar_timestamp_utc = barUtc.ToString("o"),
-                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
-                    }));
-
-                // Update all stream state machines to use the new trading_date
-                foreach (var stream in _streams.Values)
+            // Log trading day rollover (convert to string only for logging)
+            var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
+            var previousTradingDateStr = previousTradingDate?.ToString("yyyy-MM-dd") ?? "UNSET";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
+                new
                 {
-                    stream.UpdateTradingDate(newTradingDate, utcNow);
-                }
+                    previous_trading_date = previousTradingDateStr,
+                    new_trading_date = barTradingDateStr,
+                    bar_timestamp_utc = barUtc.ToString("o"),
+                    bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
+                }));
+
+            // Update all stream state machines to use the new trading_date (pass DateOnly directly)
+            foreach (var stream in _streams.Values)
+            {
+                stream.UpdateTradingDate(barChicagoDate, utcNow);
             }
         }
 
         // Replay invariant check: engine trading_date must match bar-derived trading_date
         // This prevents the trading_date mismatch bug from silently reappearing
-        if (_activeTradingDate != null && _activeTradingDate != barTradingDateStr)
+        if (_activeTradingDate.HasValue && _activeTradingDate.Value != barChicagoDate)
         {
             // Check if we're in replay mode (timetable has replay metadata)
             var isReplay = false;
@@ -189,11 +217,13 @@ public sealed class RobotEngine
             if (isReplay)
             {
                 // In replay mode, trading_date mismatch after rollover is a critical error
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
+                var engineTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+                var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: engineTradingDateStr, eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
                     new
                     {
                         error = "TRADING_DATE_MISMATCH",
-                        engine_trading_date = _activeTradingDate,
+                        engine_trading_date = engineTradingDateStr,
                         bar_derived_trading_date = barTradingDateStr,
                         bar_timestamp_utc = barUtc.ToString("o"),
                         bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o"),
@@ -219,7 +249,8 @@ public sealed class RobotEngine
         var poll = _timetablePoller.Poll(_timetablePath, utcNow);
         if (poll.Error is not null)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = poll.Error }));
             StandDown();
             return;
@@ -237,7 +268,8 @@ public sealed class RobotEngine
         }
         catch (Exception ex)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate ?? "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "PARSE_ERROR", error = ex.Message }));
             StandDown();
             return;
@@ -286,7 +318,8 @@ public sealed class RobotEngine
             }
         }
 
-        _activeTradingDate = timetable.trading_date;
+        // PHASE 3: Store as DateOnly (already parsed above)
+        _activeTradingDate = tradingDate;
 
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
             new 
@@ -422,14 +455,41 @@ public sealed class RobotEngine
                         }));
                     continue;
                 }
+                
+                // DIAGNOSTIC: Log trading date being used for stream update
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_UPDATE_DIAGNOSTIC", "ENGINE", new 
+                    { 
+                        trading_date_str = tradingDateStr,
+                        trading_date_parsed = tradingDate.ToString("yyyy-MM-dd"),
+                        timetable_trading_date = timetable.trading_date,
+                        previous_slot_time_utc = sm.SlotTimeUtc.ToString("o"),
+                        new_slot_time_utc = slotTimeUtc?.ToString("o"),
+                        note = "Logging trading date used when updating existing stream"
+                    }));
+                
                 sm.ApplyDirectiveUpdate(directive.slot_time, tradingDate, utcNow);
             }
             else
             {
-                // New stream - use tradingDateStr instead of _activeTradingDate
+                // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
                 // Note: IBarProvider is null for live/SIM modes (bars come via OnBar). For DRYRUN mode with historical replay, 
                 // IBarProvider would be passed here if available, but currently RobotEngine doesn't maintain one.
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDateStr, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: null);
+                
+                // DIAGNOSTIC: Log trading date being used for stream creation
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_CREATION_DIAGNOSTIC", "ENGINE", new 
+                    { 
+                        trading_date_str = tradingDateStr,
+                        trading_date_parsed = tradingDate.ToString("yyyy-MM-dd"),
+                        timetable_trading_date = timetable.trading_date,
+                        slot_time_chicago = slotTimeChicago,
+                        slot_time_utc = slotTimeUtc?.ToString("o"),
+                        note = "Logging trading date used when creating new stream"
+                    }));
+                
+                // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: null);
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)

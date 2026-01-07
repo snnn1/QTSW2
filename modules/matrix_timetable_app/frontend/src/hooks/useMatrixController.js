@@ -344,41 +344,6 @@ export function useMatrixController({
     showFilteredDays
   ])
   
-  // Resequence master matrix (rolling resequence)
-  const resequenceMasterMatrix = useCallback(async (resequenceDays = 40) => {
-    setMasterLoading(true)
-    setMasterError(null)
-    
-    try {
-      // Check if backend is reachable
-      const healthCheck = await matrixApi.checkBackendHealth(3000)
-      if (!healthCheck.success) {
-        setMasterError(healthCheck.error)
-        setMasterLoading(false)
-        return
-      }
-      
-      const resequenceInfo = await matrixApi.resequenceMatrix({
-        streamFilters,
-        resequenceDays
-      })
-      
-      console.log(`[Matrix] Rolling resequence complete:`, resequenceInfo.summary)
-      
-      // Reload matrix data after resequence
-      await loadMasterMatrix()
-      
-      // Refetch stats
-      await refetchMasterStats()
-      
-      setMasterLoading(false)
-    } catch (error) {
-      console.error('[Matrix] Resequence error:', error)
-      setMasterError(error.message || 'Failed to resequence matrix')
-      setMasterLoading(false)
-    }
-  }, [streamFilters, loadMasterMatrix, refetchMasterStats])
-
   // Reload latest matrix from disk (without rebuilding)
   // IMPORTANT: Always reloads data, even if file ID hasn't changed, because the file content may have been updated
   const reloadLatestMatrix = useCallback(async () => {
@@ -480,6 +445,88 @@ export function useMatrixController({
     }
   }, [streamFilters, masterContractMultiplier, includeFilteredExecuted, masterData, workerInitData, workerReady])
   
+  // Resequence master matrix (rolling resequence)
+  const resequenceMasterMatrix = useCallback(async (resequenceDays = 40) => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    try {
+      // Check if backend is reachable
+      const healthCheck = await matrixApi.checkBackendHealth(3000)
+      if (!healthCheck.success) {
+        setMasterError(healthCheck.error)
+        setMasterLoading(false)
+        return
+      }
+      
+      const resequenceInfo = await matrixApi.resequenceMatrix({
+        streamFilters,
+        resequenceDays
+      })
+      
+      console.log(`[Matrix] Rolling resequence complete:`, resequenceInfo.summary)
+      
+      // CRITICAL: Force reload from disk to get fresh data
+      // reloadLatestMatrix() handles data loading, stats, and worker reinit
+      await reloadLatestMatrix()
+      
+      setMasterLoading(false)
+    } catch (error) {
+      console.error('[Matrix] Resequence error:', error)
+      setMasterError(error.message || 'Failed to resequence matrix')
+      setMasterLoading(false)
+    }
+  }, [streamFilters, reloadLatestMatrix])
+  
+  // Build master matrix (full rebuild)
+  const buildMasterMatrix = useCallback(async () => {
+    setMasterLoading(true)
+    setMasterError(null)
+    
+    try {
+      // Check if backend is reachable
+      const healthCheck = await matrixApi.checkBackendHealth(3000)
+      if (!healthCheck.success) {
+        setMasterError(healthCheck.error)
+        setMasterLoading(false)
+        return
+      }
+      
+      // Extract visible years from stream filters
+      const visibleYearsSet = new Set()
+      Object.keys(streamFilters).forEach(id => {
+        const f = streamFilters[id]
+        if (f && Array.isArray(f.include_years)) {
+          f.include_years.forEach(y => {
+            const num = parseInt(y)
+            if (!isNaN(num)) {
+              visibleYearsSet.add(num)
+            }
+          })
+        }
+      })
+      const visibleYears = Array.from(visibleYearsSet).sort((a, b) => a - b)
+      
+      // Build matrix
+      await matrixApi.buildMatrix({
+        streamFilters,
+        visibleYears,
+        warmupMonths: 1
+      })
+      
+      console.log(`[Matrix] Full rebuild complete`)
+      
+      // CRITICAL: Force reload from disk to get fresh data
+      await reloadLatestMatrix()
+      
+      setMasterLoading(false)
+    } catch (error) {
+      console.error('[Matrix] Build error:', error)
+      setMasterError(error.message || 'Failed to build master matrix')
+      setMasterLoading(false)
+    }
+  }, [streamFilters, reloadLatestMatrix])
+  
   // Check matrix freshness periodically
   useEffect(() => {
     const checkFreshness = async () => {
@@ -564,6 +611,7 @@ export function useMatrixController({
     // Controller functions
     loadMasterMatrix,
     resequenceMasterMatrix,
+    buildMasterMatrix,
     reloadLatestMatrix,
     refetchMasterStats,
     hasLoadedRef

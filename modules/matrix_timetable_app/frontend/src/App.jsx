@@ -171,6 +171,7 @@ function AppContent() {
     // Controller functions
     loadMasterMatrix,
     resequenceMasterMatrix,
+    buildMasterMatrix,
     reloadLatestMatrix,
     refetchMasterStats,
     hasLoadedRef
@@ -3431,7 +3432,7 @@ function AppContent() {
                     {masterLoading ? 'Resequencing...' : 'Resequence Last 40 Days'}
                   </button>
                   <button
-                    onClick={() => matrixApi.buildMatrix({ streamFilters })}
+                    onClick={() => buildMasterMatrix()}
                     disabled={masterLoading}
                     className={`px-4 py-2 rounded font-medium text-sm ${
                       masterLoading
