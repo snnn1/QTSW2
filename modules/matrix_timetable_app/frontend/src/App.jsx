@@ -144,6 +144,8 @@ function AppContent() {
     // File change detection
     matrixFileId,
     matrixFreshness,
+    // Matrix generation (invalidation boundary)
+    matrixGeneration,
     // Backend stats
     backendStatsFull,
     backendStatsMultiplier,
@@ -3625,7 +3627,7 @@ function AppContent() {
                     </div>
                   )}
                   <DataTable
-                    key={`master-${showFilteredDays}`}
+                    key={`master-${showFilteredDays}-${matrixGeneration}`}
                     data={masterData}
                     streamId="master"
                     workerReady={workerReady && tableTab === 'master'}
@@ -3737,7 +3739,7 @@ function AppContent() {
                     </div>
                   )}
                   <DataTable
-                    key={`${tableTab}-${showFilteredDays}`}
+                    key={`${tableTab}-${showFilteredDays}-${matrixGeneration}`}
                     data={masterData}
                     streamId={tableTab}
                     workerReady={workerReady && workerFilteredRowsTabRef.current === tableTab}

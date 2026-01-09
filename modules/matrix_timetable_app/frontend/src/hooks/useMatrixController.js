@@ -46,6 +46,10 @@ export function useMatrixController({
   // Track if initial load has been attempted
   const hasLoadedRef = useRef(false)
   
+  // Matrix generation counter - increments on every successful matrix mutation
+  // Used as an invalidation boundary to force UI refresh and worker reinitialization
+  const [matrixGeneration, setMatrixGeneration] = useState(0)
+  
   // Worker hook
   const {
     workerReady,
@@ -289,15 +293,14 @@ export function useMatrixController({
     }
   }, [masterContractMultiplier, includeFilteredExecuted, streamFilters])
   
-  // Reinitialize worker data when worker becomes ready and masterData exists
+  // Reinitialize worker data when matrix generation changes (invalidation boundary)
+  // This ensures worker gets fresh data after any matrix mutation (resequence, rebuild, reload)
   useEffect(() => {
     if (workerReady && masterData.length > 0 && workerInitData) {
-      const timeoutId = setTimeout(() => {
-        workerInitData(masterData)
-      }, 50)
-      return () => clearTimeout(timeoutId)
+      // Reinitialize worker with fresh data when generation changes
+      workerInitData(masterData)
     }
-  }, [workerReady, workerInitData, masterData.length])
+  }, [workerReady, workerInitData, matrixGeneration, masterData])
   
   // Apply filters in worker when filters or active tab changes
   useEffect(() => {
@@ -428,19 +431,16 @@ export function useMatrixController({
         lastMatrixFileIdRef.current = data.matrix_file_id || data.file
       }
       
-      // Reinitialize worker with fresh data
-      if (trades.length > 0 && workerInitData && workerReady) {
-        setTimeout(() => {
-          workerInitData(trades)
-        }, 100)
-      }
-      
       setMasterError(null)
       console.log(`[Matrix] Successfully reloaded ${trades.length} rows from file: ${data.matrix_file_id || data.file}`)
+      
+      // Increment matrix generation to invalidate UI and force worker reinitialization
+      setMatrixGeneration(prev => prev + 1)
+      
+      setMasterLoading(false)
     } catch (error) {
       setMasterError(`Failed to reload latest matrix: ${error.message}`)
       console.error('[Matrix] Reload error:', error)
-    } finally {
       setMasterLoading(false)
     }
   }, [streamFilters, masterContractMultiplier, includeFilteredExecuted, masterData, workerInitData, workerReady])
@@ -546,26 +546,27 @@ export function useMatrixController({
     return () => clearInterval(interval)
   }, [])
   
-  // Auto-update interval (fallback - file change detection is primary)
-  const masterLoadingRef = useRef(masterLoading)
-  useEffect(() => {
-    masterLoadingRef.current = masterLoading
-  }, [masterLoading])
-  
+  // Auto-update interval - automatically resequence then refresh page every 20 minutes
   useEffect(() => {
     if (!autoUpdateEnabled) {
       return
     }
     
-    const interval = setInterval(() => {
-      if (!masterLoadingRef.current) {
-        // Check for file changes first via reloadLatestMatrix
-        reloadLatestMatrix()
+    const interval = setInterval(async () => {
+      try {
+        console.log('[Matrix] Auto-update: Triggering resequence...')
+        await resequenceMasterMatrix()
+        console.log('[Matrix] Auto-update: Resequence complete, refreshing page...')
+        window.location.reload()
+      } catch (error) {
+        console.error('[Matrix] Auto-update error:', error)
+        // Still refresh even if resequence fails
+        window.location.reload()
       }
-    }, 20 * 60 * 1000) // 20 minutes - fallback safety net
+    }, 20 * 60 * 1000) // 20 minutes
     
     return () => clearInterval(interval)
-  }, [autoUpdateEnabled, reloadLatestMatrix])
+  }, [autoUpdateEnabled, resequenceMasterMatrix])
   
   return {
     // Backend data state
@@ -580,6 +581,9 @@ export function useMatrixController({
     // File change detection
     matrixFileId,
     matrixFreshness,
+    
+    // Matrix generation (invalidation boundary)
+    matrixGeneration,
     
     // Backend stats
     backendStatsFull,

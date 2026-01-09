@@ -69,6 +69,7 @@ public sealed class StreamStateMachine
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
     private bool _rangeLockAssertEmitted = false; // RANGE_LOCK_ASSERT emitted
+    private bool _hydrationAttempted = false; // Prevent multiple hydration attempts
 
     private decimal? _lastCloseBeforeLock;
 
@@ -271,6 +272,7 @@ public sealed class StreamStateMachine
         _rangeIntentAssertEmitted = false;
         _firstBarAcceptedAssertEmitted = false;
         _rangeLockAssertEmitted = false;
+        _hydrationAttempted = false;
         
         // Clear bar buffer on reset
         lock (_barBufferLock)
@@ -327,6 +329,13 @@ public sealed class StreamStateMachine
                 break;
 
             case StreamState.RANGE_BUILDING:
+                // Hydrate from historical bars if starting late (only once, when entering RANGE_BUILDING)
+                if (!_rangeComputed && !_hydrationAttempted && _barProvider != null)
+                {
+                    _hydrationAttempted = true;
+                    TryHydrateFromHistory(utcNow);
+                }
+                
                 // DIAGNOSTIC: Log slot gate evaluation (rate-limited to once per minute per stream)
                 var nowChicago = _time.ConvertUtcToChicago(utcNow);
                 var gateDecision = utcNow >= SlotTimeUtc && !_rangeComputed;
@@ -581,6 +590,36 @@ public sealed class StreamStateMachine
             // Range window is defined in Chicago time to match trading session semantics
             if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
             {
+                // DEFENSIVE: Validate bar data before buffering
+                string? validationError = null;
+                if (high < low)
+                {
+                    validationError = "high < low";
+                }
+                else if (close < low || close > high)
+                {
+                    validationError = "close outside [low, high]";
+                }
+                
+                if (validationError != null)
+                {
+                    // Log invalid bar but continue (fail-closed per bar, not per stream)
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "BAR_INVALID", State.ToString(),
+                        new
+                        {
+                            instrument = Instrument,
+                            bar_utc_time = barUtc.ToString("o"),
+                            bar_chicago_time = barChicagoTime.ToString("o"),
+                            high = high,
+                            low = low,
+                            close = close,
+                            reason = validationError
+                        }));
+                    // Skip invalid bar - do not add to buffer
+                    return;
+                }
+                
                 // RANGE_FIRST_BAR_ACCEPTED: Emit once per stream per day when first bar enters range
                 if (!_firstBarAcceptedAssertEmitted)
                 {
@@ -1276,6 +1315,112 @@ public sealed class StreamStateMachine
                 be_triggered = false, // Will be set if triggered during price tracking (future step)
                 be_trigger_time_utc = (string?)null
             }));
+    }
+
+    /// <summary>
+    /// Hydrate bar buffer from historical bars if starting late.
+    /// Called when entering RANGE_BUILDING state and current time is after range start.
+    /// </summary>
+    private void TryHydrateFromHistory(DateTimeOffset utcNow)
+    {
+        // Only hydrate if:
+        // 1. Bar provider is available (for historical data access)
+        // 2. Range has not been computed
+        // 3. Current time is after range start (we're starting late)
+        // 4. Current time is before slot time (not too late)
+        if (_barProvider == null || _rangeComputed)
+            return;
+
+        var nowChicago = _time.ConvertUtcToChicago(utcNow);
+        
+        // Check if we're starting late (current time > range start)
+        if (nowChicago < RangeStartChicagoTime)
+            return; // Not late yet, wait for normal bar flow
+
+        // Check if slot time has passed (too late to hydrate)
+        if (nowChicago >= SlotTimeChicagoTime)
+            return; // Slot time passed, range computation will handle it
+
+        // Check if buffer is empty or incomplete
+        int currentBarCount;
+        lock (_barBufferLock)
+        {
+            currentBarCount = _barBuffer.Count;
+        }
+
+        // Try to load historical bars to ensure completeness
+        try
+        {
+            // Get historical bars from provider (provider uses UTC)
+            var historicalBars = _barProvider.GetBars(Instrument, RangeStartUtc, SlotTimeUtc).ToList();
+            
+            if (historicalBars.Count == 0)
+                return; // No historical bars available
+
+            // Filter bars to Chicago time window and add to buffer
+            var hydratedCount = 0;
+            DateTimeOffset? firstBarChicago = null;
+            DateTimeOffset? lastBarChicago = null;
+
+            lock (_barBufferLock)
+            {
+                // Create a set of existing bar timestamps to avoid duplicates
+                var existingTimestamps = new HashSet<DateTimeOffset>(_barBuffer.Select(b => b.TimestampUtc));
+
+                foreach (var bar in historicalBars)
+                {
+                    // Skip if already in buffer
+                    if (existingTimestamps.Contains(bar.TimestampUtc))
+                        continue;
+
+                    // Convert to Chicago time and check if in window
+                    var barChicagoTime = _time.ConvertUtcToChicago(bar.TimestampUtc);
+                    
+                    // Only include bars in the range window
+                    if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
+                    {
+                        _barBuffer.Add(bar);
+                        existingTimestamps.Add(bar.TimestampUtc);
+                        hydratedCount++;
+
+                        if (!firstBarChicago.HasValue || barChicagoTime < firstBarChicago.Value)
+                            firstBarChicago = barChicagoTime;
+                        if (!lastBarChicago.HasValue || barChicagoTime > lastBarChicago.Value)
+                            lastBarChicago = barChicagoTime;
+                    }
+                }
+
+                // Sort buffer by timestamp to maintain chronological order
+                _barBuffer.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+            }
+
+            // Log hydration event (once per stream per day)
+            if (hydratedCount > 0)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RANGE_HYDRATED_FROM_HISTORY", State.ToString(),
+                    new
+                    {
+                        trading_date = TradingDate,
+                        bars_loaded_count = hydratedCount,
+                        first_bar_chicago = firstBarChicago?.ToString("o"),
+                        last_bar_chicago = lastBarChicago?.ToString("o"),
+                        total_bars_in_buffer = currentBarCount + hydratedCount,
+                        note = "late start hydration"
+                    }));
+            }
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't fail - continue with normal bar processing
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_HYDRATION_ERROR", State.ToString(),
+                new
+                {
+                    error = ex.Message,
+                    note = "Historical hydration failed, continuing with normal bar processing"
+                }));
+        }
     }
 
     private void Transition(DateTimeOffset utcNow, StreamState next, string eventType, object? extra = null)

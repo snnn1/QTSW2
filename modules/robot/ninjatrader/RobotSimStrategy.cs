@@ -5,6 +5,7 @@
 // Copy into a NinjaTrader 8 strategy project and wire references to Robot.Core.
 
 using System;
+using System.Threading;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
@@ -22,6 +23,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private RobotEngine? _engine;
         private NinjaTraderSimAdapter? _adapter;
         private bool _simAccountVerified = false;
+        private Timer? _tickTimer;
+        private readonly object _timerLock = new object();
 
         protected override void OnStateChange()
         {
@@ -49,13 +52,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: instrumentName);
                 _engine.Start();
 
+                // Set bar provider for historical hydration (late start support)
+                // Create provider that accesses NinjaTrader Bars collection
+                var barProvider = new NinjaTraderBarProviderWrapper(this, _engine);
+                _engine.SetBarProvider(barProvider);
+
                 // Get the adapter instance and wire NT context
                 // Note: This requires exposing adapter from engine or using dependency injection
                 // For now, we'll wire events directly to adapter via reflection or adapter registration
                 WireNTContextToAdapter();
             }
+            else if (State == State.Realtime)
+            {
+                // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
+                StartTickTimer();
+            }
             else if (State == State.Terminated)
             {
+                StopTickTimer();
                 _engine?.Stop();
             }
         }
@@ -124,8 +138,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             var close = (decimal)Close[0];
             var nowUtc = DateTimeOffset.UtcNow;
 
+            // Deliver bar data to engine (bars only provide market data, not time advancement)
             _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, high, low, close, nowUtc);
-            _engine.Tick(nowUtc);
+            // NOTE: Tick() is now called by timer, not by bar arrivals
+            // This ensures time-based state transitions occur even when no bars arrive
         }
 
         /// <summary>
@@ -150,6 +166,64 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Forward to adapter's HandleExecutionUpdate method
             // Adapter will correlate order.Tag (intent_id) and trigger protective orders on fill
             _adapter.HandleExecutionUpdate(e.Execution, e.Execution.Order);
+        }
+
+        /// <summary>
+        /// Start periodic timer that calls Engine.Tick() every 1 second.
+        /// Timer ensures time-based state transitions occur even when no bars arrive.
+        /// </summary>
+        private void StartTickTimer()
+        {
+            lock (_timerLock)
+            {
+                if (_tickTimer != null)
+                {
+                    // Timer already started, ignore
+                    return;
+                }
+
+                // Create timer that fires every 1 second
+                // Timer callback must be thread-safe and never throw
+                _tickTimer = new Timer(TimerCallback, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+                Log("Tick timer started (1 second interval)", LogLevel.Information);
+            }
+        }
+
+        /// <summary>
+        /// Stop and dispose the tick timer.
+        /// </summary>
+        private void StopTickTimer()
+        {
+            lock (_timerLock)
+            {
+                if (_tickTimer != null)
+                {
+                    _tickTimer.Dispose();
+                    _tickTimer = null;
+                    Log("Tick timer stopped", LogLevel.Information);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Timer callback: calls Engine.Tick() with current UTC time.
+        /// Must be thread-safe, non-blocking, and never throw exceptions.
+        /// </summary>
+        private void TimerCallback(object? state)
+        {
+            try
+            {
+                if (_engine != null && _simAccountVerified)
+                {
+                    var utcNow = DateTimeOffset.UtcNow;
+                    _engine.Tick(utcNow);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log but never throw - timer callbacks must not throw exceptions
+                Log($"ERROR in tick timer callback: {ex.Message}", LogLevel.Error);
+            }
         }
 
         /// <summary>

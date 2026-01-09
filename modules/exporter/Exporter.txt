@@ -2,8 +2,14 @@
 using System;
 using System.IO;
 using System.Globalization;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Linq;
+using System.Collections.Generic;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.Data;
+using NinjaTrader.Cbi;
+using NinjaTrader.Code;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
@@ -17,11 +23,25 @@ namespace NinjaTrader.NinjaScript.Indicators
         // Disk is the single source of truth for deduplication
         private DateTime lastTimestampOnDiskUtc = DateTime.MinValue;
 
-        // Flush at most once per UTC minute
-        private int lastFlushedMinuteUtc = -1;
+        // Flush at most once per UTC minute (using stable yyyyMMddHHmm key)
+        private long lastFlushedMinuteKeyUtc = -1;
         
         // Track if we've entered real-time mode (to refresh timestamp from disk)
         private bool hasEnteredRealtime = false;
+
+        // Recovery state machine
+        private enum RecoveryState
+        {
+            LIVE,
+            DISCONNECTED,
+            RECOVERING
+        }
+        private RecoveryState recoveryState = RecoveryState.LIVE;
+        private DateTime disconnectTimeUtc = DateTime.MinValue;
+        private CancellationTokenSource recoveryCancellationTokenSource = null;
+
+        // File write lock to prevent concurrent writes
+        private readonly object fileWriteLock = new object();
 
         protected override void OnStateChange()
         {
@@ -37,9 +57,66 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
                     Print("ERROR: Exporter only works on 1-minute charts.");
             }
+            else if (State == State.Realtime)
+            {
+                // On entering realtime, check for gaps even if we started connected
+                // This handles the case where indicator was restarted while NT was already connected
+                if (recoveryState == RecoveryState.LIVE)
+                {
+                    Task.Run(() => CheckAndRecoverGapsAsync());
+                }
+            }
             else if (State == State.Terminated)
             {
+                // Cancel any ongoing recovery
+                recoveryCancellationTokenSource?.Cancel();
                 CloseWriter();
+            }
+        }
+
+        protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
+        {
+            try
+            {
+                string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                string connectionName = connectionStatusUpdate.Connection?.Options?.Name ?? "UNKNOWN";
+                ConnectionStatus status = connectionStatusUpdate.Status;
+
+                Print($"Exporter: Connection status update - Time: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC, Instrument: {instrument}, Connection: {connectionName}, Status: {status}");
+
+                if (status == ConnectionStatus.ConnectionLost || 
+                    status == ConnectionStatus.Disconnected)
+                {
+                    if (recoveryState != RecoveryState.DISCONNECTED)
+                    {
+                        recoveryState = RecoveryState.DISCONNECTED;
+                        disconnectTimeUtc = DateTime.UtcNow;
+                        
+                        // Cancel any ongoing recovery
+                        recoveryCancellationTokenSource?.Cancel();
+                        recoveryCancellationTokenSource = null;
+
+                        lock (fileWriteLock)
+                        {
+                            Print($"Exporter: DISCONNECTED - Last timestamp on disk: {lastTimestampOnDiskUtc:yyyy-MM-dd HH:mm:ss} UTC, Current file: {currentFilePath ?? "N/A"}");
+                        }
+                    }
+                }
+                else if (status == ConnectionStatus.Connected)
+                {
+                    if (recoveryState == RecoveryState.DISCONNECTED)
+                    {
+                        Print($"Exporter: RECONNECTED - Starting recovery pipeline. Disconnect duration: {(DateTime.UtcNow - disconnectTimeUtc).TotalMinutes:F1} minutes");
+                        recoveryState = RecoveryState.RECOVERING;
+                        
+                        // Start recovery asynchronously
+                        Task.Run(() => RecoverMissingBarsAsync());
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR in OnConnectionStatusUpdate: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
@@ -69,55 +146,60 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 string filePath = Path.Combine(folder, $"{instrument}_{interval}_{date}.csv");
 
-                if (currentFilePath != filePath)
-                    OpenOrSwitchFile(filePath);
-
-                if (sw == null)
-                    return;
-
-                // When entering real-time mode, refresh timestamp from disk to ensure we catch new data
-                // This handles the case where file already has recent data from previous session
-                if (State == State.Realtime && !hasEnteredRealtime)
+                lock (fileWriteLock)
                 {
-                    hasEnteredRealtime = true;
-                    DateTime diskTimestamp = GetLastTimestampFromFile(filePath);
-                    if (diskTimestamp > lastTimestampOnDiskUtc)
+                    if (currentFilePath != filePath)
+                        OpenOrSwitchFile(filePath);
+
+                    if (sw == null)
+                        return;
+
+                    // When entering real-time mode, refresh timestamp from disk to ensure we catch new data
+                    // This handles the case where file already has recent data from previous session
+                    if (State == State.Realtime && !hasEnteredRealtime)
                     {
-                        lastTimestampOnDiskUtc = diskTimestamp;
-                        Print($"Exporter: Entered real-time mode. Last timestamp on disk: {lastTimestampOnDiskUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                        hasEnteredRealtime = true;
+                        DateTime diskTimestamp = GetLastTimestampFromFile(filePath);
+                        if (diskTimestamp > lastTimestampOnDiskUtc)
+                        {
+                            lastTimestampOnDiskUtc = diskTimestamp;
+                            Print($"Exporter: Entered real-time mode. Last timestamp on disk: {lastTimestampOnDiskUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                        }
                     }
+
+                    // HARD dedupe — disk authority
+                    // Allow live writes during recovery; dedupe will prevent overlaps
+                    if (timestampUtc <= lastTimestampOnDiskUtc)
+                        return;
+
+                    string row = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0},{1},{2},{3},{4},{5}",
+                        timestampUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                        Open[0],
+                        High[0],
+                        Low[0],
+                        Close[0],
+                        Volume[0]
+                    );
+
+                    sw.WriteLine(row);
+
+                    // Use stable minute key (yyyyMMddHHmm) instead of just Minute
+                    long minuteKeyUtc = long.Parse(timestampUtc.ToString("yyyyMMddHHmm"));
+                    if (minuteKeyUtc != lastFlushedMinuteKeyUtc)
+                    {
+                        sw.Flush();
+                        lastFlushedMinuteKeyUtc = minuteKeyUtc;
+                    }
+
+                    // Update authoritative timestamp only after successful write
+                    lastTimestampOnDiskUtc = timestampUtc;
                 }
-
-                // HARD dedupe — disk authority
-                if (timestampUtc <= lastTimestampOnDiskUtc)
-                    return;
-
-                string row = string.Format(
-                    CultureInfo.InvariantCulture,
-                    "{0},{1},{2},{3},{4},{5}",
-                    timestampUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"),
-                    Open[0],
-                    High[0],
-                    Low[0],
-                    Close[0],
-                    Volume[0]
-                );
-
-                sw.WriteLine(row);
-
-                int minuteUtc = timestampUtc.Minute;
-                if (minuteUtc != lastFlushedMinuteUtc)
-                {
-                    sw.Flush();
-                    lastFlushedMinuteUtc = minuteUtc;
-                }
-
-                // Update authoritative timestamp only after successful write
-                lastTimestampOnDiskUtc = timestampUtc;
             }
             catch (Exception ex)
             {
-                Print($"Exporter: ERROR in OnBarUpdate: {ex.Message}");
+                Print($"Exporter: ERROR in OnBarUpdate: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
@@ -144,11 +226,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                     sw.Flush();
                 }
 
-                lastFlushedMinuteUtc = -1;
+                lastFlushedMinuteKeyUtc = -1;
             }
             catch (Exception ex)
             {
-                Print($"Exporter: ERROR opening file {filePath}: {ex.Message}");
+                Print($"Exporter: ERROR opening file {filePath}: {ex.Message}\n{ex.StackTrace}");
                 sw = null;
                 currentFilePath = null;
             }
@@ -221,6 +303,338 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 Print($"Exporter: ERROR reading last timestamp: {ex.Message}");
                 return DateTime.MinValue;
+            }
+        }
+
+        private async Task CheckAndRecoverGapsAsync()
+        {
+            try
+            {
+                await Task.Delay(2000); // Small delay to ensure file is ready
+
+                string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                DateTime nowUtc = DateTime.UtcNow;
+                DateTime expectedCurrentDayUtc = new DateTime(nowUtc.Year, nowUtc.Month, nowUtc.Day, 0, 0, 0, DateTimeKind.Utc);
+
+                string interval = "1m";
+                string yyyy = expectedCurrentDayUtc.ToString("yyyy");
+                string mm = expectedCurrentDayUtc.ToString("MM");
+                string date = expectedCurrentDayUtc.ToString("yyyy-MM-dd");
+
+                string folder = Path.Combine(rootPath, instrument, interval, yyyy, mm);
+                string filePath = Path.Combine(folder, $"{instrument}_{interval}_{date}.csv");
+
+                DateTime anchorTimestamp;
+                lock (fileWriteLock)
+                {
+                    if (File.Exists(filePath))
+                    {
+                        anchorTimestamp = GetLastTimestampFromFile(filePath);
+                    }
+                    else
+                    {
+                        anchorTimestamp = DateTime.MinValue;
+                    }
+                }
+
+                DateTime fromUtc = anchorTimestamp == DateTime.MinValue 
+                    ? expectedCurrentDayUtc 
+                    : anchorTimestamp.AddMinutes(1);
+                DateTime toUtc = nowUtc.AddMinutes(-1); // Avoid incomplete current minute
+                toUtc = new DateTime(toUtc.Year, toUtc.Month, toUtc.Day, toUtc.Hour, toUtc.Minute, 0, DateTimeKind.Utc);
+
+                if (fromUtc < toUtc)
+                {
+                    Print($"Exporter: Sync check detected gap: {fromUtc:yyyy-MM-dd HH:mm:ss} UTC to {toUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                    recoveryState = RecoveryState.RECOVERING;
+                    await RecoverMissingBarsAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR in CheckAndRecoverGapsAsync: {ex.Message}\n{ex.StackTrace}");
+                recoveryState = RecoveryState.LIVE;
+            }
+        }
+
+        private async Task RecoverMissingBarsAsync()
+        {
+            if (recoveryState != RecoveryState.RECOVERING)
+                return;
+
+            recoveryCancellationTokenSource = new CancellationTokenSource();
+            var cancellationToken = recoveryCancellationTokenSource.Token;
+
+            try
+            {
+                string instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                DateTime nowUtc = DateTime.UtcNow;
+
+                // Determine anchor timestamp from disk
+                DateTime anchorTimestamp;
+                string anchorFilePath;
+                
+                lock (fileWriteLock)
+                {
+                    // Get current file path or infer expected current day path
+                    if (currentFilePath != null && File.Exists(currentFilePath))
+                    {
+                        anchorFilePath = currentFilePath;
+                        anchorTimestamp = GetLastTimestampFromFile(currentFilePath);
+                    }
+                    else
+                    {
+                        // Infer expected current day path
+                        DateTime expectedCurrentDayUtc = new DateTime(nowUtc.Year, nowUtc.Month, nowUtc.Day, 0, 0, 0, DateTimeKind.Utc);
+                        string interval = "1m";
+                        string yyyy = expectedCurrentDayUtc.ToString("yyyy");
+                        string mm = expectedCurrentDayUtc.ToString("MM");
+                        string date = expectedCurrentDayUtc.ToString("yyyy-MM-dd");
+                        string folder = Path.Combine(rootPath, instrument, interval, yyyy, mm);
+                        anchorFilePath = Path.Combine(folder, $"{instrument}_{interval}_{date}.csv");
+                        
+                        if (File.Exists(anchorFilePath))
+                        {
+                            anchorTimestamp = GetLastTimestampFromFile(anchorFilePath);
+                        }
+                        else
+                        {
+                            anchorTimestamp = DateTime.MinValue;
+                        }
+                    }
+                }
+
+                // Compute recovery window
+                DateTime fromUtc = anchorTimestamp == DateTime.MinValue
+                    ? new DateTime(nowUtc.Year, nowUtc.Month, nowUtc.Day, 0, 0, 0, DateTimeKind.Utc)
+                    : anchorTimestamp.AddMinutes(1);
+
+                DateTime toUtc = nowUtc.AddMinutes(-1); // Avoid incomplete current minute
+                toUtc = new DateTime(toUtc.Year, toUtc.Month, toUtc.Day, toUtc.Hour, toUtc.Minute, 0, DateTimeKind.Utc);
+
+                if (fromUtc >= toUtc)
+                {
+                    Print($"Exporter: Recovery check - no gap detected (fromUtc: {fromUtc:yyyy-MM-dd HH:mm:ss} UTC >= toUtc: {toUtc:yyyy-MM-dd HH:mm:ss} UTC)");
+                    recoveryState = RecoveryState.LIVE;
+                    return;
+                }
+
+                Print($"Exporter: Starting recovery - fromUtc: {fromUtc:yyyy-MM-dd HH:mm:ss} UTC, toUtc: {toUtc:yyyy-MM-dd HH:mm:ss} UTC, anchor file: {anchorFilePath ?? "N/A"}");
+
+                DateTime recoveryStartTime = DateTime.UtcNow;
+                int barsReceived = 0;
+                int barsWritten = 0;
+                int barsSkipped = 0;
+
+                // Request historical bars using BarsRequest
+                // Use callback-based pattern compatible with NinjaTrader Indicators
+                var barsRequestCompleted = new TaskCompletionSource<Bars>();
+                Bars receivedBars = null;
+                Exception requestException = null;
+
+                // Retry logic with bounded attempts
+                int maxRetries = 3;
+                int retryCount = 0;
+                bool success = false;
+
+                while (retryCount < maxRetries && !success)
+                {
+                    try
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            Print($"Exporter: Recovery cancelled");
+                            recoveryState = RecoveryState.LIVE;
+                            return;
+                        }
+
+                        receivedBars = null;
+                        requestException = null;
+                        barsRequestCompleted = new TaskCompletionSource<Bars>();
+
+                        // Create BarsRequest with constructor parameters: instrument, startTime, endTime
+                        BarsRequest barsRequest = new BarsRequest(Instrument, fromUtc, toUtc)
+                        {
+                            BarsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = 1 },
+                            TradingHours = TradingHours
+                        };
+
+                        // Request bars with callback
+                        barsRequest.Request((request, errorCode, errorMessage) =>
+                        {
+                            try
+                            {
+                                if (errorCode != ErrorCode.NoError)
+                                {
+                                    requestException = new Exception($"BarsRequest error: {errorCode}, {errorMessage}");
+                                    barsRequestCompleted.TrySetResult(null);
+                                    return;
+                                }
+
+                                if (request.Bars != null && request.Bars.Count > 0)
+                                {
+                                    receivedBars = request.Bars;
+                                    barsRequestCompleted.TrySetResult(receivedBars);
+                                }
+                                else
+                                {
+                                    // Empty result
+                                    barsRequestCompleted.TrySetResult(null);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                requestException = ex;
+                                barsRequestCompleted.TrySetResult(null);
+                            }
+                        });
+
+                        // Wait for response with timeout
+                        var timeoutTask = Task.Delay(30000, cancellationToken); // 30 second timeout
+                        var completedTask = await Task.WhenAny(barsRequestCompleted.Task, timeoutTask);
+
+                        if (completedTask == timeoutTask)
+                        {
+                            retryCount++;
+                            Print($"Exporter: Recovery request timeout (attempt {retryCount}/{maxRetries})");
+                            if (retryCount < maxRetries)
+                            {
+                                await Task.Delay(1000, cancellationToken); // Wait before retry
+                                continue;
+                            }
+                            else
+                            {
+                                Print($"Exporter: ERROR - Recovery request failed after {maxRetries} attempts");
+                                recoveryState = RecoveryState.LIVE;
+                                return;
+                            }
+                        }
+
+                        var barsCollection = await barsRequestCompleted.Task;
+
+                        if (requestException != null)
+                        {
+                            throw requestException;
+                        }
+
+                        if (barsCollection == null || barsCollection.Count == 0)
+                        {
+                            Print($"Exporter: WARN - Recovery returned zero bars for window {fromUtc:yyyy-MM-dd HH:mm:ss} UTC to {toUtc:yyyy-MM-dd HH:mm:ss} UTC. Data gap remains.");
+                            recoveryState = RecoveryState.LIVE;
+                            return;
+                        }
+
+                        barsReceived = barsCollection.Count;
+                        Print($"Exporter: Recovery received {barsReceived} bars from NinjaTrader");
+
+                        // Write bars in chronological order
+                        for (int i = 0; i < barsCollection.Count; i++)
+                        {
+                            if (cancellationToken.IsCancellationRequested)
+                            {
+                                Print($"Exporter: Recovery cancelled");
+                                recoveryState = RecoveryState.LIVE;
+                                return;
+                            }
+
+                            // Normalize timestamp: bar.Time is bar close time, convert to open time (same convention as live)
+                            DateTime barCloseUtc = barsCollection.GetTime(i).ToUniversalTime();
+                            DateTime timestampUtc = barCloseUtc.AddMinutes(-1);
+
+                            lock (fileWriteLock)
+                            {
+                                // Determine correct file path by UTC date
+                                string interval = "1m";
+                                string yyyy = timestampUtc.ToString("yyyy");
+                                string mm = timestampUtc.ToString("MM");
+                                string date = timestampUtc.ToString("yyyy-MM-dd");
+                                string folder = Path.Combine(rootPath, instrument, interval, yyyy, mm);
+                                Directory.CreateDirectory(folder);
+                                string filePath = Path.Combine(folder, $"{instrument}_{interval}_{date}.csv");
+
+                                if (currentFilePath != filePath)
+                                    OpenOrSwitchFile(filePath);
+
+                                if (sw == null)
+                                    continue;
+
+                                // Hard dedupe - disk authority
+                                if (timestampUtc <= lastTimestampOnDiskUtc)
+                                {
+                                    barsSkipped++;
+                                    continue;
+                                }
+
+                                string row = string.Format(
+                                    CultureInfo.InvariantCulture,
+                                    "{0},{1},{2},{3},{4},{5}",
+                                    timestampUtc.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                                    barsCollection.GetOpen(i),
+                                    barsCollection.GetHigh(i),
+                                    barsCollection.GetLow(i),
+                                    barsCollection.GetClose(i),
+                                    barsCollection.GetVolume(i)
+                                );
+
+                                sw.WriteLine(row);
+
+                                // Flush based on stable minute key
+                                long minuteKeyUtc = long.Parse(timestampUtc.ToString("yyyyMMddHHmm"));
+                                if (minuteKeyUtc != lastFlushedMinuteKeyUtc)
+                                {
+                                    sw.Flush();
+                                    lastFlushedMinuteKeyUtc = minuteKeyUtc;
+                                }
+
+                                // Update authoritative timestamp only after successful write
+                                lastTimestampOnDiskUtc = timestampUtc;
+                                barsWritten++;
+                            }
+                        }
+
+                        success = true;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Print($"Exporter: Recovery cancelled");
+                        recoveryState = RecoveryState.LIVE;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        retryCount++;
+                        Print($"Exporter: Recovery request error (attempt {retryCount}/{maxRetries}): {ex.Message}");
+                        if (retryCount < maxRetries)
+                        {
+                            await Task.Delay(1000, cancellationToken); // Wait before retry
+                        }
+                        else
+                        {
+                            Print($"Exporter: ERROR in recovery after {maxRetries} attempts - {ex.Message}\n{ex.StackTrace}\nState: {recoveryState}, fromUtc: {fromUtc:yyyy-MM-dd HH:mm:ss} UTC, toUtc: {toUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                            recoveryState = RecoveryState.LIVE;
+                            return;
+                        }
+                    }
+                }
+
+                TimeSpan recoveryDuration = DateTime.UtcNow - recoveryStartTime;
+                Print($"Exporter: Recovery completed - barsReceived: {barsReceived}, barsWritten: {barsWritten}, barsSkipped: {barsSkipped}, duration: {recoveryDuration.TotalSeconds:F1}s, lastTimestampOnDiskUtc: {lastTimestampOnDiskUtc:yyyy-MM-dd HH:mm:ss} UTC");
+                recoveryState = RecoveryState.LIVE;
+            }
+            catch (OperationCanceledException)
+            {
+                Print($"Exporter: Recovery cancelled");
+                recoveryState = RecoveryState.LIVE;
+            }
+            catch (Exception ex)
+            {
+                Print($"Exporter: ERROR in RecoverMissingBarsAsync - {ex.Message}\n{ex.StackTrace}\nState: {recoveryState}");
+                recoveryState = RecoveryState.LIVE;
+            }
+            finally
+            {
+                recoveryCancellationTokenSource?.Dispose();
+                recoveryCancellationTokenSource = null;
             }
         }
     }

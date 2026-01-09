@@ -74,9 +74,21 @@ public sealed class ExecutionJournal
                     return diskEntry.EntrySubmitted || diskEntry.EntryFilled;
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // If journal is corrupted, treat as not submitted (fail open)
+                // Log error for observability (fail-open is correct, but errors should be visible)
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    new
+                    {
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        intent_id = intentId,
+                        stream = stream,
+                        trading_date = tradingDate,
+                        journal_path = journalPath,
+                        note = "Journal read failed, treating as not submitted (fail-open for idempotency)"
+                    }));
             }
         }
 
@@ -110,8 +122,21 @@ public sealed class ExecutionJournal
                 var json = File.ReadAllText(journalPath);
                 entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
             }
-            catch
+            catch (Exception ex)
             {
+                // Journal read failed, create new entry (fail-open)
+                // Log error for observability
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    new
+                    {
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        intent_id = intentId,
+                        stream = stream,
+                        trading_date = tradingDate,
+                        journal_path = journalPath,
+                        note = "Journal read failed during RecordSubmission, creating new entry"
+                    }));
                 entry = new ExecutionJournalEntry();
             }
         }
@@ -162,8 +187,21 @@ public sealed class ExecutionJournal
                     var json = File.ReadAllText(journalPath);
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    // Journal read failed, create new entry (fail-open)
+                    // Log error for observability
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            note = "Journal read failed during RecordFill, creating new entry"
+                        }));
                     entry = new ExecutionJournalEntry();
                 }
             }
@@ -204,8 +242,21 @@ public sealed class ExecutionJournal
                     var json = File.ReadAllText(journalPath);
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    // Journal read failed, create new entry (fail-open)
+                    // Log error for observability
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            note = "Journal read failed during RecordRejection, creating new entry"
+                        }));
                     entry = new ExecutionJournalEntry();
                 }
             }
@@ -245,8 +296,21 @@ public sealed class ExecutionJournal
                     var json = File.ReadAllText(journalPath);
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    // Journal read failed, create new entry (fail-open)
+                    // Log error for observability
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            note = "Journal read failed during RecordBEModification, creating new entry"
+                        }));
                     entry = new ExecutionJournalEntry();
                 }
             }
@@ -289,9 +353,21 @@ public sealed class ExecutionJournal
                     return diskEntry.BEModified;
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 // If journal is corrupted, treat as not modified (fail open)
+                // Log error for observability
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    new
+                    {
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        intent_id = intentId,
+                        stream = stream,
+                        trading_date = tradingDate,
+                        journal_path = journalPath,
+                        note = "Journal read failed during IsBEModified check, treating as not modified (fail-open)"
+                    }));
             }
         }
 

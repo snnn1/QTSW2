@@ -31,10 +31,23 @@ public sealed class RobotEngine
     private readonly ExecutionJournal _executionJournal;
     private readonly KillSwitch _killSwitch;
     private readonly ExecutionSummary _executionSummary;
+    private IBarProvider? _barProvider; // Optional: for historical bar hydration (SIM/DRYRUN modes)
 
     // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
     private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
     private const int BAR_HEARTBEAT_RATE_LIMIT_MINUTES = 1; // Log once per instrument per minute
+    
+    // ENGINE-level tick heartbeat diagnostic (rate-limited)
+    private DateTimeOffset _lastTickHeartbeat = DateTimeOffset.MinValue;
+    private const int TICK_HEARTBEAT_RATE_LIMIT_MINUTES = 1; // Log once per minute
+
+    /// <summary>
+    /// Set the bar provider for historical bar hydration (used when starting late).
+    /// </summary>
+    public void SetBarProvider(IBarProvider? barProvider)
+    {
+        _barProvider = barProvider;
+    }
 
     public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, bool useAsyncLogging = true)
     {
@@ -126,6 +139,21 @@ public sealed class RobotEngine
     public void Tick(DateTimeOffset utcNow)
     {
         if (_spec is null || _time is null) return;
+
+        // ENGINE_TICK_HEARTBEAT: Diagnostic to prove Tick is advancing even with zero bars
+        // Rate-limited to once per minute (DEBUG level, never affects execution)
+        var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
+        if (timeSinceLastTickHeartbeat >= TICK_HEARTBEAT_RATE_LIMIT_MINUTES || _lastTickHeartbeat == DateTimeOffset.MinValue)
+        {
+            _lastTickHeartbeat = utcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
+                new
+                {
+                    utc_now = utcNow.ToString("o"),
+                    active_stream_count = _streams.Count,
+                    note = "timer-based tick"
+                }));
+        }
 
         // Timetable reactivity
         if (_timetablePoller.ShouldPoll(utcNow))
@@ -464,7 +492,8 @@ public sealed class RobotEngine
                     }));
                 
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: null);
+                // Pass bar provider for historical hydration support (SIM/DRYRUN modes)
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: _barProvider);
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)

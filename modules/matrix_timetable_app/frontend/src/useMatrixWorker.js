@@ -376,6 +376,7 @@ export function useMatrixWorker() {
   
   return {
     workerReady,
+    dataInitialized,
     filteredLength,
     filteredIndices,
     filteredRows,
