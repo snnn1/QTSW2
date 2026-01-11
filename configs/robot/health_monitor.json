@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "data_stall_seconds": 180,
+  "robot_stall_seconds": 30,
+  "grace_period_seconds": 300,
+  "min_notify_interval_seconds": 600,
+  "pushover_enabled": true,
+  "pushover_user_key": "uvc42bmci94yv649k3ad1ypyjutw37",
+  "pushover_app_token": "athf4mwpmtxdpqpzhyh7pap2zvggk8",
+  "pushover_priority": 0
+}

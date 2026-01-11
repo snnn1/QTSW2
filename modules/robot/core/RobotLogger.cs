@@ -45,14 +45,6 @@ public sealed class RobotLogger
         }
     }
 
-    /// <summary>
-    /// Set the logging service reference (called after service is created).
-    /// </summary>
-    public void SetLoggingService(RobotLoggingService? service)
-    {
-        _loggingService = service;
-    }
-
     private static string SanitizeFileName(string instrument)
     {
         // Remove invalid filename characters and ensure safe for filesystem
@@ -72,9 +64,12 @@ public sealed class RobotLogger
         // - Execution events (has intent_id) → robot_<instrument>.jsonl (per-instrument)
         // - Stream events → robot_<instrument>.jsonl (per-instrument)
         // 
-        // If service is unavailable:
+        // Fallback behavior (when service unavailable or conversion fails):
         // - ENGINE events are DROPPED (never written synchronously to shared files)
         // - Other events fall back to per-instance files (safe, no contention)
+        //
+        // NOTE: RobotEngine always passes _loggingService in constructor, so fallback is rarely used.
+        // This fallback exists as a safety mechanism for edge cases (service unavailable, conversion errors).
         
         // Try to route through async service first (preferred path)
         if (_loggingService == null)
@@ -296,21 +291,11 @@ public static class RobotEvents
         };
     }
 
+    // Note: Timezone conversion now delegates to TimeService to avoid duplication.
+    // RobotEvents.EngineBase() and ExecutionBase() use this static helper when TimeService instance is not available.
     private static DateTimeOffset ConvertUtcToChicago(DateTimeOffset utcNow)
     {
-        var tz = ResolveChicagoTimeZone();
-        return TimeZoneInfo.ConvertTime(utcNow, tz);
-    }
-
-    private static TimeZoneInfo ResolveChicagoTimeZone()
-    {
-        var candidates = new[] { "America/Chicago", "Central Standard Time" };
-        foreach (var id in candidates)
-        {
-            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
-            catch { /* try next */ }
-        }
-        throw new TimeZoneNotFoundException("Could not resolve Chicago timezone (America/Chicago / Central Standard Time).");
+        return TimeService.ConvertUtcToChicagoStatic(utcNow);
     }
 }
 

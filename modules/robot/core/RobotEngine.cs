@@ -32,6 +32,7 @@ public sealed class RobotEngine
     private readonly KillSwitch _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private IBarProvider? _barProvider; // Optional: for historical bar hydration (SIM/DRYRUN modes)
+    private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
 
     // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
     private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
@@ -73,6 +74,26 @@ public sealed class RobotEngine
         _killSwitch = new KillSwitch(projectRoot, _log);
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
+        
+        // Initialize health monitor (fail-closed: if config missing/invalid, monitoring disabled)
+        try
+        {
+            var healthMonitorPath = Path.Combine(projectRoot, "configs", "robot", "health_monitor.json");
+            if (File.Exists(healthMonitorPath))
+            {
+                var healthMonitorJson = File.ReadAllText(healthMonitorPath);
+                var healthMonitorConfig = JsonUtil.Deserialize<HealthMonitorConfig>(healthMonitorJson);
+                if (healthMonitorConfig != null && healthMonitorConfig.Enabled)
+                {
+                    _healthMonitor = new HealthMonitor(projectRoot, healthMonitorConfig, _log);
+                }
+            }
+        }
+        catch
+        {
+            // Fail-closed: if config load fails, monitoring disabled (no alerts)
+            // Don't log error to avoid spam - monitoring is optional
+        }
     }
 
     public void Start()
@@ -110,7 +131,11 @@ public sealed class RobotEngine
             new { mode = _executionMode.ToString(), adapter = adapterType }));
 
         // Load timetable immediately (fail closed if invalid)
+        // Health monitor update happens automatically in ReloadTimetableIfChanged() → ApplyTimetable()
         ReloadTimetableIfChanged(utcNow, force: true);
+        
+        // Start health monitor if enabled
+        _healthMonitor?.Start();
     }
 
     public void Stop()
@@ -133,6 +158,9 @@ public sealed class RobotEngine
                 new { summary_path = summaryPath }));
         }
         
+        // Stop health monitor
+        _healthMonitor?.Stop();
+        
         // Release reference to async logging service (Fix B) - singleton will dispose when all references released
         _loggingService?.Release();
     }
@@ -140,6 +168,9 @@ public sealed class RobotEngine
     public void Tick(DateTimeOffset utcNow)
     {
         if (_spec is null || _time is null) return;
+
+        // Health monitor: record engine tick
+        _healthMonitor?.OnEngineTick(utcNow);
 
         // ENGINE_TICK_HEARTBEAT: Diagnostic to prove Tick is advancing even with zero bars
         // Rate-limited to once per minute (DEBUG level, never affects execution)
@@ -164,11 +195,17 @@ public sealed class RobotEngine
 
         foreach (var s in _streams.Values)
             s.Tick(utcNow);
+        
+        // Health monitor: evaluate staleness (rate-limited internally)
+        _healthMonitor?.Evaluate(utcNow);
     }
 
     public void OnBar(DateTimeOffset barUtc, string instrument, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
     {
         if (_spec is null || _time is null) return;
+
+        // Health monitor: record bar reception (early, before other processing)
+        _healthMonitor?.OnBar(instrument, barUtc);
 
         // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
         // This fires regardless of stream state or existence - pure observability
@@ -365,6 +402,12 @@ public sealed class RobotEngine
             new { trading_date = timetable.trading_date, is_replay = isReplayTimetable }));
 
         ApplyTimetable(timetable, tradingDate, utcNow);
+        
+        // Update health monitor with new timetable (for monitoring window computation)
+        if (_healthMonitor != null && _spec != null && _time != null)
+        {
+            _healthMonitor.UpdateTimetable(_spec, timetable, _time);
+        }
     }
 
     private void ApplyTimetable(TimetableContract timetable, DateOnly tradingDate, DateTimeOffset utcNow)
@@ -404,7 +447,10 @@ public sealed class RobotEngine
             {
                 // CRITICAL FIX: Use tradingDate parameter instead of _activeTradingDate
                 if (!string.IsNullOrWhiteSpace(slotTimeChicago))
-                    slotTimeUtc = _time.ConvertChicagoLocalToUtc(tradingDate, slotTimeChicago);
+                {
+                    var slotTimeChicagoTime = _time.ConstructChicagoTime(tradingDate, slotTimeChicago);
+                    slotTimeUtc = slotTimeChicagoTime.ToUniversalTime();
+                }
             }
             catch
             {
@@ -568,11 +614,12 @@ public sealed class RobotEngine
     }
 
     /// <summary>
-    /// Unified logging method: converts old event format to RobotLogEvent and logs via async service (Fix B) or fallback to sync logger.
+    /// Unified logging method: converts old event format to RobotLogEvent and logs via async service.
+    /// Falls back to RobotLogger.Write() if conversion fails (which handles its own fallback logic).
     /// </summary>
     private void LogEvent(object evt)
     {
-        // Try async logging service first (Fix B)
+        // Try async logging service first (preferred path)
         if (_loggingService != null && evt is Dictionary<string, object?> dict)
         {
             try
@@ -583,11 +630,11 @@ public sealed class RobotEngine
             }
             catch
             {
-                // Fall through to sync logger on conversion error
+                // Conversion failed - fall through to RobotLogger.Write() which has its own fallback logic
             }
         }
 
-        // Fallback to synchronous logger (backward compatibility)
+        // Fallback to RobotLogger.Write() (handles conversion and fallback internally)
         _log.Write(evt);
     }
 

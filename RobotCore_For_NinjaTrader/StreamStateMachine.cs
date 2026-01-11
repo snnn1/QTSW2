@@ -329,8 +329,43 @@ public sealed class StreamStateMachine
                 break;
 
             case StreamState.RANGE_BUILDING:
+                // SAFETY CHECK: If robot started after slot time passed, don't compute ranges or trade
+                // This prevents trading when robot wasn't running during the range window
+                if (utcNow >= SlotTimeUtc && !_rangeComputed)
+                {
+                    lock (_barBufferLock)
+                    {
+                        var barCount = _barBuffer.Count;
+                        
+                        // If slot time has passed AND we have no bars, robot started too late
+                        // Don't attempt range computation or trading
+                        if (barCount == 0)
+                        {
+                            var nowChicagoSkip = _time.ConvertUtcToChicago(utcNow);
+                            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                "LATE_START_SKIP", State.ToString(),
+                                new
+                                {
+                                    now_utc = utcNow.ToString("o"),
+                                    now_chicago = nowChicagoSkip.ToString("o"),
+                                    slot_time_chicago = SlotTimeChicago,
+                                    slot_time_utc = SlotTimeUtc.ToString("o"),
+                                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                    bar_buffer_count = barCount,
+                                    reason = "Robot started after slot time passed with no bars buffered - skipping range computation and trading",
+                                    message = "Robot was not running during range window - fail-closed safety check"
+                                }));
+                            
+                            // Commit stream as NO_TRADE due to late start
+                            Commit(utcNow, "NO_TRADE_LATE_START", "LATE_START_SKIP");
+                            break;
+                        }
+                    }
+                }
+                
                 // Hydrate from historical bars if starting late (only once, when entering RANGE_BUILDING)
-                if (!_rangeComputed && !_hydrationAttempted && _barProvider != null)
+                // Only attempt hydration if slot time hasn't passed yet, or if we have bars buffered
+                if (!_rangeComputed && !_hydrationAttempted && _barProvider != null && utcNow < SlotTimeUtc)
                 {
                     _hydrationAttempted = true;
                     TryHydrateFromHistory(utcNow);
@@ -345,21 +380,25 @@ public sealed class StreamStateMachine
                 if (!_lastSlotGateDiagnostic.HasValue || (utcNow - _lastSlotGateDiagnostic.Value).TotalSeconds >= 30 || gateDecision)
                 {
                     _lastSlotGateDiagnostic = utcNow;
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "SLOT_GATE_DIAGNOSTIC", State.ToString(),
-                        new
-                        {
-                            now_utc = utcNow.ToString("o"),
-                            now_chicago = nowChicago.ToString("o"),
-                            slot_time_chicago = SlotTimeChicago,
-                            slot_time_utc = SlotTimeUtc.ToString("o"),
-                            comparison_used = comparisonUsed,
-                            decision_result = gateDecision,
-                            stream_id = Stream,
-                            trading_date = TradingDate,
-                            range_computed_flag = _rangeComputed,
-                            time_until_slot_seconds = gateDecision ? 0 : (SlotTimeUtc - utcNow).TotalSeconds
-                        }));
+                    lock (_barBufferLock)
+                    {
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "SLOT_GATE_DIAGNOSTIC", State.ToString(),
+                            new
+                            {
+                                now_utc = utcNow.ToString("o"),
+                                now_chicago = nowChicago.ToString("o"),
+                                slot_time_chicago = SlotTimeChicago,
+                                slot_time_utc = SlotTimeUtc.ToString("o"),
+                                comparison_used = comparisonUsed,
+                                decision_result = gateDecision,
+                                stream_id = Stream,
+                                trading_date = TradingDate,
+                                range_computed_flag = _rangeComputed,
+                                bar_buffer_count = _barBuffer.Count,
+                                time_until_slot_seconds = gateDecision ? 0 : (SlotTimeUtc - utcNow).TotalSeconds
+                            }));
+                    }
                 }
                 
                 if (utcNow >= SlotTimeUtc && !_rangeComputed)

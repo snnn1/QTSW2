@@ -84,6 +84,16 @@ public sealed class TimeService
     public static bool TryParseDateOnly(string yyyyMmDd, out DateOnly date)
         => DateOnly.TryParseExact(yyyyMmDd, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out date);
 
+    /// <summary>
+    /// Static helper for timezone conversion when TimeService instance is not available.
+    /// Used by RobotEvents static methods. Prefer instance methods when TimeService is available.
+    /// </summary>
+    public static DateTimeOffset ConvertUtcToChicagoStatic(DateTimeOffset utcNow)
+    {
+        var tz = ResolveChicagoTimeZone();
+        return TimeZoneInfo.ConvertTime(utcNow, tz);
+    }
+
     private static TimeZoneInfo ResolveChicagoTimeZone()
     {
         // Windows uses "Central Standard Time"; Linux/macOS commonly use "America/Chicago".

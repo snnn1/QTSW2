@@ -27,7 +27,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 var projectRoot = QTSW2.Robot.Core.ProjectRootResolver.ResolveProjectRoot();
                 // Default to DRYRUN mode for Step-3; can be made configurable via strategy parameters
-                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), RobotMode.DRYRUN);
+                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.DRYRUN);
                 _engine.Start();
             }
             else if (State == State.Terminated)
