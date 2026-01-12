@@ -11,10 +11,22 @@ namespace QTSW2.Robot.Core.Notifications;
 /// </summary>
 public static class PushoverClient
 {
+    public const string PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json";
     private static readonly HttpClient _httpClient = new HttpClient
     {
         Timeout = TimeSpan.FromSeconds(5)
     };
+
+    /// <summary>
+    /// Result of a Pushover API call with full diagnostic details.
+    /// </summary>
+    public class SendResult
+    {
+        public bool Success { get; set; }
+        public int? HttpStatusCode { get; set; }
+        public string? ResponseBody { get; set; }
+        public Exception? Exception { get; set; }
+    }
 
     /// <summary>
     /// Send a push notification via Pushover API.
@@ -25,11 +37,17 @@ public static class PushoverClient
     /// <param name="title">Notification title</param>
     /// <param name="message">Notification message</param>
     /// <param name="priority">Priority (0 = normal, 1 = high, 2 = emergency)</param>
-    /// <returns>True if sent successfully, false otherwise</returns>
-    public static async Task<bool> SendAsync(string userKey, string appToken, string title, string message, int priority = 0)
+    /// <returns>SendResult with success status and full diagnostic details</returns>
+    public static async Task<SendResult> SendAsync(string userKey, string appToken, string title, string message, int priority = 0)
     {
+        var result = new SendResult();
+        
         if (string.IsNullOrWhiteSpace(userKey) || string.IsNullOrWhiteSpace(appToken))
-            return false;
+        {
+            result.Success = false;
+            result.Exception = new ArgumentException("User key or app token is null or empty");
+            return result;
+        }
 
         try
         {
@@ -39,17 +57,50 @@ public static class PushoverClient
             formData.Append($"&title={Uri.EscapeDataString(title)}");
             formData.Append($"&message={Uri.EscapeDataString(message)}");
             formData.Append($"&priority={priority}");
+            
+            // Priority 2 (emergency) requires both expire and retry parameters
+            // expire: maximum time in seconds that the notification will be retried (max 10800 = 3 hours)
+            // retry: how often in seconds the notification will be retried (min 30 seconds)
+            // Set expire to 3600 seconds (1 hour) and retry to 60 seconds (retry every minute)
+            if (priority == 2)
+            {
+                formData.Append($"&expire=3600");
+                formData.Append($"&retry=60");
+            }
 
             var content = new StringContent(formData.ToString(), Encoding.UTF8, "application/x-www-form-urlencoded");
 
-            var response = await _httpClient.PostAsync("https://api.pushover.net/1/messages.json", content);
+            var response = await _httpClient.PostAsync(PUSHOVER_ENDPOINT, content);
             
-            return response.IsSuccessStatusCode;
+            result.HttpStatusCode = (int)response.StatusCode;
+            result.ResponseBody = await response.Content.ReadAsStringAsync();
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                result.Success = false;
+                result.Exception = new HttpRequestException($"Pushover API returned non-success status code: {response.StatusCode}");
+            }
+            else
+            {
+                result.Success = true;
+            }
         }
-        catch
+        catch (HttpRequestException ex)
         {
-            // Swallow exceptions - notification failures should not crash the robot
-            return false;
+            result.Success = false;
+            result.Exception = ex;
         }
+        catch (TaskCanceledException ex)
+        {
+            result.Success = false;
+            result.Exception = ex;
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Exception = ex;
+        }
+        
+        return result;
     }
 }

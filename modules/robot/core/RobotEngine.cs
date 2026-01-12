@@ -83,16 +83,48 @@ public sealed class RobotEngine
             {
                 var healthMonitorJson = File.ReadAllText(healthMonitorPath);
                 var healthMonitorConfig = JsonUtil.Deserialize<HealthMonitorConfig>(healthMonitorJson);
-                if (healthMonitorConfig != null && healthMonitorConfig.Enabled)
+                if (healthMonitorConfig != null)
                 {
-                    _healthMonitor = new HealthMonitor(projectRoot, healthMonitorConfig, _log);
+                    // Log config load result for debugging
+                    LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_CONFIG_LOADED", state: "ENGINE",
+                        new
+                        {
+                            enabled = healthMonitorConfig.enabled,
+                            enabled_property = healthMonitorConfig.enabled,
+                            pushover_enabled = healthMonitorConfig.pushover_enabled,
+                            pushover_user_key_length = healthMonitorConfig.pushover_user_key?.Length ?? 0,
+                            pushover_app_token_length = healthMonitorConfig.pushover_app_token?.Length ?? 0,
+                            config_not_null = true
+                        }));
+                    
+                    if (healthMonitorConfig.enabled)
+                    {
+                        _healthMonitor = new HealthMonitor(projectRoot, healthMonitorConfig, _log);
+                    }
+                    else
+                    {
+                        LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_DISABLED", state: "ENGINE",
+                            new { reason = "config_enabled_false" }));
+                    }
+                }
+                else
+                {
+                    LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_CONFIG_NULL", state: "ENGINE",
+                        new { reason = "deserialization_returned_null" }));
                 }
             }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_CONFIG_MISSING", state: "ENGINE",
+                    new { path = healthMonitorPath }));
+            }
         }
-        catch
+        catch (Exception ex)
         {
             // Fail-closed: if config load fails, monitoring disabled (no alerts)
-            // Don't log error to avoid spam - monitoring is optional
+            // Log error for debugging (was previously silent)
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_CONFIG_ERROR", state: "ENGINE",
+                new { error = ex.Message, error_type = ex.GetType().Name }));
         }
     }
 

@@ -58,7 +58,7 @@ public sealed class NotificationService : IDisposable
     public void EnqueueNotification(string key, string title, string message, int priority)
     {
         if (_disposed) return;
-        if (!_config.PushoverEnabled) return;
+        if (!_config.pushover_enabled) return;
         
         // Backpressure: if queue exceeds max size, drop INFO-level notifications; never drop ERROR-level
         if (_queue.Count >= MAX_QUEUE_SIZE)
@@ -115,6 +115,57 @@ public sealed class NotificationService : IDisposable
         _backgroundWorker = null;
     }
     
+    /// <summary>
+    /// Format exception chain recursively for logging.
+    /// </summary>
+    private static string FormatExceptionChain(Exception ex, int maxDepth = 10)
+    {
+        var sb = new System.Text.StringBuilder();
+        var current = ex;
+        int depth = 0;
+        
+        while (current != null && depth < maxDepth)
+        {
+            if (depth > 0)
+                sb.Append(" -> ");
+            
+            sb.Append($"Type={current.GetType().Name}, Message={current.Message}");
+            
+            if (current.StackTrace != null)
+            {
+                var stackTrace = current.StackTrace.Replace("\r", "").Replace("\n", " | ");
+                var truncatedStackTrace = stackTrace.Length > 1000 ? stackTrace.Substring(0, 1000) + "..." : stackTrace;
+                sb.Append($", StackTrace={truncatedStackTrace}");
+            }
+            
+            current = current.InnerException;
+            depth++;
+        }
+        
+        return sb.ToString();
+    }
+    
+    /// <summary>
+    /// Write log entry to notification_errors.log.
+    /// </summary>
+    private void WriteNotificationLog(string level, string message)
+    {
+        try
+        {
+            var logPath = System.IO.Path.Combine(_projectRoot, "logs", "robot", "notification_errors.log");
+            var logDir = System.IO.Path.GetDirectoryName(logPath);
+            if (!System.IO.Directory.Exists(logDir))
+                System.IO.Directory.CreateDirectory(logDir);
+            
+            var logLine = $"{DateTimeOffset.UtcNow:o} [{level}] {message}\n";
+            System.IO.File.AppendAllText(logPath, logLine);
+        }
+        catch
+        {
+            // If logging fails, ignore it (don't crash the robot)
+        }
+    }
+    
     private async Task WorkerLoop(CancellationToken cancellationToken)
     {
         Thread.CurrentThread.IsBackground = true;
@@ -126,21 +177,52 @@ public sealed class NotificationService : IDisposable
                 if (_queue.TryDequeue(out var request))
                 {
                     // Send notification via Pushover (await directly since we're already in background task)
-                    try
+                    var result = await PushoverClient.SendAsync(
+                        _config.pushover_user_key,
+                        _config.pushover_app_token,
+                        request.Title,
+                        request.Message,
+                        request.Priority
+                    );
+                    
+                    if (result.Success)
                     {
-                        var success = await PushoverClient.SendAsync(
-                            _config.PushoverUserKey,
-                            _config.PushoverAppToken,
-                            request.Title,
-                            request.Message,
-                            request.Priority
-                        );
-                        
-                        // Note: Logging of send success/failure is handled by HealthMonitor
+                        // Log success (INFO level)
+                        WriteNotificationLog("INFO", 
+                            $"Pushover notification sent successfully: " +
+                            $"Key={request.Key}, " +
+                            $"Title={request.Title}, " +
+                            $"Priority={request.Priority}, " +
+                            $"HttpStatusCode={result.HttpStatusCode}, " +
+                            $"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
                     }
-                    catch
+                    else
                     {
-                        // Swallow exceptions - notification failures should not crash the robot
+                        // Log failure (ERROR level) with full diagnostic details
+                        var errorParts = new System.Text.StringBuilder();
+                        errorParts.Append($"Pushover notification failed: ");
+                        errorParts.Append($"Key={request.Key}, ");
+                        errorParts.Append($"Title={request.Title}, ");
+                        errorParts.Append($"Priority={request.Priority}, ");
+                        errorParts.Append($"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
+                        
+                        if (result.HttpStatusCode.HasValue)
+                        {
+                            errorParts.Append($", HttpStatusCode={result.HttpStatusCode.Value}");
+                        }
+                        
+                        if (!string.IsNullOrWhiteSpace(result.ResponseBody))
+                        {
+                            var sanitizedBody = result.ResponseBody.Replace("\r", "").Replace("\n", " ");
+                            errorParts.Append($", ResponseBody={sanitizedBody}");
+                        }
+                        
+                        if (result.Exception != null)
+                        {
+                            errorParts.Append($", Exception={FormatExceptionChain(result.Exception)}");
+                        }
+                        
+                        WriteNotificationLog("ERROR", errorParts.ToString());
                     }
                 }
                 else
@@ -153,9 +235,12 @@ public sealed class NotificationService : IDisposable
                 // Expected when cancellation token is triggered
                 break;
             }
-            catch
+            catch (Exception ex)
             {
-                // Swallow exceptions - notification failures should not crash the robot
+                // Log unexpected exception in worker loop (but don't crash)
+                WriteNotificationLog("ERROR", 
+                    $"Unexpected exception in notification worker loop: " +
+                    $"Exception={FormatExceptionChain(ex)}");
                 await Task.Delay(1000, cancellationToken);
             }
         }
