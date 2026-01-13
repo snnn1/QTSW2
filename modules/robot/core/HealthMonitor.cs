@@ -30,8 +30,12 @@ public sealed class HealthMonitor
     // Incident state
     private readonly Dictionary<string, bool> _dataStallActive = new(StringComparer.OrdinalIgnoreCase);
     private bool _connectionLostActive = false;
+    private bool _connectionLostNotified = false; // Track if notification already sent
     private bool _engineTickStallActive = false;
     private bool _timetablePollStallActive = false;
+    
+    // Session awareness: callback to check if any streams are in active trading state
+    private Func<bool>? _hasActiveStreamsCallback;
     
     // Rate limiting
     private readonly Dictionary<string, DateTimeOffset> _lastNotifyUtcByKey = new(StringComparer.OrdinalIgnoreCase);
@@ -44,8 +48,12 @@ public sealed class HealthMonitor
     private const int EVALUATION_INTERVAL_SECONDS = 5; // Evaluate every 5 seconds
     
     // PHASE 3: Stall detection thresholds
-    private const int ENGINE_TICK_STALL_SECONDS = 30; // Engine tick should occur at least every 30 seconds
+    private const int ENGINE_TICK_STALL_SECONDS = 120; // Engine tick should occur at least every 120 seconds (increased for noise reduction)
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
+    
+    // Connection loss: require sustained disconnection before notifying
+    private DateTimeOffset? _connectionLostFirstDetectedUtc = null;
+    private const int CONNECTION_LOST_SUSTAINED_SECONDS = 60; // Must be disconnected for 60+ seconds before notifying
     
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
@@ -59,8 +67,24 @@ public sealed class HealthMonitor
     }
     
     /// <summary>
+    /// Set callback to check if any streams are in active trading state (for session awareness).
+    /// </summary>
+    public void SetActiveStreamsCallback(Func<bool>? callback)
+    {
+        _hasActiveStreamsCallback = callback;
+    }
+    
+    /// <summary>
+    /// Check if any streams are in active trading state (ARMED, RANGE_BUILDING, or RANGE_LOCKED).
+    /// </summary>
+    private bool HasActiveStreams()
+    {
+        return _hasActiveStreamsCallback?.Invoke() ?? false;
+    }
+    
+    /// <summary>
     /// Handle NinjaTrader connection status update.
-    /// Triggers immediate alert on first transition to disconnected state.
+    /// Notifies only if sustained disconnection (60+ seconds) during active trading.
     /// </summary>
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName, DateTimeOffset utcNow)
     {
@@ -75,29 +99,56 @@ public sealed class HealthMonitor
         {
             if (!_connectionLostActive)
             {
-                // First detection: mark active and notify
+                // First detection: mark active and record timestamp
                 _connectionLostActive = true;
-                
-                var title = "Connection Lost";
-                var message = $"NinjaTrader connection lost: {connectionName}. Status: {status}";
+                _connectionLostFirstDetectedUtc = utcNow;
+                _connectionLostNotified = false;
                 
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST", state: "ENGINE",
                     new
                     {
                         connection_name = connectionName,
                         connection_status = status.ToString(),
-                        timestamp_utc = utcNow.ToString("o")
+                        timestamp_utc = utcNow.ToString("o"),
+                        note = "Connection lost detected, waiting for sustained period before notification"
                     }));
-                
-                SendNotification("CONNECTION_LOST", title, message, priority: 2); // Emergency priority
+            }
+            else if (!_connectionLostNotified && _connectionLostFirstDetectedUtc.HasValue)
+            {
+                // Check if disconnection has been sustained for threshold period
+                var elapsed = (utcNow - _connectionLostFirstDetectedUtc.Value).TotalSeconds;
+                if (elapsed >= CONNECTION_LOST_SUSTAINED_SECONDS)
+                {
+                    // Only notify if streams are active (session-aware)
+                    if (HasActiveStreams())
+                    {
+                        _connectionLostNotified = true;
+                        
+                        var title = "Connection Lost (Sustained)";
+                        var message = $"NinjaTrader connection lost for {elapsed:F0}s: {connectionName}. Status: {status}";
+                        
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST_SUSTAINED", state: "ENGINE",
+                            new
+                            {
+                                connection_name = connectionName,
+                                connection_status = status.ToString(),
+                                elapsed_seconds = elapsed,
+                                timestamp_utc = utcNow.ToString("o")
+                            }));
+                        
+                        SendNotification("CONNECTION_LOST", title, message, priority: 2, skipRateLimit: true); // Emergency priority, no rate limit
+                    }
+                }
             }
         }
         else
         {
-            // Connection restored: clear flag and log recovery (no notification)
+            // Connection restored: clear flags and log recovery (no notification)
             if (_connectionLostActive)
             {
                 _connectionLostActive = false;
+                _connectionLostFirstDetectedUtc = null;
+                _connectionLostNotified = false;
                 
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_RECOVERED", state: "ENGINE",
                     new
@@ -201,11 +252,16 @@ public sealed class HealthMonitor
     
     /// <summary>
     /// PHASE 3: Evaluate engine tick stall.
+    /// Session-aware: only evaluates during active trading windows.
     /// </summary>
     private void EvaluateEngineTickStall(DateTimeOffset utcNow)
     {
         if (_lastEngineTickUtc == DateTimeOffset.MinValue)
             return; // Engine not started yet
+        
+        // Session awareness: only check during active trading
+        if (!HasActiveStreams())
+            return; // Suppress during startup/shutdown/outside sessions
         
         var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
         
@@ -226,13 +282,14 @@ public sealed class HealthMonitor
                         threshold_seconds = ENGINE_TICK_STALL_SECONDS
                     }));
                 
-                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2); // Emergency priority
+                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipRateLimit: true); // Emergency priority, no rate limit
             }
         }
     }
     
     /// <summary>
     /// PHASE 3: Evaluate timetable poll stall.
+    /// DISABLED: Notifications suppressed (log only) - non-execution-critical.
     /// </summary>
     private void EvaluateTimetablePollStall(DateTimeOffset utcNow)
     {
@@ -247,18 +304,18 @@ public sealed class HealthMonitor
             {
                 _timetablePollStallActive = true;
                 
-                var title = "Timetable Poll Stall Detected";
-                var message = $"Timetable polling has not occurred for {elapsed:F0}s. Last poll: {_lastTimetablePollUtc:o} UTC. Threshold: {TIMETABLE_POLL_STALL_SECONDS}s";
-                
+                // LOG ONLY - no notification (non-execution-critical)
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_DETECTED", state: "ENGINE",
                     new
                     {
                         last_poll_utc = _lastTimetablePollUtc.ToString("o"),
                         elapsed_seconds = elapsed,
-                        threshold_seconds = TIMETABLE_POLL_STALL_SECONDS
+                        threshold_seconds = TIMETABLE_POLL_STALL_SECONDS,
+                        note = "Notification suppressed - non-execution-critical (log only)"
                     }));
                 
-                SendNotification("TIMETABLE_POLL_STALL", title, message, priority: 1); // High priority
+                // NOTIFICATION DISABLED: Timetable poll stall is non-execution-critical
+                // SendNotification("TIMETABLE_POLL_STALL", title, message, priority: 1);
             }
         }
     }
@@ -276,7 +333,7 @@ public sealed class HealthMonitor
     
     /// <summary>
     /// PHASE 4: Evaluate data stalls (session-aware).
-    /// Only checks during active monitoring windows (relaxed outside sessions).
+    /// DISABLED: Notifications suppressed (log only) - handled by gap tolerance + range invalidation.
     /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
@@ -288,46 +345,49 @@ public sealed class HealthMonitor
             var lastBarUtc = _lastBarUtcByInstrument[instrument];
             var elapsed = (utcNow - lastBarUtc).TotalSeconds;
             
-            // PHASE 4: Session-aware check - for now, use standard threshold
-            // TODO: Adjust threshold based on active session windows
             var threshold = _config.data_stall_seconds;
             
             if (elapsed >= threshold)
             {
                 if (!_dataStallActive.TryGetValue(instrument, out var isActive) || !isActive)
                 {
-                    // First detection: mark active and notify
+                    // First detection: mark active and log (no notification)
                     _dataStallActive[instrument] = true;
                     
-                    var title = $"Data Loss: {instrument}";
-                    var message = $"No bars received for {instrument}. Last bar: {lastBarUtc:o} UTC ({elapsed:F0}s ago). Threshold: {threshold}s";
-                    
+                    // LOG ONLY - no notification (handled by gap tolerance + range invalidation)
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
                         new
                         {
                             instrument = instrument,
                             last_bar_utc = lastBarUtc.ToString("o"),
                             elapsed_seconds = elapsed,
-                            threshold_seconds = threshold
+                            threshold_seconds = threshold,
+                            note = "Notification suppressed - handled by gap tolerance + range invalidation (log only)"
                         }));
                     
-                    SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1); // High priority
+                    // NOTIFICATION DISABLED: Data loss is handled by gap tolerance + range invalidation
+                    // SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1);
                 }
             }
         }
     }
     
-    private void SendNotification(string key, string title, string message, int priority)
+    private void SendNotification(string key, string title, string message, int priority, bool skipRateLimit = false)
     {
         if (_notificationService == null)
             return;
         
-        // Check rate limit
-        if (_lastNotifyUtcByKey.TryGetValue(key, out var lastNotify))
+        // Emergency notifications (priority 2) skip rate limiting
+        // All other notifications respect rate limit
+        if (!skipRateLimit && priority < 2)
         {
-            var timeSinceLastNotify = (DateTimeOffset.UtcNow - lastNotify).TotalSeconds;
-            if (timeSinceLastNotify < _config.min_notify_interval_seconds)
-                return; // Rate limited
+            // Check rate limit for non-emergency notifications
+            if (_lastNotifyUtcByKey.TryGetValue(key, out var lastNotify))
+            {
+                var timeSinceLastNotify = (DateTimeOffset.UtcNow - lastNotify).TotalSeconds;
+                if (timeSinceLastNotify < _config.min_notify_interval_seconds)
+                    return; // Rate limited
+            }
         }
         
         _lastNotifyUtcByKey[key] = DateTimeOffset.UtcNow;
@@ -343,6 +403,7 @@ public sealed class HealthMonitor
                 title = title,
                 message = message,
                 priority = priority,
+                skip_rate_limit = skipRateLimit,
                 pushover_configured = true,
                 note = "Notification enqueued (actual send handled by background worker, check notification_errors.log for send results)"
             }));

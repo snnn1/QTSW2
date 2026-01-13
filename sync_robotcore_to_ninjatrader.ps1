@@ -1,5 +1,10 @@
 # Sync Robot.Core source files to RobotCore_For_NinjaTrader directory
 # This ensures NinjaTrader always has the latest source files
+#
+# IMPORTANT: StreamStateMachine.cs MUST remain synchronized between:
+#   - modules/robot/core/StreamStateMachine.cs (source - edit here)
+#   - RobotCore_For_NinjaTrader/StreamStateMachine.cs (copy - auto-synced)
+# Always edit the source file, never edit the copy directly!
 
 param(
     [switch]$WhatIf,

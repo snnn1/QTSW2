@@ -57,12 +57,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var environment = _simAccountVerified ? "SIM" : "UNKNOWN";
                 _engine.SetAccountInfo(accountName, environment);
                 
+                // Start engine
                 _engine.Start();
-
-                // Set bar provider for historical hydration (late start support)
-                // Create provider that accesses NinjaTrader Bars collection
-                var barProvider = new NinjaTraderBarProviderWrapper(this, _engine);
-                _engine.SetBarProvider(barProvider);
 
                 // Get the adapter instance and wire NT context
                 // Note: This requires exposing adapter from engine or using dependency injection

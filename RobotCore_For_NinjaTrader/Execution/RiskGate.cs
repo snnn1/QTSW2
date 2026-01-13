@@ -33,7 +33,6 @@ public sealed class RiskGate
         string? slotTimeChicago,
         bool timetableValidated,
         bool streamArmed,
-        string completenessFlag,
         DateTimeOffset utcNow)
     {
         // Gate 1: Kill switch
@@ -68,26 +67,11 @@ public sealed class RiskGate
             return (false, "SLOT_TIME_NOT_ALLOWED");
         }
 
-        // Gate 5: Intent completeness
-        if (completenessFlag != "COMPLETE")
-        {
-            return (false, "INTENT_INCOMPLETE");
-        }
-
-        // Gate 6: Replay invariant (if in replay mode)
+        // Gate 5: Replay invariant (if in replay mode)
         // This is checked at bar processing level, but verify trading_date is set
         if (string.IsNullOrEmpty(tradingDate))
         {
             return (false, "TRADING_DATE_NOT_SET");
-        }
-
-        // Gate 7: Execution mode validation
-        var executionModeOk = executionMode != ExecutionMode.LIVE; // SIM and DRYRUN can execute
-        if (!executionModeOk)
-        {
-            // LIVE mode requires additional checks (see Phase C)
-            // For now, fail closed
-            return (false, "LIVE_MODE_NOT_ENABLED");
         }
 
         // All gates passed

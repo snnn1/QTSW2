@@ -32,7 +32,6 @@ public sealed class RobotEngine
     private readonly ExecutionJournal _executionJournal;
     private readonly KillSwitch _killSwitch;
     private readonly ExecutionSummary _executionSummary;
-    private IBarProvider? _barProvider; // Optional: for historical bar hydration (SIM/DRYRUN modes)
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
 
     // Logging configuration
@@ -63,13 +62,6 @@ public sealed class RobotEngine
         _environment = environment;
     }
 
-    /// <summary>
-    /// Set the bar provider for historical bar hydration (used when starting late).
-    /// </summary>
-    public void SetBarProvider(IBarProvider? barProvider)
-    {
-        _barProvider = barProvider;
-    }
     
     /// <summary>
     /// Get last tick timestamp for liveness monitoring.
@@ -129,6 +121,8 @@ public sealed class RobotEngine
                     if (healthMonitorConfig.enabled)
                     {
                         _healthMonitor = new HealthMonitor(projectRoot, healthMonitorConfig, _log);
+                        // Set session awareness callback: check if any streams are in active trading state
+                        _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
                     }
                     else
                     {
@@ -236,6 +230,9 @@ public sealed class RobotEngine
         // Health monitor update happens automatically in ReloadTimetableIfChanged() → ApplyTimetable()
         ReloadTimetableIfChanged(utcNow, force: true);
         
+        // Check if strategy started after range window for any stream
+        CheckStartupTiming(utcNow);
+        
         // PHASE 1: Emit startup operator banner with execution mode, account, environment, timetable info
         EmitStartupBanner(utcNow);
         
@@ -244,6 +241,51 @@ public sealed class RobotEngine
         
         // Start health monitor if enabled
         _healthMonitor?.Start();
+    }
+    
+    /// <summary>
+    /// Check if strategy started after range window and log warning if so.
+    /// </summary>
+    private void CheckStartupTiming(DateTimeOffset utcNow)
+    {
+        if (_spec is null || _time is null) return;
+        
+        foreach (var stream in _streams.Values)
+        {
+            if (utcNow >= stream.RangeStartUtc)
+            {
+                var nowChicago = _time.ConvertUtcToChicago(utcNow);
+                var rangeStartChicago = _time.ConvertUtcToChicago(stream.RangeStartUtc);
+                
+                LogEvent(RobotEvents.Base(_time, utcNow, stream.TradingDate, stream.Stream, stream.Instrument, stream.Session, stream.SlotTimeChicago, stream.SlotTimeUtc,
+                    "STARTUP_TIMING_WARNING", "ENGINE",
+                    new
+                    {
+                        warning = "Strategy started after range window — range may be incomplete or unavailable",
+                        stream_id = stream.Stream,
+                        instrument = stream.Instrument,
+                        session = stream.Session,
+                        now_utc = utcNow.ToString("o"),
+                        now_chicago = nowChicago.ToString("o"),
+                        range_start_utc = stream.RangeStartUtc.ToString("o"),
+                        range_start_chicago = rangeStartChicago.ToString("o"),
+                        slot_time_chicago = stream.SlotTimeChicago,
+                        note = "Ensure NinjaTrader 'Days to load' setting includes historical data for the range window"
+                    }));
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Check if any streams are in active trading state (ARMED, RANGE_BUILDING, or RANGE_LOCKED).
+    /// Used for session-aware notification filtering.
+    /// </summary>
+    private bool HasActiveStreams()
+    {
+        return _streams.Values.Any(s => !s.Committed && 
+            (s.State == StreamState.ARMED || 
+             s.State == StreamState.RANGE_BUILDING || 
+             s.State == StreamState.RANGE_LOCKED));
     }
     
     /// <summary>
@@ -680,20 +722,26 @@ public sealed class RobotEngine
             else
             {
                 // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
-                // Note: IBarProvider is null for live/SIM modes (bars come via OnBar). For DRYRUN mode with historical replay, 
-                // IBarProvider would be passed here if available, but currently RobotEngine doesn't maintain one.
                 
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
-                // Pass bar provider for historical hydration support (SIM/DRYRUN modes)
                 // Pass logging config for diagnostic control
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: _barProvider, loggingConfig: _loggingConfig);
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
                 
-                // PHASE 4: Set alert callback for missing data incidents
+                // PHASE 4: Set alert callback for high-priority alerts only (RANGE_INVALIDATED)
+                // Non-critical alerts (gaps, pre-hydration, state transitions) are logged only, not notified
                 var notificationService = GetNotificationService();
                 if (notificationService != null)
                 {
                     newSm.SetAlertCallback((key, title, message, priority) => 
-                        notificationService.EnqueueNotification(key, title, message, priority));
+                    {
+                        // Only notify for RANGE_INVALIDATED (handled in StreamStateMachine)
+                        // All other alerts are logged only (no notification)
+                        if (key.StartsWith("RANGE_INVALIDATED:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            notificationService.EnqueueNotification(key, title, message, priority);
+                        }
+                        // All other alert callbacks are suppressed (log only)
+                    });
                 }
                 
                 _streams[streamId] = newSm;
