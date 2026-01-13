@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -37,6 +38,12 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument
     private bool _simAccountVerified = false;
     private bool _ntContextSet = false;
+    
+    // PHASE 2: Callback to stand down stream on protective order failure
+    private Action<string, DateTimeOffset, string>? _standDownStreamCallback;
+    
+    // PHASE 2: Callback to get notification service for alerts
+    private Func<object?>? _getNotificationServiceCallback;
 
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
@@ -46,6 +53,15 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         
         // Note: SIM account verification happens when NT context is set via SetNTContext()
         // This allows adapter to work in both harness (mock) and NT Strategy (real) contexts
+    }
+    
+    /// <summary>
+    /// PHASE 2: Set callbacks for stream stand-down and notification service access.
+    /// </summary>
+    public void SetEngineCallbacks(Action<string, DateTimeOffset, string>? standDownStreamCallback, Func<object?>? getNotificationServiceCallback)
+    {
+        _standDownStreamCallback = standDownStreamCallback;
+        _getNotificationServiceCallback = getNotificationServiceCallback;
     }
 
     /// <summary>
@@ -247,7 +263,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     }
     
     /// <summary>
-    /// STEP 4: Handle entry fill and submit protective orders.
+    /// PHASE 2: Handle entry fill and submit protective orders with retry and failure recovery.
     /// </summary>
     private void HandleEntryFill(string intentId, Intent intent, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow)
     {
@@ -258,48 +274,155 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return;
         }
         
-        // Submit protective stop
-        var stopResult = SubmitProtectiveStop(
-            intentId,
-            intent.Instrument,
-            intent.Direction,
-            intent.StopPrice.Value,
-            fillQuantity,
-            utcNow);
+        // PHASE 2: Submit protective stop with retry
+        const int MAX_RETRIES = 3;
+        const int RETRY_DELAY_MS = 100;
         
-        if (!stopResult.Success)
+        OrderSubmissionResult? stopResult = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
-                new { error = $"Stop order submission failed: {stopResult.ErrorMessage}", intent_id = intentId }));
+            if (attempt > 0)
+            {
+                System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+            }
+            
+            stopResult = SubmitProtectiveStop(
+                intentId,
+                intent.Instrument,
+                intent.Direction,
+                intent.StopPrice.Value,
+                fillQuantity,
+                utcNow);
+            
+            if (stopResult.Success)
+                break;
         }
         
-        // Submit target order
-        var targetResult = SubmitTargetOrder(
-            intentId,
-            intent.Instrument,
-            intent.Direction,
-            intent.TargetPrice.Value,
-            fillQuantity,
-            utcNow);
-        
-        if (!targetResult.Success)
+        // PHASE 2: Submit target order with retry
+        OrderSubmissionResult? targetResult = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
-                new { error = $"Target order submission failed: {targetResult.ErrorMessage}", intent_id = intentId }));
+            if (attempt > 0)
+            {
+                System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+            }
+            
+            targetResult = SubmitTargetOrder(
+                intentId,
+                intent.Instrument,
+                intent.Direction,
+                intent.TargetPrice.Value,
+                fillQuantity,
+                utcNow);
+            
+            if (targetResult.Success)
+                break;
         }
         
-        // Log protective orders submitted
-        if (stopResult.Success && targetResult.Success)
+        // PHASE 2: If either protective leg failed after retries, flatten position and stand down stream
+        if (!stopResult.Success || !targetResult.Success)
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_SUBMITTED",
+            var failedLegs = new List<string>();
+            if (!stopResult.Success) failedLegs.Add($"STOP: {stopResult.ErrorMessage}");
+            if (!targetResult.Success) failedLegs.Add($"TARGET: {targetResult.ErrorMessage}");
+            
+            var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: {string.Join(", ", failedLegs)}";
+            
+            // Flatten position immediately
+            var flattenResult = Flatten(intentId, intent.Instrument, utcNow);
+            
+            // Stand down stream
+            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDER_FAILURE: {failureReason}");
+            
+            // Persist incident record
+            PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, flattenResult, utcNow);
+            
+            // Raise high-priority alert
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                var title = $"CRITICAL: Protective Order Failure - {intent.Instrument}";
+                var message = $"Entry filled but protective orders failed. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. Failures: {failureReason}";
+                notificationService.EnqueueNotification($"PROTECTIVE_FAILURE:{intentId}", title, message, priority: 2); // Emergency priority
+            }
+            
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_FAILED_FLATTENED",
                 new
                 {
-                    stop_order_id = stopResult.BrokerOrderId,
-                    target_order_id = targetResult.BrokerOrderId,
-                    stop_price = intent.StopPrice,
-                    target_price = intent.TargetPrice,
-                    quantity = fillQuantity
+                    intent_id = intentId,
+                    stream = intent.Stream,
+                    instrument = intent.Instrument,
+                    stop_success = stopResult.Success,
+                    stop_error = stopResult.ErrorMessage,
+                    target_success = targetResult.Success,
+                    target_error = targetResult.ErrorMessage,
+                    flatten_success = flattenResult.Success,
+                    flatten_error = flattenResult.ErrorMessage,
+                    failure_reason = failureReason,
+                    retry_count = MAX_RETRIES,
+                    note = "Position flattened and stream stood down due to protective order failure"
                 }));
+            
+            return;
+        }
+        
+        // Log protective orders submitted successfully
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_SUBMITTED",
+            new
+            {
+                stop_order_id = stopResult.BrokerOrderId,
+                target_order_id = targetResult.BrokerOrderId,
+                stop_price = intent.StopPrice,
+                target_price = intent.TargetPrice,
+                quantity = fillQuantity
+            }));
+    }
+    
+    /// <summary>
+    /// PHASE 2: Persist protective order failure incident record.
+    /// </summary>
+    private void PersistProtectiveFailureIncident(
+        string intentId,
+        Intent intent,
+        OrderSubmissionResult? stopResult,
+        OrderSubmissionResult? targetResult,
+        FlattenResult flattenResult,
+        DateTimeOffset utcNow)
+    {
+        try
+        {
+            var incidentDir = System.IO.Path.Combine(_projectRoot, "data", "execution_incidents");
+            System.IO.Directory.CreateDirectory(incidentDir);
+            
+            var incidentPath = System.IO.Path.Combine(incidentDir, $"protective_failure_{intentId}_{utcNow:yyyyMMddHHmmss}.json");
+            
+            var incident = new
+            {
+                incident_type = "PROTECTIVE_ORDER_FAILURE",
+                timestamp_utc = utcNow.ToString("o"),
+                intent_id = intentId,
+                trading_date = intent.TradingDate,
+                stream = intent.Stream,
+                instrument = intent.Instrument,
+                session = intent.Session,
+                direction = intent.Direction,
+                entry_price = intent.EntryPrice,
+                stop_price = intent.StopPrice,
+                target_price = intent.TargetPrice,
+                stop_result = stopResult != null ? new { success = stopResult.Success, error = stopResult.ErrorMessage, broker_order_id = stopResult.BrokerOrderId } : null,
+                target_result = targetResult != null ? new { success = targetResult.Success, error = targetResult.ErrorMessage, broker_order_id = targetResult.BrokerOrderId } : null,
+                flatten_result = new { success = flattenResult.Success, error = flattenResult.ErrorMessage },
+                action_taken = "POSITION_FLATTENED_STREAM_STOOD_DOWN"
+            };
+            
+            var json = JsonUtil.Serialize(incident);
+            System.IO.File.WriteAllText(incidentPath, json);
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't fail execution
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "INCIDENT_PERSIST_ERROR",
+                new { error = ex.Message, exception_type = ex.GetType().Name }));
         }
     }
     

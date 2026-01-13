@@ -56,6 +56,14 @@ public sealed class StreamStateMachine
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
     private readonly IBarProvider? _barProvider; // Optional: for DRYRUN mode to query historical bars
+    
+    // PHASE 4: Alert callback for missing data incidents
+    private Action<string, string, string, int>? _alertCallback;
+
+    // Diagnostic logging configuration
+    private readonly bool _enableDiagnosticLogs;
+    private readonly int _barDiagnosticRateLimitSeconds;
+    private readonly int _slotGateDiagnosticRateLimitSeconds;
 
     // Bar buffer for retrospective range computation (live mode)
     private readonly List<Bar> _barBuffer = new();
@@ -63,13 +71,14 @@ public sealed class StreamStateMachine
     private bool _rangeComputed = false; // Flag to prevent multiple range computations
     private DateTimeOffset? _lastSlotGateDiagnostic = null; // Rate-limiting for SLOT_GATE_DIAGNOSTIC
     private DateTimeOffset? _lastBarDiagnosticTime = null; // Rate-limiting for BAR_RECEIVED_DIAGNOSTIC
-    private const int BAR_DIAGNOSTIC_RATE_LIMIT_SECONDS = 30; // Log once per 30 seconds (reduced for debugging)
+    private bool _lastSlotGateState = false; // Track previous gate state for change detection
     
     // Assertion flags (once per stream per day)
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
     private bool _rangeLockAssertEmitted = false; // RANGE_LOCK_ASSERT emitted
     private bool _hydrationAttempted = false; // Prevent multiple hydration attempts
+    private bool _lateStartAfterSlot = false; // Track if stream started after slot_time (compute range but skip trading)
 
     private decimal? _lastCloseBeforeLock;
 
@@ -101,7 +110,8 @@ public sealed class StreamStateMachine
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
-        IBarProvider? barProvider = null // Optional: for DRYRUN mode to query historical bars
+        IBarProvider? barProvider = null, // Optional: for DRYRUN mode to query historical bars
+        LoggingConfig? loggingConfig = null // Optional: logging configuration for diagnostic control
     )
     {
         _time = time;
@@ -114,6 +124,11 @@ public sealed class StreamStateMachine
         _riskGate = riskGate;
         _executionJournal = executionJournal;
         _barProvider = barProvider;
+
+        // Load diagnostic logging configuration
+        _enableDiagnosticLogs = loggingConfig?.enable_diagnostic_logs ?? false;
+        _barDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.bar_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 300);
+        _slotGateDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.slot_gate_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 60);
 
         Stream = directive.stream;
         Instrument = directive.instrument.ToUpperInvariant();
@@ -135,32 +150,16 @@ public sealed class StreamStateMachine
         RangeStartUtc = RangeStartChicagoTime.ToUniversalTime();
         SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
         MarketCloseUtc = marketCloseChicagoTime.ToUniversalTime();
-        
-        // Log diagnostic info (only once per stream creation, not on every update)
-        _log.Write(RobotEvents.Base(time, DateTimeOffset.UtcNow, tradingDateStr, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "STREAM_INIT_DIAGNOSTIC", State.ToString(),
-            new
-            {
-                trading_date_string = tradingDateStr,
-                trading_date_parsed = dateOnly.ToString("yyyy-MM-dd"),
-                range_start_chicago = rangeStartChicago,
-                slot_time_chicago = SlotTimeChicago,
-                range_start_chicago_time = RangeStartChicagoTime.ToString("o"),
-                slot_time_chicago_time = SlotTimeChicagoTime.ToString("o"),
-                range_start_utc = RangeStartUtc.ToString("o"),
-                slot_time_utc = SlotTimeUtc.ToString("o"),
-                note = "Logging trading date and calculated slot times at stream initialization (Chicago time is authoritative)"
-            }));
 
         if (!spec.TryGetInstrument(Instrument, out var inst))
             throw new InvalidOperationException($"Instrument not found in parity spec: {Instrument}");
         _tickSize = inst.tick_size;
         _baseTarget = inst.base_target;
 
-        var existing = journals.TryLoad(tradingDate, Stream);
+        var existing = journals.TryLoad(tradingDateStr, Stream);
         _journal = existing ?? new StreamJournal
         {
-            TradingDate = tradingDate,
+            TradingDate = tradingDateStr,
             Stream = Stream,
             Committed = false,
             CommitReason = null,
@@ -172,6 +171,14 @@ public sealed class StreamStateMachine
 
     public bool IsSameInstrument(string instrument) =>
         string.Equals(Instrument, instrument, StringComparison.OrdinalIgnoreCase);
+    
+    /// <summary>
+    /// PHASE 4: Set alert callback for triggering high-priority notifications.
+    /// </summary>
+    public void SetAlertCallback(Action<string, string, string, int>? callback)
+    {
+        _alertCallback = callback;
+    }
 
     public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
     {
@@ -268,6 +275,7 @@ public sealed class StreamStateMachine
         _firstBarAcceptedAssertEmitted = false;
         _rangeLockAssertEmitted = false;
         _hydrationAttempted = false;
+        _lateStartAfterSlot = false; // Reset late start flag for new trading day
         
         // Clear bar buffer on reset
         lock (_barBufferLock)
@@ -328,80 +336,161 @@ public sealed class StreamStateMachine
                 break;
 
             case StreamState.RANGE_BUILDING:
-                // SAFETY CHECK: If robot started after slot time passed, don't compute ranges or trade
-                // This prevents trading when robot wasn't running during the range window
-                if (utcNow >= SlotTimeUtc && !_rangeComputed)
+                // Track if stream started after slot_time (for late-start policy enforcement)
+                if (utcNow >= SlotTimeUtc && !_rangeComputed && !_lateStartAfterSlot)
                 {
+                    var currentChicago = _time.ConvertUtcToChicago(utcNow);
                     lock (_barBufferLock)
                     {
                         var barCount = _barBuffer.Count;
-                        
-                        // If slot time has passed AND we have no bars, robot started too late
-                        // Don't attempt range computation or trading
+                        // If slot_time has passed and we're computing now, mark as late start
+                        // This will allow range computation but prevent trading
                         if (barCount == 0)
                         {
-                            var nowChicagoSkip = _time.ConvertUtcToChicago(utcNow);
+                            _lateStartAfterSlot = true;
                             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                                "LATE_START_SKIP", State.ToString(),
+                                "STREAM_LATE_START_DETECTED", State.ToString(),
                                 new
                                 {
                                     now_utc = utcNow.ToString("o"),
-                                    now_chicago = nowChicagoSkip.ToString("o"),
+                                    now_chicago = currentChicago.ToString("o"),
                                     slot_time_chicago = SlotTimeChicago,
                                     slot_time_utc = SlotTimeUtc.ToString("o"),
                                     range_start_chicago = RangeStartChicagoTime.ToString("o"),
                                     bar_buffer_count = barCount,
-                                    reason = "Robot started after slot time passed with no bars buffered - skipping range computation and trading",
-                                    message = "Robot was not running during range window - fail-closed safety check"
+                                    note = "Stream started after slot_time - will compute range for parity/audit but skip trading"
                                 }));
-                            
-                            // Commit stream as NO_TRADE due to late start
-                            Commit(utcNow, "NO_TRADE_LATE_START", "LATE_START_SKIP");
-                            break;
                         }
                     }
                 }
                 
-                // Hydrate from historical bars if starting late (only once, when entering RANGE_BUILDING)
-                // Only attempt hydration if slot time hasn't passed yet, or if we have bars buffered
-                if (!_rangeComputed && !_hydrationAttempted && _barProvider != null && utcNow < SlotTimeUtc)
+                // Hydrate from historical bars if starting late (allow even after slot_time)
+                // Attempt hydration if bar provider exists and we haven't hydrated yet
+                if (!_rangeComputed && !_hydrationAttempted && _barProvider != null)
                 {
                     _hydrationAttempted = true;
                     TryHydrateFromHistory(utcNow);
                 }
                 
-                // DIAGNOSTIC: Log slot gate evaluation (rate-limited to once per minute per stream)
-                var nowChicago = _time.ConvertUtcToChicago(utcNow);
-                var gateDecision = utcNow >= SlotTimeUtc && !_rangeComputed;
-                var comparisonUsed = $"utcNow ({utcNow:o}) >= SlotTimeUtc ({SlotTimeUtc:o}) && !_rangeComputed ({!_rangeComputed})";
-                
-                // Rate-limit diagnostic logging (once per 30 seconds, or immediately when gate passes)
-                if (!_lastSlotGateDiagnostic.HasValue || (utcNow - _lastSlotGateDiagnostic.Value).TotalSeconds >= 30 || gateDecision)
+                // DIAGNOSTIC: Log slot gate evaluation (only if diagnostic logs enabled, and only on state change or rate limit)
+                if (_enableDiagnosticLogs)
                 {
-                    _lastSlotGateDiagnostic = utcNow;
-                    lock (_barBufferLock)
+                    var currentTimeChicago = _time.ConvertUtcToChicago(utcNow);
+                    var gateDecision = utcNow >= SlotTimeUtc && !_rangeComputed;
+                    var gateStateChanged = gateDecision != _lastSlotGateState;
+                    
+                    // Log if state changed or rate limit exceeded
+                    var shouldLog = gateStateChanged || 
+                                   !_lastSlotGateDiagnostic.HasValue || 
+                                   (utcNow - _lastSlotGateDiagnostic.Value).TotalSeconds >= _slotGateDiagnosticRateLimitSeconds;
+                    
+                    if (shouldLog)
                     {
-                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                            "SLOT_GATE_DIAGNOSTIC", State.ToString(),
-                            new
-                            {
-                                now_utc = utcNow.ToString("o"),
-                                now_chicago = nowChicago.ToString("o"),
-                                slot_time_chicago = SlotTimeChicago,
-                                slot_time_utc = SlotTimeUtc.ToString("o"),
-                                comparison_used = comparisonUsed,
-                                decision_result = gateDecision,
-                                stream_id = Stream,
-                                trading_date = TradingDate,
-                                range_computed_flag = _rangeComputed,
-                                bar_buffer_count = _barBuffer.Count,
-                                time_until_slot_seconds = gateDecision ? 0 : (SlotTimeUtc - utcNow).TotalSeconds
-                            }));
+                        _lastSlotGateDiagnostic = utcNow;
+                        _lastSlotGateState = gateDecision;
+                        var comparisonUsed = $"utcNow ({utcNow:o}) >= SlotTimeUtc ({SlotTimeUtc:o}) && !_rangeComputed ({!_rangeComputed})";
+                        
+                        lock (_barBufferLock)
+                        {
+                            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                "SLOT_GATE_DIAGNOSTIC", State.ToString(),
+                                new
+                                {
+                                    now_utc = utcNow.ToString("o"),
+                                    now_chicago = currentTimeChicago.ToString("o"),
+                                    slot_time_chicago = SlotTimeChicago,
+                                    slot_time_utc = SlotTimeUtc.ToString("o"),
+                                    comparison_used = comparisonUsed,
+                                    decision_result = gateDecision,
+                                    state_changed = gateStateChanged,
+                                    stream_id = Stream,
+                                    trading_date = TradingDate,
+                                    range_computed_flag = _rangeComputed,
+                                    bar_buffer_count = _barBuffer.Count,
+                                    time_until_slot_seconds = gateDecision ? 0 : (SlotTimeUtc - utcNow).TotalSeconds
+                                }));
+                        }
                     }
                 }
                 
                 if (utcNow >= SlotTimeUtc && !_rangeComputed)
                 {
+                    // DETERMINISTIC: Ensure bars exist before computing
+                    // If bar buffer is empty, attempt hydration from history (even after slot_time)
+                    lock (_barBufferLock)
+                    {
+                        var barCountBeforeHydration = _barBuffer.Count;
+                        if (barCountBeforeHydration == 0 && _barProvider != null && !_hydrationAttempted)
+                        {
+                            // Attempt hydration post-slot_time
+                            _hydrationAttempted = true;
+                            var hydrationTimeChicago = _time.ConvertUtcToChicago(utcNow);
+                            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                "RANGE_HISTORY_HYDRATION_POST_SLOT_ATTEMPT", State.ToString(),
+                                new
+                                {
+                                    instrument = Instrument,
+                                    stream = Stream,
+                                    trading_date = TradingDate,
+                                    slot_time_chicago = SlotTimeChicago,
+                                    slot_time_utc = SlotTimeUtc.ToString("o"),
+                                    now_chicago = hydrationTimeChicago.ToString("o"),
+                                    now_utc = utcNow.ToString("o"),
+                                    bar_buffer_count_before = barCountBeforeHydration,
+                                    provider_present = true,
+                                    note = "Attempting historical hydration after slot_time passed"
+                                }));
+                            
+                            TryHydrateFromHistory(utcNow);
+                        }
+                    }
+                    
+                    // Re-check bar buffer count after potential hydration
+                    int finalBarCount;
+                    lock (_barBufferLock)
+                    {
+                        finalBarCount = _barBuffer.Count;
+                    }
+                    
+                    // Only commit NO_TRADE if BOTH buffer is empty AND no historical bars available
+                    if (finalBarCount == 0)
+                    {
+                        var noDataTimeChicago = _time.ConvertUtcToChicago(utcNow);
+                        
+                        // PHASE 4: Emit "NO DATA → NO TRADE" high-priority alert and persist incident
+                        var incidentMessage = $"NO DATA → NO TRADE: Stream {Stream} ({Instrument}) reached slot_time ({SlotTimeChicago}) with zero bars. No historical data available. Stream committed as NO_TRADE.";
+                        
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "NO_DATA_NO_TRADE_INCIDENT", State.ToString(),
+                            new
+                            {
+                                range_start_utc = RangeStartUtc.ToString("o"),
+                                slot_time_utc = SlotTimeUtc.ToString("o"),
+                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                                provider_present = _barProvider != null,
+                                hydrated_count = 0,
+                                final_bar_count = finalBarCount,
+                                incident_message = incidentMessage,
+                                note = "No bars available after historical hydration attempt - committing NO_TRADE and alerting operator"
+                            }));
+                        
+                        // Persist incident record
+                        PersistMissingDataIncident(utcNow, incidentMessage);
+                        
+                        // PHASE 4: Trigger high-priority alert
+                        if (_alertCallback != null)
+                        {
+                            var title = $"NO DATA → NO TRADE: {Instrument}";
+                            var message = $"Stream {Stream} reached slot_time ({SlotTimeChicago}) with zero bars. No historical data available. Stream committed as NO_TRADE.";
+                            _alertCallback($"NO_DATA_NO_TRADE:{Stream}", title, message, 2); // Emergency priority
+                        }
+                        
+                        // Commit stream as NO_TRADE
+                        Commit(utcNow, "NO_TRADE_RANGE_DATA_MISSING", "RANGE_DATA_UNAVAILABLE_AFTER_HISTORY");
+                        break;
+                    }
+                    
                     // REFACTORED: Compute range retrospectively from completed session data
                     // Do NOT build incrementally - treat session window as closed dataset
                     var computeStart = DateTimeOffset.UtcNow;
@@ -420,7 +509,8 @@ public sealed class StreamStateMachine
                             time_conversion_note = "Pure timezone converter (UTC -> Chicago), not 'now'",
                             expected_chicago_window = $"{RangeStartChicagoTime:HH:mm} to {SlotTimeChicagoTime:HH:mm}",
                             expected_utc_window = $"{RangeStartUtc:HH:mm} to {SlotTimeUtc:HH:mm}",
-                            bar_buffer_count = _barBuffer.Count,
+                            bar_buffer_count = finalBarCount,
+                            late_start_after_slot = _lateStartAfterSlot,
                             note = "Range is calculated for Chicago time window (UTC times shown for reference)"
                         }));
 
@@ -533,13 +623,39 @@ public sealed class StreamStateMachine
 
                     ComputeBreakoutLevelsAndLog(utcNow);
 
+                    // ENFORCE: Compute allowed, trade forbidden when started after slot_time
+                    if (_lateStartAfterSlot)
+                    {
+                        // Log that trading is skipped due to late start, but range was computed
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "STREAM_LATE_START_SKIP_TRADING", State.ToString(),
+                            new
+                            {
+                                computed_range_high = RangeHigh,
+                                computed_range_low = RangeLow,
+                                range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                                freeze_close = FreezeClose,
+                                freeze_close_source = FreezeCloseSource,
+                                brk_long_rounded = _brkLongRounded,
+                                brk_short_rounded = _brkShortRounded,
+                                reason = "started_after_slot_time",
+                                note = "Range computed for parity/audit but trading skipped due to late start policy"
+                            }));
+                        
+                        // Commit as NO_TRADE but with range computed (for audit/parity)
+                        Commit(utcNow, "NO_TRADE_LATE_START_RANGE_COMPUTED", "STREAM_LATE_START_SKIP_TRADING");
+                        break;
+                    }
+
                     // Check for immediate entry at lock (all execution modes)
+                    // Only if NOT late start (late start already committed above)
                     if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
                     {
                         CheckImmediateEntryAtLock(utcNow);
                     }
 
                     // Log intended brackets (all execution modes)
+                    // Only if NOT late start (late start already committed above)
                     if (utcNow < MarketCloseUtc)
                         LogIntendedBracketsPlaced(utcNow);
                 }
@@ -596,33 +712,36 @@ public sealed class StreamStateMachine
         {
             // CRITICAL: Convert bar timestamp to Chicago time explicitly
             // Do NOT assume barUtc is UTC or Chicago - conversion must be explicit
-            // DIAGNOSTIC: barUtc is assumed to be UTC (as received from NinjaTrader after conversion)
             var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
             
-            // DIAGNOSTIC: Log bar reception details (rate-limited)
-            var shouldLogBar = !_lastBarDiagnosticTime.HasValue || 
-                              (utcNow - _lastBarDiagnosticTime.Value).TotalSeconds >= BAR_DIAGNOSTIC_RATE_LIMIT_SECONDS;
-            
-            if (shouldLogBar)
+            // DIAGNOSTIC: Log bar reception details (only if diagnostic logs enabled)
+            bool shouldLogBar = false;
+            if (_enableDiagnosticLogs)
             {
-                _lastBarDiagnosticTime = utcNow;
-                var inRange = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "BAR_RECEIVED_DIAGNOSTIC", State.ToString(),
-                    new
-                    {
-                        bar_utc = barUtc.ToString("o"),
-                        bar_utc_kind = barUtc.DateTime.Kind.ToString(),
-                        bar_chicago = barChicagoTime.ToString("o"),
-                        bar_chicago_offset = barChicagoTime.Offset.ToString(),
-                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                        range_end_chicago = SlotTimeChicagoTime.ToString("o"),
-                        range_start_utc = RangeStartUtc.ToString("o"),
-                        range_end_utc = SlotTimeUtc.ToString("o"),
-                        in_range_window = inRange,
-                        bar_buffer_count = _barBuffer.Count,
-                        time_until_slot_seconds = (SlotTimeUtc - utcNow).TotalSeconds
-                    }));
+                shouldLogBar = !_lastBarDiagnosticTime.HasValue || 
+                              (utcNow - _lastBarDiagnosticTime.Value).TotalSeconds >= _barDiagnosticRateLimitSeconds;
+                
+                if (shouldLogBar)
+                {
+                    _lastBarDiagnosticTime = utcNow;
+                    var inRange = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "BAR_RECEIVED_DIAGNOSTIC", State.ToString(),
+                        new
+                        {
+                            bar_utc = barUtc.ToString("o"),
+                            bar_utc_kind = barUtc.DateTime.Kind.ToString(),
+                            bar_chicago = barChicagoTime.ToString("o"),
+                            bar_chicago_offset = barChicagoTime.Offset.ToString(),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            range_end_chicago = SlotTimeChicagoTime.ToString("o"),
+                            range_start_utc = RangeStartUtc.ToString("o"),
+                            range_end_utc = SlotTimeUtc.ToString("o"),
+                            in_range_window = inRange,
+                            bar_buffer_count = _barBuffer.Count,
+                            time_until_slot_seconds = (SlotTimeUtc - utcNow).TotalSeconds
+                        }));
+                }
             }
             
             // Buffer bars that fall within [range_start, slot_time) using Chicago time comparison
@@ -682,36 +801,42 @@ public sealed class StreamStateMachine
             }
             else
             {
-                // DIAGNOSTIC: Log bars that are filtered out (rate-limited, only when close to window)
-                var timeUntilStart = (RangeStartChicagoTime - barChicagoTime).TotalMinutes;
-                var timeAfterEnd = (barChicagoTime - SlotTimeChicagoTime).TotalMinutes;
-                if (shouldLogBar && (Math.Abs(timeUntilStart) < 30 || Math.Abs(timeAfterEnd) < 30))
+                // DIAGNOSTIC: Log bars that are filtered out (rate-limited, only when close to window and diagnostics enabled)
+                if (_enableDiagnosticLogs && shouldLogBar)
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "BAR_FILTERED_OUT", State.ToString(),
-                        new
-                        {
-                            bar_utc = barUtc.ToString("o"),
-                            bar_chicago = barChicagoTime.ToString("o"),
-                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                            range_end_chicago = SlotTimeChicagoTime.ToString("o"),
-                            reason = barChicagoTime < RangeStartChicagoTime ? "BEFORE_RANGE_START" : "AFTER_RANGE_END",
-                            minutes_from_start = timeUntilStart,
-                            minutes_from_end = timeAfterEnd
-                        }));
+                    var timeUntilStart = (RangeStartChicagoTime - barChicagoTime).TotalMinutes;
+                    var timeAfterEnd = (barChicagoTime - SlotTimeChicagoTime).TotalMinutes;
+                    if (Math.Abs(timeUntilStart) < 30 || Math.Abs(timeAfterEnd) < 30)
+                    {
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "BAR_FILTERED_OUT", State.ToString(),
+                            new
+                            {
+                                bar_utc = barUtc.ToString("o"),
+                                bar_chicago = barChicagoTime.ToString("o"),
+                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                range_end_chicago = SlotTimeChicagoTime.ToString("o"),
+                                reason = barChicagoTime < RangeStartChicagoTime ? "BEFORE_RANGE_START" : "AFTER_RANGE_END",
+                                minutes_from_start = timeUntilStart,
+                                minutes_from_end = timeAfterEnd
+                            }));
+                    }
                 }
             }
             // Bars at/after slot time are for breakout detection (handled in RANGE_LOCKED state)
         }
         else if (State == StreamState.RANGE_LOCKED)
         {
-            // DIAGNOSTIC: Log execution gate evaluation (rate-limited)
-            var barChicago = _time.ConvertUtcToChicago(barUtc);
-            var timeSinceLastEval = (barUtc - _lastExecutionGateEvalBarUtc).TotalSeconds;
-            if (timeSinceLastEval >= EXECUTION_GATE_EVAL_RATE_LIMIT_SECONDS || _lastExecutionGateEvalBarUtc == DateTimeOffset.MinValue)
+            // DIAGNOSTIC: Log execution gate evaluation (rate-limited, only if diagnostics enabled)
+            if (_enableDiagnosticLogs)
             {
-                _lastExecutionGateEvalBarUtc = barUtc;
-                LogExecutionGateEval(barUtc, barChicago, utcNow);
+                var barChicago = _time.ConvertUtcToChicago(barUtc);
+                var timeSinceLastEval = (barUtc - _lastExecutionGateEvalBarUtc).TotalSeconds;
+                if (timeSinceLastEval >= EXECUTION_GATE_EVAL_RATE_LIMIT_SECONDS || _lastExecutionGateEvalBarUtc == DateTimeOffset.MinValue)
+                {
+                    _lastExecutionGateEvalBarUtc = barUtc;
+                    LogExecutionGateEval(barUtc, barChicago, utcNow);
+                }
             }
 
             // Check for breakout after lock (before market close) - FIXED: Now works for all execution modes
@@ -921,13 +1046,11 @@ public sealed class StreamStateMachine
         
         foreach (var bar in bars)
         {
-            // DIAGNOSTIC: Capture raw timestamp as received (assumed UTC)
-            // bar.TimestampUtc is what we receive - we assume it's UTC but need to verify
+            // Capture raw timestamp as received (assumed UTC)
             var barRawUtc = bar.TimestampUtc;
             var barRawUtcKind = barRawUtc.DateTime.Kind.ToString();
             
             // Convert to Chicago time for filtering
-            // DIAGNOSTIC: This conversion assumes bar.TimestampUtc is UTC
             var barChicagoTime = _time.ConvertUtcToChicago(barRawUtc);
             
             // Range window is defined in Chicago time: [RangeStartChicagoTime, SlotTimeChicagoTime)
@@ -959,25 +1082,16 @@ public sealed class StreamStateMachine
         // Sort by timestamp (should already be sorted, but ensure correctness)
         bars.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
         
-        // DIAGNOSTIC: Log RANGE_WINDOW_AUDIT with timestamp conversion details
-        if (firstBarRawUtc.HasValue && lastBarRawUtc.HasValue)
+        // DIAGNOSTIC: Log RANGE_WINDOW_AUDIT with timestamp conversion details (only if diagnostic logs enabled)
+        if (_enableDiagnosticLogs && firstBarRawUtc.HasValue && lastBarRawUtc.HasValue)
         {
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "RANGE_WINDOW_AUDIT", State.ToString(),
                 new
                 {
-                    first_bar_raw_nt_time = firstBarRawUtc.Value.ToString("o"),
-                    first_bar_raw_nt_kind = firstBarRawUtcKind,
-                    first_bar_assumed_utc = firstBarRawUtc.Value.ToString("o"),
-                    first_bar_assumed_utc_kind = firstBarRawUtc.Value.DateTime.Kind.ToString(),
                     first_bar_chicago = firstBarChicago?.ToString("o"),
-                    first_bar_chicago_offset = firstBarChicago?.Offset.ToString(),
-                    last_bar_raw_nt_time = lastBarRawUtc.Value.ToString("o"),
-                    last_bar_raw_nt_kind = lastBarRawUtcKind,
-                    last_bar_assumed_utc = lastBarRawUtc.Value.ToString("o"),
-                    last_bar_assumed_utc_kind = lastBarRawUtc.Value.DateTime.Kind.ToString(),
                     last_bar_chicago = lastBarChicago?.ToString("o"),
-                    last_bar_chicago_offset = lastBarChicago?.Offset.ToString(),
+                    bar_count = bars.Count,
                     conversion_method = "ConvertUtcToChicago",
                     conversion_note = "Assumes bar.TimestampUtc is UTC (as received from NinjaTrader after conversion)"
                 }));
@@ -1022,10 +1136,10 @@ public sealed class StreamStateMachine
         // Return first and last bar timestamps in both UTC and Chicago time for auditability
         var firstBarUtc = bars[0].TimestampUtc;
         var lastBarUtc = bars[bars.Count - 1].TimestampUtc;
-        var firstBarChicago = _time.ConvertUtcToChicago(firstBarUtc);
-        var lastBarChicago = _time.ConvertUtcToChicago(lastBarUtc);
+        var firstBarChicagoResult = _time.ConvertUtcToChicago(firstBarUtc);
+        var lastBarChicagoResult = _time.ConvertUtcToChicago(lastBarUtc);
 
-        return (true, rangeHigh, rangeLow, freezeClose, "BAR_CLOSE", bars.Count, null, firstBarUtc, lastBarUtc, firstBarChicago, lastBarChicago);
+        return (true, rangeHigh, rangeLow, freezeClose, "BAR_CLOSE", bars.Count, null, firstBarUtc, lastBarUtc, firstBarChicagoResult, lastBarChicagoResult);
     }
 
     private void Commit(DateTimeOffset utcNow, string commitReason, string eventType)
@@ -1051,6 +1165,58 @@ public sealed class StreamStateMachine
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             eventType, State.ToString(),
             new { committed = true, commit_reason = commitReason }));
+    }
+    
+    /// <summary>
+    /// PHASE 4: Persist missing data incident record.
+    /// </summary>
+    private void PersistMissingDataIncident(DateTimeOffset utcNow, string incidentMessage)
+    {
+        try
+        {
+            // Get project root from journal path (journals are in projectRoot/data/execution_journals)
+            var journalPath = _journals.GetJournalPath(TradingDate, Stream);
+            var projectRoot = System.IO.Path.GetDirectoryName(System.IO.Path.GetDirectoryName(System.IO.Path.GetDirectoryName(journalPath)));
+            
+            if (string.IsNullOrEmpty(projectRoot))
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "INCIDENT_PERSIST_ERROR", State.ToString(),
+                    new { error = "Could not determine project root from journal path" }));
+                return;
+            }
+            
+            var incidentDir = System.IO.Path.Combine(projectRoot, "data", "execution_incidents");
+            System.IO.Directory.CreateDirectory(incidentDir);
+            
+            var incidentPath = System.IO.Path.Combine(incidentDir, $"missing_data_{Stream}_{utcNow:yyyyMMddHHmmss}.json");
+            
+            var incident = new
+            {
+                incident_type = "NO_DATA_NO_TRADE",
+                timestamp_utc = utcNow.ToString("o"),
+                trading_date = TradingDate,
+                stream = Stream,
+                instrument = Instrument,
+                session = Session,
+                slot_time_chicago = SlotTimeChicago,
+                slot_time_utc = SlotTimeUtc.ToString("o"),
+                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                range_start_utc = RangeStartUtc.ToString("o"),
+                incident_message = incidentMessage,
+                action_taken = "STREAM_COMMITTED_NO_TRADE"
+            };
+            
+            var json = JsonUtil.Serialize(incident);
+            System.IO.File.WriteAllText(incidentPath, json);
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't fail execution
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "INCIDENT_PERSIST_ERROR", State.ToString(),
+                new { error = ex.Message, exception_type = ex.GetType().Name }));
+        }
     }
 
     private void CheckImmediateEntryAtLock(DateTimeOffset utcNow)
@@ -1266,28 +1432,10 @@ public sealed class StreamStateMachine
         if (entryResult.Success)
         {
             // Register intent with adapter for fill callback handling
-            // Use reflection or type check to access adapter-specific method
-            var adapterType = _executionAdapter?.GetType();
-            if (adapterType?.Name == "NinjaTraderSimAdapter")
+            // Use type check and cast instead of reflection (RegisterIntent is internal)
+            if (_executionAdapter is NinjaTraderSimAdapter ntAdapter)
             {
-                var registerMethod = adapterType.GetMethod("RegisterIntent", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                if (registerMethod != null)
-                {
-                    registerMethod.Invoke(_executionAdapter, new object[] { intent });
-                }
-                else
-                {
-                    // Intent registration failed - protective orders may not be submitted automatically
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "INTENT_REGISTRATION_FAILED",
-                        new
-                        {
-                            trading_date = TradingDate,
-                            stream = Stream,
-                            adapter_type = adapterType?.Name ?? "UNKNOWN",
-                            reason = "REGISTER_INTENT_METHOD_NOT_FOUND",
-                            note = "Protective orders may need to be submitted manually"
-                        }));
-                }
+                ntAdapter.RegisterIntent(intent);
             }
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "ENTRY_SUBMITTED",
@@ -1374,27 +1522,26 @@ public sealed class StreamStateMachine
 
     /// <summary>
     /// Hydrate bar buffer from historical bars if starting late.
-    /// Called when entering RANGE_BUILDING state and current time is after range start.
+    /// Can be called even after slot_time has passed to enable retrospective range computation.
     /// </summary>
     private void TryHydrateFromHistory(DateTimeOffset utcNow)
     {
         // Only hydrate if:
         // 1. Bar provider is available (for historical data access)
         // 2. Range has not been computed
-        // 3. Current time is after range start (we're starting late)
-        // 4. Current time is before slot time (not too late)
+        // Note: Can hydrate even after slot_time has passed (enables retrospective computation)
         if (_barProvider == null || _rangeComputed)
             return;
 
-        var nowChicago = _time.ConvertUtcToChicago(utcNow);
+        var hydrationCheckChicago = _time.ConvertUtcToChicago(utcNow);
         
         // Check if we're starting late (current time > range start)
-        if (nowChicago < RangeStartChicagoTime)
+        // If before range start, wait for normal bar flow
+        if (hydrationCheckChicago < RangeStartChicagoTime)
             return; // Not late yet, wait for normal bar flow
 
-        // Check if slot time has passed (too late to hydrate)
-        if (nowChicago >= SlotTimeChicagoTime)
-            return; // Slot time passed, range computation will handle it
+        // REMOVED: Previous check that blocked hydration after slot_time
+        // Now allows hydration even after slot_time to enable retrospective range computation
 
         // Check if buffer is empty or incomplete
         int currentBarCount;
@@ -1452,6 +1599,8 @@ public sealed class StreamStateMachine
             // Log hydration event (once per stream per day)
             if (hydratedCount > 0)
             {
+                var hydrationLogChicago = _time.ConvertUtcToChicago(utcNow);
+                var isPostSlot = hydrationLogChicago >= SlotTimeChicagoTime;
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "RANGE_HYDRATED_FROM_HISTORY", State.ToString(),
                     new
@@ -1461,7 +1610,10 @@ public sealed class StreamStateMachine
                         first_bar_chicago = firstBarChicago?.ToString("o"),
                         last_bar_chicago = lastBarChicago?.ToString("o"),
                         total_bars_in_buffer = currentBarCount + hydratedCount,
-                        note = "late start hydration"
+                        now_chicago = hydrationLogChicago.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        is_post_slot_hydration = isPostSlot,
+                        note = isPostSlot ? "post-slot historical hydration for retrospective range computation" : "late start hydration"
                     }));
             }
         }

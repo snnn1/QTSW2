@@ -37,7 +37,8 @@ public sealed class RiskGate
         DateTimeOffset utcNow)
     {
         // Gate 1: Kill switch
-        if (_killSwitch.IsEnabled())
+        var killSwitchOk = !_killSwitch.IsEnabled();
+        if (!killSwitchOk)
         {
             return (false, "KILL_SWITCH_ACTIVE");
         }
@@ -61,7 +62,8 @@ public sealed class RiskGate
         }
 
         var allowedSlots = _spec.sessions[session].slot_end_times;
-        if (!allowedSlots.Contains(slotTimeChicago))
+        var slotTimeAllowed = allowedSlots.Contains(slotTimeChicago);
+        if (!slotTimeAllowed)
         {
             return (false, "SLOT_TIME_NOT_ALLOWED");
         }
@@ -80,7 +82,8 @@ public sealed class RiskGate
         }
 
         // Gate 7: Execution mode validation
-        if (executionMode == ExecutionMode.LIVE)
+        var executionModeOk = executionMode != ExecutionMode.LIVE; // SIM and DRYRUN can execute
+        if (!executionModeOk)
         {
             // LIVE mode requires additional checks (see Phase C)
             // For now, fail closed

@@ -1,0 +1,6 @@
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.csproj.AssemblyReference.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.AssemblyInfoInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.AssemblyInfo.cs
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.csproj.CoreCompileInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net48\Robot.Core.sourcelink.json

@@ -7,4 +7,7 @@
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.0" />
   </ItemGroup>
+  <Target Name="PreBuild" BeforeTargets="PreBuildEvent">
+    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\..\sync_robotcore_to_ninjatrader.ps1&quot;" ContinueOnError="true" />
+  </Target>
 </Project>

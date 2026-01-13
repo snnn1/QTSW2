@@ -50,6 +50,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var projectRoot = ProjectRootResolver.ResolveProjectRoot();
                 var instrumentName = Instrument.MasterInstrument.Name;
                 _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: instrumentName);
+                
+                // PHASE 1: Set account info for startup banner
+                var accountName = Account?.Name ?? "UNKNOWN";
+                // Check if SIM account (verified earlier in OnStateChange)
+                var environment = _simAccountVerified ? "SIM" : "UNKNOWN";
+                _engine.SetAccountInfo(accountName, environment);
+                
                 _engine.Start();
 
                 // Set bar provider for historical hydration (late start support)
@@ -79,10 +86,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void WireNTContextToAdapter()
         {
-            // Get adapter from engine via reflection (adapter is private field)
-            var engineType = _engine.GetType();
-            var adapterField = engineType.GetField("_executionAdapter", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var adapter = adapterField?.GetValue(_engine) as NinjaTraderSimAdapter;
+            // Get adapter from engine using accessor method (replaces reflection)
+            var adapter = _engine.GetExecutionAdapter() as NinjaTraderSimAdapter;
             
             if (adapter is null)
             {
@@ -116,14 +121,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             var barRawNtTime = barExchangeTime;
             var barRawNtKind = barExchangeTime.Kind.ToString();
             
-            // Convert bar time from exchange time to UTC
-            var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-            var barChicagoOffset = new DateTimeOffset(barExchangeTime, chicagoTz.GetUtcOffset(barExchangeTime));
-            var barUtc = barChicagoOffset.ToUniversalTime();
+            // Convert bar time from exchange time to UTC using helper method
+            var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
             
             // DIAGNOSTIC: Capture conversion details
             var barAssumedUtc = barUtc;
             var barAssumedUtcKind = barUtc.DateTime.Kind.ToString();
+            var barChicagoOffset = new DateTimeOffset(barExchangeTime, TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time").GetUtcOffset(barExchangeTime));
 
             // DIAGNOSTIC: Rate-limited logging to verify NT timestamp behavior
             var timeSinceLastLog = (barExchangeTime - _lastDiagnosticLogBarTime).TotalMinutes;
@@ -224,6 +228,23 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Log but never throw - timer callbacks must not throw exceptions
                 Log($"ERROR in tick timer callback: {ex.Message}", LogLevel.Error);
             }
+        }
+
+        protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
+        {
+            if (_engine is null) return;
+            
+            // Forward connection status to health monitor using helper method and accessor
+            var connectionName = connectionStatusUpdate.Connection?.Options?.Name ?? "Unknown";
+            // ConnectionStatusEventArgs - pass the Connection.Status directly (NinjaTrader API)
+            // The Connection property has a Status property of type NinjaTrader.Cbi.ConnectionStatus
+            var connection = connectionStatusUpdate.Connection;
+            var ntStatus = connection?.Status;
+            // Fully qualify ConnectionStatus to avoid ambiguity between QTSW2.Robot.Core.ConnectionStatus and NinjaTrader.Cbi.ConnectionStatus
+            var healthMonitorStatus = ntStatus != null ? ntStatus.ToHealthMonitorStatus() : QTSW2.Robot.Core.ConnectionStatus.ConnectionError;
+            
+            // Use RobotEngine's OnConnectionStatusUpdate method (replaces reflection)
+            _engine.OnConnectionStatusUpdate(healthMonitorStatus, connectionName);
         }
 
         /// <summary>

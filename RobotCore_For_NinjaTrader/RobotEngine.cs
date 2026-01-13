@@ -6,6 +6,7 @@ using System.Linq;
 namespace QTSW2.Robot.Core;
 
 using QTSW2.Robot.Core.Execution;
+using QTSW2.Robot.Core.Notifications;
 
 public sealed class RobotEngine
 {
@@ -34,13 +35,33 @@ public sealed class RobotEngine
     private IBarProvider? _barProvider; // Optional: for historical bar hydration (SIM/DRYRUN modes)
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
 
+    // Logging configuration
+    private readonly LoggingConfig _loggingConfig;
+
     // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
     private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
-    private const int BAR_HEARTBEAT_RATE_LIMIT_MINUTES = 1; // Log once per instrument per minute
+    private int BAR_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.enable_diagnostic_logs ? 1 : 5; // More frequent if diagnostics enabled
     
     // ENGINE-level tick heartbeat diagnostic (rate-limited)
     private DateTimeOffset _lastTickHeartbeat = DateTimeOffset.MinValue;
-    private const int TICK_HEARTBEAT_RATE_LIMIT_MINUTES = 1; // Log once per minute
+    private int TICK_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.diagnostic_rate_limits?.tick_heartbeat_minutes ?? (_loggingConfig.enable_diagnostic_logs ? 1 : 5);
+    
+    // Engine heartbeat tracking for liveness monitoring
+    private DateTimeOffset _lastTickUtc = DateTimeOffset.MinValue;
+    
+    // Account/environment info for startup banner (set by strategy host)
+    private string? _accountName;
+    private string? _environment;
+
+    /// <summary>
+    /// Set account and environment info for startup banner.
+    /// Called by strategy host before Start().
+    /// </summary>
+    public void SetAccountInfo(string? accountName, string? environment)
+    {
+        _accountName = accountName;
+        _environment = environment;
+    }
 
     /// <summary>
     /// Set the bar provider for historical bar hydration (used when starting late).
@@ -49,11 +70,19 @@ public sealed class RobotEngine
     {
         _barProvider = barProvider;
     }
+    
+    /// <summary>
+    /// Get last tick timestamp for liveness monitoring.
+    /// </summary>
+    public DateTimeOffset GetLastTickUtc() => _lastTickUtc;
 
     public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, bool useAsyncLogging = true)
     {
         _root = projectRoot;
         _executionMode = executionMode;
+        
+        // Load logging configuration
+        _loggingConfig = LoggingConfig.LoadFromFile(projectRoot);
         
         // Initialize async logging service (Fix B) - singleton per project root to prevent file lock contention
         if (useAsyncLogging)
@@ -132,6 +161,29 @@ public sealed class RobotEngine
     {
         var utcNow = DateTimeOffset.UtcNow;
         
+        // PHASE 1: Fail-fast for LIVE mode before engine starts
+        if (_executionMode == ExecutionMode.LIVE)
+        {
+            var errorMsg = "LIVE mode is not yet enabled. Use DRYRUN or SIM.";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LIVE_MODE_BLOCKED", state: "ENGINE",
+                new { error = errorMsg, execution_mode = _executionMode.ToString() }));
+            
+            // Trigger high-priority alert (not log-only)
+            if (_healthMonitor != null)
+            {
+                var notificationService = _healthMonitor.GetNotificationService();
+                if (notificationService != null)
+                {
+                    notificationService.EnqueueNotification("LIVE_MODE_BLOCKED", 
+                        "CRITICAL: LIVE Trading Blocked", 
+                        $"Robot attempted to start in LIVE mode but it is not enabled. Execution blocked. Error: {errorMsg}", 
+                        priority: 2); // Emergency priority
+                }
+            }
+            
+            throw new InvalidOperationException(errorMsg);
+        }
+        
         // Start async logging service if enabled (Fix B)
         _loggingService?.Start();
         
@@ -141,40 +193,92 @@ public sealed class RobotEngine
         {
             _spec = ParitySpec.LoadFromFile(_specPath);
             // Debug log: confirm spec_name was loaded
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
                 new { spec_name = _spec.spec_name }));
             _time = new TimeService(_spec.timezone);
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
                 new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
         }
         catch (Exception ex)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE", new { error = ex.Message }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE", new { error = ex.Message }));
             throw;
         }
 
         // Initialize execution components now that spec is loaded
         _riskGate = new RiskGate(_spec, _time, _log, _killSwitch);
-        _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
+        
+        // Try to create adapter (will throw if LIVE mode)
+        try
+        {
+            _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
+            
+            // PHASE 2: Set engine callbacks for protective order failure recovery
+            if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+            {
+                simAdapter.SetEngineCallbacks(
+                    standDownStreamCallback: (streamId, utcNow, reason) => StandDownStream(streamId, utcNow, reason),
+                    getNotificationServiceCallback: () => GetNotificationService());
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // Re-throw LIVE mode errors (already handled above, but double-check)
+            throw;
+        }
 
         // Log execution mode and adapter
         var adapterType = _executionAdapter.GetType().Name;
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
             new { mode = _executionMode.ToString(), adapter = adapterType }));
 
         // Load timetable immediately (fail closed if invalid)
         // Health monitor update happens automatically in ReloadTimetableIfChanged() → ApplyTimetable()
         ReloadTimetableIfChanged(utcNow, force: true);
         
+        // PHASE 1: Emit startup operator banner with execution mode, account, environment, timetable info
+        EmitStartupBanner(utcNow);
+        
+        // Initialize heartbeat timestamp
+        _lastTickUtc = utcNow;
+        
         // Start health monitor if enabled
         _healthMonitor?.Start();
+    }
+    
+    /// <summary>
+    /// PHASE 1: Emit prominent operator banner log with execution mode, account, environment, timetable info.
+    /// </summary>
+    private void EmitStartupBanner(DateTimeOffset utcNow)
+    {
+        var enabledStreams = _streams.Values.Where(s => !s.Committed).ToList();
+        var enabledInstruments = enabledStreams.Select(s => s.Instrument).Distinct().ToList();
+        
+        var bannerData = new Dictionary<string, object?>
+        {
+            ["execution_mode"] = _executionMode.ToString(),
+            ["account_name"] = _accountName ?? "UNKNOWN",
+            ["environment"] = _environment ?? (_executionMode == ExecutionMode.DRYRUN ? "DRYRUN" : _executionMode == ExecutionMode.SIM ? "SIM" : "UNKNOWN"),
+            ["timetable_hash"] = _lastTimetableHash ?? "NOT_LOADED",
+            ["timetable_path"] = _timetablePath,
+            ["enabled_stream_count"] = enabledStreams.Count,
+            ["enabled_instruments"] = enabledInstruments,
+            ["enabled_streams"] = enabledStreams.Select(s => new { stream = s.Stream, instrument = s.Instrument, session = s.Session, slot_time = s.SlotTimeChicago }).ToList(),
+            ["spec_name"] = _spec?.spec_name ?? "NOT_LOADED",
+            ["spec_revision"] = _spec?.spec_revision ?? "NOT_LOADED",
+            ["kill_switch_enabled"] = _killSwitch.IsEnabled(),
+            ["health_monitor_enabled"] = _healthMonitor != null
+        };
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", 
+            eventType: "OPERATOR_BANNER", state: "ENGINE", bannerData));
     }
 
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        var stopTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: stopTradingDateStr, eventType: "ENGINE_STOP", state: "ENGINE"));
+        var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "ENGINE_STOP", state: "ENGINE"));
         
         // Write execution summary if not DRYRUN
         if (_executionMode != ExecutionMode.DRYRUN)
@@ -185,12 +289,10 @@ public sealed class RobotEngine
             var summaryPath = Path.Combine(summaryDir, $"summary_{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.json");
             var json = JsonUtil.Serialize(summary);
             File.WriteAllText(summaryPath, json);
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: stopTradingDateStr, eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
+            var summaryTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: summaryTradingDateStr, eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
                 new { summary_path = summaryPath }));
         }
-        
-        // Stop health monitor
-        _healthMonitor?.Stop();
         
         // Stop health monitor
         _healthMonitor?.Stop();
@@ -203,34 +305,43 @@ public sealed class RobotEngine
     {
         if (_spec is null || _time is null) return;
 
-        // Health monitor: record engine tick
-        _healthMonitor?.OnEngineTick(utcNow);
+        // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
+        _lastTickUtc = utcNow;
+        
+        // PHASE 3: Update health monitor with engine tick timestamp
+        _healthMonitor?.UpdateEngineTick(utcNow);
 
         // ENGINE_TICK_HEARTBEAT: Diagnostic to prove Tick is advancing even with zero bars
-        // Rate-limited to once per minute (DEBUG level, never affects execution)
-        var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
-        if (timeSinceLastTickHeartbeat >= TICK_HEARTBEAT_RATE_LIMIT_MINUTES || _lastTickHeartbeat == DateTimeOffset.MinValue)
+        // Only logged if diagnostic logs are enabled
+        if (_loggingConfig.enable_diagnostic_logs)
         {
-            _lastTickHeartbeat = utcNow;
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
-                new
-                {
-                    utc_now = utcNow.ToString("o"),
-                    active_stream_count = _streams.Count,
-                    note = "timer-based tick"
-                }));
+            var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
+            if (timeSinceLastTickHeartbeat >= TICK_HEARTBEAT_RATE_LIMIT_MINUTES || _lastTickHeartbeat == DateTimeOffset.MinValue)
+            {
+                _lastTickHeartbeat = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
+                    new
+                    {
+                        utc_now = utcNow.ToString("o"),
+                        active_stream_count = _streams.Count,
+                        note = "timer-based tick"
+                    }));
+            }
         }
 
         // Timetable reactivity
         if (_timetablePoller.ShouldPoll(utcNow))
         {
+            // PHASE 3: Update health monitor with timetable poll timestamp
+            _healthMonitor?.UpdateTimetablePoll(utcNow);
+            
             ReloadTimetableIfChanged(utcNow, force: false);
         }
 
         foreach (var s in _streams.Values)
             s.Tick(utcNow);
         
-        // Health monitor: evaluate staleness (rate-limited internally)
+        // Health monitor: evaluate data loss (rate-limited internally)
         _healthMonitor?.Evaluate(utcNow);
     }
 
@@ -242,26 +353,29 @@ public sealed class RobotEngine
         _healthMonitor?.OnBar(instrument, barUtc);
 
         // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
-        // This fires regardless of stream state or existence - pure observability
-        var shouldLogHeartbeat = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastHeartbeat) ||
-                                (utcNow - lastHeartbeat).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
-        
-        if (shouldLogHeartbeat)
+        // Only logged if diagnostic logs are enabled
+        if (_loggingConfig.enable_diagnostic_logs)
         {
-            _lastBarHeartbeatPerInstrument[instrument] = utcNow;
-            var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
-                new
-                {
-                    instrument = instrument,
-                    raw_bar_time = barUtc.ToString("o"),
-                    raw_bar_time_kind = barUtc.DateTime.Kind.ToString(),
-                    utc_time = barUtc.ToString("o"),
-                    chicago_time = barChicagoTime.ToString("o"),
-                    chicago_offset = barChicagoTime.Offset.ToString(),
-                    close_price = close,
-                    note = "engine-level diagnostic"
-                }));
+            var shouldLogHeartbeat = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastHeartbeat) ||
+                                    (utcNow - lastHeartbeat).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
+            
+            if (shouldLogHeartbeat)
+            {
+                _lastBarHeartbeatPerInstrument[instrument] = utcNow;
+                var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
+                    new
+                    {
+                        instrument = instrument,
+                        raw_bar_time = barUtc.ToString("o"),
+                        raw_bar_time_kind = barUtc.DateTime.Kind.ToString(),
+                        utc_time = barUtc.ToString("o"),
+                        chicago_time = barChicagoTime.ToString("o"),
+                        chicago_offset = barChicagoTime.Offset.ToString(),
+                        close_price = close,
+                        note = "engine-level diagnostic"
+                    }));
+            }
         }
 
         // PHASE 3: Derive trading_date from bar timestamp (bar-derived date is authoritative)
@@ -278,7 +392,7 @@ public sealed class RobotEngine
             // Log trading day rollover (convert to string only for logging)
             var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             var previousTradingDateStr = previousTradingDate?.ToString("yyyy-MM-dd") ?? "UNSET";
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
                 new
                 {
                     previous_trading_date = previousTradingDateStr,
@@ -318,7 +432,7 @@ public sealed class RobotEngine
                 // In replay mode, trading_date mismatch after rollover is a critical error
                 var engineTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
                 var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: engineTradingDateStr, eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: engineTradingDateStr, eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
                     new
                     {
                         error = "TRADING_DATE_MISMATCH",
@@ -349,7 +463,7 @@ public sealed class RobotEngine
         if (poll.Error is not null)
         {
             var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = poll.Error }));
             StandDown();
             return;
@@ -357,10 +471,8 @@ public sealed class RobotEngine
 
         if (!force && !poll.Changed) return;
 
+        var previousHash = _lastTimetableHash;
         _lastTimetableHash = poll.Hash;
-        var updateTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: updateTradingDateStr, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
-            new { timetable_hash = _lastTimetableHash }));
 
         TimetableContract timetable;
         try
@@ -370,7 +482,7 @@ public sealed class RobotEngine
         catch (Exception ex)
         {
             var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "PARSE_ERROR", error = ex.Message }));
             StandDown();
             return;
@@ -378,7 +490,7 @@ public sealed class RobotEngine
 
         if (!TimeService.TryParseDateOnly(timetable.trading_date, out var tradingDate))
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "BAD_TRADING_DATE", trading_date = timetable.trading_date }));
             StandDown();
             return;
@@ -386,7 +498,7 @@ public sealed class RobotEngine
 
         if (timetable.timezone != "America/Chicago")
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "TIMEZONE_MISMATCH", timezone = timetable.timezone }));
             StandDown();
             return;
@@ -401,7 +513,7 @@ public sealed class RobotEngine
         {
             if (tradingDate > chicagoToday)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                     new { reason = "REPLAY_TRADING_DATE_FUTURE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
                 StandDown();
                 return;
@@ -412,7 +524,7 @@ public sealed class RobotEngine
             // Live timetable: require exact date match (fail closed on stale timetable)
             if (tradingDate != chicagoToday)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                     new { reason = "STALE_TRADING_DATE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
                 StandDown();
                 return;
@@ -422,19 +534,25 @@ public sealed class RobotEngine
         // PHASE 3: Store as DateOnly (already parsed above)
         _activeTradingDate = tradingDate;
 
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_LOADED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
+            new 
+            { 
+                previous_hash = previousHash,
+                new_hash = _lastTimetableHash,
+                enabled_stream_count = timetable.streams.Count(s => s.enabled),
+                total_stream_count = timetable.streams.Count
+            }));
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_LOADED", state: "ENGINE",
             new { streams = timetable.streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
         
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
             new { trading_date = timetable.trading_date, is_replay = isReplayTimetable }));
 
         ApplyTimetable(timetable, tradingDate, utcNow);
         
-        // Update health monitor with new timetable (for monitoring window computation)
-        if (_healthMonitor != null && _spec != null && _time != null)
-        {
-            _healthMonitor.UpdateTimetable(_spec, timetable, _time);
-        }
+        // Health monitor no longer uses timetable for monitoring windows
+        // (simplified to only monitor connection loss and data loss)
     }
 
     private void ApplyTimetable(TimetableContract timetable, DateOnly tradingDate, DateTimeOffset utcNow)
@@ -447,6 +565,7 @@ public sealed class RobotEngine
 
         var incoming = timetable.streams.Where(s => s.enabled).ToList();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var streamIdOccurrences = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
         // Log timetable parsing stats
         int acceptedCount = 0;
@@ -456,6 +575,15 @@ public sealed class RobotEngine
         foreach (var directive in incoming)
         {
             var streamId = directive.stream;
+            
+            // Track stream ID occurrences for duplicate detection
+            if (!string.IsNullOrWhiteSpace(streamId))
+            {
+                if (!streamIdOccurrences.TryGetValue(streamId, out var count))
+                    count = 0;
+                streamIdOccurrences[streamId] = count + 1;
+            }
+            
             var instrument = (directive.instrument ?? "").ToUpperInvariant();
             var session = directive.session ?? "";
             var slotTimeChicago = directive.slot_time ?? "";
@@ -484,7 +612,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("MISSING_FIELDS", out var count)) count = 0;
                 skippedReasons["MISSING_FIELDS"] = count + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "MISSING_FIELDS", stream_id = streamId, instrument = instrument, session = session, slot_time = slotTimeChicago }));
                 continue;
             }
@@ -494,7 +622,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_SESSION", out var count2)) count2 = 0;
                 skippedReasons["UNKNOWN_SESSION"] = count2 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_SESSION", stream_id = streamId, session = session }));
                 continue;
             }
@@ -506,7 +634,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("INVALID_SLOT_TIME", out var count3)) count3 = 0;
                 skippedReasons["INVALID_SLOT_TIME"] = count3 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "INVALID_SLOT_TIME", stream_id = streamId, slot_time = slotTimeChicago, allowed_times = allowed }));
                 continue;
             }
@@ -516,7 +644,7 @@ public sealed class RobotEngine
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_INSTRUMENT", out var count4)) count4 = 0;
                 skippedReasons["UNKNOWN_INSTRUMENT"] = count4 + 1;
-                _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_INSTRUMENT", stream_id = streamId, instrument = instrument }));
                 continue;
             }
@@ -528,7 +656,7 @@ public sealed class RobotEngine
             {
                 if (sm.Committed)
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                         "UPDATE_IGNORED_COMMITTED", "ENGINE", new { reason = "STREAM_COMMITTED" }));
                     continue;
                 }
@@ -537,20 +665,15 @@ public sealed class RobotEngine
                 if (string.IsNullOrWhiteSpace(directive.slot_time))
                 {
                     // Fail closed: skip update if slot_time is null/empty
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, sm.SlotTimeChicago, null,
+                        "STREAM_UPDATE_SKIPPED", "ENGINE", new 
+                        { 
+                            reason = "EMPTY_SLOT_TIME",
+                            previous_slot_time = sm.SlotTimeChicago,
+                            note = "Update skipped due to empty slot_time in timetable"
+                        }));
                     continue;
                 }
-                
-                // DIAGNOSTIC: Log trading date being used for stream update
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_UPDATE_DIAGNOSTIC", "ENGINE", new 
-                    { 
-                        trading_date_str = tradingDateStr,
-                        trading_date_parsed = tradingDate.ToString("yyyy-MM-dd"),
-                        timetable_trading_date = timetable.trading_date,
-                        previous_slot_time_utc = sm.SlotTimeUtc.ToString("o"),
-                        new_slot_time_utc = slotTimeUtc?.ToString("o"),
-                        note = "Logging trading date used when updating existing stream"
-                    }));
                 
                 sm.ApplyDirectiveUpdate(directive.slot_time, tradingDate, utcNow);
             }
@@ -560,26 +683,24 @@ public sealed class RobotEngine
                 // Note: IBarProvider is null for live/SIM modes (bars come via OnBar). For DRYRUN mode with historical replay, 
                 // IBarProvider would be passed here if available, but currently RobotEngine doesn't maintain one.
                 
-                // DIAGNOSTIC: Log trading date being used for stream creation
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_CREATION_DIAGNOSTIC", "ENGINE", new 
-                    { 
-                        trading_date_str = tradingDateStr,
-                        trading_date_parsed = tradingDate.ToString("yyyy-MM-dd"),
-                        timetable_trading_date = timetable.trading_date,
-                        slot_time_chicago = slotTimeChicago,
-                        slot_time_utc = slotTimeUtc?.ToString("o"),
-                        note = "Logging trading date used when creating new stream"
-                    }));
-                
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
                 // Pass bar provider for historical hydration support (SIM/DRYRUN modes)
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: _barProvider);
+                // Pass logging config for diagnostic control
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, barProvider: _barProvider, loggingConfig: _loggingConfig);
+                
+                // PHASE 4: Set alert callback for missing data incidents
+                var notificationService = GetNotificationService();
+                if (notificationService != null)
+                {
+                    newSm.SetAlertCallback((key, title, message, priority) => 
+                        notificationService.EnqueueNotification(key, title, message, priority));
+                }
+                
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
                         "STREAM_SKIPPED", "ENGINE", new { reason = "ALREADY_COMMITTED_JOURNAL" }));
                     continue;
                 }
@@ -588,8 +709,23 @@ public sealed class RobotEngine
             }
         }
 
+        // Log duplicate stream IDs if detected
+        foreach (var kvp in streamIdOccurrences)
+        {
+            if (kvp.Value > 1)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "DUPLICATE_STREAM_ID", state: "ENGINE",
+                    new
+                    {
+                        stream_id = kvp.Key,
+                        occurrence_count = kvp.Value,
+                        note = "Duplicate stream ID detected in timetable - last occurrence will be used"
+                    }));
+            }
+        }
+
         // Log parsing summary
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_PARSING_COMPLETE", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_PARSING_COMPLETE", state: "ENGINE",
             new { 
                 total_enabled = incoming.Count, 
                 accepted = acceptedCount, 
@@ -699,5 +835,49 @@ public sealed class RobotEngine
     /// Expose logging service for components that need direct access (e.g., adapters).
     /// </summary>
     internal RobotLoggingService? GetLoggingService() => _loggingService;
+    
+    /// <summary>
+    /// Expose health monitor for strategy files (replaces reflection-based access).
+    /// </summary>
+    internal HealthMonitor? GetHealthMonitor() => _healthMonitor;
+    
+    /// <summary>
+    /// Expose execution adapter for strategy files (replaces reflection-based access).
+    /// </summary>
+    internal IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
+    
+    /// <summary>
+    /// Expose time service for components that need direct access (e.g., bar providers).
+    /// </summary>
+    internal TimeService? GetTimeService() => _time;
+    
+    /// <summary>
+    /// Forward connection status update to health monitor (replaces reflection-based access).
+    /// </summary>
+    public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
+    {
+        _healthMonitor?.OnConnectionStatusUpdate(status, connectionName, DateTimeOffset.UtcNow);
+    }
+    
+    /// <summary>
+    /// PHASE 2: Stand down a specific stream (for protective order failure recovery).
+    /// </summary>
+    public void StandDownStream(string streamId, DateTimeOffset utcNow, string reason)
+    {
+        if (_streams.TryGetValue(streamId, out var stream))
+        {
+            stream.EnterRecoveryManage(utcNow, reason);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", 
+                eventType: "STREAM_STAND_DOWN", state: "ENGINE",
+                new { stream_id = streamId, reason = reason }));
+        }
+    }
+    
+    /// <summary>
+    /// PHASE 2: Get notification service for high-priority alerts (e.g., protective order failures).
+    /// </summary>
+    public NotificationService? GetNotificationService()
+    {
+        return _healthMonitor?.GetNotificationService();
+    }
 }
-

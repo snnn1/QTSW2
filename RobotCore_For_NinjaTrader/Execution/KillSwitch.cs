@@ -80,23 +80,13 @@ public sealed class KillSwitch
 
             if (state.Enabled)
             {
-                // Log kill switch enabled (once per check period)
-                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ENABLED", "ENGINE",
+                // Log kill switch active (once per check period)
+                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_ACTIVE", "ENGINE",
                     new
                     {
                         enabled = true,
                         message = state.Message ?? "Kill switch is active",
-                        note = "Execution blocked by kill switch"
-                    }));
-            }
-            else
-            {
-                // Log kill switch disabled (once per check period)
-                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_DISABLED", "ENGINE",
-                    new
-                    {
-                        enabled = false,
-                        message = "Execution allowed; kill switch disabled"
+                        note = "All order execution is blocked"
                     }));
             }
 

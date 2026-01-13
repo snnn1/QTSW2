@@ -168,6 +168,8 @@ public sealed class RobotLogger
             level = "ERROR";
         else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
             level = "WARN";
+        else if (eventType.Contains("HEARTBEAT") || eventType.Contains("DIAGNOSTIC") || eventType.Contains("AUDIT"))
+            level = "DEBUG"; // Diagnostic events are DEBUG level for filtering
 
         var source = "RobotEngine";
         if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr)

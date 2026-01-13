@@ -56,7 +56,11 @@ public sealed class JournalStore
                 // Use atomic write: write to temp file, then rename (prevents partial writes)
                 var tempPath = path + ".tmp";
                 File.WriteAllText(tempPath, json);
-                File.Move(tempPath, path, overwrite: true);
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+                File.Move(tempPath, path);
             }
             catch (IOException ex)
             {
@@ -66,7 +70,11 @@ public sealed class JournalStore
                 {
                     var tempPath = path + ".tmp";
                     File.WriteAllText(tempPath, json);
-                    File.Move(tempPath, path, overwrite: true);
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                    }
+                    File.Move(tempPath, path);
                 }
                 catch
                 {

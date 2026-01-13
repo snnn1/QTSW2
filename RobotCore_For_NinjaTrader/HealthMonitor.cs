@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using QTSW2.Robot.Core.Notifications;
@@ -8,38 +7,45 @@ using QTSW2.Robot.Core.Notifications;
 namespace QTSW2.Robot.Core;
 
 /// <summary>
-/// Health monitor: detects data stalls and robot stalls, sends Pushover notifications.
-/// Monitoring windows are computed from enabled timetable streams.
+/// Health monitor: detects connection loss and data loss, sends Pushover notifications.
+/// Simplified to only monitor external observable facts: connection status and bar arrivals.
 /// </summary>
 public sealed class HealthMonitor
 {
     private readonly HealthMonitorConfig _config;
     private readonly RobotLogger _log;
     private readonly NotificationService? _notificationService;
-    private TimeService? _time;
     
-    // Tracking state
-    private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
-    private DateTimeOffset _monitorStartUtc = DateTimeOffset.MinValue; // Track when monitoring started
+    // Data loss tracking: timestamp of last received bar per instrument
     private readonly Dictionary<string, DateTimeOffset> _lastBarUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+    
+    // PHASE 3: Engine heartbeat and timetable poll tracking
+    private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastTimetablePollUtc = DateTimeOffset.MinValue;
+    
+    // PHASE 4: Session-aware monitoring state
+    private readonly Dictionary<string, bool> _instrumentHasReceivedData = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _instrumentFirstBarUtc = new(StringComparer.OrdinalIgnoreCase);
     
     // Incident state
     private readonly Dictionary<string, bool> _dataStallActive = new(StringComparer.OrdinalIgnoreCase);
-    private bool _robotStallActive = false;
+    private bool _connectionLostActive = false;
+    private bool _engineTickStallActive = false;
+    private bool _timetablePollStallActive = false;
     
     // Rate limiting
     private readonly Dictionary<string, DateTimeOffset> _lastNotifyUtcByKey = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastEvaluateUtc = DateTimeOffset.MinValue;
     private const int EVALUATE_RATE_LIMIT_SECONDS = 1; // Max 1 evaluation per second
     
-    // Monitoring windows (computed from timetable + spec)
-    private List<(DateTimeOffset Start, DateTimeOffset End)> _monitoringWindows = new();
-    private DateOnly? _tradingDate;
-    
-    // Background evaluation thread
+    // Background evaluation thread for data loss detection
     private CancellationTokenSource? _evaluationCancellationTokenSource;
     private Task? _evaluationTask;
     private const int EVALUATION_INTERVAL_SECONDS = 5; // Evaluate every 5 seconds
+    
+    // PHASE 3: Stall detection thresholds
+    private const int ENGINE_TICK_STALL_SECONDS = 30; // Engine tick should occur at least every 30 seconds
+    private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
@@ -53,134 +59,55 @@ public sealed class HealthMonitor
     }
     
     /// <summary>
-    /// Update monitoring windows from timetable and spec.
-    /// Called when timetable is loaded or updated.
+    /// Handle NinjaTrader connection status update.
+    /// Triggers immediate alert on first transition to disconnected state.
     /// </summary>
-    public void UpdateTimetable(ParitySpec spec, TimetableContract timetable, TimeService time)
+    public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName, DateTimeOffset utcNow)
     {
-        _time = time;
-        
-        if (!TimeService.TryParseDateOnly(timetable.trading_date, out var tradingDate))
+        if (!_config.enabled)
             return;
         
-        _tradingDate = tradingDate;
-        _monitoringWindows = ComputeMonitoringWindows(spec, timetable, time, tradingDate);
+        bool isDisconnected = status == ConnectionStatus.ConnectionLost ||
+                             status == ConnectionStatus.Disconnected ||
+                             status == ConnectionStatus.ConnectionError;
         
-        // Log computed windows once at timetable update
-        var windowsList = _monitoringWindows.Select(w => new
+        if (isDisconnected)
         {
-            start_chicago = w.Start.ToString("o"),
-            end_chicago = w.End.ToString("o"),
-            start_utc = w.Start.ToUniversalTime().ToString("o"),
-            end_utc = w.End.ToUniversalTime().ToString("o")
-        }).ToList();
-        
-        _log.Write(RobotEvents.EngineBase(
-            DateTimeOffset.UtcNow,
-            tradingDate: timetable.trading_date,
-            eventType: "HEALTH_MONITOR_WINDOWS_COMPUTED",
-            state: "ENGINE",
-            extra: new
+            if (!_connectionLostActive)
             {
-                trading_date = timetable.trading_date,
-                enabled_stream_count = timetable.streams.Count(s => s.enabled),
-                monitoring_windows_count = _monitoringWindows.Count,
-                monitoring_windows = windowsList,
-                grace_period_seconds = _config.grace_period_seconds
-            }));
-    }
-    
-    /// <summary>
-    /// Compute monitoring windows from enabled streams.
-    /// Window = [RangeStartChicagoTime, SlotTimeChicagoTime + grace_period] for each enabled stream.
-    /// Windows are merged if overlapping.
-    /// </summary>
-    private List<(DateTimeOffset Start, DateTimeOffset End)> ComputeMonitoringWindows(
-        ParitySpec spec,
-        TimetableContract timetable,
-        TimeService time,
-        DateOnly tradingDate)
-    {
-        var windows = new List<(DateTimeOffset Start, DateTimeOffset End)>();
-        
-        foreach (var stream in timetable.streams.Where(s => s.enabled))
-        {
-            // Get session (S1 or S2)
-            if (!spec.sessions.TryGetValue(stream.session, out var session))
-                continue;
-            
-            // Get range start time from ParitySpec
-            var rangeStartChicago = session.range_start_time;
-            var slotTimeChicago = stream.slot_time;
-            
-            // Construct Chicago times
-            var rangeStartChicagoTime = time.ConstructChicagoTime(tradingDate, rangeStartChicago);
-            var slotTimeChicagoTime = time.ConstructChicagoTime(tradingDate, slotTimeChicago);
-            
-            // Add grace period to end time
-            var windowEnd = slotTimeChicagoTime.AddSeconds(_config.grace_period_seconds);
-            
-            windows.Add((rangeStartChicagoTime, windowEnd));
-        }
-        
-        // Merge overlapping windows
-        if (windows.Count == 0)
-            return windows;
-        
-        // Sort by start time
-        windows.Sort((a, b) => a.Start.CompareTo(b.Start));
-        
-        // Merge overlapping windows
-        var merged = new List<(DateTimeOffset Start, DateTimeOffset End)>();
-        var current = windows[0];
-        
-        for (int i = 1; i < windows.Count; i++)
-        {
-            if (windows[i].Start <= current.End)
-            {
-                // Overlapping: extend current window
-                current = (current.Start, current.End > windows[i].End ? current.End : windows[i].End);
-            }
-            else
-            {
-                // Non-overlapping: save current and start new
-                merged.Add(current);
-                current = windows[i];
+                // First detection: mark active and notify
+                _connectionLostActive = true;
+                
+                var title = "Connection Lost";
+                var message = $"NinjaTrader connection lost: {connectionName}. Status: {status}";
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST", state: "ENGINE",
+                    new
+                    {
+                        connection_name = connectionName,
+                        connection_status = status.ToString(),
+                        timestamp_utc = utcNow.ToString("o")
+                    }));
+                
+                SendNotification("CONNECTION_LOST", title, message, priority: 2); // Emergency priority
             }
         }
-        merged.Add(current);
-        
-        return merged;
-    }
-    
-    /// <summary>
-    /// Check if monitoring is currently active (current time falls within any monitoring window).
-    /// </summary>
-    private bool IsMonitoringActiveNow(DateTimeOffset utcNow)
-    {
-        if (_monitoringWindows.Count == 0)
-            return false;
-        
-        if (_time == null)
-            return false;
-        
-        var nowChicago = _time.ConvertUtcToChicago(utcNow);
-        
-        foreach (var window in _monitoringWindows)
+        else
         {
-            if (nowChicago >= window.Start && nowChicago < window.End)
-                return true;
+            // Connection restored: clear flag and log recovery (no notification)
+            if (_connectionLostActive)
+            {
+                _connectionLostActive = false;
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_RECOVERED", state: "ENGINE",
+                    new
+                    {
+                        connection_name = connectionName,
+                        connection_status = status.ToString(),
+                        timestamp_utc = utcNow.ToString("o")
+                    }));
+            }
         }
-        
-        return false;
-    }
-    
-    /// <summary>
-    /// Record engine tick heartbeat.
-    /// </summary>
-    public void OnEngineTick(DateTimeOffset utcNow)
-    {
-        _lastEngineTickUtc = utcNow;
     }
     
     /// <summary>
@@ -189,319 +116,168 @@ public sealed class HealthMonitor
     public void OnBar(string instrument, DateTimeOffset barUtc)
     {
         _lastBarUtcByInstrument[instrument] = barUtc;
+        
+        // PHASE 4: Track that instrument has received initial data
+        if (!_instrumentHasReceivedData.ContainsKey(instrument))
+        {
+            _instrumentHasReceivedData[instrument] = true;
+            _instrumentFirstBarUtc[instrument] = barUtc;
+        }
+        
+        // Clear data loss flag if it was active (recovery)
+        if (_dataStallActive.TryGetValue(instrument, out var isActive) && isActive)
+        {
+            _dataStallActive[instrument] = false;
+            
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
+                new
+                {
+                    instrument = instrument,
+                    last_bar_utc = barUtc.ToString("o")
+                }));
+        }
     }
     
     /// <summary>
-    /// Evaluate staleness and trigger alerts if needed.
+    /// PHASE 3: Update engine heartbeat timestamp.
+    /// </summary>
+    public void UpdateEngineTick(DateTimeOffset tickUtc)
+    {
+        _lastEngineTickUtc = tickUtc;
+        
+        // Clear engine tick stall flag if it was active (recovery)
+        if (_engineTickStallActive)
+        {
+            _engineTickStallActive = false;
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "ENGINE_TICK_STALL_RECOVERED", state: "ENGINE",
+                new { last_tick_utc = tickUtc.ToString("o") }));
+        }
+    }
+    
+    /// <summary>
+    /// PHASE 3: Update timetable poll timestamp.
+    /// </summary>
+    public void UpdateTimetablePoll(DateTimeOffset pollUtc)
+    {
+        _lastTimetablePollUtc = pollUtc;
+        
+        // Clear timetable poll stall flag if it was active (recovery)
+        if (_timetablePollStallActive)
+        {
+            _timetablePollStallActive = false;
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_RECOVERED", state: "ENGINE",
+                new { last_poll_utc = pollUtc.ToString("o") }));
+        }
+    }
+    
+    /// <summary>
+    /// Evaluate data loss and trigger alerts if needed.
     /// Rate-limited internally to max 1/sec.
     /// </summary>
     public void Evaluate(DateTimeOffset utcNow)
     {
-        // Log entry to Evaluate()
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new { diagnostic = "evaluate_entry", enabled = _config.enabled, last_evaluate_utc = _lastEvaluateUtc.ToString("o") }));
-        }
-        catch { /* Ignore logging errors */ }
-        
         if (!_config.enabled)
-        {
-            // Log that evaluation is skipped due to disabled config
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                    new { diagnostic = "evaluate_skipped", reason = "config_disabled" }));
-            }
-            catch { /* Ignore logging errors */ }
             return;
-        }
         
         // Rate limit evaluation
         var timeSinceLastEvaluate = (utcNow - _lastEvaluateUtc).TotalSeconds;
         if (timeSinceLastEvaluate < EVALUATE_RATE_LIMIT_SECONDS)
-        {
-            // Log rate limiting
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                    new { diagnostic = "evaluate_rate_limited", time_since_last = timeSinceLastEvaluate, rate_limit = EVALUATE_RATE_LIMIT_SECONDS }));
-            }
-            catch { /* Ignore logging errors */ }
             return;
-        }
         
         _lastEvaluateUtc = utcNow;
         
-        // Log that Evaluate() is proceeding
-        try
-        {
-            var elapsedSinceLastTick = (utcNow - _lastEngineTickUtc).TotalSeconds;
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "evaluate_proceeding",
-                    elapsed_since_last_tick = elapsedSinceLastTick,
-                    threshold = _config.robot_stall_seconds,
-                    last_engine_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o"),
-                    monitor_start_utc = _monitorStartUtc.ToString("o"),
-                    time_since_monitor_start = _monitorStartUtc != DateTimeOffset.MinValue ? (utcNow - _monitorStartUtc).TotalSeconds : 0
-                }));
-        }
-        catch { /* Ignore logging errors */ }
+        // PHASE 3: Check engine tick stall
+        EvaluateEngineTickStall(utcNow);
         
-        // Check robot stall
-        EvaluateRobotStall(utcNow);
+        // PHASE 3: Check timetable poll stall
+        EvaluateTimetablePollStall(utcNow);
         
-        // Check data stalls (only during active monitoring windows)
-        if (IsMonitoringActiveNow(utcNow))
-        {
-            EvaluateDataStalls(utcNow);
-        }
+        // PHASE 4: Check data stalls (session-aware)
+        EvaluateDataStalls(utcNow);
+        
+        // PHASE 4: Check for "never received initial data" (session-aware)
+        EvaluateInitialDataMissing(utcNow);
     }
     
-    private void EvaluateRobotStall(DateTimeOffset utcNow)
+    /// <summary>
+    /// PHASE 3: Evaluate engine tick stall.
+    /// </summary>
+    private void EvaluateEngineTickStall(DateTimeOffset utcNow)
     {
-        // Log entry to EvaluateRobotStall()
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "evaluate_robot_stall_entry",
-                    last_engine_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o"),
-                    is_min_value = _lastEngineTickUtc == DateTimeOffset.MinValue,
-                    monitor_start_utc = _monitorStartUtc.ToString("o"),
-                    time_since_monitor_start = _monitorStartUtc != DateTimeOffset.MinValue ? (utcNow - _monitorStartUtc).TotalSeconds : 0
-                }));
-        }
-        catch { /* Ignore logging errors */ }
-        
-        // Determine baseline: use _lastEngineTickUtc if it's recent, otherwise use monitor_start
-        // This handles the case where Tick() stops being called (strategy disabled)
-        DateTimeOffset baselineUtc;
-        bool usingMonitorStart = false;
-        
         if (_lastEngineTickUtc == DateTimeOffset.MinValue)
+            return; // Engine not started yet
+        
+        var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
+        
+        if (elapsed >= ENGINE_TICK_STALL_SECONDS)
         {
-            // OnEngineTick() was never called - use monitor start time
-            if (_monitorStartUtc == DateTimeOffset.MinValue)
+            if (!_engineTickStallActive)
             {
-                // Shouldn't happen, but handle it
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new { diagnostic = "robot_stall_check_skipped", reason = "monitor_not_started" }));
-                }
-                catch { /* Ignore logging errors */ }
-                return;
-            }
-            baselineUtc = _monitorStartUtc;
-            usingMonitorStart = true;
-            
-            // Log that we're using monitor start time
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
+                _engineTickStallActive = true;
+                
+                var title = "Engine Tick Stall Detected";
+                var message = $"Engine Tick() has not been called for {elapsed:F0}s. Last tick: {_lastEngineTickUtc:o} UTC. Threshold: {ENGINE_TICK_STALL_SECONDS}s";
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_STALL_DETECTED", state: "ENGINE",
                     new
                     {
-                        diagnostic = "using_monitor_start_as_baseline",
-                        reason = "on_engine_tick_never_called",
-                        monitor_start_utc = _monitorStartUtc.ToString("o"),
-                        time_since_start = (utcNow - _monitorStartUtc).TotalSeconds
-                    }));
-            }
-            catch { /* Ignore logging errors */ }
-        }
-        else
-        {
-            // OnEngineTick() was called - check if it's recent enough
-            // If _lastEngineTickUtc is very recent (< 1 second), it means Tick() was just called
-            // In that case, we should use monitor_start as baseline to detect if Tick() stops
-            var timeSinceLastTick = (utcNow - _lastEngineTickUtc).TotalSeconds;
-            
-            // If last tick was very recent (< 1s), Tick() is still being called
-            // Use monitor_start as baseline to detect when Tick() stops
-            // If last tick was old (> 1s), Tick() has stopped, use _lastEngineTickUtc as baseline
-            if (timeSinceLastTick < 1.0)
-            {
-                // Tick() was just called - use monitor_start to detect when it stops
-                if (_monitorStartUtc != DateTimeOffset.MinValue)
-                {
-                    baselineUtc = _monitorStartUtc;
-                    usingMonitorStart = true;
-                    
-                    // Log that we're using monitor start because Tick() is still active
-                    try
-                    {
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                            new
-                            {
-                                diagnostic = "using_monitor_start_as_baseline",
-                                reason = "tick_still_active_using_monitor_start",
-                                monitor_start_utc = _monitorStartUtc.ToString("o"),
-                                last_tick_utc = _lastEngineTickUtc.ToString("o"),
-                                time_since_last_tick = timeSinceLastTick,
-                                time_since_start = (utcNow - _monitorStartUtc).TotalSeconds
-                            }));
-                    }
-                    catch { /* Ignore logging errors */ }
-                }
-                else
-                {
-                    // Fallback to _lastEngineTickUtc if monitor_start not available
-                    baselineUtc = _lastEngineTickUtc;
-                }
-            }
-            else
-            {
-                // Tick() has stopped - use _lastEngineTickUtc as baseline
-                baselineUtc = _lastEngineTickUtc;
-            }
-        }
-        
-        var elapsed = (utcNow - baselineUtc).TotalSeconds;
-        
-        // Log elapsed time calculation
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "elapsed_calculated",
-                    elapsed_seconds = elapsed,
-                    threshold_seconds = _config.robot_stall_seconds,
-                    exceeds_threshold = elapsed > _config.robot_stall_seconds,
-                    robot_stall_active = _robotStallActive,
-                    baseline_utc = baselineUtc.ToString("o"),
-                    using_monitor_start = usingMonitorStart
-                }));
-        }
-        catch { /* Ignore logging errors */ }
-        
-        // Log diagnostic every time we check (for debugging) - but only when elapsed > threshold to avoid spam
-        if (elapsed > _config.robot_stall_seconds)
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "robot_stall_check",
-                    baseline_utc = baselineUtc.ToString("o"),
-                    last_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o"),
-                    elapsed_seconds = elapsed,
-                    threshold_seconds = _config.robot_stall_seconds,
-                    robot_stall_active = _robotStallActive,
-                    using_monitor_start = _lastEngineTickUtc == DateTimeOffset.MinValue
-                }));
-        }
-        
-        if (elapsed > _config.robot_stall_seconds)
-        {
-            // Log that threshold exceeded
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                    new
-                    {
-                        diagnostic = "threshold_exceeded",
+                        last_tick_utc = _lastEngineTickUtc.ToString("o"),
                         elapsed_seconds = elapsed,
-                        threshold_seconds = _config.robot_stall_seconds,
-                        robot_stall_active = _robotStallActive,
-                        will_notify = !_robotStallActive
-                    }));
-            }
-            catch { /* Ignore logging errors */ }
-            
-            if (!_robotStallActive)
-            {
-                // Log before marking as active
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new { diagnostic = "marking_stall_active" }));
-                }
-                catch { /* Ignore logging errors */ }
-                
-                // First detection: mark active and notify
-                _robotStallActive = true;
-                
-                var title = "Robot Stall Detected";
-                var lastTickInfo = _lastEngineTickUtc == DateTimeOffset.MinValue 
-                    ? "Never called (strategy may be disabled)" 
-                    : $"{_lastEngineTickUtc:o} UTC";
-                var message = $"Robot tick heartbeat stopped. Last tick: {lastTickInfo} ({elapsed:F0}s ago). Threshold: {_config.robot_stall_seconds}s";
-                
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ROBOT_STALL_DETECTED", state: "ENGINE",
-                    new
-                    {
-                        baseline_utc = baselineUtc.ToString("o"),
-                        last_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o"),
-                        elapsed_seconds = elapsed,
-                        threshold_seconds = _config.robot_stall_seconds,
-                        using_monitor_start = _lastEngineTickUtc == DateTimeOffset.MinValue
+                        threshold_seconds = ENGINE_TICK_STALL_SECONDS
                     }));
                 
-                // Log before sending notification
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new { diagnostic = "calling_send_notification", notification_key = "ROBOT_STALL" }));
-                }
-                catch { /* Ignore logging errors */ }
-                
-                SendNotification("ROBOT_STALL", title, message, priority: 2); // Emergency priority
-            }
-            else
-            {
-                // Log that stall is already active
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new { diagnostic = "stall_already_active", skipping_notification = true }));
-                }
-                catch { /* Ignore logging errors */ }
-            }
-        }
-        else
-        {
-            // Log that threshold not exceeded
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                    new
-                    {
-                        diagnostic = "threshold_not_exceeded",
-                        elapsed_seconds = elapsed,
-                        threshold_seconds = _config.robot_stall_seconds
-                    }));
-            }
-            catch { /* Ignore logging errors */ }
-            
-            // Recovery: if stall was active but now elapsed <= threshold, clear flag
-            if (_robotStallActive)
-            {
-                // Log recovery
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new { diagnostic = "marking_stall_recovered" }));
-                }
-                catch { /* Ignore logging errors */ }
-                
-                // Recovery: clear flag and log
-                _robotStallActive = false;
-                
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ROBOT_STALL_RECOVERED", state: "ENGINE",
-                    new
-                    {
-                        baseline_utc = baselineUtc.ToString("o"),
-                        last_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o"),
-                        elapsed_seconds = elapsed
-                    }));
+                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2); // Emergency priority
             }
         }
     }
     
+    /// <summary>
+    /// PHASE 3: Evaluate timetable poll stall.
+    /// </summary>
+    private void EvaluateTimetablePollStall(DateTimeOffset utcNow)
+    {
+        if (_lastTimetablePollUtc == DateTimeOffset.MinValue)
+            return; // Timetable not polled yet
+        
+        var elapsed = (utcNow - _lastTimetablePollUtc).TotalSeconds;
+        
+        if (elapsed >= TIMETABLE_POLL_STALL_SECONDS)
+        {
+            if (!_timetablePollStallActive)
+            {
+                _timetablePollStallActive = true;
+                
+                var title = "Timetable Poll Stall Detected";
+                var message = $"Timetable polling has not occurred for {elapsed:F0}s. Last poll: {_lastTimetablePollUtc:o} UTC. Threshold: {TIMETABLE_POLL_STALL_SECONDS}s";
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_DETECTED", state: "ENGINE",
+                    new
+                    {
+                        last_poll_utc = _lastTimetablePollUtc.ToString("o"),
+                        elapsed_seconds = elapsed,
+                        threshold_seconds = TIMETABLE_POLL_STALL_SECONDS
+                    }));
+                
+                SendNotification("TIMETABLE_POLL_STALL", title, message, priority: 1); // High priority
+            }
+        }
+    }
+    
+    /// <summary>
+    /// PHASE 4: Evaluate initial data missing (never received first bar for instrument).
+    /// This is session-aware and only checks during active monitoring windows.
+    /// </summary>
+    private void EvaluateInitialDataMissing(DateTimeOffset utcNow)
+    {
+        // TODO: Implement session-aware check using timetable/session definitions
+        // For now, this is a placeholder - full implementation requires access to timetable and session windows
+        // This will be called but won't trigger alerts until session-aware logic is implemented
+    }
+    
+    /// <summary>
+    /// PHASE 4: Evaluate data stalls (session-aware).
+    /// Only checks during active monitoring windows (relaxed outside sessions).
+    /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
         // Check each instrument that has received bars
@@ -512,42 +288,30 @@ public sealed class HealthMonitor
             var lastBarUtc = _lastBarUtcByInstrument[instrument];
             var elapsed = (utcNow - lastBarUtc).TotalSeconds;
             
-            if (elapsed > _config.data_stall_seconds)
+            // PHASE 4: Session-aware check - for now, use standard threshold
+            // TODO: Adjust threshold based on active session windows
+            var threshold = _config.data_stall_seconds;
+            
+            if (elapsed >= threshold)
             {
                 if (!_dataStallActive.TryGetValue(instrument, out var isActive) || !isActive)
                 {
                     // First detection: mark active and notify
                     _dataStallActive[instrument] = true;
                     
-                    var title = $"Data Stall: {instrument}";
-                    var message = $"No bars received for {instrument}. Last bar: {lastBarUtc:o} UTC ({elapsed:F0}s ago). Threshold: {_config.data_stall_seconds}s";
+                    var title = $"Data Loss: {instrument}";
+                    var message = $"No bars received for {instrument}. Last bar: {lastBarUtc:o} UTC ({elapsed:F0}s ago). Threshold: {threshold}s";
                     
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "DATA_STALL_DETECTED", state: "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
                         new
                         {
                             instrument = instrument,
                             last_bar_utc = lastBarUtc.ToString("o"),
                             elapsed_seconds = elapsed,
-                            threshold_seconds = _config.data_stall_seconds
+                            threshold_seconds = threshold
                         }));
                     
-                    SendNotification($"DATA_STALL:{instrument}", title, message, priority: 1); // High priority
-                }
-            }
-            else
-            {
-                if (_dataStallActive.TryGetValue(instrument, out var isActive) && isActive)
-                {
-                    // Recovery: clear flag and log
-                    _dataStallActive[instrument] = false;
-                    
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
-                        new
-                        {
-                            instrument = instrument,
-                            last_bar_utc = lastBarUtc.ToString("o"),
-                            elapsed_seconds = elapsed
-                        }));
+                    SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1); // High priority
                 }
             }
         }
@@ -555,73 +319,24 @@ public sealed class HealthMonitor
     
     private void SendNotification(string key, string title, string message, int priority)
     {
-        // Log entry to SendNotification()
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "send_notification_entry",
-                    notification_key = key,
-                    notification_service_null = _notificationService == null
-                }));
-        }
-        catch { /* Ignore logging errors */ }
-        
         if (_notificationService == null)
-        {
-            try
-            {
-                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                    new { diagnostic = "send_notification_skipped", reason = "notification_service_null" }));
-            }
-            catch { /* Ignore logging errors */ }
             return;
-        }
         
         // Check rate limit
         if (_lastNotifyUtcByKey.TryGetValue(key, out var lastNotify))
         {
             var timeSinceLastNotify = (DateTimeOffset.UtcNow - lastNotify).TotalSeconds;
             if (timeSinceLastNotify < _config.min_notify_interval_seconds)
-            {
-                try
-                {
-                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                        new
-                        {
-                            diagnostic = "send_notification_rate_limited",
-                            notification_key = key,
-                            time_since_last_notify = timeSinceLastNotify,
-                            min_notify_interval = _config.min_notify_interval_seconds
-                        }));
-                }
-                catch { /* Ignore logging errors */ }
                 return; // Rate limited
-            }
         }
         
         _lastNotifyUtcByKey[key] = DateTimeOffset.UtcNow;
         
-        // Log before enqueuing
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    diagnostic = "enqueuing_notification",
-                    notification_key = key,
-                    title = title,
-                    priority = priority
-                }));
-        }
-        catch { /* Ignore logging errors */ }
-        
         // Enqueue notification (non-blocking)
         _notificationService.EnqueueNotification(key, title, message, priority);
         
-        // Log notification enqueued (immediate, non-blocking)
-        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "PUSHOVER_NOTIFY_ENQUEUED", state: "ENGINE",
+        // Log notification enqueued
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "PUSHOVER_NOTIFY_ENQUEUED", state: "ENGINE",
             new
             {
                 notification_key = key,
@@ -640,14 +355,7 @@ public sealed class HealthMonitor
     {
         _notificationService?.Start();
         
-        // Track when monitoring started (for detecting stalls if Tick() never called)
-        var now = DateTimeOffset.UtcNow;
-        if (_monitorStartUtc == DateTimeOffset.MinValue)
-        {
-            _monitorStartUtc = now;
-        }
-        
-        // Start background evaluation thread (independent of Tick())
+        // Start background evaluation thread for data loss detection
         if (_evaluationTask == null || _evaluationTask.IsCompleted)
         {
             if (_evaluationCancellationTokenSource != null && !_evaluationCancellationTokenSource.IsCancellationRequested)
@@ -661,78 +369,33 @@ public sealed class HealthMonitor
         }
         
         // Log health monitor started
-        _log.Write(RobotEvents.EngineBase(now, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_STARTED", state: "ENGINE",
+        var now = DateTimeOffset.UtcNow;
+        _log.Write(RobotEvents.EngineBase(now, tradingDate: "", eventType: "HEALTH_MONITOR_STARTED", state: "ENGINE",
             new
             {
                 enabled = _config.enabled,
                 data_stall_seconds = _config.data_stall_seconds,
-                robot_stall_seconds = _config.robot_stall_seconds,
-                grace_period_seconds = _config.grace_period_seconds,
                 min_notify_interval_seconds = _config.min_notify_interval_seconds,
                 pushover_configured = _config.pushover_enabled && !string.IsNullOrWhiteSpace(_config.pushover_user_key) && !string.IsNullOrWhiteSpace(_config.pushover_app_token),
                 pushover_priority = _config.pushover_priority,
-                evaluation_thread_started = true,
-                monitor_start_utc = _monitorStartUtc.ToString("o"),
-                last_engine_tick_utc = _lastEngineTickUtc == DateTimeOffset.MinValue ? "NEVER_CALLED" : _lastEngineTickUtc.ToString("o")
+                evaluation_thread_started = true
             }));
     }
     
     /// <summary>
-    /// Background evaluation loop - runs independently of Tick().
-    /// This allows detection of robot stalls even when strategy is disabled.
+    /// Background evaluation loop - runs independently to check for data loss.
     /// </summary>
     private void EvaluationLoop(CancellationToken cancellationToken)
     {
         Thread.CurrentThread.IsBackground = true;
         Thread.CurrentThread.Name = "HealthMonitor-Evaluation";
         
-        // Log thread start
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_EVALUATION_THREAD_STARTED", state: "ENGINE",
-                new { evaluation_interval_seconds = EVALUATION_INTERVAL_SECONDS }));
-        }
-        catch { /* Ignore logging errors */ }
-        
-        int iterationCount = 0;
-        // Log that we're entering the loop
-        try
-        {
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_EVALUATION_LOOP_ENTERED", state: "ENGINE",
-                new { cancellation_requested = cancellationToken.IsCancellationRequested }));
-        }
-        catch { /* Ignore logging errors */ }
-        
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                iterationCount++;
                 var utcNow = DateTimeOffset.UtcNow;
-                
-                // Log first iteration immediately
-                if (iterationCount == 1)
-                {
-                    try
-                    {
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_EVALUATION_LOOP_FIRST_ITERATION", state: "ENGINE",
-                            new { iteration = iterationCount, enabled = _config.enabled, last_engine_tick_utc = _lastEngineTickUtc.ToString("o") }));
-                    }
-                    catch { /* Ignore logging errors */ }
-                }
-                
-                // Log every 6th iteration (every ~30 seconds) for debugging
-                if (iterationCount % 6 == 0)
-                {
-                    try
-                    {
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_EVALUATION_LOOP_ITERATION", state: "ENGINE",
-                            new { iteration = iterationCount, last_engine_tick_utc = _lastEngineTickUtc.ToString("o"), enabled = _config.enabled }));
-                    }
-                    catch { /* Ignore logging errors */ }
-                }
-                
-                Evaluate(utcNow); // Evaluate staleness and trigger alerts if needed
+                Evaluate(utcNow); // Evaluate data loss and trigger alerts if needed
                 
                 // Sleep for evaluation interval
                 Thread.Sleep(TimeSpan.FromSeconds(EVALUATION_INTERVAL_SECONDS));
@@ -746,7 +409,7 @@ public sealed class HealthMonitor
                 // Log error but continue monitoring
                 try
                 {
-                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _tradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "HEALTH_MONITOR_EVALUATION_ERROR", state: "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_EVALUATION_ERROR", state: "ENGINE",
                         new { error = ex.Message, error_type = ex.GetType().Name, stack_trace = ex.StackTrace }));
                 }
                 catch
@@ -784,4 +447,20 @@ public sealed class HealthMonitor
         }
         _evaluationTask = null;
     }
+    
+    /// <summary>
+    /// Get notification service for external use (e.g., engine startup alerts).
+    /// </summary>
+    public NotificationService? GetNotificationService() => _notificationService;
+}
+
+/// <summary>
+/// NinjaTrader connection status enumeration.
+/// </summary>
+public enum ConnectionStatus
+{
+    Connected,
+    ConnectionLost,
+    Disconnected,
+    ConnectionError
 }

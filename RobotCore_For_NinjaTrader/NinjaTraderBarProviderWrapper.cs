@@ -1,3 +1,6 @@
+// NOTE: This file is NT-specific and exists only in RobotCore_For_NinjaTrader/
+// It wraps NinjaTraderBarProvider and accesses RobotEngine via accessor methods.
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -26,10 +29,8 @@ public class NinjaTraderBarProviderWrapper : IBarProvider
     {
         if (_provider == null)
         {
-            // Get TimeService from engine via reflection (it's private)
-            var engineType = _engine.GetType();
-            var timeServiceField = engineType.GetField("_time", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var timeService = timeServiceField?.GetValue(_engine) as TimeService;
+            // Get TimeService from engine using accessor method (replaces reflection)
+            var timeService = _engine.GetTimeService();
             
             if (timeService == null)
                 throw new InvalidOperationException("TimeService not available in RobotEngine");
