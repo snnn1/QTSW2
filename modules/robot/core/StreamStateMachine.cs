@@ -784,7 +784,7 @@ public sealed class StreamStateMachine
     private DateTimeOffset _lastExecutionGateEvalBarUtc = DateTimeOffset.MinValue;
     private const int EXECUTION_GATE_EVAL_RATE_LIMIT_SECONDS = 60; // Log once per minute max
 
-    public void OnBar(DateTimeOffset barUtc, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
+    public void OnBar(DateTimeOffset barUtc, decimal open, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
     {
         // REFACTORED: Do NOT build range incrementally
         // Only buffer bars for retrospective computation when slot time is reached
@@ -918,9 +918,8 @@ public sealed class StreamStateMachine
                 
                 lock (_barBufferLock)
                 {
-                    // Need open price - use close as fallback (should be provided by caller)
-                    // Note: OnBar signature should include open, but using close as fallback for now
-                    _barBuffer.Add(new Bar(barUtc, close, high, low, close, null));
+                    // Add bar to buffer with actual open price
+                    _barBuffer.Add(new Bar(barUtc, open, high, low, close, null));
                 }
                 
                 // Gap tolerance tracking (treat bar timestamp as bar OPEN time in Chicago)
@@ -1353,7 +1352,8 @@ public sealed class StreamStateMachine
             }
             
             var fileDir = Path.Combine(projectRoot, "data", "raw", Instrument.ToLowerInvariant(), "1m", year.ToString("0000"), month.ToString("00"));
-            var fileName = $"{year:0000}-{month:00}-{day:00}.csv";
+            // File naming pattern: {INSTRUMENT}_1m_{yyyy-MM-dd}.csv (e.g., ES_1m_2026-01-13.csv)
+            var fileName = $"{Instrument.ToUpperInvariant()}_1m_{year:0000}-{month:00}-{day:00}.csv";
             var filePath = Path.Combine(fileDir, fileName);
             
             // Log fully resolved absolute path before reading

@@ -133,13 +133,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Log($"DIAGNOSTIC: Raw NT Bar Time: {barExchangeTime:o}, Kind: {barExchangeTime.Kind}, Converted UTC: {barUtc:o}, Chicago Offset: {barChicagoOffset.Offset}", LogLevel.Information);
             }
 
+            var open = (decimal)Open[0];
             var high = (decimal)High[0];
             var low = (decimal)Low[0];
             var close = (decimal)Close[0];
             var nowUtc = DateTimeOffset.UtcNow;
 
             // Deliver bar data to engine (bars only provide market data, not time advancement)
-            _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, high, low, close, nowUtc);
+            _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
             // NOTE: Tick() is now called by timer, not by bar arrivals
             // This ensures time-based state transitions occur even when no bars arrive
         }

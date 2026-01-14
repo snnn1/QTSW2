@@ -387,7 +387,7 @@ public sealed class RobotEngine
         _healthMonitor?.Evaluate(utcNow);
     }
 
-    public void OnBar(DateTimeOffset barUtc, string instrument, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
+    public void OnBar(DateTimeOffset barUtc, string instrument, decimal open, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
     {
         if (_spec is null || _time is null) return;
 
@@ -493,7 +493,7 @@ public sealed class RobotEngine
         foreach (var s in _streams.Values)
         {
             if (s.IsSameInstrument(instrument))
-                s.OnBar(barUtc, high, low, close, utcNow);
+                s.OnBar(barUtc, open, high, low, close, utcNow);
         }
     }
 

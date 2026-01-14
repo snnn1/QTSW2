@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Robot.Core")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+38f54a5e7e7ec563fdc89a520da1f5e50a355611")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+eedc7d83c08521c97e05326e583e96a2b362eacc")]
 [assembly: System.Reflection.AssemblyProductAttribute("Robot.Core")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Robot.Core")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

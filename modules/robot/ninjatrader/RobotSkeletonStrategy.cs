@@ -66,11 +66,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
             var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
 
+            var open = (decimal)Open[0];
             var high = (decimal)High[0];
             var low = (decimal)Low[0];
             var close = (decimal)Close[0];
 
-            _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, high, low, close, nowUtc);
+            _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
             // NOTE: Tick() is now called by timer, not by bar arrivals
             // This ensures time-based state transitions occur even when no bars arrive
 
