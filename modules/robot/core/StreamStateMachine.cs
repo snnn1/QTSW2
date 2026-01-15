@@ -97,6 +97,10 @@ public sealed class StreamStateMachine
     private DateTimeOffset? _lastBarTimestampUtc = null; // Detect out-of-order bars
     private bool _slotEndSummaryLogged = false; // Ensure exactly one summary per slot
     
+    // Logging rate limiting
+    private bool _rangeComputeStartLogged = false; // Ensure RANGE_COMPUTE_START only logged once per slot
+    private DateTimeOffset? _lastRangeComputeFailedLogUtc = null; // Rate-limit RANGE_COMPUTE_FAILED (once per minute max)
+    
     // Assertion flags (once per stream per day)
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
@@ -225,6 +229,22 @@ public sealed class StreamStateMachine
         // Only update if trading_date actually changed
         if (previousTradingDateStr == newTradingDateStr)
             return;
+        
+        // GUARD: If previous trading date is empty/null, this is initialization, not a rollover
+        // In this case, just update the journal and times without resetting state
+        var isInitialization = string.IsNullOrWhiteSpace(previousTradingDateStr);
+        
+        // GUARD: If new date is before previous date, this is historical/replay data
+        // Don't reset state for backward date progression (replay mode)
+        var isBackwardDate = false;
+        if (!isInitialization && !string.IsNullOrWhiteSpace(previousTradingDateStr))
+        {
+            if (TimeService.TryParseDateOnly(previousTradingDateStr, out var prevDate) && 
+                newTradingDate < prevDate)
+            {
+                isBackwardDate = true;
+            }
+        }
 
         // Load or create journal for the new trading_date
         var existingJournal = _journals.TryLoad(newTradingDateStr, Stream);
@@ -233,14 +253,25 @@ public sealed class StreamStateMachine
             // Journal already exists and is committed - use it and mark as DONE
             _journal = existingJournal;
             State = StreamState.DONE;
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "TRADING_DAY_ROLLOVER", State.ToString(),
-                new
-                {
-                    previous_trading_date = previousTradingDateStr,
-                    new_trading_date = newTradingDateStr,
-                    note = "JOURNAL_ALREADY_COMMITTED_FOR_NEW_DATE"
-                }));
+            
+            // Only log rollover if it's forward progression (not backward/replay)
+            if (!isBackwardDate)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "TRADING_DAY_ROLLOVER", State.ToString(),
+                    new
+                    {
+                        previous_trading_date = previousTradingDateStr,
+                        new_trading_date = newTradingDateStr,
+                        note = "JOURNAL_ALREADY_COMMITTED_FOR_NEW_DATE"
+                    }));
+            }
+            else
+            {
+                // Backward date with committed journal - silent update
+                LogHealth("INFO", "TRADING_DATE_BACKWARD", $"Trading date moved backward (committed journal): {previousTradingDateStr} -> {newTradingDateStr}",
+                    new { previous_trading_date = previousTradingDateStr, new_trading_date = newTradingDateStr, note = "Committed journal, state preserved" });
+            }
             return;
         }
 
@@ -277,73 +308,102 @@ public sealed class StreamStateMachine
         }
         _journals.Save(_journal);
 
-        // Reset daily state flags for new trading day
-        RangeHigh = null;
-        RangeLow = null;
-        FreezeClose = null;
-        FreezeCloseSource = "UNSET";
-        _lastCloseBeforeLock = null;
-        _entryDetected = false;
-        _intendedDirection = null;
-        _intendedEntryPrice = null;
-        _intendedEntryTimeUtc = null;
-        _triggerReason = null;
-        _rangeComputed = false;
-        
-        // Reset assertion flags for new trading day
-        _rangeIntentAssertEmitted = false;
-        _firstBarAcceptedAssertEmitted = false;
-        _rangeLockAssertEmitted = false;
-        
-        // Reset pre-hydration and gap tracking state for new trading day
-        _preHydrationComplete = false;
-        _largestSingleGapMinutes = 0.0;
-        _totalGapMinutes = 0.0;
-        _lastBarOpenChicago = null;
-        _rangeInvalidated = false;
-        _rangeInvalidatedNotified = false; // Reset notification flag on new slot
-        _slotEndSummaryLogged = false;
-        _lastHeartbeatUtc = null;
-        _lastBarReceivedUtc = null;
-        _lastBarTimestampUtc = null;
-        
-        // A) Strategy lifecycle: New trading day detected
-        LogHealth("INFO", "TRADING_DAY_ROLLOVER", $"New trading day detected: {newTradingDateStr}",
-            new { previous_trading_date = previousTradingDateStr, new_trading_date = newTradingDateStr });
-        
-        // Clear bar buffer on reset
-        lock (_barBufferLock)
+        // Only reset state and clear buffers if this is an actual forward rollover (not initialization or backward date)
+        if (!isInitialization && !isBackwardDate)
         {
-            _barBuffer.Clear();
-        }
-        _brkLongRaw = null;
-        _brkShortRaw = null;
-        _brkLongRounded = null;
-        _brkShortRounded = null;
+            // Reset daily state flags for new trading day
+            RangeHigh = null;
+            RangeLow = null;
+            FreezeClose = null;
+            FreezeCloseSource = "UNSET";
+            _lastCloseBeforeLock = null;
+            _entryDetected = false;
+            _intendedDirection = null;
+            _intendedEntryPrice = null;
+            _intendedEntryTimeUtc = null;
+            _triggerReason = null;
+            _rangeComputed = false;
+            
+            // Reset assertion flags for new trading day
+            _rangeIntentAssertEmitted = false;
+            _firstBarAcceptedAssertEmitted = false;
+            _rangeLockAssertEmitted = false;
+            
+            // Reset pre-hydration and gap tracking state for new trading day
+            // CRITICAL: Since we clear the bar buffer below, we need to re-run pre-hydration
+            // If state is ARMED, reset to PRE_HYDRATION so pre-hydration can re-run
+            _preHydrationComplete = false;
+            _largestSingleGapMinutes = 0.0;
+            _totalGapMinutes = 0.0;
+            _lastBarOpenChicago = null;
+            _rangeInvalidated = false;
+            _rangeInvalidatedNotified = false; // Reset notification flag on new slot
+            _slotEndSummaryLogged = false;
+            _lastHeartbeatUtc = null;
+            _lastBarReceivedUtc = null;
+            _lastBarTimestampUtc = null;
+            _rangeComputeStartLogged = false; // Reset for new trading day
+            _lastRangeComputeFailedLogUtc = null; // Reset for new trading day
+            
+            // A) Strategy lifecycle: New trading day detected
+            LogHealth("INFO", "TRADING_DAY_ROLLOVER", $"New trading day detected: {newTradingDateStr}",
+                new { previous_trading_date = previousTradingDateStr, new_trading_date = newTradingDateStr });
+            
+            // Clear bar buffer on reset
+            lock (_barBufferLock)
+            {
+                _barBuffer.Clear();
+            }
+            _brkLongRaw = null;
+            _brkShortRaw = null;
+            _brkLongRounded = null;
+            _brkShortRounded = null;
 
-        // Reset state to ARMED if we were in a mid-day state (preserve committed state)
-        if (!_journal.Committed && State != StreamState.ARMED)
-        {
-            State = StreamState.ARMED;
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "TRADING_DAY_ROLLOVER", State.ToString(),
-                new
-                {
-                    previous_trading_date = previousTradingDateStr,
-                    new_trading_date = newTradingDateStr,
-                    state_reset_to = "ARMED"
-                }));
+            // Reset state appropriately for new trading day
+            // Since we cleared the bar buffer and reset _preHydrationComplete, we must reset to PRE_HYDRATION
+            // to allow pre-hydration to re-run for the new trading day
+            if (!_journal.Committed)
+            {
+                // Reset to PRE_HYDRATION so pre-hydration can re-run for new trading day
+                State = StreamState.PRE_HYDRATION;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "TRADING_DAY_ROLLOVER", State.ToString(),
+                    new
+                    {
+                        previous_trading_date = previousTradingDateStr,
+                        new_trading_date = newTradingDateStr,
+                        state_reset_to = "PRE_HYDRATION",
+                        reason = "Bar buffer cleared and pre-hydration reset for new trading day"
+                    }));
+            }
+            else
+            {
+                // Journal is committed - mark as DONE
+                State = StreamState.DONE;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "TRADING_DAY_ROLLOVER", State.ToString(),
+                    new
+                    {
+                        previous_trading_date = previousTradingDateStr,
+                        new_trading_date = newTradingDateStr,
+                        state_reset_to = "DONE",
+                        reason = "Journal already committed for new trading day"
+                    }));
+            }
         }
-        else
+        else if (isInitialization)
         {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "TRADING_DAY_ROLLOVER", State.ToString(),
-                new
-                {
-                    previous_trading_date = previousTradingDateStr,
-                    new_trading_date = newTradingDateStr,
-                    state_preserved = State.ToString()
-                }));
+            // Initialization: Just update journal and times, don't reset state or clear buffers
+            // This prevents rollover spam when streams are first created
+            LogHealth("INFO", "TRADING_DATE_INITIALIZED", $"Trading date initialized: {newTradingDateStr}",
+                new { new_trading_date = newTradingDateStr, note = "Initial setup, not a rollover" });
+        }
+        else if (isBackwardDate)
+        {
+            // Backward date (replay/historical): Update journal and times, but don't reset state
+            // This prevents state resets when processing historical bars
+            LogHealth("INFO", "TRADING_DATE_BACKWARD", $"Trading date moved backward (replay mode): {previousTradingDateStr} -> {newTradingDateStr}",
+                new { previous_trading_date = previousTradingDateStr, new_trading_date = newTradingDateStr, note = "Historical data, state preserved" });
         }
     }
 
@@ -381,13 +441,58 @@ public sealed class StreamStateMachine
                     break;
                 }
                 
+                // DIAGNOSTIC: Log time comparison details periodically while waiting for range start
+                var timeUntilRangeStart = RangeStartUtc - utcNow;
+                var timeUntilSlot = SlotTimeUtc - utcNow;
+                
+                // Log diagnostic info every 5 minutes while waiting, or if we're past range start time
+                var shouldLogArmedDiagnostic = !_lastHeartbeatUtc.HasValue || 
+                    (utcNow - _lastHeartbeatUtc.Value).TotalMinutes >= 5 ||
+                    utcNow >= RangeStartUtc;
+                
+                if (shouldLogArmedDiagnostic)
+                {
+                    _lastHeartbeatUtc = utcNow;
+                    var barCount = 0;
+                    lock (_barBufferLock)
+                    {
+                        barCount = _barBuffer.Count;
+                    }
+                    
+                    LogHealth("INFO", "ARMED_STATE_DIAGNOSTIC", 
+                        $"ARMED state diagnostic - waiting for range start. Time until range start: {timeUntilRangeStart.TotalMinutes:F1} min, Time until slot: {timeUntilSlot.TotalMinutes:F1} min",
+                        new 
+                        { 
+                            utc_now = utcNow.ToString("o"),
+                            range_start_utc = RangeStartUtc.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            slot_time_utc = SlotTimeUtc.ToString("o"),
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            time_until_range_start_minutes = timeUntilRangeStart.TotalMinutes,
+                            time_until_slot_minutes = timeUntilSlot.TotalMinutes,
+                            pre_hydration_complete = _preHydrationComplete,
+                            bar_buffer_count = barCount,
+                            can_transition = utcNow >= RangeStartUtc
+                        });
+                }
+                
                 if (utcNow >= RangeStartUtc)
                 {
                     // A) Strategy lifecycle: New range window started
                     LogHealth("INFO", "RANGE_WINDOW_STARTED", $"Range window started for slot {SlotTimeChicago}",
-                        new { range_start_chicago = RangeStartChicagoTime.ToString("o"), slot_time_chicago = SlotTimeChicagoTime.ToString("o") });
+                        new { 
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"), 
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            utc_now = utcNow.ToString("o"),
+                            range_start_utc = RangeStartUtc.ToString("o"),
+                            time_since_range_start_minutes = (utcNow - RangeStartUtc).TotalMinutes
+                        });
                     
                     Transition(utcNow, StreamState.RANGE_BUILDING, "RANGE_BUILD_START");
+                    
+                    // Reset logging flags when entering RANGE_BUILDING state
+                    _rangeComputeStartLogged = false;
+                    _lastRangeComputeFailedLogUtc = null;
                     
                     // Compute initial range from available bars when entering RANGE_BUILDING
                     // Range will be updated incrementally from live bars until slot_time
@@ -423,6 +528,52 @@ public sealed class StreamStateMachine
                                     slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
                                     note = "Range initialized from history, will be updated incrementally by live bars until slot_time"
                                 }));
+                        }
+                        else
+                        {
+                            // Log failure to compute initial range
+                            LogHealth("WARN", "RANGE_INITIALIZATION_FAILED", 
+                                $"Failed to compute initial range from history. Will retry on next bar or tick.",
+                                new
+                                {
+                                    reason = initialRangeResult.Reason ?? "UNKNOWN",
+                                    bar_buffer_count = initialRangeResult.BarCount,
+                                    range_start_utc = RangeStartUtc.ToString("o"),
+                                    utc_now = utcNow.ToString("o")
+                                });
+                        }
+                    }
+                    else if (utcNow >= SlotTimeUtc && !_rangeComputed)
+                    {
+                        // CRITICAL: We're past slot time but range was never computed
+                        // This is a failure case - log error and attempt recovery
+                        LogHealth("ERROR", "RANGE_COMPUTE_MISSED_SLOT_TIME", 
+                            $"Slot time reached but range was never computed. Attempting late computation.",
+                            new
+                            {
+                                slot_time_utc = SlotTimeUtc.ToString("o"),
+                                utc_now = utcNow.ToString("o"),
+                                minutes_past_slot = (utcNow - SlotTimeUtc).TotalMinutes
+                            });
+                        
+                        // Attempt to compute range anyway (may have partial data)
+                        var lateRangeResult = ComputeRangeRetrospectively(utcNow, endTimeUtc: SlotTimeUtc);
+                        if (lateRangeResult.Success)
+                        {
+                            RangeHigh = lateRangeResult.RangeHigh;
+                            RangeLow = lateRangeResult.RangeLow;
+                            FreezeClose = lateRangeResult.FreezeClose;
+                            FreezeCloseSource = lateRangeResult.FreezeCloseSource;
+                            _rangeComputed = true;
+                            
+                            LogHealth("INFO", "RANGE_COMPUTED_LATE", 
+                                "Range computed successfully after slot time (late but recovered)",
+                                new
+                                {
+                                    range_high = RangeHigh,
+                                    range_low = RangeLow,
+                                    bar_count = lateRangeResult.BarCount
+                                });
                         }
                     }
                 }
@@ -526,49 +677,64 @@ public sealed class StreamStateMachine
                         // Do NOT build incrementally - treat session window as closed dataset
                         var computeStart = DateTimeOffset.UtcNow;
                         
-                        // Log time conversion method info once per stream
-                        int barBufferCount;
-                        lock (_barBufferLock)
+                        // Log RANGE_COMPUTE_START only once per stream per slot (prevents spam)
+                        if (!_rangeComputeStartLogged)
                         {
-                            barBufferCount = _barBuffer.Count;
-                        }
-                        
-                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                            "RANGE_COMPUTE_START", State.ToString(),
-                            new
+                            _rangeComputeStartLogged = true;
+                            int barBufferCount;
+                            lock (_barBufferLock)
                             {
-                                range_start_utc = RangeStartUtc.ToString("o"),
-                                range_end_utc = SlotTimeUtc.ToString("o"),
-                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                                range_end_chicago = SlotTimeChicagoTime.ToString("o"),
-                                slot_time_chicago = SlotTimeChicago,
-                                time_conversion_method = "ConvertUtcToChicago",
-                                time_conversion_note = "Pure timezone converter (UTC -> Chicago), not 'now'",
-                                expected_chicago_window = $"{RangeStartChicagoTime:HH:mm} to {SlotTimeChicagoTime:HH:mm}",
-                                expected_utc_window = $"{RangeStartUtc:HH:mm} to {SlotTimeUtc:HH:mm}",
-                                bar_buffer_count = barBufferCount,
-                                note = "Range is calculated for Chicago time window (UTC times shown for reference)"
-                            }));
+                                barBufferCount = _barBuffer.Count;
+                            }
+                            
+                            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                "RANGE_COMPUTE_START", State.ToString(),
+                                new
+                                {
+                                    range_start_utc = RangeStartUtc.ToString("o"),
+                                    range_end_utc = SlotTimeUtc.ToString("o"),
+                                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                    range_end_chicago = SlotTimeChicagoTime.ToString("o"),
+                                    slot_time_chicago = SlotTimeChicago,
+                                    time_conversion_method = "ConvertUtcToChicago",
+                                    time_conversion_note = "Pure timezone converter (UTC -> Chicago), not 'now'",
+                                    expected_chicago_window = $"{RangeStartChicagoTime:HH:mm} to {SlotTimeChicagoTime:HH:mm}",
+                                    expected_utc_window = $"{RangeStartUtc:HH:mm} to {SlotTimeUtc:HH:mm}",
+                                    bar_buffer_count = barBufferCount,
+                                    note = "Range is calculated for Chicago time window (UTC times shown for reference)"
+                                }));
+                        }
 
                         var rangeResult = ComputeRangeRetrospectively(utcNow);
                         
                         if (!rangeResult.Success)
                         {
-                            // Range computation failed - log but continue (allow retry or partial ranges)
-                            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                                "RANGE_COMPUTE_FAILED", State.ToString(),
-                                new
-                                {
-                                    range_start_utc = RangeStartUtc.ToString("o"),
-                                    range_end_utc = SlotTimeUtc.ToString("o"),
-                                    reason = rangeResult.Reason,
-                                    bar_count = rangeResult.BarCount,
-                                    message = "Range computation failed - will retry on next tick or use partial data"
-                                }));
+                            // Range computation failed - rate-limit logging to once per minute max
+                            var shouldLogFailure = !_lastRangeComputeFailedLogUtc.HasValue || 
+                                (utcNow - _lastRangeComputeFailedLogUtc.Value).TotalMinutes >= 1.0;
+                            
+                            if (shouldLogFailure)
+                            {
+                                _lastRangeComputeFailedLogUtc = utcNow;
+                                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                    "RANGE_COMPUTE_FAILED", State.ToString(),
+                                    new
+                                    {
+                                        range_start_utc = RangeStartUtc.ToString("o"),
+                                        range_end_utc = SlotTimeUtc.ToString("o"),
+                                        reason = rangeResult.Reason,
+                                        bar_count = rangeResult.BarCount,
+                                        message = "Range computation failed - will retry on next tick or use partial data",
+                                        note = "This error is rate-limited to once per minute to reduce log noise"
+                                    }));
+                            }
                             
                             // Don't commit NO_TRADE - allow retry or partial range computation
                             break;
                         }
+                        
+                        // Reset failure log timestamp on successful computation
+                        _lastRangeComputeFailedLogUtc = null;
 
                         // Range computed successfully - set values atomically
                         RangeHigh = rangeResult.RangeHigh;

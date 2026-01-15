@@ -429,19 +429,26 @@ public sealed class RobotEngine
         {
             // Trading date rollover: update engine trading_date and notify all streams
             var previousTradingDate = _activeTradingDate;
+            var isInitialization = !_activeTradingDate.HasValue;
             _activeTradingDate = barChicagoDate;
 
             // Log trading day rollover (convert to string only for logging)
             var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             var previousTradingDateStr = previousTradingDate?.ToString("yyyy-MM-dd") ?? "UNSET";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
-                new
-                {
-                    previous_trading_date = previousTradingDateStr,
-                    new_trading_date = barTradingDateStr,
-                    bar_timestamp_utc = barUtc.ToString("o"),
-                    bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
-                }));
+            
+            // Only log ENGINE-level rollover if it's an actual rollover (not initialization)
+            // Initialization is handled silently to prevent log spam
+            if (!isInitialization)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
+                    new
+                    {
+                        previous_trading_date = previousTradingDateStr,
+                        new_trading_date = barTradingDateStr,
+                        bar_timestamp_utc = barUtc.ToString("o"),
+                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
+                    }));
+            }
 
             // Update all stream state machines to use the new trading_date (pass DateOnly directly)
             foreach (var stream in _streams.Values)
