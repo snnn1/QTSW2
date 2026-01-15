@@ -163,17 +163,8 @@ public sealed class StreamStateMachine
         var dateOnly = tradingDate;
         var tradingDateStr = tradingDate.ToString("yyyy-MM-dd"); // Convert to string only for journal/logging
 
-        // PHASE 1: Construct Chicago times directly (authoritative)
-        // CRITICAL: Chicago time is the source of truth - UTC is derived from it
-        var rangeStartChicago = spec.sessions[Session].range_start_time;
-        RangeStartChicagoTime = time.ConstructChicagoTime(dateOnly, rangeStartChicago);
-        SlotTimeChicagoTime = time.ConstructChicagoTime(dateOnly, SlotTimeChicago);
-        var marketCloseChicagoTime = time.ConstructChicagoTime(dateOnly, spec.entry_cutoff.market_close_time);
-        
-        // PHASE 2: Derive UTC times from Chicago times (derived representation)
-        RangeStartUtc = RangeStartChicagoTime.ToUniversalTime();
-        SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
-        MarketCloseUtc = marketCloseChicagoTime.ToUniversalTime();
+        // Initialize time boundaries using extracted method
+        RecomputeTimeBoundaries(dateOnly, spec, time);
 
         if (!spec.TryGetInstrument(Instrument, out var inst))
             throw new InvalidOperationException($"Instrument not found in parity spec: {Instrument}");
@@ -222,13 +213,38 @@ public sealed class StreamStateMachine
     public void UpdateTradingDate(DateOnly newTradingDate, DateTimeOffset utcNow)
     {
         // Update trading_date and recompute all UTC times based on new date
-        // This is called when replay crosses into a new trading day
+        // NOTE: This method should only be called during initialization or historical replay.
+        // In live trading, trading date is locked from first bar and never changes.
         var newTradingDateStr = newTradingDate.ToString("yyyy-MM-dd");
         var previousTradingDateStr = _journal.TradingDate;
 
         // Only update if trading_date actually changed
         if (previousTradingDateStr == newTradingDateStr)
             return;
+
+        // GUARD: If trading date is already set and differs, this is a mid-session change attempt
+        // This should not happen in live trading - log warning and prevent change
+        if (!string.IsNullOrWhiteSpace(previousTradingDateStr))
+        {
+            if (TimeService.TryParseDateOnly(previousTradingDateStr, out var prevDate) && 
+                prevDate != newTradingDate)
+            {
+                // Check if this is initialization (empty journal) vs mid-session change
+                // If state is beyond PRE_HYDRATION, this is a mid-session change attempt
+                if (State != StreamState.PRE_HYDRATION)
+                {
+                    LogHealth("WARN", "TRADING_DATE_CHANGE_BLOCKED", $"Trading date change blocked - date is immutable after initialization",
+                        new
+                        {
+                            previous_trading_date = previousTradingDateStr,
+                            attempted_new_trading_date = newTradingDateStr,
+                            current_state = State.ToString(),
+                            note = "Trading date is locked and cannot be changed mid-session"
+                        });
+                    return; // Block mid-session trading date changes
+                }
+            }
+        }
         
         // GUARD: If previous trading date is empty/null, this is initialization, not a rollover
         // In this case, just update the journal and times without resetting state
@@ -275,16 +291,8 @@ public sealed class StreamStateMachine
             return;
         }
 
-        // PHASE 1: Reconstruct Chicago times directly for the new trading_date (authoritative)
-        var rangeStartChicago = _spec.sessions[Session].range_start_time;
-        RangeStartChicagoTime = _time.ConstructChicagoTime(newTradingDate, rangeStartChicago);
-        SlotTimeChicagoTime = _time.ConstructChicagoTime(newTradingDate, SlotTimeChicago);
-        var marketCloseChicagoTime = _time.ConstructChicagoTime(newTradingDate, _spec.entry_cutoff.market_close_time);
-        
-        // PHASE 2: Derive UTC times from Chicago times (derived representation)
-        RangeStartUtc = RangeStartChicagoTime.ToUniversalTime();
-        SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
-        MarketCloseUtc = marketCloseChicagoTime.ToUniversalTime();
+        // Recompute time boundaries for new trading date
+        RecomputeTimeBoundaries(newTradingDate);
 
         // Replace journal with one for the new trading_date
         if (existingJournal != null)
@@ -311,39 +319,8 @@ public sealed class StreamStateMachine
         // Only reset state and clear buffers if this is an actual forward rollover (not initialization or backward date)
         if (!isInitialization && !isBackwardDate)
         {
-            // Reset daily state flags for new trading day
-            RangeHigh = null;
-            RangeLow = null;
-            FreezeClose = null;
-            FreezeCloseSource = "UNSET";
-            _lastCloseBeforeLock = null;
-            _entryDetected = false;
-            _intendedDirection = null;
-            _intendedEntryPrice = null;
-            _intendedEntryTimeUtc = null;
-            _triggerReason = null;
-            _rangeComputed = false;
-            
-            // Reset assertion flags for new trading day
-            _rangeIntentAssertEmitted = false;
-            _firstBarAcceptedAssertEmitted = false;
-            _rangeLockAssertEmitted = false;
-            
-            // Reset pre-hydration and gap tracking state for new trading day
-            // CRITICAL: Since we clear the bar buffer below, we need to re-run pre-hydration
-            // If state is ARMED, reset to PRE_HYDRATION so pre-hydration can re-run
-            _preHydrationComplete = false;
-            _largestSingleGapMinutes = 0.0;
-            _totalGapMinutes = 0.0;
-            _lastBarOpenChicago = null;
-            _rangeInvalidated = false;
-            _rangeInvalidatedNotified = false; // Reset notification flag on new slot
-            _slotEndSummaryLogged = false;
-            _lastHeartbeatUtc = null;
-            _lastBarReceivedUtc = null;
-            _lastBarTimestampUtc = null;
-            _rangeComputeStartLogged = false; // Reset for new trading day
-            _lastRangeComputeFailedLogUtc = null; // Reset for new trading day
+            // Reset all daily state for new trading day
+            ResetDailyState();
             
             // A) Strategy lifecycle: New trading day detected
             LogHealth("INFO", "TRADING_DAY_ROLLOVER", $"New trading day detected: {newTradingDateStr}",
@@ -1761,6 +1738,56 @@ public sealed class StreamStateMachine
 
         if (bars.Count == 0)
         {
+            // Diagnostic: Log detailed information when no bars found in range window
+            // This helps diagnose date mismatch or timing issues
+            var barBufferCount = 0;
+            DateTimeOffset? firstBarInBufferUtc = null;
+            DateTimeOffset? lastBarInBufferUtc = null;
+            DateTimeOffset? firstBarInBufferChicago = null;
+            DateTimeOffset? lastBarInBufferChicago = null;
+            string? barBufferDateRange = null;
+            
+            lock (_barBufferLock)
+            {
+                barBufferCount = _barBuffer.Count;
+                if (_barBuffer.Count > 0)
+                {
+                    firstBarInBufferUtc = _barBuffer[0].TimestampUtc;
+                    lastBarInBufferUtc = _barBuffer[_barBuffer.Count - 1].TimestampUtc;
+                    firstBarInBufferChicago = _time.ConvertUtcToChicago(firstBarInBufferUtc.Value);
+                    lastBarInBufferChicago = _time.ConvertUtcToChicago(lastBarInBufferUtc.Value);
+                    
+                    var firstDate = _time.GetChicagoDateToday(firstBarInBufferUtc.Value);
+                    var lastDate = _time.GetChicagoDateToday(lastBarInBufferUtc.Value);
+                    if (firstDate == lastDate)
+                    {
+                        barBufferDateRange = firstDate.ToString("yyyy-MM-dd");
+                    }
+                    else
+                    {
+                        barBufferDateRange = $"{firstDate:yyyy-MM-dd} to {lastDate:yyyy-MM-dd}";
+                    }
+                }
+            }
+            
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_COMPUTE_NO_BARS_DIAGNOSTIC", State.ToString(),
+                new
+                {
+                    trading_date = TradingDate,
+                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                    range_start_utc = RangeStartUtc.ToString("o"),
+                    range_end_chicago = endTimeChicagoActual.ToString("o"),
+                    range_end_utc = endTimeUtcActual.ToString("o"),
+                    first_bar_timestamp_chicago = firstBarInBufferChicago?.ToString("o"),
+                    first_bar_timestamp_utc = firstBarInBufferUtc?.ToString("o"),
+                    last_bar_timestamp_chicago = lastBarInBufferChicago?.ToString("o"),
+                    last_bar_timestamp_utc = lastBarInBufferUtc?.ToString("o"),
+                    bar_buffer_count = barBufferCount,
+                    bar_buffer_date_range = barBufferDateRange ?? "NO_BARS",
+                    note = "No bars found in range window - check date alignment and bar timestamps"
+                }));
+            
             return (false, null, null, null, "UNSET", 0, "NO_BARS_IN_WINDOW", null, null, null, null);
         }
 
@@ -2188,6 +2215,78 @@ public sealed class StreamStateMachine
                 be_triggered = false, // Will be set if triggered during price tracking (future step)
                 be_trigger_time_utc = (string?)null
             }));
+    }
+
+    /// <summary>
+    /// Recompute all time boundaries (Chicago and UTC) for a given trading date.
+    /// This is the single source of truth for time boundary computation.
+    /// </summary>
+    private void RecomputeTimeBoundaries(DateOnly tradingDate)
+    {
+        RecomputeTimeBoundaries(tradingDate, _spec, _time);
+    }
+    
+    /// <summary>
+    /// Recompute all time boundaries (Chicago and UTC) for a given trading date.
+    /// Overload for use during construction when instance fields aren't available yet.
+    /// </summary>
+    private void RecomputeTimeBoundaries(DateOnly tradingDate, ParitySpec spec, TimeService time)
+    {
+        // PHASE 1: Construct Chicago times directly (authoritative)
+        // CRITICAL: Chicago time is the source of truth - UTC is derived from it
+        var rangeStartChicago = spec.sessions[Session].range_start_time;
+        RangeStartChicagoTime = time.ConstructChicagoTime(tradingDate, rangeStartChicago);
+        SlotTimeChicagoTime = time.ConstructChicagoTime(tradingDate, SlotTimeChicago);
+        var marketCloseChicagoTime = time.ConstructChicagoTime(tradingDate, spec.entry_cutoff.market_close_time);
+        
+        // PHASE 2: Derive UTC times from Chicago times (derived representation)
+        RangeStartUtc = RangeStartChicagoTime.ToUniversalTime();
+        SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
+        MarketCloseUtc = marketCloseChicagoTime.ToUniversalTime();
+    }
+    
+    /// <summary>
+    /// Reset all daily state flags for a new trading day.
+    /// Called during trading date rollover to clear accumulated state.
+    /// </summary>
+    private void ResetDailyState()
+    {
+        // Range tracking
+        RangeHigh = null;
+        RangeLow = null;
+        FreezeClose = null;
+        FreezeCloseSource = "UNSET";
+        
+        // Entry tracking
+        _lastCloseBeforeLock = null;
+        _entryDetected = false;
+        _intendedDirection = null;
+        _intendedEntryPrice = null;
+        _intendedEntryTimeUtc = null;
+        _triggerReason = null;
+        _rangeComputed = false;
+        
+        // Assertion flags
+        _rangeIntentAssertEmitted = false;
+        _firstBarAcceptedAssertEmitted = false;
+        _rangeLockAssertEmitted = false;
+        
+        // Pre-hydration and gap tracking
+        // CRITICAL: Since we clear the bar buffer, we need to re-run pre-hydration
+        _preHydrationComplete = false;
+        _largestSingleGapMinutes = 0.0;
+        _totalGapMinutes = 0.0;
+        _lastBarOpenChicago = null;
+        _rangeInvalidated = false;
+        _rangeInvalidatedNotified = false;
+        
+        // Logging state
+        _slotEndSummaryLogged = false;
+        _lastHeartbeatUtc = null;
+        _lastBarReceivedUtc = null;
+        _lastBarTimestampUtc = null;
+        _rangeComputeStartLogged = false;
+        _lastRangeComputeFailedLogUtc = null;
     }
 
     private void Transition(DateTimeOffset utcNow, StreamState next, string eventType, object? extra = null)

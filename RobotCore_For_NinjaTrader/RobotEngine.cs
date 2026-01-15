@@ -23,7 +23,14 @@ public sealed class RobotEngine
     private string _timetablePath = "";
 
     private string? _lastTimetableHash;
+    private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
     private DateOnly? _activeTradingDate; // PHASE 3: Store as DateOnly (authoritative), convert to string only for logging/journal
+    
+    /// <summary>
+    /// Get trading date as string for logging/journal purposes.
+    /// Returns empty string if trading date is not yet set.
+    /// </summary>
+    private string TradingDateString => _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
 
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
@@ -226,15 +233,13 @@ public sealed class RobotEngine
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
             new { mode = _executionMode.ToString(), adapter = adapterType }));
 
-        // Load timetable immediately (fail closed if invalid)
-        // Health monitor update happens automatically in ReloadTimetableIfChanged() → ApplyTimetable()
+        // Load timetable for structure validation only (fail closed if invalid)
+        // Trading date will be locked from first market bar, then streams will be created
         ReloadTimetableIfChanged(utcNow, force: true);
         
-        // Check if strategy started after range window for any stream
-        CheckStartupTiming(utcNow);
-        
-        // PHASE 1: Emit startup operator banner with execution mode, account, environment, timetable info
-        EmitStartupBanner(utcNow);
+        // Do not create streams yet - wait for first bar to lock trading date
+        // Do not check startup timing yet - streams don't exist
+        // Do not emit startup banner yet - defer until trading date locked
         
         // Initialize heartbeat timestamp
         _lastTickUtc = utcNow;
@@ -312,15 +317,14 @@ public sealed class RobotEngine
             ["health_monitor_enabled"] = _healthMonitor != null
         };
         
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", 
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
             eventType: "OPERATOR_BANNER", state: "ENGINE", bannerData));
     }
 
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "ENGINE_STOP", state: "ENGINE"));
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_STOP", state: "ENGINE"));
         
         // Write execution summary if not DRYRUN
         if (_executionMode != ExecutionMode.DRYRUN)
@@ -331,8 +335,7 @@ public sealed class RobotEngine
             var summaryPath = Path.Combine(summaryDir, $"summary_{DateTimeOffset.UtcNow:yyyyMMddHHmmss}.json");
             var json = JsonUtil.Serialize(summary);
             File.WriteAllText(summaryPath, json);
-            var summaryTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: summaryTradingDateStr, eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "EXECUTION_SUMMARY_WRITTEN", state: "ENGINE",
                 new { summary_path = summaryPath }));
         }
         
@@ -361,7 +364,7 @@ public sealed class RobotEngine
             if (timeSinceLastTickHeartbeat >= TICK_HEARTBEAT_RATE_LIMIT_MINUTES || _lastTickHeartbeat == DateTimeOffset.MinValue)
             {
                 _lastTickHeartbeat = utcNow;
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
                     new
                     {
                         utc_now = utcNow.ToString("o"),
@@ -405,7 +408,7 @@ public sealed class RobotEngine
             {
                 _lastBarHeartbeatPerInstrument[instrument] = utcNow;
                 var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
                     new
                     {
                         instrument = instrument,
@@ -424,76 +427,59 @@ public sealed class RobotEngine
         // Parse once, store as DateOnly
         var barChicagoDate = _time.GetChicagoDateToday(barUtc);
 
-        // Check if trading_date needs to roll over to a new day
-        if (_activeTradingDate != barChicagoDate)
+        // Lock trading date from first bar (non-negotiable authority)
+        if (!_activeTradingDate.HasValue)
         {
-            // Trading date rollover: update engine trading_date and notify all streams
-            var previousTradingDate = _activeTradingDate;
-            var isInitialization = !_activeTradingDate.HasValue;
+            // First bar received - lock trading date
             _activeTradingDate = barChicagoDate;
-
-            // Log trading day rollover (convert to string only for logging)
-            var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
-            var previousTradingDateStr = previousTradingDate?.ToString("yyyy-MM-dd") ?? "UNSET";
+            var tradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             
-            // Only log ENGINE-level rollover if it's an actual rollover (not initialization)
-            // Initialization is handled silently to prevent log spam
-            if (!isInitialization)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: barTradingDateStr, eventType: "TRADING_DAY_ROLLOVER", state: "ENGINE",
-                    new
-                    {
-                        previous_trading_date = previousTradingDateStr,
-                        new_trading_date = barTradingDateStr,
-                        bar_timestamp_utc = barUtc.ToString("o"),
-                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o")
-                    }));
-            }
-
-            // Update all stream state machines to use the new trading_date (pass DateOnly directly)
-            foreach (var stream in _streams.Values)
-            {
-                stream.UpdateTradingDate(barChicagoDate, utcNow);
-            }
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TRADING_DATE_LOCKED", state: "ENGINE",
+                new
+                {
+                    trading_date = tradingDateStr,
+                    bar_timestamp_utc = barUtc.ToString("o"),
+                    bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o"),
+                    note = "Trading date locked from first market bar - immutable for this engine run"
+                }));
+            
+            // Validate timetable structure and create streams now that trading date is known
+            EnsureStreamsCreated(utcNow);
+            
+            // Emit startup banner now that trading date is locked
+            EmitStartupBanner(utcNow);
+        }
+        else if (_activeTradingDate.Value != barChicagoDate)
+        {
+            // Trading date mismatch - log warning and ignore bar
+            // Trading date is immutable once locked, so bars from different dates are ignored
+            var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
+            var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
+            
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "BAR_DATE_MISMATCH", state: "ENGINE",
+                new
+                {
+                    locked_trading_date = tradingDateStr,
+                    bar_trading_date = barTradingDateStr,
+                    bar_timestamp_utc = barUtc.ToString("o"),
+                    bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o"),
+                    instrument = instrument,
+                    note = "Bar ignored - trading date is locked and immutable"
+                }));
+            return; // Ignore bar from different trading date
         }
 
-        // Replay invariant check: engine trading_date must match bar-derived trading_date
-        // This prevents the trading_date mismatch bug from silently reappearing
-        if (_activeTradingDate.HasValue && _activeTradingDate.Value != barChicagoDate)
+        // Only process bars if streams exist (they should exist after EnsureStreamsCreated)
+        if (_streams.Count == 0)
         {
-            // Check if we're in replay mode (timetable has replay metadata)
-            var isReplay = false;
-            try
-            {
-                if (File.Exists(_timetablePath))
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_RECEIVED_NO_STREAMS", state: "ENGINE",
+                new
                 {
-                    var timetable = TimetableContract.LoadFromFile(_timetablePath);
-                    isReplay = timetable.metadata?.replay == true;
-                }
-            }
-            catch
-            {
-                // If we can't determine replay mode, skip invariant check (fail open for live mode)
-            }
-
-            if (isReplay)
-            {
-                // In replay mode, trading_date mismatch after rollover is a critical error
-                var engineTradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-                var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: engineTradingDateStr, eventType: "REPLAY_INVARIANT_VIOLATION", state: "ENGINE",
-                    new
-                    {
-                        error = "TRADING_DATE_MISMATCH",
-                        engine_trading_date = engineTradingDateStr,
-                        bar_derived_trading_date = barTradingDateStr,
-                        bar_timestamp_utc = barUtc.ToString("o"),
-                        bar_timestamp_chicago = _time.ConvertUtcToChicago(barUtc).ToString("o"),
-                        message = "Engine trading_date does not match bar-derived trading_date after rollover. Replay aborted."
-                    }));
-                StandDown();
-                return;
-            }
+                    instrument = instrument,
+                    bar_timestamp_utc = barUtc.ToString("o"),
+                    note = "Bar received but streams not yet created - this should not happen"
+                }));
+            return;
         }
 
         // Pass bar data to streams of matching instrument
@@ -504,6 +490,73 @@ public sealed class RobotEngine
         }
     }
 
+    /// <summary>
+    /// Ensure streams are created after trading date is locked.
+    /// Called from OnBar() after trading date is locked from first bar.
+    /// </summary>
+    private void EnsureStreamsCreated(DateTimeOffset utcNow)
+    {
+        if (_spec is null || _time is null || !_activeTradingDate.HasValue)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAMS_CREATION_SKIPPED", state: "ENGINE",
+                new { reason = "Missing spec, time, or trading date" }));
+            return;
+        }
+
+        // If streams already exist, skip creation
+        if (_streams.Count > 0)
+        {
+            return;
+        }
+
+        // Validate timetable structure
+        if (_lastTimetable == null)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "STREAMS_CREATION_FAILED", state: "ENGINE",
+                new { reason = "No timetable loaded" }));
+            return;
+        }
+
+        // Validate timetable timezone matches
+        if (_lastTimetable.timezone != "America/Chicago")
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "STREAMS_CREATION_FAILED", state: "ENGINE",
+                new { reason = "TIMEZONE_MISMATCH", timezone = _lastTimetable.timezone }));
+            return;
+        }
+
+        // Apply timetable to create streams with locked trading date
+        ApplyTimetable(_lastTimetable, utcNow);
+
+        // Log stream creation
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "STREAMS_CREATED", state: "ENGINE",
+            new
+            {
+                stream_count = _streams.Count,
+                trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                note = "Streams created after trading date locked from first bar"
+            }));
+
+        // Verify all streams use the same trading date (invariant check)
+        foreach (var stream in _streams.Values)
+        {
+            if (stream.TradingDate != _activeTradingDate.Value.ToString("yyyy-MM-dd"))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "INVARIANT_VIOLATION", state: "ENGINE",
+                    new
+                    {
+                        error = "STREAM_TRADING_DATE_MISMATCH",
+                        expected_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        stream_trading_date = stream.TradingDate,
+                        stream_id = stream.Stream
+                    }));
+            }
+        }
+
+        // Check startup timing now that streams exist
+        CheckStartupTiming(utcNow);
+    }
+
     private void ReloadTimetableIfChanged(DateTimeOffset utcNow, bool force)
     {
         if (_spec is null || _time is null) return;
@@ -511,8 +564,7 @@ public sealed class RobotEngine
         var poll = _timetablePoller.Poll(_timetablePath, utcNow);
         if (poll.Error is not null)
         {
-            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = poll.Error }));
             StandDown();
             return;
@@ -530,87 +582,68 @@ public sealed class RobotEngine
         }
         catch (Exception ex)
         {
-            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "PARSE_ERROR", error = ex.Message }));
             StandDown();
             return;
         }
 
-        if (!TimeService.TryParseDateOnly(timetable.trading_date, out var tradingDate))
-        {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = "BAD_TRADING_DATE", trading_date = timetable.trading_date }));
-            StandDown();
-            return;
-        }
+        // Trading date parsing removed - trading date comes from bars, not timetable
 
         if (timetable.timezone != "America/Chicago")
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
                 new { reason = "TIMEZONE_MISMATCH", timezone = timetable.timezone }));
             StandDown();
             return;
         }
 
-        var chicagoToday = _time.GetChicagoDateToday(utcNow);
-        
-        // For replay timetables (metadata.replay = true), allow trading_date <= chicagoToday
-        // For live timetables, require exact match (trading_date == chicagoToday)
+        // Timetable structure validation only - trading date is NOT set from timetable
+        // Trading date will be locked from first market bar in OnBar()
         var isReplayTimetable = timetable.metadata?.replay == true;
-        if (isReplayTimetable)
-        {
-            if (tradingDate > chicagoToday)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                    new { reason = "REPLAY_TRADING_DATE_FUTURE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
-                StandDown();
-                return;
-            }
-        }
-        else
-        {
-            // Live timetable: require exact date match (fail closed on stale timetable)
-            if (tradingDate != chicagoToday)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                    new { reason = "STALE_TRADING_DATE", trading_date = timetable.trading_date, chicago_today = chicagoToday.ToString("yyyy-MM-dd") }));
-                StandDown();
-                return;
-            }
-        }
 
-        // PHASE 3: Store as DateOnly (already parsed above)
-        _activeTradingDate = tradingDate;
-
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
             new 
             { 
                 previous_hash = previousHash,
                 new_hash = _lastTimetableHash,
                 enabled_stream_count = timetable.streams.Count(s => s.enabled),
-                total_stream_count = timetable.streams.Count
+                total_stream_count = timetable.streams.Count,
+                note = "Timetable structure validated - trading date not set from timetable"
             }));
 
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_LOADED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_LOADED", state: "ENGINE",
             new { streams = timetable.streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
         
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetable.trading_date, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
-            new { trading_date = timetable.trading_date, is_replay = isReplayTimetable }));
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
+            new { is_replay = isReplayTimetable, note = "Structure only - trading date from bars" }));
 
-        ApplyTimetable(timetable, tradingDate, utcNow);
+        // Store timetable for later application
+        _lastTimetable = timetable;
+
+        // If trading date is already locked and streams exist, apply timetable changes immediately
+        // This handles timetable updates after initial stream creation
+        if (_activeTradingDate.HasValue && _streams.Count > 0)
+        {
+            ApplyTimetable(timetable, utcNow);
+        }
+        // Otherwise, timetable will be applied when EnsureStreamsCreated() is called after trading date is locked
         
         // Health monitor no longer uses timetable for monitoring windows
         // (simplified to only monitor connection loss and data loss)
     }
 
-    private void ApplyTimetable(TimetableContract timetable, DateOnly tradingDate, DateTimeOffset utcNow)
+    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow)
     {
-        // CRITICAL FIX: Use tradingDate parameter instead of _activeTradingDate to allow streams
-        // to be created even after StandDown() clears _activeTradingDate.
-        // _activeTradingDate is set just before this call, but if StandDown() was called earlier,
-        // we still want to create streams from a valid timetable.
-        if (_spec is null || _time is null || _lastTimetableHash is null) return;
+        // Trading date must be locked before streams can be created
+        if (_spec is null || _time is null || _lastTimetableHash is null || !_activeTradingDate.HasValue)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_APPLY_SKIPPED", state: "ENGINE",
+                new { reason = "Missing spec, time, hash, or trading date" }));
+            return;
+        }
+
+        var tradingDate = _activeTradingDate.Value; // Use locked trading date
 
         var incoming = timetable.streams.Where(s => s.enabled).ToList();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -724,7 +757,7 @@ public sealed class RobotEngine
                     continue;
                 }
                 
-                sm.ApplyDirectiveUpdate(directive.slot_time, tradingDate, utcNow);
+                sm.ApplyDirectiveUpdate(directive.slot_time, _activeTradingDate.Value, utcNow);
             }
             else
             {
