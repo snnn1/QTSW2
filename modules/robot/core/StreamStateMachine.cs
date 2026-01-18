@@ -542,6 +542,43 @@ public sealed class StreamStateMachine
                 // Transition to ARMED if we have bars or if we're past range start time
                 if (barCount > 0 || nowChicago >= RangeStartChicagoTime)
                 {
+                    // CONSOLIDATED HYDRATION SUMMARY LOG: Forensic snapshot for every day
+                    // This single log captures all hydration statistics at PRE_HYDRATION → ARMED transition
+                    // Collect all bar source counters for comprehensive reporting
+                    int historicalBarCount, liveBarCount, dedupedBarCount, filteredFutureBarCount, filteredPartialBarCount;
+                    lock (_barBufferLock)
+                    {
+                        historicalBarCount = _historicalBarCount;
+                        liveBarCount = _liveBarCount;
+                        dedupedBarCount = _dedupedBarCount;
+                        filteredFutureBarCount = _filteredFutureBarCount;
+                        filteredPartialBarCount = _filteredPartialBarCount;
+                    }
+                    
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_SUMMARY", "PRE_HYDRATION",
+                        new
+                        {
+                            instrument = Instrument,
+                            slot = Stream,
+                            trading_date = TradingDate,
+                            total_bars_in_buffer = barCount,
+                            // Bar source breakdown
+                            historical_bar_count = historicalBarCount,
+                            live_bar_count = liveBarCount,
+                            deduped_bar_count = dedupedBarCount,
+                            filtered_future_bar_count = filteredFutureBarCount,
+                            filtered_partial_bar_count = filteredPartialBarCount,
+                            // Timing context
+                            now_chicago = nowChicago.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            // Mode and source info
+                            execution_mode = _executionMode.ToString(),
+                            note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
+                                   "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
+                        }));
+                    
                     LogHealth("INFO", "PRE_HYDRATION_COMPLETE", $"Pre-hydration complete (SIM mode) - {barCount} bars total (file + NinjaTrader)",
                         new
                         {
@@ -560,6 +597,43 @@ public sealed class StreamStateMachine
             else
             {
                 // DRYRUN mode: File-based pre-hydration complete, transition to ARMED
+                // CONSOLIDATED HYDRATION SUMMARY LOG: Forensic snapshot for every day
+                int barCount = GetBarBufferCount();
+                int historicalBarCount, liveBarCount, dedupedBarCount, filteredFutureBarCount, filteredPartialBarCount;
+                lock (_barBufferLock)
+                {
+                    historicalBarCount = _historicalBarCount;
+                    liveBarCount = _liveBarCount;
+                    dedupedBarCount = _dedupedBarCount;
+                    filteredFutureBarCount = _filteredFutureBarCount;
+                    filteredPartialBarCount = _filteredPartialBarCount;
+                }
+                
+                var nowChicago = _time.ConvertUtcToChicago(utcNow);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "HYDRATION_SUMMARY", "PRE_HYDRATION",
+                    new
+                    {
+                        instrument = Instrument,
+                        slot = Stream,
+                        trading_date = TradingDate,
+                        total_bars_in_buffer = barCount,
+                        // Bar source breakdown
+                        historical_bar_count = historicalBarCount,
+                        live_bar_count = liveBarCount,
+                        deduped_bar_count = dedupedBarCount,
+                        filtered_future_bar_count = filteredFutureBarCount,
+                        filtered_partial_bar_count = filteredPartialBarCount,
+                        // Timing context
+                        now_chicago = nowChicago.ToString("o"),
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        // Mode and source info
+                        execution_mode = _executionMode.ToString(),
+                        note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
+                               "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
+                    }));
+                
                 Transition(utcNow, StreamState.ARMED, "PRE_HYDRATION_COMPLETE");
             }
         }

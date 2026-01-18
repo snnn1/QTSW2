@@ -23,6 +23,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private RobotEngine? _engine;
         private NinjaTraderSimAdapter? _adapter;
         private bool _simAccountVerified = false;
+        private bool _engineReady = false; // Single latch: true once engine is fully initialized and ready
         private Timer? _tickTimer;
         private readonly object _timerLock = new object();
 
@@ -87,21 +88,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Note: This requires exposing adapter from engine or using dependency injection
                 // For now, we'll wire events directly to adapter via reflection or adapter registration
                 WireNTContextToAdapter();
+                
+                // ENGINE_READY latch: Set once when all initialization is complete
+                // This flag guards all execution paths to simplify reasoning and reduce repetition
+                _engineReady = true;
+                Log("Engine ready - all initialization complete", LogLevel.Information);
             }
             else if (State == State.Realtime)
             {
                 // CRITICAL: Verify engine is ready before starting tick timer
-                // Check that trading date is locked and streams exist
-                if (_engine == null)
+                // Use ENGINE_READY latch to simplify condition checks
+                if (!_engineReady)
                 {
-                    Log("ERROR: Cannot start tick timer - engine is null", LogLevel.Error);
-                    return;
-                }
-                
-                var tradingDateStr = _engine.GetTradingDate();
-                if (string.IsNullOrEmpty(tradingDateStr))
-                {
-                    Log("ERROR: Cannot start tick timer - trading date not locked. Engine may be in StandDown state.", LogLevel.Error);
+                    Log("ERROR: Cannot start tick timer - engine not ready. Engine may not be fully initialized.", LogLevel.Error);
                     return;
                 }
                 
@@ -311,7 +310,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
-            if (_engine is null || !_simAccountVerified) return;
+            // Use ENGINE_READY latch to guard execution
+            if (!_engineReady || _engine is null) return;
             if (CurrentBar < 1) return;
 
             // DIAGNOSTIC: Capture raw NinjaTrader bar timestamp before any conversion
@@ -416,24 +416,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
-                // CRITICAL: Defensive checks before calling engine.Tick()
-                if (_engine is null)
+                // CRITICAL: Use ENGINE_READY latch to guard execution
+                // This simplifies reasoning and reduces repetition of multiple condition checks
+                if (!_engineReady || _engine is null)
                 {
-                    Log("ERROR: Tick timer callback called but engine is null", LogLevel.Error);
-                    return;
-                }
-                
-                if (!_simAccountVerified)
-                {
-                    Log("ERROR: Tick timer callback called but SIM account not verified", LogLevel.Error);
-                    return;
-                }
-                
-                // Verify trading date is still locked (should never change, but defensive check)
-                var tradingDateStr = _engine.GetTradingDate();
-                if (string.IsNullOrEmpty(tradingDateStr))
-                {
-                    Log("ERROR: Tick timer callback called but trading date not locked. Engine may be in StandDown state.", LogLevel.Error);
+                    // Log error only if engine was ready before (to avoid spam on startup)
+                    if (_engineReady && _engine == null)
+                    {
+                        Log("ERROR: Tick timer callback called but engine became null after initialization", LogLevel.Error);
+                    }
                     return;
                 }
                 
