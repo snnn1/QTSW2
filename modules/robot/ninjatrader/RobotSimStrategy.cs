@@ -33,13 +33,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name = "RobotSimStrategy";
                 Calculate = Calculate.OnBarClose; // Bar-close series
                 IsUnmanaged = true; // Required for manual order management
+                IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only - no playback support
             }
             else if (State == State.DataLoaded)
             {
-                // Verify SIM account
+                // Verify SIM account only (playback mode not supported)
                 if (Account is null)
                 {
                     Log($"ERROR: Account is null. Aborting.", LogLevel.Error);
+                    return;
+                }
+
+                if (!Account.IsSimAccount)
+                {
+                    Log($"ERROR: Account '{Account.Name}' is not a Sim account. Aborting.", LogLevel.Error);
                     return;
                 }
 
@@ -53,12 +60,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 // PHASE 1: Set account info for startup banner
                 var accountName = Account?.Name ?? "UNKNOWN";
-                // Check if SIM account (verified earlier in OnStateChange)
                 var environment = _simAccountVerified ? "SIM" : "UNKNOWN";
                 _engine.SetAccountInfo(accountName, environment);
                 
                 // Start engine
                 _engine.Start();
+
+                // CRITICAL: Verify engine startup succeeded before requesting bars
+                // Check that trading date is locked and streams are created
+                var tradingDateStr = _engine.GetTradingDate();
+                if (string.IsNullOrEmpty(tradingDateStr))
+                {
+                    var errorMsg = "CRITICAL: Engine started but trading date not locked. " +
+                                 "This indicates timetable was invalid or missing trading_date. " +
+                                 "Cannot request historical bars without trading date. " +
+                                 "Check logs for TIMETABLE_INVALID or TIMETABLE_MISSING_TRADING_DATE events.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+
+                // Request historical bars from NinjaTrader for pre-hydration (SIM mode)
+                // This will throw if BarsRequest fails (fail-fast for critical errors)
+                RequestHistoricalBarsForPreHydration();
 
                 // Get the adapter instance and wire NT context
                 // Note: This requires exposing adapter from engine or using dependency injection
@@ -67,6 +90,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Realtime)
             {
+                // CRITICAL: Verify engine is ready before starting tick timer
+                // Check that trading date is locked and streams exist
+                if (_engine == null)
+                {
+                    Log("ERROR: Cannot start tick timer - engine is null", LogLevel.Error);
+                    return;
+                }
+                
+                var tradingDateStr = _engine.GetTradingDate();
+                if (string.IsNullOrEmpty(tradingDateStr))
+                {
+                    Log("ERROR: Cannot start tick timer - trading date not locked. Engine may be in StandDown state.", LogLevel.Error);
+                    return;
+                }
+                
                 // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
                 StartTickTimer();
             }
@@ -74,6 +112,170 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 StopTickTimer();
                 _engine?.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Request historical bars from NinjaTrader using BarsRequest API for pre-hydration.
+        /// Called after engine.Start() when streams are created and trading date is locked.
+        /// </summary>
+        private void RequestHistoricalBarsForPreHydration()
+        {
+            if (_engine == null || Instrument == null) return;
+
+            try
+            {
+                // CRITICAL: Verify trading date is locked before requesting bars
+                // This should not happen in normal operation - if it does, it's a configuration error
+                var tradingDateStr = _engine.GetTradingDate();
+                if (string.IsNullOrEmpty(tradingDateStr))
+                {
+                    var errorMsg = "CRITICAL: Cannot request historical bars - trading date not yet locked from timetable. " +
+                                 $"This indicates a configuration error: timetable missing or invalid trading_date. " +
+                                 $"Engine.Start() should have locked the trading date. Cannot proceed.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+
+                // Parse trading date
+                if (!DateOnly.TryParse(tradingDateStr, out var tradingDate))
+                {
+                    Log($"Invalid trading date format: {tradingDateStr}", LogLevel.Warning);
+                    return;
+                }
+
+                // CRITICAL: Get range start and slot times from engine spec (not hardcoded)
+                // Hardcoding creates silent misalignment when:
+                // - Session definitions change
+                // - Instruments differ
+                // - S2 or other regimes are added
+                // This must read from the same spec object that defines the stream
+                var instrumentName = Instrument.MasterInstrument.Name.ToUpperInvariant();
+                var sessionName = "S1"; // Default session - could be made configurable
+                
+                // CRITICAL: Get session info from engine spec - fail if not available
+                // Hardcoded fallback defeats the purpose of reading from spec and creates silent misalignment
+                var sessionInfo = _engine.GetSessionInfo(instrumentName, sessionName);
+                
+                if (!sessionInfo.HasValue)
+                {
+                    var errorMsg = $"Cannot get session info from spec for {instrumentName}/{sessionName}. " +
+                                 $"This indicates a configuration error: instrument or session not found in spec. " +
+                                 $"Cannot proceed with BarsRequest as time range would be incorrect.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+                
+                var (rangeStartTime, slotEndTimes) = sessionInfo.Value;
+                var rangeStartChicago = rangeStartTime;
+                
+                if (string.IsNullOrWhiteSpace(rangeStartChicago))
+                {
+                    var errorMsg = $"Session {sessionName} has empty range_start_time in spec. Cannot proceed with BarsRequest.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+                
+                if (slotEndTimes == null || slotEndTimes.Count == 0)
+                {
+                    var errorMsg = $"Session {sessionName} has no slot_end_times in spec. Cannot proceed with BarsRequest.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+                
+                // Use first slot time from spec (or earliest if multiple streams exist)
+                // Note: In a multi-stream scenario, we'd need to request bars for all slots
+                // For now, use first slot time as a reasonable default
+                var slotTimeChicago = slotEndTimes[0];
+                
+                Log($"Using session info from spec: range_start={rangeStartChicago}, first_slot={slotTimeChicago} (from {slotEndTimes.Count} slots)", LogLevel.Information);
+
+                // CRITICAL: Only request bars up to "now" to avoid injecting future bars
+                // If we request bars up to slotTimeChicago (07:30) but strategy starts at 07:25,
+                // we'd get bars at 07:26, 07:27, etc. which would duplicate live bars
+                //
+                // RESTART BEHAVIOR POLICY: "Restart = Full Reconstruction"
+                // When strategy restarts mid-session:
+                // - BarsRequest loads historical bars from range_start to min(slot_time, now)
+                // - If restart occurs after slot_time, only loads up to slot_time (not beyond)
+                // - Range is recomputed from all available bars (historical + live)
+                // - This ensures deterministic reconstruction but may differ from uninterrupted operation
+                var timeService = new TimeService("America/Chicago");
+                var nowUtc = DateTimeOffset.UtcNow;
+                var nowChicago = timeService.ConvertUtcToChicago(nowUtc);
+                var slotTimeChicagoTime = timeService.ConstructChicagoTime(tradingDate, slotTimeChicago);
+                
+                // Use the earlier of: slotTimeChicago or now (to avoid future bars)
+                // CRITICAL: If restart occurs after slot_time, only request up to slot_time
+                // This prevents loading bars beyond the range window, which would change the input set
+                var endTimeChicago = nowChicago < slotTimeChicagoTime
+                    ? nowChicago.ToString("HH:mm")
+                    : slotTimeChicago;
+                
+                // Log restart detection if restarting after slot time
+                if (nowChicago >= slotTimeChicagoTime)
+                {
+                    Log($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest limited to slot_time to prevent range input set changes", LogLevel.Information);
+                }
+                
+                Log($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+
+                // Request bars using helper class (only up to current time)
+                List<Bar> bars;
+                try
+                {
+                    bars = NinjaTraderBarRequest.RequestBarsForTradingDate(
+                        Instrument,
+                        tradingDate,
+                        rangeStartChicago,
+                        endTimeChicago,
+                        timeService
+                    );
+                }
+                catch (Exception ex)
+                {
+                    // BarsRequest failure is critical - log error and rethrow
+                    var errorMsg = $"CRITICAL: Failed to request historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago}). " +
+                                 $"Error: {ex.Message}. " +
+                                 $"Without historical bars, range computation may fail or be incomplete. " +
+                                 $"Check NinjaTrader historical data availability and 'Days to load' setting.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg, ex);
+                }
+
+                // Validate bars were returned
+                if (bars == null)
+                {
+                    var errorMsg = $"CRITICAL: BarsRequest returned null for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago}). " +
+                                 $"This indicates a NinjaTrader API failure. Cannot proceed.";
+                    Log(errorMsg, LogLevel.Error);
+                    throw new InvalidOperationException(errorMsg);
+                }
+
+                if (bars.Count == 0)
+                {
+                    // No bars returned - this may be acceptable if started after slot_time, but log as error for visibility
+                    var errorMsg = $"WARNING: No historical bars returned from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago}). " +
+                                 $"Possible causes: " +
+                                 $"1) Strategy started after slot_time (bars already passed), " +
+                                 $"2) NinjaTrader 'Days to load' setting too low, " +
+                                 $"3) No historical data available for this date. " +
+                                 $"Range computation will rely on live bars only - may be incomplete.";
+                    Log(errorMsg, LogLevel.Warning);
+                    // Don't throw - allow degraded operation, but make it visible
+                }
+                else
+                {
+                    // Feed bars to engine for pre-hydration
+                    // Note: Streams should exist by now (created in engine.Start())
+                    _engine.LoadPreHydrationBars(Instrument.MasterInstrument.Name, bars, DateTimeOffset.UtcNow);
+                    Log($"Loaded {bars.Count} historical bars from NinjaTrader for pre-hydration", LogLevel.Information);
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log error but don't fail - fallback to file-based or live bars
+                Log($"Failed to request historical bars from NinjaTrader: {ex.Message}. Will use file-based or live bars.", LogLevel.Warning);
             }
         }
 
@@ -185,7 +387,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Create timer that fires every 1 second
                 // Timer callback must be thread-safe and never throw
-                _tickTimer = new Timer(TimerCallback, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+                _tickTimer = new Timer(TickTimerCallback, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
                 Log("Tick timer started (1 second interval)", LogLevel.Information);
             }
         }
@@ -210,15 +412,33 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// Timer callback: calls Engine.Tick() with current UTC time.
         /// Must be thread-safe, non-blocking, and never throw exceptions.
         /// </summary>
-        private void TimerCallback(object? state)
+        private void TickTimerCallback(object? state)
         {
             try
             {
-                if (_engine != null && _simAccountVerified)
+                // CRITICAL: Defensive checks before calling engine.Tick()
+                if (_engine is null)
                 {
-                    var utcNow = DateTimeOffset.UtcNow;
-                    _engine.Tick(utcNow);
+                    Log("ERROR: Tick timer callback called but engine is null", LogLevel.Error);
+                    return;
                 }
+                
+                if (!_simAccountVerified)
+                {
+                    Log("ERROR: Tick timer callback called but SIM account not verified", LogLevel.Error);
+                    return;
+                }
+                
+                // Verify trading date is still locked (should never change, but defensive check)
+                var tradingDateStr = _engine.GetTradingDate();
+                if (string.IsNullOrEmpty(tradingDateStr))
+                {
+                    Log("ERROR: Tick timer callback called but trading date not locked. Engine may be in StandDown state.", LogLevel.Error);
+                    return;
+                }
+                
+                var utcNow = DateTimeOffset.UtcNow;
+                _engine.Tick(utcNow);
             }
             catch (Exception ex)
             {

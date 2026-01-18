@@ -27,6 +27,20 @@ public struct DateOnly : IComparable<DateOnly>, IEquatable<DateOnly>
 
     public static DateOnly FromDateTime(DateTime dateTime) => new DateOnly(dateTime);
 
+    public static DateOnly Parse(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+            throw new ArgumentNullException(nameof(input));
+        
+        // Try parsing as "yyyy-MM-dd" format first (most common)
+        if (TryParseExact(input, "yyyy-MM-dd", null, DateTimeStyles.None, out var result))
+            return result;
+        
+        // Fall back to DateTime.Parse for other formats
+        var dt = DateTime.Parse(input);
+        return new DateOnly(dt);
+    }
+
     public static bool TryParseExact(string input, string format, IFormatProvider? provider, DateTimeStyles style, out DateOnly result)
     {
         if (DateTime.TryParseExact(input, format, provider, style, out var dt))
@@ -34,6 +48,29 @@ public struct DateOnly : IComparable<DateOnly>, IEquatable<DateOnly>
             result = new DateOnly(dt);
             return true;
         }
+        result = default;
+        return false;
+    }
+
+    public static bool TryParse(string input, out DateOnly result)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            result = default;
+            return false;
+        }
+
+        // Try parsing as "yyyy-MM-dd" format first (most common)
+        if (TryParseExact(input, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out result))
+            return true;
+
+        // Fall back to DateTime.TryParse for other formats
+        if (DateTime.TryParse(input, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+        {
+            result = new DateOnly(dt);
+            return true;
+        }
+
         result = default;
         return false;
     }

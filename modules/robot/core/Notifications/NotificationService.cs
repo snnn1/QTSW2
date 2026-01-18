@@ -20,11 +20,21 @@ public sealed class NotificationService : IDisposable
     private readonly ConcurrentQueue<NotificationRequest> _queue = new();
     private CancellationTokenSource _cancellationTokenSource = new();
     private Task? _backgroundWorker;
+    private Task? _watchdogTask;
     private bool _disposed = false;
+    
+    // Worker liveness tracking
+    private DateTimeOffset _workerStartedAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastDequeuedAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastHeartbeatAt = DateTimeOffset.MinValue;
+    private int _workerRestartCount = 0;
+    private readonly object _livenessLock = new();
     
     // Configuration constants
     private const int MAX_QUEUE_SIZE = 1000;
     private const int WORKER_SLEEP_MS = 100;
+    private const int HEARTBEAT_INTERVAL_SECONDS = 60;
+    private const int STALL_DETECTION_SECONDS = 120;
     
     private readonly string _projectRoot;
     private readonly HealthMonitorConfig _config;
@@ -83,15 +93,135 @@ public sealed class NotificationService : IDisposable
     /// </summary>
     public void Start()
     {
-        if (_backgroundWorker != null && !_backgroundWorker.IsCompleted) return;
-        
-        if (_cancellationTokenSource.IsCancellationRequested)
+        lock (_livenessLock)
         {
-            _cancellationTokenSource.Dispose();
-            _cancellationTokenSource = new CancellationTokenSource();
+            if (_backgroundWorker != null && !_backgroundWorker.IsCompleted) return;
+            
+            if (_cancellationTokenSource.IsCancellationRequested)
+            {
+                _cancellationTokenSource.Dispose();
+                _cancellationTokenSource = new CancellationTokenSource();
+            }
+            
+            _workerStartedAt = DateTimeOffset.UtcNow;
+            _lastDequeuedAt = DateTimeOffset.MinValue;
+            _lastHeartbeatAt = DateTimeOffset.UtcNow;
+            
+            _backgroundWorker = Task.Run(async () => await WorkerLoop(_cancellationTokenSource.Token));
+            
+            WriteNotificationLog("INFO", 
+                $"Notification worker started: " +
+                $"StartedAt={_workerStartedAt:o}, " +
+                $"RestartCount={_workerRestartCount}");
+            
+            // Start watchdog timer to detect stalled workers (only if not already running)
+            if (_watchdogTask == null || _watchdogTask.IsCompleted)
+            {
+                _watchdogTask = Task.Run(async () => await WatchdogLoop());
+            }
         }
-        
-        _backgroundWorker = Task.Run(async () => await WorkerLoop(_cancellationTokenSource.Token));
+    }
+    
+    /// <summary>
+    /// Watchdog loop to detect and restart stalled workers.
+    /// </summary>
+    private async Task WatchdogLoop()
+    {
+        while (!_disposed)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), CancellationToken.None); // Check every 30 seconds
+                
+                // Check if worker is stalled (read values outside lock)
+                bool shouldRestart = false;
+                int queueLength = 0;
+                DateTimeOffset lastDequeuedAt;
+                int restartCount;
+                TaskStatus workerStatus = TaskStatus.Created;
+                
+                lock (_livenessLock)
+                {
+                    if (_disposed) break;
+                    
+                    var now = DateTimeOffset.UtcNow;
+                    queueLength = _queue.Count;
+                    lastDequeuedAt = _lastDequeuedAt;
+                    restartCount = _workerRestartCount;
+                    
+                    // Worker is stalled if:
+                    // - Worker task exists AND
+                    // - It is not completed AND
+                    // - Queue length > 0 AND
+                    // - now - _lastDequeuedAt > 120 seconds
+                    if (_backgroundWorker != null && 
+                        !_backgroundWorker.IsCompleted && 
+                        queueLength > 0 && 
+                        lastDequeuedAt != DateTimeOffset.MinValue &&
+                        (now - lastDequeuedAt).TotalSeconds > STALL_DETECTION_SECONDS)
+                    {
+                        workerStatus = _backgroundWorker.Status;
+                        shouldRestart = true;
+                    }
+                }
+                
+                // Perform restart outside of lock (to avoid await in lock)
+                if (shouldRestart)
+                {
+                    WriteNotificationLog("WARN", 
+                        $"Notification worker stalled detected: " +
+                        $"QueueLength={queueLength}, " +
+                        $"LastDequeuedAt={lastDequeuedAt:o}, " +
+                        $"SecondsSinceLastDequeue={(DateTimeOffset.UtcNow - lastDequeuedAt).TotalSeconds:F1}, " +
+                        $"RestartCount={restartCount}, " +
+                        $"WorkerTaskStatus={workerStatus}");
+                    
+                    // Cancel current worker
+                    _cancellationTokenSource.Cancel();
+                    
+                    // Wait briefly for cancellation to propagate
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), CancellationToken.None);
+                    }
+                    catch { }
+                    
+                    // Perform restart operations inside lock
+                    lock (_livenessLock)
+                    {
+                        // Dispose old cancellation token source
+                        _cancellationTokenSource.Dispose();
+                        
+                        // Create new cancellation token source
+                        _cancellationTokenSource = new CancellationTokenSource();
+                        
+                        // Increment restart count
+                        _workerRestartCount++;
+                        
+                        // Reset timestamps
+                        _workerStartedAt = DateTimeOffset.UtcNow;
+                        _lastDequeuedAt = DateTimeOffset.MinValue;
+                        _lastHeartbeatAt = DateTimeOffset.UtcNow;
+                        
+                        // Start fresh worker
+                        _backgroundWorker = Task.Run(async () => await WorkerLoop(_cancellationTokenSource.Token));
+                    }
+                    
+                    WriteNotificationLog("INFO", 
+                        $"Notification worker restarted: " +
+                        $"StartedAt={DateTimeOffset.UtcNow:o}, " +
+                        $"RestartCount={_workerRestartCount}, " +
+                        $"QueueLength={queueLength}");
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteNotificationLog("ERROR", 
+                    $"Watchdog loop exception: " +
+                    $"Exception={FormatExceptionChain(ex)}");
+                await Task.Delay(TimeSpan.FromSeconds(5), CancellationToken.None);
+            }
+        }
     }
     
     /// <summary>
@@ -99,20 +229,29 @@ public sealed class NotificationService : IDisposable
     /// </summary>
     public void Stop()
     {
-        if (_backgroundWorker == null) return;
-        
-        _cancellationTokenSource.Cancel();
-        
-        try
+        lock (_livenessLock)
         {
-            _backgroundWorker.Wait(TimeSpan.FromSeconds(5));
+            if (_backgroundWorker == null) return;
+            
+            WriteNotificationLog("INFO", 
+                $"Notification worker stopping: " +
+                $"QueueLength={_queue.Count}, " +
+                $"RestartCount={_workerRestartCount}");
+            
+            _cancellationTokenSource.Cancel();
+            
+            try
+            {
+                _backgroundWorker.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (AggregateException)
+            {
+                // Expected when cancellation token is triggered
+            }
+            
+            _backgroundWorker = null;
+            _watchdogTask = null;
         }
-        catch (AggregateException)
-        {
-            // Expected when cancellation token is triggered
-        }
-        
-        _backgroundWorker = null;
     }
     
     /// <summary>
@@ -170,79 +309,174 @@ public sealed class NotificationService : IDisposable
     {
         Thread.CurrentThread.IsBackground = true;
         
-        while (!cancellationToken.IsCancellationRequested)
+        try
         {
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                if (_queue.TryDequeue(out var request))
+                try
                 {
-                    // Send notification via Pushover (await directly since we're already in background task)
-                    var result = await PushoverClient.SendAsync(
-                        _config.pushover_user_key,
-                        _config.pushover_app_token,
-                        request.Title,
-                        request.Message,
-                        request.Priority
-                    );
+                    var now = DateTimeOffset.UtcNow;
                     
-                    if (result.Success)
+                    // Emit heartbeat every 60 seconds
+                    lock (_livenessLock)
                     {
-                        // Log success (INFO level)
-                        WriteNotificationLog("INFO", 
-                            $"Pushover notification sent successfully: " +
-                            $"Key={request.Key}, " +
-                            $"Title={request.Title}, " +
-                            $"Priority={request.Priority}, " +
-                            $"HttpStatusCode={result.HttpStatusCode}, " +
-                            $"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
+                        if ((now - _lastHeartbeatAt).TotalSeconds >= HEARTBEAT_INTERVAL_SECONDS)
+                        {
+                            var uptime = _lastDequeuedAt != DateTimeOffset.MinValue 
+                                ? (now - _workerStartedAt).TotalSeconds 
+                                : 0;
+                            
+                            WriteNotificationLog("INFO", 
+                                $"Notification worker heartbeat: " +
+                                $"WorkerRunning=true, " +
+                                $"QueueLength={_queue.Count}, " +
+                                $"LastDequeuedAt={(_lastDequeuedAt != DateTimeOffset.MinValue ? _lastDequeuedAt.ToString("o") : "never")}, " +
+                                $"WorkerUptimeSeconds={uptime:F1}, " +
+                                $"RestartCount={_workerRestartCount}");
+                            
+                            _lastHeartbeatAt = now;
+                        }
+                    }
+                    
+                    if (_queue.TryDequeue(out var request))
+                    {
+                        // Update last dequeued timestamp (regardless of success/failure)
+                        lock (_livenessLock)
+                        {
+                            _lastDequeuedAt = DateTimeOffset.UtcNow;
+                        }
+                        
+                        // Send notification via Pushover with timeout guard
+                        PushoverClient.SendResult result;
+                        try
+                        {
+                            // Implement timeout guard using Task.WhenAny (10 seconds max)
+                            var sendTask = PushoverClient.SendAsync(
+                                _config.pushover_user_key,
+                                _config.pushover_app_token,
+                                request.Title,
+                                request.Message,
+                                request.Priority
+                            );
+                            
+                            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+                            var completedTask = await Task.WhenAny(sendTask, timeoutTask);
+                            
+                            if (completedTask == timeoutTask)
+                            {
+                                // Timeout occurred
+                                result = new PushoverClient.SendResult
+                                {
+                                    Success = false,
+                                    Exception = new TimeoutException("Pushover send operation timed out after 10 seconds")
+                                };
+                            }
+                            else
+                            {
+                                // Send completed (successfully or with error)
+                                result = await sendTask;
+                            }
+                        }
+                        catch (OperationCanceledException ex)
+                        {
+                            // Cancellation occurred
+                            result = new PushoverClient.SendResult
+                            {
+                                Success = false,
+                                Exception = ex
+                            };
+                        }
+                        catch (Exception ex)
+                        {
+                            // Unexpected exception during send
+                            result = new PushoverClient.SendResult
+                            {
+                                Success = false,
+                                Exception = ex
+                            };
+                        }
+                        
+                        if (result.Success)
+                        {
+                            // Log success (INFO level)
+                            WriteNotificationLog("INFO", 
+                                $"Pushover notification sent successfully: " +
+                                $"Key={request.Key}, " +
+                                $"Title={request.Title}, " +
+                                $"Priority={request.Priority}, " +
+                                $"HttpStatusCode={result.HttpStatusCode}, " +
+                                $"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
+                        }
+                        else
+                        {
+                            // Log failure (ERROR level) with full diagnostic details
+                            var errorParts = new System.Text.StringBuilder();
+                            errorParts.Append($"Pushover notification failed: ");
+                            errorParts.Append($"Key={request.Key}, ");
+                            errorParts.Append($"Title={request.Title}, ");
+                            errorParts.Append($"Priority={request.Priority}, ");
+                            errorParts.Append($"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
+                            
+                            if (result.HttpStatusCode.HasValue)
+                            {
+                                errorParts.Append($", HttpStatusCode={result.HttpStatusCode.Value}");
+                            }
+                            
+                            if (!string.IsNullOrWhiteSpace(result.ResponseBody))
+                            {
+                                var sanitizedBody = result.ResponseBody.Replace("\r", "").Replace("\n", " ");
+                                errorParts.Append($", ResponseBody={sanitizedBody}");
+                            }
+                            
+                            if (result.Exception != null)
+                            {
+                                errorParts.Append($", Exception={FormatExceptionChain(result.Exception)}");
+                            }
+                            
+                            WriteNotificationLog("ERROR", errorParts.ToString());
+                        }
+                        
+                        // Continue processing queue regardless of success/failure
                     }
                     else
                     {
-                        // Log failure (ERROR level) with full diagnostic details
-                        var errorParts = new System.Text.StringBuilder();
-                        errorParts.Append($"Pushover notification failed: ");
-                        errorParts.Append($"Key={request.Key}, ");
-                        errorParts.Append($"Title={request.Title}, ");
-                        errorParts.Append($"Priority={request.Priority}, ");
-                        errorParts.Append($"Endpoint={PushoverClient.PUSHOVER_ENDPOINT}");
-                        
-                        if (result.HttpStatusCode.HasValue)
-                        {
-                            errorParts.Append($", HttpStatusCode={result.HttpStatusCode.Value}");
-                        }
-                        
-                        if (!string.IsNullOrWhiteSpace(result.ResponseBody))
-                        {
-                            var sanitizedBody = result.ResponseBody.Replace("\r", "").Replace("\n", " ");
-                            errorParts.Append($", ResponseBody={sanitizedBody}");
-                        }
-                        
-                        if (result.Exception != null)
-                        {
-                            errorParts.Append($", Exception={FormatExceptionChain(result.Exception)}");
-                        }
-                        
-                        WriteNotificationLog("ERROR", errorParts.ToString());
+                        await Task.Delay(WORKER_SLEEP_MS, cancellationToken);
                     }
                 }
-                else
+                catch (OperationCanceledException)
                 {
-                    await Task.Delay(WORKER_SLEEP_MS, cancellationToken);
+                    // Expected when cancellation token is triggered
+                    WriteNotificationLog("INFO", 
+                        $"Notification worker cancelled: " +
+                        $"RestartCount={_workerRestartCount}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    // Log unexpected exception in worker loop (but don't crash)
+                    WriteNotificationLog("ERROR", 
+                        $"Unexpected exception in notification worker loop: " +
+                        $"Exception={FormatExceptionChain(ex)}");
+                    
+                    // Continue processing - don't exit loop
+                    try
+                    {
+                        await Task.Delay(1000, cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
-            catch (OperationCanceledException)
-            {
-                // Expected when cancellation token is triggered
-                break;
-            }
-            catch (Exception ex)
-            {
-                // Log unexpected exception in worker loop (but don't crash)
-                WriteNotificationLog("ERROR", 
-                    $"Unexpected exception in notification worker loop: " +
-                    $"Exception={FormatExceptionChain(ex)}");
-                await Task.Delay(1000, cancellationToken);
-            }
+        }
+        catch (Exception ex)
+        {
+            // Worker exited unexpectedly
+            WriteNotificationLog("ERROR", 
+                $"Notification worker exited unexpectedly: " +
+                $"Exception={FormatExceptionChain(ex)}, " +
+                $"RestartCount={_workerRestartCount}");
         }
     }
     

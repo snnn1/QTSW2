@@ -319,13 +319,16 @@ class TimetableEngine:
         Generate timetable for a specific trading day.
         
         Args:
-            trade_date: Trading date (YYYY-MM-DD) or None for today
+            trade_date: Trading date (YYYY-MM-DD) or None for today (Chicago time)
             
         Returns:
             DataFrame with timetable entries
         """
         if trade_date is None:
-            trade_date = date.today().isoformat()
+            # Use Chicago timezone to get today's date (consistent with robot engine)
+            chicago_tz = pytz.timezone("America/Chicago")
+            chicago_now = datetime.now(chicago_tz)
+            trade_date = chicago_now.date().isoformat()
         
         trade_date_obj = pd.to_datetime(trade_date).date()
         
@@ -417,7 +420,13 @@ class TimetableEngine:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        trade_date = timetable_df['trade_date'].iloc[0] if not timetable_df.empty else date.today().isoformat()
+        if not timetable_df.empty:
+            trade_date = timetable_df['trade_date'].iloc[0]
+        else:
+            # Use Chicago timezone to get today's date (consistent with robot engine)
+            chicago_tz = pytz.timezone("America/Chicago")
+            chicago_now = datetime.now(chicago_tz)
+            trade_date = chicago_now.date().isoformat()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         parquet_file = output_path / f"timetable_{trade_date.replace('-', '')}_{timestamp}.parquet"

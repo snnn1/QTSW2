@@ -38,10 +38,10 @@ public partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
-        // Assert: account.IsSimAccount == true
+        // Assert: account.IsSimAccount == true (playback mode not supported)
         if (!account.IsSimAccount)
         {
-            var error = $"Account '{account.Name}' is not Sim account - aborting execution";
+            var error = $"Account '{account.Name}' is not a Sim account - aborting execution";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
                 new { reason = "NOT_SIM_ACCOUNT", account_name = account.Name, error }));
             throw new InvalidOperationException(error);

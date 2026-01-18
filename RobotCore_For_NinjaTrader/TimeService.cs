@@ -105,5 +105,15 @@ public sealed class TimeService
         }
         throw new TimeZoneNotFoundException("Could not resolve Chicago timezone (America/Chicago / Central Standard Time).");
     }
+
+    /// <summary>
+    /// Format DateTimeOffset as ISO 8601 string (replaces .ToString("o") pattern).
+    /// </summary>
+    public static string FormatIso8601(DateTimeOffset dt) => dt.ToString("o");
+
+    /// <summary>
+    /// Format DateOnly as yyyy-MM-dd string (replaces .ToString("yyyy-MM-dd") pattern).
+    /// </summary>
+    public static string FormatDateOnly(DateOnly date) => date.ToString("yyyy-MM-dd");
 }
 
