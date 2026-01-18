@@ -43,6 +43,8 @@ public static class HistoricalReplay
                 continue;
             }
 
+            Console.WriteLine($"[Replay] Processing date: {currentDate:yyyy-MM-dd}");
+            
             // Update timetable trading_date for this date if using replay timetable
             // The engine will reload the timetable when we tick with the historical date
             UpdateTimetableTradingDateIfReplay(projectRoot, currentDate, timeService);
@@ -53,14 +55,17 @@ public static class HistoricalReplay
 
             // Collect all bars for this date across all instruments
             var dateBars = new List<(Bar bar, string instrument)>();
+            Console.WriteLine($"[Replay] Loading bars for {instrumentsToProcess.Length} instruments...");
 
             foreach (var instrument in instrumentsToProcess)
             {
+                Console.WriteLine($"[Replay] Loading {instrument}...");
                 // Calculate time range for this date
                 // Need bars from earliest range start to forced flatten time
                 var earliestRangeStart = spec.sessions.Values.Min(s => s.range_start_time);
                 if (string.IsNullOrEmpty(earliestRangeStart))
                 {
+                    Console.WriteLine($"[Replay] Skipping {instrument}: No valid range start time");
                     continue; // Skip if no valid range start time
                 }
                 var rangeStartUtc = timeService.ConvertChicagoLocalToUtc(currentDate, earliestRangeStart);
@@ -71,6 +76,8 @@ public static class HistoricalReplay
                 // Get bars for this date range
                 var bars = barProvider.GetBars(instrument, rangeStartUtc, forcedFlattenUtc.AddHours(1))
                     .ToList();
+                
+                Console.WriteLine($"[Replay] Loaded {bars.Count} bars for {instrument}");
 
                 foreach (var bar in bars)
                 {
@@ -78,8 +85,15 @@ public static class HistoricalReplay
                 }
             }
 
+            Console.WriteLine($"[Replay] Total bars collected: {dateBars.Count}");
+            Console.WriteLine($"[Replay] Sorting bars chronologically...");
+
             // Sort all bars by timestamp (across all instruments)
             dateBars.Sort((a, b) => a.bar.TimestampUtc.CompareTo(b.bar.TimestampUtc));
+
+            Console.WriteLine($"[Replay] Feeding {dateBars.Count} bars to engine...");
+            var barCount = 0;
+            var lastProgressTime = DateTime.UtcNow;
 
             // Feed bars to engine in chronological order
             foreach (var (bar, instrument) in dateBars)
@@ -91,7 +105,20 @@ public static class HistoricalReplay
                 
                 // Tick engine at bar time
                 engine.Tick(barUtc);
+                
+                barCount++;
+                
+                // Progress update every 1000 bars or every 10 seconds
+                var now = DateTime.UtcNow;
+                if (barCount % 1000 == 0 || (now - lastProgressTime).TotalSeconds >= 10)
+                {
+                    var progress = (barCount * 100.0 / dateBars.Count);
+                    Console.WriteLine($"[Replay] Progress: {barCount}/{dateBars.Count} bars ({progress:F1}%)");
+                    lastProgressTime = now;
+                }
             }
+            
+            Console.WriteLine($"[Replay] Completed processing {barCount} bars");
 
             // Final tick at end of day to ensure all state transitions complete
             var endOfDayUtc = timeService.ConvertChicagoLocalToUtc(currentDate, "16:00");
@@ -101,7 +128,7 @@ public static class HistoricalReplay
         }
     }
 
-    private static void UpdateTimetableTradingDateIfReplay(string projectRoot, DateOnly tradingDate, TimeService timeService)
+    public static void UpdateTimetableTradingDateIfReplay(string projectRoot, DateOnly tradingDate, TimeService timeService)
     {
         // Check if replay timetable exists
         var replayTimetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_replay.json");
@@ -136,9 +163,13 @@ public static class HistoricalReplay
                 }).ToArray()
             };
 
-            // Write updated timetable (this will trigger engine reload on next tick)
+            // Write updated timetable to BOTH replay and current (engine watches current)
             var json = JsonSerializer.Serialize(updatedTimetable);
             File.WriteAllText(replayTimetablePath, json);
+            
+            // Also update timetable_current.json so engine can see it
+            var currentTimetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_current.json");
+            File.WriteAllText(currentTimetablePath, json);
         }
         catch
         {

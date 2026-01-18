@@ -25,7 +25,7 @@ static void PrintUsage()
     Console.WriteLine("- Engine reads ONLY from:");
     Console.WriteLine("  configs/analyzer_robot_parity.json");
     Console.WriteLine("  data/timetable/timetable_current.json");
-    Console.WriteLine("  data/translated_test/ (when --replay is used)");
+    Console.WriteLine("  data/translated/ (when --replay is used)");
     Console.WriteLine("- Logs: logs/robot/robot_skeleton.jsonl (or --log-dir if specified)");
     Console.WriteLine("- Journal: logs/robot/journal/<trading_date>_<stream>.json");
 }
@@ -157,9 +157,18 @@ if (argsList.Contains("--replay"))
     Console.WriteLine($"Replay mode: {startDate:yyyy-MM-dd} to {endDate:yyyy-MM-dd}");
     if (logDir != null)
         Console.WriteLine($"Custom log directory: {logDir}");
+    
+    // CRITICAL: Update timetable BEFORE starting engine so it sees valid streams
+    // The engine loads timetable on Start(), so we need it ready first
+    if (replayTimetablePath != null && File.Exists(replayTimetablePath))
+    {
+        // Update timetable for first date before engine starts
+        HistoricalReplay.UpdateTimetableTradingDateIfReplay(root, startDate, timeSvc);
+    }
+    
     var engine = new RobotEngine(root, TimeSpan.FromSeconds(1), executionMode, logDir, replayTimetablePath);
     engine.Start();
-    var snapshotRoot = Path.Combine(root, "data", "translated_test");
+    var snapshotRoot = Path.Combine(root, "data", "translated");
     HistoricalReplay.Replay(engine, specLoaded, timeSvc, snapshotRoot, root, startDate, endDate);
     engine.Stop();
     Console.WriteLine($"Done. Inspect logs in: {logDir ?? "logs/robot/"}");

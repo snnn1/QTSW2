@@ -24,12 +24,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// <param name="startTimeUtc">Start time (UTC)</param>
         /// <param name="endTimeUtc">End time (UTC)</param>
         /// <param name="barSizeMinutes">Bar size in minutes (default: 1)</param>
+        /// <param name="logCallback">Optional callback for logging events</param>
         /// <returns>List of bars in chronological order</returns>
         public static List<Bar> RequestHistoricalBars(
             Instrument instrument,
             DateTimeOffset startTimeUtc,
             DateTimeOffset endTimeUtc,
-            int barSizeMinutes = 1)
+            int barSizeMinutes = 1,
+            Action<string, object>? logCallback = null)
         {
             var bars = new List<Bar>();
 
@@ -47,6 +49,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Request bars synchronously
                 // Note: Request() may return null if no data available or request fails
                 var barsSeries = barsRequest.Request();
+
+                // Log raw result immediately after Request()
+                if (logCallback != null)
+                {
+                    var rawBars = barsSeries != null ? barsSeries.Count : 0;
+                    string? firstBarTime = null;
+                    string? lastBarTime = null;
+                    
+                    if (barsSeries != null && barsSeries.Count > 0)
+                    {
+                        firstBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.Get(0).Time).ToString("o");
+                        lastBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.Get(barsSeries.Count - 1).Time).ToString("o");
+                    }
+                    
+                    logCallback("BARSREQUEST_RAW_RESULT", new
+                    {
+                        instrument = instrument.MasterInstrument.Name,
+                        bars_returned_raw = rawBars,
+                        first_bar_time = firstBarTime,
+                        last_bar_time = lastBarTime,
+                        request_start_utc = startTimeUtc.ToString("o"),
+                        request_end_utc = endTimeUtc.ToString("o")
+                    });
+                }
 
                 if (barsSeries != null && barsSeries.Count > 0)
                 {
@@ -90,13 +116,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// <param name="rangeStartChicago">Range start time (Chicago time, e.g., "07:30")</param>
         /// <param name="slotTimeChicago">Slot time (Chicago time, e.g., "09:00")</param>
         /// <param name="timeService">TimeService for timezone conversions</param>
+        /// <param name="logCallback">Optional callback for logging events</param>
         /// <returns>List of bars in chronological order</returns>
         public static List<Bar> RequestBarsForTradingDate(
             Instrument instrument,
             DateOnly tradingDate,
             string rangeStartChicago,
             string slotTimeChicago,
-            TimeService timeService)
+            TimeService timeService,
+            Action<string, object>? logCallback = null)
         {
             // Construct Chicago times for the trading date
             var rangeStartChicagoTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
@@ -107,7 +135,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             var slotTimeUtc = slotTimeChicagoTime.ToUniversalTime();
             
             // Request bars for this range
-            return RequestHistoricalBars(instrument, rangeStartUtc, slotTimeUtc, barSizeMinutes: 1);
+            return RequestHistoricalBars(instrument, rangeStartUtc, slotTimeUtc, barSizeMinutes: 1, logCallback: logCallback);
         }
     }
 }

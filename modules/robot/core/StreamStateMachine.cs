@@ -302,7 +302,7 @@ public sealed class StreamStateMachine
         SlotTimeChicagoTime = _time.ConstructChicagoTime(tradingDate, newSlotTimeChicago);
         
         // PHASE 2: Derive UTC from Chicago time (derived representation)
-        SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
+        SlotTimeUtc = _time.ConvertChicagoToUtc(SlotTimeChicagoTime);
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, "UPDATE_APPLIED", State.ToString(),
             new { slot_time_chicago = SlotTimeChicago, slot_time_chicago_time = SlotTimeChicagoTime.ToString("o"), slot_time_utc = SlotTimeUtc.ToString("o") }));
@@ -520,21 +520,30 @@ public sealed class StreamStateMachine
     /// </summary>
     private void HandlePreHydrationState(DateTimeOffset utcNow)
     {
-        // Both SIM and DRYRUN modes: Use file-based pre-hydration first
-        // SIM mode: Then supplement with NinjaTrader bars as they arrive
-        // DRYRUN mode: File-based only
+        // DRYRUN mode: Use file-based pre-hydration only
+        // SIM mode: Use NinjaTrader BarsRequest only (no CSV files)
         if (!_preHydrationComplete)
         {
-            // Perform file-based pre-hydration (works for both SIM and DRYRUN)
-            PerformPreHydration(utcNow);
+            if (IsSimMode())
+            {
+                // SIM mode: Skip CSV files, rely solely on BarsRequest
+                // BarsRequest bars arrive via LoadPreHydrationBars() and are buffered in OnBar()
+                // Mark pre-hydration as complete so we can transition when bars arrive
+                _preHydrationComplete = true;
+            }
+            else
+            {
+                // DRYRUN mode: Perform file-based pre-hydration
+                PerformPreHydration(utcNow);
+            }
         }
         
-        // After file-based pre-hydration completes, check if we should wait for more bars
+        // After pre-hydration setup completes, check if we should transition to ARMED
         if (_preHydrationComplete)
         {
             if (IsSimMode())
             {
-                // SIM mode: File-based pre-hydration complete, but can supplement with NinjaTrader bars
+                // SIM mode: Wait for BarsRequest bars from NinjaTrader
                 // Check if we have sufficient bars or if we're past range start time
                 int barCount = GetBarBufferCount();
                 var nowChicago = _time.ConvertUtcToChicago(utcNow);
@@ -542,6 +551,23 @@ public sealed class StreamStateMachine
                 // Transition to ARMED if we have bars or if we're past range start time
                 if (barCount > 0 || nowChicago >= RangeStartChicagoTime)
                 {
+                    // Log timeout if transitioning without bars
+                    if (barCount == 0 && nowChicago >= RangeStartChicagoTime)
+                    {
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
+                            SlotTimeChicago, SlotTimeUtc,
+                            "PRE_HYDRATION_TIMEOUT_NO_BARS", "PRE_HYDRATION",
+                            new
+                            {
+                                stream_id = Stream,
+                                instrument = Instrument,
+                                trading_date = TradingDate,
+                                now_chicago = nowChicago.ToString("o"),
+                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                note = "Proceeding without historical bars"
+                            }));
+                    }
+                    
                     // CONSOLIDATED HYDRATION SUMMARY LOG: Forensic snapshot for every day
                     // This single log captures all hydration statistics at PRE_HYDRATION → ARMED transition
                     // Collect all bar source counters for comprehensive reporting
@@ -579,7 +605,24 @@ public sealed class StreamStateMachine
                                    "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
                         }));
                     
-                    LogHealth("INFO", "PRE_HYDRATION_COMPLETE", $"Pre-hydration complete (SIM mode) - {barCount} bars total (file + NinjaTrader)",
+                    // HYDRATION_SNAPSHOT: Consolidated snapshot per stream
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
+                        SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_SNAPSHOT", "PRE_HYDRATION",
+                        new
+                        {
+                            execution_mode = _executionMode.ToString(),
+                            instrument = Instrument,
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            barsrequest_raw_count = historicalBarCount + filteredFutureBarCount + filteredPartialBarCount, // Approximate
+                            barsrequest_accepted_count = historicalBarCount,
+                            live_bar_count = liveBarCount,
+                            hydration_source = "BARSREQUEST",
+                            transition_reason = barCount > 0 ? "BAR_COUNT" : "TIME_THRESHOLD"
+                        }));
+                    
+                    LogHealth("INFO", "PRE_HYDRATION_COMPLETE", $"Pre-hydration complete (SIM mode) - {barCount} bars total (BarsRequest only)",
                         new
                         {
                             instrument = Instrument,
@@ -588,7 +631,7 @@ public sealed class StreamStateMachine
                             bars_received = barCount,
                             now_chicago = nowChicago.ToString("o"),
                             range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                            note = "File-based pre-hydration complete, supplemented with NinjaTrader bars"
+                            note = "SIM mode uses BarsRequest only (no CSV files)"
                         });
                     Transition(utcNow, StreamState.ARMED, "PRE_HYDRATION_COMPLETE_SIM");
                 }
@@ -610,29 +653,46 @@ public sealed class StreamStateMachine
                 }
                 
                 var nowChicago = _time.ConvertUtcToChicago(utcNow);
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "HYDRATION_SUMMARY", "PRE_HYDRATION",
-                    new
-                    {
-                        instrument = Instrument,
-                        slot = Stream,
-                        trading_date = TradingDate,
-                        total_bars_in_buffer = barCount,
-                        // Bar source breakdown
-                        historical_bar_count = historicalBarCount,
-                        live_bar_count = liveBarCount,
-                        deduped_bar_count = dedupedBarCount,
-                        filtered_future_bar_count = filteredFutureBarCount,
-                        filtered_partial_bar_count = filteredPartialBarCount,
-                        // Timing context
-                        now_chicago = nowChicago.ToString("o"),
-                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
-                        // Mode and source info
-                        execution_mode = _executionMode.ToString(),
-                        note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
-                               "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
-                    }));
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_SUMMARY", "PRE_HYDRATION",
+                        new
+                        {
+                            instrument = Instrument,
+                            slot = Stream,
+                            trading_date = TradingDate,
+                            total_bars_in_buffer = barCount,
+                            // Bar source breakdown
+                            historical_bar_count = historicalBarCount,
+                            live_bar_count = liveBarCount,
+                            deduped_bar_count = dedupedBarCount,
+                            filtered_future_bar_count = filteredFutureBarCount,
+                            filtered_partial_bar_count = filteredPartialBarCount,
+                            // Timing context
+                            now_chicago = nowChicago.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            // Mode and source info
+                            execution_mode = _executionMode.ToString(),
+                            note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
+                                   "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
+                        }));
+                    
+                    // HYDRATION_SNAPSHOT: Consolidated snapshot per stream (DRYRUN mode)
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
+                        SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_SNAPSHOT", "PRE_HYDRATION",
+                        new
+                        {
+                            execution_mode = _executionMode.ToString(),
+                            instrument = Instrument,
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            barsrequest_raw_count = historicalBarCount + filteredFutureBarCount + filteredPartialBarCount, // Approximate
+                            barsrequest_accepted_count = historicalBarCount,
+                            live_bar_count = liveBarCount,
+                            hydration_source = "CSV",
+                            transition_reason = "PRE_HYDRATION_COMPLETE"
+                        }));
                 
                 Transition(utcNow, StreamState.ARMED, "PRE_HYDRATION_COMPLETE");
             }
@@ -2581,9 +2641,9 @@ public sealed class StreamStateMachine
         var marketCloseChicagoTime = time.ConstructChicagoTime(tradingDate, spec.entry_cutoff.market_close_time);
         
         // PHASE 2: Derive UTC times from Chicago times (derived representation)
-        RangeStartUtc = RangeStartChicagoTime.ToUniversalTime();
-        SlotTimeUtc = SlotTimeChicagoTime.ToUniversalTime();
-        MarketCloseUtc = marketCloseChicagoTime.ToUniversalTime();
+        RangeStartUtc = time.ConvertChicagoToUtc(RangeStartChicagoTime);
+        SlotTimeUtc = time.ConvertChicagoToUtc(SlotTimeChicagoTime);
+        MarketCloseUtc = time.ConvertChicagoToUtc(marketCloseChicagoTime);
         
         // CRITICAL: Check for DST transition on this trading date
         // Timezone edge case mitigation: Detect DST transitions that can cause missing/duplicate hours

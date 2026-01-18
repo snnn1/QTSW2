@@ -648,6 +648,20 @@ public sealed class RobotEngine
         
         var totalFiltered = barsFilteredFuture + barsFilteredPartial;
 
+        // Log filtering summary (always log, even if no filtering occurred)
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+            eventType: "BARSREQUEST_FILTER_SUMMARY", state: "ENGINE",
+            new
+            {
+                instrument = instrument,
+                raw_bar_count = bars.Count,
+                accepted_bar_count = filteredBars.Count,
+                filtered_future_count = barsFilteredFuture,
+                filtered_partial_count = barsFilteredPartial,
+                accepted_first_bar_utc = filteredBars.Count > 0 ? filteredBars[0].TimestampUtc.ToString("o") : null,
+                accepted_last_bar_utc = filteredBars.Count > 0 ? filteredBars[filteredBars.Count - 1].TimestampUtc.ToString("o") : null
+            }));
+
         if (totalFiltered > 0)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_FILTERED", state: "ENGINE",
@@ -667,6 +681,33 @@ public sealed class RobotEngine
 
         if (filteredBars.Count == 0)
         {
+            // Get current Chicago time for diagnostic
+            var nowChicago = _time?.ConvertUtcToChicago(utcNow) ?? utcNow;
+            
+            // Log zero-bars diagnostic with actionable suggestions
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                eventType: "BARSREQUEST_ZERO_BARS_DIAGNOSTIC", state: "ENGINE",
+                new
+                {
+                    instrument = instrument,
+                    trading_date = TradingDateString,
+                    requested_start_chicago = bars.Count > 0 ? "N/A" : "See BARSREQUEST_REQUESTED log",
+                    requested_end_chicago = bars.Count > 0 ? "N/A" : "See BARSREQUEST_REQUESTED log",
+                    now_chicago = nowChicago.ToString("o"),
+                    trading_hours_template = "See BARSREQUEST_REQUESTED log",
+                    execution_mode = "SIM",
+                    raw_bar_count = bars.Count,
+                    filtered_future_count = barsFilteredFuture,
+                    filtered_partial_count = barsFilteredPartial,
+                    suggested_checks = new[]
+                    {
+                        "Check NinjaTrader 'Days to load' setting",
+                        "Verify instrument has historical data",
+                        "Confirm trading hours template",
+                        "Confirm data provider connection"
+                    }
+                }));
+            
             // All bars filtered out - this is unusual and should be logged as warning
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_NO_BARS_AFTER_FILTER", state: "ENGINE",
                 new
@@ -998,7 +1039,7 @@ public sealed class RobotEngine
                 if (!string.IsNullOrWhiteSpace(slotTimeChicago))
                 {
                     var slotTimeChicagoTime = _time.ConstructChicagoTime(tradingDate, slotTimeChicago);
-                    slotTimeUtc = slotTimeChicagoTime.ToUniversalTime();
+                    slotTimeUtc = _time.ConvertChicagoToUtc(slotTimeChicagoTime);
                 }
             }
             catch
@@ -1289,5 +1330,61 @@ public sealed class RobotEngine
     public NotificationService? GetNotificationService()
     {
         return _healthMonitor?.GetNotificationService();
+    }
+
+    /// <summary>
+    /// Public method to log engine events from external callers (e.g., RobotSimStrategy).
+    /// </summary>
+    public void LogEngineEvent(DateTimeOffset utcNow, string eventType, object? data = null)
+    {
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", data));
+    }
+    
+    /// <summary>
+    /// Get time range covering all enabled streams for an instrument (for BarsRequest).
+    /// Returns the earliest range_start and latest slot_time across all enabled streams for the instrument.
+    /// </summary>
+    public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
+    {
+        if (_spec is null || _time is null || !_activeTradingDate.HasValue) return null;
+        
+        var instrumentUpper = instrument.ToUpperInvariant();
+        var enabledStreams = _streams.Values
+            .Where(s => !s.Committed && s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        
+        if (enabledStreams.Count == 0) return null;
+        
+        // Find earliest range_start across all sessions used by enabled streams
+        var sessionsUsed = enabledStreams.Select(s => s.Session).Distinct().ToList();
+        string? earliestRangeStart = null;
+        
+        foreach (var session in sessionsUsed)
+        {
+            if (_spec.sessions.TryGetValue(session, out var sessionInfo))
+            {
+                var rangeStart = sessionInfo.range_start_time;
+                if (!string.IsNullOrWhiteSpace(rangeStart))
+                {
+                    if (earliestRangeStart == null || string.Compare(rangeStart, earliestRangeStart, StringComparison.Ordinal) < 0)
+                    {
+                        earliestRangeStart = rangeStart;
+                    }
+                }
+            }
+        }
+        
+        if (string.IsNullOrWhiteSpace(earliestRangeStart)) return null;
+        
+        // Find latest slot_time across all enabled streams
+        var latestSlotTime = enabledStreams
+            .Select(s => s.SlotTimeChicago)
+            .Where(st => !string.IsNullOrWhiteSpace(st))
+            .OrderByDescending(st => st, StringComparer.Ordinal)
+            .FirstOrDefault();
+        
+        if (string.IsNullOrWhiteSpace(latestSlotTime)) return null;
+        
+        return (earliestRangeStart, latestSlotTime);
     }
 }

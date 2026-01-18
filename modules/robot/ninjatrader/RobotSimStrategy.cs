@@ -3,8 +3,14 @@
 //
 // IMPORTANT: This Strategy MUST run in SIM account only.
 // Copy into a NinjaTrader 8 strategy project and wire references to Robot.Core.
+//
+// REQUIRED FILES: When copying this file to NT project, also include:
+// - NinjaTraderBarRequest.cs (from modules/robot/ninjatrader/)
+// - Robot.Core.dll (or source files from modules/robot/core/)
 
 using System;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
@@ -34,20 +40,28 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name = "RobotSimStrategy";
                 Calculate = Calculate.OnBarClose; // Bar-close series
                 IsUnmanaged = true; // Required for manual order management
-                IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only - no playback support
+                IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only
             }
             else if (State == State.DataLoaded)
             {
-                // Verify SIM account only (playback mode not supported)
+                // Verify SIM account only
                 if (Account is null)
                 {
                     Log($"ERROR: Account is null. Aborting.", LogLevel.Error);
                     return;
                 }
 
-                if (!Account.IsSimAccount)
+                // Check if account is SIM account by checking account name pattern
+                // Note: NinjaTrader Account class doesn't have IsSimAccount property
+                // SIM accounts typically have names like "Sim101", "Simulation", etc.
+                var accountName = Account?.Name ?? "";
+                var accountNameUpper = accountName.ToUpperInvariant();
+                var isSimAccount = accountNameUpper.Contains("SIM") || 
+                                 accountNameUpper.Contains("SIMULATION");
+                
+                if (!isSimAccount)
                 {
-                    Log($"ERROR: Account '{Account.Name}' is not a Sim account. Aborting.", LogLevel.Error);
+                    Log($"ERROR: Account '{Account?.Name}' does not appear to be a Sim account. Aborting.", LogLevel.Error);
                     return;
                 }
 
@@ -60,7 +74,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: instrumentName);
                 
                 // PHASE 1: Set account info for startup banner
-                var accountName = Account?.Name ?? "UNKNOWN";
+                // Reuse accountName variable declared above
                 var environment = _simAccountVerified ? "SIM" : "UNKNOWN";
                 _engine.SetAccountInfo(accountName, environment);
                 
@@ -143,51 +157,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                // CRITICAL: Get range start and slot times from engine spec (not hardcoded)
-                // Hardcoding creates silent misalignment when:
-                // - Session definitions change
-                // - Instruments differ
-                // - S2 or other regimes are added
-                // This must read from the same spec object that defines the stream
+                // CRITICAL: Get time range covering ALL enabled streams for this instrument
+                // This ensures S1 (02:00) and S2 (08:00) streams both get their historical bars
+                // The range covers from earliest range_start to latest slot_time across all enabled streams
                 var instrumentName = Instrument.MasterInstrument.Name.ToUpperInvariant();
-                var sessionName = "S1"; // Default session - could be made configurable
+                var timeRange = _engine.GetBarsRequestTimeRange(instrumentName);
                 
-                // CRITICAL: Get session info from engine spec - fail if not available
-                // Hardcoded fallback defeats the purpose of reading from spec and creates silent misalignment
-                var sessionInfo = _engine.GetSessionInfo(instrumentName, sessionName);
-                
-                if (!sessionInfo.HasValue)
+                if (!timeRange.HasValue)
                 {
-                    var errorMsg = $"Cannot get session info from spec for {instrumentName}/{sessionName}. " +
-                                 $"This indicates a configuration error: instrument or session not found in spec. " +
-                                 $"Cannot proceed with BarsRequest as time range would be incorrect.";
+                    var errorMsg = $"Cannot determine BarsRequest time range for {instrumentName}. " +
+                                 $"This indicates no enabled streams exist for this instrument, or streams not yet created. " +
+                                 $"Ensure timetable has enabled streams for {instrumentName} and engine.Start() completed successfully.";
                     Log(errorMsg, LogLevel.Error);
                     throw new InvalidOperationException(errorMsg);
                 }
                 
-                var (rangeStartTime, slotEndTimes) = sessionInfo.Value;
-                var rangeStartChicago = rangeStartTime;
+                var (rangeStartChicago, slotTimeChicago) = timeRange.Value;
                 
-                if (string.IsNullOrWhiteSpace(rangeStartChicago))
+                if (string.IsNullOrWhiteSpace(rangeStartChicago) || string.IsNullOrWhiteSpace(slotTimeChicago))
                 {
-                    var errorMsg = $"Session {sessionName} has empty range_start_time in spec. Cannot proceed with BarsRequest.";
+                    var errorMsg = $"Invalid BarsRequest time range for {instrumentName}: range_start={rangeStartChicago}, slot_time={slotTimeChicago}. " +
+                                 $"Cannot proceed with BarsRequest.";
                     Log(errorMsg, LogLevel.Error);
                     throw new InvalidOperationException(errorMsg);
                 }
                 
-                if (slotEndTimes == null || slotEndTimes.Count == 0)
-                {
-                    var errorMsg = $"Session {sessionName} has no slot_end_times in spec. Cannot proceed with BarsRequest.";
-                    Log(errorMsg, LogLevel.Error);
-                    throw new InvalidOperationException(errorMsg);
-                }
-                
-                // Use first slot time from spec (or earliest if multiple streams exist)
-                // Note: In a multi-stream scenario, we'd need to request bars for all slots
-                // For now, use first slot time as a reasonable default
-                var slotTimeChicago = slotEndTimes[0];
-                
-                Log($"Using session info from spec: range_start={rangeStartChicago}, first_slot={slotTimeChicago} (from {slotEndTimes.Count} slots)", LogLevel.Information);
+                Log($"Using BarsRequest time range covering all enabled streams: range_start={rangeStartChicago}, latest_slot={slotTimeChicago}", LogLevel.Information);
 
                 // CRITICAL: Only request bars up to "now" to avoid injecting future bars
                 // If we request bars up to slotTimeChicago (07:30) but strategy starts at 07:25,
@@ -219,17 +214,110 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 Log($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
 
+                // Log intent before request
+                var requestStartUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, rangeStartChicago);
+                var requestEndUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, endTimeChicago);
+                
+                // Log BARSREQUEST_REQUESTED event (use reflection for backward compatibility with older DLLs)
+                try
+                {
+                    var logMethod = _engine.GetType().GetMethod("LogEngineEvent", 
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (logMethod != null)
+                    {
+                        logMethod.Invoke(_engine, new object[] 
+                        { 
+                            DateTimeOffset.UtcNow, 
+                            "BARSREQUEST_REQUESTED", 
+                            new Dictionary<string, object>
+                            {
+                                { "instrument", Instrument.MasterInstrument.Name },
+                                { "trading_date", tradingDateStr },
+                                { "range_start_chicago", rangeStartChicago },
+                                { "request_end_chicago", endTimeChicago },
+                                { "start_utc", requestStartUtc.ToString("o") },
+                                { "end_utc", requestEndUtc.ToString("o") },
+                                { "bars_period", "1m" },
+                                { "trading_hours_template", Instrument.MasterInstrument.TradingHours?.Name ?? "UNKNOWN" },
+                                { "execution_mode", "SIM" }
+                            }
+                        });
+                    }
+                    else
+                    {
+                        // LogEngineEvent not available - log using NT Log method instead
+                        Log($"BARSREQUEST_REQUESTED: {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+                    }
+                }
+                catch
+                {
+                    // LogEngineEvent not available - log using NT Log method instead
+                    Log($"BARSREQUEST_REQUESTED: {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+                }
+
                 // Request bars using helper class (only up to current time)
                 List<Bar> bars;
                 try
                 {
-                    bars = NinjaTraderBarRequest.RequestBarsForTradingDate(
+                    // Try direct call first (if NinjaTraderBarRequest is in same namespace and compiled)
+                    // If that fails, use reflection as fallback
+                    Type? barRequestType = null;
+                    try
+                    {
+                        // Try to find the type in current assembly or loaded assemblies
+                        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+                        {
+                            barRequestType = assembly.GetType("NinjaTrader.NinjaScript.Strategies.NinjaTraderBarRequest");
+                            if (barRequestType != null) break;
+                        }
+                    }
+                    catch { /* Continue to reflection fallback */ }
+                    
+                    if (barRequestType == null)
+                    {
+                        throw new InvalidOperationException(
+                            "NinjaTraderBarRequest class not found. " +
+                            "CRITICAL: Ensure NinjaTraderBarRequest.cs is included in your NinjaTrader project " +
+                            "and that NINJATRADER is defined (should be automatic in NT projects). " +
+                            "File location: Same folder as RobotSimStrategy.cs");
+                    }
+                    
+                    var requestMethod = barRequestType.GetMethod("RequestBarsForTradingDate",
+                        BindingFlags.Public | BindingFlags.Static);
+                    if (requestMethod == null)
+                    {
+                        throw new InvalidOperationException("RequestBarsForTradingDate method not found in NinjaTraderBarRequest.");
+                    }
+                    
+                    // Build log callback using reflection
+                    Action<string, object>? logCallback = null;
+                    try
+                    {
+                        var logMethod = _engine.GetType().GetMethod("LogEngineEvent",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (logMethod != null)
+                        {
+                            logCallback = (eventType, data) =>
+                            {
+                                try
+                                {
+                                    logMethod.Invoke(_engine, new object[] { DateTimeOffset.UtcNow, eventType, data });
+                                }
+                                catch { /* Ignore logging errors */ }
+                            };
+                        }
+                    }
+                    catch { /* Log callback optional */ }
+                    
+                    bars = (List<Bar>)requestMethod.Invoke(null, new object[]
+                    {
                         Instrument,
                         tradingDate,
                         rangeStartChicago,
                         endTimeChicago,
-                        timeService
-                    );
+                        timeService,
+                        logCallback
+                    });
                 }
                 catch (Exception ex)
                 {

@@ -28,22 +28,17 @@ public sealed class SnapshotParquetBarProvider : IBarProvider
             throw new DirectoryNotFoundException($"Snapshot directory not found: {_snapshotRoot}");
         }
 
-        // Find Python script in the same directory as this DLL or in project root
-        var assemblyLocation = System.Reflection.Assembly.GetExecutingAssembly().Location;
-        var assemblyDir = Path.GetDirectoryName(assemblyLocation) ?? "";
-        var projectRoot = Directory.GetParent(assemblyDir)?.Parent?.Parent?.Parent?.FullName ?? "";
-        _pythonScriptPath = Path.Combine(projectRoot, "modules", "robot", "harness", "read_parquet_bars.py");
+        // Find Python script - try current directory first (when running from project root)
+        var currentDir = Directory.GetCurrentDirectory();
+        _pythonScriptPath = Path.Combine(currentDir, "modules", "robot", "harness", "read_parquet_bars.py");
         
         if (!File.Exists(_pythonScriptPath))
         {
-            // Try alternative location (if running from project root)
-            var altPath = Path.Combine(
-                Directory.GetCurrentDirectory(),
-                "modules",
-                "robot",
-                "core",
-                "read_parquet_bars.py"
-            );
+            // Try alternative location (if running from assembly directory)
+            var assemblyLocation = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            var assemblyDir = Path.GetDirectoryName(assemblyLocation) ?? "";
+            var projectRoot = Directory.GetParent(assemblyDir)?.Parent?.Parent?.Parent?.FullName ?? "";
+            var altPath = Path.Combine(projectRoot, "modules", "robot", "harness", "read_parquet_bars.py");
 
             if (File.Exists(altPath))
             {
@@ -51,7 +46,7 @@ public sealed class SnapshotParquetBarProvider : IBarProvider
             }
             else
             {
-                throw new FileNotFoundException($"Python helper script not found: {_pythonScriptPath}");
+                throw new FileNotFoundException($"Python helper script not found. Tried: {_pythonScriptPath} and {altPath}");
             }
         }
     }
@@ -65,12 +60,46 @@ public sealed class SnapshotParquetBarProvider : IBarProvider
         if (!Directory.Exists(instrumentDir))
             yield break;
 
+        // Extract date range from UTC timestamps (convert to Chicago time for filename matching)
+        var startChicago = _timeService.ConvertUtcToChicago(startUtc);
+        var endChicago = _timeService.ConvertUtcToChicago(endUtc);
+        var startDate = startChicago.Date;
+        var endDate = endChicago.Date;
+
+        // Find parquet files, but filter by date range in filename to avoid reading unnecessary files
         var parquetFiles = Directory.GetFiles(
                 instrumentDir,
                 "*.parquet",
                 SearchOption.AllDirectories)
-            .Where(f => Path.GetFileName(f)
-                .StartsWith($"{instrument}_1m_", StringComparison.OrdinalIgnoreCase))
+            .Where(f =>
+            {
+                var fileName = Path.GetFileName(f);
+                if (!fileName.StartsWith($"{instrument}_1m_", StringComparison.OrdinalIgnoreCase))
+                    return false;
+                
+                // Extract date from filename: {instrument}_1m_{YYYY-MM-DD}.parquet
+                var datePart = fileName.Substring($"{instrument}_1m_".Length).Replace(".parquet", "");
+                // Parse date in YYYY-MM-DD format
+                if (datePart.Length == 10 && datePart[4] == '-' && datePart[7] == '-')
+                {
+                    if (int.TryParse(datePart.Substring(0, 4), out var year) &&
+                        int.TryParse(datePart.Substring(5, 2), out var month) &&
+                        int.TryParse(datePart.Substring(8, 2), out var day))
+                    {
+                        try
+                        {
+                            var fileDate = new System.DateTime(year, month, day);
+                            // Only include files within our date range
+                            return fileDate.Date >= startDate && fileDate.Date <= endDate;
+                        }
+                        catch
+                        {
+                            return false; // Invalid date
+                        }
+                    }
+                }
+                return false; // Skip files with invalid date format
+            })
             .OrderBy(f => f)
             .ToList();
 
@@ -186,29 +215,41 @@ public sealed class SnapshotParquetBarProvider : IBarProvider
             // Fall through to try CASE B
         }
 
-        // CASE B: [ [...], [...], ... ]
+        // CASE B: [ [...], [...], ... ] - handle mixed types (string timestamp, numeric prices)
         try
         {
-            var rows = JsonUtil.Deserialize<List<List<string>>>(output);
-            foreach (var row in rows)
+            // Use System.Text.Json directly for better mixed-type handling (.NET 8.0)
+            using var doc = System.Text.Json.JsonDocument.Parse(output);
+            var root = doc.RootElement;
+            
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Array)
+                throw new InvalidOperationException("Expected JSON array");
+            
+            foreach (var rowElement in root.EnumerateArray())
             {
-                if (row == null || row.Count < 5)
+                if (rowElement.ValueKind != System.Text.Json.JsonValueKind.Array)
+                    throw new InvalidOperationException("Expected array-shaped row");
+                
+                var rowArray = rowElement.EnumerateArray().ToList();
+                if (rowArray.Count < 5)
                     throw new InvalidOperationException("Expected array-shaped row with at least 5 elements");
 
-                bars.Add(new Bar(
-                    DateTimeOffset.Parse(row[0]),
-                    decimal.Parse(row[1]),
-                    decimal.Parse(row[2]),
-                    decimal.Parse(row[3]),
-                    decimal.Parse(row[4]),
-                    row.Count > 5 ? decimal.Parse(row[5]) : 0m
-                ));
+                var timestamp = DateTimeOffset.Parse(rowArray[0].GetString() ?? throw new InvalidOperationException("Invalid timestamp"));
+                var open = rowArray[1].GetDecimal();
+                var high = rowArray[2].GetDecimal();
+                var low = rowArray[3].GetDecimal();
+                var close = rowArray[4].GetDecimal();
+                var volume = rowArray.Count > 5 && rowArray[5].ValueKind != System.Text.Json.JsonValueKind.Null 
+                    ? rowArray[5].GetDecimal() 
+                    : (decimal?)null;
+
+                bars.Add(new Bar(timestamp, open, high, low, close, volume));
             }
             return bars;
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Failed to parse Python JSON output: {ex.Message}");
+            throw new InvalidOperationException($"Failed to parse Python JSON output: {ex.Message}", ex);
         }
     }
 }

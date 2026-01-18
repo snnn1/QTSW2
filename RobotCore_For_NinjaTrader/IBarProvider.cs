@@ -4,31 +4,9 @@ using System.Collections.Generic;
 namespace QTSW2.Robot.Core;
 
 /// <summary>
-/// Represents a single OHLC bar.
-/// </summary>
-public readonly struct Bar
-{
-    public DateTimeOffset TimestampUtc { get; }
-    public decimal Open { get; }
-    public decimal High { get; }
-    public decimal Low { get; }
-    public decimal Close { get; }
-    public decimal? Volume { get; }
-
-    public Bar(DateTimeOffset timestampUtc, decimal open, decimal high, decimal low, decimal close, decimal? volume = null)
-    {
-        TimestampUtc = timestampUtc;
-        Open = open;
-        High = high;
-        Low = low;
-        Close = close;
-        Volume = volume;
-    }
-}
-
-/// <summary>
 /// Interface for providing historical bars to the Robot engine.
 /// Used in DRYRUN mode to replay historical data from snapshot files.
+/// Bar type is defined in Bar.cs (separate file).
 /// </summary>
 public interface IBarProvider
 {

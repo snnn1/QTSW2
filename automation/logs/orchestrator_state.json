@@ -1,18 +1,14 @@
 {
-  "run_id": "b248b145-e6f6-4ff2-877d-f8890c09c403",
-  "state": "success",
-  "current_stage": "merger",
-  "started_at": "2026-01-17T23:15:02.730409-06:00",
-  "updated_at": "2026-01-17T23:22:22.143557-06:00",
+  "run_id": "f4876753-4523-4ee1-b9c1-09ed26713295",
+  "state": "running_analyzer",
+  "current_stage": "analyzer",
+  "started_at": "2026-01-18T15:15:02.713025-06:00",
+  "updated_at": "2026-01-18T15:15:34.168199-06:00",
   "retry_count": 0,
   "error": null,
   "metadata": {
     "manual": false,
     "manual_override": false,
-    "triggered_at": "2026-01-18T05:15:02.730393+00:00",
-    "run_health": "healthy",
-    "run_health_reasons": [
-      "No health issues detected"
-    ]
+    "triggered_at": "2026-01-18T21:15:02.713008+00:00"
   }
 }

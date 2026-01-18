@@ -38,7 +38,7 @@ public partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
-        // Assert: account.IsSimAccount == true (playback mode not supported)
+        // Assert: account.IsSimAccount == true
         if (!account.IsSimAccount)
         {
             var error = $"Account '{account.Name}' is not a Sim account - aborting execution";
