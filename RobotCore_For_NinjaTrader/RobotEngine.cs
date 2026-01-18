@@ -1290,4 +1290,60 @@ public sealed class RobotEngine
     {
         return _healthMonitor?.GetNotificationService();
     }
+
+    /// <summary>
+    /// Public method to log engine events from external callers (e.g., RobotSimStrategy).
+    /// </summary>
+    public void LogEngineEvent(DateTimeOffset utcNow, string eventType, object? data = null)
+    {
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", data));
+    }
+    
+    /// <summary>
+    /// Get time range covering all enabled streams for an instrument (for BarsRequest).
+    /// Returns the earliest range_start and latest slot_time across all enabled streams for the instrument.
+    /// </summary>
+    public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
+    {
+        if (_spec is null || _time is null || !_activeTradingDate.HasValue) return null;
+        
+        var instrumentUpper = instrument.ToUpperInvariant();
+        var enabledStreams = _streams.Values
+            .Where(s => !s.Committed && s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        
+        if (enabledStreams.Count == 0) return null;
+        
+        // Find earliest range_start across all sessions used by enabled streams
+        var sessionsUsed = enabledStreams.Select(s => s.Session).Distinct().ToList();
+        string? earliestRangeStart = null;
+        
+        foreach (var session in sessionsUsed)
+        {
+            if (_spec.sessions.TryGetValue(session, out var sessionInfo))
+            {
+                var rangeStart = sessionInfo.range_start_time;
+                if (!string.IsNullOrWhiteSpace(rangeStart))
+                {
+                    if (earliestRangeStart == null || string.Compare(rangeStart, earliestRangeStart, StringComparison.Ordinal) < 0)
+                    {
+                        earliestRangeStart = rangeStart;
+                    }
+                }
+            }
+        }
+        
+        if (string.IsNullOrWhiteSpace(earliestRangeStart)) return null;
+        
+        // Find latest slot_time across all enabled streams
+        var latestSlotTime = enabledStreams
+            .Select(s => s.SlotTimeChicago)
+            .Where(st => !string.IsNullOrWhiteSpace(st))
+            .OrderByDescending(st => st, StringComparer.Ordinal)
+            .FirstOrDefault();
+        
+        if (string.IsNullOrWhiteSpace(latestSlotTime)) return null;
+        
+        return (earliestRangeStart, latestSlotTime);
+    }
 }
