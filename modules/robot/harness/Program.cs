@@ -2,6 +2,7 @@ using System.Text.Json;
 using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Harness;
+using DateOnly = QTSW2.Robot.Core.DateOnly; // Use compat shim instead of System.DateOnly
 
 static void PrintUsage()
 {
@@ -62,7 +63,7 @@ if (argsList.Contains("--write-sample-timetable"))
 {
     Directory.CreateDirectory(Path.GetDirectoryName(timetablePath)!);
     var spec = ParitySpec.LoadFromFile(Path.Combine(root, "configs", "analyzer_robot_parity.json"));
-    var time = new TimeService(spec.Timezone);
+    var time = new TimeService(spec.timezone);
     var utcNow = DateTimeOffset.UtcNow;
     var tradingDate = time.GetChicagoDateToday(utcNow).ToString("yyyy-MM-dd");
 
@@ -80,7 +81,7 @@ if (argsList.Contains("--write-sample-timetable"))
         }
     };
 
-    File.WriteAllText(timetablePath, JsonSerializer.Serialize(sample, ParitySpec.JsonOptions()));
+    File.WriteAllText(timetablePath, JsonSerializer.Serialize(sample));
     Console.WriteLine($"Wrote sample timetable to: {timetablePath}");
 }
 
@@ -114,7 +115,7 @@ if (modeIndex >= 0 && modeIndex + 1 < argsList.Count)
 
 // Load spec and time service early (needed for replay)
 var specLoaded = ParitySpec.LoadFromFile(Path.Combine(root, "configs", "analyzer_robot_parity.json"));
-var timeSvc = new TimeService(specLoaded.Timezone);
+var timeSvc = new TimeService(specLoaded.timezone);
 
 // Handle replay mode
 if (argsList.Contains("--replay"))
@@ -175,9 +176,9 @@ var startUtc = DateTimeOffset.UtcNow;
 var chicagoDate = timeSvc.GetChicagoDateToday(startUtc);
 
 // Pick ES1 window: S1 starts 02:00 CT, slot_time 07:30 CT (from sample)
-var rangeStartUtc = timeSvc.ConvertChicagoLocalToUtc(chicagoDate, specLoaded.Sessions["S1"].RangeStartTime);
+var rangeStartUtc = timeSvc.ConvertChicagoLocalToUtc(chicagoDate, specLoaded.sessions["S1"].range_start_time);
 var slotUtc = timeSvc.ConvertChicagoLocalToUtc(chicagoDate, "07:30");
-var closeUtc = timeSvc.ConvertChicagoLocalToUtc(chicagoDate, specLoaded.EntryCutoff.MarketCloseTime);
+var closeUtc = timeSvc.ConvertChicagoLocalToUtc(chicagoDate, specLoaded.entry_cutoff.market_close_time);
 
 // If it's already after close in real time, just run a short tick loop for wiring verification.
 var simStart = startUtc < rangeStartUtc ? startUtc : rangeStartUtc.AddMinutes(-1);
@@ -198,7 +199,7 @@ for (var t = simStart; t <= simEnd; t = t.AddMinutes(1))
     var close = open + delta;
     px = close;
 
-    engine.OnBar(t, "ES", high, low, close, t);
+    engine.OnBar(t, "ES", open, high, low, close, t);
     engine.Tick(t);
 }
 

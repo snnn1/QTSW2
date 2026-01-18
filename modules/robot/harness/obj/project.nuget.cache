@@ -1,8 +1,11 @@
 {
   "version": 2,
-  "dgSpecHash": "VtVajAMIg20=",
+  "dgSpecHash": "j6ByPKN36U4=",
   "success": true,
   "projectFilePath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
-  "expectedPackageFiles": [],
+  "expectedPackageFiles": [
+    "C:\\Users\\jakej\\.nuget\\packages\\system.text.encodings.web\\8.0.0\\system.text.encodings.web.8.0.0.nupkg.sha512",
+    "C:\\Users\\jakej\\.nuget\\packages\\system.text.json\\8.0.0\\system.text.json.8.0.0.nupkg.sha512"
+  ],
   "logs": []
 }

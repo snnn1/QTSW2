@@ -3,8 +3,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using QTSW2.Robot.Core;
 
-namespace QTSW2.Robot.Core;
+namespace QTSW2.Robot.Harness;
 
 /// <summary>
 /// Provides bars from snapshot parquet files for DRYRUN mode.
@@ -31,7 +32,7 @@ public sealed class SnapshotParquetBarProvider : IBarProvider
         var assemblyLocation = System.Reflection.Assembly.GetExecutingAssembly().Location;
         var assemblyDir = Path.GetDirectoryName(assemblyLocation) ?? "";
         var projectRoot = Directory.GetParent(assemblyDir)?.Parent?.Parent?.Parent?.FullName ?? "";
-        _pythonScriptPath = Path.Combine(projectRoot, "modules", "robot", "core", "read_parquet_bars.py");
+        _pythonScriptPath = Path.Combine(projectRoot, "modules", "robot", "harness", "read_parquet_bars.py");
         
         if (!File.Exists(_pythonScriptPath))
         {

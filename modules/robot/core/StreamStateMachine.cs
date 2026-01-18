@@ -650,7 +650,7 @@ public sealed class StreamStateMachine
                     // Should not happen - pre-hydration should complete before ARMED
                     LogHealth("ERROR", "INVARIANT_VIOLATION", "ARMED state reached without pre-hydration completion",
                         new { instrument = Instrument, slot = Stream });
-                    break;
+                    return; // Skip processing if invariant violated
                 }
                 
                 // DIAGNOSTIC: Log time comparison details periodically while waiting for range start
@@ -1103,22 +1103,19 @@ public sealed class StreamStateMachine
                 Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
             }
 
-            // Log range lock snapshot (dry-run)
-            if (IsDryRunMode())
-            {
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "DRYRUN_RANGE_LOCK_SNAPSHOT", State.ToString(),
-                    new
-                    {
-                        range_high = RangeHigh,
-                        range_low = RangeLow,
-                        range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
-                        freeze_close = FreezeClose,
-                        freeze_close_source = FreezeCloseSource,
-                        slot_time_chicago = SlotTimeChicago,
-                        slot_time_utc = SlotTimeUtc.ToString("o")
-                    }));
-            }
+            // Log range lock snapshot (all modes - was DRYRUN-only, now unconditional for consistency)
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_LOCK_SNAPSHOT", State.ToString(),
+                new
+                {
+                    range_high = RangeHigh,
+                    range_low = RangeLow,
+                    range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                    freeze_close = FreezeClose,
+                    freeze_close_source = FreezeCloseSource,
+                    slot_time_chicago = SlotTimeChicago,
+                    slot_time_utc = SlotTimeUtc.ToString("o")
+                }));
 
             ComputeBreakoutLevelsAndLog(utcNow);
 
@@ -1599,35 +1596,18 @@ public sealed class StreamStateMachine
         _brkLongRounded = UtilityRoundToTick.RoundToTick(_brkLongRaw.Value, _tickSize);
         _brkShortRounded = UtilityRoundToTick.RoundToTick(_brkShortRaw.Value, _tickSize);
 
-        if (IsDryRunMode())
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "DRYRUN_BREAKOUT_LEVELS", State.ToString(),
-                new
-                {
-                    brk_long_raw = _brkLongRaw,
-                    brk_short_raw = _brkShortRaw,
-                    brk_long_rounded = _brkLongRounded,
-                    brk_short_rounded = _brkShortRounded,
-                    tick_size = _tickSize,
-                    rounding_method_name = _spec.breakout.tick_rounding.method
-                }));
-        }
-        else
-        {
-            // SIM/LIVE mode: log rounded levels (needed for execution)
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "BREAKOUT_LEVELS_COMPUTED", State.ToString(),
-                new
-                {
-                    brk_long_raw = _brkLongRaw,
-                    brk_short_raw = _brkShortRaw,
-                    brk_long_rounded = _brkLongRounded,
-                    brk_short_rounded = _brkShortRounded,
-                    tick_size = _tickSize,
-                    rounding_method = _spec.breakout.tick_rounding.method
-                }));
-        }
+        // Log breakout levels (all modes - was DRYRUN-only, now unconditional for consistency)
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "BREAKOUT_LEVELS_COMPUTED", State.ToString(),
+            new
+            {
+                brk_long_raw = _brkLongRaw,
+                brk_short_raw = _brkShortRaw,
+                brk_long_rounded = _brkLongRounded,
+                brk_short_rounded = _brkShortRounded,
+                tick_size = _tickSize,
+                rounding_method = _spec.breakout.tick_rounding.method
+            }));
     }
 
     private void LogIntendedBracketsPlaced(DateTimeOffset utcNow)
@@ -2160,7 +2140,8 @@ public sealed class StreamStateMachine
         var sessionDurationMinutes = (endTimeChicagoActual - RangeStartChicagoTime).TotalMinutes;
         var expectedBarCount = (int)Math.Round(sessionDurationMinutes); // 1-minute bars
         var actualBarCount = bars.Count;
-        var barCountMismatch = Math.Abs(actualBarCount - expectedBarCount) > 5; // Allow 5 bar tolerance for gaps
+        var barCountDiff = actualBarCount - expectedBarCount;
+        var barCountMismatch = Math.Abs(barCountDiff) > 5; // Allow 5 bar tolerance for gaps
         
         // Check for DST transition (offset change within session)
         var startOffset = RangeStartChicagoTime.Offset;
@@ -2793,7 +2774,7 @@ public sealed class StreamStateMachine
             {
                 // Bar with this barStartUtc already exists - check precedence
                 var existingBar = _barBuffer[existingBarIndex];
-                var existingSource = _barSourceMap.GetValueOrDefault(bar.TimestampUtc, BarSource.CSV); // Default to CSV if not tracked
+                var existingSource = _barSourceMap.TryGetValue(bar.TimestampUtc, out var existingBarSource) ? existingBarSource : BarSource.CSV; // Default to CSV if not tracked
                 
                 // PRECEDENCE CHECK: Only replace if new source has higher precedence
                 // LIVE (0) > BARSREQUEST (1) > CSV (2) - lower enum value = higher precedence
@@ -2925,13 +2906,9 @@ public sealed class StreamStateMachine
 
     /// <summary>
     /// Check if execution mode is SIM.
+    /// Used to determine if BarsRequest pre-hydration is available (SIM mode uses NinjaTrader BarsRequest).
     /// </summary>
     private bool IsSimMode() => _executionMode == ExecutionMode.SIM;
-
-    /// <summary>
-    /// Check if execution mode is DRYRUN.
-    /// </summary>
-    private bool IsDryRunMode() => _executionMode == ExecutionMode.DRYRUN;
 
     private void Transition(DateTimeOffset utcNow, StreamState next, string eventType, object? extra = null)
     {

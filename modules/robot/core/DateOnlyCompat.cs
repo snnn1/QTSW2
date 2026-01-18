@@ -90,4 +90,7 @@ public struct DateOnly : IComparable<DateOnly>, IEquatable<DateOnly>
     public static bool operator >(DateOnly left, DateOnly right) => left.CompareTo(right) > 0;
     public static bool operator <=(DateOnly left, DateOnly right) => left.CompareTo(right) <= 0;
     public static bool operator >=(DateOnly left, DateOnly right) => left.CompareTo(right) >= 0;
+
+    public DateOnly AddDays(int days) => new DateOnly(_date.AddDays(days));
+    public DayOfWeek GetDayOfWeek() => _date.DayOfWeek;
 }

@@ -1,6 +1,8 @@
 using System.Linq;
 using System.Text.Json;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Harness;
+using DateOnly = QTSW2.Robot.Core.DateOnly; // Use compat shim instead of System.DateOnly
 
 namespace QTSW2.Robot.Harness;
 
@@ -27,14 +29,15 @@ public static class HistoricalReplay
         var barProvider = new SnapshotParquetBarProvider(snapshotRoot, timeService);
 
         // Get instruments to process
-        var instrumentsToProcess = instruments ?? spec.Instruments.Keys.ToArray();
+        var instrumentsToProcess = instruments ?? spec.instruments.Keys.ToArray();
 
         // Process each trading date
         var currentDate = startDate;
         while (currentDate <= endDate)
         {
             // Skip weekends (basic check - can be enhanced)
-            if (currentDate.DayOfWeek == DayOfWeek.Saturday || currentDate.DayOfWeek == DayOfWeek.Sunday)
+            var dayOfWeek = currentDate.GetDayOfWeek();
+            if (dayOfWeek == DayOfWeek.Saturday || dayOfWeek == DayOfWeek.Sunday)
             {
                 currentDate = currentDate.AddDays(1);
                 continue;
@@ -55,7 +58,7 @@ public static class HistoricalReplay
             {
                 // Calculate time range for this date
                 // Need bars from earliest range start to forced flatten time
-                var earliestRangeStart = spec.Sessions.Values.Min(s => s.RangeStartTime);
+                var earliestRangeStart = spec.sessions.Values.Min(s => s.range_start_time);
                 if (string.IsNullOrEmpty(earliestRangeStart))
                 {
                     continue; // Skip if no valid range start time
@@ -84,7 +87,7 @@ public static class HistoricalReplay
                 var barUtc = bar.TimestampUtc;
                 
                 // Feed bar to engine
-                engine.OnBar(barUtc, instrument, bar.High, bar.Low, bar.Close, barUtc);
+                engine.OnBar(barUtc, instrument, bar.Open, bar.High, bar.Low, bar.Close, barUtc);
                 
                 // Tick engine at bar time
                 engine.Tick(barUtc);
@@ -118,23 +121,23 @@ public static class HistoricalReplay
             // Create updated timetable with new trading_date
             var updatedTimetable = new
             {
-                as_of = timetable.AsOf,
+                as_of = timetable.as_of,
                 trading_date = tradingDate.ToString("yyyy-MM-dd"),
-                timezone = timetable.Timezone,
-                source = timetable.Source,
-                metadata = timetable.Metadata != null ? new { replay = timetable.Metadata.Replay } : (object?)null,
-                streams = timetable.Streams.Select(s => new
+                timezone = timetable.timezone,
+                source = timetable.source,
+                metadata = timetable.metadata != null ? new { replay = timetable.metadata.replay } : (object?)null,
+                streams = timetable.streams.Select(s => new
                 {
-                    stream = s.Stream,
-                    instrument = s.Instrument,
-                    session = s.Session,
-                    slot_time = s.SlotTime,
-                    enabled = s.Enabled
+                    stream = s.stream,
+                    instrument = s.instrument,
+                    session = s.session,
+                    slot_time = s.slot_time,
+                    enabled = s.enabled
                 }).ToArray()
             };
 
             // Write updated timetable (this will trigger engine reload on next tick)
-            var json = JsonSerializer.Serialize(updatedTimetable, ParitySpec.JsonOptions());
+            var json = JsonSerializer.Serialize(updatedTimetable);
             File.WriteAllText(replayTimetablePath, json);
         }
         catch
@@ -162,7 +165,7 @@ public static class HistoricalReplay
         };
 
         Directory.CreateDirectory(Path.GetDirectoryName(timetablePath)!);
-        var json = JsonSerializer.Serialize(timetable, ParitySpec.JsonOptions());
+        var json = JsonSerializer.Serialize(timetable);
         File.WriteAllText(timetablePath, json);
     }
 }

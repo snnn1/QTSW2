@@ -317,7 +317,7 @@ public sealed class RobotEngine
         {
             ["execution_mode"] = _executionMode.ToString(),
             ["account_name"] = _accountName ?? "UNKNOWN",
-            ["environment"] = _environment ?? (_executionMode == ExecutionMode.DRYRUN ? "DRYRUN" : _executionMode == ExecutionMode.SIM ? "SIM" : "UNKNOWN"),
+            ["environment"] = _environment ?? _executionMode.ToString(),
             ["timetable_hash"] = _lastTimetableHash ?? "NOT_LOADED",
             ["timetable_path"] = _timetablePath,
             ["enabled_stream_count"] = enabledStreams.Count,
