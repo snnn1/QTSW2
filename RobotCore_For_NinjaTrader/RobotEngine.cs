@@ -1305,14 +1305,49 @@ public sealed class RobotEngine
     /// </summary>
     public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
     {
-        if (_spec is null || _time is null || !_activeTradingDate.HasValue) return null;
+        // Diagnostic: Log why we're returning null
+        if (_spec is null)
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { instrument, reason = "spec_is_null" }));
+            return null;
+        }
+        
+        if (_time is null)
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { instrument, reason = "time_service_is_null" }));
+            return null;
+        }
+        
+        if (!_activeTradingDate.HasValue)
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { instrument, reason = "trading_date_not_locked", total_streams = _streams.Count }));
+            return null;
+        }
         
         var instrumentUpper = instrument.ToUpperInvariant();
         var enabledStreams = _streams.Values
             .Where(s => !s.Committed && s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
             .ToList();
         
-        if (enabledStreams.Count == 0) return null;
+        if (enabledStreams.Count == 0)
+        {
+            var allInstruments = _streams.Values.Where(s => !s.Committed).Select(s => s.Instrument).Distinct().ToList();
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { 
+                    instrument, 
+                    reason = "no_enabled_streams_for_instrument",
+                    total_streams = _streams.Count,
+                    enabled_instruments = allInstruments
+                }));
+            return null;
+        }
         
         // Find earliest range_start across all sessions used by enabled streams
         var sessionsUsed = enabledStreams.Select(s => s.Session).Distinct().ToList();
@@ -1333,7 +1368,18 @@ public sealed class RobotEngine
             }
         }
         
-        if (string.IsNullOrWhiteSpace(earliestRangeStart)) return null;
+        if (string.IsNullOrWhiteSpace(earliestRangeStart))
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { 
+                    instrument, 
+                    reason = "no_valid_range_start_time",
+                    enabled_stream_count = enabledStreams.Count,
+                    sessions_used = enabledStreams.Select(s => s.Session).Distinct().ToList()
+                }));
+            return null;
+        }
         
         // Find latest slot_time across all enabled streams
         var latestSlotTime = enabledStreams
@@ -1342,7 +1388,18 @@ public sealed class RobotEngine
             .OrderByDescending(st => st, StringComparer.Ordinal)
             .FirstOrDefault();
         
-        if (string.IsNullOrWhiteSpace(latestSlotTime)) return null;
+        if (string.IsNullOrWhiteSpace(latestSlotTime))
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
+                new { 
+                    instrument, 
+                    reason = "no_valid_slot_time",
+                    enabled_stream_count = enabledStreams.Count,
+                    streams_with_slot_times = enabledStreams.Where(s => !string.IsNullOrWhiteSpace(s.SlotTimeChicago)).Select(s => new { stream = s.Stream, slot_time = s.SlotTimeChicago }).ToList()
+                }));
+            return null;
+        }
         
         return (earliestRangeStart, latestSlotTime);
     }

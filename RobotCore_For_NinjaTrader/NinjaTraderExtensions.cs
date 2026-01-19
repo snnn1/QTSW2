@@ -38,8 +38,13 @@ public static class NinjaTraderExtensions
     {
         // Times[0][0] is DateTimeKind.Unspecified, representing exchange local time (Chicago)
         // We need to interpret it as Chicago time and convert to UTC (DST-aware)
+        // Ensure DateTimeKind is Unspecified before creating DateTimeOffset (prevents UTC offset errors)
+        var barExchangeTimeUnspecified = barExchangeTime.Kind == DateTimeKind.Unspecified 
+            ? barExchangeTime 
+            : DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Unspecified);
+        
         var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-        var barChicagoOffset = new DateTimeOffset(barExchangeTime, chicagoTz.GetUtcOffset(barExchangeTime));
+        var barChicagoOffset = new DateTimeOffset(barExchangeTimeUnspecified, chicagoTz.GetUtcOffset(barExchangeTimeUnspecified));
         return barChicagoOffset.ToUniversalTime();
     }
 }

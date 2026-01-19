@@ -54,11 +54,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Check if account is SIM account by checking account name pattern
                 // Note: NinjaTrader Account class doesn't have IsSimAccount property
-                // SIM accounts typically have names like "Sim101", "Simulation", etc.
+                // SIM accounts typically have names like "Sim101", "Simulation", "DEMO123", etc.
                 var accountName = Account?.Name ?? "";
                 var accountNameUpper = accountName.ToUpperInvariant();
                 var isSimAccount = accountNameUpper.Contains("SIM") || 
-                                 accountNameUpper.Contains("SIMULATION");
+                                 accountNameUpper.Contains("SIMULATION") ||
+                                 accountNameUpper.Contains("DEMO");
                 
                 if (!isSimAccount)
                 {
@@ -219,36 +220,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var requestStartUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, rangeStartChicago);
                 var requestEndUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, endTimeChicago);
                 
-                // Log BARSREQUEST_REQUESTED event (use reflection for backward compatibility with older DLLs)
+                // Log BARSREQUEST_REQUESTED event
                 try
                 {
-                    var logMethod = _engine.GetType().GetMethod("LogEngineEvent", 
-                        BindingFlags.Public | BindingFlags.Instance);
-                    if (logMethod != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_REQUESTED", new Dictionary<string, object>
                     {
-                        logMethod.Invoke(_engine, new object[] 
-                        { 
-                            DateTimeOffset.UtcNow, 
-                            "BARSREQUEST_REQUESTED", 
-                            new Dictionary<string, object>
-                            {
-                                { "instrument", Instrument.MasterInstrument.Name },
-                                { "trading_date", tradingDateStr },
-                                { "range_start_chicago", rangeStartChicago },
-                                { "request_end_chicago", endTimeChicago },
-                                { "start_utc", requestStartUtc.ToString("o") },
-                                { "end_utc", requestEndUtc.ToString("o") },
-                                { "bars_period", "1m" },
-                                { "trading_hours_template", Instrument.MasterInstrument.TradingHours?.Name ?? "UNKNOWN" },
-                                { "execution_mode", "SIM" }
-                            }
-                        });
-                    }
-                    else
-                    {
-                        // LogEngineEvent not available - log using NT Log method instead
-                        Log($"BARSREQUEST_REQUESTED: {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
-                    }
+                        { "instrument", Instrument.MasterInstrument.Name },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_chicago", rangeStartChicago },
+                        { "request_end_chicago", endTimeChicago },
+                        { "start_utc", requestStartUtc.ToString("o") },
+                        { "end_utc", requestEndUtc.ToString("o") },
+                        { "bars_period", "1m" },
+                        { "trading_hours_template", Instrument.MasterInstrument.TradingHours?.Name ?? "UNKNOWN" },
+                        { "execution_mode", "SIM" }
+                    });
                 }
                 catch
                 {
@@ -260,65 +246,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                 List<Bar> bars;
                 try
                 {
-                    // Try direct call first (if NinjaTraderBarRequest is in same namespace and compiled)
-                    // If that fails, use reflection as fallback
-                    Type? barRequestType = null;
-                    try
-                    {
-                        // Try to find the type in current assembly or loaded assemblies
-                        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
-                        {
-                            barRequestType = assembly.GetType("NinjaTrader.NinjaScript.Strategies.NinjaTraderBarRequest");
-                            if (barRequestType != null) break;
-                        }
-                    }
-                    catch { /* Continue to reflection fallback */ }
-                    
-                    if (barRequestType == null)
-                    {
-                        throw new InvalidOperationException(
-                            "NinjaTraderBarRequest class not found. " +
-                            "CRITICAL: Ensure NinjaTraderBarRequest.cs is included in your NinjaTrader project " +
-                            "and that NINJATRADER is defined (should be automatic in NT projects). " +
-                            "File location: Same folder as RobotSimStrategy.cs");
-                    }
-                    
-                    var requestMethod = barRequestType.GetMethod("RequestBarsForTradingDate",
-                        BindingFlags.Public | BindingFlags.Static);
-                    if (requestMethod == null)
-                    {
-                        throw new InvalidOperationException("RequestBarsForTradingDate method not found in NinjaTraderBarRequest.");
-                    }
-                    
-                    // Build log callback using reflection
+                    // Build log callback for BARSREQUEST_RAW_RESULT
                     Action<string, object>? logCallback = null;
                     try
                     {
-                        var logMethod = _engine.GetType().GetMethod("LogEngineEvent",
-                            BindingFlags.Public | BindingFlags.Instance);
-                        if (logMethod != null)
+                        logCallback = (eventType, data) =>
                         {
-                            logCallback = (eventType, data) =>
+                            try
                             {
-                                try
-                                {
-                                    logMethod.Invoke(_engine, new object[] { DateTimeOffset.UtcNow, eventType, data });
-                                }
-                                catch { /* Ignore logging errors */ }
-                            };
-                        }
+                                _engine.LogEngineEvent(DateTimeOffset.UtcNow, eventType, data);
+                            }
+                            catch { /* Ignore logging errors */ }
+                        };
                     }
                     catch { /* Log callback optional */ }
                     
-                    bars = (List<Bar>)requestMethod.Invoke(null, new object[]
-                    {
+                    // Direct call to NinjaTraderBarRequest (same namespace)
+                    bars = NinjaTraderBarRequest.RequestBarsForTradingDate(
                         Instrument,
                         tradingDate,
                         rangeStartChicago,
                         endTimeChicago,
                         timeService,
                         logCallback
-                    });
+                    );
                 }
                 catch (Exception ex)
                 {
