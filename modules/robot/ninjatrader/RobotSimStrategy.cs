@@ -200,6 +200,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var nowUtc = DateTimeOffset.UtcNow;
                 var nowChicago = timeService.ConvertUtcToChicago(nowUtc);
                 var slotTimeChicagoTime = timeService.ConstructChicagoTime(tradingDate, slotTimeChicago);
+                var rangeStartChicagoTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
                 var nowChicagoDate = DateOnly.FromDateTime(nowChicago.DateTime);
                 
                 // Use the earlier of: slotTimeChicago or now (to avoid future bars)
@@ -209,6 +210,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var endTimeChicago = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
                     ? nowChicago.ToString("HH:mm")
                     : slotTimeChicago;
+                
+                // Check if we're starting before range_start_time (request would be invalid)
+                if (nowChicagoDate == tradingDate && nowChicago < rangeStartChicagoTime)
+                {
+                    var warningMsg = $"Starting before range_start_time ({rangeStartChicago}) - skipping BarsRequest. " +
+                                   $"System will rely on live bars once range starts. Current time: {nowChicago:HH:mm}";
+                    Log(warningMsg, LogLevel.Warning);
+                    return; // Skip BarsRequest, rely on live bars
+                }
                 
                 // Log restart detection if restarting after slot time (on same trading date)
                 if (nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime)

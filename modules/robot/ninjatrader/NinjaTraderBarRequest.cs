@@ -87,15 +87,44 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Log raw result after Request() completes
                 if (logCallback != null)
                 {
-                    var rawBars = barsSeries != null ? barsSeries.Count : 0;
+                    var rawBars = 0;
                     string? firstBarTime = null;
                     string? lastBarTime = null;
                     
-                    if (barsSeries != null && barsSeries.Count > 0)
+                    // Safely access barsSeries.Count - it may throw if collection is invalid
+                    try
                     {
-                        // Use GetTime() method to access bar times
-                        firstBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(0)).ToString("o");
-                        lastBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(barsSeries.Count - 1)).ToString("o");
+                        if (barsSeries != null)
+                        {
+                            rawBars = barsSeries.Count;
+                            
+                            if (rawBars > 0)
+                            {
+                                // Use GetTime() method to access bar times - wrap in try-catch for safety
+                                try
+                                {
+                                    firstBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(0)).ToString("o");
+                                }
+                                catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                                {
+                                    // Index 0 may be invalid - ignore
+                                }
+                                
+                                try
+                                {
+                                    lastBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(rawBars - 1)).ToString("o");
+                                }
+                                catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                                {
+                                    // Last index may be invalid - ignore
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                    {
+                        // barsSeries.Count itself may throw if collection is invalid - treat as empty
+                        rawBars = 0;
                     }
                     
                     logCallback("BARSREQUEST_RAW_RESULT", new
@@ -109,7 +138,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     });
                 }
 
-                if (barsSeries != null && barsSeries.Count > 0)
+                // Safely check if we have bars to process
+                int barsCount = 0;
+                try
+                {
+                    if (barsSeries != null)
+                    {
+                        barsCount = barsSeries.Count;
+                    }
+                }
+                catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                {
+                    // barsSeries.Count may throw if collection is invalid - treat as empty
+                    barsCount = 0;
+                }
+
+                if (barsSeries != null && barsCount > 0)
                 {
                     // Convert local times to UTC for range comparison
                     // Ensure DateTimeKind is Unspecified before conversion (ConvertTimeToUtc requires Unspecified or Local)
@@ -125,34 +169,44 @@ namespace NinjaTrader.NinjaScript.Strategies
                     var endUtcForComparison = TimeZoneInfo.ConvertTimeToUtc(endLocalForConversion, chicagoTz);
                     
                     // Convert NinjaTrader bars to Robot.Core.Bar format
-                    for (int i = 0; i < barsSeries.Count; i++)
+                    // Wrap individual bar access in try-catch to handle sparse collections
+                    // Use barsCount (safely retrieved) instead of barsSeries.Count
+                    for (int i = 0; i < barsCount; i++)
                     {
-                        // Access bar data using Bars collection methods
-                        var barExchangeTime = barsSeries.GetTime(i); // Exchange time (Chicago, Unspecified kind)
-                        var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
-                        
-                        // Skip bars outside requested range (compare in UTC)
-                        if (barUtc < startUtcForComparison || barUtc >= endUtcForComparison)
+                        try
+                        {
+                            // Access bar data using Bars collection methods
+                            var barExchangeTime = barsSeries.GetTime(i); // Exchange time (Chicago, Unspecified kind)
+                            var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                            
+                            // Skip bars outside requested range (compare in UTC)
+                            if (barUtc < startUtcForComparison || barUtc >= endUtcForComparison)
+                                continue;
+                            
+                            // Get OHLCV data using Bars collection methods
+                            var open = (decimal)barsSeries.GetOpen(i);
+                            var high = (decimal)barsSeries.GetHigh(i);
+                            var low = (decimal)barsSeries.GetLow(i);
+                            var close = (decimal)barsSeries.GetClose(i);
+                            var volume = barsSeries.GetVolume(i);
+                            
+                            // Create CoreBar struct
+                            var bar = new CoreBar(
+                                timestampUtc: barUtc,
+                                open: open,
+                                high: high,
+                                low: low,
+                                close: close,
+                                volume: volume > 0 ? (decimal?)volume : null
+                            );
+                            
+                            bars.Add(bar);
+                        }
+                        catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                        {
+                            // Bars collection may have gaps - skip invalid indices and continue
                             continue;
-                        
-                        // Get OHLCV data using Bars collection methods
-                        var open = (decimal)barsSeries.GetOpen(i);
-                        var high = (decimal)barsSeries.GetHigh(i);
-                        var low = (decimal)barsSeries.GetLow(i);
-                        var close = (decimal)barsSeries.GetClose(i);
-                        var volume = barsSeries.GetVolume(i);
-                        
-                        // Create CoreBar struct
-                        var bar = new CoreBar(
-                            timestampUtc: barUtc,
-                            open: open,
-                            high: high,
-                            low: low,
-                            close: close,
-                            volume: volume > 0 ? (decimal?)volume : null
-                        );
-                        
-                        bars.Add(bar);
+                        }
                     }
                 }
             }
