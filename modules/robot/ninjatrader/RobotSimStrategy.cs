@@ -200,16 +200,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var nowUtc = DateTimeOffset.UtcNow;
                 var nowChicago = timeService.ConvertUtcToChicago(nowUtc);
                 var slotTimeChicagoTime = timeService.ConstructChicagoTime(tradingDate, slotTimeChicago);
+                var nowChicagoDate = DateOnly.FromDateTime(nowChicago.DateTime);
                 
                 // Use the earlier of: slotTimeChicago or now (to avoid future bars)
-                // CRITICAL: If restart occurs after slot_time, only request up to slot_time
+                // CRITICAL: Only use current time if we're on the trading date AND before slot_time
+                // If we're on a different date (e.g., requesting tomorrow's bars), always use slot_time
                 // This prevents loading bars beyond the range window, which would change the input set
-                var endTimeChicago = nowChicago < slotTimeChicagoTime
+                var endTimeChicago = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
                     ? nowChicago.ToString("HH:mm")
                     : slotTimeChicago;
                 
-                // Log restart detection if restarting after slot time
-                if (nowChicago >= slotTimeChicagoTime)
+                // Log restart detection if restarting after slot time (on same trading date)
+                if (nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime)
                 {
                     Log($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest limited to slot_time to prevent range input set changes", LogLevel.Information);
                 }
@@ -345,35 +347,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             Log($"NT context wired to adapter: Account={Account.Name}, Instrument={Instrument.MasterInstrument.Name}", LogLevel.Information);
         }
 
-        private DateTime _lastDiagnosticLogBarTime = DateTime.MinValue;
-        private const int DIAGNOSTIC_LOG_RATE_LIMIT_MINUTES = 1; // Log once per minute max
-
         protected override void OnBarUpdate()
         {
             // Use ENGINE_READY latch to guard execution
             if (!_engineReady || _engine is null) return;
             if (CurrentBar < 1) return;
 
-            // DIAGNOSTIC: Capture raw NinjaTrader bar timestamp before any conversion
-            var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
-            var barRawNtTime = barExchangeTime;
-            var barRawNtKind = barExchangeTime.Kind.ToString();
-            
             // Convert bar time from exchange time to UTC using helper method
+            var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
             var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
-            
-            // DIAGNOSTIC: Capture conversion details
-            var barAssumedUtc = barUtc;
-            var barAssumedUtcKind = barUtc.DateTime.Kind.ToString();
-            var barChicagoOffset = new DateTimeOffset(barExchangeTime, TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time").GetUtcOffset(barExchangeTime));
-
-            // DIAGNOSTIC: Rate-limited logging to verify NT timestamp behavior
-            var timeSinceLastLog = (barExchangeTime - _lastDiagnosticLogBarTime).TotalMinutes;
-            if (timeSinceLastLog >= DIAGNOSTIC_LOG_RATE_LIMIT_MINUTES || _lastDiagnosticLogBarTime == DateTime.MinValue)
-            {
-                _lastDiagnosticLogBarTime = barExchangeTime;
-                Log($"DIAGNOSTIC: Raw NT Bar Time: {barExchangeTime:o}, Kind: {barExchangeTime.Kind}, Converted UTC: {barUtc:o}, Chicago Offset: {barChicagoOffset.Offset}", LogLevel.Information);
-            }
 
             var open = (decimal)Open[0];
             var high = (decimal)High[0];
