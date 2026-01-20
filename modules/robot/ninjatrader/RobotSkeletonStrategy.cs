@@ -17,6 +17,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         private RobotEngine? _engine;
         private Timer? _tickTimer;
         private readonly object _timerLock = new object();
+        
+        // CRITICAL FIX: Lock bar time interpretation after first detection
+        private enum BarTimeInterpretation { UTC, Chicago }
+        private BarTimeInterpretation? _barTimeInterpretation = null;
+        private bool _barTimeInterpretationLocked = false;
 
         protected override void OnStateChange()
         {
@@ -56,15 +61,64 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_engine is null) return;
             if (CurrentBar < 1) return;
 
-            // NinjaTrader Times[0][0] is in exchange time (typically Chicago time for futures).
-            // Convert to UTC deterministically using TimeService conversion logic.
-            // Times[0][0] is a DateTime representing the bar's timestamp in exchange timezone.
+            // CRITICAL FIX: NinjaTrader Times[0][0] timezone handling with locking
+            // Lock interpretation after first detection to prevent mid-run flips
+            var barExchangeTime = Times[0][0]; // Exchange time from NinjaTrader
             var nowUtc = DateTimeOffset.UtcNow;
+            DateTimeOffset barUtc;
             
-            // Convert bar time from exchange time to UTC using helper method
-            // Times[0][0] is DateTimeKind.Unspecified, representing exchange local time (Chicago)
-            var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
-            var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+            if (!_barTimeInterpretationLocked)
+            {
+                // First bar: Detect and lock interpretation
+                // Try treating Times[0][0] as UTC first
+                var barUtcIfUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
+                var barAgeIfUtc = (nowUtc - barUtcIfUtc).TotalMinutes;
+                
+                // Try treating Times[0][0] as Chicago time
+                var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
+                
+                // Choose interpretation that gives reasonable bar age
+                if (barAgeIfUtc >= 0 && barAgeIfUtc < 10 && barAgeIfUtc < barAgeIfChicago)
+                {
+                    _barTimeInterpretation = BarTimeInterpretation.UTC;
+                    barUtc = barUtcIfUtc;
+                }
+                else if (barAgeIfChicago >= 0 && barAgeIfChicago < 10)
+                {
+                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                    barUtc = barUtcIfChicago;
+                }
+                else
+                {
+                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                    barUtc = barUtcIfChicago;
+                }
+                
+                // Lock interpretation
+                _barTimeInterpretationLocked = true;
+            }
+            else
+            {
+                // Subsequent bars: Use locked interpretation and verify consistency
+                if (_barTimeInterpretation == BarTimeInterpretation.UTC)
+                {
+                    barUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
+                }
+                else
+                {
+                    barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                }
+                
+                // Verify locked interpretation still gives valid bar age
+                var barAge = (nowUtc - barUtc).TotalMinutes;
+                if (barAge < 0 || barAge > 60)
+                {
+                    // CRITICAL: Interpretation would flip - log alert
+                    // Note: Skeleton strategy doesn't have full logging, but we can log to console
+                    Log($"CRITICAL: Bar time interpretation mismatch. Locked: {_barTimeInterpretation}, Age: {barAge:F2} min", LogLevel.Error);
+                }
+            }
 
             var open = (decimal)Open[0];
             var high = (decimal)High[0];

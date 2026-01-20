@@ -33,6 +33,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _engineReady = false; // Single latch: true once engine is fully initialized and ready
         private Timer? _tickTimer;
         private readonly object _timerLock = new object();
+        
+        // Rate-limiting for timezone detection logging (per instrument)
+        private readonly Dictionary<string, DateTimeOffset> _lastTimezoneDetectionLogUtc = new Dictionary<string, DateTimeOffset>();
+        
+        // CRITICAL FIX: Lock bar time interpretation after first detection
+        private enum BarTimeInterpretation { UTC, Chicago }
+        private BarTimeInterpretation? _barTimeInterpretation = null;
+        private bool _barTimeInterpretationLocked = false;
 
         protected override void OnStateChange()
         {
@@ -217,6 +225,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     var warningMsg = $"Starting before range_start_time ({rangeStartChicago}) - skipping BarsRequest. " +
                                    $"System will rely on live bars once range starts. Current time: {nowChicago:HH:mm}";
                     Log(warningMsg, LogLevel.Warning);
+                    
+                    // Log BarsRequest skipped event
+                    if (_engine != null)
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "trading_date", tradingDateStr },
+                            { "range_start_time", rangeStartChicago },
+                            { "current_time_chicago", nowChicago.ToString("HH:mm") },
+                            { "reason", "Starting before range_start_time" },
+                            { "note", "System will rely on live bars once range starts" }
+                        });
+                    }
                     return; // Skip BarsRequest, rely on live bars
                 }
                 
@@ -227,6 +249,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 
                 Log($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+                
+                // Log BarsRequest initialization event
+                if (_engine != null)
+                {
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_INITIALIZATION", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_time", rangeStartChicago },
+                        { "slot_time", slotTimeChicago },
+                        { "end_time", endTimeChicago },
+                        { "current_time_chicago", nowChicago.ToString("HH:mm") },
+                        { "is_restart_after_slot", nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime },
+                        { "note", "BarsRequest initialization - requesting historical bars for pre-hydration" }
+                    });
+                }
 
                 // Log intent before request
                 var requestStartUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, rangeStartChicago);
@@ -313,6 +351,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  $"3) No historical data available for this date. " +
                                  $"Range computation will rely on live bars only - may be incomplete.";
                     Log(errorMsg, LogLevel.Warning);
+                    
+                    // Log BarsRequest unexpected count event
+                    if (_engine != null)
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_UNEXPECTED_COUNT", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "trading_date", tradingDateStr },
+                            { "bars_returned", 0 },
+                            { "expected_range", $"{rangeStartChicago} to {endTimeChicago}" },
+                            { "current_time_chicago", nowChicago.ToString("HH:mm") },
+                            { "reason", "No bars returned from BarsRequest" },
+                            { "possible_causes", new[] { 
+                                "Strategy started after slot_time (bars already passed)",
+                                "NinjaTrader 'Days to load' setting too low",
+                                "No historical data available for this date"
+                            }},
+                            { "note", "Range computation will rely on live bars only - may be incomplete" }
+                        });
+                    }
                     // Don't throw - allow degraded operation, but make it visible
                 }
                 else
@@ -321,6 +379,34 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Note: Streams should exist by now (created in engine.Start())
                     _engine.LoadPreHydrationBars(Instrument.MasterInstrument.Name, bars, DateTimeOffset.UtcNow);
                     Log($"Loaded {bars.Count} historical bars from NinjaTrader for pre-hydration", LogLevel.Information);
+                    
+                    // Log successful BarsRequest with bar count check
+                    if (_engine != null)
+                    {
+                        // Calculate expected bar count (rough estimate: 1 bar per minute)
+                        var rangeStartTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
+                        var endTime = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
+                            ? nowChicago
+                            : timeService.ConstructChicagoTime(tradingDate, endTimeChicago);
+                        var expectedMinutes = (int)(endTime - rangeStartTime).TotalMinutes;
+                        var expectedBarCount = Math.Max(0, expectedMinutes);
+                        
+                        // Log if count is unexpectedly low (less than 50% of expected)
+                        if (bars.Count < expectedBarCount * 0.5 && expectedBarCount > 10)
+                        {
+                            _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_UNEXPECTED_COUNT", new Dictionary<string, object>
+                            {
+                                { "instrument", instrumentName },
+                                { "trading_date", tradingDateStr },
+                                { "bars_returned", bars.Count },
+                                { "expected_bar_count", expectedBarCount },
+                                { "expected_range", $"{rangeStartChicago} to {endTimeChicago}" },
+                                { "coverage_percent", Math.Round((double)bars.Count / expectedBarCount * 100, 1) },
+                                { "reason", "Bar count lower than expected" },
+                                { "note", "BarsRequest returned fewer bars than expected - may indicate data gaps or timing issues" }
+                            });
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -363,15 +449,110 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!_engineReady || _engine is null) return;
             if (CurrentBar < 1) return;
 
-            // Convert bar time from exchange time to UTC using helper method
-            var barExchangeTime = Times[0][0]; // Exchange time (Chicago, Unspecified kind)
-            var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+            // CRITICAL FIX: NinjaTrader Times[0][0] timezone handling with locking
+            // Lock interpretation after first detection to prevent mid-run flips
+            var barExchangeTime = Times[0][0]; // Exchange time from NinjaTrader
+            var nowUtc = DateTimeOffset.UtcNow;
+            DateTimeOffset barUtc;
+            
+            if (!_barTimeInterpretationLocked)
+            {
+                // First bar: Detect and lock interpretation
+                // Try treating Times[0][0] as UTC first
+                var barUtcIfUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
+                var barAgeIfUtc = (nowUtc - barUtcIfUtc).TotalMinutes;
+                
+                // Try treating Times[0][0] as Chicago time
+                var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
+                
+                // Choose interpretation that gives reasonable bar age (between 0 and 10 minutes for recent bars)
+                string selectedInterpretation;
+                string selectionReason;
+                
+                if (barAgeIfUtc >= 0 && barAgeIfUtc < 10 && barAgeIfUtc < barAgeIfChicago)
+                {
+                    // Times[0][0] appears to be UTC
+                    _barTimeInterpretation = BarTimeInterpretation.UTC;
+                    barUtc = barUtcIfUtc;
+                    selectedInterpretation = "UTC";
+                    selectionReason = $"UTC interpretation gives reasonable bar age ({barAgeIfUtc:F2} min) and is better than Chicago ({barAgeIfChicago:F2} min)";
+                }
+                else if (barAgeIfChicago >= 0 && barAgeIfChicago < 10)
+                {
+                    // Times[0][0] appears to be Chicago time
+                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                    barUtc = barUtcIfChicago;
+                    selectedInterpretation = "CHICAGO";
+                    selectionReason = $"Chicago interpretation gives reasonable bar age ({barAgeIfChicago:F2} min)";
+                }
+                else
+                {
+                    // Fallback: Use Chicago interpretation (documented behavior)
+                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                    barUtc = barUtcIfChicago;
+                    selectedInterpretation = "CHICAGO";
+                    selectionReason = $"Fallback to Chicago interpretation (documented behavior). UTC age: {barAgeIfUtc:F2} min, Chicago age: {barAgeIfChicago:F2} min";
+                }
+                
+                // Lock interpretation
+                _barTimeInterpretationLocked = true;
+                
+                // Log detection (always log on first bar)
+                if (_engine != null)
+                {
+                    var instrumentName = Instrument.MasterInstrument.Name;
+                    _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_DETECTED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "raw_times_value", barExchangeTime.ToString("o") },
+                        { "raw_times_kind", barExchangeTime.Kind.ToString() },
+                        { "chosen_interpretation", selectedInterpretation },
+                        { "reason", selectionReason },
+                        { "bar_age_if_utc", Math.Round(barAgeIfUtc, 2) },
+                        { "bar_age_if_chicago", Math.Round(barAgeIfChicago, 2) },
+                        { "final_bar_timestamp_utc", barUtc.ToString("o") },
+                        { "current_time_utc", nowUtc.ToString("o") }
+                    });
+                }
+            }
+            else
+            {
+                // Subsequent bars: Use locked interpretation and verify consistency
+                if (_barTimeInterpretation == BarTimeInterpretation.UTC)
+                {
+                    barUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
+                }
+                else
+                {
+                    barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                }
+                
+                // Verify locked interpretation still gives valid bar age
+                var barAge = (nowUtc - barUtc).TotalMinutes;
+                if (barAge < 0 || barAge > 60)
+                {
+                    // CRITICAL: Interpretation would flip - log alert
+                    if (_engine != null)
+                    {
+                        var instrumentName = Instrument.MasterInstrument.Name;
+                        _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_MISMATCH", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "severity", "CRITICAL" },
+                            { "locked_interpretation", _barTimeInterpretation.ToString() },
+                            { "current_bar_age_minutes", Math.Round(barAge, 2) },
+                            { "raw_bar_time", barExchangeTime.ToString("o") },
+                            { "warning", "Bar time interpretation would flip - this should not happen" }
+                        });
+                    }
+                }
+            }
 
             var open = (decimal)Open[0];
             var high = (decimal)High[0];
             var low = (decimal)Low[0];
             var close = (decimal)Close[0];
-            var nowUtc = DateTimeOffset.UtcNow;
 
             // Deliver bar data to engine (bars only provide market data, not time advancement)
             _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);

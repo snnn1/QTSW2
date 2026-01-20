@@ -4,6 +4,7 @@ import './App.css'
 import { useMatrixWorker } from './useMatrixWorker'
 import { STREAMS, DAYS_OF_WEEK, AVAILABLE_TIMES, ANALYZER_COLUMN_ORDER, DEFAULT_COLUMNS } from './utils/constants'
 import { getDefaultFilters, loadAllFilters, saveAllFilters, getStreamFiltersFromStorage } from './utils/filterUtils'
+import { getChicagoDateNow, dateToYYYYMMDD, parseYYYYMMDD, formatChicagoTime } from './utils/dateUtils'
 // Use existing utility files instead of duplicating code
 import { 
   getContractValue, 
@@ -2867,8 +2868,12 @@ function AppContent() {
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
 
   // Calculate current trading day (for filtering timetable) - only update when date changes, not every second
+  // CRITICAL FIX: Initialize from Chicago timezone, not browser time
+  // Use explicit Chicago date conversion to avoid timezone issues
   const [currentTradingDay, setCurrentTradingDay] = useState(() => {
-    let tradingDay = new Date()
+    // Get Chicago date as YYYY-MM-DD string, then parse to Date
+    const chicagoDateStr = getChicagoDateNow()
+    let tradingDay = parseYYYYMMDD(chicagoDateStr)
     const dayOfWeek = tradingDay.getDay()
     if (dayOfWeek === 0) { // Sunday
       tradingDay.setDate(tradingDay.getDate() + 1) // Monday
@@ -2879,9 +2884,12 @@ function AppContent() {
   })
   
   // Update trading day only when the date changes (not every second)
+  // CRITICAL FIX: Use Chicago timezone, not browser time
   useEffect(() => {
     const updateTradingDay = () => {
-      let tradingDay = new Date()
+      // Get Chicago date as YYYY-MM-DD string, then parse to Date
+      const chicagoDateStr = getChicagoDateNow()
+      let tradingDay = parseYYYYMMDD(chicagoDateStr)
       const dayOfWeek = tradingDay.getDay()
       if (dayOfWeek === 0) { // Sunday
         tradingDay.setDate(tradingDay.getDate() + 1) // Monday
@@ -2890,8 +2898,9 @@ function AppContent() {
       }
       
       // Only update if the date string changed (not the time)
-      const newDateStr = tradingDay.toISOString().split('T')[0]
-      const currentDateStr = currentTradingDay.toISOString().split('T')[0]
+      // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString()
+      const newDateStr = dateToYYYYMMDD(tradingDay)
+      const currentDateStr = dateToYYYYMMDD(currentTradingDay)
       if (newDateStr !== currentDateStr) {
         setCurrentTradingDay(tradingDay)
       }
@@ -2926,12 +2935,13 @@ function AppContent() {
       }
       
       // Check if displayed date exists in master matrix
-      const displayedDateStr = currentTradingDay.toISOString().split('T')[0]
+      // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString()
+      const displayedDateStr = dateToYYYYMMDD(currentTradingDay)
       const dateExistsInMatrix = masterData.some(row => {
         const rowDate = row.Date || row.trade_date
         if (!rowDate) return false
         const rowDateStr = rowDate instanceof Date 
-          ? rowDate.toISOString().split('T')[0]
+          ? dateToYYYYMMDD(rowDate)
           : rowDate.split('T')[0]
         return rowDateStr === displayedDateStr
       })
@@ -2945,7 +2955,6 @@ function AppContent() {
           if (timetable && timetable.trading_date === displayedDateStr && timetable.streams) {
             // Convert backend format to worker format
             const timetableRows = timetable.streams
-              .filter(s => s.enabled === true) // Only enabled for display
               .map(s => ({
                 Stream: s.stream,
                 Time: s.slot_time || s.decision_time || '',
@@ -2967,7 +2976,6 @@ function AppContent() {
               const updatedTimetable = await matrixApi.getCurrentTimetable()
               if (updatedTimetable && updatedTimetable.streams) {
                 const updatedRows = updatedTimetable.streams
-                  .filter(s => s.enabled === true)
                   .map(s => ({
                     Stream: s.stream,
                     Time: s.slot_time || s.decision_time || '',
@@ -3238,11 +3246,49 @@ function AppContent() {
                   </div>
                 </div>
                 <div className="text-right">
-                  <div className="text-lg font-mono font-semibold text-gray-300">
-                    {currentTime.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
-                  </div>
-                  <div className="text-2xl font-mono font-bold text-blue-400">
-                    {currentTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  <div className="flex gap-6 items-start">
+                    {/* UTC Time */}
+                    <div>
+                      <div className="text-xs font-semibold text-gray-500 uppercase mb-1">UTC</div>
+                      <div className="text-sm font-mono font-semibold text-gray-400">
+                        {currentTime.toLocaleDateString('en-US', { 
+                          weekday: 'long', 
+                          year: 'numeric', 
+                          month: 'long', 
+                          day: 'numeric',
+                          timeZone: 'UTC'
+                        })}
+                      </div>
+                      <div className="text-xl font-mono font-bold text-blue-400">
+                        {currentTime.toLocaleTimeString('en-US', { 
+                          hour12: false, 
+                          hour: '2-digit', 
+                          minute: '2-digit', 
+                          second: '2-digit',
+                          timeZone: 'UTC'
+                        })}
+                      </div>
+                    </div>
+                    {/* Chicago Time */}
+                    <div>
+                      <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Chicago</div>
+                      <div className="text-sm font-mono font-semibold text-gray-400">
+                        {formatChicagoTime(currentTime, {
+                          weekday: 'long',
+                          year: 'numeric',
+                          month: 'long',
+                          day: 'numeric'
+                        })}
+                      </div>
+                      <div className="text-xl font-mono font-bold text-green-400">
+                        {formatChicagoTime(currentTime, {
+                          hour12: false,
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit'
+                        })}
+                      </div>
+                    </div>
                   </div>
                   {lastMergeTime && (
                     <div className="mt-2 text-sm font-mono text-gray-400">
@@ -3275,17 +3321,33 @@ function AppContent() {
                         <tr className="bg-gray-800">
                           <th className="px-4 py-3 text-left font-semibold">Stream</th>
                           <th className="px-4 py-3 text-left font-semibold">Time</th>
+                          <th className="px-4 py-3 text-left font-semibold">Status</th>
                         </tr>
                       </thead>
                       <tbody>
                         {workerTimetable
-                          .filter(row => row.Enabled !== false) // UI filters out disabled streams (presentation layer)
-                          .map((row, idx) => (
-                            <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
-                              <td className="px-4 py-3">{row.Stream}</td>
-                              <td className="px-4 py-3 font-mono">{row.Time}</td>
-                            </tr>
-                          ))}
+                          .map((row, idx) => {
+                            const isDisabled = row.Enabled === false
+                            return (
+                              <tr 
+                                key={`${row.Stream}-${idx}`} 
+                                className={`border-b border-gray-700 hover:bg-gray-750 ${isDisabled ? 'opacity-50 bg-gray-800' : ''}`}
+                                title={isDisabled && row.BlockReason ? `Blocked: ${row.BlockReason}` : ''}
+                              >
+                                <td className="px-4 py-3">{row.Stream}</td>
+                                <td className="px-4 py-3 font-mono">{row.Time}</td>
+                                <td className="px-4 py-3">
+                                  {isDisabled ? (
+                                    <span className="text-red-400 text-sm" title={row.BlockReason || 'Blocked'}>
+                                      Blocked {row.BlockReason && `(${row.BlockReason})`}
+                                    </span>
+                                  ) : (
+                                    <span className="text-green-400 text-sm">Enabled</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })}
                       </tbody>
                     </table>
                   </div>

@@ -176,6 +176,18 @@ class ColumnarData {
 // ---------------------------------------------------------------------
 const dateCache = new Map()
 
+// CRITICAL FIX: Extract YYYY-MM-DD from Date without timezone conversion
+// Never use .toISOString() for date-only values as it converts to UTC
+function dateToYYYYMMDD(date) {
+  if (!date || !(date instanceof Date)) {
+    throw new Error(`Invalid date: ${date}`)
+  }
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
 function parseDateCached(dateValue) {
   if (!dateValue) return null
   if (dateCache.has(dateValue)) return dateCache.get(dateValue)
@@ -1254,12 +1266,13 @@ self.onmessage = function(e) {
         let filterDateStr = null // The date to use for filtering data rows
         
         // Parse currentTradingDay if provided
+        // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString() to avoid UTC conversion
         let currentTradingDayDate = null
         let currentTradingDayStr = null
         if (currentTradingDay) {
           if (currentTradingDay instanceof Date) {
             currentTradingDayDate = currentTradingDay
-            currentTradingDayStr = currentTradingDay.toISOString().split('T')[0]
+            currentTradingDayStr = dateToYYYYMMDD(currentTradingDay)
           } else if (typeof currentTradingDay === 'string') {
             currentTradingDayDate = parseDateCached(currentTradingDay)
             currentTradingDayStr = currentTradingDay.split('T')[0]
@@ -1308,13 +1321,26 @@ self.onmessage = function(e) {
           note: displayedDateExists ? 'Using matrix data' : 'Displayed date not in matrix - will include all streams with default times'
         })
         
+        // Helper function to normalize time to HH:MM format for comparison
+        const normalizeTime = (timeStr) => {
+          if (!timeStr) return ''
+          const str = String(timeStr).trim()
+          const parts = str.split(':')
+          if (parts.length === 2) {
+            const hours = parts[0].padStart(2, '0')
+            const minutes = parts[1].padStart(2, '0')
+            return `${hours}:${minutes}`
+          }
+          return str
+        }
+        
         // CRITICAL: If displayed date doesn't exist in matrix, we can't determine enabled status from matrix data
         // In this case, we should still include all streams but they'll be marked appropriately
         // The backend-generated timetable_current.json should be used instead, but for now we'll
         // include all streams with default times when date doesn't exist
         
         // Build timetable for displayed date (tradingDateStr)
-        // CRITICAL: Must include ALL 12 streams (complete execution contract)
+        // CRITICAL: Must include ALL streams (complete execution contract)
         // Filtered streams are marked with enabled=false, not skipped
         const timetableRows = []
         const seenStreams = new Map() // stream -> { Stream, Time, Enabled, BlockReason }
@@ -1324,6 +1350,26 @@ self.onmessage = function(e) {
         // If not, we'll still include all streams but mark them as disabled
         const dataDateToUse = displayedDateExists ? currentTradingDayStr : latestDateStr
         
+        // Debug: Log ES1 rows for the target date
+        const es1RowsForDate = []
+        for (let i = 0; i < self.columnarData.length; i++) {
+          const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
+          const stream = Stream[i] || ''
+          if (stream === 'ES1') {
+            const parsed = dateValue ? parseDateCached(dateValue) : null
+            // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString() to avoid UTC conversion
+            const dayKey = parsed ? dateToYYYYMMDD(parsed) : 'no-date'
+            if (dayKey === dataDateToUse) {
+              es1RowsForDate.push({ idx: i, date: dayKey, time: Time[i], timeChange: TimeChange[i] || '', matchesDate: dayKey === dataDateToUse })
+            }
+          }
+        }
+        if (es1RowsForDate.length > 0) {
+          console.log(`[Worker] ES1 rows for date ${dataDateToUse}:`, es1RowsForDate)
+        } else {
+          console.log(`[Worker] No ES1 rows found for date ${dataDateToUse}`)
+        }
+        
         for (let i = 0; i < self.columnarData.length; i++) {
           const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
           if (!dateValue) continue
@@ -1331,7 +1377,8 @@ self.onmessage = function(e) {
           const parsed = parseDateCached(dateValue)
           if (!parsed) continue
           
-          const dayKey = parsed.toISOString().split('T')[0]
+          // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString() to avoid UTC conversion
+          const dayKey = dateToYYYYMMDD(parsed)
           // Use dataDateToUse: displayed date if exists, otherwise latest date
           // But filters are always applied for displayed date (currentTradingDay)
           if (dayKey !== dataDateToUse) continue
@@ -1344,17 +1391,34 @@ self.onmessage = function(e) {
           
           // Skip if we've already seen this stream (one row per stream per date)
           if (seenStreams.has(stream)) {
+            if (stream === 'ES1') {
+              console.log(`[Worker] ES1 skipped - already seen`)
+            }
             continue
           }
           
           // Use Time Change if available, otherwise use Time
-          // Time Change format is like "09:30 -> 10:00", extract the target time (after ->)
+          // Time Change can be either:
+          // 1. Just the new time (e.g., "08:00") - current format
+          // 2. "old -> new" format (e.g., "07:30 -> 08:00") - backward compatibility
+          // NOTE: If 07:30 is filtered, sequencer never selects it, so Time column is already correct
           let displayTime = time
-          if (timeChange && timeChange.includes('->')) {
-            const parts = timeChange.split('->')
-            if (parts.length === 2) {
-              displayTime = parts[1].trim()
+          if (timeChange && timeChange.trim()) {
+            if (timeChange.includes('->')) {
+              // Backward compatibility: parse "old -> new" format
+              const parts = timeChange.split('->')
+              if (parts.length === 2) {
+                displayTime = parts[1].trim()
+              }
+            } else {
+              // Current format: Time Change is just the new time
+              displayTime = timeChange.trim()
             }
+          }
+          
+          // Debug logging for es1 to understand what's being read
+          if (stream === 'ES1') {
+            console.log(`[Worker] ES1 timetable processing: date=${dayKey}, Time=${time}, TimeChange="${timeChange}", displayTime=${displayTime}, dataDateToUse=${dataDateToUse}`)
           }
           
           // Check filters and determine enabled status
@@ -1424,6 +1488,30 @@ self.onmessage = function(e) {
             }
           }
           
+          // CRITICAL: Check if the selected time is in exclude_times filter
+          // If the time is filtered, block the stream
+          if (enabled && displayTime) {
+            const normalizedDisplayTime = normalizeTime(displayTime)
+            
+            // Check stream-specific exclude_times
+            if (streamFilter?.exclude_times?.length > 0) {
+              const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
+              if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+                enabled = false
+                blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
+              }
+            }
+            
+            // Check master exclude_times if stream filter didn't block it
+            if (enabled && masterFilter?.exclude_times?.length > 0) {
+              const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
+              if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+                enabled = false
+                blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
+              }
+            }
+          }
+          
           // ALWAYS include stream (enabled or blocked)
           seenStreams.set(stream, {
             Stream: stream,
@@ -1433,8 +1521,8 @@ self.onmessage = function(e) {
           })
         }
         
-        // Second pass: Ensure ALL 12 streams are present (add missing ones as blocked)
-        const allStreams = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2']
+        // Second pass: Ensure ALL 14 streams are present (add missing ones as blocked)
+        const allStreams = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2', 'RTY1', 'RTY2']
         const sessionTimeSlots = {
           'S1': ['07:30', '08:00', '09:00'],
           'S2': ['09:30', '10:00', '10:30', '11:00']
@@ -1444,16 +1532,47 @@ self.onmessage = function(e) {
           if (!seenStreams.has(streamId)) {
             // Stream not in master matrix for this date
             const session = streamId.endsWith('1') ? 'S1' : 'S2'
-            const defaultTime = sessionTimeSlots[session]?.[0] || ''
+            
+            // Get stream and master filters to determine excluded times
+            const streamFilter = streamFilters[streamId]
+            const masterFilter = streamFilters['master']
+            
+            // Collect all exclude_times (stream-specific + master)
+            const excludeTimesList = []
+            if (streamFilter?.exclude_times?.length > 0) {
+              excludeTimesList.push(...streamFilter.exclude_times)
+            }
+            if (masterFilter?.exclude_times?.length > 0) {
+              excludeTimesList.push(...masterFilter.exclude_times)
+            }
+            
+            // Select first NON-FILTERED time from session slots
+            // If 07:30 is filtered, sequencer never selects it, so we shouldn't either
+            let defaultTime = ''
+            if (excludeTimesList.length > 0) {
+              const excludeTimesNormalized = excludeTimesList.map(t => normalizeTime(t))
+              const availableTimes = sessionTimeSlots[session] || []
+              // Find first time that's NOT in exclude_times
+              for (const timeSlot of availableTimes) {
+                if (!excludeTimesNormalized.includes(normalizeTime(timeSlot))) {
+                  defaultTime = timeSlot
+                  break
+                }
+              }
+              // If all times are filtered, use first time anyway (will be blocked below)
+              if (!defaultTime && availableTimes.length > 0) {
+                defaultTime = availableTimes[0]
+              }
+            } else {
+              // No exclude_times, use first available time
+              defaultTime = sessionTimeSlots[session]?.[0] || ''
+            }
             
             // If displayed date doesn't exist in matrix, we can't determine enabled status
             // Default to enabled=true, filters will determine final status
             // Backend-generated timetable_current.json should be used for accurate RS-based selection
             let enabled = true
             let blockReason = null
-            
-            // Apply filters for displayed date even if stream not in matrix
-            const streamFilter = streamFilters[streamId]
             if (streamFilter?.exclude_days_of_week?.length > 0) {
               const excludedDOW = streamFilter.exclude_days_of_week
               const isFiltered = excludedDOW.some(d => {
@@ -1475,7 +1594,6 @@ self.onmessage = function(e) {
               }
             }
             
-            const masterFilter = streamFilters['master']
             if (enabled && masterFilter?.exclude_days_of_week?.length > 0) {
               const excludedDOW = masterFilter.exclude_days_of_week
               const isFiltered = excludedDOW.some(d => {
@@ -1497,6 +1615,30 @@ self.onmessage = function(e) {
               }
             }
             
+            // CRITICAL: Check if the default time is in exclude_times filter
+            // If the time is filtered, block the stream
+            if (enabled && defaultTime) {
+              const normalizedDefaultTime = normalizeTime(defaultTime)
+              
+              // Check stream-specific exclude_times
+              if (streamFilter?.exclude_times?.length > 0) {
+                const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
+                if (excludeTimesNormalized.includes(normalizedDefaultTime)) {
+                  enabled = false
+                  blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
+                }
+              }
+              
+              // Check master exclude_times if stream filter didn't block it
+              if (enabled && masterFilter?.exclude_times?.length > 0) {
+                const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
+                if (excludeTimesNormalized.includes(normalizedDefaultTime)) {
+                  enabled = false
+                  blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
+                }
+              }
+            }
+            
             // If still enabled but no data, mark as needing backend generation
             if (enabled && !displayedDateExists) {
               blockReason = 'requires_backend_rs_calculation'
@@ -1511,12 +1653,16 @@ self.onmessage = function(e) {
           }
         }
         
-        // Convert map to array (all 12 streams guaranteed)
+        // Convert map to array (all 14 streams guaranteed)
         timetableRows.push(...Array.from(seenStreams.values()))
         
+        // Debug: Log ES1 result and all streams with their times
+        const es1Result = timetableRows.find(r => r.Stream === 'ES1')
         console.log('[Worker] Timetable result:', {
           totalRows: timetableRows.length,
-          streams: timetableRows.map(r => r.Stream)
+          streams: timetableRows.map(r => ({ Stream: r.Stream, Time: r.Time, Enabled: r.Enabled })),
+          es1Result: es1Result ? { Stream: es1Result.Stream, Time: es1Result.Time, Enabled: es1Result.Enabled, BlockReason: es1Result.BlockReason } : 'NOT_FOUND',
+          es1FromSeenStreams: seenStreams.has('ES1') ? seenStreams.get('ES1') : 'NOT_IN_SEEN_STREAMS'
         })
         
         // Sort by time descending (latest time first, earliest time last)

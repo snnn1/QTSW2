@@ -1,3 +1,5 @@
+import { formatChicagoTime } from '../utils/dateUtils'
+
 export default function TimetableTab({
   currentTradingDay,
   currentTime,
@@ -7,6 +9,36 @@ export default function TimetableTab({
   workerTimetable,
   onRetryLoad
 }) {
+  // Format UTC time
+  const utcDateStr = currentTime.toLocaleDateString('en-US', { 
+    weekday: 'long', 
+    year: 'numeric', 
+    month: 'long', 
+    day: 'numeric',
+    timeZone: 'UTC'
+  })
+  const utcTimeStr = currentTime.toLocaleTimeString('en-US', { 
+    hour12: false, 
+    hour: '2-digit', 
+    minute: '2-digit', 
+    second: '2-digit',
+    timeZone: 'UTC'
+  })
+  
+  // Format Chicago time
+  const chicagoDateStr = formatChicagoTime(currentTime, {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  })
+  const chicagoTimeStr = formatChicagoTime(currentTime, {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  })
+  
   return (
     <div className="space-y-6">
       <div className="bg-gray-900 rounded-lg p-6">
@@ -18,11 +50,25 @@ export default function TimetableTab({
             </div>
           </div>
           <div className="text-right">
-            <div className="text-lg font-mono font-semibold text-gray-300">
-              {currentTime.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+            {/* UTC Time */}
+            <div className="mb-2">
+              <div className="text-xs font-semibold text-gray-500 uppercase mb-1">UTC</div>
+              <div className="text-sm font-mono font-semibold text-gray-400">
+                {utcDateStr}
+              </div>
+              <div className="text-xl font-mono font-bold text-blue-400">
+                {utcTimeStr}
+              </div>
             </div>
-            <div className="text-2xl font-mono font-bold text-blue-400">
-              {currentTime.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            {/* Chicago Time */}
+            <div>
+              <div className="text-xs font-semibold text-gray-500 uppercase mb-1">Chicago</div>
+              <div className="text-sm font-mono font-semibold text-gray-400">
+                {chicagoDateStr}
+              </div>
+              <div className="text-xl font-mono font-bold text-green-400">
+                {chicagoTimeStr}
+              </div>
             </div>
           </div>
         </div>
@@ -50,17 +96,33 @@ export default function TimetableTab({
                 <tr className="bg-gray-800">
                   <th className="px-4 py-3 text-left font-semibold">Stream</th>
                   <th className="px-4 py-3 text-left font-semibold">Time</th>
+                  <th className="px-4 py-3 text-left font-semibold">Status</th>
                 </tr>
               </thead>
               <tbody>
                 {workerTimetable
-                  .filter(row => row.Enabled !== false) // UI filters out disabled streams (presentation layer)
-                  .map((row, idx) => (
-                    <tr key={`${row.Stream}-${idx}`} className="border-b border-gray-700 hover:bg-gray-750">
-                      <td className="px-4 py-3">{row.Stream}</td>
-                      <td className="px-4 py-3 font-mono">{row.Time}</td>
-                    </tr>
-                  ))}
+                  .map((row, idx) => {
+                    const isDisabled = row.Enabled === false
+                    return (
+                      <tr 
+                        key={`${row.Stream}-${idx}`} 
+                        className={`border-b border-gray-700 hover:bg-gray-750 ${isDisabled ? 'opacity-50 bg-gray-800' : ''}`}
+                        title={isDisabled && row.BlockReason ? `Blocked: ${row.BlockReason}` : ''}
+                      >
+                        <td className="px-4 py-3">{row.Stream}</td>
+                        <td className="px-4 py-3 font-mono">{row.Time}</td>
+                        <td className="px-4 py-3">
+                          {isDisabled ? (
+                            <span className="text-red-400 text-sm" title={row.BlockReason || 'Blocked'}>
+                              Blocked {row.BlockReason && `(${row.BlockReason})`}
+                            </span>
+                          ) : (
+                            <span className="text-green-400 text-sm">Enabled</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
               </tbody>
             </table>
           </div>

@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { WORKER_MESSAGE_TYPES, WORKER_RESPONSE_TYPES, CONTRACT_VALUES, createWorkerMessage } from './worker/contract'
 import { useWorkerRequestManager } from './worker/requestManager'
+import { dateToYYYYMMDD } from './utils/dateUtils'
 
 // #region agent log
 // Disabled for performance - debug logging adds network overhead
@@ -363,9 +364,10 @@ export function useMatrixWorker() {
     const postMessageStart = Date.now();
     logDebug('useMatrixWorker.js:186', 'Posting CALCULATE_TIMETABLE message to worker', {requestId, hypothesisId: 'C'});
     // #endregion
+    // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString() to avoid UTC conversion
     const message = createWorkerMessage(WORKER_MESSAGE_TYPES.CALCULATE_TIMETABLE, {
       streamFilters,
-      currentTradingDay: currentTradingDay ? currentTradingDay.toISOString().split('T')[0] : null,
+      currentTradingDay: currentTradingDay ? dateToYYYYMMDD(currentTradingDay) : null,
       requestId
     })
     workerRef.current.postMessage(message)

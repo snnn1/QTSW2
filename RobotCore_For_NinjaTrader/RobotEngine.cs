@@ -61,6 +61,9 @@ public sealed class RobotEngine
     // Engine heartbeat tracking for liveness monitoring
     private DateTimeOffset _lastTickUtc = DateTimeOffset.MinValue;
     
+    // Gap violation summary tracking (rate-limited)
+    private DateTimeOffset? _lastGapViolationSummaryUtc = null;
+    
     // Account/environment info for startup banner (set by strategy host)
     private string? _accountName;
     private string? _environment;
@@ -413,6 +416,35 @@ public sealed class RobotEngine
 
         foreach (var s in _streams.Values)
             s.Tick(utcNow);
+        
+        // Track and log gap violations across all streams (rate-limited to once per 5 minutes)
+        var timeSinceLastGapViolationSummary = (utcNow - (_lastGapViolationSummaryUtc ?? DateTimeOffset.MinValue)).TotalMinutes;
+        if (timeSinceLastGapViolationSummary >= 5.0 || _lastGapViolationSummaryUtc == null)
+        {
+            var invalidatedStreams = _streams.Values
+                .Where(s => s.RangeInvalidated && !s.Committed)
+                .Select(s => new
+                {
+                    stream_id = s.Stream,
+                    instrument = s.Instrument,
+                    session = s.Session,
+                    slot_time = s.SlotTimeChicago,
+                    state = s.State.ToString()
+                })
+                .ToList();
+            
+            if (invalidatedStreams.Count > 0)
+            {
+                _lastGapViolationSummaryUtc = utcNow;
+                LogEngineEvent(utcNow, "GAP_VIOLATIONS_SUMMARY", new
+                {
+                    invalidated_stream_count = invalidatedStreams.Count,
+                    invalidated_streams = invalidatedStreams,
+                    total_streams = _streams.Count,
+                    note = "Streams invalidated due to gap tolerance violations - trading blocked for these streams"
+                });
+            }
+        }
         
         // Health monitor: evaluate data loss (rate-limited internally)
         _healthMonitor?.Evaluate(utcNow);
@@ -775,12 +807,29 @@ public sealed class RobotEngine
         // Apply timetable to create streams with locked trading date
         ApplyTimetable(_lastTimetable, utcNow);
 
-        // Log stream creation
+        // Log stream creation with detailed stream information
+        var streamDetails = _streams.Values.Select(s => new
+        {
+            stream_id = s.Stream,
+            instrument = s.Instrument,
+            session = s.Session,
+            slot_time = s.SlotTimeChicago,
+            committed = s.Committed,
+            state = s.State.ToString()
+        }).ToList();
+        
+        // Group by instrument and session for summary
+        var streamsByInstrument = _streams.Values
+            .GroupBy(s => s.Instrument)
+            .ToDictionary(g => g.Key, g => g.Select(s => new { session = s.Session, slot_time = s.SlotTimeChicago, committed = s.Committed }).ToList());
+        
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "STREAMS_CREATED", state: "ENGINE",
             new
             {
                 stream_count = _streams.Count,
                 trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                streams = streamDetails,
+                streams_by_instrument = streamsByInstrument,
                 note = "Streams created after trading date locked from timetable"
             }));
 
@@ -1331,20 +1380,61 @@ public sealed class RobotEngine
         }
         
         var instrumentUpper = instrument.ToUpperInvariant();
-        var enabledStreams = _streams.Values
-            .Where(s => !s.Committed && s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+        var utcNow = DateTimeOffset.UtcNow;
+        
+        // Log all streams for this instrument for diagnostics
+        var allStreamsForInstrument = _streams.Values
+            .Where(s => s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        
+        if (allStreamsForInstrument.Count == 0)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_STREAM_STATUS", state: "ENGINE",
+                new
+                {
+                    instrument = instrumentUpper,
+                    result = "NO_STREAMS_FOUND",
+                    total_streams_in_engine = _streams.Count,
+                    note = "No streams found for this instrument. Check timetable configuration."
+                }));
+            return null;
+        }
+        
+        // Log stream details for diagnostics
+        var streamDetails = allStreamsForInstrument.Select(s => new
+        {
+            stream_id = s.Stream,
+            session = s.Session,
+            instrument = s.Instrument,
+            slot_time = s.SlotTimeChicago,
+            committed = s.Committed,
+            state = s.State.ToString()
+        }).ToList();
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+            eventType: "BARSREQUEST_STREAM_STATUS", state: "ENGINE",
+            new
+            {
+                instrument = instrumentUpper,
+                total_streams = allStreamsForInstrument.Count,
+                streams = streamDetails
+            }));
+        
+        var enabledStreams = allStreamsForInstrument
+            .Where(s => !s.Committed)
             .ToList();
         
         if (enabledStreams.Count == 0)
         {
-            var allInstruments = _streams.Values.Where(s => !s.Committed).Select(s => s.Instrument).Distinct().ToList();
-            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
-                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
-                new { 
-                    instrument, 
-                    reason = "no_enabled_streams_for_instrument",
-                    total_streams = _streams.Count,
-                    enabled_instruments = allInstruments
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_STREAM_STATUS", state: "ENGINE",
+                new
+                {
+                    instrument = instrumentUpper,
+                    result = "ALL_STREAMS_COMMITTED",
+                    total_streams = allStreamsForInstrument.Count,
+                    note = "All streams are committed - no active streams for BarsRequest"
                 }));
             return null;
         }
@@ -1352,6 +1442,7 @@ public sealed class RobotEngine
         // Find earliest range_start across all sessions used by enabled streams
         var sessionsUsed = enabledStreams.Select(s => s.Session).Distinct().ToList();
         string? earliestRangeStart = null;
+        var sessionRangeStarts = new Dictionary<string, string>();
         
         foreach (var session in sessionsUsed)
         {
@@ -1360,6 +1451,7 @@ public sealed class RobotEngine
                 var rangeStart = sessionInfo.range_start_time;
                 if (!string.IsNullOrWhiteSpace(rangeStart))
                 {
+                    sessionRangeStarts[session] = rangeStart;
                     if (earliestRangeStart == null || string.Compare(rangeStart, earliestRangeStart, StringComparison.Ordinal) < 0)
                     {
                         earliestRangeStart = rangeStart;
@@ -1370,13 +1462,15 @@ public sealed class RobotEngine
         
         if (string.IsNullOrWhiteSpace(earliestRangeStart))
         {
-            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
-                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
-                new { 
-                    instrument, 
-                    reason = "no_valid_range_start_time",
-                    enabled_stream_count = enabledStreams.Count,
-                    sessions_used = enabledStreams.Select(s => s.Session).Distinct().ToList()
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_STREAM_STATUS", state: "ENGINE",
+                new
+                {
+                    instrument = instrumentUpper,
+                    result = "NO_RANGE_START_FOUND",
+                    enabled_streams = enabledStreams.Count,
+                    sessions_used = sessionsUsed,
+                    note = "No range_start_time found in session definitions"
                 }));
             return null;
         }
@@ -1390,16 +1484,31 @@ public sealed class RobotEngine
         
         if (string.IsNullOrWhiteSpace(latestSlotTime))
         {
-            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, 
-                eventType: "BARSREQUEST_RANGE_NULL", state: "ENGINE",
-                new { 
-                    instrument, 
-                    reason = "no_valid_slot_time",
-                    enabled_stream_count = enabledStreams.Count,
-                    streams_with_slot_times = enabledStreams.Where(s => !string.IsNullOrWhiteSpace(s.SlotTimeChicago)).Select(s => new { stream = s.Stream, slot_time = s.SlotTimeChicago }).ToList()
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+                eventType: "BARSREQUEST_STREAM_STATUS", state: "ENGINE",
+                new
+                {
+                    instrument = instrumentUpper,
+                    result = "NO_SLOT_TIME_FOUND",
+                    enabled_streams = enabledStreams.Count,
+                    note = "No valid slot_time found in enabled streams"
                 }));
             return null;
         }
+        
+        // Log successful range determination
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+            eventType: "BARSREQUEST_RANGE_DETERMINED", state: "ENGINE",
+            new
+            {
+                instrument = instrumentUpper,
+                earliest_range_start = earliestRangeStart,
+                latest_slot_time = latestSlotTime,
+                enabled_stream_count = enabledStreams.Count,
+                sessions_used = sessionsUsed,
+                session_range_starts = sessionRangeStarts,
+                stream_slot_times = enabledStreams.Select(s => new { stream_id = s.Stream, session = s.Session, slot_time = s.SlotTimeChicago }).ToList()
+            }));
         
         return (earliestRangeStart, latestSlotTime);
     }

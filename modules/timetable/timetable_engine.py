@@ -52,7 +52,8 @@ class TimetableEngine:
         # Streams to process
         self.streams = [
             "ES1", "ES2", "GC1", "GC2", "CL1", "CL2",
-            "NQ1", "NQ2", "NG1", "NG2", "YM1", "YM2"
+            "NQ1", "NQ2", "NG1", "NG2", "YM1", "YM2",
+            "RTY1", "RTY2"
         ]
         
         # Day-of-month blocked days for "2" streams (from centralized config)
@@ -491,7 +492,7 @@ class TimetableEngine:
         target_dom = trade_date_obj.day
         
         # Build streams array from master matrix data
-        # CRITICAL: Must include ALL 12 streams (complete execution contract)
+        # CRITICAL: Must include ALL streams (complete execution contract)
         # Streams not in master matrix or filtered are included with enabled=false
         streams_dict = {}  # stream_id -> stream_entry
         seen_streams = set()
@@ -516,17 +517,30 @@ class TimetableEngine:
             session = 'S1' if stream.endswith('1') else 'S2'
             
             # Get time (use Time Change if available, otherwise Time)
+            # Time Change can be either:
+            # 1. Just the new time (e.g., "08:00") - current format
+            # 2. "old -> new" format (e.g., "07:30 -> 08:00") - backward compatibility
             time = row.get('Time', '')
             time_change = row.get('Time Change', '')
-            if time_change and '->' in str(time_change):
-                parts = str(time_change).split('->')
-                if len(parts) == 2:
-                    time = parts[1].strip()
+            if time_change and str(time_change).strip():
+                time_change_str = str(time_change).strip()
+                if '->' in time_change_str:
+                    # Backward compatibility: parse "old -> new" format
+                    parts = time_change_str.split('->')
+                    if len(parts) == 2:
+                        time = parts[1].strip()
+                else:
+                    # Current format: Time Change is just the new time
+                    time = time_change_str
             
             # If no time, use default for session
             if not time:
                 available_times = self.session_time_slots.get(session, [])
                 time = available_times[0] if available_times else ""
+            
+            # Initialize enabled status
+            enabled = True
+            block_reason = None
             
             # Check final_allowed column first (if exists, this is the authoritative filter)
             if has_final_allowed:
@@ -535,14 +549,8 @@ class TimetableEngine:
                 if final_allowed is not True:
                     enabled = False
                     block_reason = f"master_matrix_filtered_{final_allowed}"
-                else:
-                    enabled = True
-                    block_reason = None
             else:
                 # No final_allowed column - check filters manually
-                enabled = True
-                block_reason = None
-                
                 if stream_filters:
                     stream_filter = stream_filters.get(stream, {})
                     
@@ -574,6 +582,33 @@ class TimetableEngine:
                             enabled = False
                             block_reason = f"master_dom_filter_{target_dom}"
             
+            # CRITICAL: Check if the selected time is in exclude_times filter
+            # If the time is filtered, block the stream
+            if enabled and stream_filters and time:
+                try:
+                    from modules.matrix.utils import normalize_time
+                    normalized_time = normalize_time(str(time))
+                    
+                    # Check stream-specific exclude_times
+                    stream_filter = stream_filters.get(stream, {})
+                    if stream_filter.get('exclude_times'):
+                        exclude_times_normalized = [normalize_time(str(t)) for t in stream_filter['exclude_times']]
+                        if normalized_time in exclude_times_normalized:
+                            enabled = False
+                            block_reason = f"time_filter({','.join(stream_filter['exclude_times'])})"
+                    
+                    # Check master exclude_times if stream filter didn't block it
+                    if enabled:
+                        master_filter = stream_filters.get('master', {})
+                        if master_filter.get('exclude_times'):
+                            exclude_times_normalized = [normalize_time(str(t)) for t in master_filter['exclude_times']]
+                            if normalized_time in exclude_times_normalized:
+                                enabled = False
+                                block_reason = f"master_time_filter({','.join(master_filter['exclude_times'])})"
+                except Exception as e:
+                    # If normalization fails, log warning but don't fail
+                    logger.warning(f"Failed to check exclude_times for stream {stream} time {time}: {e}")
+            
             # Always include stream (enabled or blocked)
             stream_entry = {
                 'stream': stream,
@@ -587,7 +622,7 @@ class TimetableEngine:
                 stream_entry['block_reason'] = block_reason
             streams_dict[stream] = stream_entry
         
-        # Second pass: Ensure ALL 12 streams are present (add missing ones as blocked)
+        # Second pass: Ensure ALL 14 streams are present (add missing ones as blocked)
         for stream_id in self.streams:
             if stream_id not in streams_dict:
                 # Stream not in master matrix - add as blocked
@@ -687,7 +722,7 @@ class TimetableEngine:
         
         # Build streams array - include ALL streams (enabled and blocked)
         # Each stream_id maps to one session: ES1->S1, ES2->S2, etc.
-        # CRITICAL: Timetable must contain complete execution contract - all 12 streams
+        # CRITICAL: Timetable must contain complete execution contract - all 14 streams
         streams = []
         
         # Create a lookup dict from timetable_df: stream_id -> (session, slot_time, enabled, block_reason)

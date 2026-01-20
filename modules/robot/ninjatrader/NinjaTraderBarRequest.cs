@@ -70,6 +70,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     catch (Exception callbackEx)
                     {
                         // Catch any errors in callback (e.g., DateTimeOffset creation issues)
+                        // Log callback error if callback provided
+                        if (logCallback != null)
+                        {
+                            logCallback("BARSREQUEST_CALLBACK_ERROR", new
+                            {
+                                instrument = instrument.MasterInstrument.Name,
+                                error_code = errorCode.ToString(),
+                                error_message = errorMessage,
+                                exception_message = callbackEx.Message,
+                                exception_type = callbackEx.GetType().Name,
+                                note = "Error occurred in BarsRequest callback handler"
+                            });
+                        }
                         throw new InvalidOperationException($"BarsRequest callback error: {callbackEx.Message}", callbackEx);
                     }
                     finally

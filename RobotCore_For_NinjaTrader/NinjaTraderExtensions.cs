@@ -31,6 +31,9 @@ public static class NinjaTraderExtensions
     /// <summary>
     /// Convert NinjaTrader bar exchange time to UTC DateTimeOffset.
     /// Handles Chicago timezone conversion with DST awareness.
+    /// 
+    /// CRITICAL: This method assumes barExchangeTime is in Chicago local time (exchange time).
+    /// If Times[0][0] is already UTC, use the detection logic in RobotSimStrategy.OnBarUpdate instead.
     /// </summary>
     /// <param name="barExchangeTime">Bar time from NinjaTrader (DateTimeKind.Unspecified, Chicago time)</param>
     /// <returns>UTC DateTimeOffset</returns>
@@ -44,7 +47,10 @@ public static class NinjaTraderExtensions
             : DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Unspecified);
         
         var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-        var barChicagoOffset = new DateTimeOffset(barExchangeTimeUnspecified, chicagoTz.GetUtcOffset(barExchangeTimeUnspecified));
+        // GetUtcOffset returns the offset FROM UTC (negative for timezones behind UTC)
+        // For Chicago in January: GetUtcOffset returns -06:00:00
+        var chicagoOffset = chicagoTz.GetUtcOffset(barExchangeTimeUnspecified);
+        var barChicagoOffset = new DateTimeOffset(barExchangeTimeUnspecified, chicagoOffset);
         return barChicagoOffset.ToUniversalTime();
     }
 }

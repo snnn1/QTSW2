@@ -49,6 +49,7 @@ public sealed class StreamStateMachine
 
     public StreamState State { get; private set; } = StreamState.PRE_HYDRATION; // Initial state, will be set in constructor based on execution mode
     public bool Committed => _journal.Committed;
+    public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
     // Range tracking (points)
@@ -140,6 +141,9 @@ public sealed class StreamStateMachine
     // Logging rate limiting
     private bool _rangeComputeStartLogged = false; // Ensure RANGE_COMPUTE_START only logged once per slot
     private DateTimeOffset? _lastRangeComputeFailedLogUtc = null; // Rate-limit RANGE_COMPUTE_FAILED (once per minute max)
+    private DateTimeOffset? _lastBarFilteringLogUtc = null; // Rate-limit RANGE_COMPUTE_BAR_FILTERING (once per minute max)
+    private DateTimeOffset? _stateEntryTimeUtc = null; // Track when current state was entered (for stuck detection)
+    private DateTimeOffset? _lastStuckStateCheckUtc = null; // Rate-limit stuck state checks (once per 5 minutes max)
     
     // Assertion flags (once per stream per day)
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
@@ -270,6 +274,9 @@ public sealed class StreamStateMachine
             LastUpdateUtc = DateTimeOffset.MinValue.ToString("o"),
             TimetableHashAtCommit = null
         };
+        
+        // Initialize state entry time tracking
+        _stateEntryTimeUtc = DateTimeOffset.UtcNow;
     }
 
     public bool IsSameInstrument(string instrument) =>
@@ -991,6 +998,17 @@ public sealed class StreamStateMachine
                             }));
                     }
                     
+                    // Check if stream is stuck in RANGE_BUILDING state
+                    CheckForStuckState(utcNow, "RANGE_BUILDING", new
+                    {
+                        reason = "Range computation failing repeatedly",
+                        range_compute_failure_reason = rangeResult.Reason,
+                        bar_count = rangeResult.BarCount,
+                        time_since_range_start_minutes = (utcNow - RangeStartUtc).TotalMinutes,
+                        time_until_slot_minutes = (SlotTimeUtc - utcNow).TotalMinutes,
+                        prerequisite_check = "Range computation requires bars in window"
+                    });
+                    
                     // Don't commit NO_TRADE - allow retry or partial range computation
                     return;
                 }
@@ -1441,19 +1459,32 @@ public sealed class StreamStateMachine
                             var wasInvalidated = _rangeInvalidated;
                             _rangeInvalidated = true;
                             
-                            LogHealth("ERROR", "GAP_TOLERANCE_VIOLATION", $"Range invalidated due to gap violation: {violationReason}",
-                                new
-                                {
-                                    instrument = Instrument,
-                                    slot = Stream,
-                                    violation_reason = violationReason,
-                                    gap_minutes = gapMinutes,
-                                    largest_single_gap_minutes = _largestSingleGapMinutes,
-                                    total_gap_minutes = _totalGapMinutes,
-                                    previous_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
-                                    current_bar_open_chicago = barChicagoTime.ToString("o"),
-                                    slot_time_chicago = SlotTimeChicagoTime.ToString("o")
-                                });
+                            var gapViolationData = new
+                            {
+                                instrument = Instrument,
+                                slot = Stream,
+                                violation_reason = violationReason,
+                                gap_minutes = gapMinutes,
+                                largest_single_gap_minutes = _largestSingleGapMinutes,
+                                total_gap_minutes = _totalGapMinutes,
+                                previous_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
+                                current_bar_open_chicago = barChicagoTime.ToString("o"),
+                                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                                gap_location = $"Between {_lastBarOpenChicago.Value:HH:mm} and {barChicagoTime:HH:mm} Chicago time",
+                                minutes_until_slot_time = (SlotTimeChicagoTime - barChicagoTime).TotalMinutes,
+                                note = gapMinutes > MAX_SINGLE_GAP_MINUTES 
+                                    ? $"Single gap of {gapMinutes:F1} minutes exceeds limit of {MAX_SINGLE_GAP_MINUTES} minutes"
+                                    : _totalGapMinutes > MAX_TOTAL_GAP_MINUTES
+                                    ? $"Total gaps of {_totalGapMinutes:F1} minutes exceed limit of {MAX_TOTAL_GAP_MINUTES} minutes"
+                                    : $"Gap of {gapMinutes:F1} minutes in last 10 minutes exceeds limit of {MAX_GAP_LAST_10_MINUTES} minutes"
+                            };
+                            
+                            // Log to health directory (detailed health tracking)
+                            LogHealth("ERROR", "GAP_TOLERANCE_VIOLATION", $"Range invalidated due to gap violation: {violationReason}", gapViolationData);
+                            
+                            // Also log to main engine log for easier discovery
+                            log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                "GAP_TOLERANCE_VIOLATION", State.ToString(), gapViolationData));
                             
                             // Notify RANGE_INVALIDATED once per slot (transition false → true)
                             if (!wasInvalidated && !_rangeInvalidatedNotified)
@@ -2028,6 +2059,14 @@ public sealed class StreamStateMachine
         // Get expected trading date from journal (should match timetable)
         var expectedTradingDate = TradingDate; // Format: "YYYY-MM-DD"
         
+        // Track filtering statistics for diagnostics
+        int barsFilteredByDate = 0;
+        int barsFilteredByTimeWindow = 0;
+        int barsAccepted = 0;
+        DateTimeOffset? firstFilteredBarUtc = null;
+        DateTimeOffset? lastFilteredBarUtc = null;
+        string? firstFilteredBarReason = null;
+        
         foreach (var bar in bars)
         {
             // Capture raw timestamp as received (assumed UTC)
@@ -2043,6 +2082,13 @@ public sealed class StreamStateMachine
             {
                 // Bar is from wrong trading date - skip it
                 // This ensures we only compute ranges from bars matching the timetable trading date
+                barsFilteredByDate++;
+                if (firstFilteredBarUtc == null)
+                {
+                    firstFilteredBarUtc = barRawUtc;
+                    firstFilteredBarReason = $"Date mismatch: bar date {barTradingDate} != expected {expectedTradingDate}";
+                }
+                lastFilteredBarUtc = barRawUtc;
                 continue;
             }
             
@@ -2052,6 +2098,7 @@ public sealed class StreamStateMachine
             {
                 filteredBars.Add(bar);
                 barChicagoTimes[bar] = barChicagoTime; // Cache Chicago time for reuse
+                barsAccepted++;
                 
                 // Capture diagnostic info for first and last filtered bars
                 if (firstBarRawUtc == null)
@@ -2063,6 +2110,47 @@ public sealed class StreamStateMachine
                 lastBarRawUtc = barRawUtc;
                 lastBarRawUtcKind = barRawUtcKind;
                 lastBarChicago = barChicagoTime;
+            }
+            else
+            {
+                // Bar is from correct date but outside time window
+                barsFilteredByTimeWindow++;
+                if (firstFilteredBarUtc == null && barsFilteredByDate == 0)
+                {
+                    firstFilteredBarUtc = barRawUtc;
+                    var barTimeStr = barChicagoTime.ToString("HH:mm:ss");
+                    var rangeStartStr = RangeStartChicagoTime.ToString("HH:mm:ss");
+                    var rangeEndStr = endTimeChicagoActual.ToString("HH:mm:ss");
+                    firstFilteredBarReason = $"Time window: bar time {barTimeStr} not in [{rangeStartStr}, {rangeEndStr})";
+                }
+                lastFilteredBarUtc = barRawUtc;
+            }
+        }
+        
+        // Log bar filtering details if bars were filtered out (rate-limited, diagnostic only)
+        if (_enableDiagnosticLogs && (barsFilteredByDate > 0 || barsFilteredByTimeWindow > 0))
+        {
+            var shouldLogFiltering = !_lastBarFilteringLogUtc.HasValue || 
+                                    (utcNow - _lastBarFilteringLogUtc.Value).TotalMinutes >= 1.0;
+            if (shouldLogFiltering)
+            {
+                _lastBarFilteringLogUtc = utcNow;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RANGE_COMPUTE_BAR_FILTERING", State.ToString(),
+                    new
+                    {
+                        bars_in_buffer = bars.Count,
+                        bars_accepted = barsAccepted,
+                        bars_filtered_by_date = barsFilteredByDate,
+                        bars_filtered_by_time_window = barsFilteredByTimeWindow,
+                        expected_trading_date = expectedTradingDate,
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        range_end_chicago = endTimeChicagoActual.ToString("o"),
+                        first_filtered_bar_utc = firstFilteredBarUtc?.ToString("o"),
+                        last_filtered_bar_utc = lastFilteredBarUtc?.ToString("o"),
+                        first_filtered_bar_reason = firstFilteredBarReason,
+                        note = $"Bar filtering details: {barsAccepted} accepted, {barsFilteredByDate} filtered by date, {barsFilteredByTimeWindow} filtered by time window"
+                    }));
             }
         }
         
@@ -2970,13 +3058,78 @@ public sealed class StreamStateMachine
     /// </summary>
     private bool IsSimMode() => _executionMode == ExecutionMode.SIM;
 
+    /// <summary>
+    /// Check if stream is stuck in current state and log warning if so.
+    /// </summary>
+    private void CheckForStuckState(DateTimeOffset utcNow, string stateName, object? context = null)
+    {
+        // Rate-limit stuck state checks (once per 5 minutes max)
+        if (_lastStuckStateCheckUtc.HasValue && 
+            (utcNow - _lastStuckStateCheckUtc.Value).TotalMinutes < 5.0)
+        {
+            return; // Too soon to check again
+        }
+        
+        _lastStuckStateCheckUtc = utcNow;
+        
+        if (!_stateEntryTimeUtc.HasValue)
+        {
+            _stateEntryTimeUtc = utcNow; // Initialize if not set
+            return;
+        }
+        
+        var timeInState = (utcNow - _stateEntryTimeUtc.Value).TotalMinutes;
+        
+        // Define expected maximum time in each state (in minutes)
+        var maxTimeInState = stateName switch
+        {
+            "PRE_HYDRATION" => 30.0, // Should complete quickly
+            "ARMED" => 60.0, // Can wait up to range_start_time
+            "RANGE_BUILDING" => 120.0, // Can take up to slot_time
+            "RANGE_LOCKED" => 480.0, // Can last until market close
+            _ => 60.0 // Default threshold
+        };
+        
+        if (timeInState > maxTimeInState)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "STREAM_STATE_STUCK", State.ToString(),
+                new
+                {
+                    state = stateName,
+                    time_in_state_minutes = Math.Round(timeInState, 2),
+                    max_expected_time_minutes = maxTimeInState,
+                    state_entry_time_utc = _stateEntryTimeUtc.Value.ToString("o"),
+                    current_time_utc = utcNow.ToString("o"),
+                    context = context,
+                    note = $"Stream has been in {stateName} state for {Math.Round(timeInState, 1)} minutes, exceeding expected maximum of {maxTimeInState} minutes"
+                }));
+        }
+    }
+    
     private void Transition(DateTimeOffset utcNow, StreamState next, string eventType, object? extra = null)
     {
+        var previousState = State;
+        var timeInPreviousState = _stateEntryTimeUtc.HasValue 
+            ? (utcNow - _stateEntryTimeUtc.Value).TotalMinutes 
+            : (double?)null;
+        
         State = next;
+        _stateEntryTimeUtc = utcNow; // Track when we entered this state
         _journal.LastState = next.ToString();
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journals.Save(_journal);
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, eventType, next.ToString(), extra));
+        
+        // Log state transition with context
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, eventType, next.ToString(), 
+            new
+            {
+                previous_state = previousState.ToString(),
+                new_state = next.ToString(),
+                time_in_previous_state_minutes = timeInPreviousState.HasValue ? Math.Round(timeInPreviousState.Value, 2) : (double?)null,
+                transition_event = eventType,
+                extra_data = extra
+            }));
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, "JOURNAL_WRITTEN", next.ToString(),
             new { committed = _journal.Committed, commit_reason = _journal.CommitReason }));
         
