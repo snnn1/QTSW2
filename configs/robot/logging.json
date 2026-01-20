@@ -2,7 +2,7 @@
   "max_file_size_mb": 50,
   "max_rotated_files": 5,
   "min_log_level": "INFO",
-  "enable_diagnostic_logs": false,
+  "enable_diagnostic_logs": true,
   "diagnostic_rate_limits": {
     "tick_heartbeat_minutes": 5,
     "bar_diagnostic_seconds": 300,

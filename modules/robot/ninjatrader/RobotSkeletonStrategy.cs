@@ -5,6 +5,7 @@
 // Copy into a NinjaTrader 8 strategy project and wire references to the core engine.
 
 using System;
+using System.Collections.Generic;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
@@ -70,33 +71,73 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!_barTimeInterpretationLocked)
             {
                 // First bar: Detect and lock interpretation
-                // Try treating Times[0][0] as UTC first
+                // SIMPLIFIED: We know Times[0][0] is UTC for live bars, so try UTC first
                 var barUtcIfUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
                 var barAgeIfUtc = (nowUtc - barUtcIfUtc).TotalMinutes;
                 
-                // Try treating Times[0][0] as Chicago time
-                var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
-                var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
+                string selectedInterpretation;
+                string selectionReason;
                 
-                // Choose interpretation that gives reasonable bar age
-                if (barAgeIfUtc >= 0 && barAgeIfUtc < 10 && barAgeIfUtc < barAgeIfChicago)
+                // If UTC gives reasonable age (0-60 min), use it (expected case for live bars)
+                if (barAgeIfUtc >= 0 && barAgeIfUtc <= 60)
                 {
                     _barTimeInterpretation = BarTimeInterpretation.UTC;
                     barUtc = barUtcIfUtc;
-                }
-                else if (barAgeIfChicago >= 0 && barAgeIfChicago < 10)
-                {
-                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
-                    barUtc = barUtcIfChicago;
+                    selectedInterpretation = "UTC";
+                    selectionReason = $"UTC interpretation gives reasonable bar age ({barAgeIfUtc:F2} min)";
                 }
                 else
                 {
-                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
-                    barUtc = barUtcIfChicago;
+                    // Edge case: UTC didn't work, try Chicago (for historical bars or edge cases)
+                    var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                    var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
+                    
+                    if (barAgeIfChicago >= 0 && barAgeIfChicago <= 60)
+                    {
+                        _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                        barUtc = barUtcIfChicago;
+                        selectedInterpretation = "CHICAGO";
+                        selectionReason = $"Chicago interpretation gives reasonable bar age ({barAgeIfChicago:F2} min) - UTC gave {barAgeIfUtc:F2} min";
+                    }
+                    else
+                    {
+                        // Both failed - default to UTC (we know live bars are UTC)
+                        _barTimeInterpretation = BarTimeInterpretation.UTC;
+                        barUtc = barUtcIfUtc;
+                        selectedInterpretation = "UTC";
+                        selectionReason = $"Both interpretations unreasonable (UTC: {barAgeIfUtc:F2} min, Chicago: {barAgeIfChicago:F2} min) - defaulting to UTC for live bars";
+                    }
                 }
                 
                 // Lock interpretation
                 _barTimeInterpretationLocked = true;
+                
+                // CRITICAL INVARIANT LOG: Explicit log right after locking to make it impossible to miss
+                // This ensures if interpretation is wrong, we know immediately in logs (seconds, not hours)
+                var finalBarAge = (nowUtc - barUtc).TotalMinutes;
+                var invariantMessage = $"Bar time interpretation LOCKED = {selectedInterpretation}. First bar age = {Math.Round(finalBarAge, 2)} minutes. Reason = {selectionReason}";
+                
+                // Log to engine if available
+                if (_engine != null)
+                {
+                    var instrumentName = Instrument.MasterInstrument.Name;
+                    _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_LOCKED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "locked_interpretation", selectedInterpretation },
+                        { "reason", selectionReason },
+                        { "first_bar_age_minutes", Math.Round(finalBarAge, 2) },
+                        { "bar_age_if_utc", Math.Round(barAgeIfUtc, 2) },
+                        { "raw_times_value", barExchangeTime.ToString("o") },
+                        { "raw_times_kind", barExchangeTime.Kind.ToString() },
+                        { "final_bar_timestamp_utc", barUtc.ToString("o") },
+                        { "current_time_utc", nowUtc.ToString("o") },
+                        { "invariant", invariantMessage }
+                    });
+                }
+                
+                // Also log to NinjaTrader console for visibility
+                Log(invariantMessage, LogLevel.Information);
             }
             else
             {

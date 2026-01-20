@@ -64,9 +64,24 @@ public sealed class RobotEngine
     // Gap violation summary tracking (rate-limited)
     private DateTimeOffset? _lastGapViolationSummaryUtc = null;
     
+    // Bar rejection tracking for summary events
+    private readonly Dictionary<string, BarRejectionStats> _barRejectionStats = new Dictionary<string, BarRejectionStats>();
+    private DateTimeOffset? _lastBarRejectionSummaryUtc = null;
+    private const double BAR_REJECTION_SUMMARY_INTERVAL_MINUTES = 5.0;
+    
     // Account/environment info for startup banner (set by strategy host)
     private string? _accountName;
     private string? _environment;
+    
+    // Helper class for tracking bar rejection statistics
+    private class BarRejectionStats
+    {
+        public int PartialRejected { get; set; }
+        public int DateMismatch { get; set; }
+        public int BeforeDateLocked { get; set; }
+        public int TotalAccepted { get; set; }
+        public DateTimeOffset LastUpdateUtc { get; set; }
+    }
 
     /// <summary>
     /// Set account and environment info for startup banner.
@@ -470,16 +485,29 @@ public sealed class RobotEngine
         if (barAgeMinutes < MIN_BAR_AGE_MINUTES)
         {
             // Bar is too recent - likely partial/in-progress, reject it
+            // Track rejection statistics
+            if (!_barRejectionStats.TryGetValue(instrument, out var stats))
+            {
+                stats = new BarRejectionStats();
+                _barRejectionStats[instrument] = stats;
+            }
+            stats.PartialRejected++;
+            stats.LastUpdateUtc = utcNow;
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_PARTIAL_REJECTED", state: "ENGINE",
                 new
                 {
                     instrument = instrument,
                     bar_timestamp_utc = barUtc.ToString("o"),
                     current_time_utc = utcNow.ToString("o"),
-                    bar_age_minutes = barAgeMinutes,
+                    bar_age_minutes = Math.Round(barAgeMinutes, 3),
                     min_bar_age_minutes = MIN_BAR_AGE_MINUTES,
+                    rejection_reason = "Bar too recent - likely partial/in-progress bar",
                     note = "Bar rejected - too recent, likely partial/in-progress bar. Only fully closed bars accepted."
                 }));
+            
+            // Log rejection summary if threshold exceeded (rate-limited)
+            LogBarRejectionSummaryIfNeeded(utcNow);
             return; // Reject partial bar
         }
 
@@ -519,6 +547,15 @@ public sealed class RobotEngine
         // Trading date should be locked from timetable - if not, log error and ignore bar
         if (!_activeTradingDate.HasValue)
         {
+            // Track rejection statistics
+            if (!_barRejectionStats.TryGetValue(instrument, out var stats))
+            {
+                stats = new BarRejectionStats();
+                _barRejectionStats[instrument] = stats;
+            }
+            stats.BeforeDateLocked++;
+            stats.LastUpdateUtc = utcNow;
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BAR_RECEIVED_BEFORE_DATE_LOCKED", state: "ENGINE",
                 new
                 {
@@ -526,8 +563,12 @@ public sealed class RobotEngine
                     bar_timestamp_chicago = barChicagoTime.ToString("o"),
                     bar_trading_date = barChicagoDate.ToString("yyyy-MM-dd"),
                     instrument = instrument,
+                    rejection_reason = "Trading date not yet locked from timetable",
                     note = "Bar received before trading date locked from timetable - this should not happen in normal operation"
                 }));
+            
+            // Log rejection summary if threshold exceeded (rate-limited)
+            LogBarRejectionSummaryIfNeeded(utcNow);
             return; // Ignore bar - trading date should be locked from timetable
         }
 
@@ -539,6 +580,15 @@ public sealed class RobotEngine
             var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
             var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             
+            // Track rejection statistics
+            if (!_barRejectionStats.TryGetValue(instrument, out var stats))
+            {
+                stats = new BarRejectionStats();
+                _barRejectionStats[instrument] = stats;
+            }
+            stats.DateMismatch++;
+            stats.LastUpdateUtc = utcNow;
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "BAR_DATE_MISMATCH", state: "ENGINE",
                 new
                 {
@@ -547,11 +597,25 @@ public sealed class RobotEngine
                     bar_timestamp_utc = barUtc.ToString("o"),
                     bar_timestamp_chicago = barChicagoTime.ToString("o"),
                     instrument = instrument,
+                    rejection_reason = $"Trading date mismatch: bar date {barTradingDateStr} != locked date {tradingDateStr}",
+                    date_alignment_note = $"Bar is from {barTradingDateStr} but system expects {tradingDateStr}",
                     note = "Bar ignored - trading date is locked from timetable and immutable"
                 }));
+            
+            // Log rejection summary if threshold exceeded (rate-limited)
+            LogBarRejectionSummaryIfNeeded(utcNow);
             return; // Ignore bar from different trading date
         }
 
+        // Track acceptance statistics
+        if (!_barRejectionStats.TryGetValue(instrument, out var acceptanceStats))
+        {
+            acceptanceStats = new BarRejectionStats();
+            _barRejectionStats[instrument] = acceptanceStats;
+        }
+        acceptanceStats.TotalAccepted++;
+        acceptanceStats.LastUpdateUtc = utcNow;
+        
         // Bar date matches - log acceptance (rate-limited to avoid spam)
         var shouldLogAcceptance = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastAcceptance) ||
                                  (utcNow - lastAcceptance).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
@@ -569,6 +633,9 @@ public sealed class RobotEngine
                     note = "Bar accepted - date matches locked trading date"
                 }));
         }
+        
+        // Log rejection summary if threshold exceeded (rate-limited)
+        LogBarRejectionSummaryIfNeeded(utcNow);
 
         // Only process bars if streams exist (they should exist after EnsureStreamsCreated)
         if (_streams.Count == 0)
@@ -584,11 +651,141 @@ public sealed class RobotEngine
         }
 
         // Pass bar data to streams of matching instrument
+        var streamsReceivingBar = new List<string>();
+        var streamsFilteredOut = new List<string>();
+        
         foreach (var s in _streams.Values)
         {
             if (s.IsSameInstrument(instrument))
+            {
+                streamsReceivingBar.Add($"{s.Session}_{s.SlotTimeChicago}");
                 s.OnBar(barUtc, open, high, low, close, utcNow);
+                
+                // Log bar delivery to stream (rate-limited, diagnostic only)
+                if (_loggingConfig.enable_diagnostic_logs)
+                {
+                    var deliveryKey = $"bar_delivery_{instrument}_{s.Session}_{s.SlotTimeChicago}";
+                    var shouldLogDelivery = !_lastBarDeliveryLogUtc.TryGetValue(deliveryKey, out var lastDelivery) ||
+                                          (utcNow - lastDelivery).TotalMinutes >= 5.0;
+                    if (shouldLogDelivery)
+                    {
+                        _lastBarDeliveryLogUtc[deliveryKey] = utcNow;
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_DELIVERY_TO_STREAM", state: "ENGINE",
+                            new
+                            {
+                                instrument = instrument,
+                                stream = $"{s.Session}_{s.SlotTimeChicago}",
+                                bar_timestamp_utc = barUtc.ToString("o"),
+                                bar_timestamp_chicago = barChicagoTime.ToString("o"),
+                                note = "Bar delivered to stream"
+                            }));
+                    }
+                }
+            }
+            else
+            {
+                streamsFilteredOut.Add($"{s.Session}_{s.SlotTimeChicago}");
+            }
         }
+        
+        // Log bar delivery summary periodically (rate-limited)
+        LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
+    }
+    
+    /// <summary>
+    /// Log bar rejection summary if interval has elapsed (rate-limited to every 5 minutes).
+    /// </summary>
+    private void LogBarRejectionSummaryIfNeeded(DateTimeOffset utcNow)
+    {
+        if (_lastBarRejectionSummaryUtc.HasValue && 
+            (utcNow - _lastBarRejectionSummaryUtc.Value).TotalMinutes < BAR_REJECTION_SUMMARY_INTERVAL_MINUTES)
+        {
+            return; // Too soon to log summary
+        }
+        
+        _lastBarRejectionSummaryUtc = utcNow;
+        
+        // Build summary for each instrument
+        var summary = new Dictionary<string, object>();
+        foreach (var kvp in _barRejectionStats)
+        {
+            var instrument = kvp.Key;
+            var stats = kvp.Value;
+            var totalRejected = stats.PartialRejected + stats.DateMismatch + stats.BeforeDateLocked;
+            var totalProcessed = totalRejected + stats.TotalAccepted;
+            var rejectionRate = totalProcessed > 0 ? (double)totalRejected / totalProcessed * 100.0 : 0.0;
+            
+            summary[instrument] = new
+            {
+                total_accepted = stats.TotalAccepted,
+                partial_rejected = stats.PartialRejected,
+                date_mismatch = stats.DateMismatch,
+                before_date_locked = stats.BeforeDateLocked,
+                total_rejected = totalRejected,
+                total_processed = totalProcessed,
+                rejection_rate_percent = Math.Round(rejectionRate, 2),
+                last_update_utc = stats.LastUpdateUtc.ToString("o")
+            };
+            
+            // Log warning if rejection rate exceeds threshold
+            if (rejectionRate > 50.0 && totalProcessed >= 10)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_REJECTION_RATE_HIGH", state: "ENGINE",
+                    new
+                    {
+                        instrument = instrument,
+                        rejection_rate_percent = Math.Round(rejectionRate, 2),
+                        total_processed = totalProcessed,
+                        total_rejected = totalRejected,
+                        partial_rejected = stats.PartialRejected,
+                        date_mismatch = stats.DateMismatch,
+                        before_date_locked = stats.BeforeDateLocked,
+                        note = $"High rejection rate detected - {rejectionRate:F1}% of bars rejected. Check timezone conversion and date alignment."
+                    }));
+            }
+        }
+        
+        if (summary.Count > 0)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_REJECTION_SUMMARY", state: "ENGINE",
+                new
+                {
+                    summary = summary,
+                    note = $"Bar rejection statistics (last {BAR_REJECTION_SUMMARY_INTERVAL_MINUTES} minutes)"
+                }));
+        }
+    }
+    
+    // Rate-limiting for bar delivery logging (per stream)
+    private readonly Dictionary<string, DateTimeOffset> _lastBarDeliveryLogUtc = new Dictionary<string, DateTimeOffset>();
+    private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
+    private const double BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES = 5.0;
+    
+    /// <summary>
+    /// Log bar delivery summary if interval has elapsed (rate-limited to every 5 minutes).
+    /// </summary>
+    private void LogBarDeliverySummaryIfNeeded(DateTimeOffset utcNow, string instrument, List<string> streamsReceivingBar, List<string> streamsFilteredOut)
+    {
+        if (!_loggingConfig.enable_diagnostic_logs) return;
+        
+        if (_lastBarDeliverySummaryUtc.HasValue && 
+            (utcNow - _lastBarDeliverySummaryUtc.Value).TotalMinutes < BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES)
+        {
+            return; // Too soon to log summary
+        }
+        
+        _lastBarDeliverySummaryUtc = utcNow;
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_DELIVERY_SUMMARY", state: "ENGINE",
+            new
+            {
+                instrument = instrument,
+                streams_receiving_bars = streamsReceivingBar,
+                streams_filtered_out = streamsFilteredOut,
+                total_streams_receiving = streamsReceivingBar.Count,
+                total_streams_filtered = streamsFilteredOut.Count,
+                note = $"Bar delivery distribution across streams (last {BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES} minutes)"
+            }));
     }
 
     /// <summary>

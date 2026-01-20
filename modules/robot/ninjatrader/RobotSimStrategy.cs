@@ -455,64 +455,82 @@ namespace NinjaTrader.NinjaScript.Strategies
             var nowUtc = DateTimeOffset.UtcNow;
             DateTimeOffset barUtc;
             
+            // DIAGNOSTIC: Log when detection path is entered (first bar only)
+            if (!_barTimeInterpretationLocked && _engine != null)
+            {
+                var instrumentName = Instrument.MasterInstrument.Name;
+                _engine.LogEngineEvent(nowUtc, "BAR_TIME_DETECTION_STARTING", new Dictionary<string, object>
+                {
+                    { "instrument", instrumentName },
+                    { "current_bar", CurrentBar },
+                    { "bar_exchange_time", barExchangeTime.ToString("o") },
+                    { "note", "Starting timezone detection for first bar" }
+                });
+            }
+            
             if (!_barTimeInterpretationLocked)
             {
                 // First bar: Detect and lock interpretation
-                // Try treating Times[0][0] as UTC first
+                // SIMPLIFIED: We know Times[0][0] is UTC for live bars, so try UTC first
                 var barUtcIfUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
                 var barAgeIfUtc = (nowUtc - barUtcIfUtc).TotalMinutes;
                 
-                // Try treating Times[0][0] as Chicago time
-                var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
-                var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
-                
-                // Choose interpretation that gives reasonable bar age (between 0 and 10 minutes for recent bars)
                 string selectedInterpretation;
                 string selectionReason;
                 
-                if (barAgeIfUtc >= 0 && barAgeIfUtc < 10 && barAgeIfUtc < barAgeIfChicago)
+                // If UTC gives reasonable age (0-60 min), use it (expected case for live bars)
+                if (barAgeIfUtc >= 0 && barAgeIfUtc <= 60)
                 {
-                    // Times[0][0] appears to be UTC
                     _barTimeInterpretation = BarTimeInterpretation.UTC;
                     barUtc = barUtcIfUtc;
                     selectedInterpretation = "UTC";
-                    selectionReason = $"UTC interpretation gives reasonable bar age ({barAgeIfUtc:F2} min) and is better than Chicago ({barAgeIfChicago:F2} min)";
-                }
-                else if (barAgeIfChicago >= 0 && barAgeIfChicago < 10)
-                {
-                    // Times[0][0] appears to be Chicago time
-                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
-                    barUtc = barUtcIfChicago;
-                    selectedInterpretation = "CHICAGO";
-                    selectionReason = $"Chicago interpretation gives reasonable bar age ({barAgeIfChicago:F2} min)";
+                    selectionReason = $"UTC interpretation gives reasonable bar age ({barAgeIfUtc:F2} min)";
                 }
                 else
                 {
-                    // Fallback: Use Chicago interpretation (documented behavior)
-                    _barTimeInterpretation = BarTimeInterpretation.Chicago;
-                    barUtc = barUtcIfChicago;
-                    selectedInterpretation = "CHICAGO";
-                    selectionReason = $"Fallback to Chicago interpretation (documented behavior). UTC age: {barAgeIfUtc:F2} min, Chicago age: {barAgeIfChicago:F2} min";
+                    // Edge case: UTC didn't work, try Chicago (for historical bars or edge cases)
+                    var barUtcIfChicago = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                    var barAgeIfChicago = (nowUtc - barUtcIfChicago).TotalMinutes;
+                    
+                    if (barAgeIfChicago >= 0 && barAgeIfChicago <= 60)
+                    {
+                        _barTimeInterpretation = BarTimeInterpretation.Chicago;
+                        barUtc = barUtcIfChicago;
+                        selectedInterpretation = "CHICAGO";
+                        selectionReason = $"Chicago interpretation gives reasonable bar age ({barAgeIfChicago:F2} min) - UTC gave {barAgeIfUtc:F2} min";
+                    }
+                    else
+                    {
+                        // Both failed - default to UTC (we know live bars are UTC)
+                        _barTimeInterpretation = BarTimeInterpretation.UTC;
+                        barUtc = barUtcIfUtc;
+                        selectedInterpretation = "UTC";
+                        selectionReason = $"Both interpretations unreasonable (UTC: {barAgeIfUtc:F2} min, Chicago: {barAgeIfChicago:F2} min) - defaulting to UTC for live bars";
+                    }
                 }
                 
                 // Lock interpretation
                 _barTimeInterpretationLocked = true;
                 
-                // Log detection (always log on first bar)
+                // CRITICAL INVARIANT LOG: Explicit log right after locking to make it impossible to miss
+                // This ensures if interpretation is wrong, we know immediately in logs (seconds, not hours)
                 if (_engine != null)
                 {
                     var instrumentName = Instrument.MasterInstrument.Name;
-                    _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_DETECTED", new Dictionary<string, object>
+                    var finalBarAge = (nowUtc - barUtc).TotalMinutes;
+                    
+                    _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_LOCKED", new Dictionary<string, object>
                     {
                         { "instrument", instrumentName },
+                        { "locked_interpretation", selectedInterpretation },
+                        { "reason", selectionReason },
+                        { "first_bar_age_minutes", Math.Round(finalBarAge, 2) },
+                        { "bar_age_if_utc", Math.Round(barAgeIfUtc, 2) },
                         { "raw_times_value", barExchangeTime.ToString("o") },
                         { "raw_times_kind", barExchangeTime.Kind.ToString() },
-                        { "chosen_interpretation", selectedInterpretation },
-                        { "reason", selectionReason },
-                        { "bar_age_if_utc", Math.Round(barAgeIfUtc, 2) },
-                        { "bar_age_if_chicago", Math.Round(barAgeIfChicago, 2) },
                         { "final_bar_timestamp_utc", barUtc.ToString("o") },
-                        { "current_time_utc", nowUtc.ToString("o") }
+                        { "current_time_utc", nowUtc.ToString("o") },
+                        { "invariant", $"Bar time interpretation LOCKED = {selectedInterpretation}. First bar age = {Math.Round(finalBarAge, 2)} minutes. Reason = {selectionReason}" }
                     });
                 }
             }
