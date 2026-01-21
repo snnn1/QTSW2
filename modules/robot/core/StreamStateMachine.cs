@@ -1955,7 +1955,7 @@ public sealed class StreamStateMachine
         // Range window is defined in Chicago time to match trading session semantics
         // State-independent buffering: Always buffer bars within range window regardless of state
         if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
-            {
+        {
                 // DEFENSIVE: Validate bar data before buffering
                 string? validationError = null;
                 if (high < low)
@@ -2151,33 +2151,32 @@ public sealed class StreamStateMachine
                 // Always update FreezeClose to latest bar's close (will be last bar before slot_time)
                 FreezeClose = close;
                 FreezeCloseSource = "BAR_CLOSE";
-            }
-            else
+        }
+        else
+        {
+            // DIAGNOSTIC: Log bars that are filtered out (rate-limited, only when close to window and diagnostics enabled)
+            if (_enableDiagnosticLogs && shouldLogBar)
             {
-                // DIAGNOSTIC: Log bars that are filtered out (rate-limited, only when close to window and diagnostics enabled)
-                if (_enableDiagnosticLogs && shouldLogBar)
+                var timeUntilStart = (RangeStartChicagoTime - barChicagoTime).TotalMinutes;
+                var timeAfterEnd = (barChicagoTime - SlotTimeChicagoTime).TotalMinutes;
+                if (Math.Abs(timeUntilStart) < 30 || Math.Abs(timeAfterEnd) < 30)
                 {
-                    var timeUntilStart = (RangeStartChicagoTime - barChicagoTime).TotalMinutes;
-                    var timeAfterEnd = (barChicagoTime - SlotTimeChicagoTime).TotalMinutes;
-                    if (Math.Abs(timeUntilStart) < 30 || Math.Abs(timeAfterEnd) < 30)
-                    {
-                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                            "BAR_FILTERED_OUT", State.ToString(),
-                            new
-                            {
-                                bar_utc = barUtc.ToString("o"),
-                                bar_chicago = barChicagoTime.ToString("o"),
-                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                                range_end_chicago = SlotTimeChicagoTime.ToString("o"),
-                                reason = barChicagoTime < RangeStartChicagoTime ? "BEFORE_RANGE_START" : "AFTER_RANGE_END",
-                                minutes_from_start = timeUntilStart,
-                                minutes_from_end = timeAfterEnd
-                            }));
-                    }
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "BAR_FILTERED_OUT", State.ToString(),
+                        new
+                        {
+                            bar_utc = barUtc.ToString("o"),
+                            bar_chicago = barChicagoTime.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            range_end_chicago = SlotTimeChicagoTime.ToString("o"),
+                            reason = barChicagoTime < RangeStartChicagoTime ? "BEFORE_RANGE_START" : "AFTER_RANGE_END",
+                            minutes_from_start = timeUntilStart,
+                            minutes_from_end = timeAfterEnd
+                        }));
                 }
             }
-            // Bars at/after slot time are for breakout detection (handled in RANGE_LOCKED state)
         }
+        // Bars at/after slot time are for breakout detection (handled in RANGE_LOCKED state)
         
         // Handle RANGE_LOCKED state separately (bars at/after slot time for breakout detection)
         if (State == StreamState.RANGE_LOCKED)

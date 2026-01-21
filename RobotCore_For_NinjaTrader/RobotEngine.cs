@@ -1163,8 +1163,8 @@ public sealed class RobotEngine
                     filtered_partial = barsFilteredPartial,
                     total_filtered = totalFiltered,
                     streams_fed = streamsFed,
-                    first_bar_utc = filteredBars[0].TimestampUtc.ToString("o"),
-                    last_bar_utc = filteredBars[filteredBars.Count - 1].TimestampUtc.ToString("o"),
+                    first_bar_utc = filteredBars.Count > 0 ? filteredBars[0].TimestampUtc.ToString("o") : null,
+                    last_bar_utc = filteredBars.Count > 0 ? filteredBars[filteredBars.Count - 1].TimestampUtc.ToString("o") : null,
                     source = "NinjaTrader_BarsRequest",
                     note = "Only fully closed bars loaded (filtered future and partial bars)"
                 }));
