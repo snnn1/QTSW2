@@ -433,4 +433,15 @@ public class ExecutionJournalEntry
     public string? BEModifiedAt { get; set; }
 
     public decimal? BEStopPrice { get; set; }
+    
+    // Minimal extension for recovery: deterministic rebuild fields
+    public string? Direction { get; set; }
+    
+    public decimal? EntryPrice { get; set; }
+    
+    public decimal? StopPrice { get; set; }
+    
+    public decimal? TargetPrice { get; set; }
+    
+    public string? OcoGroup { get; set; }
 }

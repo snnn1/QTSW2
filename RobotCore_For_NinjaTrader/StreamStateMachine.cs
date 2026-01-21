@@ -80,6 +80,7 @@ public sealed class StreamStateMachine
     private readonly IExecutionAdapter? _executionAdapter;
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
+    private bool _stopBracketsSubmittedAtLock = false;
     
     // PHASE 4: Alert callback for missing data incidents
     private Action<string, string, string, int>? _alertCallback;
@@ -1802,6 +1803,14 @@ public sealed class StreamStateMachine
                 CheckImmediateEntryAtLock(utcNow);
             }
 
+            // NEW: Place stop entry bracket orders immediately after range locks (SIM/LIVE),
+            // so the breakout can fill without requiring our bar-by-bar "detect then submit" path.
+            // If an immediate entry was already detected/submitted at lock, skip bracket placement.
+            if (!_entryDetected && utcNow < MarketCloseUtc)
+            {
+                SubmitStopEntryBracketsAtLock(utcNow);
+            }
+
             // Log intended brackets (all execution modes)
             if (utcNow < MarketCloseUtc)
                 LogIntendedBracketsPlaced(utcNow);
@@ -2045,38 +2054,44 @@ public sealed class StreamStateMachine
                 // Gap tolerance tracking (treat bar timestamp as bar OPEN time in Chicago)
                 if (_lastBarOpenChicago.HasValue)
                 {
-                    var gapMinutes = (barChicagoTime - _lastBarOpenChicago.Value).TotalMinutes;
+                    // IMPORTANT:
+                    // - For 1-minute bars, a "normal" delta is ~1 minute.
+                    // - A delta of 2 minutes means we are missing ~1 minute-bar (2 - 1).
+                    // We track missing minutes (delta - 1), not the raw delta, otherwise totals explode too fast.
+                    var gapDeltaMinutes = (barChicagoTime - _lastBarOpenChicago.Value).TotalMinutes;
                     
                     // Only track gaps > 1 minute (normal 1-minute bars have ~1 minute gaps)
-                    if (gapMinutes > 1.0)
+                    if (gapDeltaMinutes > 1.0)
                     {
+                        var missingMinutes = gapDeltaMinutes - 1.0;
+
                         // Update gap tracking
-                        if (gapMinutes > _largestSingleGapMinutes)
-                            _largestSingleGapMinutes = gapMinutes;
+                        if (missingMinutes > _largestSingleGapMinutes)
+                            _largestSingleGapMinutes = missingMinutes;
                         
-                        _totalGapMinutes += gapMinutes;
+                        _totalGapMinutes += missingMinutes;
                         
                         // Check gap tolerance rules (invalidate immediately if violated)
                         bool violated = false;
                         string violationReason = "";
                         
-                        if (gapMinutes > MAX_SINGLE_GAP_MINUTES)
+                        if (missingMinutes > MAX_SINGLE_GAP_MINUTES)
                         {
                             violated = true;
-                            violationReason = $"Single gap {gapMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES})";
+                            violationReason = $"Single gap missing {missingMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES})";
                         }
                         else if (_totalGapMinutes > MAX_TOTAL_GAP_MINUTES)
                         {
                             violated = true;
-                            violationReason = $"Total gap {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES})";
+                            violationReason = $"Total gap missing {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES})";
                         }
                         
                         // Check last 10 minutes rule
                         var last10MinStart = SlotTimeChicagoTime.AddMinutes(-10);
-                        if (barChicagoTime >= last10MinStart && gapMinutes > MAX_GAP_LAST_10_MINUTES)
+                        if (barChicagoTime >= last10MinStart && missingMinutes > MAX_GAP_LAST_10_MINUTES)
                         {
                             violated = true;
-                            violationReason = $"Gap {gapMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES})";
+                            violationReason = $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES})";
                         }
                         
                         if (violated)
@@ -2089,7 +2104,10 @@ public sealed class StreamStateMachine
                                 instrument = Instrument,
                                 slot = Stream,
                                 violation_reason = violationReason,
-                                gap_minutes = gapMinutes,
+                                // Backward-compat: keep gap_minutes, but now it means "missing minutes"
+                                gap_minutes = missingMinutes,
+                                // Extra forensic context: raw delta between bar opens
+                                gap_delta_minutes = gapDeltaMinutes,
                                 largest_single_gap_minutes = _largestSingleGapMinutes,
                                 total_gap_minutes = _totalGapMinutes,
                                 previous_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
@@ -2097,11 +2115,11 @@ public sealed class StreamStateMachine
                                 slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
                                 gap_location = $"Between {_lastBarOpenChicago.Value:HH:mm} and {barChicagoTime:HH:mm} Chicago time",
                                 minutes_until_slot_time = (SlotTimeChicagoTime - barChicagoTime).TotalMinutes,
-                                note = gapMinutes > MAX_SINGLE_GAP_MINUTES 
-                                    ? $"Single gap of {gapMinutes:F1} minutes exceeds limit of {MAX_SINGLE_GAP_MINUTES} minutes"
+                                note = missingMinutes > MAX_SINGLE_GAP_MINUTES 
+                                    ? $"Single gap missing {missingMinutes:F1} minutes exceeds limit of {MAX_SINGLE_GAP_MINUTES} minutes"
                                     : _totalGapMinutes > MAX_TOTAL_GAP_MINUTES
-                                    ? $"Total gaps of {_totalGapMinutes:F1} minutes exceed limit of {MAX_TOTAL_GAP_MINUTES} minutes"
-                                    : $"Gap of {gapMinutes:F1} minutes in last 10 minutes exceeds limit of {MAX_GAP_LAST_10_MINUTES} minutes"
+                                    ? $"Total gaps missing {_totalGapMinutes:F1} minutes exceed limit of {MAX_TOTAL_GAP_MINUTES} minutes"
+                                    : $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds limit of {MAX_GAP_LAST_10_MINUTES} minutes"
                             };
                             
                             // Log to health directory (detailed health tracking)
@@ -2124,12 +2142,13 @@ public sealed class StreamStateMachine
                         else
                         {
                             // Gap within tolerance - log as WARN
-                            LogHealth("WARN", "GAP_TOLERATED", $"Gap {gapMinutes:F1} minutes tolerated (within limits)",
+                            LogHealth("WARN", "GAP_TOLERATED", $"Gap missing {missingMinutes:F1} minutes tolerated (within limits)",
                                 new
                                 {
                                     instrument = Instrument,
                                     slot = Stream,
-                                    gap_minutes = gapMinutes,
+                                    gap_minutes = missingMinutes,
+                                    gap_delta_minutes = gapDeltaMinutes,
                                     largest_single_gap_minutes = _largestSingleGapMinutes,
                                     total_gap_minutes = _totalGapMinutes,
                                     previous_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
@@ -2332,7 +2351,168 @@ public sealed class StreamStateMachine
         BracketsIntended = true;
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "INTENDED_BRACKETS_PLACED", State.ToString(),
-            new { brackets_intended = true, note = "Skeleton does not place orders." }));
+            new { brackets_intended = true, note = "Brackets intended. In SIM/LIVE, stop-entry brackets may be submitted at RANGE_LOCKED." }));
+    }
+
+    /// <summary>
+    /// Submit paired stop-market entry orders (long + short) immediately after RANGE_LOCKED.
+    /// These are linked via OCO so only one side can fill.
+    /// </summary>
+    private void SubmitStopEntryBracketsAtLock(DateTimeOffset utcNow)
+    {
+        // Idempotency: only once per stream per day
+        if (_stopBracketsSubmittedAtLock) return;
+
+        // Preconditions
+        if (_journal.Committed || State == StreamState.DONE) return;
+        if (_rangeInvalidated) return;
+        if (_executionAdapter == null || _executionJournal == null || _riskGate == null) return;
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return;
+        if (!RangeHigh.HasValue || !RangeLow.HasValue) return;
+
+        // Risk gate (fail-closed)
+        var streamArmed = !_journal.Committed && State != StreamState.DONE;
+        var (allowed, reason, failedGates) = _riskGate.CheckGates(
+            _executionMode,
+            TradingDate,
+            Stream,
+            Instrument,
+            Session,
+            SlotTimeChicago,
+            timetableValidated: true,
+            streamArmed: streamArmed,
+            utcNow);
+
+        if (!allowed)
+        {
+            // Use a deterministic id for bracket attempt logs (not a trade intent id)
+            var gateIntentId = $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}";
+            _riskGate.LogBlocked(gateIntentId, Instrument, Stream, Session, SlotTimeChicago, TradingDate,
+                reason ?? "UNKNOWN", failedGates, streamArmed, true, utcNow);
+            return;
+        }
+
+        var brkLong = _brkLongRounded.Value;
+        var brkShort = _brkShortRounded.Value;
+
+        // Shared OCO group links the two entry stops
+        var ocoGroup = RobotOrderIds.EncodeEntryOco(TradingDate, Stream, SlotTimeChicago);
+
+        // Compute protective prices deterministically from lock snapshot (pure computation)
+        var rh = RangeHigh.Value;
+        var rl = RangeLow.Value;
+        var (longStop, longTarget, longBeTrigger) = ComputeProtectivesFromLockSnapshot("Long", brkLong, rh, rl);
+        var (shortStop, shortTarget, shortBeTrigger) = ComputeProtectivesFromLockSnapshot("Short", brkShort, rh, rl);
+
+        // Build intents (canonical) for idempotency + journaling
+        var longIntent = new Intent(
+            TradingDate,
+            Stream,
+            Instrument,
+            Session,
+            SlotTimeChicago,
+            "Long",
+            brkLong,
+            stopPrice: longStop,
+            targetPrice: longTarget,
+            beTrigger: longBeTrigger,
+            entryTimeUtc: utcNow,
+            triggerReason: "STOP_BRACKETS_AT_LOCK");
+
+        var shortIntent = new Intent(
+            TradingDate,
+            Stream,
+            Instrument,
+            Session,
+            SlotTimeChicago,
+            "Short",
+            brkShort,
+            stopPrice: shortStop,
+            targetPrice: shortTarget,
+            beTrigger: shortBeTrigger,
+            entryTimeUtc: utcNow,
+            triggerReason: "STOP_BRACKETS_AT_LOCK");
+
+        var longIntentId = longIntent.ComputeIntentId();
+        var shortIntentId = shortIntent.ComputeIntentId();
+
+        // Already submitted? then treat as done.
+        if (_executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
+            _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream))
+        {
+            _stopBracketsSubmittedAtLock = true;
+            return;
+        }
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_SUBMIT_ATTEMPT", new
+        {
+            stream_id = Stream,
+            trading_date = TradingDate,
+            slot_time_chicago = SlotTimeChicago,
+            brk_long = brkLong,
+            brk_short = brkShort,
+            oco_group = ocoGroup,
+            long_stop_price = longStop,
+            long_target_price = longTarget,
+            long_be_trigger = longBeTrigger,
+            short_stop_price = shortStop,
+            short_target_price = shortTarget,
+            short_be_trigger = shortBeTrigger,
+            note = "Submitting paired stop-market entry orders at RANGE_LOCKED"
+        }));
+
+        // Register intents so protective orders can be submitted on fill, and ensure OCO cancels opposite
+        if (_executionAdapter is NinjaTraderSimAdapter ntAdapter)
+        {
+            ntAdapter.RegisterIntent(longIntent);
+            ntAdapter.RegisterIntent(shortIntent);
+        }
+
+        var longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, Instrument, "Long", brkLong, 1, ocoGroup, utcNow);
+        var shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, Instrument, "Short", brkShort, 1, ocoGroup, utcNow);
+
+        // Persist to execution journal for idempotency (record both attempts)
+        if (longRes.Success)
+            _executionJournal.RecordSubmission(longIntentId, TradingDate, Stream, Instrument, "ENTRY_STOP_LONG", longRes.BrokerOrderId, utcNow);
+        else
+            _executionJournal.RecordRejection(longIntentId, TradingDate, Stream, longRes.ErrorMessage ?? "ENTRY_STOP_LONG_FAILED", utcNow);
+
+        if (shortRes.Success)
+            _executionJournal.RecordSubmission(shortIntentId, TradingDate, Stream, Instrument, "ENTRY_STOP_SHORT", shortRes.BrokerOrderId, utcNow);
+        else
+            _executionJournal.RecordRejection(shortIntentId, TradingDate, Stream, shortRes.ErrorMessage ?? "ENTRY_STOP_SHORT_FAILED", utcNow);
+
+        if (longRes.Success && shortRes.Success)
+        {
+            _stopBracketsSubmittedAtLock = true;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_SUBMITTED", new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                slot_time_chicago = SlotTimeChicago,
+                long_intent_id = longIntentId,
+                short_intent_id = shortIntentId,
+                long_broker_order_id = longRes.BrokerOrderId,
+                short_broker_order_id = shortRes.BrokerOrderId,
+                oco_group = ocoGroup,
+                note = "Stop entry brackets submitted; breakout fill should not require additional submission"
+            }));
+        }
+        else
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_SUBMIT_FAILED", new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                slot_time_chicago = SlotTimeChicago,
+                oco_group = ocoGroup,
+                long_success = longRes.Success,
+                long_error = longRes.ErrorMessage,
+                short_success = shortRes.Success,
+                short_error = shortRes.ErrorMessage,
+                note = "Failed to submit one or both stop entry brackets"
+            }));
+        }
     }
     
     /// <summary>
@@ -3404,6 +3584,36 @@ public sealed class StreamStateMachine
                 be_triggered = false, // Will be set if triggered during price tracking (future step)
                 be_trigger_time_utc = (string?)null
             }));
+    }
+
+    /// <summary>
+    /// Pure, lock-snapshot-driven protective computation (no reliance on mutable interim fields).
+    /// Uses the same math as the normal entry path:
+    /// - target = entry ± target_pts
+    /// - stop distance = min(range_size, 3 * target_pts)
+    /// - BE trigger = 65% of target distance
+    /// </summary>
+    private (decimal stopPrice, decimal targetPrice, decimal beTriggerPrice) ComputeProtectivesFromLockSnapshot(
+        string direction,
+        decimal entryPrice,
+        decimal rangeHigh,
+        decimal rangeLow)
+    {
+        var rangeSize = rangeHigh - rangeLow;
+
+        // Target
+        var targetPrice = direction == "Long" ? entryPrice + _baseTarget : entryPrice - _baseTarget;
+
+        // Stop loss: min(range_size, 3 * target_pts)
+        var maxSlPoints = 3 * _baseTarget;
+        var slPoints = Math.Min(rangeSize, maxSlPoints);
+        var stopPrice = direction == "Long" ? entryPrice - slPoints : entryPrice + slPoints;
+
+        // BE trigger: 65% of target distance
+        var beTriggerPts = _baseTarget * 0.65m;
+        var beTriggerPrice = direction == "Long" ? entryPrice + beTriggerPts : entryPrice - beTriggerPts;
+
+        return (stopPrice, targetPrice, beTriggerPrice);
     }
 
     /// <summary>

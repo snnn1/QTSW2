@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -192,7 +193,9 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 Direction = direction,
                 Quantity = quantity,
                 Price = entryPrice,
-                State = "SUBMITTED"
+                State = "SUBMITTED",
+                IsEntryOrder = true,
+                FilledQuantity = 0
             };
             _orderMap[intentId] = orderInfo;
             
@@ -227,6 +230,114 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             }));
             
             return OrderSubmissionResult.FailureResult($"Entry order submission failed: {ex.Message}", utcNow);
+        }
+    }
+
+    /// <summary>
+    /// STEP 2b: Submit stop-market entry order (breakout stop).
+    /// Used to place stop entries immediately after RANGE_LOCKED (before breakout occurs).
+    /// </summary>
+    public OrderSubmissionResult SubmitStopEntryOrder(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int quantity,
+        string? ocoGroup,
+        DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
+        {
+            order_type = "ENTRY_STOP",
+            direction,
+            stop_price = stopPrice,
+            quantity,
+            oco_group = ocoGroup,
+            account = "SIM"
+        }));
+
+        if (!_simAccountVerified)
+        {
+            var error = "SIM account not verified - not placing stop entry orders";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+            {
+                error,
+                order_type = "ENTRY_STOP",
+                account = "SIM"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
+        try
+        {
+#if NINJATRADER
+            if (_ntContextSet)
+            {
+                return SubmitStopEntryOrderReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+            }
+#endif
+
+            var mockOrderId = $"NT_STOP_{intentId}_{utcNow:yyyyMMddHHmmss}";
+            var orderAction = direction == "Long" ? "Buy" : "SellShort";
+
+            var orderInfo = new OrderInfo
+            {
+                IntentId = intentId,
+                Instrument = instrument,
+                OrderId = mockOrderId,
+                OrderType = "ENTRY_STOP",
+                Direction = direction,
+                Quantity = quantity,
+                Price = stopPrice,
+                State = "SUBMITTED",
+                IsEntryOrder = true,
+                FilledQuantity = 0
+            };
+            _orderMap[intentId] = orderInfo;
+
+            var acknowledgedAt = utcNow.AddMilliseconds(50);
+            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY_STOP", mockOrderId, acknowledgedAt);
+
+            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
+            {
+                broker_order_id = mockOrderId,
+                order_type = "ENTRY_STOP",
+                direction,
+                stop_price = stopPrice,
+                quantity,
+                oco_group = ocoGroup,
+                account = "SIM",
+                order_action = orderAction,
+                order_type_nt = "StopMarket",
+                note = "MOCK - harness mode"
+            }));
+
+            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMITTED", new
+            {
+                broker_order_id = mockOrderId,
+                order_type = "ENTRY_STOP",
+                direction,
+                stop_price = stopPrice,
+                quantity,
+                oco_group = ocoGroup,
+                account = "SIM"
+            }));
+
+            return OrderSubmissionResult.SuccessResult(mockOrderId, utcNow, acknowledgedAt);
+        }
+        catch (Exception ex)
+        {
+            _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {ex.Message}", utcNow);
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+            {
+                error = ex.Message,
+                order_type = "ENTRY_STOP",
+                account = "SIM",
+                exception_type = ex.GetType().Name
+            }));
+
+            return OrderSubmissionResult.FailureResult($"Stop entry order submission failed: {ex.Message}", utcNow);
         }
     }
 
@@ -376,6 +487,20 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 target_price = intent.TargetPrice,
                 quantity = fillQuantity
             }));
+
+        // Proof log: unambiguous, includes encoded envelope and decoded identity
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVES_PLACED", new
+        {
+            intent_id = intentId,
+            encoded_entry_tag = RobotOrderIds.EncodeTag(intentId),
+            stop_tag = RobotOrderIds.EncodeStopTag(intentId),
+            target_tag = RobotOrderIds.EncodeTargetTag(intentId),
+            order_type = "ENTRY_OR_ENTRY_STOP",
+            stop_price = intent.StopPrice,
+            target_price = intent.TargetPrice,
+            protected_quantity = fillQuantity,
+            note = "Protective stop + target successfully placed/ensured for filled quantity"
+        }));
     }
     
     /// <summary>
@@ -693,6 +818,50 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         // Mock: return 0
         return 0;
     }
+    
+    public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
+    {
+        // Route to real NT API if context is set, otherwise use mock
+#if NINJATRADER
+        if (_ntContextSet)
+        {
+            return GetAccountSnapshotReal(utcNow);
+        }
+#endif
+        
+        // Mock implementation for harness testing
+        return new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot>(),
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+    }
+    
+    public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        // Route to real NT API if context is set, otherwise use mock
+#if NINJATRADER
+        if (_ntContextSet)
+        {
+            CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
+            return;
+        }
+#endif
+        
+        // Mock implementation for harness testing
+        var robotOwnedOrders = snap.WorkingOrders?.Where(o => 
+            (!string.IsNullOrEmpty(o.Tag) && o.Tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) ||
+            (!string.IsNullOrEmpty(o.OcoGroup) && o.OcoGroup.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+        ).ToList() ?? new List<WorkingOrderSnapshot>();
+        
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_MOCK", state: "ENGINE",
+            new
+            {
+                robot_owned_count = robotOwnedOrders.Count,
+                robot_owned_order_ids = robotOwnedOrders.Select(o => o.OrderId).ToList(),
+                note = "MOCK - harness mode"
+            }));
+    }
 
     /// <summary>
     /// Order tracking info for callback correlation.
@@ -707,5 +876,11 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         public int Quantity { get; set; }
         public decimal? Price { get; set; }
         public string State { get; set; } = ""; // SUBMITTED, FILLED, REJECTED, CANCELLED
+
+        // Classification: true for entry intents (ENTRY and ENTRY_STOP)
+        public bool IsEntryOrder { get; set; }
+
+        // Partial fill handling
+        public int FilledQuantity { get; set; }
     }
 }

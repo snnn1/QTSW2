@@ -13,13 +13,15 @@ public sealed class RiskGate
     private readonly TimeService _time;
     private readonly RobotLogger _log;
     private readonly KillSwitch _killSwitch;
+    private readonly IExecutionRecoveryGuard? _guard;
 
-    public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch)
+    public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch, IExecutionRecoveryGuard? guard = null)
     {
         _spec = spec;
         _time = time;
         _log = log;
         _killSwitch = killSwitch;
+        _guard = guard;
     }
 
     /// <summary>
@@ -38,6 +40,13 @@ public sealed class RiskGate
         DateTimeOffset utcNow)
     {
         var failedGates = new List<string>();
+        
+        // Gate 0: Recovery state guard (blocks execution during disconnect recovery)
+        if (_guard != null && !_guard.IsExecutionAllowed())
+        {
+            failedGates.Add("RECOVERY_STATE");
+            return (false, _guard.GetRecoveryStateReason(), failedGates);
+        }
         
         // Gate 1: Kill switch
         var killSwitchOk = !_killSwitch.IsEnabled();

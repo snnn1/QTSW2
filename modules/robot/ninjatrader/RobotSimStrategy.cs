@@ -748,6 +748,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void OnOrderUpdate(object sender, OrderEventArgs e)
         {
+            if (_engine is null) return;
+            
+            // Update broker sync gate timestamp (before forwarding to adapter)
+            var utcNow = DateTimeOffset.UtcNow;
+            _engine.OnBrokerOrderUpdateObserved(utcNow);
+            
             if (_adapter is null) return;
 
             // Forward to adapter's HandleOrderUpdate method
@@ -760,6 +766,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void OnExecutionUpdate(object sender, ExecutionEventArgs e)
         {
+            if (_engine is null) return;
+            
+            // Update broker sync gate timestamp (before forwarding to adapter)
+            var utcNow = DateTimeOffset.UtcNow;
+            _engine.OnBrokerExecutionUpdateObserved(utcNow);
+            
             if (_adapter is null) return;
 
             // Forward to adapter's HandleExecutionUpdate method
