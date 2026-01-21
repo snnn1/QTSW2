@@ -663,7 +663,52 @@ class TimetableEngine:
         
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
-        as_of = datetime.now(chicago_tz).isoformat()
+        chicago_now = datetime.now(chicago_tz)
+        as_of = chicago_now.isoformat()
+        
+        # Compute trading_date using CME rollover rule (17:00 Chicago)
+        # If Chicago time < 17:00: trading_date = Chicago calendar date
+        # If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
+        chicago_date = chicago_now.date()
+        chicago_hour = chicago_now.hour
+        
+        # Rollover at 17:00 Chicago time
+        if chicago_hour >= 17:
+            # At or after 17:00, trading_date is next calendar day
+            from datetime import timedelta
+            trading_date = (chicago_date + timedelta(days=1)).isoformat()
+            rollover_applied = True
+        else:
+            # Before 17:00, trading_date is current calendar day
+            trading_date = chicago_date.isoformat()
+            rollover_applied = False
+        
+        # Log CME trading date computation for verification
+        logger.info(
+            f"CME_TRADING_DATE_ROLLOVER: "
+            f"Chicago time={chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
+            f"hour={chicago_hour}, "
+            f"calendar_date={chicago_date.isoformat()}, "
+            f"computed_trading_date={trading_date}, "
+            f"rollover_applied={rollover_applied}"
+        )
+        
+        # Validation: Flag if as_of >= 17:00 but trading_date would be same day (should never happen)
+        if chicago_hour >= 17 and trading_date == chicago_date.isoformat():
+            logger.warning(
+                f"CME_TRADING_DATE_VALIDATION_FAILED: "
+                f"as_of={as_of} (>= 17:00) but trading_date={trading_date} "
+                f"equals calendar date {chicago_date.isoformat()}. "
+                f"This should never happen after the fix."
+            )
+        
+        # Optional: Log if trade_date parameter differs from computed trading_date
+        if trade_date and trade_date != trading_date:
+            logger.info(
+                f"CME_TRADING_DATE_COMPUTED: "
+                f"trade_date parameter={trade_date}, computed trading_date={trading_date} "
+                f"(based on Chicago time {chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')})"
+            )
         
         # Ensure all streams have decision_time (sequencer intent) - same as slot_time
         # This represents what the sequencer would use even if stream is blocked
@@ -674,7 +719,7 @@ class TimetableEngine:
         # Build execution timetable document
         execution_timetable = {
             'as_of': as_of,
-            'trading_date': trade_date,
+            'trading_date': trading_date,  # Use computed value, not trade_date parameter
             'timezone': 'America/Chicago',
             'source': 'master_matrix',
             'streams': streams

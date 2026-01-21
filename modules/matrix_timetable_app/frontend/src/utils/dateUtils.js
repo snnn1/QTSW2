@@ -43,6 +43,45 @@ export function getChicagoDateNow() {
 }
 
 /**
+ * Get CME trading date with 17:00 Chicago rollover rule.
+ * 
+ * CME trading date semantics:
+ * - If Chicago time < 17:00: trading_date = Chicago calendar date
+ * - If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
+ * 
+ * This matches the timetable generation logic.
+ * 
+ * @returns {string} CME trading date in YYYY-MM-DD format
+ */
+export function getCMETradingDate() {
+  const now = new Date()
+  // Get Chicago time using Intl.DateTimeFormat for DST-aware conversion
+  const chicagoFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  })
+  
+  const parts = chicagoFormatter.formatToParts(now)
+  const year = parseInt(parts.find(p => p.type === 'year').value)
+  const month = parseInt(parts.find(p => p.type === 'month').value)
+  const day = parseInt(parts.find(p => p.type === 'day').value)
+  const hour = parseInt(parts.find(p => p.type === 'hour').value)
+  
+  // Apply CME rollover rule: if >= 17:00, trading_date is next calendar day
+  let tradingDate = new Date(year, month - 1, day)
+  if (hour >= 17) {
+    tradingDate.setDate(tradingDate.getDate() + 1)
+  }
+  
+  return dateToYYYYMMDD(tradingDate)
+}
+
+/**
  * Parse YYYY-MM-DD string to Date object.
  * Creates date at midnight local time (no timezone conversion).
  * 

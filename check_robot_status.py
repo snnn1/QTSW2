@@ -1,121 +1,103 @@
-#!/usr/bin/env python3
-"""Check robot status and recent activity"""
+"""
+Check Robot Status - Verify CME rollover and session window are working
+"""
 import json
-import glob
-from datetime import datetime, timezone
+from pathlib import Path
+from datetime import datetime
+import pytz
 
-def main():
-    log_files = glob.glob('logs/robot/robot_*.jsonl')
-    
-    print("=" * 80)
-    print("ROBOT STATUS CHECK")
-    print("=" * 80)
-    
-    all_events = []
-    for log_file in log_files:
-        try:
-            with open(log_file, 'r', encoding='utf-8-sig') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                        all_events.append(entry)
-                    except:
-                        continue
-        except:
-            continue
-    
-    # Get today's events
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_events = []
-    
-    for entry in all_events:
-        try:
-            ts_str = entry.get('ts_utc', '')
-            if ts_str:
-                if ts_str.endswith('Z'):
-                    ts_str = ts_str[:-1] + '+00:00'
-                ts = datetime.fromisoformat(ts_str)
-                if ts >= today_start:
-                    today_events.append((ts, entry))
-        except:
-            continue
-    
-    today_events.sort(key=lambda x: x[0])
-    
-    print(f"\nFound {len(today_events)} events today")
-    
-    if not today_events:
-        print("\n[CRITICAL] No events found today - Robot may not be running!")
-        return
-    
-    # Check latest event
-    latest_ts, latest_entry = today_events[-1]
-    print(f"\nLatest Event: {latest_entry.get('event', '')} at {latest_ts.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print(f"Latest State: {latest_entry.get('state', '')}")
-    
-    # Check for ENGINE_START
-    engine_starts = [(ts, e) for ts, e in today_events if e.get('event') == 'ENGINE_START']
-    if engine_starts:
-        print(f"\n[OK] ENGINE_START found: {len(engine_starts)} occurrence(s)")
-        for ts, entry in engine_starts:
-            print(f"  [{ts.strftime('%H:%M:%S')}] ENGINE_START")
-    else:
-        print("\n[WARNING] No ENGINE_START found today")
-    
-    # Check for ENGINE_STOP
-    engine_stops = [(ts, e) for ts, e in today_events if e.get('event') == 'ENGINE_STOP']
-    if engine_stops:
-        print(f"\n[WARNING] ENGINE_STOP found: {len(engine_stops)} occurrence(s)")
-        for ts, entry in engine_stops:
-            print(f"  [{ts.strftime('%H:%M:%S')}] ENGINE_STOP")
-    
-    # Check for PRE_HYDRATION_COMPLETE
-    pre_hydration = [(ts, e) for ts, e in today_events if e.get('event') == 'PRE_HYDRATION_COMPLETE']
-    if pre_hydration:
-        print(f"\n[OK] PRE_HYDRATION_COMPLETE found: {len(pre_hydration)} occurrence(s)")
-        for ts, entry in pre_hydration[-3:]:
-            data = entry.get('data', {})
-            print(f"  [{ts.strftime('%H:%M:%S')}] {data.get('instrument', '')} {data.get('stream', '')} {data.get('session', '')}")
-    
-    # Check for ARMED
-    armed_events = [(ts, e) for ts, e in today_events if e.get('event') == 'ARMED' or e.get('state') == 'ARMED']
-    if armed_events:
-        print(f"\n[OK] ARMED events found: {len(armed_events)} occurrence(s)")
-        for ts, entry in armed_events[-3:]:
-            data = entry.get('data', {})
-            print(f"  [{ts.strftime('%H:%M:%S')}] {entry.get('event', '')} - {data.get('instrument', '')} {data.get('stream', '')} {data.get('session', '')}")
-    
-    # Check for RANGE_WINDOW_STARTED
-    range_started = [(ts, e) for ts, e in today_events if e.get('event') == 'RANGE_WINDOW_STARTED']
-    if range_started:
-        print(f"\n[OK] RANGE_WINDOW_STARTED found: {len(range_started)} occurrence(s)")
-        for ts, entry in range_started[-3:]:
-            data = entry.get('data', {})
-            print(f"  [{ts.strftime('%H:%M:%S')}] {data.get('instrument', '')} {data.get('stream', '')} {data.get('session', '')}")
-    else:
-        print("\n[WARNING] No RANGE_WINDOW_STARTED found today")
-    
-    # Check for any bar events
-    bar_events = [(ts, e) for ts, e in today_events if 'BAR' in e.get('event', '')]
-    if bar_events:
-        print(f"\n[OK] Bar events found: {len(bar_events)} occurrence(s)")
-    else:
-        print("\n[WARNING] No bar events found today")
-    
-    # Show last 10 events
-    print("\n" + "=" * 80)
-    print("LAST 10 EVENTS")
-    print("=" * 80)
-    for ts, entry in today_events[-10:]:
-        event = entry.get('event', '')
-        state = entry.get('state', '')
-        data = entry.get('data', {})
-        instrument = data.get('instrument', '')
-        session = data.get('session', '')
-        print(f"[{ts.strftime('%H:%M:%S')}] {event} | State: {state} | {instrument} {session}")
+engine_log = Path("logs/robot/robot_ENGINE.jsonl")
+if not engine_log.exists():
+    print(f"Engine log not found: {engine_log}")
+    exit(1)
 
-if __name__ == '__main__':
-    main()
+events = []
+with open(engine_log, 'r', encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                events.append(json.loads(line))
+            except:
+                pass
+
+print("="*80)
+print("ROBOT STATUS CHECK")
+print("="*80)
+
+# Check trading date locked
+trading_date_events = [e for e in events if e.get('event') == 'TRADING_DATE_LOCKED']
+if trading_date_events:
+    latest = trading_date_events[-1]
+    payload = latest.get('data', {}).get('payload', {})
+    print(f"\n[TRADING_DATE_LOCKED]")
+    print(f"  Trading Date: {payload.get('trading_date', 'N/A')}")
+    print(f"  Source: {payload.get('source', 'N/A')}")
+    print(f"  Timestamp: {latest.get('ts_utc', 'N/A')}")
+else:
+    print("\n[WARNING] No TRADING_DATE_LOCKED events found")
+
+# Check session start times
+session_start_events = [e for e in events if e.get('event') == 'SESSION_START_TIME_SET']
+if session_start_events:
+    print(f"\n[SESSION_START_TIME_SET] ({len(session_start_events)} events)")
+    for e in session_start_events[-5:]:
+        payload = e.get('data', {}).get('payload', {})
+        print(f"  {payload.get('instrument', 'N/A')}: {payload.get('session_start_time', 'N/A')}")
+else:
+    print("\n[WARNING] No SESSION_START_TIME_SET events found")
+
+# Check bar acceptance/rejection
+bar_delivery = [e for e in events if e.get('event') == 'BAR_DELIVERY_TO_STREAM']
+bar_mismatch = [e for e in events if e.get('event') == 'BAR_DATE_MISMATCH']
+
+print(f"\n[BAR STATISTICS]")
+print(f"  Bars Delivered: {len(bar_delivery)}")
+print(f"  Bars Rejected (DATE_MISMATCH): {len(bar_mismatch)}")
+
+if bar_delivery:
+    print(f"\n[RECENT BAR DELIVERIES]")
+    for e in bar_delivery[-5:]:
+        payload = e.get('data', {}).get('payload', {})
+        print(f"  {payload.get('instrument', 'N/A')} {payload.get('stream', 'N/A')}: {payload.get('bar_timestamp_chicago', 'N/A')}")
+
+if bar_mismatch:
+    print(f"\n[RECENT BAR REJECTIONS]")
+    for e in bar_mismatch[-5:]:
+        payload = e.get('data', {}).get('payload', {})
+        print(f"  {payload.get('instrument', 'N/A')}: {payload.get('bar_timestamp_chicago', 'N/A')} - {payload.get('rejection_reason', 'N/A')}")
+        print(f"    Session Window: {payload.get('session_start_chicago', 'N/A')} to {payload.get('session_end_chicago', 'N/A')}")
+
+# Check current trading date from logs
+if events:
+    latest_event = events[-1]
+    trading_date = latest_event.get('trading_date', 'N/A')
+    print(f"\n[CURRENT STATE]")
+    print(f"  Latest Event Trading Date: {trading_date}")
+    print(f"  Latest Event: {latest_event.get('event', 'N/A')}")
+    print(f"  Latest Timestamp: {latest_event.get('ts_utc', 'N/A')}")
+
+# Verify timetable
+timetable_path = Path("data/timetable/timetable_current.json")
+if timetable_path.exists():
+    timetable = json.loads(timetable_path.read_text())
+    print(f"\n[TIMETABLE FILE]")
+    print(f"  Trading Date: {timetable.get('trading_date', 'N/A')}")
+    print(f"  As Of: {timetable.get('as_of', 'N/A')}")
+    
+    # Check if trading_date matches CME rollover
+    chicago_tz = pytz.timezone("America/Chicago")
+    as_of_str = timetable.get('as_of', '')
+    if as_of_str:
+        as_of_dt = datetime.fromisoformat(as_of_str)
+        chicago_time = as_of_dt.astimezone(chicago_tz)
+        chicago_hour = chicago_time.hour
+        from datetime import timedelta
+        expected_trading_date = (chicago_time.date() + timedelta(days=1)).isoformat() if chicago_hour >= 17 else chicago_time.date().isoformat()
+        actual_trading_date = timetable.get('trading_date', '')
+        match = actual_trading_date == expected_trading_date
+        print(f"  Expected (CME rollover): {expected_trading_date}")
+        print(f"  Actual: {actual_trading_date}")
+        print(f"  Match: {match} {'[OK]' if match else '[FAIL]'}")
+
+print("\n" + "="*80)

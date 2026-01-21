@@ -40,6 +40,9 @@ public sealed class RobotEngine
 
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
+    
+    // Session start time per instrument (from TradingHours, fallback to 17:00 CST)
+    private readonly Dictionary<string, string> _sessionStartTimes = new Dictionary<string, string>();
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
@@ -469,22 +472,20 @@ public sealed class RobotEngine
     {
         if (_spec is null || _time is null) return;
 
-        // CRITICAL: Reject partial bars - only accept fully closed bars
-        // Partial-bar contamination problem:
+        // CRITICAL: Reject future bars and validate bar timing
+        // FIX #2: For OnBarClose sources, bars are already closed, so we don't need strict age requirements
         // - BarsRequest returns fully closed bars (good)
-        // - Live bars should be closed (OnBarClose), but defensive check needed
-        // - If you start mid-minute, BarsRequest gives completed prior bar
-        // - Live feed may later emit a bar that partially overlaps expectations
-        // - What breaks: Off-by-one minute range errors, incomplete data
+        // - OnBarClose (NinjaTrader) provides closed bars when callback fires
+        // - Only reject future bars (negative age) which indicate clock/timezone issues
         //
-        // Rule: Only accept bars that are at least 1 minute old (bar period)
-        // This ensures the bar is fully closed before we use it
+        // Rule: Accept bars with age >= 0 (current or past), reject future bars (age < 0)
+        // This allows OnBarClose bars to be processed immediately while preventing future bar contamination
         var barAgeMinutes = (utcNow - barUtc).TotalMinutes;
-        const double MIN_BAR_AGE_MINUTES = 1.0; // Bar period (1 minute bars)
+        const double FUTURE_BAR_THRESHOLD_MINUTES = -0.1; // Reject bars more than 0.1 minutes in the future
         
-        if (barAgeMinutes < MIN_BAR_AGE_MINUTES)
+        if (barAgeMinutes < FUTURE_BAR_THRESHOLD_MINUTES)
         {
-            // Bar is too recent - likely partial/in-progress, reject it
+            // Bar is in the future - indicates clock/timezone issue, reject it
             // Track rejection statistics
             if (!_barRejectionStats.TryGetValue(instrument, out var stats))
             {
@@ -494,21 +495,52 @@ public sealed class RobotEngine
             stats.PartialRejected++;
             stats.LastUpdateUtc = utcNow;
             
+            var nowChicago = _time.ConvertUtcToChicago(utcNow);
+            var barChicagoTimeRejected = _time.ConvertUtcToChicago(barUtc);
+            
+            // Find all streams matching this instrument for diagnostic purposes
+            var matchingStreamIds = new List<string>();
+            foreach (var s in _streams.Values)
+            {
+                if (s.IsSameInstrument(instrument))
+                {
+                    matchingStreamIds.Add(s.Stream);
+                }
+            }
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_PARTIAL_REJECTED", state: "ENGINE",
                 new
                 {
                     instrument = instrument,
+                    stream_id = matchingStreamIds.Count > 0 ? string.Join(",", matchingStreamIds) : "NO_STREAMS",
+                    trading_date = TradingDateString,
                     bar_timestamp_utc = barUtc.ToString("o"),
+                    bar_timestamp_chicago = barChicagoTimeRejected.ToString("o"),
                     current_time_utc = utcNow.ToString("o"),
+                    current_time_chicago = nowChicago.ToString("o"),
                     bar_age_minutes = Math.Round(barAgeMinutes, 3),
-                    min_bar_age_minutes = MIN_BAR_AGE_MINUTES,
-                    rejection_reason = "Bar too recent - likely partial/in-progress bar",
-                    note = "Bar rejected - too recent, likely partial/in-progress bar. Only fully closed bars accepted."
+                    future_bar_threshold_minutes = FUTURE_BAR_THRESHOLD_MINUTES,
+                    rejection_reason = "FUTURE_BAR",
+                    note = "Bar rejected - bar timestamp is in the future relative to engine time. This indicates a clock synchronization or timezone conversion issue."
                 }));
+            
+            // HIGH-SIGNAL WARNING: If future bar rejection occurs continuously after trading date is locked
+            if (_activeTradingDate.HasValue && stats.PartialRejected >= 10)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_REJECTION_CONTINUOUS_FUTURE", state: "ENGINE",
+                    new
+                    {
+                        instrument = instrument,
+                        future_bar_rejection_count = stats.PartialRejected,
+                        trading_date = TradingDateString,
+                        warning = "Continuous future bar rejections detected - indicates persistent clock/timezone issue",
+                        note = "This may indicate a system clock synchronization problem or timezone conversion error"
+                    }));
+            }
             
             // Log rejection summary if threshold exceeded (rate-limited)
             LogBarRejectionSummaryIfNeeded(utcNow);
-            return; // Reject partial bar
+            return; // Reject future bar
         }
 
         // Health monitor: record bar reception (early, before other processing)
@@ -556,27 +588,65 @@ public sealed class RobotEngine
             stats.BeforeDateLocked++;
             stats.LastUpdateUtc = utcNow;
             
+            var nowChicago = _time.ConvertUtcToChicago(utcNow);
+            var timetableTradingDate = _lastTimetable?.trading_date ?? "NOT_LOADED";
+            
+            // Find all streams matching this instrument for diagnostic purposes
+            var matchingStreamIds = new List<string>();
+            foreach (var s in _streams.Values)
+            {
+                if (s.IsSameInstrument(instrument))
+                {
+                    matchingStreamIds.Add(s.Stream);
+                }
+            }
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BAR_RECEIVED_BEFORE_DATE_LOCKED", state: "ENGINE",
                 new
                 {
+                    instrument = instrument,
+                    stream_id = matchingStreamIds.Count > 0 ? string.Join(",", matchingStreamIds) : "NO_STREAMS",
+                    trading_date = "",
                     bar_timestamp_utc = barUtc.ToString("o"),
                     bar_timestamp_chicago = barChicagoTime.ToString("o"),
                     bar_trading_date = barChicagoDate.ToString("yyyy-MM-dd"),
-                    instrument = instrument,
-                    rejection_reason = "Trading date not yet locked from timetable",
+                    current_time_utc = utcNow.ToString("o"),
+                    current_time_chicago = nowChicago.ToString("o"),
+                    timetable_trading_date = timetableTradingDate,
+                    timetable_path = _timetablePath,
+                    rejection_reason = "TRADING_DATE_NOT_LOCKED",
                     note = "Bar received before trading date locked from timetable - this should not happen in normal operation"
                 }));
+            
+            // HIGH-SIGNAL WARNING: Bars rejected after engine start indicates timetable loading failure
+            if (stats.BeforeDateLocked >= 5)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BAR_REJECTION_CONTINUOUS_NO_DATE_LOCK", state: "ENGINE",
+                    new
+                    {
+                        instrument = instrument,
+                        rejection_count = stats.BeforeDateLocked,
+                        timetable_path = _timetablePath,
+                        timetable_trading_date = timetableTradingDate,
+                        warning = "Multiple bars rejected due to trading date not locked - timetable may have failed to load",
+                        note = "Check timetable file exists and is valid. Engine should lock trading date at startup."
+                    }));
+            }
             
             // Log rejection summary if threshold exceeded (rate-limited)
             LogBarRejectionSummaryIfNeeded(utcNow);
             return; // Ignore bar - trading date should be locked from timetable
         }
 
-        // Validate bar date matches locked trading date
-        if (_activeTradingDate.Value != barChicagoDate)
+        // Validate bar falls within trading session window for active trading date
+        // Session window: [previous_day session_start CST, trading_date 16:00 CST)
+        // This replaces calendar date comparison which was invalid for futures (session starts evening before)
+        var (sessionStartChicago, sessionEndChicago) = GetSessionWindow(_activeTradingDate.Value, instrument);
+        
+        if (barChicagoTime < sessionStartChicago || barChicagoTime >= sessionEndChicago)
         {
-            // Trading date mismatch - log warning and ignore bar
-            // Trading date is immutable once locked, so bars from different dates are ignored
+            // Bar is outside session window - log mismatch and reject
+            // BAR_DATE_MISMATCH now means "bar outside trading session window" (not calendar date mismatch)
             var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
             var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             
@@ -589,22 +659,54 @@ public sealed class RobotEngine
             stats.DateMismatch++;
             stats.LastUpdateUtc = utcNow;
             
+            // Enhanced diagnostic logging
+            var nowChicago = _time.ConvertUtcToChicago(utcNow);
+            var timetableTradingDate = _lastTimetable?.trading_date ?? "NOT_LOADED";
+            
+            // Find all streams matching this instrument for diagnostic purposes
+            var matchingStreamIds = new List<string>();
+            foreach (var s in _streams.Values)
+            {
+                if (s.IsSameInstrument(instrument))
+                {
+                    matchingStreamIds.Add(s.Stream);
+                }
+            }
+            
+            // Determine rejection reason
+            var rejectionReason = barChicagoTime < sessionStartChicago ? "BEFORE_SESSION_START" : "AFTER_SESSION_END";
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "BAR_DATE_MISMATCH", state: "ENGINE",
                 new
                 {
+                    // Existing fields (kept for backward compatibility)
                     locked_trading_date = tradingDateStr,
                     bar_trading_date = barTradingDateStr,
                     bar_timestamp_utc = barUtc.ToString("o"),
                     bar_timestamp_chicago = barChicagoTime.ToString("o"),
                     instrument = instrument,
-                    rejection_reason = $"Trading date mismatch: bar date {barTradingDateStr} != locked date {tradingDateStr}",
-                    date_alignment_note = $"Bar is from {barTradingDateStr} but system expects {tradingDateStr}",
-                    note = "Bar ignored - trading date is locked from timetable and immutable"
+                    rejection_reason = rejectionReason,
+                    date_alignment_note = $"Bar is outside trading session window for trading date {tradingDateStr}",
+                    note = "Bar ignored - outside trading session window (BAR_DATE_MISMATCH now means 'bar outside session window', not 'calendar date mismatch')",
+                    
+                    // DIAGNOSTIC FIELDS (high priority)
+                    active_trading_date = tradingDateStr, // Engine's active trading date
+                    bar_utc = barUtc.ToString("o"), // Canonical bar timestamp passed into engine
+                    bar_chicago = barChicagoTime.ToString("o"), // Derived Chicago time from bar_utc
+                    bar_chicago_date = barChicagoDate.ToString("yyyy-MM-dd"), // Date-only from bar_chicago
+                    now_utc = utcNow.ToString("o"), // Engine tick time (not DateTimeOffset.UtcNow from strategy)
+                    now_chicago = nowChicago.ToString("o"), // Derived Chicago time from now_utc
+                    timetable_trading_date = timetableTradingDate, // Raw string read from timetable
+                    stream_id = matchingStreamIds.Count > 0 ? string.Join(",", matchingStreamIds) : "NO_STREAMS", // All streams matching this instrument
+                    
+                    // NEW: Session window fields
+                    session_start_chicago = sessionStartChicago.ToString("o"),
+                    session_end_chicago = sessionEndChicago.ToString("o")
                 }));
             
             // Log rejection summary if threshold exceeded (rate-limited)
             LogBarRejectionSummaryIfNeeded(utcNow);
-            return; // Ignore bar from different trading date
+            return; // Ignore bar outside session window
         }
 
         // Track acceptance statistics
@@ -789,6 +891,72 @@ public sealed class RobotEngine
     }
 
     /// <summary>
+    /// Set session start time for an instrument (from TradingHours).
+    /// Called by NinjaTrader strategy to provide instrument-specific session start time.
+    /// </summary>
+    /// <param name="instrument">Instrument name (e.g., "ES")</param>
+    /// <param name="sessionStartTime">Session start time in HH:MM format (e.g., "17:00")</param>
+    public void SetSessionStartTime(string instrument, string sessionStartTime)
+    {
+        if (string.IsNullOrWhiteSpace(instrument) || string.IsNullOrWhiteSpace(sessionStartTime))
+            return;
+        
+        var instrumentUpper = instrument.ToUpperInvariant();
+        _sessionStartTimes[instrumentUpper] = sessionStartTime;
+        
+        LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, eventType: "SESSION_START_TIME_SET", state: "ENGINE",
+            new
+            {
+                instrument = instrumentUpper,
+                session_start_time = sessionStartTime,
+                source = "TradingHours",
+                note = "Session start time set from NinjaTrader TradingHours template"
+            }));
+    }
+    
+    /// <summary>
+    /// Get session start time for an instrument, with fallback to default.
+    /// </summary>
+    /// <param name="instrument">Instrument name</param>
+    /// <returns>Session start time in HH:MM format</returns>
+    private string GetSessionStartTime(string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument))
+            return "17:00"; // Default fallback
+        
+        var instrumentUpper = instrument.ToUpperInvariant();
+        if (_sessionStartTimes.TryGetValue(instrumentUpper, out var startTime))
+            return startTime;
+        
+        // Fallback to default (standard CME futures session start)
+        return "17:00";
+    }
+    
+    /// <summary>
+    /// Compute the trading session window for a given trading date.
+    /// Session starts the evening before (from TradingHours or default 17:00 CST) and ends at market close (16:00 CST).
+    /// </summary>
+    /// <param name="tradingDate">Trading date</param>
+    /// <param name="instrument">Instrument name (for instrument-specific session start time)</param>
+    /// <returns>Tuple of (sessionStartChicago, sessionEndChicago)</returns>
+    private (DateTimeOffset sessionStartChicago, DateTimeOffset sessionEndChicago) GetSessionWindow(DateOnly tradingDate, string instrument = "")
+    {
+        if (_spec is null || _time is null)
+            throw new InvalidOperationException("Spec and TimeService must be initialized");
+        
+        // Session starts previous calendar day at time from TradingHours (or default 17:00 CST)
+        var sessionStartTime = GetSessionStartTime(instrument);
+        var previousDay = tradingDate.AddDays(-1);
+        var sessionStartChicago = _time.ConstructChicagoTime(previousDay, sessionStartTime);
+        
+        // Session ends at market close on trading date (from spec)
+        var marketCloseTime = _spec.entry_cutoff.market_close_time; // "16:00"
+        var sessionEndChicago = _time.ConstructChicagoTime(tradingDate, marketCloseTime);
+        
+        return (sessionStartChicago, sessionEndChicago);
+    }
+    
+    /// <summary>
     /// Get session information from spec for a given instrument and session.
     /// Used by NinjaTrader strategy to get range_start_time and slot_end_times for BarsRequest.
     /// </summary>
@@ -852,7 +1020,6 @@ public sealed class RobotEngine
         var filteredBars = new List<Bar>();
         var barsFilteredFuture = 0;
         var barsFilteredPartial = 0;
-        const double MIN_BAR_AGE_MINUTES = 1.0; // Bar period (1 minute bars)
         
         foreach (var bar in bars)
         {
@@ -863,9 +1030,12 @@ public sealed class RobotEngine
                 continue;
             }
             
-            // Filter 2: Reject partial/in-progress bars (must be at least 1 minute old)
+                // Filter 2: Reject bars that are too recent (less than 0.1 minutes old)
+            // Note: BarsRequest should return historical bars that are old enough, but we add a small buffer
+            // to handle edge cases where BarsRequest might return very recent bars
             var barAgeMinutes = (utcNow - bar.TimestampUtc).TotalMinutes;
-            if (barAgeMinutes < MIN_BAR_AGE_MINUTES)
+            const double MIN_BARSREQUEST_BAR_AGE_MINUTES = 0.1; // Small buffer for BarsRequest bars
+            if (barAgeMinutes < MIN_BARSREQUEST_BAR_AGE_MINUTES)
             {
                 barsFilteredPartial++;
                 continue;
@@ -903,8 +1073,8 @@ public sealed class RobotEngine
                     total_filtered = totalFiltered,
                     bars_loaded = filteredBars.Count,
                     current_time_utc = utcNow.ToString("o"),
-                    min_bar_age_minutes = MIN_BAR_AGE_MINUTES,
-                    note = "Filtered out future bars and partial/in-progress bars. Only fully closed bars accepted."
+                    min_bar_age_minutes = 0.1, // Small buffer for BarsRequest bars
+                    note = "Filtered out future bars and very recent bars (< 0.1 min old). Only fully closed bars accepted."
                 }));
         }
 
@@ -968,16 +1138,36 @@ public sealed class RobotEngine
                     stream.State != StreamState.ARMED && 
                     stream.State != StreamState.RANGE_BUILDING)
                 {
+                    var nowChicago = _time?.ConvertUtcToChicago(utcNow) ?? utcNow;
+                    
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_SKIPPED_STREAM_STATE", state: "ENGINE",
                         new
                         {
                             instrument = instrument,
                             stream_id = stream.Stream,
+                            trading_date = TradingDateString,
                             stream_state = stream.State.ToString(),
                             bar_count = filteredBars.Count,
+                            current_time_chicago = nowChicago.ToString("o"),
+                            rejection_reason = $"STREAM_STATE_{stream.State}",
                             note = $"Stream is in {stream.State} state - bars will not be buffered. " +
                                    "This may indicate a timing issue or stream already progressed past pre-hydration."
                         }));
+                    
+                    // HIGH-SIGNAL WARNING: Bars skipped during active range-building indicates state machine issue
+                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.DONE)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_SKIPPED_ACTIVE_STREAM", state: "ENGINE",
+                            new
+                            {
+                                instrument = instrument,
+                                stream_id = stream.Stream,
+                                stream_state = stream.State.ToString(),
+                                warning = "Pre-hydration bars skipped for stream in active state - may indicate state machine issue",
+                                note = "Stream has progressed beyond pre-hydration state. Bars should be received via OnBar() instead."
+                            }));
+                    }
+                    
                     continue; // Skip this stream
                 }
                 
@@ -1099,7 +1289,14 @@ public sealed class RobotEngine
         if (poll.Error is not null)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = poll.Error }));
+                new 
+                { 
+                    reason = "POLL_ERROR",
+                    error = poll.Error,
+                    trading_date = TradingDateString,
+                    timetable_path = _timetablePath,
+                    note = "Timetable file poll failed - engine will stand down"
+                }));
             StandDown();
             return;
         }
@@ -1117,7 +1314,15 @@ public sealed class RobotEngine
         catch (Exception ex)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = "PARSE_ERROR", error = ex.Message }));
+                new 
+                { 
+                    reason = "PARSE_ERROR",
+                    error = ex.Message,
+                    error_type = ex.GetType().Name,
+                    trading_date = TradingDateString,
+                    timetable_path = _timetablePath,
+                    note = "Timetable file parse failed - engine will stand down"
+                }));
             StandDown();
             return;
         }
@@ -1176,7 +1381,15 @@ public sealed class RobotEngine
         if (timetable.timezone != "America/Chicago")
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_INVALID", state: "ENGINE",
-                new { reason = "TIMEZONE_MISMATCH", timezone = timetable.timezone }));
+                new 
+                { 
+                    reason = "TIMEZONE_MISMATCH",
+                    expected_timezone = "America/Chicago",
+                    actual_timezone = timetable.timezone,
+                    trading_date = TradingDateString,
+                    timetable_path = _timetablePath,
+                    note = "Timetable timezone mismatch - engine will stand down"
+                }));
             StandDown();
             return;
         }
@@ -1437,6 +1650,21 @@ public sealed class RobotEngine
 
     private void StandDown()
     {
+        var utcNow = DateTimeOffset.UtcNow;
+        var streamCount = _streams.Count;
+        var tradingDateStr = TradingDateString;
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "ENGINE_STAND_DOWN", state: "ENGINE",
+            new
+            {
+                reason = "Timetable validation failure",
+                trading_date = tradingDateStr,
+                timetable_path = _timetablePath,
+                streams_cleared = streamCount,
+                active_trading_date_cleared = _activeTradingDate.HasValue,
+                note = "Engine stand-down due to timetable validation failure - all streams cleared, trading date reset"
+            }));
+        
         _streams.Clear();
         _activeTradingDate = null;
     }
@@ -1456,9 +1684,27 @@ public sealed class RobotEngine
                 _loggingService.Log(logEvent);
                 return; // Successfully logged via async service
             }
-            catch
+            catch (Exception ex)
             {
-                // Conversion failed - fall through to RobotLogger.Write() which has its own fallback logic
+                // Fail loudly: log conversion failure as ERROR event before falling back
+                try
+                {
+                    var utcNow = DateTimeOffset.UtcNow;
+                    var errorEvent = RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "LOG_CONVERSION_ERROR", state: "ENGINE",
+                        new
+                        {
+                            exception_type = ex.GetType().Name,
+                            error = ex.Message,
+                            stack_trace = ex.StackTrace != null && ex.StackTrace.Length > 500 ? ex.StackTrace.Substring(0, 500) : ex.StackTrace,
+                            original_event_type = dict.TryGetValue("event_type", out var et) ? et?.ToString() : "UNKNOWN",
+                            note = "Failed to convert event dictionary to RobotLogEvent - falling back to RobotLogger.Write()"
+                        });
+                    _log.Write(errorEvent);
+                }
+                catch
+                {
+                    // If even error logging fails, silently fall through to fallback
+                }
             }
         }
 

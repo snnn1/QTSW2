@@ -1,53 +1,40 @@
-# Verify that StreamStateMachine.cs files are synchronized
-# This script checks if the two files are identical
-
+# Verify that StreamStateMachine.cs files are in sync
 param(
-    [switch]$Fix,
-    [switch]$Verbose
+    [switch]$Fix
 )
 
-$ErrorActionPreference = "Stop"
+$file1 = "RobotCore_For_NinjaTrader\StreamStateMachine.cs"
+$file2 = "modules\robot\core\StreamStateMachine.cs"
 
-$sourceFile = "modules\robot\core\StreamStateMachine.cs"
-$targetFile = "RobotCore_For_NinjaTrader\StreamStateMachine.cs"
-
-if (-not (Test-Path $sourceFile)) {
-    Write-Error "Source file not found: $sourceFile"
+if (-not (Test-Path $file1)) {
+    Write-Error "File not found: $file1"
     exit 1
 }
 
-if (-not (Test-Path $targetFile)) {
-    Write-Error "Target file not found: $targetFile"
+if (-not (Test-Path $file2)) {
+    Write-Error "File not found: $file2"
     exit 1
 }
 
-Write-Host "Verifying StreamStateMachine.cs synchronization..." -ForegroundColor Cyan
+# Compare file contents (ignoring line endings)
+$content1 = Get-Content $file1 -Raw
+$content2 = Get-Content $file2 -Raw
 
-# Compare file contents
-$sourceContent = Get-Content $sourceFile -Raw
-$targetContent = Get-Content $targetFile -Raw
+# Normalize line endings for comparison
+$content1 = $content1 -replace "`r`n", "`n" -replace "`r", "`n"
+$content2 = $content2 -replace "`r`n", "`n" -replace "`r", "`n"
 
-if ($sourceContent -eq $targetContent) {
-    Write-Host "Files are synchronized" -ForegroundColor Green
+if ($content1 -eq $content2) {
+    Write-Host "Files are in sync."
     exit 0
-} else {
-    Write-Host "Files are OUT OF SYNC!" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Source: $sourceFile" -ForegroundColor Yellow
-    Write-Host "Target: $targetFile" -ForegroundColor Yellow
-    Write-Host ""
-    
-    if ($Fix) {
-        Write-Host "Fixing synchronization..." -ForegroundColor Cyan
-        Copy-Item -Path $sourceFile -Destination $targetFile -Force
-        Write-Host "Files synchronized" -ForegroundColor Green
-        exit 0
-    } else {
-        Write-Host "Run with -Fix to automatically sync:" -ForegroundColor Yellow
-        Write-Host "  .\verify_sync.ps1 -Fix" -ForegroundColor White
-        Write-Host ""
-        Write-Host "Or run the full sync script:" -ForegroundColor Yellow
-        Write-Host "  .\sync_robotcore_to_ninjatrader.ps1" -ForegroundColor White
-        exit 1
-    }
 }
+
+if ($Fix) {
+    Write-Host "Syncing files..."
+    Copy-Item -Path $file2 -Destination $file1 -Force
+    Write-Host "Files synced."
+    exit 0
+}
+
+Write-Error "Files are out of sync!"
+exit 1

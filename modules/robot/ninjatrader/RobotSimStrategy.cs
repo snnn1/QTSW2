@@ -90,6 +90,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 // Start engine
                 _engine.Start();
+                
+                // Set session start time from TradingHours (if available)
+                try
+                {
+                    var tradingHours = Instrument.MasterInstrument.TradingHours;
+                    if (tradingHours != null && tradingHours.Sessions != null && tradingHours.Sessions.Count > 0)
+                    {
+                        // Get first session's begin time (in hhmm format, e.g., 1700 = 17:00)
+                        var beginTime = tradingHours.Sessions[0].BeginTime;
+                        if (beginTime > 0)
+                        {
+                            // Convert hhmm int to HH:MM string (e.g., 1700 -> "17:00")
+                            var hours = beginTime / 100;
+                            var minutes = beginTime % 100;
+                            var sessionStartTime = $"{hours:D2}:{minutes:D2}";
+                            
+                            _engine.SetSessionStartTime(instrumentName, sessionStartTime);
+                            Log($"Session start time set from TradingHours: {sessionStartTime} for {instrumentName}", LogLevel.Information);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Log but don't fail - will fall back to default 17:00 CST
+                    Log($"Warning: Could not extract session start from TradingHours: {ex.Message}. Using default 17:00 CST.", LogLevel.Warning);
+                }
 
                 // CRITICAL: Verify engine startup succeeded before requesting bars
                 // Check that trading date is locked and streams are created
@@ -144,7 +170,25 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void RequestHistoricalBarsForPreHydration()
         {
-            if (_engine == null || Instrument == null) return;
+            var instrumentName = Instrument?.MasterInstrument?.Name?.ToUpperInvariant() ?? "UNKNOWN";
+            
+            // FIX #3: Ensure every code path logs a final disposition event
+            // Early return guard - log skipped
+            if (_engine == null || Instrument == null)
+            {
+                if (_engine != null)
+                {
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "reason", "Engine or Instrument is null" },
+                        { "engine_null", _engine == null },
+                        { "instrument_null", Instrument == null },
+                        { "note", "Cannot request bars - missing required context" }
+                    });
+                }
+                return;
+            }
 
             try
             {
@@ -157,20 +201,46 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  $"This indicates a configuration error: timetable missing or invalid trading_date. " +
                                  $"Engine.Start() should have locked the trading date. Cannot proceed.";
                     Log(errorMsg, LogLevel.Error);
+                    
+                    // Log failed before throwing
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", "NOT_LOCKED" },
+                        { "range_start_time", "N/A" },
+                        { "slot_time", "N/A" },
+                        { "reason", "Trading date not locked" },
+                        { "error", errorMsg },
+                        { "note", "Trading date must be locked from timetable before requesting bars" }
+                    });
+                    
                     throw new InvalidOperationException(errorMsg);
                 }
 
                 // Parse trading date
                 if (!DateOnly.TryParse(tradingDateStr, out var tradingDate))
                 {
-                    Log($"Invalid trading date format: {tradingDateStr}", LogLevel.Warning);
+                    var errorMsg = $"Invalid trading date format: {tradingDateStr}";
+                    Log(errorMsg, LogLevel.Warning);
+                    
+                    // Log skipped before returning
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_time", "N/A" },
+                        { "slot_time", "N/A" },
+                        { "reason", "Invalid trading date format" },
+                        { "error", errorMsg },
+                        { "note", "Cannot parse trading date - skipping BarsRequest" }
+                    });
                     return;
                 }
 
                 // CRITICAL: Get time range covering ALL enabled streams for this instrument
                 // This ensures S1 (02:00) and S2 (08:00) streams both get their historical bars
                 // The range covers from earliest range_start to latest slot_time across all enabled streams
-                var instrumentName = Instrument.MasterInstrument.Name.ToUpperInvariant();
+                instrumentName = Instrument.MasterInstrument.Name.ToUpperInvariant();
                 var timeRange = _engine.GetBarsRequestTimeRange(instrumentName);
                 
                 if (!timeRange.HasValue)
@@ -179,6 +249,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  $"This indicates no enabled streams exist for this instrument, or streams not yet created. " +
                                  $"Ensure timetable has enabled streams for {instrumentName} and engine.Start() completed successfully.";
                     Log(errorMsg, LogLevel.Error);
+                    
+                    // Log failed before throwing
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "reason", "Cannot determine time range" },
+                        { "error", errorMsg },
+                        { "note", "No enabled streams found for this instrument" }
+                    });
+                    
                     throw new InvalidOperationException(errorMsg);
                 }
                 
@@ -189,6 +269,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     var errorMsg = $"Invalid BarsRequest time range for {instrumentName}: range_start={rangeStartChicago}, slot_time={slotTimeChicago}. " +
                                  $"Cannot proceed with BarsRequest.";
                     Log(errorMsg, LogLevel.Error);
+                    
+                    // Log failed before throwing
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "reason", "Invalid time range" },
+                        { "error", errorMsg },
+                        { "range_start", rangeStartChicago ?? "NULL" },
+                        { "slot_time", slotTimeChicago ?? "NULL" },
+                        { "note", "Time range values are null or empty" }
+                    });
+                    
                     throw new InvalidOperationException(errorMsg);
                 }
                 
@@ -329,6 +422,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  $"Without historical bars, range computation may fail or be incomplete. " +
                                  $"Check NinjaTrader historical data availability and 'Days to load' setting.";
                     Log(errorMsg, LogLevel.Error);
+                    
+                    // Log failed before throwing
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_time", rangeStartChicago },
+                        { "slot_time", slotTimeChicago },
+                        { "end_time", endTimeChicago },
+                        { "reason", "Exception during BarsRequest execution" },
+                        { "error", ex.Message },
+                        { "error_type", ex.GetType().Name },
+                        { "stack_trace", ex.StackTrace },
+                        { "note", "BarsRequest threw exception - check NinjaTrader historical data availability" }
+                    });
+                    
                     throw new InvalidOperationException(errorMsg, ex);
                 }
 
@@ -338,6 +447,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     var errorMsg = $"CRITICAL: BarsRequest returned null for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago}). " +
                                  $"This indicates a NinjaTrader API failure. Cannot proceed.";
                     Log(errorMsg, LogLevel.Error);
+                    
+                    // Log failed before throwing
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_time", rangeStartChicago },
+                        { "slot_time", slotTimeChicago },
+                        { "end_time", endTimeChicago },
+                        { "reason", "BarsRequest returned null" },
+                        { "error", errorMsg },
+                        { "note", "NinjaTrader API returned null - indicates API failure" }
+                    });
+                    
                     throw new InvalidOperationException(errorMsg);
                 }
 
@@ -352,23 +475,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                                  $"Range computation will rely on live bars only - may be incomplete.";
                     Log(errorMsg, LogLevel.Warning);
                     
-                    // Log BarsRequest unexpected count event
+                    // FIX #3: Log final disposition - EXECUTED with zero count
                     if (_engine != null)
                     {
-                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_UNEXPECTED_COUNT", new Dictionary<string, object>
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_EXECUTED", new Dictionary<string, object>
                         {
                             { "instrument", instrumentName },
                             { "trading_date", tradingDateStr },
                             { "bars_returned", 0 },
-                            { "expected_range", $"{rangeStartChicago} to {endTimeChicago}" },
+                            { "first_bar_utc", (string?)null },
+                            { "last_bar_utc", (string?)null },
+                            { "range_start_time", rangeStartChicago },
+                            { "slot_time", slotTimeChicago },
+                            { "end_time", endTimeChicago },
                             { "current_time_chicago", nowChicago.ToString("HH:mm") },
-                            { "reason", "No bars returned from BarsRequest" },
+                            { "note", "BarsRequest executed successfully but returned zero bars - will rely on live bars" },
                             { "possible_causes", new[] { 
                                 "Strategy started after slot_time (bars already passed)",
                                 "NinjaTrader 'Days to load' setting too low",
                                 "No historical data available for this date"
-                            }},
-                            { "note", "Range computation will rely on live bars only - may be incomplete" }
+                            }}
                         });
                     }
                     // Don't throw - allow degraded operation, but make it visible
@@ -380,9 +506,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _engine.LoadPreHydrationBars(Instrument.MasterInstrument.Name, bars, DateTimeOffset.UtcNow);
                     Log($"Loaded {bars.Count} historical bars from NinjaTrader for pre-hydration", LogLevel.Information);
                     
-                    // Log successful BarsRequest with bar count check
+                    // FIX #3: Log final disposition - EXECUTED with bar count and timestamps
                     if (_engine != null)
                     {
+                        var firstBarUtc = bars[0].TimestampUtc.ToString("o");
+                        var lastBarUtc = bars[bars.Count - 1].TimestampUtc.ToString("o");
+                        
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_EXECUTED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "trading_date", tradingDateStr },
+                            { "bars_returned", bars.Count },
+                            { "first_bar_utc", firstBarUtc },
+                            { "last_bar_utc", lastBarUtc },
+                            { "range_start_time", rangeStartChicago },
+                            { "slot_time", slotTimeChicago },
+                            { "end_time", endTimeChicago },
+                            { "current_time_chicago", nowChicago.ToString("HH:mm") },
+                            { "note", "BarsRequest executed successfully" }
+                        });
+                        
+                        // Also log if count is unexpectedly low (less than 50% of expected)
                         // Calculate expected bar count (rough estimate: 1 bar per minute)
                         var rangeStartTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
                         var endTime = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
@@ -391,7 +535,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                         var expectedMinutes = (int)(endTime - rangeStartTime).TotalMinutes;
                         var expectedBarCount = Math.Max(0, expectedMinutes);
                         
-                        // Log if count is unexpectedly low (less than 50% of expected)
                         if (bars.Count < expectedBarCount * 0.5 && expectedBarCount > 10)
                         {
                             _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_UNEXPECTED_COUNT", new Dictionary<string, object>
@@ -412,7 +555,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex)
             {
                 // Log error but don't fail - fallback to file-based or live bars
-                Log($"Failed to request historical bars from NinjaTrader: {ex.Message}. Will use file-based or live bars.", LogLevel.Warning);
+                var errorMsg = $"Failed to request historical bars from NinjaTrader: {ex.Message}. Will use file-based or live bars.";
+                Log(errorMsg, LogLevel.Warning);
+                
+                // FIX #3: Log final disposition - FAILED
+                if (_engine != null)
+                {
+                    try
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_FAILED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "reason", "Exception in outer catch handler" },
+                            { "error", ex.Message },
+                            { "error_type", ex.GetType().Name },
+                            { "stack_trace", ex.StackTrace },
+                            { "note", "BarsRequest failed - will fallback to file-based or live bars" }
+                        });
+                    }
+                    catch
+                    {
+                        // Ignore logging errors in catch handler
+                    }
+                }
             }
         }
 

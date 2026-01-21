@@ -861,12 +861,53 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
-        as_of = datetime.now(chicago_tz).isoformat()
+        chicago_now = datetime.now(chicago_tz)
+        as_of = chicago_now.isoformat()
+        
+        # Compute trading_date using CME rollover rule (17:00 Chicago)
+        # If Chicago time < 17:00: trading_date = Chicago calendar date
+        # If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
+        chicago_date = chicago_now.date()
+        chicago_hour = chicago_now.hour
+        
+        # Rollover at 17:00 Chicago time
+        if chicago_hour >= 17:
+            from datetime import timedelta
+            trading_date = (chicago_date + timedelta(days=1)).isoformat()
+            rollover_applied = True
+        else:
+            trading_date = chicago_date.isoformat()
+            rollover_applied = False
+        
+        # Log CME trading date computation for verification
+        logging.info(
+            f"CME_TRADING_DATE_ROLLOVER: "
+            f"Chicago time={chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
+            f"hour={chicago_hour}, "
+            f"calendar_date={chicago_date.isoformat()}, "
+            f"computed_trading_date={trading_date}, "
+            f"rollover_applied={rollover_applied}"
+        )
+        
+        # Validation: Flag violations
+        if chicago_hour >= 17 and trading_date == chicago_date.isoformat():
+            logging.warning(
+                f"CME_TRADING_DATE_VALIDATION_FAILED: "
+                f"as_of={as_of} (>= 17:00) but trading_date={trading_date} "
+                f"equals calendar date {chicago_date.isoformat()}"
+            )
+        
+        # Optional: Log if request.trading_date differs
+        if request.trading_date != trading_date:
+            logging.info(
+                f"CME_TRADING_DATE_COMPUTED: "
+                f"request.trading_date={request.trading_date}, computed trading_date={trading_date}"
+            )
         
         # Build execution timetable document
         execution_timetable = {
             'as_of': as_of,
-            'trading_date': request.trading_date,
+            'trading_date': trading_date,  # Use computed value
             'timezone': 'America/Chicago',
             'source': 'master_matrix',
             'streams': [s.dict() for s in request.streams]

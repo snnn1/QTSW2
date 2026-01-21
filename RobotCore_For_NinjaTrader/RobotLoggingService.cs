@@ -57,6 +57,10 @@ public sealed class RobotLoggingService : IDisposable
     private long _droppedDebugCount = 0; // Changed to long for Interlocked operations
     private long _droppedInfoCount = 0;  // Changed to long for Interlocked operations
     private int _writeFailureCount = 0;
+    private DateTime _lastBackpressureEventUtc = DateTime.MinValue;
+    private DateTime _lastWorkerErrorEventUtc = DateTime.MinValue;
+    private const int BACKPRESSURE_EVENT_RATE_LIMIT_SECONDS = 60; // Emit backpressure event max once per minute
+    private const int WORKER_ERROR_EVENT_RATE_LIMIT_SECONDS = 60; // Emit worker error event max once per minute
 
     /// <summary>
     /// Get or create the singleton instance for the given project root.
@@ -140,11 +144,15 @@ public sealed class RobotLoggingService : IDisposable
             if (evt.level == "DEBUG")
             {
                 Interlocked.Increment(ref _droppedDebugCount);
+                // Emit rate-limited ERROR event for backpressure drops
+                EmitBackpressureEvent("DEBUG");
                 return;
             }
             if (evt.level == "INFO")
             {
                 Interlocked.Increment(ref _droppedInfoCount);
+                // Emit rate-limited ERROR event for backpressure drops
+                EmitBackpressureEvent("INFO");
                 return;
             }
             // WARN and ERROR are never dropped
@@ -299,6 +307,8 @@ public sealed class RobotLoggingService : IDisposable
             catch (Exception ex)
             {
                 LogErrorToFile($"Worker loop error: {ex.Message}");
+                // Emit rate-limited ERROR event for worker loop errors
+                EmitWorkerErrorEvent(ex);
                 Thread.Sleep(1000); // Back off on error
             }
         }
@@ -382,6 +392,8 @@ public sealed class RobotLoggingService : IDisposable
         {
             Interlocked.Increment(ref _writeFailureCount);
             LogErrorToFile($"Write failure for {instrument}: {ex.Message}");
+            // Emit ERROR event for write failures (bypass queue since write is broken)
+            EmitWriteFailureEvent(instrument, ex);
 
             // If writer is broken, remove it so we can retry next time
             if (writer != null)
@@ -528,6 +540,145 @@ public sealed class RobotLoggingService : IDisposable
             sanitized = sanitized.Replace(c, '_');
         }
         return sanitized.ToUpperInvariant();
+    }
+
+    /// <summary>
+    /// Emit backpressure drop event directly to JSONL (bypasses queue since queue is full).
+    /// Rate-limited to prevent spam.
+    /// </summary>
+    private void EmitBackpressureEvent(string droppedLevel)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastBackpressureEventUtc).TotalSeconds < BACKPRESSURE_EVENT_RATE_LIMIT_SECONDS)
+            return;
+
+        _lastBackpressureEventUtc = now;
+        try
+        {
+            var droppedDebug = Interlocked.Read(ref _droppedDebugCount);
+            var droppedInfo = Interlocked.Read(ref _droppedInfoCount);
+            var queueSize = _queue.Count;
+
+            var errorEvent = new RobotLogEvent(
+                DateTimeOffset.UtcNow,
+                "ERROR",
+                "RobotLoggingService",
+                "ENGINE",
+                "LOG_BACKPRESSURE_DROP",
+                $"Logging backpressure: dropped {droppedLevel} events",
+                data: new Dictionary<string, object?>
+                {
+                    ["dropped_level"] = droppedLevel,
+                    ["dropped_debug_count"] = droppedDebug,
+                    ["dropped_info_count"] = droppedInfo,
+                    ["queue_size"] = queueSize,
+                    ["max_queue_size"] = MAX_QUEUE_SIZE,
+                    ["note"] = "Events dropped due to queue backpressure - consider increasing MAX_QUEUE_SIZE or reducing log volume"
+                }
+            );
+
+            // Write directly to ENGINE log file, bypassing queue
+            WriteEventDirectly("ENGINE", errorEvent);
+        }
+        catch
+        {
+            // If even direct write fails, silently fail to prevent infinite loops
+        }
+    }
+
+    /// <summary>
+    /// Emit worker loop error event directly to JSONL (bypasses queue).
+    /// Rate-limited to prevent spam.
+    /// </summary>
+    private void EmitWorkerErrorEvent(Exception ex)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastWorkerErrorEventUtc).TotalSeconds < WORKER_ERROR_EVENT_RATE_LIMIT_SECONDS)
+            return;
+
+        _lastWorkerErrorEventUtc = now;
+        try
+        {
+            var errorEvent = new RobotLogEvent(
+                DateTimeOffset.UtcNow,
+                "ERROR",
+                "RobotLoggingService",
+                "ENGINE",
+                "LOG_WORKER_LOOP_ERROR",
+                $"Worker loop error: {ex.Message}",
+                data: new Dictionary<string, object?>
+                {
+                    ["exception_type"] = ex.GetType().Name,
+                    ["error"] = ex.Message,
+                    ["stack_trace"] = ex.StackTrace != null && ex.StackTrace.Length > 500 ? ex.StackTrace.Substring(0, 500) : ex.StackTrace,
+                    ["note"] = "Background worker loop encountered an error"
+                }
+            );
+
+            // Write directly to ENGINE log file, bypassing queue
+            WriteEventDirectly("ENGINE", errorEvent);
+        }
+        catch
+        {
+            // If even direct write fails, silently fail to prevent infinite loops
+        }
+    }
+
+    /// <summary>
+    /// Emit write failure event directly to JSONL (bypasses queue since write is broken).
+    /// </summary>
+    private void EmitWriteFailureEvent(string instrument, Exception ex)
+    {
+        try
+        {
+            var errorEvent = new RobotLogEvent(
+                DateTimeOffset.UtcNow,
+                "ERROR",
+                "RobotLoggingService",
+                instrument,
+                "LOG_WRITE_FAILURE",
+                $"Write failure for {instrument}: {ex.Message}",
+                data: new Dictionary<string, object?>
+                {
+                    ["exception_type"] = ex.GetType().Name,
+                    ["error"] = ex.Message,
+                    ["stack_trace"] = ex.StackTrace != null && ex.StackTrace.Length > 500 ? ex.StackTrace.Substring(0, 500) : ex.StackTrace,
+                    ["write_failure_count"] = _writeFailureCount,
+                    ["note"] = "Failed to write log batch to file"
+                }
+            );
+
+            // Write directly to ENGINE log file (since instrument-specific write is broken)
+            WriteEventDirectly("ENGINE", errorEvent);
+        }
+        catch
+        {
+            // If even direct write fails, silently fail to prevent infinite loops
+        }
+    }
+
+    /// <summary>
+    /// Write event directly to JSONL file, bypassing the queue.
+    /// Used for critical errors when queue might be full or broken.
+    /// </summary>
+    private void WriteEventDirectly(string instrument, RobotLogEvent evt)
+    {
+        try
+        {
+            lock (_writersLock)
+            {
+                var sanitizedInstrument = SanitizeFileName(instrument);
+                var filePath = Path.Combine(_logDirectory, $"robot_{sanitizedInstrument}.jsonl");
+
+                // Use File.AppendAllText for direct write (thread-safe for append-only)
+                var json = JsonUtil.Serialize(evt);
+                File.AppendAllText(filePath, json + Environment.NewLine);
+            }
+        }
+        catch
+        {
+            // If even direct write fails, silently fail to prevent infinite loops
+        }
     }
 
     private void LogErrorToFile(string message)

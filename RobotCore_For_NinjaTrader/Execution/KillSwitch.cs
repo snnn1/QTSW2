@@ -22,6 +22,72 @@ public sealed class KillSwitch
     {
         _killSwitchPath = Path.Combine(projectRoot, "configs", "robot", "kill_switch.json");
         _log = log;
+        
+        // Log kill switch initialization at startup
+        var now = DateTimeOffset.UtcNow;
+        if (File.Exists(_killSwitchPath))
+        {
+            try
+            {
+                var json = File.ReadAllText(_killSwitchPath);
+                var state = JsonUtil.Deserialize<KillSwitchState>(json);
+                if (state != null)
+                {
+                    _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_INITIALIZED", "ENGINE",
+                        new
+                        {
+                            enabled = state.Enabled,
+                            message = state.Message ?? "No message",
+                            kill_switch_path = _killSwitchPath,
+                            file_found = true,
+                            note = state.Enabled 
+                                ? "Kill switch is ENABLED - all execution is blocked" 
+                                : "Kill switch is DISABLED - execution allowed"
+                        }));
+                }
+                else
+                {
+                    _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_INITIALIZED", "ENGINE",
+                        new
+                        {
+                            enabled = true,
+                            reason = "DESERIALIZATION_NULL",
+                            kill_switch_path = _killSwitchPath,
+                            file_found = true,
+                            warning = "Kill switch file exists but deserialization returned null - defaulting to ENABLED (fail-closed)",
+                            note = "Execution blocked by default - fail-closed behavior activated for safety"
+                        }));
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_INITIALIZED", "ENGINE",
+                    new
+                    {
+                        enabled = true,
+                        reason = "READ_ERROR",
+                        error = ex.Message,
+                        error_type = ex.GetType().Name,
+                        kill_switch_path = _killSwitchPath,
+                        file_found = true,
+                        warning = "Kill switch file exists but could not be read - defaulting to ENABLED (fail-closed)",
+                        note = "Execution blocked by default - fail-closed behavior activated for safety"
+                    }));
+            }
+        }
+        else
+        {
+            _log.Write(RobotEvents.EngineBase(now, "", "KILL_SWITCH_INITIALIZED", "ENGINE",
+                new
+                {
+                    enabled = true,
+                    reason = "FILE_NOT_FOUND",
+                    kill_switch_path = _killSwitchPath,
+                    file_found = false,
+                    warning = "Kill switch file not found - defaulting to ENABLED (fail-closed)",
+                    note = "Execution blocked by default - fail-closed behavior activated for safety"
+                }));
+        }
     }
 
     /// <summary>

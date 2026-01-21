@@ -4,7 +4,7 @@ import './App.css'
 import { useMatrixWorker } from './useMatrixWorker'
 import { STREAMS, DAYS_OF_WEEK, AVAILABLE_TIMES, ANALYZER_COLUMN_ORDER, DEFAULT_COLUMNS } from './utils/constants'
 import { getDefaultFilters, loadAllFilters, saveAllFilters, getStreamFiltersFromStorage } from './utils/filterUtils'
-import { getChicagoDateNow, dateToYYYYMMDD, parseYYYYMMDD, formatChicagoTime } from './utils/dateUtils'
+import { getChicagoDateNow, getCMETradingDate, dateToYYYYMMDD, parseYYYYMMDD, formatChicagoTime } from './utils/dateUtils'
 // Use existing utility files instead of duplicating code
 import { 
   getContractValue, 
@@ -2868,12 +2868,12 @@ function AppContent() {
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
 
   // Calculate current trading day (for filtering timetable) - only update when date changes, not every second
-  // CRITICAL FIX: Initialize from Chicago timezone, not browser time
-  // Use explicit Chicago date conversion to avoid timezone issues
+  // CRITICAL FIX: Use CME trading date with 17:00 Chicago rollover rule
+  // This matches the timetable generation logic (timetable_current.json)
   const [currentTradingDay, setCurrentTradingDay] = useState(() => {
-    // Get Chicago date as YYYY-MM-DD string, then parse to Date
-    const chicagoDateStr = getChicagoDateNow()
-    let tradingDay = parseYYYYMMDD(chicagoDateStr)
+    // Get CME trading date (applies 17:00 rollover rule)
+    const cmeTradingDateStr = getCMETradingDate()
+    let tradingDay = parseYYYYMMDD(cmeTradingDateStr)
     const dayOfWeek = tradingDay.getDay()
     if (dayOfWeek === 0) { // Sunday
       tradingDay.setDate(tradingDay.getDate() + 1) // Monday
@@ -2884,12 +2884,12 @@ function AppContent() {
   })
   
   // Update trading day only when the date changes (not every second)
-  // CRITICAL FIX: Use Chicago timezone, not browser time
+  // CRITICAL FIX: Use CME trading date with 17:00 Chicago rollover rule
   useEffect(() => {
     const updateTradingDay = () => {
-      // Get Chicago date as YYYY-MM-DD string, then parse to Date
-      const chicagoDateStr = getChicagoDateNow()
-      let tradingDay = parseYYYYMMDD(chicagoDateStr)
+      // Get CME trading date (applies 17:00 rollover rule)
+      const cmeTradingDateStr = getCMETradingDate()
+      let tradingDay = parseYYYYMMDD(cmeTradingDateStr)
       const dayOfWeek = tradingDay.getDay()
       if (dayOfWeek === 0) { // Sunday
         tradingDay.setDate(tradingDay.getDate() + 1) // Monday

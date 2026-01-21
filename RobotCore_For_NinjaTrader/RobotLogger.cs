@@ -89,17 +89,51 @@ public sealed class RobotLogger
                     return; // Successfully routed through service
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Conversion failed - fall through to sync logger for non-ENGINE events
+                // Fail loudly: log conversion failure as ERROR event before falling back
+                try
+                {
+                    var utcNow = DateTimeOffset.UtcNow;
+                    string streamVal = "";
+                    string instrumentVal = "";
+                    if (evt is Dictionary<string, object?> evtDict)
+                    {
+                        if (evtDict.TryGetValue("stream", out var s)) streamVal = s?.ToString() ?? "";
+                        if (evtDict.TryGetValue("instrument", out var i)) instrumentVal = i?.ToString() ?? "";
+                    }
+                    var errorEvent = new Dictionary<string, object?>
+                    {
+                        ["ts_utc"] = utcNow.ToString("o"),
+                        ["event_type"] = "LOGGER_CONVERSION_ERROR",
+                        ["stream"] = streamVal,
+                        ["instrument"] = instrumentVal,
+                        ["data"] = new Dictionary<string, object?>
+                        {
+                            ["payload"] = new Dictionary<string, object?>
+                            {
+                                ["exception_type"] = ex.GetType().Name,
+                                ["error"] = ex.Message,
+                                ["stack_trace"] = ex.StackTrace != null && ex.StackTrace.Length > 500 ? ex.StackTrace.Substring(0, 500) : ex.StackTrace,
+                                ["note"] = "Failed to convert event to RobotLogEvent - falling back to sync logger"
+                            }
+                        }
+                    };
+                    // Replace evt with error event so the fallback path persists it
+                    evt = errorEvent;
+                }
+                catch
+                {
+                    // If even error event creation fails, silently fall through
+                }
             }
         }
 
         // Check if this is an ENGINE event (for fallback behavior)
         bool isEngineEvent = false;
-        if (evt is Dictionary<string, object?> dict)
+        if (evt is Dictionary<string, object?> evtDict2)
         {
-            if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr && streamStr == "__engine__")
+            if (evtDict2.TryGetValue("stream", out var streamObj) && streamObj is string streamStr && streamStr == "__engine__")
             {
                 isEngineEvent = true;
             }
@@ -168,8 +202,8 @@ public sealed class RobotLogger
             level = "ERROR";
         else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
             level = "WARN";
-        else if (eventType.Contains("HEARTBEAT") || eventType.Contains("DIAGNOSTIC") || eventType.Contains("AUDIT"))
-            level = "DEBUG"; // Diagnostic events are DEBUG level for filtering
+        // Note: DIAGNOSTIC/HEARTBEAT/AUDIT events now default to INFO (aligned with RobotEngine.ConvertToRobotLogEvent)
+        // This allows them to pass through min_log_level: INFO filter in RobotLoggingService
 
         var source = "RobotEngine";
         if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr)
