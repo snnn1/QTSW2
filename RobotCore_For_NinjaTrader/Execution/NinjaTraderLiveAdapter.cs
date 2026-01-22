@@ -51,6 +51,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        // TODO: Phase C - Implement actual NT Live stop-entry placement with OCO linking
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
         {
             order_type = "ENTRY_STOP",

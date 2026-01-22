@@ -46,6 +46,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        // DRYRUN: Log but do not place order
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_ENTRY_ORDER_DRYRUN", new
         {
             direction,

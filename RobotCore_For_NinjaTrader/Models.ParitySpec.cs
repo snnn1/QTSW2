@@ -27,7 +27,9 @@ public sealed class ParitySpec
     public static ParitySpec LoadFromFile(string path)
     {
         var json = File.ReadAllText(path);
-        var spec = JsonUtil.Deserialize<ParitySpec>(json) ?? throw new InvalidOperationException("Failed to parse parity spec JSON.");
+        var spec = JsonUtil.Deserialize<ParitySpec>(json);
+        if (spec == null)
+            throw new InvalidOperationException("Failed to parse parity spec JSON.");
         spec.ValidateOrThrow();
         return spec;
     }

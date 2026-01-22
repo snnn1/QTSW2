@@ -21,8 +21,10 @@ public sealed class TimetableContract
     public static TimetableContract LoadFromFile(string path)
     {
         var json = File.ReadAllText(path);
-        return JsonUtil.Deserialize<TimetableContract>(json)
-               ?? throw new InvalidOperationException("Failed to parse timetable_current.json");
+        var contract = JsonUtil.Deserialize<TimetableContract>(json);
+        if (contract == null)
+            throw new InvalidOperationException("Failed to parse timetable_current.json");
+        return contract;
     }
 }
 

@@ -84,9 +84,10 @@ public partial class NinjaTraderSimAdapter
             // STEP 2: Create NT Order using real API
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
             var orderType = entryPrice.HasValue ? OrderType.Limit : OrderType.Market;
+            var ntEntryPrice = entryPrice.HasValue ? (double)entryPrice.Value : 0.0;
             
             // Real NT API: CreateOrder
-            var order = account.CreateOrder(ntInstrument, orderAction, orderType, quantity, entryPrice ?? 0);
+            var order = account.CreateOrder(ntInstrument, orderAction, orderType, quantity, ntEntryPrice);
             order.Tag = RobotOrderIds.EncodeTag(intentId); // Robot-owned envelope
             order.TimeInForce = TimeInForce.Day;
 
@@ -328,14 +329,15 @@ public partial class NinjaTraderSimAdapter
             if (existingStop != null)
             {
                 var changed = false;
+                var stopPriceD = (double)stopPrice;
                 if (existingStop.Quantity != quantity)
                 {
                     existingStop.Quantity = quantity;
                     changed = true;
                 }
-                if (Math.Abs(existingStop.StopPrice - stopPrice) > 0)
+                if (Math.Abs(existingStop.StopPrice - stopPriceD) > 1e-10)
                 {
-                    existingStop.StopPrice = stopPrice;
+                    existingStop.StopPrice = stopPriceD;
                     changed = true;
                 }
 
@@ -366,7 +368,7 @@ public partial class NinjaTraderSimAdapter
 
             // Real NT API: Create stop order
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
-            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, stopPrice);
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, (double)stopPrice);
             order.Tag = stopTag;
             order.TimeInForce = TimeInForce.Day;
 
@@ -439,14 +441,15 @@ public partial class NinjaTraderSimAdapter
             if (existingTarget != null)
             {
                 var changed = false;
+                var targetPriceD = (double)targetPrice;
                 if (existingTarget.Quantity != quantity)
                 {
                     existingTarget.Quantity = quantity;
                     changed = true;
                 }
-                if (Math.Abs(existingTarget.LimitPrice - targetPrice) > 0)
+                if (Math.Abs(existingTarget.LimitPrice - targetPriceD) > 1e-10)
                 {
-                    existingTarget.LimitPrice = targetPrice;
+                    existingTarget.LimitPrice = targetPriceD;
                     changed = true;
                 }
 
@@ -477,7 +480,7 @@ public partial class NinjaTraderSimAdapter
 
             // Real NT API: Create target order
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
-            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.Limit, quantity, targetPrice);
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.Limit, quantity, (double)targetPrice);
             order.Tag = targetTag;
             order.TimeInForce = TimeInForce.Day;
 
@@ -550,7 +553,7 @@ public partial class NinjaTraderSimAdapter
             }
 
             // Real NT API: Modify stop price
-            stopOrder.StopPrice = beStopPrice;
+            stopOrder.StopPrice = (double)beStopPrice;
             var result = account.Change(new[] { stopOrder });
 
             if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
@@ -753,7 +756,7 @@ public partial class NinjaTraderSimAdapter
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
 
             // Real NT API: Create stop-market entry
-            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, stopPrice);
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, (double)stopPrice);
             order.Tag = RobotOrderIds.EncodeTag(intentId);
             order.TimeInForce = TimeInForce.Day;
             if (!string.IsNullOrEmpty(ocoGroup))

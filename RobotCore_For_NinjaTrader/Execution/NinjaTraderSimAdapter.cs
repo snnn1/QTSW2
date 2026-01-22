@@ -256,6 +256,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             account = "SIM"
         }));
 
+        // Hard safety: Verify Sim account (should already be verified, but double-check)
         if (!_simAccountVerified)
         {
             var error = "SIM account not verified - not placing stop entry orders";
@@ -270,6 +271,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
 
         try
         {
+            // Route to real NT API if context is set, otherwise use mock
 #if NINJATRADER
             if (_ntContextSet)
             {
@@ -277,6 +279,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             }
 #endif
 
+            // Mock implementation for harness testing
             var mockOrderId = $"NT_STOP_{intentId}_{utcNow:yyyyMMddHHmmss}";
             var orderAction = direction == "Long" ? "Buy" : "SellShort";
 
@@ -312,6 +315,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 note = "MOCK - harness mode"
             }));
 
+            // Alias event for easier grepping (user-facing)
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMITTED", new
             {
                 broker_order_id = mockOrderId,

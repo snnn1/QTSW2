@@ -31,26 +31,30 @@ public static class NinjaTraderExtensions
     /// <summary>
     /// Convert NinjaTrader bar exchange time to UTC DateTimeOffset.
     /// Handles Chicago timezone conversion with DST awareness.
-    /// 
-    /// CRITICAL: This method assumes barExchangeTime is in Chicago local time (exchange time).
-    /// If Times[0][0] is already UTC, use the detection logic in RobotSimStrategy.OnBarUpdate instead.
     /// </summary>
     /// <param name="barExchangeTime">Bar time from NinjaTrader (DateTimeKind.Unspecified, Chicago time)</param>
     /// <returns>UTC DateTimeOffset</returns>
     public static DateTimeOffset ConvertBarTimeToUtc(DateTime barExchangeTime)
     {
-        // Times[0][0] is DateTimeKind.Unspecified, representing exchange local time (Chicago)
-        // We need to interpret it as Chicago time and convert to UTC (DST-aware)
-        // Ensure DateTimeKind is Unspecified before creating DateTimeOffset (prevents UTC offset errors)
-        var barExchangeTimeUnspecified = barExchangeTime.Kind == DateTimeKind.Unspecified 
-            ? barExchangeTime 
-            : DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Unspecified);
-        
+        // NinjaTrader typically provides DateTimeKind.Unspecified for exchange-local timestamps,
+        // but some APIs/callbacks can return Local or Utc kinds. DateTimeOffset requires:
+        // - If Kind==Utc, offset MUST be 00:00 or it throws.
+        // - If Kind==Unspecified, any offset is allowed.
+        if (barExchangeTime.Kind == DateTimeKind.Utc)
+        {
+            return new DateTimeOffset(barExchangeTime, TimeSpan.Zero);
+        }
+
+        if (barExchangeTime.Kind == DateTimeKind.Local)
+        {
+            // Local machine time -> normalize to UTC.
+            return new DateTimeOffset(barExchangeTime).ToUniversalTime();
+        }
+
+        // Treat Unspecified as exchange-local Chicago time and convert to UTC (DST-aware).
         var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-        // GetUtcOffset returns the offset FROM UTC (negative for timezones behind UTC)
-        // For Chicago in January: GetUtcOffset returns -06:00:00
-        var chicagoOffset = chicagoTz.GetUtcOffset(barExchangeTimeUnspecified);
-        var barChicagoOffset = new DateTimeOffset(barExchangeTimeUnspecified, chicagoOffset);
+        var unspecified = DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Unspecified);
+        var barChicagoOffset = new DateTimeOffset(unspecified, chicagoTz.GetUtcOffset(unspecified));
         return barChicagoOffset.ToUniversalTime();
     }
 }

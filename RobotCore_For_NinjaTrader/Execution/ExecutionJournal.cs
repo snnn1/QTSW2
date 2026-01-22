@@ -15,6 +15,7 @@ public sealed class ExecutionJournal
     private readonly string _journalDir;
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
+    private readonly object _lock = new object();
 
     public ExecutionJournal(string projectRoot, RobotLogger log)
     {
@@ -53,46 +54,49 @@ public sealed class ExecutionJournal
     /// </summary>
     public bool IsIntentSubmitted(string intentId, string tradingDate, string stream)
     {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        
-        if (_cache.TryGetValue(key, out var entry))
+        lock (_lock)
         {
-            return entry.EntrySubmitted || entry.EntryFilled;
-        }
-
-        // Check disk
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
-        if (File.Exists(journalPath))
-        {
-            try
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            
+            if (_cache.TryGetValue(key, out var entry))
             {
-                var json = File.ReadAllText(journalPath);
-                var diskEntry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                if (diskEntry != null)
+                return entry.EntrySubmitted || entry.EntryFilled;
+            }
+
+            // Check disk
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+            if (File.Exists(journalPath))
+            {
+                try
                 {
-                    _cache[key] = diskEntry;
-                    return diskEntry.EntrySubmitted || diskEntry.EntryFilled;
+                    var json = File.ReadAllText(journalPath);
+                    var diskEntry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (diskEntry != null)
+                    {
+                        _cache[key] = diskEntry;
+                        return diskEntry.EntrySubmitted || diskEntry.EntryFilled;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // If journal is corrupted, treat as not submitted (fail open)
+                    // Log error for observability (fail-open is correct, but errors should be visible)
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            note = "Journal read failed, treating as not submitted (fail-open for idempotency)"
+                        }));
                 }
             }
-            catch (Exception ex)
-            {
-                // If journal is corrupted, treat as not submitted (fail open)
-                // Log error for observability (fail-open is correct, but errors should be visible)
-                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        intent_id = intentId,
-                        stream = stream,
-                        trading_date = tradingDate,
-                        journal_path = journalPath,
-                        note = "Journal read failed, treating as not submitted (fail-open for idempotency)"
-                    }));
-            }
-        }
 
-        return false;
+            return false;
+        }
     }
 
     /// <summary>
@@ -107,61 +111,64 @@ public sealed class ExecutionJournal
         string? brokerOrderId,
         DateTimeOffset utcNow)
     {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
 
-        ExecutionJournalEntry entry;
-        if (_cache.TryGetValue(key, out var existing))
-        {
-            entry = existing;
-        }
-        else if (File.Exists(journalPath))
-        {
-            try
+            ExecutionJournalEntry entry;
+            if (_cache.TryGetValue(key, out var existing))
             {
-                var json = File.ReadAllText(journalPath);
-                entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                entry = existing;
             }
-            catch (Exception ex)
+            else if (File.Exists(journalPath))
             {
-                // Journal read failed, create new entry (fail-open)
-                // Log error for observability
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        intent_id = intentId,
-                        stream = stream,
-                        trading_date = tradingDate,
-                        journal_path = journalPath,
-                        note = "Journal read failed during RecordSubmission, creating new entry"
-                    }));
-                entry = new ExecutionJournalEntry();
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                }
+                catch (Exception ex)
+                {
+                    // Journal read failed, create new entry (fail-open)
+                    // Log error for observability
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            note = "Journal read failed during RecordSubmission, creating new entry"
+                        }));
+                    entry = new ExecutionJournalEntry();
+                }
             }
-        }
-        else
-        {
-            entry = new ExecutionJournalEntry
+            else
             {
-                IntentId = intentId,
-                TradingDate = tradingDate,
-                Stream = stream,
-                Instrument = instrument
-            };
+                entry = new ExecutionJournalEntry
+                {
+                    IntentId = intentId,
+                    TradingDate = tradingDate,
+                    Stream = stream,
+                    Instrument = instrument
+                };
+            }
+
+            entry.EntrySubmitted = true;
+            entry.EntrySubmittedAt = utcNow.ToString("o");
+            entry.BrokerOrderId = brokerOrderId;
+
+            if (orderType == "ENTRY")
+            {
+                entry.EntryOrderType = orderType;
+            }
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
         }
-
-        entry.EntrySubmitted = true;
-        entry.EntrySubmittedAt = utcNow.ToString("o");
-        entry.BrokerOrderId = brokerOrderId;
-
-        if (orderType == "ENTRY")
-        {
-            entry.EntryOrderType = orderType;
-        }
-
-        _cache[key] = entry;
-        SaveJournal(journalPath, entry);
     }
 
     /// <summary>
@@ -175,49 +182,52 @@ public sealed class ExecutionJournal
         int fillQuantity,
         DateTimeOffset utcNow)
     {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
-
-        if (!_cache.TryGetValue(key, out var entry))
+        lock (_lock)
         {
-            if (File.Exists(journalPath))
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            if (!_cache.TryGetValue(key, out var entry))
             {
-                try
+                if (File.Exists(journalPath))
                 {
-                    var json = File.ReadAllText(journalPath);
-                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    try
+                    {
+                        var json = File.ReadAllText(journalPath);
+                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Journal read failed, create new entry (fail-open)
+                        // Log error for observability
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                            new
+                            {
+                                error = ex.Message,
+                                exception_type = ex.GetType().Name,
+                                intent_id = intentId,
+                                stream = stream,
+                                trading_date = tradingDate,
+                                journal_path = journalPath,
+                                note = "Journal read failed during RecordFill, creating new entry"
+                            }));
+                        entry = new ExecutionJournalEntry();
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
-                    // Journal read failed, create new entry (fail-open)
-                    // Log error for observability
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
-                        new
-                        {
-                            error = ex.Message,
-                            exception_type = ex.GetType().Name,
-                            intent_id = intentId,
-                            stream = stream,
-                            trading_date = tradingDate,
-                            journal_path = journalPath,
-                            note = "Journal read failed during RecordFill, creating new entry"
-                        }));
                     entry = new ExecutionJournalEntry();
                 }
             }
-            else
-            {
-                entry = new ExecutionJournalEntry();
-            }
+
+            entry.EntryFilled = true;
+            entry.EntryFilledAt = utcNow.ToString("o");
+            entry.FillPrice = fillPrice;
+            entry.FillQuantity = fillQuantity;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
         }
-
-        entry.EntryFilled = true;
-        entry.EntryFilledAt = utcNow.ToString("o");
-        entry.FillPrice = fillPrice;
-        entry.FillQuantity = fillQuantity;
-
-        _cache[key] = entry;
-        SaveJournal(journalPath, entry);
     }
 
     /// <summary>
@@ -230,48 +240,51 @@ public sealed class ExecutionJournal
         string reason,
         DateTimeOffset utcNow)
     {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
-
-        if (!_cache.TryGetValue(key, out var entry))
+        lock (_lock)
         {
-            if (File.Exists(journalPath))
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            if (!_cache.TryGetValue(key, out var entry))
             {
-                try
+                if (File.Exists(journalPath))
                 {
-                    var json = File.ReadAllText(journalPath);
-                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    try
+                    {
+                        var json = File.ReadAllText(journalPath);
+                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Journal read failed, create new entry (fail-open)
+                        // Log error for observability
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                            new
+                            {
+                                error = ex.Message,
+                                exception_type = ex.GetType().Name,
+                                intent_id = intentId,
+                                stream = stream,
+                                trading_date = tradingDate,
+                                journal_path = journalPath,
+                                note = "Journal read failed during RecordRejection, creating new entry"
+                            }));
+                        entry = new ExecutionJournalEntry();
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
-                    // Journal read failed, create new entry (fail-open)
-                    // Log error for observability
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
-                        new
-                        {
-                            error = ex.Message,
-                            exception_type = ex.GetType().Name,
-                            intent_id = intentId,
-                            stream = stream,
-                            trading_date = tradingDate,
-                            journal_path = journalPath,
-                            note = "Journal read failed during RecordRejection, creating new entry"
-                        }));
                     entry = new ExecutionJournalEntry();
                 }
             }
-            else
-            {
-                entry = new ExecutionJournalEntry();
-            }
+
+            entry.Rejected = true;
+            entry.RejectedAt = utcNow.ToString("o");
+            entry.RejectionReason = reason;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
         }
-
-        entry.Rejected = true;
-        entry.RejectedAt = utcNow.ToString("o");
-        entry.RejectionReason = reason;
-
-        _cache[key] = entry;
-        SaveJournal(journalPath, entry);
     }
 
     /// <summary>
@@ -284,23 +297,85 @@ public sealed class ExecutionJournal
         decimal beStopPrice,
         DateTimeOffset utcNow)
     {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
-
-        if (!_cache.TryGetValue(key, out var entry))
+        lock (_lock)
         {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            if (!_cache.TryGetValue(key, out var entry))
+            {
+                if (File.Exists(journalPath))
+                {
+                    try
+                    {
+                        var json = File.ReadAllText(journalPath);
+                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Journal read failed, create new entry (fail-open)
+                        // Log error for observability
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                            new
+                            {
+                                error = ex.Message,
+                                exception_type = ex.GetType().Name,
+                                intent_id = intentId,
+                                stream = stream,
+                                trading_date = tradingDate,
+                                journal_path = journalPath,
+                                note = "Journal read failed during RecordBEModification, creating new entry"
+                            }));
+                        entry = new ExecutionJournalEntry();
+                    }
+                }
+                else
+                {
+                    entry = new ExecutionJournalEntry();
+                }
+            }
+
+            entry.BEModified = true;
+            entry.BEModifiedAt = utcNow.ToString("o");
+            entry.BEStopPrice = beStopPrice;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+        }
+    }
+
+    /// <summary>
+    /// Check if BE modification was already attempted (prevent duplicates).
+    /// </summary>
+    public bool IsBEModified(string intentId, string tradingDate, string stream)
+    {
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            
+            if (_cache.TryGetValue(key, out var entry))
+            {
+                return entry.BEModified;
+            }
+
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
             if (File.Exists(journalPath))
             {
                 try
                 {
                     var json = File.ReadAllText(journalPath);
-                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json) ?? new ExecutionJournalEntry();
+                    var diskEntry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (diskEntry != null)
+                    {
+                        _cache[key] = diskEntry;
+                        return diskEntry.BEModified;
+                    }
                 }
                 catch (Exception ex)
                 {
-                    // Journal read failed, create new entry (fail-open)
+                    // If journal is corrupted, treat as not modified (fail open)
                     // Log error for observability
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
                         new
                         {
                             error = ex.Message,
@@ -309,69 +384,13 @@ public sealed class ExecutionJournal
                             stream = stream,
                             trading_date = tradingDate,
                             journal_path = journalPath,
-                            note = "Journal read failed during RecordBEModification, creating new entry"
+                            note = "Journal read failed during IsBEModified check, treating as not modified (fail-open)"
                         }));
-                    entry = new ExecutionJournalEntry();
                 }
             }
-            else
-            {
-                entry = new ExecutionJournalEntry();
-            }
+
+            return false;
         }
-
-        entry.BEModified = true;
-        entry.BEModifiedAt = utcNow.ToString("o");
-        entry.BEStopPrice = beStopPrice;
-
-        _cache[key] = entry;
-        SaveJournal(journalPath, entry);
-    }
-
-    /// <summary>
-    /// Check if BE modification was already attempted (prevent duplicates).
-    /// </summary>
-    public bool IsBEModified(string intentId, string tradingDate, string stream)
-    {
-        var key = $"{tradingDate}_{stream}_{intentId}";
-        
-        if (_cache.TryGetValue(key, out var entry))
-        {
-            return entry.BEModified;
-        }
-
-        var journalPath = GetJournalPath(tradingDate, stream, intentId);
-        if (File.Exists(journalPath))
-        {
-            try
-            {
-                var json = File.ReadAllText(journalPath);
-                var diskEntry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                if (diskEntry != null)
-                {
-                    _cache[key] = diskEntry;
-                    return diskEntry.BEModified;
-                }
-            }
-            catch (Exception ex)
-            {
-                // If journal is corrupted, treat as not modified (fail open)
-                // Log error for observability
-                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        intent_id = intentId,
-                        stream = stream,
-                        trading_date = tradingDate,
-                        journal_path = journalPath,
-                        note = "Journal read failed during IsBEModified check, treating as not modified (fail-open)"
-                    }));
-            }
-        }
-
-        return false;
     }
 
     private string GetJournalPath(string tradingDate, string stream, string intentId)

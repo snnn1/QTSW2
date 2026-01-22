@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -31,6 +32,14 @@ public interface IExecutionAdapter
     /// Place a stop-market entry order (breakout stop).
     /// Intended for placing bracketed stop entries immediately after RANGE_LOCKED.
     /// </summary>
+    /// <param name="intentId">Unique intent identifier (hash of canonical fields)</param>
+    /// <param name="instrument">Instrument symbol</param>
+    /// <param name="direction">"Long" or "Short"</param>
+    /// <param name="stopPrice">Stop trigger price</param>
+    /// <param name="quantity">Number of contracts</param>
+    /// <param name="ocoGroup">Optional OCO group string to link long/short entries</param>
+    /// <param name="utcNow">Current UTC timestamp</param>
+    /// <returns>Order submission result</returns>
     OrderSubmissionResult SubmitStopEntryOrder(
         string intentId,
         string instrument,

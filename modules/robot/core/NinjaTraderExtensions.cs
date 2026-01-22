@@ -36,10 +36,25 @@ public static class NinjaTraderExtensions
     /// <returns>UTC DateTimeOffset</returns>
     public static DateTimeOffset ConvertBarTimeToUtc(DateTime barExchangeTime)
     {
-        // Times[0][0] is DateTimeKind.Unspecified, representing exchange local time (Chicago)
-        // We need to interpret it as Chicago time and convert to UTC (DST-aware)
+        // NinjaTrader typically provides DateTimeKind.Unspecified for exchange-local timestamps,
+        // but some APIs/callbacks can return Local or Utc kinds. DateTimeOffset requires:
+        // - If Kind==Utc, offset MUST be 00:00 or it throws.
+        // - If Kind==Unspecified, any offset is allowed.
+        if (barExchangeTime.Kind == DateTimeKind.Utc)
+        {
+            return new DateTimeOffset(barExchangeTime, TimeSpan.Zero);
+        }
+
+        if (barExchangeTime.Kind == DateTimeKind.Local)
+        {
+            // Local machine time -> normalize to UTC.
+            return new DateTimeOffset(barExchangeTime).ToUniversalTime();
+        }
+
+        // Treat Unspecified as exchange-local Chicago time and convert to UTC (DST-aware).
         var chicagoTz = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
-        var barChicagoOffset = new DateTimeOffset(barExchangeTime, chicagoTz.GetUtcOffset(barExchangeTime));
+        var unspecified = DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Unspecified);
+        var barChicagoOffset = new DateTimeOffset(unspecified, chicagoTz.GetUtcOffset(unspecified));
         return barChicagoOffset.ToUniversalTime();
     }
 }
