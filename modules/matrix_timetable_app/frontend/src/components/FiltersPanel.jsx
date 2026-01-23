@@ -126,7 +126,40 @@ export default function FiltersPanel({
         
         {/* Days of Month */}
         <div className="relative dom-dropdown-container space-y-2">
-          <label className="block text-xs font-medium mb-2 text-gray-400">Exclude DOM</label>
+          <div className="flex items-center justify-between mb-2">
+            <label className="block text-xs font-medium text-gray-400">Exclude DOM</label>
+            {filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0 && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  // Clear all day of month filters
+                  setStreamFilters(prev => {
+                    const updated = { ...prev }
+                    if (updated[streamId]) {
+                      updated[streamId] = {
+                        ...updated[streamId],
+                        exclude_days_of_month: []
+                      }
+                    } else {
+                      updated[streamId] = {
+                        exclude_days_of_week: [],
+                        exclude_days_of_month: [],
+                        exclude_times: [],
+                        include_years: []
+                      }
+                    }
+                    return updated
+                  })
+                }}
+                className="text-xs text-blue-400 hover:text-blue-300 underline"
+                title="Clear all excluded days"
+              >
+                Clear All
+              </button>
+            )}
+          </div>
           <button
             type="button"
             onClick={(e) => {

@@ -10,6 +10,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,10 +43,10 @@ public sealed class RobotLoggingService : IDisposable
     private int _referenceCount = 0; // Track how many engines are using this instance
     private readonly object _referenceLock = new();
 
-    // Configuration constants
-    private const int FLUSH_INTERVAL_MS = 500;
-    private const int MAX_QUEUE_SIZE = 50000;
-    private const int MAX_BATCH_PER_FLUSH = 2000;
+    // Configuration constants (now configurable via LoggingConfig)
+    private readonly int FLUSH_INTERVAL_MS;
+    private readonly int MAX_QUEUE_SIZE;
+    private readonly int MAX_BATCH_PER_FLUSH;
     private const int ERROR_LOG_INTERVAL_SECONDS = 10;
 
     // Log rotation and filtering configuration
@@ -61,6 +62,178 @@ public sealed class RobotLoggingService : IDisposable
     private DateTime _lastWorkerErrorEventUtc = DateTime.MinValue;
     private const int BACKPRESSURE_EVENT_RATE_LIMIT_SECONDS = 60; // Emit backpressure event max once per minute
     private const int WORKER_ERROR_EVENT_RATE_LIMIT_SECONDS = 60; // Emit worker error event max once per minute
+
+    // Human-friendly daily summary (written by background worker)
+    private DateTime _lastDailySummaryWriteUtc = DateTime.MinValue;
+    private const int DAILY_SUMMARY_WRITE_INTERVAL_SECONDS = 60;
+    private readonly DailySummaryAggregator _dailySummary = new();
+    
+    // Daily rotation tracking
+    private DateTime _lastRotationDateUtc = DateTime.MinValue;
+
+    private sealed class DailySummaryAggregator
+    {
+        public DateTime StartedUtc { get; } = DateTime.UtcNow;
+
+        public long TotalEvents { get; private set; }
+        public long Errors { get; private set; }
+        public long Warnings { get; private set; }
+
+        public long RangeEvents { get; private set; }
+        public long RangeLocked { get; private set; }
+
+        public long OrdersSubmitted { get; private set; }
+        public long ExecutionsFilled { get; private set; }
+        public long OrdersRejected { get; private set; }
+
+        public long PushoverEvents { get; private set; }
+        public long LoggingPipelineErrors { get; private set; } // LOG_* events
+
+        public readonly Dictionary<string, long> OrderTypeCounts = new(StringComparer.OrdinalIgnoreCase);
+
+        private RobotLogEvent? _latestError;
+        private RobotLogEvent? _latestOrderSubmitted;
+        private RobotLogEvent? _latestRangeLocked;
+        private RobotLogEvent? _latestPushover;
+        private RobotLogEvent? _latestLoggingPipelineError;
+
+        public void Observe(RobotLogEvent evt)
+        {
+            TotalEvents++;
+
+            if (string.Equals(evt.level, "ERROR", StringComparison.OrdinalIgnoreCase))
+            {
+                Errors++;
+                _latestError = evt;
+            }
+            else if (string.Equals(evt.level, "WARN", StringComparison.OrdinalIgnoreCase))
+            {
+                Warnings++;
+            }
+
+            var name = evt.@event ?? "";
+
+            if (name.StartsWith("LOG_", StringComparison.OrdinalIgnoreCase))
+            {
+                LoggingPipelineErrors++;
+                _latestLoggingPipelineError = evt;
+            }
+
+            if (name.StartsWith("RANGE_", StringComparison.OrdinalIgnoreCase) || string.Equals(name, "RANGE_LOCKED", StringComparison.OrdinalIgnoreCase))
+            {
+                RangeEvents++;
+                if (string.Equals(name, "RANGE_LOCKED", StringComparison.OrdinalIgnoreCase))
+                {
+                    RangeLocked++;
+                    _latestRangeLocked = evt;
+                }
+            }
+
+            if (string.Equals(name, "ORDER_SUBMITTED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "ORDER_SUBMIT_SUCCESS", StringComparison.OrdinalIgnoreCase))
+            {
+                OrdersSubmitted++;
+                _latestOrderSubmitted = evt;
+
+                // Best-effort order_type breakdown
+                if (evt.data != null && evt.data.TryGetValue("order_type", out var otObj))
+                {
+                    var ot = otObj?.ToString() ?? "";
+                    if (!string.IsNullOrWhiteSpace(ot))
+                    {
+                        if (!OrderTypeCounts.TryGetValue(ot, out var cur)) cur = 0;
+                        OrderTypeCounts[ot] = cur + 1;
+                    }
+                }
+            }
+
+            if (string.Equals(name, "EXECUTION_FILLED", StringComparison.OrdinalIgnoreCase))
+            {
+                ExecutionsFilled++;
+            }
+
+            if (string.Equals(name, "ORDER_REJECTED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "ORDER_SUBMIT_FAIL", StringComparison.OrdinalIgnoreCase))
+            {
+                OrdersRejected++;
+            }
+
+            if (name.StartsWith("PUSHOVER_", StringComparison.OrdinalIgnoreCase))
+            {
+                PushoverEvents++;
+                _latestPushover = evt;
+            }
+        }
+
+        private static string Compact(string? s, int maxLen = 160)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Length <= maxLen ? s : s.Substring(0, maxLen) + "...";
+        }
+
+        private static string Fmt(RobotLogEvent? e)
+        {
+            if (e == null) return "N/A";
+            return $"{e.ts_utc} | {e.instrument} | {e.@event} | {Compact(e.message)}";
+        }
+
+        public string RenderMarkdown(string logDir, long droppedDebug, long droppedInfo, int writeFailures)
+        {
+            var nowUtc = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+            var date = DateTime.UtcNow.ToString("yyyyMMdd");
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"# Robot Daily Log Summary ({date})");
+            sb.AppendLine();
+            sb.AppendLine($"Generated: {nowUtc} UTC");
+            sb.AppendLine();
+            sb.AppendLine("## Location");
+            sb.AppendLine($"- log_dir: `{logDir}`");
+            sb.AppendLine();
+            sb.AppendLine("## Health");
+            sb.AppendLine($"- total_events: {TotalEvents}");
+            sb.AppendLine($"- errors: {Errors}");
+            sb.AppendLine($"- warnings: {Warnings}");
+            sb.AppendLine($"- dropped_debug: {droppedDebug}");
+            sb.AppendLine($"- dropped_info: {droppedInfo}");
+            sb.AppendLine($"- write_failures: {writeFailures}");
+            sb.AppendLine();
+            sb.AppendLine("## Latest notable events");
+            sb.AppendLine($"- latest_error: {Fmt(_latestError)}");
+            sb.AppendLine($"- latest_logging_pipeline_error: {Fmt(_latestLoggingPipelineError)}");
+            sb.AppendLine();
+            sb.AppendLine("## Ranges");
+            sb.AppendLine($"- range_events: {RangeEvents}");
+            sb.AppendLine($"- range_locked: {RangeLocked}");
+            sb.AppendLine($"- latest_range_locked: {Fmt(_latestRangeLocked)}");
+            sb.AppendLine();
+            sb.AppendLine("## Orders");
+            sb.AppendLine($"- orders_submitted: {OrdersSubmitted}");
+            sb.AppendLine($"- orders_rejected: {OrdersRejected}");
+            sb.AppendLine($"- executions_filled: {ExecutionsFilled}");
+            sb.AppendLine($"- latest_order_submitted: {Fmt(_latestOrderSubmitted)}");
+            if (OrderTypeCounts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("### Order types");
+                foreach (var kv in OrderTypeCounts.OrderByDescending(kv => kv.Value))
+                {
+                    sb.AppendLine($"- {kv.Key}: {kv.Value}");
+                }
+            }
+            sb.AppendLine();
+            sb.AppendLine("## Notifications");
+            sb.AppendLine($"- pushover_events: {PushoverEvents}");
+            sb.AppendLine($"- latest_pushover: {Fmt(_latestPushover)}");
+
+            sb.AppendLine();
+            sb.AppendLine("## Notes");
+            sb.AppendLine("- This file is maintained by the logging background worker (non-blocking).");
+            sb.AppendLine("- For full details, grep the JSONL files in `logs/robot/`.");
+
+            return sb.ToString();
+        }
+    }
 
     /// <summary>
     /// Get or create the singleton instance for the given project root.
@@ -121,6 +294,11 @@ public sealed class RobotLoggingService : IDisposable
         _maxLogFileSizeBytes = _config.max_file_size_mb * 1024 * 1024;
         _minLogLevel = _config.min_log_level ?? "INFO";
         
+        // Use configurable values (with defaults)
+        MAX_QUEUE_SIZE = _config.max_queue_size > 0 ? _config.max_queue_size : 50000;
+        MAX_BATCH_PER_FLUSH = _config.max_batch_per_flush > 0 ? _config.max_batch_per_flush : 2000;
+        FLUSH_INTERVAL_MS = _config.flush_interval_ms > 0 ? _config.flush_interval_ms : 500;
+        
         // Archive old logs on startup
         ArchiveOldLogs();
     }
@@ -136,6 +314,12 @@ public sealed class RobotLoggingService : IDisposable
         if (!ShouldLog(evt.level))
         {
             return;
+        }
+        
+        // Sensitive data filtering (if enabled)
+        if (_config.enable_sensitive_data_filter && evt.data != null)
+        {
+            evt.data = SensitiveDataFilter.FilterDictionary(evt.data);
         }
 
         // Backpressure: if queue exceeds max size, drop DEBUG first, then INFO
@@ -349,6 +533,9 @@ public sealed class RobotLoggingService : IDisposable
             WriteBatchToFile(kvp.Key, kvp.Value);
         }
 
+        // Periodically emit a human-friendly daily summary (best-effort).
+        MaybeWriteDailySummary(force);
+
         // Log dropped counts if any (aggregated every flush)
         var droppedDebug = Interlocked.Exchange(ref _droppedDebugCount, 0);
         var droppedInfo = Interlocked.Exchange(ref _droppedInfoCount, 0);
@@ -356,6 +543,34 @@ public sealed class RobotLoggingService : IDisposable
         {
             var queueSize = _queue.Count;
             LogErrorToFile($"Backpressure: dropped_debug={droppedDebug}, dropped_info={droppedInfo}, queue_size={queueSize}");
+        }
+    }
+
+    private void MaybeWriteDailySummary(bool force)
+    {
+        try
+        {
+            var now = DateTime.UtcNow;
+            if (!force && (now - _lastDailySummaryWriteUtc).TotalSeconds < DAILY_SUMMARY_WRITE_INTERVAL_SECONDS)
+                return;
+
+            _lastDailySummaryWriteUtc = now;
+
+            var date = now.ToString("yyyyMMdd");
+            var summaryPath = Path.Combine(_logDirectory, $"daily_{date}.md");
+
+            // Snapshot counters that can change across threads
+            var droppedDebug = Interlocked.Read(ref _droppedDebugCount);
+            var droppedInfo = Interlocked.Read(ref _droppedInfoCount);
+            var writeFailures = Volatile.Read(ref _writeFailureCount);
+
+            var md = _dailySummary.RenderMarkdown(_logDirectory, droppedDebug, droppedInfo, writeFailures);
+            File.WriteAllText(summaryPath, md, Encoding.UTF8);
+        }
+        catch (Exception ex)
+        {
+            // Do not throw from worker loop; log once per interval to sidecar file.
+            LogErrorToFile($"Daily summary write failed: {ex.Message}");
         }
     }
 
@@ -382,6 +597,8 @@ public sealed class RobotLoggingService : IDisposable
             // Serialize and write each event (compact JSON, one per line)
             foreach (var evt in batch)
             {
+                // Update daily summary counters from worker thread (no locks needed)
+                _dailySummary.Observe(evt);
                 var json = JsonUtil.Serialize(evt);
                 writer.WriteLine(json);
             }
@@ -415,7 +632,7 @@ public sealed class RobotLoggingService : IDisposable
     }
 
     /// <summary>
-    /// Rotate log file if it exceeds maximum size.
+    /// Rotate log file if it exceeds maximum size or daily rotation is enabled.
     /// </summary>
     private void RotateLogFileIfNeeded(string instrument)
     {
@@ -425,7 +642,26 @@ public sealed class RobotLoggingService : IDisposable
         if (!File.Exists(filePath)) return;
         
         var fileInfo = new FileInfo(filePath);
-        if (fileInfo.Length <= _maxLogFileSizeBytes) return;
+        var nowUtc = DateTime.UtcNow;
+        var shouldRotate = false;
+        
+        // Check size-based rotation
+        if (fileInfo.Length > _maxLogFileSizeBytes)
+        {
+            shouldRotate = true;
+        }
+        // Check daily rotation (if enabled)
+        else if (_config.rotate_daily)
+        {
+            var fileDate = fileInfo.CreationTimeUtc.Date;
+            var todayDate = nowUtc.Date;
+            if (fileDate < todayDate)
+            {
+                shouldRotate = true;
+            }
+        }
+        
+        if (!shouldRotate) return;
 
         // Close current writer if it exists
         if (_writers.TryGetValue(instrument, out var writer))
@@ -566,6 +802,7 @@ public sealed class RobotLoggingService : IDisposable
                 "ENGINE",
                 "LOG_BACKPRESSURE_DROP",
                 $"Logging backpressure: dropped {droppedLevel} events",
+                runId: "LOGGING_SERVICE",
                 data: new Dictionary<string, object?>
                 {
                     ["dropped_level"] = droppedLevel,
@@ -606,6 +843,7 @@ public sealed class RobotLoggingService : IDisposable
                 "ENGINE",
                 "LOG_WORKER_LOOP_ERROR",
                 $"Worker loop error: {ex.Message}",
+                runId: "LOGGING_SERVICE",
                 data: new Dictionary<string, object?>
                 {
                     ["exception_type"] = ex.GetType().Name,
@@ -638,6 +876,7 @@ public sealed class RobotLoggingService : IDisposable
                 instrument,
                 "LOG_WRITE_FAILURE",
                 $"Write failure for {instrument}: {ex.Message}",
+                runId: "LOGGING_SERVICE",
                 data: new Dictionary<string, object?>
                 {
                     ["exception_type"] = ex.GetType().Name,

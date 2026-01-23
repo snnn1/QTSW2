@@ -114,6 +114,10 @@ data/
 # Explicitly keep tools/ directory (source code)
 !tools/
 
+# Local robot secrets (never commit)
+configs/robot/health_monitor.secrets.json
+configs/robot/health_monitor.local.json
+
 # Local ops diagnostics and archive files (never commit)
 ops/diagnostics/
 ops/archive/

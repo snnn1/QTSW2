@@ -14,6 +14,7 @@ public sealed class RobotLogger
     private readonly string _projectRoot;
     private readonly string? _customLogDir;
     private RobotLoggingService? _loggingService; // Optional reference to singleton service for ENGINE logs
+    private string? _runId; // Engine run identifier (GUID per engine start)
 
     public RobotLogger(string projectRoot, string? customLogDir = null, string? instrument = null, RobotLoggingService? loggingService = null)
     {
@@ -29,11 +30,10 @@ public sealed class RobotLogger
         var guidStr = Guid.NewGuid().ToString("N");
         _instanceId = guidStr.Substring(0, 8);
 
-        if (customLogDir != null)
-        {
-            _jsonlPath = Path.Combine(dir, $"robot_dryrun_{_instanceId}.jsonl");
-        }
-        else if (!string.IsNullOrWhiteSpace(instrument))
+        // NOTE: customLogDir is a directory override (not "dryrun mode").
+        // If the async logging service is unavailable, we fall back to per-instance files
+        // in the selected directory to avoid file lock contention.
+        if (!string.IsNullOrWhiteSpace(instrument))
         {
             // Per-instrument log file with instance ID: robot_ES_<instance>.jsonl
             var sanitizedInstrument = SanitizeFileName(instrument);
@@ -43,6 +43,15 @@ public sealed class RobotLogger
         {
             _jsonlPath = Path.Combine(dir, $"robot_skeleton_{_instanceId}.jsonl");
         }
+    }
+
+    /// <summary>
+    /// Set the current engine run ID (GUID per engine start). This is propagated into every RobotLogEvent.
+    /// Must be set before any logs are emitted in RobotEngine.Start().
+    /// </summary>
+    public void SetRunId(string runId)
+    {
+        _runId = runId;
     }
 
     private static string SanitizeFileName(string instrument)
@@ -196,14 +205,9 @@ public sealed class RobotLogger
             utcNow = parsed;
         }
 
-        var level = "INFO";
         var eventType = dict.TryGetValue("event_type", out var et) ? et?.ToString() ?? "" : "";
-        if (eventType.Contains("ERROR") || eventType.Contains("FAIL") || eventType.Contains("INVALID") || eventType.Contains("VIOLATION"))
-            level = "ERROR";
-        else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
-            level = "WARN";
-        // Note: DIAGNOSTIC/HEARTBEAT/AUDIT events now default to INFO (aligned with RobotEngine.ConvertToRobotLogEvent)
-        // This allows them to pass through min_log_level: INFO filter in RobotLoggingService
+        // Use centralized event registry for level assignment (replaces fragile string matching)
+        var level = RobotEventTypes.GetLevel(eventType);
 
         var source = "RobotEngine";
         if (dict.TryGetValue("stream", out var streamObj) && streamObj is string streamStr)
@@ -244,7 +248,7 @@ public sealed class RobotLogger
             }
         }
 
-        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, data: data.Count > 0 ? data : null);
+        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, runId: _runId, data: data.Count > 0 ? data : null);
     }
 }
 

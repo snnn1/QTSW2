@@ -868,5 +868,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         public Account GetAccount() => Account;
         public Instrument GetInstrument() => Instrument;
+        
+        /// <summary>
+        /// Send a test notification to verify Pushover is working.
+        /// Call this method from NinjaTrader or external code to test notifications.
+        /// </summary>
+        public void SendTestNotification()
+        {
+            if (_engine is null)
+            {
+                Log("ERROR: Cannot send test notification - engine is null", LogLevel.Error);
+                return;
+            }
+            
+            if (!_engineReady)
+            {
+                Log("WARNING: Cannot send test notification - engine not ready yet", LogLevel.Warning);
+                return;
+            }
+            
+            _engine.SendTestNotification();
+            Log("Test notification requested - check logs for PUSHOVER_NOTIFY_ENQUEUED event", LogLevel.Information);
+        }
     }
 }

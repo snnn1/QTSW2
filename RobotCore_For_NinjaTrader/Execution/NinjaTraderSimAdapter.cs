@@ -1,3 +1,11 @@
+// NOTE: NinjaTrader's in-app C# compiler does not automatically define custom
+// conditional compilation symbols. This adapter relies on `NINJATRADER` to
+// compile the real NT8 API path (vs the mock harness fallback).
+//
+// Defining it here ensures the real order submission code is compiled when this
+// file is deployed/compiled inside NinjaTrader.
+#define NINJATRADER
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -19,7 +27,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed class NinjaTraderSimAdapter : IExecutionAdapter
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 {
     private readonly RobotLogger _log;
     private readonly string _projectRoot;

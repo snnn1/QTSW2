@@ -84,6 +84,9 @@ public sealed class StreamStateMachine
     
     // PHASE 4: Alert callback for missing data incidents
     private Action<string, string, string, int>? _alertCallback;
+    
+    // Critical event reporting callback: (eventType, payload, tradingDate) => void
+    private Action<string, Dictionary<string, object>, string?>? _reportCriticalCallback;
 
     // Diagnostic logging configuration
     private readonly bool _enableDiagnosticLogs;
@@ -308,6 +311,14 @@ public sealed class StreamStateMachine
     public void SetAlertCallback(Action<string, string, string, int>? callback)
     {
         _alertCallback = callback;
+    }
+    
+    /// <summary>
+    /// Set callback for reporting critical events to HealthMonitor.
+    /// </summary>
+    public void SetReportCriticalCallback(Action<string, Dictionary<string, object>, string?>? callback)
+    {
+        _reportCriticalCallback = callback;
     }
 
     public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
@@ -1555,16 +1566,61 @@ public sealed class StreamStateMachine
                     if (shouldLogFailure)
                     {
                         _lastRangeComputeFailedLogUtc = utcNow;
+                        // Categorize reason codes for better filtering
+                        var reasonCode = rangeResult.Reason ?? "UNKNOWN";
+                        var isBenignFailure = reasonCode == "NO_BARS_YET" || 
+                                             reasonCode == "NO_BARS_IN_WINDOW" || 
+                                             reasonCode == "OUTSIDE_RANGE_WINDOW" || 
+                                             reasonCode == "BARS_FROM_WRONG_DATE" ||
+                                             reasonCode == "INSUFFICIENT_BARS";
+                        var isActionableFailure = reasonCode == "INVALID_RANGE_HIGH_LOW" || 
+                                                 reasonCode == "NO_FREEZE_CLOSE";
+                        
+                        // DEFENSIVE GUARDRAIL: Ensure ACTIONABLE failures are always logged at ERROR level
+                        // This prevents accidental downgrades in future refactors
+                        if (isActionableFailure)
+                        {
+                            var eventLevel = RobotEventTypes.GetLevel("RANGE_COMPUTE_FAILED");
+                            System.Diagnostics.Debug.Assert(
+                                eventLevel == "ERROR",
+                                $"INVARIANT VIOLATION: ACTIONABLE RANGE_COMPUTE_FAILED reason '{reasonCode}' must be logged at ERROR level, but RobotEventTypes.GetLevel() returned '{eventLevel}'. " +
+                                $"This is a hard contract: ACTIONABLE = ERROR. Update RobotEventTypes.cs to ensure RANGE_COMPUTE_FAILED is ERROR level."
+                            );
+                            
+                            // Runtime check (in addition to debug assertion) for production safety
+                            if (eventLevel != "ERROR")
+                            {
+                                // Log a critical error about the invariant violation
+                                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                                    "LOGGING_INVARIANT_VIOLATION", State.ToString(),
+                                    new
+                                    {
+                                        event_type = "RANGE_COMPUTE_FAILED",
+                                        reason = reasonCode,
+                                        reason_category = "ACTIONABLE",
+                                        expected_level = "ERROR",
+                                        actual_level = eventLevel,
+                                        message = "CRITICAL: ACTIONABLE failures must be logged at ERROR level. This is a hard contract violation.",
+                                        note = "This indicates a configuration error in RobotEventTypes.cs - ACTIONABLE failures require ERROR level"
+                                    }));
+                            }
+                        }
+                        
                         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                             "RANGE_COMPUTE_FAILED", State.ToString(),
                             new
                             {
                                 range_start_utc = RangeStartUtc.ToString("o"),
                                 range_end_utc = SlotTimeUtc.ToString("o"),
-                                reason = rangeResult.Reason,
+                                reason = reasonCode,
+                                reason_category = isBenignFailure ? "BENIGN" : isActionableFailure ? "ACTIONABLE" : "UNKNOWN",
                                 bar_count = rangeResult.BarCount,
                                 message = "Range computation failed - will retry on next tick or use partial data",
-                                note = "This error is rate-limited to once per minute to reduce log noise"
+                                note = isBenignFailure 
+                                    ? "Benign failure - waiting for bars or data alignment (rate-limited to once per minute)"
+                                    : isActionableFailure
+                                        ? "Actionable failure - indicates data or logic issue (rate-limited to once per minute)"
+                                        : "This error is rate-limited to once per minute to reduce log noise"
                             }));
                     }
                     
@@ -2290,27 +2346,35 @@ public sealed class StreamStateMachine
         if (barUtc >= slotTimePlusInterval && !finalAllowed && stateOk && slotReached)
         {
             // This should not happen - execution should be allowed by now
+            var payload = new Dictionary<string, object>
+            {
+                ["error"] = "EXECUTION_SHOULD_BE_ALLOWED_BUT_IS_NOT",
+                ["bar_timestamp_chicago"] = barChicagoTime,
+                ["slot_time_chicago"] = slotTimeChicagoStr,
+                ["slot_time_utc"] = slotTimeUtcParsed.ToString("o"),
+                ["bar_interval_minutes"] = estimatedBarIntervalMinutes,
+                ["realtime_ok"] = realtimeOk,
+                ["trading_day"] = tradingDay,
+                ["session_active"] = sessionActive,
+                ["slot_reached"] = slotReached,
+                ["timetable_enabled"] = timetableEnabled,
+                ["stream_armed"] = streamArmed,
+                ["can_detect_entries"] = canDetectEntries,
+                ["entry_detected"] = _entryDetected,
+                ["breakout_levels_computed"] = _brkLongRounded.HasValue && _brkShortRounded.HasValue,
+                ["execution_mode"] = _executionMode.ToString(),
+                ["instrument"] = Instrument,
+                ["stream"] = Stream,
+                ["trading_date"] = TradingDate,
+                ["message"] = "Slot time has passed but execution is not allowed. Check gate states above."
+            };
+            
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "EXECUTION_GATE_INVARIANT_VIOLATION", State.ToString(),
-                new
-                {
-                    error = "EXECUTION_SHOULD_BE_ALLOWED_BUT_IS_NOT",
-                    bar_timestamp_chicago = barChicagoTime,
-                    slot_time_chicago = slotTimeChicagoStr,
-                    slot_time_utc = slotTimeUtcParsed.ToString("o"),
-                    bar_interval_minutes = estimatedBarIntervalMinutes,
-                    realtime_ok = realtimeOk,
-                    trading_day = tradingDay,
-                    session_active = sessionActive,
-                    slot_reached = slotReached,
-                    timetable_enabled = timetableEnabled,
-                    stream_armed = streamArmed,
-                    can_detect_entries = canDetectEntries,
-                    entry_detected = _entryDetected,
-                    breakout_levels_computed = _brkLongRounded.HasValue && _brkShortRounded.HasValue,
-                    execution_mode = _executionMode.ToString(),
-                    message = "Slot time has passed but execution is not allowed. Check gate states above."
-                }));
+                payload));
+            
+            // Report critical event to HealthMonitor for notification
+            _reportCriticalCallback?.Invoke("EXECUTION_GATE_INVARIANT_VIOLATION", payload, TradingDate);
         }
     }
 
@@ -3098,7 +3162,26 @@ public sealed class StreamStateMachine
                         : "No bars found in range window - waiting for bars from correct trading date or check date alignment"
                 }));
             
-            return (false, null, null, null, "UNSET", 0, "NO_BARS_IN_WINDOW", null, null, null, null);
+            // Determine more specific reason code
+            string reasonCode;
+            if (barBufferCount == 0)
+            {
+                reasonCode = "NO_BARS_YET";
+            }
+            else if (barsFromWrongDate)
+            {
+                reasonCode = "BARS_FROM_WRONG_DATE";
+            }
+            else if (barsFromCorrectDate)
+            {
+                reasonCode = "OUTSIDE_RANGE_WINDOW";
+            }
+            else
+            {
+                reasonCode = "NO_BARS_IN_WINDOW";
+            }
+            
+            return (false, null, null, null, "UNSET", 0, reasonCode, null, null, null, null);
         }
 
         // Sort by timestamp (should already be sorted, but ensure correctness)
@@ -3147,6 +3230,12 @@ public sealed class StreamStateMachine
         if (rangeHigh < rangeLow)
         {
             return (false, null, null, null, "UNSET", bars.Count, "INVALID_RANGE_HIGH_LOW", bars[0].TimestampUtc, bars[bars.Count - 1].TimestampUtc, _time.ConvertUtcToChicago(bars[0].TimestampUtc), _time.ConvertUtcToChicago(bars[bars.Count - 1].TimestampUtc));
+        }
+
+        // Validate we have sufficient bars for reliable range computation
+        if (bars.Count < 3)
+        {
+            return (false, null, null, null, "UNSET", bars.Count, "INSUFFICIENT_BARS", bars[0].TimestampUtc, bars[bars.Count - 1].TimestampUtc, _time.ConvertUtcToChicago(bars[0].TimestampUtc), _time.ConvertUtcToChicago(bars[bars.Count - 1].TimestampUtc));
         }
 
         // Validate we have a freeze close

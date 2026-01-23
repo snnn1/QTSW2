@@ -8,5 +8,11 @@
     "bar_diagnostic_seconds": 300,
     "slot_gate_diagnostic_seconds": 60
   },
-  "archive_days": 7
+  "archive_days": 7,
+  "max_queue_size": 50000,
+  "max_batch_per_flush": 2000,
+  "flush_interval_ms": 500,
+  "rotate_daily": false,
+  "enable_sensitive_data_filter": true,
+  "archive_cleanup_days": 30
 }

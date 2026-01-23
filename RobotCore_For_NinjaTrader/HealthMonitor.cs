@@ -15,6 +15,8 @@ public sealed class HealthMonitor
     private readonly HealthMonitorConfig _config;
     private readonly RobotLogger _log;
     private readonly NotificationService? _notificationService;
+    private string? _runId; // Engine run identifier (GUID per engine start)
+    private readonly object _notifyLock = new object(); // Guards dedupe + rate-limit state
     
     // Data loss tracking: timestamp of last received bar per instrument
     private readonly Dictionary<string, DateTimeOffset> _lastBarUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
@@ -42,6 +44,18 @@ public sealed class HealthMonitor
     private DateTimeOffset _lastEvaluateUtc = DateTimeOffset.MinValue;
     private const int EVALUATE_RATE_LIMIT_SECONDS = 1; // Max 1 evaluation per second
     
+    // Critical event notification tracking: one notification per (eventType, run_id)
+    // Key format: "{eventType}:{run_id}" where run_id defaults to trading_date if not provided
+    private readonly HashSet<string> _criticalNotificationsSent = new(StringComparer.OrdinalIgnoreCase);
+    private bool _missingRunIdWarned = false; // Rate-limit missing run_id warning (once per process)
+    
+    // Whitelist of allowed critical event types
+    private static readonly HashSet<string> ALLOWED_CRITICAL_EVENT_TYPES = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "EXECUTION_GATE_INVARIANT_VIOLATION",
+        "DISCONNECT_FAIL_CLOSED_ENTERED"
+    };
+    
     // Background evaluation thread for data loss detection
     private CancellationTokenSource? _evaluationCancellationTokenSource;
     private Task? _evaluationTask;
@@ -64,6 +78,15 @@ public sealed class HealthMonitor
         {
             _notificationService = NotificationService.GetOrCreate(projectRoot, config);
         }
+    }
+
+    /// <summary>
+    /// Set engine run_id (GUID per engine start). Used for deterministic notification dedupe.
+    /// Must be set by RobotEngine.Start() before any notifications are reported.
+    /// </summary>
+    public void SetRunId(string runId)
+    {
+        _runId = runId;
     }
     
     /// <summary>
@@ -372,31 +395,176 @@ public sealed class HealthMonitor
         }
     }
     
+    /// <summary>
+    /// Report a critical event for notification.
+    /// Only whitelisted event types are allowed: EXECUTION_GATE_INVARIANT_VIOLATION, DISCONNECT_FAIL_CLOSED_ENTERED
+    /// Enforces: One notification per (eventType, run_id) to keep behavior deterministic and auditable.
+    /// </summary>
+    /// <param name="eventType">Event type (must be whitelisted)</param>
+    /// <param name="payload">Event payload dictionary (for audit readability; dedupe is engine-run scoped)</param>
+    public void ReportCritical(string eventType, Dictionary<string, object> payload)
+    {
+        if (!_config.enabled || _notificationService == null)
+            return;
+        
+        // Whitelist check: only allow specific critical event types
+        if (!ALLOWED_CRITICAL_EVENT_TYPES.Contains(eventType))
+        {
+            var td = payload != null && payload.TryGetValue("trading_date", out var tdObj) ? tdObj?.ToString() ?? "" : "";
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: td, eventType: "CRITICAL_NOTIFICATION_REJECTED", state: "ENGINE",
+                new
+                {
+                    event_type = eventType,
+                    reason = "NOT_WHITELISTED",
+                    allowed_types = string.Join(", ", ALLOWED_CRITICAL_EVENT_TYPES),
+                    note = "Critical event type not in whitelist - notification rejected for safety"
+                }));
+            return;
+        }
+
+        // Dedupe key ladder:
+        // 1) eventType:_runId (preferred; deterministic per engine run)
+        // 2) eventType:trading_date (only if trading_date is known/locked)
+        // 3) eventType:UNKNOWN_RUN (last resort; warn once to surface bug)
+        string dedupeKey;
+        var tradingDate = payload != null && payload.TryGetValue("trading_date", out var tradingDateObj)
+            ? tradingDateObj?.ToString() ?? ""
+            : "";
+
+        if (!string.IsNullOrWhiteSpace(_runId))
+        {
+            dedupeKey = $"{eventType}:{_runId}";
+        }
+        else if (!string.IsNullOrWhiteSpace(tradingDate))
+        {
+            dedupeKey = $"{eventType}:{tradingDate}";
+        }
+        else
+        {
+            dedupeKey = $"{eventType}:UNKNOWN_RUN";
+            // Rate-limited warning: once per process to avoid spam
+            lock (_notifyLock)
+            {
+                if (!_missingRunIdWarned)
+                {
+                    _missingRunIdWarned = true;
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "CRITICAL_DEDUPE_MISSING_RUN_ID", state: "ENGINE",
+                        new
+                        {
+                            event_type = eventType,
+                            note = "HealthMonitor missing run_id and trading_date; using UNKNOWN_RUN dedupe key (bug)"
+                        }));
+                }
+            }
+        }
+
+        // Decide + mark sent under lock (thread-safe)
+        lock (_notifyLock)
+        {
+            if (_criticalNotificationsSent.Contains(dedupeKey))
+                return;
+            _criticalNotificationsSent.Add(dedupeKey);
+        }
+        
+        // Build notification message from payload
+        var title = eventType.Replace("_", " ");
+        var message = BuildCriticalEventMessage(eventType, payload);
+        
+        // Send notification: Emergency priority (2), immediate enqueue (skip rate limit)
+        SendNotification(dedupeKey, title, message, priority: 2, skipRateLimit: true);
+        
+        // Log that critical event was reported
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: tradingDate, eventType: "CRITICAL_EVENT_REPORTED", state: "ENGINE",
+            new
+            {
+                event_type = eventType,
+                run_id = _runId,
+                dedupe_key = dedupeKey,
+                notification_sent = true,
+                priority = 2,
+                note = "Critical event reported to notification system (one per eventType:run_id)"
+            }));
+    }
+    
+    /// <summary>
+    /// Build human-readable message from critical event payload.
+    /// </summary>
+    private string BuildCriticalEventMessage(string eventType, Dictionary<string, object>? payload)
+    {
+        if (payload == null)
+            return $"Critical event: {eventType}";
+        
+        var parts = new List<string>();
+        
+        if (eventType == "EXECUTION_GATE_INVARIANT_VIOLATION")
+        {
+            parts.Add("Execution Gate Invariant Violation");
+            if (payload.TryGetValue("instrument", out var inst) && inst != null)
+                parts.Add($"Instrument: {inst}");
+            if (payload.TryGetValue("stream", out var stream) && stream != null)
+                parts.Add($"Stream: {stream}");
+            if (payload.TryGetValue("error", out var error) && error != null)
+                parts.Add($"Error: {error}");
+            if (payload.TryGetValue("message", out var msg) && msg != null)
+                parts.Add($"Details: {msg}");
+        }
+        else if (eventType == "DISCONNECT_FAIL_CLOSED_ENTERED")
+        {
+            parts.Add("Robot Entered Fail-Closed Mode");
+            if (payload.TryGetValue("connection_name", out var connName) && connName != null)
+                parts.Add($"Connection: {connName}");
+            if (payload.TryGetValue("active_stream_count", out var streamCount) && streamCount != null)
+                parts.Add($"Active Streams: {streamCount}");
+            parts.Add("All execution blocked - requires operator intervention");
+        }
+        else
+        {
+            parts.Add($"Critical event: {eventType}");
+            if (payload.TryGetValue("message", out var msg) && msg != null)
+                parts.Add($"{msg}");
+        }
+        
+        return string.Join(". ", parts);
+    }
+    
     private void SendNotification(string key, string title, string message, int priority, bool skipRateLimit = false)
     {
         if (_notificationService == null)
             return;
-        
-        // Emergency notifications (priority 2) skip rate limiting
-        // All other notifications respect rate limit
-        if (!skipRateLimit && priority < 2)
+
+        var utcNow = DateTimeOffset.UtcNow;
+        bool shouldSend = true;
+
+        // Decide under lock (thread-safe), keep lock scope minimal
+        lock (_notifyLock)
         {
-            // Check rate limit for non-emergency notifications
-            if (_lastNotifyUtcByKey.TryGetValue(key, out var lastNotify))
+            // Emergency notifications (priority 2) skip rate limiting
+            // All other notifications respect rate limit
+            if (!skipRateLimit && priority < 2)
             {
-                var timeSinceLastNotify = (DateTimeOffset.UtcNow - lastNotify).TotalSeconds;
-                if (timeSinceLastNotify < _config.min_notify_interval_seconds)
-                    return; // Rate limited
+                // Check rate limit for non-emergency notifications
+                if (_lastNotifyUtcByKey.TryGetValue(key, out var lastNotify))
+                {
+                    var timeSinceLastNotify = (utcNow - lastNotify).TotalSeconds;
+                    if (timeSinceLastNotify < _config.min_notify_interval_seconds)
+                        shouldSend = false;
+                }
+            }
+
+            if (shouldSend)
+            {
+                _lastNotifyUtcByKey[key] = utcNow;
             }
         }
+
+        if (!shouldSend)
+            return;
         
-        _lastNotifyUtcByKey[key] = DateTimeOffset.UtcNow;
-        
-        // Enqueue notification (non-blocking)
+        // Enqueue notification (non-blocking) - outside lock
         _notificationService.EnqueueNotification(key, title, message, priority);
         
         // Log notification enqueued
-        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "PUSHOVER_NOTIFY_ENQUEUED", state: "ENGINE",
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PUSHOVER_NOTIFY_ENQUEUED", state: "ENGINE",
             new
             {
                 notification_key = key,
@@ -513,6 +681,43 @@ public sealed class HealthMonitor
     /// Get notification service for external use (e.g., engine startup alerts).
     /// </summary>
     public NotificationService? GetNotificationService() => _notificationService;
+    
+    /// <summary>
+    /// Send a test notification to verify Pushover is working.
+    /// This bypasses the critical event whitelist and sends a test message.
+    /// </summary>
+    public void SendTestNotification()
+    {
+        if (!_config.enabled || _notificationService == null)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "TEST_NOTIFICATION_SKIPPED", state: "ENGINE",
+                new
+                {
+                    reason = _config.enabled ? "NOTIFICATION_SERVICE_NULL" : "HEALTH_MONITOR_DISABLED",
+                    note = "Test notification skipped - health monitor disabled or notification service not configured"
+                }));
+            return;
+        }
+        
+        var testKey = $"TEST_NOTIFICATION:{_runId ?? "UNKNOWN_RUN"}";
+        var title = "Robot Test Notification";
+        var message = $"Test notification from robot. Run ID: {_runId ?? "UNKNOWN_RUN"}. If you receive this, Pushover is working correctly.";
+        
+        // Send test notification: Normal priority (0), skip rate limit for testing
+        SendNotification(testKey, title, message, priority: 0, skipRateLimit: true);
+        
+        // Log test notification sent
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "TEST_NOTIFICATION_SENT", state: "ENGINE",
+            new
+            {
+                run_id = _runId,
+                notification_key = testKey,
+                title = title,
+                message = message,
+                priority = 0,
+                note = "Test notification sent to verify Pushover connectivity"
+            }));
+    }
 }
 
 /// <summary>

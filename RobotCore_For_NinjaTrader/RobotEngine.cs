@@ -28,6 +28,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly JournalStore _journals;
     private readonly FilePoller _timetablePoller;
     private readonly object _engineLock = new object(); // Serialize engine entrypoints (Tick/OnBar/etc.)
+    
+    // Engine run identifier (GUID per engine Start())
+    private string? _runId;
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -65,12 +68,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
-    private readonly KillSwitch _killSwitch;
+    private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
 
     // Logging configuration
     private readonly LoggingConfig _loggingConfig;
+    private readonly string _resolvedLogDir;
+    private readonly string _resolvedLogDirSource;
+    private readonly string _loggingConfigPath;
+    private readonly string? _resolvedLogDirWarning;
 
     // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
     private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
@@ -187,15 +194,66 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         
         // Load logging configuration
         _loggingConfig = LoggingConfig.LoadFromFile(projectRoot);
+        _loggingConfigPath = Path.Combine(projectRoot, "configs", "robot", "logging.json");
+
+        // Resolve effective log directory (configurable; default is <projectRoot>\logs\robot)
+        // Precedence: ctor customLogDir > env QTSW2_LOG_DIR > configs/robot/logging.json:log_dir > default
+        var defaultLogDir = Path.Combine(projectRoot, "logs", "robot");
+        var logDirSource = "default";
+        string? warning = null;
+
+        string? chosen = null;
+        if (!string.IsNullOrWhiteSpace(customLogDir))
+        {
+            chosen = customLogDir;
+            logDirSource = "ctor_param";
+        }
+        else
+        {
+            var envLogDir = Environment.GetEnvironmentVariable("QTSW2_LOG_DIR");
+            if (!string.IsNullOrWhiteSpace(envLogDir))
+            {
+                chosen = envLogDir;
+                logDirSource = "env:QTSW2_LOG_DIR";
+            }
+            else if (!string.IsNullOrWhiteSpace(_loggingConfig.log_dir))
+            {
+                chosen = _loggingConfig.log_dir;
+                logDirSource = "config:logging.json";
+            }
+        }
+
+        var effectiveLogDir = defaultLogDir;
+        if (!string.IsNullOrWhiteSpace(chosen))
+        {
+            effectiveLogDir = Path.IsPathRooted(chosen) ? chosen : Path.Combine(projectRoot, chosen);
+        }
+
+        try
+        {
+            Directory.CreateDirectory(effectiveLogDir);
+        }
+        catch (Exception ex)
+        {
+            // Fail-open: fall back to default log dir if override is invalid
+            warning = $"Failed to create log dir '{effectiveLogDir}'. Falling back to '{defaultLogDir}'. Error: {ex.Message}";
+            effectiveLogDir = defaultLogDir;
+            logDirSource = logDirSource + "_fallback";
+            try { Directory.CreateDirectory(effectiveLogDir); } catch { /* ignore */ }
+        }
+
+        _resolvedLogDir = effectiveLogDir;
+        _resolvedLogDirSource = logDirSource;
+        _resolvedLogDirWarning = warning;
         
         // Initialize async logging service (Fix B) - singleton per project root to prevent file lock contention
         if (useAsyncLogging)
         {
-            _loggingService = RobotLoggingService.GetOrCreate(projectRoot, customLogDir);
+            _loggingService = RobotLoggingService.GetOrCreate(projectRoot, _resolvedLogDir);
         }
         
         // Create logger with service reference so ENGINE logs route through singleton
-        _log = new RobotLogger(projectRoot, customLogDir, instrument, _loggingService);
+        _log = new RobotLogger(projectRoot, _resolvedLogDir, instrument, _loggingService);
         
         _journals = new JournalStore(projectRoot);
         _timetablePoller = new FilePoller(timetablePollInterval);
@@ -203,27 +261,225 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
 
-        // Initialize execution components that don't depend on spec
-        _killSwitch = new KillSwitch(projectRoot, _log);
+        // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
+        // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
-        
-        // Initialize health monitor (fail-closed: if config missing/invalid, monitoring disabled)
+    }
+
+    public void Start()
+    {
+        // CRITICAL: Set run_id before any Start-path logs
+        _runId = Guid.NewGuid().ToString("N");
+        _log.SetRunId(_runId);
+
+        var utcNow = DateTimeOffset.UtcNow;
+
+        // Initialize HealthMonitor after run_id is set so any health-monitor logs include run_id.
+        InitializeHealthMonitorIfNeeded();
+        _healthMonitor?.SetRunId(_runId);
+
+        // Phase: initialize core under engine lock (serialize against timer/bar threads)
+        lock (_engineLock)
+        {
+            // Initialize KillSwitch after run_id is set so its constructor logs include run_id.
+            if (_killSwitch == null)
+            {
+                _killSwitch = new KillSwitch(_root, _log);
+            }
+
+            // PHASE 1: Fail-fast for LIVE mode before engine starts
+            if (_executionMode == ExecutionMode.LIVE)
+            {
+                var errorMsg = "LIVE mode is not yet enabled. Use DRYRUN or SIM.";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LIVE_MODE_BLOCKED", state: "ENGINE",
+                    new { error = errorMsg, execution_mode = _executionMode.ToString() }));
+
+                // Trigger high-priority alert (not log-only)
+                if (_healthMonitor != null)
+                {
+                    var notificationService = _healthMonitor.GetNotificationService();
+                    if (notificationService != null)
+                    {
+                        notificationService.EnqueueNotification(
+                            "LIVE_MODE_BLOCKED",
+                            "CRITICAL: LIVE Trading Blocked",
+                            $"Robot attempted to start in LIVE mode but it is not enabled. Execution blocked. Error: {errorMsg}",
+                            priority: 2); // Emergency priority
+                    }
+                }
+
+                throw new InvalidOperationException(errorMsg);
+            }
+
+            // Start async logging service if enabled (Fix B)
+            _loggingService?.Start();
+
+            // Log resolved runtime paths/config for operator visibility
+            var envProjectRoot = Environment.GetEnvironmentVariable("QTSW2_PROJECT_ROOT");
+            var envLogDir = Environment.GetEnvironmentVariable("QTSW2_LOG_DIR");
+            var cwd = "";
+            try { cwd = Directory.GetCurrentDirectory(); } catch { cwd = ""; }
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PROJECT_ROOT_RESOLVED", state: "ENGINE",
+                new
+                {
+                    project_root = _root,
+                    env_QTSW2_PROJECT_ROOT = envProjectRoot,
+                    cwd,
+                    spec_path = _specPath,
+                    spec_exists = File.Exists(_specPath)
+                }));
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LOG_DIR_RESOLVED", state: "ENGINE",
+                new
+                {
+                    log_dir = _resolvedLogDir,
+                    source = _resolvedLogDirSource,
+                    env_QTSW2_LOG_DIR = envLogDir,
+                    config_log_dir = _loggingConfig.log_dir,
+                    warning = _resolvedLogDirWarning
+                }));
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LOGGING_CONFIG_LOADED", state: "ENGINE",
+                new
+                {
+                    path = _loggingConfigPath,
+                    exists = File.Exists(_loggingConfigPath),
+                    max_file_size_mb = _loggingConfig.max_file_size_mb,
+                    max_rotated_files = _loggingConfig.max_rotated_files,
+                    min_log_level = _loggingConfig.min_log_level,
+                    enable_diagnostic_logs = _loggingConfig.enable_diagnostic_logs,
+                    diagnostic_rate_limits = _loggingConfig.diagnostic_rate_limits,
+                    archive_days = _loggingConfig.archive_days
+                }));
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE"));
+
+            try
+            {
+                _spec = ParitySpec.LoadFromFile(_specPath);
+                // Debug log: confirm spec_name was loaded
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
+                    new { spec_name = _spec.spec_name }));
+                _time = new TimeService(_spec.timezone);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
+                    new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE",
+                    new { error = ex.Message }));
+                throw;
+            }
+
+            // Initialize execution components now that spec is loaded
+            if (_killSwitch == null)
+                throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
+            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this);
+
+            // Try to create adapter (will throw if LIVE mode)
+            _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
+
+            // PHASE 2: Set engine callbacks for protective order failure recovery
+            if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+            {
+                simAdapter.SetEngineCallbacks(
+                    standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
+                    getNotificationServiceCallback: () => GetNotificationService());
+            }
+
+            // Log execution mode and adapter
+            var adapterType = _executionAdapter.GetType().Name;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
+                new { mode = _executionMode.ToString(), adapter = adapterType }));
+        }
+
+        // Timetable disk I/O happens outside the engine lock; application happens under the lock.
+        var parsed = PollAndParseTimetable(utcNow);
+
+        lock (_engineLock)
+        {
+            // Load timetable and lock trading date from it (fail closed if invalid)
+            // Trading date is locked immediately from timetable, then streams are created
+            ReloadTimetableIfChanged(utcNow, force: true, parsed.Poll, parsed.Timetable, parsed.ParseException);
+
+            // If trading date was locked from timetable, create streams and emit banner
+            if (_activeTradingDate.HasValue)
+            {
+                EnsureStreamsCreated(utcNow);
+                EmitStartupBanner(utcNow);
+            }
+            // Otherwise, timetable was invalid or missing trading_date - StandDown() was called
+
+            // Initialize heartbeat timestamp
+            _lastTickUtc = utcNow;
+
+            // Start health monitor if enabled
+            _healthMonitor?.Start();
+        }
+    }
+
+    private bool _healthMonitorInitAttempted = false;
+
+    /// <summary>
+    /// Initialize health monitor (fail-closed: if config missing/invalid, monitoring disabled).
+    /// This is delayed until Start() so that all health-monitor-related logs include run_id.
+    /// </summary>
+    private void InitializeHealthMonitorIfNeeded()
+    {
+        if (_healthMonitorInitAttempted)
+            return;
+        _healthMonitorInitAttempted = true;
+
         try
         {
-            var healthMonitorPath = Path.Combine(projectRoot, "configs", "robot", "health_monitor.json");
+            var healthMonitorPath = Path.Combine(_root, "configs", "robot", "health_monitor.json");
             if (File.Exists(healthMonitorPath))
             {
                 var healthMonitorJson = File.ReadAllText(healthMonitorPath);
                 var healthMonitorConfig = JsonUtil.Deserialize<HealthMonitorConfig>(healthMonitorJson);
                 if (healthMonitorConfig != null)
                 {
+                    // Secrets handling: allow a local (gitignored) secrets file to provide credentials
+                    var healthMonitorSecretsPath = Path.Combine(_root, "configs", "robot", "health_monitor.secrets.json");
+                    if (File.Exists(healthMonitorSecretsPath))
+                    {
+                        try
+                        {
+                            var secretsJson = File.ReadAllText(healthMonitorSecretsPath);
+                            var secrets = JsonUtil.Deserialize<Dictionary<string, object>>(secretsJson);
+                            if (secrets != null)
+                            {
+                                if (secrets.TryGetValue("pushover_enabled", out var poEnabledObj))
+                                {
+                                    var poEnabledStr = Convert.ToString(poEnabledObj);
+                                    if (!string.IsNullOrWhiteSpace(poEnabledStr) && bool.TryParse(poEnabledStr, out var poEnabled))
+                                        healthMonitorConfig.pushover_enabled = poEnabled;
+                                }
+
+                                if (secrets.TryGetValue("pushover_user_key", out var userKeyObj))
+                                {
+                                    var userKey = Convert.ToString(userKeyObj);
+                                    if (!string.IsNullOrWhiteSpace(userKey))
+                                        healthMonitorConfig.pushover_user_key = userKey;
+                                }
+
+                                if (secrets.TryGetValue("pushover_app_token", out var appTokenObj))
+                                {
+                                    var appToken = Convert.ToString(appTokenObj);
+                                    if (!string.IsNullOrWhiteSpace(appToken))
+                                        healthMonitorConfig.pushover_app_token = appToken;
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // Fail-closed: ignore secrets file parse errors.
+                        }
+                    }
+
                     // Secrets handling: allow environment variables to provide credentials (never store in git)
-                    // Supported env vars:
-                    // - QTSW2_PUSHOVER_USER_KEY / PUSHOVER_USER_KEY
-                    // - QTSW2_PUSHOVER_APP_TOKEN / PUSHOVER_APP_TOKEN
-                    // - QTSW2_PUSHOVER_ENABLED (true/false) [optional]
-                    // - QTSW2_HEALTH_MONITOR_ENABLED (true/false) [optional]
                     try
                     {
                         var envHmEnabled = Environment.GetEnvironmentVariable("QTSW2_HEALTH_MONITOR_ENABLED");
@@ -270,11 +526,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             pushover_app_token_length = healthMonitorConfig.pushover_app_token?.Length ?? 0,
                             config_not_null = true
                         }));
-                    
+
+                    // If Pushover is enabled but not configured, log a loud warning event (no secrets).
+                    var pushoverConfigured = healthMonitorConfig.pushover_enabled &&
+                                             !string.IsNullOrWhiteSpace(healthMonitorConfig.pushover_user_key) &&
+                                             !string.IsNullOrWhiteSpace(healthMonitorConfig.pushover_app_token);
+                    if (healthMonitorConfig.pushover_enabled && !pushoverConfigured)
+                    {
+                        LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "PUSHOVER_CONFIG_MISSING", state: "ENGINE",
+                            new
+                            {
+                                pushover_enabled = true,
+                                pushover_configured = false,
+                                secrets_file = Path.Combine(_root, "configs", "robot", "health_monitor.secrets.json"),
+                                env_vars = "QTSW2_PUSHOVER_USER_KEY / QTSW2_PUSHOVER_APP_TOKEN (or PUSHOVER_USER_KEY / PUSHOVER_APP_TOKEN)",
+                                note = "Pushover enabled but credentials are missing. No push notifications will be sent until configured."
+                            }));
+                    }
+
                     if (healthMonitorConfig.enabled)
                     {
-                        _healthMonitor = new HealthMonitor(projectRoot, healthMonitorConfig, _log);
-                        // Set session awareness callback: check if any streams are in active trading state
+                        _healthMonitor = new HealthMonitor(_root, healthMonitorConfig, _log);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
                     }
                     else
@@ -297,108 +569,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         catch (Exception ex)
         {
-            // Fail-closed: if config load fails, monitoring disabled (no alerts)
-            // Log error for debugging (was previously silent)
             LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HEALTH_MONITOR_CONFIG_ERROR", state: "ENGINE",
                 new { error = ex.Message, error_type = ex.GetType().Name }));
-        }
-    }
-
-    public void Start()
-    {
-        var utcNow = DateTimeOffset.UtcNow;
-
-        // Phase: initialize core under engine lock (serialize against timer/bar threads)
-        lock (_engineLock)
-        {
-            // PHASE 1: Fail-fast for LIVE mode before engine starts
-            if (_executionMode == ExecutionMode.LIVE)
-            {
-                var errorMsg = "LIVE mode is not yet enabled. Use DRYRUN or SIM.";
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LIVE_MODE_BLOCKED", state: "ENGINE",
-                    new { error = errorMsg, execution_mode = _executionMode.ToString() }));
-
-                // Trigger high-priority alert (not log-only)
-                if (_healthMonitor != null)
-                {
-                    var notificationService = _healthMonitor.GetNotificationService();
-                    if (notificationService != null)
-                    {
-                        notificationService.EnqueueNotification(
-                            "LIVE_MODE_BLOCKED",
-                            "CRITICAL: LIVE Trading Blocked",
-                            $"Robot attempted to start in LIVE mode but it is not enabled. Execution blocked. Error: {errorMsg}",
-                            priority: 2); // Emergency priority
-                    }
-                }
-
-                throw new InvalidOperationException(errorMsg);
-            }
-
-            // Start async logging service if enabled (Fix B)
-            _loggingService?.Start();
-
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE"));
-
-            try
-            {
-                _spec = ParitySpec.LoadFromFile(_specPath);
-                // Debug log: confirm spec_name was loaded
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_NAME_LOADED", state: "ENGINE",
-                    new { spec_name = _spec.spec_name }));
-                _time = new TimeService(_spec.timezone);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
-                    new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
-            }
-            catch (Exception ex)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE",
-                    new { error = ex.Message }));
-                throw;
-            }
-
-            // Initialize execution components now that spec is loaded
-            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this);
-
-            // Try to create adapter (will throw if LIVE mode)
-            _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
-
-            // PHASE 2: Set engine callbacks for protective order failure recovery
-            if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-            {
-                simAdapter.SetEngineCallbacks(
-                    standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
-                    getNotificationServiceCallback: () => GetNotificationService());
-            }
-
-            // Log execution mode and adapter
-            var adapterType = _executionAdapter.GetType().Name;
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
-                new { mode = _executionMode.ToString(), adapter = adapterType }));
-        }
-
-        // Timetable disk I/O happens outside the engine lock; application happens under the lock.
-        var parsed = PollAndParseTimetable(utcNow);
-
-        lock (_engineLock)
-        {
-            // Load timetable and lock trading date from it (fail closed if invalid)
-            // Trading date is locked immediately from timetable, then streams are created
-            ReloadTimetableIfChanged(utcNow, force: true, parsed.Poll, parsed.Timetable, parsed.ParseException);
-
-            // If trading date was locked from timetable, create streams and emit banner
-            if (_activeTradingDate.HasValue)
-            {
-                EnsureStreamsCreated(utcNow);
-                EmitStartupBanner(utcNow);
-            }
-            // Otherwise, timetable was invalid or missing trading_date - StandDown() was called
-
-            // Initialize heartbeat timestamp
-            _lastTickUtc = utcNow;
-
-            // Start health monitor if enabled
-            _healthMonitor?.Start();
         }
     }
     
@@ -472,7 +644,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             ["enabled_streams"] = enabledStreams.Select(s => new { stream = s.Stream, instrument = s.Instrument, session = s.Session, slot_time = s.SlotTimeChicago }).ToList(),
             ["spec_name"] = _spec?.spec_name ?? "NOT_LOADED",
             ["spec_revision"] = _spec?.spec_revision ?? "NOT_LOADED",
-            ["kill_switch_enabled"] = _killSwitch.IsEnabled(),
+            ["kill_switch_enabled"] = _killSwitch != null && _killSwitch.IsEnabled(),
             ["health_monitor_enabled"] = _healthMonitor != null
         };
         
@@ -529,6 +701,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Tick(DateTimeOffset utcNow)
     {
+        // Check for test notification trigger file (outside lock for performance)
+        var triggerFile = Path.Combine(_root, "data", "test_notification_trigger.txt");
+        if (File.Exists(triggerFile))
+        {
+            try
+            {
+                File.Delete(triggerFile);
+                SendTestNotification();
+            }
+            catch (Exception ex)
+            {
+                // Log but don't throw - tick must never crash
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TEST_NOTIFICATION_TRIGGER_ERROR", state: "ENGINE",
+                    new { error = ex.Message }));
+            }
+        }
+        
         var shouldPoll = _timetablePoller.ShouldPoll(utcNow);
         var parsed = shouldPoll ? PollAndParseTimetable(utcNow) : default;
 
@@ -1832,6 +2021,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     });
                 }
                 
+                // Set critical event reporting callback for EXECUTION_GATE_INVARIANT_VIOLATION
+                if (_healthMonitor != null)
+                {
+                    newSm.SetReportCriticalCallback((eventType, payload, tradingDate) =>
+                    {
+                        // Audit clarity only: embed run_id + trading_date into payload
+                        if (!string.IsNullOrWhiteSpace(_runId))
+                            payload["run_id"] = _runId;
+                        if (!string.IsNullOrWhiteSpace(tradingDate))
+                            payload["trading_date"] = tradingDate;
+
+                        _healthMonitor.ReportCritical(eventType, payload);
+                    });
+                }
+                
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)
@@ -1950,12 +2154,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             utcNow = parsed;
         }
 
-        var level = "INFO";
         var eventType = dict.TryGetValue("event_type", out var et) ? et?.ToString() ?? "" : "";
-        if (eventType.Contains("ERROR") || eventType.Contains("FAIL") || eventType.Contains("INVALID") || eventType.Contains("VIOLATION"))
-            level = "ERROR";
-        else if (eventType.Contains("WARN") || eventType.Contains("BLOCKED"))
-            level = "WARN";
+        // Use centralized event registry for level assignment (replaces fragile string matching)
+        var level = RobotEventTypes.GetLevel(eventType);
 
         // Determine source based on stream field
         var source = "RobotEngine";
@@ -1997,7 +2198,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
 
-        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, data: data.Count > 0 ? data : null);
+        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, runId: _runId, data: data.Count > 0 ? data : null);
     }
 
     /// <summary>
@@ -2009,6 +2210,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Expose health monitor for strategy files (replaces reflection-based access).
     /// </summary>
     internal HealthMonitor? GetHealthMonitor() => _healthMonitor;
+    
+    /// <summary>
+    /// Send a test notification to verify Pushover is working.
+    /// Public method for testing from strategy or external code.
+    /// </summary>
+    public void SendTestNotification()
+    {
+        _healthMonitor?.SendTestNotification();
+    }
     
     /// <summary>
     /// Expose execution adapter for strategy files (replaces reflection-based access).
@@ -2046,16 +2256,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         _disconnectFirstUtc = utcNow;
                     }
 
+                    var payload = new Dictionary<string, object>
+                    {
+                        ["recovery_state"] = _recoveryState.ToString(),
+                        ["disconnect_first_utc"] = _disconnectFirstUtc.Value.ToString("o"),
+                        ["connection_status"] = status.ToString(),
+                        ["connection_name"] = connectionName,
+                        ["execution_mode"] = _executionMode.ToString(),
+                        ["active_stream_count"] = _streams.Count(s => !s.Value.Committed)
+                    };
+                    
+                    // Audit clarity: include run_id and trading_date when known
+                    if (!string.IsNullOrWhiteSpace(_runId))
+                        payload["run_id"] = _runId;
+                    if (!string.IsNullOrWhiteSpace(TradingDateString))
+                        payload["trading_date"] = TradingDateString;
+                    
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "DISCONNECT_FAIL_CLOSED_ENTERED", state: "ENGINE",
-                        new
-                        {
-                            recovery_state = _recoveryState.ToString(),
-                            disconnect_first_utc = _disconnectFirstUtc.Value.ToString("o"),
-                            connection_status = status.ToString(),
-                            connection_name = connectionName,
-                            execution_mode = _executionMode.ToString(),
-                            active_stream_count = _streams.Count(s => !s.Value.Committed)
-                        }));
+                        payload));
+                    
+                    // Report critical event to HealthMonitor for notification
+                    _healthMonitor?.ReportCritical("DISCONNECT_FAIL_CLOSED_ENTERED", payload);
                 }
             }
             else if (!wasConnected && isConnected)

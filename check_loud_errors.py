@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 """Check for loud error events - summarizes ERROR/VIOLATION/backpressure events over a time window"""
+import argparse
 import json
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-log_dir = Path("logs/robot")
+ap = argparse.ArgumentParser()
+ap.add_argument("--log-dir", default=None, help="Path to logs/robot directory (overrides env/config)")
+ap.add_argument("--hours-back", type=int, default=24, help="Lookback window in hours")
+args = ap.parse_args()
+
+log_dir = None
+if args.log_dir:
+    log_dir = Path(args.log_dir)
+else:
+    env_log_dir = os.environ.get("QTSW2_LOG_DIR")
+    env_root = os.environ.get("QTSW2_PROJECT_ROOT")
+    if env_log_dir:
+        log_dir = Path(env_log_dir)
+    elif env_root:
+        log_dir = Path(env_root) / "logs" / "robot"
+    else:
+        log_dir = Path("logs/robot")
+
 if not log_dir.exists():
     print(f"Log directory not found: {log_dir}")
-    exit(1)
+    raise SystemExit(1)
 
 # Default: last 24 hours
-hours_back = 24
+hours_back = args.hours_back
 cutoff_time = (datetime.utcnow() - timedelta(hours=hours_back)).isoformat() + "Z"
 
 print("="*80)

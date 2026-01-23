@@ -11,6 +11,8 @@ Focuses on events like:
 """
 
 import json
+import argparse
+import os
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
@@ -39,12 +41,29 @@ def compact(obj, max_len=220):
     return s if len(s) <= max_len else s[:max_len] + "...[truncated]"
 
 
-LOG_DIR = Path("logs/robot")
+ap = argparse.ArgumentParser()
+ap.add_argument("--log-dir", default=None, help="Path to logs/robot directory (overrides env/config)")
+ap.add_argument("--window-hours", type=int, default=6, help="Lookback window in hours")
+args = ap.parse_args()
+
+LOG_DIR: Path
+if args.log_dir:
+    LOG_DIR = Path(args.log_dir)
+else:
+    env_log_dir = os.environ.get("QTSW2_LOG_DIR")
+    env_root = os.environ.get("QTSW2_PROJECT_ROOT")
+    if env_log_dir:
+        LOG_DIR = Path(env_log_dir)
+    elif env_root:
+        LOG_DIR = Path(env_root) / "logs" / "robot"
+    else:
+        LOG_DIR = Path("logs/robot")
+
 if not LOG_DIR.exists():
     print(f"Missing log dir: {LOG_DIR}")
     raise SystemExit(1)
 
-WINDOW_HOURS = 6
+WINDOW_HOURS = args.window_hours
 cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
 
 target_prefixes = (
