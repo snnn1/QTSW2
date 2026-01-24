@@ -129,7 +129,7 @@ public sealed class StreamStateMachine
     private bool _rangeInvalidated = false; // Permanently invalidated due to gap violation
     private bool _rangeInvalidatedNotified = false; // Track if RANGE_INVALIDATED notification already sent for this slot
     
-    // Gap tolerance constants
+    // Gap tolerance constants (only apply to DATA_FEED_FAILURE - LOW_LIQUIDITY gaps never invalidate)
     private const double MAX_SINGLE_GAP_MINUTES = 3.0;
     private const double MAX_TOTAL_GAP_MINUTES = 6.0;
     private const double MAX_GAP_LAST_10_MINUTES = 2.0;
@@ -1635,6 +1635,21 @@ public sealed class StreamStateMachine
                         prerequisite_check = "Range computation requires bars in window"
                     });
                     
+                    // CRITICAL FIX: If slot time has passed and we still have no bars, commit as NO_TRADE_NO_DATA
+                    // This prevents streams from staying stuck in RANGE_BUILDING forever when no data is available
+                    var noDataReasonCode = rangeResult.Reason ?? "UNKNOWN";
+                    var isNoDataFailure = noDataReasonCode == "NO_BARS_YET" || 
+                                         noDataReasonCode == "NO_BARS_IN_WINDOW" || 
+                                         noDataReasonCode == "BARS_FROM_WRONG_DATE";
+                    var slotTimePassed = utcNow >= SlotTimeUtc.AddMinutes(5); // Allow 5 minute grace period after slot time
+                    
+                    if (slotTimePassed && isNoDataFailure && rangeResult.BarCount == 0)
+                    {
+                        LogSlotEndSummary(utcNow, "NO_DATA", false, false, $"No bars received for range computation - slot time passed ({SlotTimeChicago})");
+                        Commit(utcNow, "NO_TRADE_NO_DATA", "No bars available for range computation after slot time");
+                        return;
+                    }
+                    
                     // Don't commit NO_TRADE - allow retry or partial range computation
                     return;
                 }
@@ -1829,6 +1844,40 @@ public sealed class StreamStateMachine
                 
                 // G) "Nothing happened" explanation: Range locked summary
                 LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
+                
+                // Log range lock snapshot (all modes - was DRYRUN-only, now unconditional for consistency)
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RANGE_LOCK_SNAPSHOT", State.ToString(),
+                    new
+                    {
+                        range_high = RangeHigh,
+                        range_low = RangeLow,
+                        range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
+                        freeze_close = FreezeClose,
+                        freeze_close_source = FreezeCloseSource,
+                        slot_time_chicago = SlotTimeChicago,
+                        slot_time_utc = SlotTimeUtc.ToString("o")
+                    }));
+
+                ComputeBreakoutLevelsAndLog(utcNow);
+
+                // Check for immediate entry at lock (all execution modes)
+                if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
+                {
+                    CheckImmediateEntryAtLock(utcNow);
+                }
+
+                // CRITICAL FIX: Place stop entry bracket orders ONLY ONCE when transitioning to RANGE_LOCKED
+                // This prevents duplicate submissions if HandleRangeBuildingState runs multiple times
+                // If an immediate entry was already detected/submitted at lock, skip bracket placement.
+                if (!_entryDetected && utcNow < MarketCloseUtc)
+                {
+                    SubmitStopEntryBracketsAtLock(utcNow);
+                }
+
+                // Log intended brackets (all execution modes)
+                if (utcNow < MarketCloseUtc)
+                    LogIntendedBracketsPlaced(utcNow);
             }
             else
             {
@@ -1836,40 +1885,6 @@ public sealed class StreamStateMachine
                 LogSlotEndSummary(utcNow, "RANGE_INVALIDATED", false, false, "Range invalidated due to gap tolerance violation");
                 Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
             }
-
-            // Log range lock snapshot (all modes - was DRYRUN-only, now unconditional for consistency)
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "RANGE_LOCK_SNAPSHOT", State.ToString(),
-                new
-                {
-                    range_high = RangeHigh,
-                    range_low = RangeLow,
-                    range_size = RangeHigh.HasValue && RangeLow.HasValue ? (decimal?)(RangeHigh.Value - RangeLow.Value) : (decimal?)null,
-                    freeze_close = FreezeClose,
-                    freeze_close_source = FreezeCloseSource,
-                    slot_time_chicago = SlotTimeChicago,
-                    slot_time_utc = SlotTimeUtc.ToString("o")
-                }));
-
-            ComputeBreakoutLevelsAndLog(utcNow);
-
-            // Check for immediate entry at lock (all execution modes)
-            if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
-            {
-                CheckImmediateEntryAtLock(utcNow);
-            }
-
-            // NEW: Place stop entry bracket orders immediately after range locks (SIM/LIVE),
-            // so the breakout can fill without requiring our bar-by-bar "detect then submit" path.
-            // If an immediate entry was already detected/submitted at lock, skip bracket placement.
-            if (!_entryDetected && utcNow < MarketCloseUtc)
-            {
-                SubmitStopEntryBracketsAtLock(utcNow);
-            }
-
-            // Log intended brackets (all execution modes)
-            if (utcNow < MarketCloseUtc)
-                LogIntendedBracketsPlaced(utcNow);
         }
     }
 
@@ -2017,8 +2032,31 @@ public sealed class StreamStateMachine
         _lastBarTimestampUtc = barUtc;
         
         // Buffer bars that fall within [range_start, slot_time) using Chicago time comparison
+        // Bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)
         // Range window is defined in Chicago time to match trading session semantics
         // State-independent buffering: Always buffer bars within range window regardless of state
+        
+        // DIAGNOSTIC: Proof log for 1-minute boundary investigation
+        // Log every bar admission decision with raw timestamp, Chicago time, comparison result, and source
+        var barSource = isHistorical ? "BARSREQUEST" : "LIVE";
+        var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "BAR_ADMISSION_PROOF", State.ToString(),
+            new
+            {
+                bar_time_raw_utc = barUtc.ToString("o"),
+                bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
+                bar_time_chicago = barChicagoTime.ToString("o"),
+                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                comparison_result = comparisonResult,
+                comparison_detail = comparisonResult 
+                    ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago < slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
+                    : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss}))",
+                bar_source = barSource,
+                note = "Diagnostic proof log - bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)"
+            }));
+        
         if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
         {
                 // DEFENSIVE: Validate bar data before buffering
@@ -2127,28 +2165,53 @@ public sealed class StreamStateMachine
                         
                         _totalGapMinutes += missingMinutes;
                         
-                        // Check gap tolerance rules (invalidate immediately if violated)
+                        // Classify gap type: DATA_FEED_FAILURE vs LOW_LIQUIDITY
+                        // DATA_FEED_FAILURE indicators:
+                        // - Gaps during PRE_HYDRATION (BARSREQUEST should return complete data)
+                        // - Very low bar count overall (suggests data feed issue)
+                        // - Gaps from BARSREQUEST source (historical data should be complete)
+                        // LOW_LIQUIDITY indicators:
+                        // - Gaps during RANGE_BUILDING from LIVE feed (market genuinely sparse)
+                        // - Reasonable bar count but with gaps (some trading occurred)
+                        var totalBarCount = _historicalBarCount + _liveBarCount;
+                        var expectedMinBars = (int)((SlotTimeChicagoTime - RangeStartChicagoTime).TotalMinutes * 0.5); // Expect at least 50% coverage
+                        var isDataFeedFailure = 
+                            State == StreamState.PRE_HYDRATION || // PRE_HYDRATION gaps = data feed issue
+                            barSource == BarSource.BARSREQUEST || // Historical gaps = data feed issue
+                            totalBarCount < expectedMinBars; // Very low bar count = data feed issue
+                        
+                        var gapType = isDataFeedFailure ? "DATA_FEED_FAILURE" : "LOW_LIQUIDITY";
+                        var gapTypeNote = isDataFeedFailure 
+                            ? "Gap likely due to data feed failure (PRE_HYDRATION/BARSREQUEST gaps or insufficient data)"
+                            : "Gap likely due to legitimate low liquidity (sparse trading during live feed)";
+                        
+                        // Check gap tolerance rules (only for DATA_FEED_FAILURE - LOW_LIQUIDITY gaps never invalidate)
                         bool violated = false;
                         string violationReason = "";
                         
-                        if (missingMinutes > MAX_SINGLE_GAP_MINUTES)
+                        // Only check tolerance for DATA_FEED_FAILURE - LOW_LIQUIDITY gaps are allowed (never invalidate)
+                        if (isDataFeedFailure)
                         {
-                            violated = true;
-                            violationReason = $"Single gap missing {missingMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES})";
+                            if (missingMinutes > MAX_SINGLE_GAP_MINUTES)
+                            {
+                                violated = true;
+                                violationReason = $"Single gap missing {missingMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES}) for DATA_FEED_FAILURE";
+                            }
+                            else if (_totalGapMinutes > MAX_TOTAL_GAP_MINUTES)
+                            {
+                                violated = true;
+                                violationReason = $"Total gap missing {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES}) for DATA_FEED_FAILURE";
+                            }
+                            
+                            // Check last 10 minutes rule
+                            var last10MinStart = SlotTimeChicagoTime.AddMinutes(-10);
+                            if (barChicagoTime >= last10MinStart && missingMinutes > MAX_GAP_LAST_10_MINUTES)
+                            {
+                                violated = true;
+                                violationReason = $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES}) for DATA_FEED_FAILURE";
+                            }
                         }
-                        else if (_totalGapMinutes > MAX_TOTAL_GAP_MINUTES)
-                        {
-                            violated = true;
-                            violationReason = $"Total gap missing {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES})";
-                        }
-                        
-                        // Check last 10 minutes rule
-                        var last10MinStart = SlotTimeChicagoTime.AddMinutes(-10);
-                        if (barChicagoTime >= last10MinStart && missingMinutes > MAX_GAP_LAST_10_MINUTES)
-                        {
-                            violated = true;
-                            violationReason = $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES})";
-                        }
+                        // LOW_LIQUIDITY gaps: Never invalidate (violated stays false)
                         
                         if (violated)
                         {
@@ -2160,6 +2223,8 @@ public sealed class StreamStateMachine
                                 instrument = Instrument,
                                 slot = Stream,
                                 violation_reason = violationReason,
+                                gap_type = gapType,
+                                gap_type_note = gapTypeNote,
                                 // Backward-compat: keep gap_minutes, but now it means "missing minutes"
                                 gap_minutes = missingMinutes,
                                 // Extra forensic context: raw delta between bar opens
@@ -2171,11 +2236,21 @@ public sealed class StreamStateMachine
                                 slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
                                 gap_location = $"Between {_lastBarOpenChicago.Value:HH:mm} and {barChicagoTime:HH:mm} Chicago time",
                                 minutes_until_slot_time = (SlotTimeChicagoTime - barChicagoTime).TotalMinutes,
-                                note = missingMinutes > MAX_SINGLE_GAP_MINUTES 
-                                    ? $"Single gap missing {missingMinutes:F1} minutes exceeds limit of {MAX_SINGLE_GAP_MINUTES} minutes"
-                                    : _totalGapMinutes > MAX_TOTAL_GAP_MINUTES
-                                    ? $"Total gaps missing {_totalGapMinutes:F1} minutes exceed limit of {MAX_TOTAL_GAP_MINUTES} minutes"
-                                    : $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds limit of {MAX_GAP_LAST_10_MINUTES} minutes"
+                                // Diagnostic context for gap classification
+                                stream_state = State.ToString(),
+                                bar_source = barSource.ToString(),
+                                total_bar_count = totalBarCount,
+                                historical_bar_count = _historicalBarCount,
+                                live_bar_count = _liveBarCount,
+                                expected_min_bars = expectedMinBars,
+                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                note = isDataFeedFailure
+                                    ? (missingMinutes > MAX_SINGLE_GAP_MINUTES 
+                                        ? $"Single gap missing {missingMinutes:F1} minutes exceeds limit of {MAX_SINGLE_GAP_MINUTES} minutes for DATA_FEED_FAILURE"
+                                        : _totalGapMinutes > MAX_TOTAL_GAP_MINUTES
+                                        ? $"Total gaps missing {_totalGapMinutes:F1} minutes exceed limit of {MAX_TOTAL_GAP_MINUTES} minutes for DATA_FEED_FAILURE"
+                                        : $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds limit of {MAX_GAP_LAST_10_MINUTES} minutes for DATA_FEED_FAILURE")
+                                    : $"LOW_LIQUIDITY gap tolerated (gaps from low liquidity never invalidate range)"
                             };
                             
                             // Log to health directory (detailed health tracking)
@@ -2191,24 +2266,29 @@ public sealed class StreamStateMachine
                                 _rangeInvalidatedNotified = true;
                                 var notificationKey = $"RANGE_INVALIDATED:{Stream}";
                                 var title = $"Range Invalidated: {Instrument} {Stream}";
-                                var message = $"Range invalidated due to gap violation: {violationReason}. Trading blocked for this slot.";
+                                var message = $"Range invalidated due to gap violation: {violationReason}. " +
+                                           $"Gap type: {gapType} - {gapTypeNote}. Trading blocked for this slot.";
                                 _alertCallback?.Invoke(notificationKey, title, message, 1); // High priority
                             }
                         }
                         else
                         {
-                            // Gap within tolerance - log as WARN
-                            LogHealth("WARN", "GAP_TOLERATED", $"Gap missing {missingMinutes:F1} minutes tolerated (within limits)",
+                            // Gap within tolerance - log as WARN with gap type classification
+                            LogHealth("WARN", "GAP_TOLERATED", $"Gap missing {missingMinutes:F1} minutes tolerated (within limits for {gapType})",
                                 new
                                 {
                                     instrument = Instrument,
                                     slot = Stream,
+                                    gap_type = gapType,
+                                    gap_type_note = gapTypeNote,
                                     gap_minutes = missingMinutes,
                                     gap_delta_minutes = gapDeltaMinutes,
                                     largest_single_gap_minutes = _largestSingleGapMinutes,
                                     total_gap_minutes = _totalGapMinutes,
                                     previous_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
-                                    current_bar_open_chicago = barChicagoTime.ToString("o")
+                                    current_bar_open_chicago = barChicagoTime.ToString("o"),
+                                    stream_state = State.ToString(),
+                                    bar_source = barSource.ToString()
                                 });
                         }
                     }
@@ -2642,17 +2722,44 @@ public sealed class StreamStateMachine
         }
     }
     
+    // Per-file locks for health log files to prevent concurrent access
+    private static readonly Dictionary<string, object> _healthFileLocks = new();
+    private static readonly object _healthLocksLock = new();
+
+    /// <summary>
+    /// Get or create a lock object for a specific health log file path.
+    /// </summary>
+    private static object GetHealthFileLock(string filePath)
+    {
+        lock (_healthLocksLock)
+        {
+            if (!_healthFileLocks.TryGetValue(filePath, out var fileLock))
+            {
+                fileLock = new object();
+                _healthFileLocks[filePath] = fileLock;
+            }
+            return fileLock;
+        }
+    }
+
     /// <summary>
     /// Log health/anomaly event to logs/health/ directory.
+    /// Uses proper file locking to prevent concurrent access conflicts.
     /// </summary>
     private void LogHealth(string level, string eventType, string message, object? data = null)
     {
         try
         {
-            var journalPath = _journals.GetJournalPath(TradingDate, Stream);
-            var projectRoot = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(journalPath)));
+            // Use ProjectRootResolver instead of deriving from journal path to avoid path issues
+            var projectRoot = ProjectRootResolver.ResolveProjectRoot();
             if (string.IsNullOrEmpty(projectRoot))
-                return;
+            {
+                // Fallback: try to get from journal path if resolver fails
+                var journalPath = _journals.GetJournalPath(TradingDate, Stream);
+                projectRoot = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(journalPath)));
+                if (string.IsNullOrEmpty(projectRoot))
+                    return;
+            }
             
             var healthDir = Path.Combine(projectRoot, "logs", "health");
             Directory.CreateDirectory(healthDir);
@@ -2679,7 +2786,18 @@ public sealed class StreamStateMachine
             };
             
             var json = JsonUtil.Serialize(logEntry);
-            File.AppendAllText(logFile, json + Environment.NewLine);
+            
+            // Use per-file locking to prevent concurrent writes (similar to JournalStore)
+            var fileLock = GetHealthFileLock(logFile);
+            lock (fileLock)
+            {
+                // Use FileShare.ReadWrite to allow concurrent reads but serialize writes
+                using (var fileStream = new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                using (var writer = new StreamWriter(fileStream))
+                {
+                    writer.WriteLine(json);
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -3035,6 +3153,27 @@ public sealed class StreamStateMachine
             
             // Range window is defined in Chicago time: [RangeStartChicagoTime, endTimeChicagoActual)
             // For hybrid initialization, endTime can be current time (not just slot_time)
+            
+            // DIAGNOSTIC: Proof log for 1-minute boundary investigation (retrospective computation)
+            var comparisonResultRetro = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < endTimeChicagoActual;
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BAR_ADMISSION_PROOF_RETROSPECTIVE", State.ToString(),
+                new
+                {
+                    bar_time_raw_utc = barRawUtc.ToString("o"),
+                    bar_time_raw_kind = barRawUtcKind,
+                    bar_time_chicago = barChicagoTime.ToString("o"),
+                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                    range_end_chicago = endTimeChicagoActual.ToString("o"),
+                    slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                    comparison_result = comparisonResultRetro,
+                    comparison_detail = comparisonResultRetro
+                        ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago < end_time ({endTimeChicagoActual:HH:mm:ss})"
+                        : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), end_time ({endTimeChicagoActual:HH:mm:ss}))",
+                    bar_source = "CSV",
+                    note = "Diagnostic proof log - bar timestamps represent OPEN time (CSV bars from translator already use open time)"
+                }));
+            
             if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < endTimeChicagoActual)
             {
                 filteredBars.Add(bar);
@@ -3454,7 +3593,28 @@ public sealed class StreamStateMachine
 
     private void RecordIntendedEntry(string direction, decimal entryPrice, DateTimeOffset entryTimeUtc, string triggerReason, DateTimeOffset utcNow)
     {
-        if (_entryDetected) return; // Already detected
+        if (_entryDetected)
+        {
+            // CRITICAL FIX: Log when breakout is detected but entry already exists
+            // This helps debug why breakouts aren't triggering entries (e.g., if immediate entry at lock prevents later breakout entries)
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BREAKOUT_DETECTED_ALREADY_ENTERED", State.ToString(),
+                new
+                {
+                    detected_direction = direction,
+                    detected_entry_price = entryPrice,
+                    detected_entry_time_utc = entryTimeUtc.ToString("o"),
+                    detected_entry_time_chicago = _time.ConvertUtcToChicago(entryTimeUtc).ToString("o"),
+                    detected_trigger_reason = triggerReason,
+                    existing_entry_direction = _intendedDirection,
+                    existing_entry_price = _intendedEntryPrice,
+                    existing_entry_time_utc = _intendedEntryTimeUtc.ToString("o"),
+                    existing_entry_time_chicago = _time.ConvertUtcToChicago(_intendedEntryTimeUtc).ToString("o"),
+                    existing_trigger_reason = _triggerReason,
+                    note = "Breakout detected but entry already exists - this breakout was ignored"
+                }));
+            return; // Already detected
+        }
 
         _entryDetected = true;
         _intendedDirection = direction;
@@ -3561,12 +3721,15 @@ public sealed class StreamStateMachine
         }
 
         // Submit entry order (quantity = 1 contract per stream)
+        // Use StopMarket for breakout entries, Limit for immediate entries
+        var entryOrderType = triggerReason == "BREAKOUT" ? "STOP_MARKET" : "LIMIT";
         var entryResult = _executionAdapter.SubmitEntryOrder(
             intentId,
             Instrument,
             direction,
-            entryPrice, // Use limit order at entry price
+            entryPrice,
             1, // Quantity: 1 contract
+            entryOrderType,
             utcNow);
 
         // Record submission in journal
@@ -3574,7 +3737,7 @@ public sealed class StreamStateMachine
         {
             if (entryResult.Success)
             {
-                _executionJournal.RecordSubmission(intentId, TradingDate, Stream, Instrument, "ENTRY", entryResult.BrokerOrderId, utcNow);
+                _executionJournal.RecordSubmission(intentId, TradingDate, Stream, Instrument, "ENTRY", entryResult.BrokerOrderId, utcNow, entryPrice);
             }
             else
             {
@@ -4194,12 +4357,25 @@ public sealed class StreamStateMachine
         var barCount = GetBarBufferCount();
         
         State = next;
-        _stateEntryTimeUtc = utcNow; // Track when we entered this state
+        var stateEntryTimeUtc = utcNow; // Track when we entered this state
+        _stateEntryTimeUtc = stateEntryTimeUtc;
         _journal.LastState = next.ToString();
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journals.Save(_journal);
         
-        // Log state transition with full context
+        // MANDATORY: Emit STREAM_STATE_TRANSITION event for watchdog observability (plan requirement #2)
+        // This event includes only state movement fields, not derived state like range_high/low
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, 
+            "STREAM_STATE_TRANSITION", next.ToString(), 
+            new
+            {
+                previous_state = previousState.ToString(),
+                new_state = next.ToString(),
+                state_entry_time_utc = stateEntryTimeUtc.ToString("o"),
+                time_in_previous_state_minutes = timeInPreviousState.HasValue ? Math.Round(timeInPreviousState.Value, 2) : (double?)null
+            }));
+        
+        // Log state transition with full context (original event for backward compatibility)
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, eventType, next.ToString(), 
             new
             {

@@ -62,6 +62,7 @@ public partial class NinjaTraderSimAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow)
     {
         if (_ntAccount == null || _ntInstrument == null)
@@ -83,8 +84,34 @@ public partial class NinjaTraderSimAdapter
         {
             // STEP 2: Create NT Order using real API
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
-            var orderType = entryPrice.HasValue ? OrderType.Limit : OrderType.Market;
-            var ntEntryPrice = entryPrice.HasValue ? (double)entryPrice.Value : 0.0;
+            
+            // Determine order type: use entryOrderType if provided, otherwise infer from entryPrice
+            OrderType orderType;
+            double ntEntryPrice;
+            
+            if (entryOrderType == "STOP_MARKET")
+            {
+                // Breakout entry: use StopMarket order
+                orderType = OrderType.StopMarket;
+                if (!entryPrice.HasValue)
+                {
+                    var error = "StopMarket order requires entryPrice (stop trigger price)";
+                    return OrderSubmissionResult.FailureResult(error, utcNow);
+                }
+                ntEntryPrice = (double)entryPrice.Value;
+            }
+            else if (entryOrderType == "MARKET" || !entryPrice.HasValue)
+            {
+                // Market order
+                orderType = OrderType.Market;
+                ntEntryPrice = 0.0;
+            }
+            else
+            {
+                // Default: Limit order (for immediate entries at lock)
+                orderType = OrderType.Limit;
+                ntEntryPrice = (double)entryPrice.Value;
+            }
             
             // Real NT API: CreateOrder
             var order = account.CreateOrder(ntInstrument, orderAction, orderType, quantity, ntEntryPrice);
@@ -134,8 +161,8 @@ public partial class NinjaTraderSimAdapter
                 return OrderSubmissionResult.FailureResult(error, utcNow);
             }
 
-            // Journal: ENTRY_SUBMITTED
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", order.OrderId, acknowledgedAt);
+            // Journal: ENTRY_SUBMITTED (store expected entry price for slippage calculation)
+            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", order.OrderId, acknowledgedAt, entryPrice);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -143,6 +170,7 @@ public partial class NinjaTraderSimAdapter
                 order_type = "ENTRY",
                 direction,
                 entry_price = entryPrice,
+                entry_order_type = entryOrderType,
                 quantity,
                 account = "SIM",
                 order_action = orderAction.ToString(),
@@ -205,6 +233,16 @@ public partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_ACKNOWLEDGED",
                 new { broker_order_id = order.OrderId, order_type = orderInfo.OrderType }));
+            
+            // Mark protective orders as acknowledged for watchdog tracking
+            if (orderInfo.OrderType == "STOP")
+            {
+                orderInfo.ProtectiveStopAcknowledged = true;
+            }
+            else if (orderInfo.OrderType == "TARGET")
+            {
+                orderInfo.ProtectiveTargetAcknowledged = true;
+            }
         }
         else if (orderState == OrderState.Rejected)
         {
@@ -249,12 +287,19 @@ public partial class NinjaTraderSimAdapter
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
         var filledTotal = orderInfo.FilledQuantity;
+        
+        // Get contract multiplier for slippage calculation
+        decimal? contractMultiplier = null;
+        if (_ntInstrument is Instrument ntInst)
+        {
+            contractMultiplier = (decimal)ntInst.MasterInstrument.PointValue;
+        }
 
         // Update ExecutionJournal: PARTIAL_FILL or FILLED (use cumulative quantity for safety)
         if (filledTotal < orderInfo.Quantity)
         {
             // Partial fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow);
+            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_PARTIAL_FILL",
                 new
                 {
@@ -269,7 +314,7 @@ public partial class NinjaTraderSimAdapter
         else
         {
             // Full fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow);
+            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
             orderInfo.State = "FILLED";
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
@@ -283,12 +328,19 @@ public partial class NinjaTraderSimAdapter
                 }));
         }
 
-        // STEP 4: Protective submission must fire for entry intents (ENTRY and ENTRY_STOP)
-        // Partial-fill rule: never allow filled position without a stop; protect filled qty immediately.
+        // STEP 4: Register entry fill with coordinator
         if (orderInfo.IsEntryOrder && _intentMap.TryGetValue(intentId, out var entryIntent))
         {
+            // Register exposure with coordinator
+            _coordinator?.OnEntryFill(intentId, filledTotal, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+            
             // Ensure we protect the currently filled quantity (no market-close gating)
             HandleEntryFill(intentId, entryIntent, fillPrice, filledTotal, utcNow);
+        }
+        else if (orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET")
+        {
+            // Exit fill: register with coordinator
+            _coordinator?.OnExitFill(intentId, filledTotal, utcNow);
         }
     }
 
@@ -657,6 +709,152 @@ public partial class NinjaTraderSimAdapter
             Positions = positions,
             WorkingOrders = workingOrders
         };
+    }
+    
+    /// <summary>
+    /// Cancel orders for a specific intent only using real NT API.
+    /// </summary>
+    private bool CancelIntentOrdersReal(string intentId, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null)
+        {
+            return false;
+        }
+        
+        var account = _ntAccount as Account;
+        if (account == null)
+        {
+            return false;
+        }
+        
+        var ordersToCancel = new List<Order>();
+        
+        try
+        {
+            // Find orders matching this intent ID
+            foreach (var order in account.Orders)
+            {
+                if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                {
+                    continue;
+                }
+                
+                var tag = order.Tag as string ?? "";
+                var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
+                
+                // Match intent ID (handles STOP, TARGET suffixes)
+                if (decodedIntentId == intentId)
+                {
+                    ordersToCancel.Add(order);
+                }
+            }
+            
+            if (ordersToCancel.Count > 0)
+            {
+                // Real NT API: Cancel orders
+                account.Cancel(ordersToCancel.ToArray());
+                
+                // Update order map
+                foreach (var order in ordersToCancel)
+                {
+                    var tag = order.Tag as string ?? "";
+                    var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
+                    if (decodedIntentId == intentId && _orderMap.TryGetValue(intentId, out var orderInfo))
+                    {
+                        orderInfo.State = "CANCELLED";
+                    }
+                }
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_SUCCESS", state: "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        cancelled_count = ordersToCancel.Count,
+                        cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList()
+                    }));
+                
+                return true;
+            }
+            
+            return true; // No orders to cancel is success
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Flatten exposure for a specific intent only using real NT API.
+    /// </summary>
+    private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null || _ntInstrument == null)
+        {
+            var error = "NT context not set";
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+        
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        
+        if (account == null || ntInstrument == null)
+        {
+            var error = "NT context type mismatch";
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+        
+        try
+        {
+            // Get position for this instrument
+            var position = account.GetPosition(ntInstrument);
+            
+            if (position.MarketPosition == MarketPosition.Flat)
+            {
+                // Already flat
+                return FlattenResult.SuccessResult(utcNow);
+            }
+            
+            // Note: NinjaTrader API doesn't support per-intent flattening
+            // We flatten the entire instrument position
+            // This is acceptable because:
+            // 1. The coordinator tracks remaining intents
+            // 2. If other intents exist, they would need to be re-entered (rare path)
+            // 3. This is an emergency fallback scenario
+            
+            account.Flatten(ntInstrument);
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    position_qty = position.Quantity,
+                    note = "Flattened instrument position (broker API limitation - per-intent not supported)"
+                }));
+            
+            return FlattenResult.SuccessResult(utcNow);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            
+            return FlattenResult.FailureResult($"Flatten intent failed: {ex.Message}", utcNow);
+        }
     }
     
     /// <summary>

@@ -69,6 +69,15 @@ public sealed class HealthMonitor
     private DateTimeOffset? _connectionLostFirstDetectedUtc = null;
     private const int CONNECTION_LOST_SUSTAINED_SECONDS = 60; // Must be disconnected for 60+ seconds before notifying
     
+    // CRITICAL FIX: Shared state across all HealthMonitor instances to prevent duplicate connection loss logging
+    // When multiple strategy instances run (one per instrument), NinjaTrader calls OnConnectionStatusUpdate
+    // on all instances simultaneously. We only want to log CONNECTION_LOST once per actual disconnect.
+    private static readonly object _sharedConnectionLock = new object();
+    private static bool _sharedConnectionLostLogged = false; // Track if CONNECTION_LOST event has been logged
+    private static bool _sharedConnectionLostNotified = false; // Track if CONNECTION_LOST_SUSTAINED notification has been sent
+    private static DateTimeOffset? _sharedConnectionLostFirstDetectedUtc = null;
+    private static int _sharedConnectionLostInstanceCount = 0; // Track how many instances detected the disconnect
+    
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
         _config = config;
@@ -108,6 +117,7 @@ public sealed class HealthMonitor
     /// <summary>
     /// Handle NinjaTrader connection status update.
     /// Notifies only if sustained disconnection (60+ seconds) during active trading.
+    /// CRITICAL FIX: Uses shared state to prevent duplicate logging when multiple strategy instances detect the same disconnect.
     /// </summary>
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName, DateTimeOffset utcNow)
     {
@@ -120,46 +130,80 @@ public sealed class HealthMonitor
         
         if (isDisconnected)
         {
+            // Update instance state for recovery tracking
             if (!_connectionLostActive)
             {
-                // First detection: mark active and record timestamp
                 _connectionLostActive = true;
                 _connectionLostFirstDetectedUtc = utcNow;
                 _connectionLostNotified = false;
-                
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST", state: "ENGINE",
-                    new
-                    {
-                        connection_name = connectionName,
-                        connection_status = status.ToString(),
-                        timestamp_utc = utcNow.ToString("o"),
-                        note = "Connection lost detected, waiting for sustained period before notification"
-                    }));
             }
-            else if (!_connectionLostNotified && _connectionLostFirstDetectedUtc.HasValue)
+            
+            // CRITICAL FIX: Use shared state to prevent duplicate logging across multiple strategy instances
+            lock (_sharedConnectionLock)
             {
-                // Check if disconnection has been sustained for threshold period
+                if (!_sharedConnectionLostLogged)
+                {
+                    // First instance to detect: log the event and initialize shared state
+                    _sharedConnectionLostLogged = true;
+                    _sharedConnectionLostFirstDetectedUtc = utcNow;
+                    _sharedConnectionLostInstanceCount = 1;
+                    
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST", state: "ENGINE",
+                        new
+                        {
+                            connection_name = connectionName,
+                            connection_status = status.ToString(),
+                            timestamp_utc = utcNow.ToString("o"),
+                            strategy_instance_count = 1,
+                            note = "Connection lost detected, waiting for sustained period before notification"
+                        }));
+                }
+                else
+                {
+                    // Another instance detected the same disconnect: increment counter but don't log
+                    _sharedConnectionLostInstanceCount++;
+                }
+            }
+            
+            // Check if disconnection has been sustained for threshold period
+            if (!_connectionLostNotified && _connectionLostFirstDetectedUtc.HasValue)
+            {
                 var elapsed = (utcNow - _connectionLostFirstDetectedUtc.Value).TotalSeconds;
                 if (elapsed >= CONNECTION_LOST_SUSTAINED_SECONDS)
                 {
-                    // Only notify if streams are active (session-aware)
-                    if (HasActiveStreams())
+                    // CRITICAL FIX: Only send notification once per disconnect (use shared state)
+                    lock (_sharedConnectionLock)
                     {
-                        _connectionLostNotified = true;
-                        
-                        var title = "Connection Lost (Sustained)";
-                        var message = $"NinjaTrader connection lost for {elapsed:F0}s: {connectionName}. Status: {status}";
-                        
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST_SUSTAINED", state: "ENGINE",
-                            new
+                        if (!_sharedConnectionLostNotified && _sharedConnectionLostLogged && _sharedConnectionLostFirstDetectedUtc.HasValue)
+                        {
+                            var sharedElapsed = (utcNow - _sharedConnectionLostFirstDetectedUtc.Value).TotalSeconds;
+                            if (sharedElapsed >= CONNECTION_LOST_SUSTAINED_SECONDS)
                             {
-                                connection_name = connectionName,
-                                connection_status = status.ToString(),
-                                elapsed_seconds = elapsed,
-                                timestamp_utc = utcNow.ToString("o")
-                            }));
-                        
-                        SendNotification("CONNECTION_LOST", title, message, priority: 2, skipRateLimit: true); // Emergency priority, no rate limit
+                                // Mark as notified in shared state to prevent duplicate notifications
+                                _sharedConnectionLostNotified = true;
+                                _connectionLostNotified = true;
+                                
+                                var hasActiveStreams = HasActiveStreams();
+                                var title = "Connection Lost (Sustained)";
+                                var message = $"NinjaTrader connection lost for {sharedElapsed:F0}s: {connectionName}. Status: {status}. " +
+                                             $"Active streams: {(hasActiveStreams ? "Yes" : "No")}. " +
+                                             $"Detected by {_sharedConnectionLostInstanceCount} strategy instance(s).";
+                                
+                                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_LOST_SUSTAINED", state: "ENGINE",
+                                    new
+                                    {
+                                        connection_name = connectionName,
+                                        connection_status = status.ToString(),
+                                        elapsed_seconds = sharedElapsed,
+                                        timestamp_utc = utcNow.ToString("o"),
+                                        has_active_streams = hasActiveStreams,
+                                        strategy_instance_count = _sharedConnectionLostInstanceCount,
+                                        note = "Connection loss notification sent regardless of stream state (critical infrastructure issue)"
+                                    }));
+                                
+                                SendNotification("CONNECTION_LOST", title, message, priority: 2, skipRateLimit: true); // Emergency priority, no rate limit
+                            }
+                        }
                     }
                 }
             }
@@ -172,6 +216,15 @@ public sealed class HealthMonitor
                 _connectionLostActive = false;
                 _connectionLostFirstDetectedUtc = null;
                 _connectionLostNotified = false;
+                
+                // CRITICAL FIX: Reset shared state when connection is restored
+                lock (_sharedConnectionLock)
+                {
+                    _sharedConnectionLostLogged = false;
+                    _sharedConnectionLostNotified = false;
+                    _sharedConnectionLostFirstDetectedUtc = null;
+                    _sharedConnectionLostInstanceCount = 0;
+                }
                 
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CONNECTION_RECOVERED", state: "ENGINE",
                     new

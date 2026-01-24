@@ -26,6 +26,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow)
     {
         // TODO: Phase C - Implement actual NT Live order placement with guardrails
@@ -34,6 +35,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
             order_type = "ENTRY",
             direction,
             entry_price = entryPrice,
+            entry_order_type = entryOrderType,
             quantity,
             account = "LIVE",
             note = "Stub - actual NT integration pending"

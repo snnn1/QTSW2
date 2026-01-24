@@ -18,6 +18,12 @@ public sealed class ExecutionSummary
     private int _ordersBlocked;
     private readonly Dictionary<string, int> _blockedByReason = new();
     private int _duplicatesSkipped;
+    
+    // Cost tracking
+    private decimal _totalSlippageDollars = 0;
+    private decimal _totalCommission = 0;
+    private decimal _totalFees = 0;
+    private decimal _totalExecutionCost = 0;
 
     public void RecordIntentSeen(string intentId, string tradingDate, string stream, string instrument)
     {
@@ -92,6 +98,25 @@ public sealed class ExecutionSummary
             intent.DuplicateSkipped = true;
         }
     }
+    
+    /// <summary>
+    /// Record execution cost (slippage, commission, fees) for an intent.
+    /// </summary>
+    public void RecordExecutionCost(string intentId, decimal slippageDollars, decimal? commission, decimal? fees)
+    {
+        _totalSlippageDollars += slippageDollars;
+        if (commission.HasValue) _totalCommission += commission.Value;
+        if (fees.HasValue) _totalFees += fees.Value;
+        _totalExecutionCost = _totalSlippageDollars + _totalCommission + _totalFees;
+        
+        if (_intents.TryGetValue(intentId, out var intent))
+        {
+            intent.SlippageDollars = slippageDollars;
+            intent.Commission = commission;
+            intent.Fees = fees;
+            intent.TotalCost = slippageDollars + (commission ?? 0) + (fees ?? 0);
+        }
+    }
 
     public ExecutionSummarySnapshot GetSnapshot() => new ExecutionSummarySnapshot
     {
@@ -103,7 +128,11 @@ public sealed class ExecutionSummary
         OrdersBlocked = _ordersBlocked,
         BlockedByReason = new Dictionary<string, int>(_blockedByReason),
         DuplicatesSkipped = _duplicatesSkipped,
-        IntentDetails = new List<IntentSummary>(_intents.Values)
+        IntentDetails = new List<IntentSummary>(_intents.Values),
+        TotalSlippageDollars = _totalSlippageDollars,
+        TotalCommission = _totalCommission,
+        TotalFees = _totalFees,
+        TotalExecutionCost = _totalExecutionCost
     };
 }
 
@@ -134,6 +163,12 @@ public class IntentSummary
     public string? BlockReason { get; set; }
 
     public bool DuplicateSkipped { get; set; }
+    
+    // Cost tracking
+    public decimal? SlippageDollars { get; set; }
+    public decimal? Commission { get; set; }
+    public decimal? Fees { get; set; }
+    public decimal? TotalCost { get; set; }
 }
 
 public class ExecutionSummarySnapshot
@@ -155,4 +190,10 @@ public class ExecutionSummarySnapshot
     public int DuplicatesSkipped { get; set; }
 
     public List<IntentSummary> IntentDetails { get; set; } = new();
+    
+    // Cost tracking
+    public decimal TotalSlippageDollars { get; set; }
+    public decimal TotalCommission { get; set; }
+    public decimal TotalFees { get; set; }
+    public decimal TotalExecutionCost { get; set; }
 }

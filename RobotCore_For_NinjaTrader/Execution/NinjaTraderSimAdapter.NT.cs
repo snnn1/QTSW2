@@ -1,8 +1,3 @@
-// NOTE: NinjaTrader's in-app C# compiler does not automatically define custom
-// conditional compilation symbols. This file is the NT8 API implementation and
-// must be compiled inside NinjaTrader.
-#define NINJATRADER
-
 // NinjaTrader-specific implementation using real NT APIs
 // This file is compiled only when NINJATRADER is defined (inside NT Strategy context)
 
@@ -11,7 +6,6 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
 
@@ -21,113 +15,8 @@ namespace QTSW2.Robot.Core.Execution;
 /// Real NinjaTrader API implementation for SIM adapter.
 /// This partial class provides real NT API calls when running inside NinjaTrader.
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter
+public partial class NinjaTraderSimAdapter
 {
-    /// <summary>
-    /// NT8 API compatibility shim for Account.CreateOrder().
-    /// Different NT8 builds/broker adapters expose different CreateOrder overload sets.
-    /// We use reflection to select an available overload at runtime and supply best-effort defaults.
-    /// </summary>
-    private static Order CreateOrderCompat(
-        Account account,
-        Instrument instrument,
-        OrderAction orderAction,
-        OrderType orderType,
-        TimeInForce timeInForce,
-        int quantity,
-        double limitPrice,
-        double stopPrice,
-        string oco,
-        string name)
-    {
-        var methods = account.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public);
-        MethodInfo? best = null;
-
-        // Prefer the simplest overloads first (fewest parameters)
-        foreach (var m in methods)
-        {
-            if (!string.Equals(m.Name, "CreateOrder", StringComparison.Ordinal))
-                continue;
-
-            if (m.ReturnType != typeof(Order))
-                continue;
-
-            var ps = m.GetParameters();
-            if (ps.Length < 4) // must have at least instrument/action/type/qty-ish
-                continue;
-
-            // Keep the smallest param-count as "best" to minimize mismatch risk.
-            if (best == null || ps.Length < best.GetParameters().Length)
-                best = m;
-        }
-
-        if (best == null)
-            throw new InvalidOperationException("No compatible Account.CreateOrder() overload found (return type Order).");
-
-        var p = best.GetParameters();
-        var args = new object?[p.Length];
-
-        var intCount = 0;
-        var doubleCount = 0;
-        var stringCount = 0;
-
-        for (var i = 0; i < p.Length; i++)
-        {
-            var t = p[i].ParameterType;
-
-            if (t == typeof(Instrument))
-            {
-                args[i] = instrument;
-            }
-            else if (t == typeof(OrderAction))
-            {
-                args[i] = orderAction;
-            }
-            else if (t == typeof(OrderType))
-            {
-                args[i] = orderType;
-            }
-            else if (t == typeof(TimeInForce))
-            {
-                args[i] = timeInForce;
-            }
-            else if (t == typeof(int))
-            {
-                // First int is usually quantity; subsequent ints use a safe default (0).
-                args[i] = intCount == 0 ? quantity : 0;
-                intCount++;
-            }
-            else if (t == typeof(double))
-            {
-                // First double typically limitPrice, second stopPrice; remaining doubles default 0.
-                args[i] = doubleCount == 0 ? limitPrice : (doubleCount == 1 ? stopPrice : 0.0);
-                doubleCount++;
-            }
-            else if (t == typeof(string))
-            {
-                // First string typically OCO id, second string name/signal; remaining strings empty.
-                args[i] = stringCount == 0 ? oco : (stringCount == 1 ? name : "");
-                stringCount++;
-            }
-            else if (t == typeof(OrderState))
-            {
-                // Best-effort default: Initialized.
-                args[i] = OrderState.Initialized;
-            }
-            else
-            {
-                // Unknown/optional parameters: pass null for ref types, default(T) for value types.
-                args[i] = t.IsValueType ? Activator.CreateInstance(t) : null;
-            }
-        }
-
-        var orderObj = best.Invoke(account, args);
-        if (orderObj is not Order order)
-            throw new InvalidOperationException("Account.CreateOrder() returned null or non-Order.");
-
-        return order;
-    }
-
     /// <summary>
     /// STEP 1: Verify SIM account using real NT API.
     /// </summary>
@@ -150,16 +39,8 @@ public sealed partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
-        // NT8: Account types vary by connection/provider. We still fail-closed, but allow:
-        // - NT internal sim accounts (e.g., "Sim101")
-        // - Provider demo accounts (often prefixed with "DEMO")
-        // This prevents the strategy from disabling itself when running on a demo feed/account.
-        var accountName = account.Name ?? "";
-        var isAllowedSimulationAccount =
-            accountName.StartsWith("Sim", StringComparison.OrdinalIgnoreCase) ||
-            accountName.StartsWith("DEMO", StringComparison.OrdinalIgnoreCase);
-
-        if (!isAllowedSimulationAccount)
+        // Assert: account.IsSimAccount == true
+        if (!account.IsSimAccount)
         {
             var error = $"Account '{account.Name}' is not a Sim account - aborting execution";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
@@ -181,6 +62,7 @@ public sealed partial class NinjaTraderSimAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow)
     {
         if (_ntAccount == null || _ntInstrument == null)
@@ -202,23 +84,38 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // STEP 2: Create NT Order using real API
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
-            var orderType = entryPrice.HasValue ? OrderType.Limit : OrderType.Market;
-            var limitPrice = entryPrice.HasValue ? (double)entryPrice.Value : 0.0;
-            var stopPrice = 0.0;
-            var oco = ""; // entry is not OCO-linked
-            var name = RobotOrderIds.EncodeTag(intentId); // robot-owned envelope (NT8 uses Order.Name, not Tag)
-
-            var order = CreateOrderCompat(
-                account,
-                ntInstrument,
-                orderAction,
-                orderType,
-                TimeInForce.Day,
-                quantity,
-                limitPrice,
-                stopPrice,
-                oco,
-                name);
+            
+            // Determine order type: use entryOrderType if provided, otherwise infer from entryPrice
+            OrderType orderType;
+            double ntEntryPrice;
+            
+            if (entryOrderType == "STOP_MARKET")
+            {
+                // Breakout entry: use StopMarket order
+                orderType = OrderType.StopMarket;
+                if (!entryPrice.HasValue)
+                {
+                    var error = "StopMarket order requires entryPrice (stop trigger price)";
+                    return OrderSubmissionResult.FailureResult(error, utcNow);
+                }
+                ntEntryPrice = (double)entryPrice.Value;
+            }
+            else if (entryOrderType == "MARKET" || !entryPrice.HasValue)
+            {
+                // Market order
+                orderType = OrderType.Market;
+                ntEntryPrice = 0.0;
+            }
+            else
+            {
+                // Default: Limit order (for immediate entries at lock)
+                orderType = OrderType.Limit;
+                ntEntryPrice = (double)entryPrice.Value;
+            }
+            
+            // Real NT API: CreateOrder
+            var order = account.CreateOrder(ntInstrument, orderAction, orderType, quantity, ntEntryPrice);
+            order.Tag = RobotOrderIds.EncodeTag(intentId); // Robot-owned envelope
             order.TimeInForce = TimeInForce.Day;
 
             // Store order info for callback correlation
@@ -232,17 +129,40 @@ public sealed partial class NinjaTraderSimAdapter
                 Quantity = quantity,
                 Price = entryPrice,
                 State = "SUBMITTED",
+                NTOrder = order, // Store NT order object
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
             _orderMap[intentId] = orderInfo;
 
-            // NT8: Submit() often returns void in NinjaScript; rely on OrderUpdate callbacks for final state.
-            account.Submit(new[] { order });
+            // Real NT API: Submit order
+            var result = account.Submit(new[] { order });
+            
+            if (result == null || result.Length == 0)
+            {
+                var error = "Order submission returned null/empty result";
+                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_SUBMIT_FAILED: {error}", utcNow);
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+
+            var submitResult = result[0];
             var acknowledgedAt = DateTimeOffset.UtcNow;
 
-            // Journal: ENTRY_SUBMITTED
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", order.OrderId, acknowledgedAt);
+            if (submitResult.OrderState == OrderState.Rejected)
+            {
+                var error = submitResult.ErrorMessage ?? "Order rejected";
+                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_SUBMIT_FAILED: {error}", utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+                {
+                    error,
+                    broker_order_id = order.OrderId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+
+            // Journal: ENTRY_SUBMITTED (store expected entry price for slippage calculation)
+            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", order.OrderId, acknowledgedAt, entryPrice);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -250,11 +170,12 @@ public sealed partial class NinjaTraderSimAdapter
                 order_type = "ENTRY",
                 direction,
                 entry_price = entryPrice,
+                entry_order_type = entryOrderType,
                 quantity,
                 account = "SIM",
                 order_action = orderAction.ToString(),
                 order_type_nt = orderType.ToString(),
-                note = "Submitted via Account.Submit(); awaiting OrderUpdate for final state"
+                order_state = submitResult.OrderState.ToString()
             }));
 
             // Alias event for easier grepping (user-facing)
@@ -290,10 +211,10 @@ public sealed partial class NinjaTraderSimAdapter
     private void HandleOrderUpdateReal(object orderObj, object orderUpdateObj)
     {
         var order = orderObj as Order;
+        var orderUpdate = orderUpdateObj as OrderUpdate;
         if (order == null) return;
 
-        // NT8: use Order.Name as the robot-owned "tag" field
-        var encodedTag = order.Name ?? "";
+        var encodedTag = order.Tag as string;
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
         if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
 
@@ -312,14 +233,23 @@ public sealed partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_ACKNOWLEDGED",
                 new { broker_order_id = order.OrderId, order_type = orderInfo.OrderType }));
+            
+            // Mark protective orders as acknowledged for watchdog tracking
+            if (orderInfo.OrderType == "STOP")
+            {
+                orderInfo.ProtectiveStopAcknowledged = true;
+            }
+            else if (orderInfo.OrderType == "TARGET")
+            {
+                orderInfo.ProtectiveTargetAcknowledged = true;
+            }
         }
         else if (orderState == OrderState.Rejected)
         {
-            // NT8 Order does not always expose ErrorMessage; keep it generic.
-            _executionJournal.RecordRejection(intentId, "", "", "ORDER_REJECTED", utcNow);
+            _executionJournal.RecordRejection(intentId, "", "", $"ORDER_REJECTED: {order.ErrorMessage}", utcNow);
             orderInfo.State = "REJECTED";
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
-                new { broker_order_id = order.OrderId }));
+                new { broker_order_id = order.OrderId, error = order.ErrorMessage }));
         }
         else if (orderState == OrderState.Cancelled)
         {
@@ -335,12 +265,11 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private void HandleExecutionUpdateReal(object executionObj, object orderObj)
     {
-        // Disambiguate: NinjaTrader also has an Execution namespace; we want the Cbi.Execution type.
-        var execution = executionObj as NinjaTrader.Cbi.Execution;
+        var execution = executionObj as Execution;
         var order = orderObj as Order;
         if (execution == null || order == null) return;
 
-        var encodedTag = order.Name ?? "";
+        var encodedTag = order.Tag as string;
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
         if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
 
@@ -358,12 +287,19 @@ public sealed partial class NinjaTraderSimAdapter
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
         var filledTotal = orderInfo.FilledQuantity;
+        
+        // Get contract multiplier for slippage calculation
+        decimal? contractMultiplier = null;
+        if (_ntInstrument is Instrument ntInst)
+        {
+            contractMultiplier = (decimal)ntInst.MasterInstrument.PointValue;
+        }
 
         // Update ExecutionJournal: PARTIAL_FILL or FILLED (use cumulative quantity for safety)
         if (filledTotal < orderInfo.Quantity)
         {
             // Partial fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow);
+            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_PARTIAL_FILL",
                 new
                 {
@@ -378,7 +314,7 @@ public sealed partial class NinjaTraderSimAdapter
         else
         {
             // Full fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow);
+            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
             orderInfo.State = "FILLED";
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
@@ -392,12 +328,19 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
         }
 
-        // STEP 4: Protective submission must fire for entry intents (ENTRY and ENTRY_STOP)
-        // Partial-fill rule: never allow filled position without a stop; protect filled qty immediately.
+        // STEP 4: Register entry fill with coordinator
         if (orderInfo.IsEntryOrder && _intentMap.TryGetValue(intentId, out var entryIntent))
         {
+            // Register exposure with coordinator
+            _coordinator?.OnEntryFill(intentId, filledTotal, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+            
             // Ensure we protect the currently filled quantity (no market-close gating)
             HandleEntryFill(intentId, entryIntent, fillPrice, filledTotal, utcNow);
+        }
+        else if (orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET")
+        {
+            // Exit fill: register with coordinator
+            _coordinator?.OnExitFill(intentId, filledTotal, utcNow);
         }
     }
 
@@ -432,7 +375,7 @@ public sealed partial class NinjaTraderSimAdapter
             // Idempotent: if stop already exists, ensure it matches desired stop/qty
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
             var existingStop = account.Orders.FirstOrDefault(o =>
-                (o.Name ?? "") == stopTag &&
+                (o.Tag as string) == stopTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
             if (existingStop != null)
@@ -452,8 +395,13 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (changed)
                 {
-                    // NT8: Change() often returns void in NinjaScript; rely on OrderUpdate for final state.
-                    account.Change(new[] { existingStop });
+                    var changeRes = account.Change(new[] { existingStop });
+                    if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
+                    {
+                        var err = changeRes?[0]?.ErrorMessage ?? "Stop order change rejected";
+                        _executionJournal.RecordRejection(intentId, "", "", $"STOP_CHANGE_FAILED: {err}", utcNow);
+                        return OrderSubmissionResult.FailureResult(err, utcNow);
+                    }
                 }
 
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -472,21 +420,19 @@ public sealed partial class NinjaTraderSimAdapter
 
             // Real NT API: Create stop order
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
-            var order = CreateOrderCompat(
-                account,
-                ntInstrument,
-                orderAction,
-                OrderType.StopMarket,
-                TimeInForce.Day,
-                quantity,
-                0.0, // limitPrice (unused for StopMarket)
-                (double)stopPrice,
-                "",  // OCO (set later when paired)
-                stopTag);
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, (double)stopPrice);
+            order.Tag = stopTag;
             order.TimeInForce = TimeInForce.Day;
 
-            // Submit (event-driven confirmation via OrderUpdate)
-            account.Submit(new[] { order });
+            // Real NT API: Submit order
+            var result = account.Submit(new[] { order });
+            
+            if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
+            {
+                var error = result?[0]?.ErrorMessage ?? "Stop order rejected";
+                _executionJournal.RecordRejection(intentId, "", "", $"STOP_SUBMIT_FAILED: {error}", utcNow);
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
 
             // Journal: STOP_SUBMITTED
             _executionJournal.RecordSubmission(intentId, "", "", instrument, "STOP", order.OrderId, utcNow);
@@ -541,7 +487,7 @@ public sealed partial class NinjaTraderSimAdapter
             // Idempotent: if target already exists, ensure it matches desired target/qty
             var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
             var existingTarget = account.Orders.FirstOrDefault(o =>
-                (o.Name ?? "") == targetTag &&
+                (o.Tag as string) == targetTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
             if (existingTarget != null)
@@ -561,8 +507,13 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (changed)
                 {
-                    // NT8: Change() often returns void in NinjaScript; rely on OrderUpdate for final state.
-                    account.Change(new[] { existingTarget });
+                    var changeRes = account.Change(new[] { existingTarget });
+                    if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
+                    {
+                        var err = changeRes?[0]?.ErrorMessage ?? "Target order change rejected";
+                        _executionJournal.RecordRejection(intentId, "", "", $"TARGET_CHANGE_FAILED: {err}", utcNow);
+                        return OrderSubmissionResult.FailureResult(err, utcNow);
+                    }
                 }
 
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -581,21 +532,19 @@ public sealed partial class NinjaTraderSimAdapter
 
             // Real NT API: Create target order
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
-            var order = CreateOrderCompat(
-                account,
-                ntInstrument,
-                orderAction,
-                OrderType.Limit,
-                TimeInForce.Day,
-                quantity,
-                (double)targetPrice,
-                0.0, // stopPrice
-                "",  // OCO (set later when paired)
-                targetTag);
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.Limit, quantity, (double)targetPrice);
+            order.Tag = targetTag;
             order.TimeInForce = TimeInForce.Day;
 
-            // Submit (event-driven confirmation via OrderUpdate)
-            account.Submit(new[] { order });
+            // Real NT API: Submit order
+            var result = account.Submit(new[] { order });
+            
+            if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
+            {
+                var error = result?[0]?.ErrorMessage ?? "Target order rejected";
+                _executionJournal.RecordRejection(intentId, "", "", $"TARGET_SUBMIT_FAILED: {error}", utcNow);
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
 
             // Journal: TARGET_SUBMITTED
             _executionJournal.RecordSubmission(intentId, "", "", instrument, "TARGET", order.OrderId, utcNow);
@@ -646,7 +595,7 @@ public sealed partial class NinjaTraderSimAdapter
             // Find existing stop order (robot-owned tag envelope)
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
             var stopOrder = account.Orders.FirstOrDefault(o =>
-                (o.Name ?? "") == stopTag &&
+                (o.Tag as string) == stopTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
             if (stopOrder == null)
@@ -657,8 +606,13 @@ public sealed partial class NinjaTraderSimAdapter
 
             // Real NT API: Modify stop price
             stopOrder.StopPrice = (double)beStopPrice;
-            // NT8: Change() often returns void in NinjaScript; rely on OrderUpdate for final state.
-            account.Change(new[] { stopOrder });
+            var result = account.Change(new[] { stopOrder });
+
+            if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
+            {
+                var error = result?[0]?.ErrorMessage ?? "BE modification rejected";
+                return OrderModificationResult.FailureResult(error, utcNow);
+            }
 
             _executionJournal.RecordBEModification(intentId, "", "", beStopPrice, utcNow);
 
@@ -729,7 +683,7 @@ public sealed partial class NinjaTraderSimAdapter
                     {
                         OrderId = order.OrderId,
                         Instrument = order.Instrument.MasterInstrument.Name,
-                        Tag = order.Name ?? "",
+                        Tag = order.Tag as string,
                         OcoGroup = order.Oco,
                         OrderType = order.OrderType.ToString(),
                         Price = order.OrderType == OrderType.Limit ? (decimal?)order.LimitPrice : null,
@@ -755,6 +709,152 @@ public sealed partial class NinjaTraderSimAdapter
             Positions = positions,
             WorkingOrders = workingOrders
         };
+    }
+    
+    /// <summary>
+    /// Cancel orders for a specific intent only using real NT API.
+    /// </summary>
+    private bool CancelIntentOrdersReal(string intentId, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null)
+        {
+            return false;
+        }
+        
+        var account = _ntAccount as Account;
+        if (account == null)
+        {
+            return false;
+        }
+        
+        var ordersToCancel = new List<Order>();
+        
+        try
+        {
+            // Find orders matching this intent ID
+            foreach (var order in account.Orders)
+            {
+                if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                {
+                    continue;
+                }
+                
+                var tag = order.Tag as string ?? "";
+                var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
+                
+                // Match intent ID (handles STOP, TARGET suffixes)
+                if (decodedIntentId == intentId)
+                {
+                    ordersToCancel.Add(order);
+                }
+            }
+            
+            if (ordersToCancel.Count > 0)
+            {
+                // Real NT API: Cancel orders
+                account.Cancel(ordersToCancel.ToArray());
+                
+                // Update order map
+                foreach (var order in ordersToCancel)
+                {
+                    var tag = order.Tag as string ?? "";
+                    var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
+                    if (decodedIntentId == intentId && _orderMap.TryGetValue(intentId, out var orderInfo))
+                    {
+                        orderInfo.State = "CANCELLED";
+                    }
+                }
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_SUCCESS", state: "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        cancelled_count = ordersToCancel.Count,
+                        cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList()
+                    }));
+                
+                return true;
+            }
+            
+            return true; // No orders to cancel is success
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Flatten exposure for a specific intent only using real NT API.
+    /// </summary>
+    private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null || _ntInstrument == null)
+        {
+            var error = "NT context not set";
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+        
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        
+        if (account == null || ntInstrument == null)
+        {
+            var error = "NT context type mismatch";
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+        
+        try
+        {
+            // Get position for this instrument
+            var position = account.GetPosition(ntInstrument);
+            
+            if (position.MarketPosition == MarketPosition.Flat)
+            {
+                // Already flat
+                return FlattenResult.SuccessResult(utcNow);
+            }
+            
+            // Note: NinjaTrader API doesn't support per-intent flattening
+            // We flatten the entire instrument position
+            // This is acceptable because:
+            // 1. The coordinator tracks remaining intents
+            // 2. If other intents exist, they would need to be re-entered (rare path)
+            // 3. This is an emergency fallback scenario
+            
+            account.Flatten(ntInstrument);
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    position_qty = position.Quantity,
+                    note = "Flattened instrument position (broker API limitation - per-intent not supported)"
+                }));
+            
+            return FlattenResult.SuccessResult(utcNow);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            
+            return FlattenResult.FailureResult($"Flatten intent failed: {ex.Message}", utcNow);
+        }
     }
     
     /// <summary>
@@ -785,7 +885,7 @@ public sealed partial class NinjaTraderSimAdapter
                     continue;
                 }
                 
-                var tag = order.Name ?? "";
+                var tag = order.Tag as string ?? "";
                 var oco = order.Oco ?? "";
                 
                 // Strict robot-owned detection: Tag or OCO starts with "QTSW2:"
@@ -853,21 +953,12 @@ public sealed partial class NinjaTraderSimAdapter
         {
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
 
-            // NT8 API: Create stop-market entry (breakout stop entry)
-            var name = RobotOrderIds.EncodeTag(intentId);
-            var oco = ocoGroup ?? "";
-            var order = CreateOrderCompat(
-                account,
-                ntInstrument,
-                orderAction,
-                OrderType.StopMarket,
-                TimeInForce.Day,
-                quantity,
-                0.0, // limitPrice (unused for StopMarket)
-                (double)stopPrice,
-                oco,
-                name);
+            // Real NT API: Create stop-market entry
+            var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, (double)stopPrice);
+            order.Tag = RobotOrderIds.EncodeTag(intentId);
             order.TimeInForce = TimeInForce.Day;
+            if (!string.IsNullOrEmpty(ocoGroup))
+                order.Oco = ocoGroup;
 
             // Store order info for callback correlation
             var orderInfo = new OrderInfo
@@ -880,14 +971,36 @@ public sealed partial class NinjaTraderSimAdapter
                 Quantity = quantity,
                 Price = stopPrice,
                 State = "SUBMITTED",
+                NTOrder = order,
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
             _orderMap[intentId] = orderInfo;
 
-            // Submit (event-driven confirmation via OrderUpdate)
-            account.Submit(new[] { order });
+            var result = account.Submit(new[] { order });
+            if (result == null || result.Length == 0)
+            {
+                var error = "Stop entry submission returned null/empty result";
+                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow);
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+
+            var submitResult = result[0];
             var acknowledgedAt = DateTimeOffset.UtcNow;
+
+            if (submitResult.OrderState == OrderState.Rejected)
+            {
+                var error = submitResult.ErrorMessage ?? "Stop entry order rejected";
+                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+                {
+                    error,
+                    order_type = "ENTRY_STOP",
+                    broker_order_id = order.OrderId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
 
             _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY_STOP", order.OrderId, acknowledgedAt);
 
@@ -902,7 +1015,7 @@ public sealed partial class NinjaTraderSimAdapter
                 account = "SIM",
                 order_action = orderAction.ToString(),
                 order_type_nt = OrderType.StopMarket.ToString(),
-                note = "Submitted via Account.Submit(); awaiting OrderUpdate for final state"
+                order_state = submitResult.OrderState.ToString()
             }));
 
             // Alias event for easier grepping (user-facing)
@@ -932,6 +1045,12 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult($"Stop entry order submission failed: {ex.Message}", utcNow);
         }
     }
+}
+
+// Extend OrderInfo to store NT order object
+partial class OrderInfo
+{
+    public object? NTOrder { get; set; } // NinjaTrader.Cbi.Order
 }
 
 #endif

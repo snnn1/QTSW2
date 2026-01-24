@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 
 namespace QTSW2.Robot.Core;
 
@@ -191,6 +192,36 @@ public sealed class RobotLogger
     }
 
     /// <summary>
+    /// Convert anonymous object (or any object with properties) to dictionary using reflection.
+    /// This fixes the issue where anonymous objects are serialized as strings instead of proper JSON.
+    /// Returns null if conversion fails or object has no properties.
+    /// </summary>
+    private Dictionary<string, object?>? ConvertAnonymousObjectToDictionary(object obj)
+    {
+        if (obj == null) return null;
+        
+        var dict = new Dictionary<string, object?>();
+        var type = obj.GetType();
+        
+        // Get all public instance properties (works for anonymous types and regular objects)
+        var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var prop in props)
+        {
+            try
+            {
+                var value = prop.GetValue(obj);
+                dict[prop.Name] = value;
+            }
+            catch
+            {
+                // Skip properties that can't be read
+            }
+        }
+        
+        return dict.Count > 0 ? dict : null;
+    }
+
+    /// <summary>
     /// Convert old event dictionary format to RobotLogEvent.
     /// Returns null if conversion fails.
     /// </summary>
@@ -223,6 +254,12 @@ public sealed class RobotLogger
         var instrument = dict.TryGetValue("instrument", out var inst) ? inst?.ToString() ?? "" : "";
         var message = eventType;
         
+        // Extract standardized top-level fields (per plan requirement #1)
+        var tradingDate = dict.TryGetValue("trading_date", out var td) ? td?.ToString() : null;
+        var stream = dict.TryGetValue("stream", out var str) ? str?.ToString() : null;
+        var session = dict.TryGetValue("session", out var sess) ? sess?.ToString() : null;
+        var slotTimeChicago = dict.TryGetValue("slot_time_chicago", out var stc) ? stc?.ToString() : null;
+        
         // Extract data payload
         var data = new Dictionary<string, object?>();
         if (dict.TryGetValue("data", out var dataObj))
@@ -234,21 +271,43 @@ public sealed class RobotLogger
             }
             else if (dataObj != null)
             {
-                data["payload"] = dataObj;
+                // CRITICAL FIX: Convert anonymous objects to dictionaries for proper JSON serialization
+                // Anonymous objects are serialized as strings, causing empty fields in logs
+                var convertedDict = ConvertAnonymousObjectToDictionary(dataObj);
+                if (convertedDict != null)
+                {
+                    foreach (var kvp in convertedDict)
+                        data[kvp.Key] = kvp.Value;
+                }
+                else
+                {
+                    // Fallback: store as payload if conversion fails
+                    data["payload"] = dataObj;
+                }
             }
         }
 
-        // Include additional context fields in data
+        // Include additional context fields in data (but exclude standardized top-level fields)
         foreach (var kvp in dict)
         {
             if (kvp.Key != "ts_utc" && kvp.Key != "ts_chicago" && kvp.Key != "event_type" && 
-                kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream")
+                kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream" &&
+                kvp.Key != "trading_date" && kvp.Key != "session" && kvp.Key != "slot_time_chicago" &&
+                kvp.Key != "slot_time_utc" && kvp.Key != "state" && kvp.Key != "intent_id")
             {
                 data[kvp.Key] = kvp.Value;
             }
         }
 
-        return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, runId: _runId, data: data.Count > 0 ? data : null);
+        var logEvent = new RobotLogEvent(utcNow, level, source, instrument, eventType, message, runId: _runId, data: data.Count > 0 ? data : null);
+        
+        // Set standardized top-level fields
+        logEvent.trading_date = tradingDate;
+        logEvent.stream = stream;
+        logEvent.session = session;
+        logEvent.slot_time_chicago = slotTimeChicago;
+        
+        return logEvent;
     }
 }
 

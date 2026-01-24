@@ -73,6 +73,9 @@ SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "configs" / "schedule.json"
 # Global orchestrator instance
 orchestrator_instance = None
 
+# Global watchdog aggregator instance
+watchdog_aggregator_instance = None
+
 # File counts cache (for fast response times)
 _file_counts_cache = {
     "raw_files": 0,
@@ -88,7 +91,7 @@ _file_counts_cache_ttl_seconds = 30  # Refresh cache if older than 30 seconds
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-    global orchestrator_instance
+    global orchestrator_instance, watchdog_aggregator_instance
     logger = logging.getLogger(__name__)
     logger.info("Pipeline Dashboard API started")
     
@@ -155,6 +158,44 @@ async def lifespan(app: FastAPI):
         print("=" * 60 + "\n")
         orchestrator_instance = None
     
+    # Initialize watchdog aggregator (independent of orchestrator)
+    print("\n" + "=" * 60)
+    print("INITIALIZING WATCHDOG AGGREGATOR")
+    print("=" * 60)
+    try:
+        print("Step 1: Importing watchdog aggregator...")
+        logger.info("Initializing Watchdog Aggregator...")
+        try:
+            from modules.watchdog.aggregator import WatchdogAggregator
+        except ImportError:
+            import sys
+            sys.path.insert(0, str(QTSW2_ROOT))
+            from modules.watchdog.aggregator import WatchdogAggregator
+        print("   [OK] Imported")
+        
+        print("Step 2: Creating aggregator instance...")
+        watchdog_aggregator_instance = WatchdogAggregator()
+        print("   [OK] Instance created")
+        
+        print("Step 3: Starting aggregator...")
+        await watchdog_aggregator_instance.start()
+        print("   [OK] Aggregator started successfully!")
+        print("=" * 60 + "\n")
+        
+        # Set aggregator instance in watchdog router
+        watchdog.aggregator_instance = watchdog_aggregator_instance
+        logger.info("Watchdog Aggregator started successfully")
+    except Exception as e:
+        import traceback
+        error_msg = f"Failed to start watchdog aggregator: {e}\nFull traceback:\n{traceback.format_exc()}"
+        logger.error(error_msg, exc_info=True)
+        print("\n" + "=" * 60)
+        print("[WARNING] Watchdog aggregator failed to start!")
+        print("=" * 60)
+        print(f"Error: {str(e)}")
+        print("=" * 60 + "\n")
+        watchdog_aggregator_instance = None
+    
     # Legacy scheduler removed - Windows Task Scheduler runs pipeline directly via automation/run_pipeline_standalone.py
     
     # Create master matrix debug log file on startup
@@ -174,6 +215,12 @@ async def lifespan(app: FastAPI):
     yield  # Application runs here
     
     # Shutdown
+    if watchdog_aggregator_instance:
+        try:
+            await watchdog_aggregator_instance.stop()
+            logger.info("Watchdog Aggregator stopped")
+        except Exception as e:
+            logger.error(f"Error stopping watchdog aggregator: {e}")
     logger = logging.getLogger(__name__)
     
     # Stop orchestrator
@@ -240,7 +287,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1K
 # Import and include routers
 # Handle both module import (dashboard.backend.main) and direct script execution
 try:
-    from .routers import pipeline, schedule, websocket, apps, metrics
+    from .routers import pipeline, schedule, websocket, apps, metrics, watchdog
 except (ImportError, ValueError):
     # Fallback: Add parent directory to path and import
     import sys
@@ -254,10 +301,10 @@ except (ImportError, ValueError):
     if str(dashboard_path) not in sys.path:
         sys.path.insert(0, str(dashboard_path))
     try:
-        from routers import pipeline, schedule, websocket, apps, metrics
+        from routers import pipeline, schedule, websocket, apps, metrics, watchdog
     except ImportError as e:
         # Last resort: try absolute import
-        from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics
+        from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics, watchdog
 
 # Import matrix API router from matrix module
 try:
@@ -273,6 +320,7 @@ app.include_router(schedule.router)
 app.include_router(websocket.router)
 app.include_router(apps.router)
 app.include_router(metrics.router)
+app.include_router(watchdog.router)
 app.include_router(matrix_router)  # Matrix API from modules.matrix.api
 
 # Legacy scheduler removed - no process to set

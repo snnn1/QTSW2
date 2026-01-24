@@ -16,12 +16,34 @@ public sealed class ExecutionJournal
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
     private readonly object _lock = new object();
+    
+    // Callback for stream stand-down on journal corruption
+    private Action<string, string, string, DateTimeOffset>? _onJournalCorruptionCallback;
+    
+    // Callback for recording execution costs in ExecutionSummary
+    private Action<string, decimal, decimal?, decimal?>? _onExecutionCostCallback;
 
     public ExecutionJournal(string projectRoot, RobotLogger log)
     {
         _journalDir = Path.Combine(projectRoot, "data", "execution_journals");
         Directory.CreateDirectory(_journalDir);
         _log = log;
+    }
+    
+    /// <summary>
+    /// Set callback for journal corruption events (stream stand-down).
+    /// </summary>
+    public void SetJournalCorruptionCallback(Action<string, string, string, DateTimeOffset> callback)
+    {
+        _onJournalCorruptionCallback = callback;
+    }
+    
+    /// <summary>
+    /// Set callback for recording execution costs (slippage, commission, fees).
+    /// </summary>
+    public void SetExecutionCostCallback(Action<string, decimal, decimal?, decimal?> callback)
+    {
+        _onExecutionCostCallback = callback;
     }
 
     /// <summary>
@@ -79,9 +101,10 @@ public sealed class ExecutionJournal
                 }
                 catch (Exception ex)
                 {
-                    // If journal is corrupted, treat as not submitted (fail open)
-                    // Log error for observability (fail-open is correct, but errors should be visible)
-                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    // CRITICAL FIX: Fail-closed on journal corruption
+                    // Journal corruption is actionable - stand down stream to prevent duplicate submissions
+                    var utcNow = DateTimeOffset.UtcNow;
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                         new
                         {
                             error = ex.Message,
@@ -90,8 +113,15 @@ public sealed class ExecutionJournal
                             stream = stream,
                             trading_date = tradingDate,
                             journal_path = journalPath,
-                            note = "Journal read failed, treating as not submitted (fail-open for idempotency)"
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal corruption - standing down stream to prevent duplicate submissions (fail-closed)"
                         }));
+                    
+                    // Stand down stream
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    
+                    // Return true (treat as submitted) to prevent duplicate submission
+                    return true; // Fail-closed: assume submitted to prevent duplicates
                 }
             }
 
@@ -109,7 +139,8 @@ public sealed class ExecutionJournal
         string instrument,
         string orderType,
         string? brokerOrderId,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        decimal? expectedEntryPrice = null)
     {
         lock (_lock)
         {
@@ -130,9 +161,8 @@ public sealed class ExecutionJournal
                 }
                 catch (Exception ex)
                 {
-                    // Journal read failed, create new entry (fail-open)
-                    // Log error for observability
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    // CRITICAL FIX: Fail-closed on journal corruption
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                         new
                         {
                             error = ex.Message,
@@ -141,9 +171,15 @@ public sealed class ExecutionJournal
                             stream = stream,
                             trading_date = tradingDate,
                             journal_path = journalPath,
-                            note = "Journal read failed during RecordSubmission, creating new entry"
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal corruption during RecordSubmission - standing down stream (fail-closed)"
                         }));
-                    entry = new ExecutionJournalEntry();
+                    
+                    // Stand down stream
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    
+                    // Return early - don't record submission to prevent duplicates
+                    return;
                 }
             }
             else
@@ -164,6 +200,11 @@ public sealed class ExecutionJournal
             if (orderType == "ENTRY")
             {
                 entry.EntryOrderType = orderType;
+                // Store expected entry price for slippage calculation
+                if (expectedEntryPrice.HasValue)
+                {
+                    entry.ExpectedEntryPrice = expectedEntryPrice.Value;
+                }
             }
 
             _cache[key] = entry;
@@ -180,7 +221,8 @@ public sealed class ExecutionJournal
         string stream,
         decimal fillPrice,
         int fillQuantity,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        decimal? contractMultiplier = null)
     {
         lock (_lock)
         {
@@ -198,9 +240,8 @@ public sealed class ExecutionJournal
                     }
                     catch (Exception ex)
                     {
-                        // Journal read failed, create new entry (fail-open)
-                        // Log error for observability
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        // CRITICAL FIX: Fail-closed on journal corruption
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                             new
                             {
                                 error = ex.Message,
@@ -209,9 +250,15 @@ public sealed class ExecutionJournal
                                 stream = stream,
                                 trading_date = tradingDate,
                                 journal_path = journalPath,
-                                note = "Journal read failed during RecordFill, creating new entry"
+                                action = "STREAM_STAND_DOWN",
+                                note = "Journal corruption during RecordFill - standing down stream (fail-closed)"
                             }));
-                        entry = new ExecutionJournalEntry();
+                        
+                        // Stand down stream
+                        _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                        
+                        // Return early - don't record fill to prevent duplicates
+                        return;
                     }
                 }
                 else
@@ -224,6 +271,40 @@ public sealed class ExecutionJournal
             entry.EntryFilledAt = utcNow.ToString("o");
             entry.FillPrice = fillPrice;
             entry.FillQuantity = fillQuantity;
+            entry.ActualFillPrice = fillPrice; // Store for slippage calculation
+
+            // Calculate slippage if expected price is available
+            if (entry.ExpectedEntryPrice.HasValue)
+            {
+                entry.SlippagePoints = fillPrice - entry.ExpectedEntryPrice.Value;
+                
+                // Calculate slippage in dollars if contract multiplier is provided
+                if (contractMultiplier.HasValue && fillQuantity > 0)
+                {
+                    entry.SlippageDollars = entry.SlippagePoints.Value * contractMultiplier.Value * fillQuantity;
+                }
+                
+                // Log slippage event
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_SLIPPAGE_DETECTED", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream = stream,
+                        instrument = entry.Instrument,
+                        expected_entry_price = entry.ExpectedEntryPrice.Value,
+                        actual_fill_price = fillPrice,
+                        slippage_points = entry.SlippagePoints.Value,
+                        slippage_dollars = entry.SlippageDollars,
+                        fill_quantity = fillQuantity,
+                        contract_multiplier = contractMultiplier
+                    }));
+                
+                // Record cost in ExecutionSummary via callback
+                if (entry.SlippageDollars.HasValue)
+                {
+                    _onExecutionCostCallback?.Invoke(intentId, entry.SlippageDollars.Value, entry.Commission, entry.Fees);
+                }
+            }
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
@@ -256,9 +337,8 @@ public sealed class ExecutionJournal
                     }
                     catch (Exception ex)
                     {
-                        // Journal read failed, create new entry (fail-open)
-                        // Log error for observability
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        // CRITICAL FIX: Fail-closed on journal corruption
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                             new
                             {
                                 error = ex.Message,
@@ -267,9 +347,15 @@ public sealed class ExecutionJournal
                                 stream = stream,
                                 trading_date = tradingDate,
                                 journal_path = journalPath,
-                                note = "Journal read failed during RecordRejection, creating new entry"
+                                action = "STREAM_STAND_DOWN",
+                                note = "Journal corruption during RecordRejection - standing down stream (fail-closed)"
                             }));
-                        entry = new ExecutionJournalEntry();
+                        
+                        // Stand down stream
+                        _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                        
+                        // Return early - don't record rejection to prevent duplicates
+                        return;
                     }
                 }
                 else
@@ -313,9 +399,8 @@ public sealed class ExecutionJournal
                     }
                     catch (Exception ex)
                     {
-                        // Journal read failed, create new entry (fail-open)
-                        // Log error for observability
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                        // CRITICAL FIX: Fail-closed on journal corruption
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                             new
                             {
                                 error = ex.Message,
@@ -324,9 +409,15 @@ public sealed class ExecutionJournal
                                 stream = stream,
                                 trading_date = tradingDate,
                                 journal_path = journalPath,
-                                note = "Journal read failed during RecordBEModification, creating new entry"
+                                action = "STREAM_STAND_DOWN",
+                                note = "Journal corruption during RecordBEModification - standing down stream (fail-closed)"
                             }));
-                        entry = new ExecutionJournalEntry();
+                        
+                        // Stand down stream
+                        _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                        
+                        // Return early - don't record BE modification to prevent duplicates
+                        return;
                     }
                 }
                 else
@@ -373,9 +464,9 @@ public sealed class ExecutionJournal
                 }
                 catch (Exception ex)
                 {
-                    // If journal is corrupted, treat as not modified (fail open)
-                    // Log error for observability
-                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_JOURNAL_READ_ERROR", "ENGINE",
+                    // CRITICAL FIX: Fail-closed on journal corruption
+                    var utcNow = DateTimeOffset.UtcNow;
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
                         new
                         {
                             error = ex.Message,
@@ -384,8 +475,15 @@ public sealed class ExecutionJournal
                             stream = stream,
                             trading_date = tradingDate,
                             journal_path = journalPath,
-                            note = "Journal read failed during IsBEModified check, treating as not modified (fail-open)"
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal corruption during IsBEModified check - standing down stream (fail-closed)"
                         }));
+                    
+                    // Stand down stream
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    
+                    // Return true (treat as modified) to prevent duplicate BE modification
+                    return true; // Fail-closed: assume modified to prevent duplicates
                 }
             }
 
@@ -463,4 +561,13 @@ public class ExecutionJournalEntry
     public decimal? TargetPrice { get; set; }
     
     public string? OcoGroup { get; set; }
+    
+    // Slippage and cost tracking
+    public decimal? ExpectedEntryPrice { get; set; } // Price we intended to fill at
+    public decimal? ActualFillPrice { get; set; } // Price we actually filled at (same as FillPrice, kept for clarity)
+    public decimal? SlippagePoints { get; set; } // ActualFillPrice - ExpectedEntryPrice (signed)
+    public decimal? SlippageDollars { get; set; } // SlippagePoints * contract_multiplier * quantity
+    public decimal? Commission { get; set; } // Broker commission (if available)
+    public decimal? Fees { get; set; } // Exchange fees (if available)
+    public decimal? TotalCost { get; set; } // SlippageDollars + Commission + Fees
 }

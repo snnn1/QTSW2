@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    extensions: ['.tsx', '.ts', '.jsx', '.js'], // Prefer TypeScript files
+  },
   // Production build configuration
   build: {
     outDir: 'dist',

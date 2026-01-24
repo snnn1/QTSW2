@@ -381,12 +381,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Try to create adapter (will throw if LIVE mode)
             _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
 
+            // Set journal corruption callback for fail-closed behavior
+            _executionJournal.SetJournalCorruptionCallback((stream, tradingDate, intentId, utcNow) =>
+            {
+                StandDownStream(stream, utcNow, $"JOURNAL_CORRUPTION:{intentId}");
+            });
+            
+            // Set execution cost callback for cost tracking
+            _executionJournal.SetExecutionCostCallback((intentId, slippageDollars, commission, fees) =>
+            {
+                _executionSummary.RecordExecutionCost(intentId, slippageDollars, commission, fees);
+            });
+
+            // Create intent exposure coordinator
+            var coordinator = new InstrumentIntentCoordinator(
+                _log,
+                () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                (streamId, now, reason) => StandDownStream(streamId, now, reason),
+                (intentId, instrument, now) => FlattenIntent(intentId, instrument, now),
+                (intentId, now) => CancelIntentOrders(intentId, now));
+
             // PHASE 2: Set engine callbacks for protective order failure recovery
             if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
             {
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService());
+                
+                // Wire coordinator to adapter
+                simAdapter.SetCoordinator(coordinator);
             }
 
             // Log execution mode and adapter
@@ -442,6 +465,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (healthMonitorConfig != null)
                 {
                     // Secrets handling: allow a local (gitignored) secrets file to provide credentials
+                    // File: configs/robot/health_monitor.secrets.json
                     var healthMonitorSecretsPath = Path.Combine(_root, "configs", "robot", "health_monitor.secrets.json");
                     if (File.Exists(healthMonitorSecretsPath))
                     {
@@ -748,6 +772,26 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 3: Update health monitor with engine tick timestamp
             _healthMonitor?.UpdateEngineTick(utcNow);
 
+            // ENGINE_TICK_HEARTBEAT: Always emit for watchdog monitoring (required for engine_alive detection)
+            // CRITICAL: Emit BEFORE any early returns to ensure watchdog always sees engine liveness
+            // Rate-limited: every 1 minute if diagnostics enabled, every 60 seconds otherwise (for watchdog)
+            var watchdogHeartbeatIntervalMinutes = 1.0; // Always emit at least every 60 seconds for watchdog
+            var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
+            var shouldEmitHeartbeat = timeSinceLastTickHeartbeat >= watchdogHeartbeatIntervalMinutes || _lastTickHeartbeat == DateTimeOffset.MinValue;
+            
+            if (shouldEmitHeartbeat)
+            {
+                _lastTickHeartbeat = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
+                    new
+                    {
+                        utc_now = utcNow.ToString("o"),
+                        active_stream_count = _streams.Count,
+                        recovery_state = _recoveryState.ToString(),
+                        note = _loggingConfig.enable_diagnostic_logs ? "timer-based tick (diagnostic)" : "timer-based tick (watchdog monitoring)"
+                    }));
+            }
+
             // Broker sync gate: Check if we're waiting for synchronization
             if (_recoveryState == ConnectionRecoveryState.RECONNECTED_RECOVERY_PENDING)
             {
@@ -784,24 +828,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
                 // Start recovery runner (idempotent, single-threaded)
                 RunRecovery(utcNow);
-            }
-
-            // ENGINE_TICK_HEARTBEAT: Diagnostic to prove Tick is advancing even with zero bars
-            // Only logged if diagnostic logs are enabled
-            if (_loggingConfig.enable_diagnostic_logs)
-            {
-                var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
-                if (timeSinceLastTickHeartbeat >= TICK_HEARTBEAT_RATE_LIMIT_MINUTES || _lastTickHeartbeat == DateTimeOffset.MinValue)
-                {
-                    _lastTickHeartbeat = utcNow;
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
-                        new
-                        {
-                            utc_now = utcNow.ToString("o"),
-                            active_stream_count = _streams.Count,
-                            note = "timer-based tick"
-                        }));
-                }
             }
 
             // Timetable reactivity (disk I/O already completed outside lock)
@@ -1027,12 +1053,46 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // This replaces calendar date comparison which was invalid for futures (session starts evening before)
         var (sessionStartChicago, sessionEndChicago) = GetSessionWindow(_activeTradingDate.Value, instrument);
         
-        if (barChicagoTime < sessionStartChicago || barChicagoTime >= sessionEndChicago)
+        // CRITICAL FIX: Allow historical bars from dates before the trading date
+        // Bars from dates before the trading date are historical data and should be accepted
+        // Only reject bars that are:
+        // 1. From dates after the trading date (future bars)
+        // 2. From dates that are too far in the past (more than 7 days before trading date)
+        // 3. From dates within the trading date but outside the session window
+        var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
+        var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
+        var barDate = barChicagoDate;
+        var tradingDate = _activeTradingDate.Value;
+        
+        // Check if bar is from a date before the trading date (historical data)
+        var isHistoricalBar = barDate < tradingDate;
+        // Calculate days difference (compatible with older .NET versions that don't have DayNumber)
+        // Convert DateOnly to DateTime at midnight for subtraction
+        var tradingDateTime = new DateTime(tradingDate.Year, tradingDate.Month, tradingDate.Day);
+        var barDateTime = new DateTime(barDate.Year, barDate.Month, barDate.Day);
+        var daysBeforeTradingDate = isHistoricalBar ? (tradingDateTime - barDateTime).Days : 0;
+        
+        // Allow historical bars from up to 7 days before trading date
+        // This handles cases where NinjaTrader sends historical bars from previous days
+        const int MAX_HISTORICAL_DAYS = 7;
+        var isTooOldHistorical = isHistoricalBar && daysBeforeTradingDate > MAX_HISTORICAL_DAYS;
+        
+        // Check if bar is from a date after the trading date (future bar)
+        var isFutureBar = barDate > tradingDate;
+        
+        // Check if bar is within session window (for bars from trading date)
+        var isWithinSessionWindow = barChicagoTime >= sessionStartChicago && barChicagoTime < sessionEndChicago;
+        
+        // Reject bar if:
+        // 1. It's a future bar (from date after trading date)
+        // 2. It's too old historical (more than 7 days before trading date)
+        // 3. It's from the trading date but outside the session window
+        var shouldReject = isFutureBar || isTooOldHistorical || (!isHistoricalBar && !isWithinSessionWindow);
+        
+        if (shouldReject)
         {
-            // Bar is outside session window - log mismatch and reject
+            // Bar is outside session window or invalid - log mismatch and reject
             // BAR_DATE_MISMATCH now means "bar outside trading session window" (not calendar date mismatch)
-            var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
-            var barTradingDateStr = barChicagoDate.ToString("yyyy-MM-dd");
             
             // Track rejection statistics
             if (!_barRejectionStats.TryGetValue(instrument, out var stats))
@@ -1058,7 +1118,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
             
             // Determine rejection reason
-            var rejectionReason = barChicagoTime < sessionStartChicago ? "BEFORE_SESSION_START" : "AFTER_SESSION_END";
+            string rejectionReason;
+            if (isFutureBar)
+            {
+                rejectionReason = "FUTURE_DATE";
+            }
+            else if (isTooOldHistorical)
+            {
+                rejectionReason = "TOO_OLD_HISTORICAL";
+            }
+            else if (barChicagoTime < sessionStartChicago)
+            {
+                rejectionReason = "BEFORE_SESSION_START";
+            }
+            else
+            {
+                rejectionReason = "AFTER_SESSION_END";
+            }
             
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "BAR_DATE_MISMATCH", state: "ENGINE",
                 new
@@ -1085,7 +1161,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     
                     // NEW: Session window fields
                     session_start_chicago = sessionStartChicago.ToString("o"),
-                    session_end_chicago = sessionEndChicago.ToString("o")
+                    session_end_chicago = sessionEndChicago.ToString("o"),
+                    
+                    // NEW: Historical bar detection fields
+                    is_historical_bar = isHistoricalBar,
+                    days_before_trading_date = daysBeforeTradingDate,
+                    is_future_bar = isFutureBar,
+                    is_too_old_historical = isTooOldHistorical,
+                    max_historical_days = MAX_HISTORICAL_DAYS
                 }));
             
             // Log rejection summary if threshold exceeded (rate-limited)
@@ -2326,6 +2409,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
+    /// Flatten exposure for a specific intent (helper for coordinator callback).
+    /// </summary>
+    private FlattenResult FlattenIntent(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+        {
+            return simAdapter.FlattenIntent(intentId, instrument, utcNow);
+        }
+        
+        // Fallback to regular flatten
+        return _executionAdapter.Flatten(intentId, instrument, utcNow);
+    }
+    
+    /// <summary>
+    /// Cancel orders for a specific intent (helper for coordinator callback).
+    /// </summary>
+    private bool CancelIntentOrders(string intentId, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+        {
+            return simAdapter.CancelIntentOrders(intentId, utcNow);
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
     /// PHASE 2: Get notification service for high-priority alerts (e.g., protective order failures).
     /// </summary>
     public NotificationService? GetNotificationService()
@@ -2670,6 +2780,32 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Get time range covering all enabled streams for an instrument (for BarsRequest).
     /// Returns the earliest range_start and latest slot_time across all enabled streams for the instrument.
     /// </summary>
+    /// <summary>
+    /// Check if streams are ready for an instrument (exist and have at least one enabled stream).
+    /// Used to gate BarsRequest on stream readiness - deterministic, no retries needed.
+    /// </summary>
+    public bool AreStreamsReadyForInstrument(string instrument)
+    {
+        lock (_engineLock)
+        {
+            if (_spec is null || _time is null || !_activeTradingDate.HasValue) return false;
+
+            var instrumentUpper = instrument.ToUpperInvariant();
+            var allStreamsForInstrument = _streams.Values
+                .Where(s => s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (allStreamsForInstrument.Count == 0) return false;
+
+            // Check if at least one stream is enabled (not committed)
+            var enabledStreams = allStreamsForInstrument
+                .Where(s => !s.Committed)
+                .ToList();
+
+            return enabledStreams.Count > 0;
+        }
+    }
+
     public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
     {
         lock (_engineLock)

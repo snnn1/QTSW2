@@ -29,6 +29,18 @@ public sealed class RobotLogEvent
     /// <summary>Instrument identifier: ES, NQ, CL, GC, etc.</summary>
     public string instrument { get; set; } = "";
 
+    /// <summary>Trading date (YYYY-MM-DD format)</summary>
+    public string? trading_date { get; set; }
+
+    /// <summary>Stream identifier</summary>
+    public string? stream { get; set; }
+
+    /// <summary>Session identifier</summary>
+    public string? session { get; set; }
+
+    /// <summary>Slot time in Chicago timezone</summary>
+    public string? slot_time_chicago { get; set; }
+
     /// <summary>Account name if available</summary>
     public string? account { get; set; }
 

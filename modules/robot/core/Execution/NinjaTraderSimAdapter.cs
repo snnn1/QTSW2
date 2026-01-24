@@ -45,6 +45,9 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     
     // PHASE 2: Callback to get notification service for alerts
     private Func<object?>? _getNotificationServiceCallback;
+    
+    // Intent exposure coordinator
+    private InstrumentIntentCoordinator? _coordinator;
 
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
@@ -63,6 +66,14 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
+    }
+    
+    /// <summary>
+    /// Set intent exposure coordinator.
+    /// </summary>
+    public void SetCoordinator(InstrumentIntentCoordinator coordinator)
+    {
+        _coordinator = coordinator;
     }
 
     /// <summary>
@@ -146,6 +157,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -153,6 +165,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             order_type = "ENTRY",
             direction,
             entry_price = entryPrice,
+            entry_order_type = entryOrderType,
             quantity,
             account = "SIM"
         }));
@@ -175,14 +188,15 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
 #if NINJATRADER
             if (_ntContextSet)
             {
-                return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, utcNow);
+                return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
             }
 #endif
 
             // Mock implementation for harness testing
             var mockOrderId = $"NT_{intentId}_{utcNow:yyyyMMddHHmmss}";
             var orderAction = direction == "Long" ? "Buy" : "SellShort";
-            var orderType = entryPrice.HasValue ? "Limit" : "Market";
+            // Determine order type: use entryOrderType if provided, otherwise infer from entryPrice
+            var orderType = entryOrderType ?? (entryPrice.HasValue ? "Limit" : "Market");
             
             var orderInfo = new OrderInfo
             {
@@ -389,6 +403,26 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return;
         }
         
+        // Record entry fill time for watchdog tracking
+        if (_orderMap.TryGetValue(intentId, out var entryOrderInfo))
+        {
+            entryOrderInfo.EntryFillTime = utcNow;
+            entryOrderInfo.ProtectiveStopAcknowledged = false;
+            entryOrderInfo.ProtectiveTargetAcknowledged = false;
+        }
+        
+        // Validate exit orders before submission
+        if (_coordinator != null)
+        {
+            if (!_coordinator.CanSubmitExit(intentId, fillQuantity))
+            {
+                var error = "Exit validation failed - cannot submit protective orders";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
+                    new { error = error, intent_id = intentId, fill_quantity = fillQuantity }));
+                return;
+            }
+        }
+        
         // PHASE 2: Submit protective stop with retry
         const int MAX_RETRIES = 3;
         const int RETRY_DELAY_MS = 100;
@@ -399,6 +433,14 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             if (attempt > 0)
             {
                 System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+            }
+            
+            // Validate again before each retry
+            if (_coordinator != null && !_coordinator.CanSubmitExit(intentId, fillQuantity))
+            {
+                var error = "Exit validation failed during retry";
+                stopResult = OrderSubmissionResult.FailureResult(error, utcNow);
+                break;
             }
             
             stopResult = SubmitProtectiveStop(
@@ -422,6 +464,14 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 System.Threading.Thread.Sleep(RETRY_DELAY_MS);
             }
             
+            // Validate again before each retry
+            if (_coordinator != null && !_coordinator.CanSubmitExit(intentId, fillQuantity))
+            {
+                var error = "Exit validation failed during retry";
+                targetResult = OrderSubmissionResult.FailureResult(error, utcNow);
+                break;
+            }
+            
             targetResult = SubmitTargetOrder(
                 intentId,
                 intent.Instrument,
@@ -443,10 +493,13 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             
             var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: {string.Join(", ", failedLegs)}";
             
-            // Flatten position immediately
+            // Notify coordinator of protective failure
+            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
+            
+            // Flatten position immediately (coordinator handles per-intent flattening)
             var flattenResult = Flatten(intentId, intent.Instrument, utcNow);
             
-            // Stand down stream
+            // Stand down stream (coordinator also calls this, but keep for backward compatibility)
             _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDER_FAILURE: {failureReason}");
             
             // Persist incident record
@@ -491,6 +544,9 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 target_price = intent.TargetPrice,
                 quantity = fillQuantity
             }));
+        
+        // Check for unprotected positions after protective order submission
+        CheckUnprotectedPositions(utcNow);
 
         // Proof log: unambiguous, includes encoded envelope and decoded identity
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVES_PLACED", new
@@ -868,6 +924,174 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     }
 
     /// <summary>
+    /// Check for unprotected positions and flatten if protectives not acknowledged within timeout.
+    /// </summary>
+    private void CheckUnprotectedPositions(DateTimeOffset utcNow)
+    {
+        const double UNPROTECTED_POSITION_TIMEOUT_SECONDS = 10.0;
+        
+        foreach (var kvp in _orderMap)
+        {
+            var orderInfo = kvp.Value;
+            
+            // Only check entry orders that are filled
+            if (!orderInfo.IsEntryOrder || orderInfo.State != "FILLED" || !orderInfo.EntryFillTime.HasValue)
+                continue;
+            
+            var elapsed = (utcNow - orderInfo.EntryFillTime.Value).TotalSeconds;
+            
+            // Check if timeout exceeded and protectives not acknowledged
+            if (elapsed > UNPROTECTED_POSITION_TIMEOUT_SECONDS)
+            {
+                if (!orderInfo.ProtectiveStopAcknowledged || !orderInfo.ProtectiveTargetAcknowledged)
+                {
+                    // Flatten position and stand down stream
+                    var intentId = orderInfo.IntentId;
+                    var instrument = orderInfo.Instrument;
+                    
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNPROTECTED_POSITION_TIMEOUT",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = instrument,
+                            elapsed_seconds = elapsed,
+                            protective_stop_acknowledged = orderInfo.ProtectiveStopAcknowledged,
+                            protective_target_acknowledged = orderInfo.ProtectiveTargetAcknowledged,
+                            timeout_seconds = UNPROTECTED_POSITION_TIMEOUT_SECONDS,
+                            note = "Position unprotected beyond timeout - flattening and standing down stream"
+                        }));
+                    
+                    // Get intent to find stream
+                    if (_intentMap.TryGetValue(intentId, out var intent))
+                    {
+                        // Flatten position
+                        var flattenResult = Flatten(intentId, instrument, utcNow);
+                        
+                        // Stand down stream
+                        _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"UNPROTECTED_POSITION_TIMEOUT:{intentId}");
+                        
+                        // Raise high-priority alert
+                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                        if (notificationService != null)
+                        {
+                            var title = $"CRITICAL: Unprotected Position Timeout - {instrument}";
+                            var message = $"Entry filled but protective orders not acknowledged within {UNPROTECTED_POSITION_TIMEOUT_SECONDS} seconds. Position flattened. Stream: {intent.Stream}, Intent: {intentId}";
+                            notificationService.EnqueueNotification($"UNPROTECTED_TIMEOUT:{intentId}", title, message, priority: 2); // Emergency priority
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cancel orders for a specific intent only.
+    /// </summary>
+    public bool CancelIntentOrders(string intentId, DateTimeOffset utcNow)
+    {
+        if (!_simAccountVerified)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_BLOCKED", state: "ENGINE",
+                new { intent_id = intentId, reason = "SIM_ACCOUNT_NOT_VERIFIED" }));
+            return false;
+        }
+        
+        try
+        {
+#if NINJATRADER
+            if (_ntContextSet)
+            {
+                return CancelIntentOrdersReal(intentId, utcNow);
+            }
+#endif
+            
+            // Mock implementation
+            var ordersToCancel = _orderMap.Values
+                .Where(o => o.IntentId == intentId && (o.State == "SUBMITTED" || o.State == "WORKING"))
+                .ToList();
+            
+            foreach (var orderInfo in ordersToCancel)
+            {
+                orderInfo.State = "CANCELLED";
+            }
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_MOCK", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    cancelled_count = ordersToCancel.Count,
+                    note = "MOCK - harness mode"
+                }));
+            
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            return false;
+        }
+    }
+    
+    /// <summary>
+    /// Flatten exposure for a specific intent only.
+    /// </summary>
+    public FlattenResult FlattenIntent(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ATTEMPT", state: "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                instrument = instrument
+            }));
+        
+        if (!_simAccountVerified)
+        {
+            var error = "SIM account not verified";
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+        
+        try
+        {
+#if NINJATRADER
+            if (_ntContextSet)
+            {
+                return FlattenIntentReal(intentId, instrument, utcNow);
+            }
+#endif
+            
+            // Mock implementation
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    note = "MOCK - harness mode"
+                }));
+            
+            return FlattenResult.SuccessResult(utcNow);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            
+            return FlattenResult.FailureResult($"Flatten intent failed: {ex.Message}", utcNow);
+        }
+    }
+
+    /// <summary>
     /// Order tracking info for callback correlation.
     /// </summary>
     private partial class OrderInfo
@@ -886,5 +1110,10 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
 
         // Partial fill handling
         public int FilledQuantity { get; set; }
+        
+        // Watchdog tracking for unprotected positions
+        public DateTimeOffset? EntryFillTime { get; set; }
+        public bool ProtectiveStopAcknowledged { get; set; }
+        public bool ProtectiveTargetAcknowledged { get; set; }
     }
 }

@@ -14,10 +14,12 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using NinjaTrader.Cbi;
+using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
+using CoreBar = QTSW2.Robot.Core.Bar; // Alias to avoid ambiguity with NinjaTrader.Data.Bar
 
 namespace NinjaTrader.NinjaScript.Strategies
 {
@@ -41,6 +43,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private enum BarTimeInterpretation { UTC, Chicago }
         private BarTimeInterpretation? _barTimeInterpretation = null;
         private bool _barTimeInterpretationLocked = false;
+        
+        // CRITICAL PERFORMANCE FIX: Rate-limit BAR_TIME_INTERPRETATION_MISMATCH warnings
+        // After disconnect, NinjaTrader sends many out-of-order historical bars, causing thousands of warnings
+        // Rate-limit to once per minute per instrument to prevent log flooding and NinjaTrader slowdown
+        private readonly Dictionary<string, DateTimeOffset> _lastBarTimeMismatchLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int BAR_TIME_MISMATCH_RATE_LIMIT_MINUTES = 1; // Log at most once per minute per instrument
 
         protected override void OnStateChange()
         {
@@ -80,8 +88,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Initialize RobotEngine in SIM mode
                 var projectRoot = ProjectRootResolver.ResolveProjectRoot();
-                var instrumentName = Instrument.MasterInstrument.Name;
-                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: instrumentName);
+                var engineInstrumentName = Instrument.MasterInstrument.Name;
+                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName);
                 
                 // PHASE 1: Set account info for startup banner
                 // Reuse accountName variable declared above
@@ -106,8 +114,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             var minutes = beginTime % 100;
                             var sessionStartTime = $"{hours:D2}:{minutes:D2}";
                             
-                            _engine.SetSessionStartTime(instrumentName, sessionStartTime);
-                            Log($"Session start time set from TradingHours: {sessionStartTime} for {instrumentName}", LogLevel.Information);
+                            _engine.SetSessionStartTime(engineInstrumentName, sessionStartTime);
+                            Log($"Session start time set from TradingHours: {sessionStartTime} for {engineInstrumentName}", LogLevel.Information);
                         }
                     }
                 }
@@ -130,9 +138,58 @@ namespace NinjaTrader.NinjaScript.Strategies
                     throw new InvalidOperationException(errorMsg);
                 }
 
-                // Request historical bars from NinjaTrader for pre-hydration (SIM mode)
-                // This will throw if BarsRequest fails (fail-fast for critical errors)
-                RequestHistoricalBarsForPreHydration();
+                // CRITICAL FIX: Gate BarsRequest on stream readiness (Option A - deterministic, no retries)
+                // Pattern: Streams created THEN BarsRequest (single-shot, deterministic)
+                // This ensures streams exist before requesting bars, preventing race conditions
+                // CRITICAL: Wrap stream readiness check in try-catch to ensure _engineReady is set even if no streams exist
+                // This allows the engine to start and emit heartbeats even if the timetable has no enabled streams for this instrument
+                var instrumentNameUpper = engineInstrumentName.ToUpperInvariant();
+                try
+                {
+                    if (!_engine.AreStreamsReadyForInstrument(instrumentNameUpper))
+                    {
+                        var warningMsg = $"WARNING: Cannot request historical bars - streams not ready for {instrumentNameUpper}. " +
+                                       $"This may indicate: " +
+                                       $"1) Timetable has no enabled streams for {instrumentNameUpper}, " +
+                                       $"2) Streams were not created during engine.Start(), " +
+                                       $"3) All streams for {instrumentNameUpper} are committed. " +
+                                       $"Skipping BarsRequest - engine will continue without pre-hydration bars. " +
+                                       $"Check logs for STREAMS_CREATED events.";
+                        Log(warningMsg, LogLevel.Warning);
+                        
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentNameUpper },
+                            { "reason", "Streams not ready" },
+                            { "note", "Skipping BarsRequest - no enabled streams for this instrument. Engine will continue without pre-hydration bars." }
+                        });
+                        
+                        // Don't throw - allow engine to continue without bars for this instrument
+                        // This is expected if timetable doesn't have enabled streams for CL
+                    }
+                    else
+                    {
+                        // Streams are ready - request historical bars from NinjaTrader for pre-hydration (SIM mode)
+                        // CRITICAL FIX: Wrap in try-catch to ensure _engineReady is set even if BarsRequest fails
+                        // This ensures the timer can still call Tick() and emit heartbeats even if BarsRequest fails
+                        try
+                        {
+                            RequestHistoricalBarsForPreHydration(instrumentNameUpper);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Log error but don't prevent engine from being marked ready
+                            // Engine can still process ticks and emit heartbeats even if BarsRequest fails
+                            Log($"WARNING: BarsRequest failed but engine will continue: {ex.Message}", LogLevel.Warning);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Catch any unexpected errors during stream readiness check
+                    // Log but don't prevent engine from being marked ready
+                    Log($"WARNING: Stream readiness check failed but engine will continue: {ex.Message}", LogLevel.Warning);
+                }
 
                 // Get the adapter instance and wire NT context
                 // Note: This requires exposing adapter from engine or using dependency injection
@@ -141,8 +198,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 // ENGINE_READY latch: Set once when all initialization is complete
                 // This flag guards all execution paths to simplify reasoning and reduce repetition
+                // CRITICAL: Set _engineReady even if BarsRequest failed, so timer can call Tick() and emit heartbeats
                 _engineReady = true;
                 Log("Engine ready - all initialization complete", LogLevel.Information);
+                
+                // CRITICAL FIX: Start timer in DataLoaded state for SIM mode
+                // In SIM mode, the strategy may never reach Realtime state if market is closed,
+                // but we still need heartbeats for watchdog monitoring
+                // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
+                StartTickTimer();
             }
             else if (State == State.Realtime)
             {
@@ -155,6 +219,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 
                 // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
+                // Note: Timer may already be started from DataLoaded state, but StartTickTimer() is idempotent
                 StartTickTimer();
             }
             else if (State == State.Terminated)
@@ -168,9 +233,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// Request historical bars from NinjaTrader using BarsRequest API for pre-hydration.
         /// Called after engine.Start() when streams are created and trading date is locked.
         /// </summary>
-        private void RequestHistoricalBarsForPreHydration()
+        private void RequestHistoricalBarsForPreHydration(string instrumentName)
         {
-            var instrumentName = Instrument?.MasterInstrument?.Name?.ToUpperInvariant() ?? "UNKNOWN";
             
             // FIX #3: Ensure every code path logs a final disposition event
             // Early return guard - log skipped
@@ -386,7 +450,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 // Request bars using helper class (only up to current time)
-                List<Bar> bars;
+                // Note: NinjaTraderBarRequest returns QTSW2.Robot.Core.Bar (CoreBar), not NinjaTrader.Data.Bar
+                // Use alias to avoid ambiguity with NinjaTrader.Data.Bar
+                List<CoreBar> bars;
                 try
                 {
                     // Build log callback for BARSREQUEST_RAW_RESULT
@@ -715,10 +781,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var barAge = (nowUtc - barUtc).TotalMinutes;
                 if (barAge < 0 || barAge > 60)
                 {
-                    // CRITICAL: Interpretation would flip - log alert
-                    if (_engine != null)
+                    // CRITICAL PERFORMANCE FIX: Rate-limit this warning to prevent log flooding
+                    // After disconnect, NinjaTrader sends many out-of-order historical bars
+                    // Logging every one causes thousands of warnings and slows down NinjaTrader
+                    var instrumentName = Instrument.MasterInstrument.Name;
+                    var shouldLog = !_lastBarTimeMismatchLogUtc.TryGetValue(instrumentName, out var lastLogUtc) ||
+                                   (nowUtc - lastLogUtc).TotalMinutes >= BAR_TIME_MISMATCH_RATE_LIMIT_MINUTES;
+                    
+                    if (shouldLog && _engine != null)
                     {
-                        var instrumentName = Instrument.MasterInstrument.Name;
+                        _lastBarTimeMismatchLogUtc[instrumentName] = nowUtc;
                         _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_MISMATCH", new Dictionary<string, object>
                         {
                             { "instrument", instrumentName },
@@ -726,7 +798,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "locked_interpretation", _barTimeInterpretation.ToString() },
                             { "current_bar_age_minutes", Math.Round(barAge, 2) },
                             { "raw_bar_time", barExchangeTime.ToString("o") },
-                            { "warning", "Bar time interpretation would flip - this should not happen" }
+                            { "warning", "Bar time interpretation would flip - this should not happen" },
+                            { "rate_limited", true },
+                            { "note", $"Warning rate-limited to once per {BAR_TIME_MISMATCH_RATE_LIMIT_MINUTES} minute(s) per instrument to prevent log flooding. This typically occurs after disconnect when historical bars arrive out of order." }
                         });
                     }
                 }
@@ -737,8 +811,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             var low = (decimal)Low[0];
             var close = (decimal)Close[0];
 
+            // 🔒 INVARIANT GUARD: This conversion assumes fixed 1-minute bars
+            // If BarsPeriod changes, AddMinutes(-1) becomes incorrect
+            if (BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || BarsPeriod.Value != 1)
+            {
+                var errorMsg = $"CRITICAL: Bar timestamp conversion requires 1-minute bars. " +
+                              $"Current BarsPeriod: {BarsPeriod.BarsPeriodType}, Value: {BarsPeriod.Value}. " +
+                              $"Cannot convert close time to open time. Stand down.";
+                Log(errorMsg, LogLevel.Error);
+                throw new InvalidOperationException(errorMsg);
+            }
+
+            // Convert bar timestamp from close time to open time (Analyzer parity)
+            // INVARIANT: BarsPeriod == 1 minute (enforced above)
+            var barUtcOpenTime = barUtc.AddMinutes(-1);
+
             // Deliver bar data to engine (bars only provide market data, not time advancement)
-            _engine.OnBar(barUtc, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
+            _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
             // NOTE: Tick() is now called by timer, not by bar arrivals
             // This ensures time-based state transitions occur even when no bars arrive
         }

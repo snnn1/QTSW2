@@ -23,6 +23,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow)
     {
         // DRYRUN: Log but do not place order
@@ -30,6 +31,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         {
             direction,
             entry_price = entryPrice,
+            entry_order_type = entryOrderType,
             quantity,
             note = "DRYRUN mode - order not placed"
         }));

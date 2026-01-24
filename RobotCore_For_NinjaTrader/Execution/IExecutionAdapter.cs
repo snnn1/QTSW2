@@ -11,13 +11,14 @@ namespace QTSW2.Robot.Core.Execution;
 public interface IExecutionAdapter
 {
     /// <summary>
-    /// Place an entry order (market or limit).
+    /// Place an entry order (market, limit, or stop-market).
     /// </summary>
     /// <param name="intentId">Unique intent identifier (hash of canonical fields)</param>
     /// <param name="instrument">Instrument symbol</param>
     /// <param name="direction">"Long" or "Short"</param>
-    /// <param name="entryPrice">Entry price (null for market order)</param>
+    /// <param name="entryPrice">Entry price (null for market order, used as limit price for Limit orders, stop price for StopMarket orders)</param>
     /// <param name="quantity">Number of contracts</param>
+    /// <param name="entryOrderType">Order type: "LIMIT", "STOP_MARKET", or "MARKET" (null defaults to Limit if entryPrice provided, Market if null)</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Order submission result</returns>
     OrderSubmissionResult SubmitEntryOrder(
@@ -26,6 +27,7 @@ public interface IExecutionAdapter
         string direction,
         decimal? entryPrice,
         int quantity,
+        string? entryOrderType,
         DateTimeOffset utcNow);
 
     /// <summary>

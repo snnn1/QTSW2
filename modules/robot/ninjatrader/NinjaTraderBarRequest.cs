@@ -54,6 +54,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                 barsRequest.BarsPeriod = new BarsPeriod { BarsPeriodType = BarsPeriodType.Minute, Value = barSizeMinutes };
                 barsRequest.TradingHours = instrument.MasterInstrument.TradingHours;
 
+                // 🔒 INVARIANT GUARD: This conversion assumes fixed 1-minute bars
+                // If BarsPeriod changes, AddMinutes(-1) becomes incorrect
+                if (barsRequest.BarsPeriod.BarsPeriodType != BarsPeriodType.Minute || barsRequest.BarsPeriod.Value != 1)
+                {
+                    var errorMsg = $"CRITICAL: Bar timestamp conversion requires 1-minute bars. " +
+                                  $"Current BarsPeriod: {barsRequest.BarsPeriod.BarsPeriodType}, Value: {barsRequest.BarsPeriod.Value}. " +
+                                  $"Cannot convert close time to open time. Stand down.";
+                    if (logCallback != null)
+                    {
+                        logCallback("BARSREQUEST_INVARIANT_VIOLATION", new
+                        {
+                            instrument = instrument.MasterInstrument.Name,
+                            bars_period_type = barsRequest.BarsPeriod.BarsPeriodType.ToString(),
+                            bars_period_value = barsRequest.BarsPeriod.Value,
+                            error = errorMsg
+                        });
+                    }
+                    throw new InvalidOperationException(errorMsg);
+                }
+
                 // Use ManualResetEvent to wait for async callback
                 var waitHandle = new System.Threading.ManualResetEventSlim(false);
                 
@@ -203,9 +223,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                             var close = (decimal)barsSeries.GetClose(i);
                             var volume = barsSeries.GetVolume(i);
                             
+                            // Convert bar timestamp from close time to open time (Analyzer parity)
+                            // INVARIANT: BarsPeriod == 1 minute (enforced above)
+                            var barUtcOpenTime = barUtc.AddMinutes(-1);
+                            
                             // Create CoreBar struct
                             var bar = new CoreBar(
-                                timestampUtc: barUtc,
+                                timestampUtc: barUtcOpenTime,  // Use open time instead of close time
                                 open: open,
                                 high: high,
                                 low: low,
