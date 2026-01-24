@@ -4,14 +4,19 @@
  */
 import { useState, useEffect } from 'react'
 import { formatDuration, computeTimeInState } from '../../utils/timeUtils'
+import { useStreamPnl } from '../../hooks/useStreamPnl'
 import type { StreamState } from '../../types/watchdog'
 
 interface StreamStatusTableProps {
   streams: StreamState[]
   onStreamClick: (stream: StreamState) => void
+  marketOpen?: boolean | null
 }
 
-export function StreamStatusTable({ streams, onStreamClick }: StreamStatusTableProps) {
+export function StreamStatusTable({ streams, onStreamClick, marketOpen }: StreamStatusTableProps) {
+  // Get current trading date from first stream (all streams should have same trading_date)
+  const currentTradingDate = streams[0]?.trading_date || new Date().toISOString().split('T')[0]
+  const { pnl } = useStreamPnl(currentTradingDate)
   const [, forceUpdate] = useState(0)
   
   // Force re-render every second for live timers
@@ -22,13 +27,32 @@ export function StreamStatusTable({ streams, onStreamClick }: StreamStatusTableP
     return () => clearInterval(interval)
   }, [])
   
-  // Empty state
+  // Empty state with market-aware messaging
   if (streams.length === 0) {
-    return (
-      <div className="bg-gray-800 rounded-lg p-8 text-center text-gray-500">
-        No active streams
-      </div>
-    )
+    if (marketOpen === false) {
+      // Market closed - this is expected
+      return (
+        <div className="bg-gray-800 rounded-lg p-8 text-center">
+          <div className="text-gray-400 text-lg mb-2">No active streams</div>
+          <div className="text-gray-500 text-sm">Market is closed — this is expected</div>
+        </div>
+      )
+    } else if (marketOpen === true) {
+      // Market open but no streams - might be an issue
+      return (
+        <div className="bg-gray-800 rounded-lg p-8 text-center">
+          <div className="text-amber-500 text-lg mb-2">No active streams</div>
+          <div className="text-gray-400 text-sm">Market is open — streams should be active</div>
+        </div>
+      )
+    } else {
+      // Market status unknown
+      return (
+        <div className="bg-gray-800 rounded-lg p-8 text-center text-gray-500">
+          No active streams
+        </div>
+      )
+    }
   }
   
   const getStateBadgeColor = (state: string) => {
@@ -67,6 +91,7 @@ export function StreamStatusTable({ streams, onStreamClick }: StreamStatusTableP
               <th className="px-4 py-2 text-left">Time in State</th>
               <th className="px-4 py-2 text-left">Slot</th>
               <th className="px-4 py-2 text-left">Range</th>
+              <th className="px-4 py-2 text-left">PnL</th>
               <th className="px-4 py-2 text-left">Commit</th>
               <th className="px-4 py-2 text-left">Issues</th>
             </tr>
@@ -80,6 +105,9 @@ export function StreamStatusTable({ streams, onStreamClick }: StreamStatusTableP
               if (stream.committed && stream.commit_reason === 'RANGE_INVALIDATED') {
                 issues.push('⚠️ Range Invalidated')
               }
+              
+              // Get P&L for this stream
+              const streamPnl = pnl[stream.stream]
               
               return (
                 <tr
@@ -103,6 +131,28 @@ export function StreamStatusTable({ streams, onStreamClick }: StreamStatusTableP
                     {stream.state === 'RANGE_LOCKED' && stream.range_high && stream.range_low
                       ? `H: ${stream.range_high} / L: ${stream.range_low}`
                       : '-'}
+                  </td>
+                  <td className="px-4 py-2 font-mono">
+                    {(() => {
+                      if (!streamPnl) {
+                        return <span className="text-gray-500">-</span>
+                      }
+                      
+                      if (streamPnl.open_positions > 0) {
+                        return <span className="text-amber-500">OPEN</span>
+                      }
+                      
+                      const realizedPnl = streamPnl.realized_pnl
+                      if (realizedPnl === undefined || realizedPnl === null) {
+                        return <span className="text-gray-500">-</span>
+                      }
+                      
+                      return (
+                        <span className={realizedPnl >= 0 ? 'text-green-500' : 'text-red-500'}>
+                          ${realizedPnl.toFixed(2)}
+                        </span>
+                      )
+                    })()}
                   </td>
                   <td className="px-4 py-2">{stream.commit_reason || '-'}</td>
                   <td className="px-4 py-2">

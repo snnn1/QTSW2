@@ -7,6 +7,7 @@ import logging
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
+from collections import defaultdict
 import pytz
 
 from .event_feed import EventFeedGenerator
@@ -46,8 +47,92 @@ class WatchdogAggregator:
         self._running = False
         logger.info("Watchdog aggregator stopped")
     
+    def get_stream_pnl(
+        self,
+        trading_date: str,
+        stream: Optional[str] = None
+    ) -> Dict:
+        """
+        Get realized P&L for stream(s).
+        
+        DO NOT inject into get_stream_states() - this is a separate endpoint.
+        
+        Args:
+            trading_date: Trading date (YYYY-MM-DD)
+            stream: Optional stream filter
+        
+        Returns:
+            If stream specified: Single stream P&L dict
+            If stream None: Dict with "trading_date" and "streams" list
+        """
+        try:
+            from .pnl.ledger_builder import LedgerBuilder
+            from .pnl.pnl_calculator import compute_intent_realized_pnl, aggregate_stream_pnl
+            
+            ledger_builder = LedgerBuilder()
+            
+            # Build ledger rows
+            ledger_rows = ledger_builder.build_ledger_rows(trading_date, stream)
+            
+            # Calculate P&L for each intent
+            for row in ledger_rows:
+                compute_intent_realized_pnl(row)
+            
+            # PHASE 2: Import canonicalization helpers
+            from .pnl.ledger_builder import canonicalize_stream, get_canonical_instrument
+            
+            if stream:
+                # PHASE 3: Stream parameter should already be canonical, but defensive canonicalization
+                # Ledger rows already have canonical stream IDs from _build_ledger_row()
+                execution_instrument = ledger_rows[0].get("execution_instrument", "") if ledger_rows else ""
+                if execution_instrument:
+                    canonical_stream = canonicalize_stream(stream, execution_instrument)
+                else:
+                    canonical_stream = stream
+                return aggregate_stream_pnl(ledger_rows, canonical_stream)
+            else:
+                # PHASE 3: Aggregate by canonical stream ID
+                # Ledger rows already have canonical stream IDs from _build_ledger_row()
+                streams_dict = defaultdict(list)
+                for row in ledger_rows:
+                    stream_id = row.get("stream", "")  # Already canonicalized in _build_ledger_row()
+                    if stream_id:
+                        streams_dict[stream_id].append(row)
+                
+                aggregated_streams = [
+                    aggregate_stream_pnl(rows, stream_id)
+                    for stream_id, rows in streams_dict.items()
+                ]
+                
+                return {
+                    "trading_date": trading_date,
+                    "streams": aggregated_streams
+                }
+        except Exception as e:
+            logger.error(f"Error computing stream P&L: {e}", exc_info=True)
+            # Return safe defaults
+            if stream:
+                return {
+                    "trading_date": trading_date,
+                    "stream": stream,
+                    "realized_pnl": 0.0,
+                    "open_positions": 0,
+                    "total_costs_realized": 0.0,
+                    "intent_count": 0,
+                    "closed_count": 0,
+                    "partial_count": 0,
+                    "open_count": 0,
+                    "pnl_confidence": "LOW"
+                }
+            else:
+                return {
+                    "trading_date": trading_date,
+                    "streams": []
+                }
+    
     async def _process_events_loop(self):
         """Background loop to process new events."""
+        cleanup_counter = 0
         while self._running:
             try:
                 # Generate new events from raw logs
@@ -57,12 +142,35 @@ class WatchdogAggregator:
                 if FRONTEND_FEED_FILE.exists():
                     await self._process_feed_events()
                 
+                # Periodic cleanup: every 60 seconds, remove stale streams
+                cleanup_counter += 1
+                if cleanup_counter >= 60:  # Every 60 seconds
+                    cleanup_counter = 0
+                    self._cleanup_stale_streams_periodic()
+                
                 # Sleep before next iteration
                 await asyncio.sleep(1)  # Process every second
                 
             except Exception as e:
                 logger.error(f"Error in event processing loop: {e}", exc_info=True)
                 await asyncio.sleep(5)  # Wait longer on error
+    
+    def _cleanup_stale_streams_periodic(self):
+        """Periodically clean up stale streams (runs every 60 seconds)."""
+        try:
+            # Get current trading date from state manager
+            current_trading_date = self._state_manager._trading_date
+            
+            # Fallback: if trading_date not set, use today's date (Chicago timezone)
+            if not current_trading_date:
+                chicago_now = datetime.now(CHICAGO_TZ)
+                current_trading_date = chicago_now.strftime("%Y-%m-%d")
+                logger.debug(f"Trading date not set, using today's date: {current_trading_date}")
+            
+            utc_now = datetime.now(timezone.utc)
+            self._state_manager.cleanup_stale_streams(current_trading_date, utc_now)
+        except Exception as e:
+            logger.warning(f"Error in periodic cleanup: {e}")
     
     async def _process_feed_events(self):
         """Process new events from frontend_feed.jsonl."""
@@ -98,7 +206,26 @@ class WatchdogAggregator:
             return events
         
         try:
+            # Use byte-offset tracking for incremental reading (similar to event_feed.py)
+            # Store last read position per run_id to avoid re-reading entire file
+            if not hasattr(self, '_feed_file_positions'):
+                self._feed_file_positions: Dict[str, int] = {}  # run_id -> byte position
+            
+            # For each run_id in cursor, read from last known position
+            # If run_id not in positions, start from beginning
+            run_ids_to_track = set(cursor.keys())
+            
+            # Also track any new run_ids we encounter
             with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8') as f:
+                # If we have positions, seek to the minimum position (earliest unread)
+                if self._feed_file_positions:
+                    min_pos = min(self._feed_file_positions.values())
+                    f.seek(min_pos)
+                else:
+                    # First time: read from beginning
+                    f.seek(0)
+                
+                # Read new lines since last position
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -109,14 +236,24 @@ class WatchdogAggregator:
                         run_id = event.get("run_id")
                         event_seq = event.get("event_seq", 0)
                         
+                        if not run_id:
+                            continue
+                        
                         # Check if we should include this event
                         last_seq = cursor.get(run_id, 0)
                         if event_seq > last_seq:
                             events.append(event)
+                            # Track this run_id
+                            run_ids_to_track.add(run_id)
                     
                     except json.JSONDecodeError as e:
                         logger.warning(f"Failed to parse JSON line: {e}")
                         continue
+                
+                # Update file positions for all tracked run_ids
+                current_pos = f.tell()
+                for run_id in run_ids_to_track:
+                    self._feed_file_positions[run_id] = current_pos
         
         except Exception as e:
             logger.error(f"Error reading feed file: {e}")
@@ -164,9 +301,18 @@ class WatchdogAggregator:
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
             # Return minimal safe status
+            # Compute market_open even in error case for consistent UI
+            try:
+                from .market_session import is_market_open
+                chicago_now = datetime.now(CHICAGO_TZ)
+                market_open = is_market_open(chicago_now)
+            except Exception:
+                market_open = False  # Safe default if market session check fails
+            
             return {
                 "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
                 "engine_alive": False,
+                "engine_activity_state": "STALLED",
                 "last_engine_tick_chicago": None,
                 "engine_tick_stall_detected": True,
                 "recovery_state": "UNKNOWN",
@@ -176,7 +322,8 @@ class WatchdogAggregator:
                 "stuck_streams": [],
                 "execution_blocked_count": 0,
                 "protective_failures_count": 0,
-                "data_stall_detected": {}
+                "data_stall_detected": {},
+                "market_open": market_open
             }
     
     def get_risk_gate_status(self) -> Dict:
@@ -228,22 +375,33 @@ class WatchdogAggregator:
         """Get current stream states."""
         streams = []
         try:
+            # Get current trading date (filter out stale streams from previous days)
+            current_trading_date = self._state_manager._trading_date
+            if not current_trading_date:
+                # Fallback: use today's date
+                chicago_now = datetime.now(CHICAGO_TZ)
+                current_trading_date = chicago_now.strftime("%Y-%m-%d")
+            
             if hasattr(self._state_manager, '_stream_states'):
                 for (trading_date, stream), info in self._state_manager._stream_states.items():
+                    # Only include streams from current trading date
+                    if trading_date != current_trading_date:
+                        continue
+                    
                     streams.append({
                         "trading_date": trading_date,
                         "stream": stream,
                         "instrument": getattr(info, 'instrument', ''),
-                        "session": "",  # TODO: Extract from events
+                        "session": getattr(info, 'session', None) or "",
                         "state": getattr(info, 'state', ''),
                         "committed": getattr(info, 'committed', False),
                         "commit_reason": getattr(info, 'commit_reason', None),
-                        "slot_time_chicago": "",  # TODO: Extract from events
-                        "slot_time_utc": "",  # TODO: Extract from events
-                        "range_high": None,  # TODO: Extract from events
-                        "range_low": None,  # TODO: Extract from events
-                        "freeze_close": None,  # TODO: Extract from events
-                        "range_invalidated": False,  # TODO: Extract from events
+                        "slot_time_chicago": getattr(info, 'slot_time_chicago', None) or "",
+                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or "",
+                        "range_high": getattr(info, 'range_high', None),
+                        "range_low": getattr(info, 'range_low', None),
+                        "freeze_close": getattr(info, 'freeze_close', None),
+                        "range_invalidated": getattr(info, 'range_invalidated', False),
                         "state_entry_time_utc": getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc)).isoformat()
                     })
         except Exception as e:

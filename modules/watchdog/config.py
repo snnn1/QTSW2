@@ -30,6 +30,8 @@ UNPROTECTED_POSITION_UPDATE_FREQUENCY = 2
 
 # Live-critical event types (from specification section 5.1)
 LIVE_CRITICAL_EVENT_TYPES = {
+    # PHASE 3.1: Identity invariants status for ongoing monitoring
+    "IDENTITY_INVARIANTS_STATUS",
     # Engine Health
     "ENGINE_START",
     "ENGINE_STOP",

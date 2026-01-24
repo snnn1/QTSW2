@@ -15,7 +15,9 @@ import { useRiskGates } from '../hooks/useRiskGates'
 import { useUnprotectedPositions } from '../hooks/useUnprotectedPositions'
 import { useStreamStates } from '../hooks/useStreamStates'
 import { useActiveIntents } from '../hooks/useActiveIntents'
+import { useStreamPnl } from '../hooks/useStreamPnl'
 import { getCurrentChicagoTime } from '../utils/timeUtils'
+import { NavigationBar } from '../components/shared/NavigationBar'
 import type { StreamState, WatchdogEvent } from '../types/watchdog'
 
 export function WatchdogPage() {
@@ -39,6 +41,17 @@ export function WatchdogPage() {
   const { streams, loading: streamsLoading, error: streamsError, lastSuccessfulPollTimestamp: streamsPollTime } = useStreamStates()
   const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents()
   
+  // Get P&L data
+  const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
+  const { pnl } = useStreamPnl(currentTradingDate)
+  
+  // Calculate total P&L
+  const totalPnl = useMemo(() => {
+    return Object.values(pnl).reduce((sum, s) => {
+      return sum + (s.realized_pnl || 0)
+    }, 0)
+  }, [pnl])
+  
   // Check for any errors
   const hasErrors = statusError || eventsError || gatesError || positionsError || streamsError || intentsError
   const isLoading = statusLoading || eventsLoading || gatesLoading || positionsLoading || streamsLoading || intentsLoading
@@ -54,10 +67,54 @@ export function WatchdogPage() {
   // Determine engine status
   const engineStatus = useMemo(() => {
     if (!status) return 'STALLED'
-    if (!status.engine_alive) return 'STALLED'
+
+    // Recovery overrides activity state
     if (status.recovery_state === 'DISCONNECT_FAIL_CLOSED') return 'FAIL_CLOSED'
     if (status.recovery_state === 'RECOVERY_RUNNING') return 'RECOVERY_IN_PROGRESS'
-    return 'ALIVE'
+
+    switch (status.engine_activity_state) {
+      case 'ACTIVE':
+        return 'ALIVE'
+      case 'IDLE_MARKET_CLOSED':
+        return 'IDLE_MARKET_CLOSED'
+      case 'STALLED':
+        return 'STALLED'
+      default:
+        return 'STALLED'
+    }
+  }, [status])
+  
+  // Determine data flow status
+  const dataFlowStatus = useMemo(() => {
+    if (!status) return 'UNKNOWN'
+    
+    const stalls = Object.values(status.data_stall_detected || {})
+    
+    // If no instruments tracked yet, we can't determine data flow status
+    // But if market is closed, we can infer acceptable silence
+    if (stalls.length === 0) {
+      // If market is known to be closed, show acceptable silence
+      // Otherwise, show unknown (waiting for first bar)
+      if (status.market_open === false) {
+        return 'ACCEPTABLE_SILENCE'
+      }
+      return 'UNKNOWN'
+    }
+    
+    // Check for critical stalls (market open + stalled)
+    const criticalStall = stalls.some(d => d.stall_detected && d.market_open)
+    if (criticalStall) {
+      return 'STALLED'
+    }
+    
+    // Check for acceptable silence (market closed + stalled)
+    const acceptableSilence = stalls.some(d => d.stall_detected && !d.market_open)
+    if (acceptableSilence) {
+      return 'ACCEPTABLE_SILENCE'
+    }
+    
+    // No stalls detected = data flowing
+    return 'FLOWING'
   }, [status])
   
   // Build critical alerts
@@ -74,18 +131,34 @@ export function WatchdogPage() {
       })
     }
     
-    if (status.engine_tick_stall_detected) {
+    if (status.engine_activity_state === 'STALLED') {
       result.push({
         type: 'critical',
-        message: 'ENGINE TICK STALL DETECTED',
+        message: 'ENGINE TICK STALL DETECTED (Market Open)',
         scrollTo: 'watchdog-header'
       })
     }
     
-    if (Object.values(status.data_stall_detected).some(d => d.stall_detected)) {
+    const stalls = Object.values(status.data_stall_detected || {})
+    
+    const criticalStall = stalls.some(
+      d => d.stall_detected && d.market_open
+    )
+    
+    const closedMarketSilence = stalls.some(
+      d => !d.market_open
+    )
+    
+    if (criticalStall) {
       result.push({
         type: 'critical',
-        message: 'DATA STALL DETECTED',
+        message: 'DATA STALL DETECTED (Market Open)',
+        scrollTo: 'stream-table'
+      })
+    } else if (closedMarketSilence && stalls.some(d => d.stall_detected)) {
+      result.push({
+        type: 'degraded',
+        message: 'No data flow (Market Closed)',
         scrollTo: 'stream-table'
       })
     }
@@ -104,18 +177,25 @@ export function WatchdogPage() {
   return (
     <div className="min-h-screen bg-black text-white">
       <WatchdogHeader
+        identityInvariantsPass={status?.last_identity_invariants_pass ?? null}
+        identityViolations={status?.last_identity_violations ?? []}
         runId={cursor.runId}
         engineStatus={engineStatus}
+        marketOpen={status?.market_open !== undefined ? status.market_open : null}
+        connectionStatus={status?.connection_status ?? null}
+        dataFlowStatus={dataFlowStatus}
         chicagoTime={chicagoTime}
         lastEngineTick={status?.last_engine_tick_chicago || null}
         lastSuccessfulPollTimestamp={lastSuccessfulPollTimestamp}
       />
       
+      <NavigationBar />
+      
       <CriticalAlertBanner alerts={alerts} />
       
       {/* Error Display */}
       {hasErrors && (
-        <div className="container mx-auto px-4 py-4 mt-16">
+        <div className="container mx-auto px-4 py-4 mt-28">
           <div className="bg-red-900 border border-red-700 rounded-lg p-4">
             <h2 className="text-lg font-semibold mb-2">API Errors</h2>
             <div className="space-y-1 text-sm">
@@ -135,7 +215,7 @@ export function WatchdogPage() {
       
       {/* Loading State */}
       {isLoading && !hasErrors && (
-        <div className="container mx-auto px-4 py-8 mt-16">
+        <div className="container mx-auto px-4 py-8 mt-24">
           <div className="text-center text-gray-400">
             <div className="text-lg mb-2">Loading watchdog data...</div>
             <div className="text-sm">Connecting to backend...</div>
@@ -143,7 +223,7 @@ export function WatchdogPage() {
         </div>
       )}
       
-      <div className="container mx-auto px-4 py-8 mt-16">
+      <div className="container mx-auto px-4 py-8 mt-24">
         <div className="grid grid-cols-10 gap-4">
           {/* Left Column (70%) */}
           <div className="col-span-7 space-y-4">
@@ -151,6 +231,7 @@ export function WatchdogPage() {
               <StreamStatusTable
                 streams={streams}
                 onStreamClick={setSelectedStream}
+                marketOpen={status?.market_open ?? null}
               />
             </div>
             
@@ -162,6 +243,17 @@ export function WatchdogPage() {
           
           {/* Right Column (30%) */}
           <div className="col-span-3 space-y-4">
+            {/* P&L Summary Card */}
+            <div className="bg-gray-800 rounded-lg p-4">
+              <div className="text-sm text-gray-400 mb-1">Total Realized P&L</div>
+              <div className={`text-2xl font-bold ${totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                ${totalPnl.toFixed(2)}
+              </div>
+              <div className="text-xs text-gray-500 mt-1">
+                {Object.keys(pnl).length} stream(s)
+              </div>
+            </div>
+            
             <div id="risk-gates-panel">
               <RiskGatesPanel gates={gates} loading={!gates} />
             </div>

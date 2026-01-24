@@ -747,24 +747,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         lock (_engineLock)
         {
-            // CRITICAL: Defensive checks - engine must be initialized
-            if (_spec is null)
-            {
-                // Spec should be loaded in Start() - if null, engine is in invalid state
-                // Log error but don't throw (to prevent tick timer from crashing)
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_INVALID_STATE", state: "ENGINE",
-                    new { error = "Spec is null - engine not properly initialized" }));
-                return;
-            }
-
-            if (_time is null)
-            {
-                // TimeService should be created in Start() - if null, engine is in invalid state
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_INVALID_STATE", state: "ENGINE",
-                    new { error = "TimeService is null - engine not properly initialized" }));
-                return;
-            }
-
+            // HEARTBEAT: Emit unconditionally for process liveness (before any early returns)
+            // This ensures watchdog always sees engine liveness, regardless of trading readiness
             // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
             _lastTickUtc = utcNow;
             _lastEngineTickUtc = utcNow; // Also update for broker sync gate
@@ -790,6 +774,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         recovery_state = _recoveryState.ToString(),
                         note = _loggingConfig.enable_diagnostic_logs ? "timer-based tick (diagnostic)" : "timer-based tick (watchdog monitoring)"
                     }));
+            }
+
+            // TRADING READINESS: Guards that prevent trading logic from running when engine is not ready
+            // CRITICAL: Defensive checks - engine must be initialized for trading logic
+            if (_spec is null)
+            {
+                // Spec should be loaded in Start() - if null, engine is in invalid state
+                // Log error but don't throw (to prevent tick timer from crashing)
+                // Heartbeat already emitted above, so watchdog will see engine is alive
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_INVALID_STATE", state: "ENGINE",
+                    new { error = "Spec is null - engine not properly initialized" }));
+                return;
+            }
+
+            if (_time is null)
+            {
+                // TimeService should be created in Start() - if null, engine is in invalid state
+                // Heartbeat already emitted above, so watchdog will see engine is alive
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_INVALID_STATE", state: "ENGINE",
+                    new { error = "TimeService is null - engine not properly initialized" }));
+                return;
             }
 
             // Broker sync gate: Check if we're waiting for synchronization

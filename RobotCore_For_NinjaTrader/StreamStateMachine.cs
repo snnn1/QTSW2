@@ -44,6 +44,17 @@ public sealed class StreamStateMachine
     
     public string Stream { get; }
     public string Instrument { get; }
+    
+    /// <summary>
+    /// PHASE 1: Execution instrument (e.g., MES, MNQ) - used for order placement and fills.
+    /// </summary>
+    public string ExecutionInstrument { get; private set; } = "";
+    
+    /// <summary>
+    /// PHASE 1: Canonical instrument (e.g., ES, NQ) - used for logic identity (future use).
+    /// </summary>
+    public string CanonicalInstrument { get; private set; } = "";
+    
     public string Session { get; }
     public string SlotTimeChicago { get; private set; }
 
@@ -80,6 +91,7 @@ public sealed class StreamStateMachine
     private readonly IExecutionAdapter? _executionAdapter;
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
+    private readonly int _orderQuantity; // PHASE 3.2: Fixed order quantity for all intents (code-controlled)
     private bool _stopBracketsSubmittedAtLock = false;
     
     // PHASE 4: Alert callback for missing data incidents
@@ -189,7 +201,8 @@ public sealed class StreamStateMachine
         DateOnly tradingDate, // PHASE 3: Accept DateOnly directly (authoritative), no parsing needed
         string timetableHash,
         TimetableStream directive,
-        ExecutionMode executionMode = ExecutionMode.DRYRUN,
+        ExecutionMode executionMode,
+        int orderQuantity, // PHASE 3.2: Fixed order quantity (mandatory, code-controlled)
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
@@ -205,6 +218,16 @@ public sealed class StreamStateMachine
         _executionAdapter = executionAdapter;
         _riskGate = riskGate;
         _executionJournal = executionJournal;
+        
+        // PHASE 3.2: Store and validate order quantity
+        _orderQuantity = orderQuantity;
+        if (_orderQuantity <= 0)
+        {
+            throw new ArgumentException(
+                $"Order quantity must be positive, got {_orderQuantity}. " +
+                $"Execution instrument: {ExecutionInstrument}",
+                nameof(orderQuantity));
+        }
 
         // Load diagnostic logging configuration
         _enableDiagnosticLogs = loggingConfig?.enable_diagnostic_logs ?? false;
@@ -212,9 +235,17 @@ public sealed class StreamStateMachine
         _slotGateDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.slot_gate_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 60);
 
         Stream = directive.stream;
-        Instrument = directive.instrument.ToUpperInvariant();
         Session = directive.session;
         SlotTimeChicago = directive.slot_time;
+
+        // PHASE 2: Store execution instrument (from timetable directive) - used for orders
+        ExecutionInstrument = directive.instrument.ToUpperInvariant();
+        
+        // PHASE 2: Compute canonical instrument (maps micro futures to base instruments) - used for logic
+        CanonicalInstrument = GetCanonicalInstrument(ExecutionInstrument, spec);
+        
+        // PHASE 2: Instrument property now represents LOGIC identity (canonical), not execution
+        Instrument = CanonicalInstrument;
 
         // PHASE 3: Use DateOnly directly (no parsing needed)
         var dateOnly = tradingDate;
@@ -271,6 +302,8 @@ public sealed class StreamStateMachine
                         restart_time_utc = nowUtc.ToString("o"),
                         range_start_chicago = RangeStartChicagoTime.ToString("o"),
                         slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                        canonical_instrument = CanonicalInstrument,   // PHASE 3: Canonical identity
                         policy = "RESTART_FULL_RECONSTRUCTION",
                         note = "Mid-session restart detected - will reconstruct range from historical + live bars. Result may differ from uninterrupted operation."
                     }));
@@ -292,8 +325,38 @@ public sealed class StreamStateMachine
         _stateEntryTimeUtc = DateTimeOffset.UtcNow;
     }
 
-    public bool IsSameInstrument(string instrument) =>
-        string.Equals(Instrument, instrument, StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// PHASE 1: Get canonical instrument for a given execution instrument.
+    /// Maps micro futures (MES, MNQ, etc.) to their base instruments (ES, NQ, etc.).
+    /// Returns execution instrument unchanged if not a micro or if spec is unavailable.
+    /// </summary>
+    private static string GetCanonicalInstrument(string executionInstrument, ParitySpec spec)
+    {
+        if (spec != null &&
+            spec.TryGetInstrument(executionInstrument, out var inst) &&
+            inst.is_micro &&
+            !string.IsNullOrWhiteSpace(inst.base_instrument))
+        {
+            return inst.base_instrument.ToUpperInvariant(); // MES → ES
+        }
+
+        return executionInstrument.ToUpperInvariant(); // ES → ES
+    }
+
+    /// <summary>
+    /// PHASE 2: Check if incoming instrument matches this stream's canonical instrument.
+    /// Routes bars by canonical instrument (MES bars route to ES streams).
+    /// </summary>
+    public bool IsSameInstrument(string incomingInstrument)
+    {
+        // PHASE 2: Canonicalize incoming instrument for comparison
+        var incomingCanonical = GetCanonicalInstrument(incomingInstrument, _spec);
+        return string.Equals(
+            CanonicalInstrument,
+            incomingCanonical,
+            StringComparison.OrdinalIgnoreCase
+        );
+    }
     
     /// <summary>
     /// Record filtered bars for logging clarity.
@@ -1846,6 +1909,7 @@ public sealed class StreamStateMachine
                 LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
                 
                 // Log range lock snapshot (all modes - was DRYRUN-only, now unconditional for consistency)
+                // PHASE 3: Include both canonical and execution identities
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "RANGE_LOCK_SNAPSHOT", State.ToString(),
                     new
@@ -1856,6 +1920,8 @@ public sealed class StreamStateMachine
                         freeze_close = FreezeClose,
                         freeze_close_source = FreezeCloseSource,
                         slot_time_chicago = SlotTimeChicago,
+                        execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                        canonical_instrument = CanonicalInstrument,   // PHASE 3: Canonical identity
                         slot_time_utc = SlotTimeUtc.ToString("o")
                     }));
 
@@ -2038,7 +2104,7 @@ public sealed class StreamStateMachine
         
         // DIAGNOSTIC: Proof log for 1-minute boundary investigation
         // Log every bar admission decision with raw timestamp, Chicago time, comparison result, and source
-        var barSource = isHistorical ? "BARSREQUEST" : "LIVE";
+        var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
         var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "BAR_ADMISSION_PROOF", State.ToString(),
@@ -2053,7 +2119,7 @@ public sealed class StreamStateMachine
                 comparison_detail = comparisonResult 
                     ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago < slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
                     : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss}))",
-                bar_source = barSource,
+                bar_source = barSourceStr,
                 note = "Diagnostic proof log - bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)"
             }));
         
@@ -2220,7 +2286,9 @@ public sealed class StreamStateMachine
                             
                             var gapViolationData = new
                             {
-                                instrument = Instrument,
+                                instrument = Instrument,  // Canonical (top-level for backward compatibility)
+                                execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                                canonical_instrument = CanonicalInstrument,   // PHASE 3: Canonical identity
                                 slot = Stream,
                                 violation_reason = violationReason,
                                 gap_type = gapType,
@@ -2612,17 +2680,21 @@ public sealed class StreamStateMachine
             ntAdapter.RegisterIntent(shortIntent);
         }
 
-        var longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, Instrument, "Long", brkLong, 1, ocoGroup, utcNow);
-        var shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, Instrument, "Short", brkShort, 1, ocoGroup, utcNow);
+        // PHASE 2: Use ExecutionInstrument for order placement (not canonical Instrument)
+        // PHASE 3: Use ExecutionInstrument for order placement (explicit, not ambiguous Instrument property)
+        // PHASE 3.2: Use code-controlled order quantity (Chart Trader quantity ignored)
+        var longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+        var shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
 
         // Persist to execution journal for idempotency (record both attempts)
+        // PHASE 2: Journal uses ExecutionInstrument for execution tracking
         if (longRes.Success)
-            _executionJournal.RecordSubmission(longIntentId, TradingDate, Stream, Instrument, "ENTRY_STOP_LONG", longRes.BrokerOrderId, utcNow);
+            _executionJournal.RecordSubmission(longIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_LONG", longRes.BrokerOrderId, utcNow);
         else
             _executionJournal.RecordRejection(longIntentId, TradingDate, Stream, longRes.ErrorMessage ?? "ENTRY_STOP_LONG_FAILED", utcNow);
 
         if (shortRes.Success)
-            _executionJournal.RecordSubmission(shortIntentId, TradingDate, Stream, Instrument, "ENTRY_STOP_SHORT", shortRes.BrokerOrderId, utcNow);
+            _executionJournal.RecordSubmission(shortIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_SHORT", shortRes.BrokerOrderId, utcNow);
         else
             _executionJournal.RecordRejection(shortIntentId, TradingDate, Stream, shortRes.ErrorMessage ?? "ENTRY_STOP_SHORT_FAILED", utcNow);
 
@@ -3464,12 +3536,26 @@ public sealed class StreamStateMachine
         _journals.Save(_journal);
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "JOURNAL_WRITTEN", StreamState.DONE.ToString(),
-            new { committed = true, commit_reason = commitReason, timetable_hash_at_commit = _timetableHash }));
+            new 
+            { 
+                committed = true, 
+                commit_reason = commitReason, 
+                timetable_hash_at_commit = _timetableHash,
+                execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
+            }));
 
         State = StreamState.DONE;
+        // PHASE 3: Include both identities in commit event (RANGE_INVALIDATED, STREAM_STAND_DOWN, etc.)
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             eventType, State.ToString(),
-            new { committed = true, commit_reason = commitReason }));
+            new 
+            { 
+                committed = true, 
+                commit_reason = commitReason,
+                execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
+            }));
     }
     
     /// <summary>
@@ -3608,8 +3694,8 @@ public sealed class StreamStateMachine
                     detected_trigger_reason = triggerReason,
                     existing_entry_direction = _intendedDirection,
                     existing_entry_price = _intendedEntryPrice,
-                    existing_entry_time_utc = _intendedEntryTimeUtc.ToString("o"),
-                    existing_entry_time_chicago = _time.ConvertUtcToChicago(_intendedEntryTimeUtc).ToString("o"),
+                    existing_entry_time_utc = _intendedEntryTimeUtc?.ToString("o") ?? "",
+                    existing_entry_time_chicago = _intendedEntryTimeUtc.HasValue ? _time.ConvertUtcToChicago(_intendedEntryTimeUtc.Value).ToString("o") : "",
                     existing_trigger_reason = _triggerReason,
                     note = "Breakout detected but entry already exists - this breakout was ignored"
                 }));
@@ -3641,11 +3727,29 @@ public sealed class StreamStateMachine
         // Build intent and execute (execution mode only determines adapter, not behavior)
         // Note: Execution adapter will validate null values - no need to check here
 
-        // Build canonical intent
+        // PHASE 3: Assert Instrument property is canonical (logic identity)
+        if (Instrument != CanonicalInstrument)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 3 ASSERTION FAILED: Stream Instrument property '{Instrument}' does not match CanonicalInstrument '{CanonicalInstrument}'. " +
+                $"Instrument property must represent logic identity (canonical)."
+            );
+        }
+        
+        // PHASE 3: Assert Stream ID is canonical (does not contain execution instrument)
+        if (ExecutionInstrument != CanonicalInstrument && Stream.Contains(ExecutionInstrument, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"PHASE 3 ASSERTION FAILED: Execution instrument '{ExecutionInstrument}' found in Stream ID '{Stream}'. " +
+                $"Stream ID must use canonical instrument '{CanonicalInstrument}'."
+            );
+        }
+        
+        // Build canonical intent (uses canonical Instrument for logic identity)
         var intent = new Intent(
             TradingDate,
             Stream,
-            Instrument,
+            Instrument,  // PHASE 3: Intent ID uses canonical instrument (logic identity)
             Session,
             SlotTimeChicago,
             direction,
@@ -3701,6 +3805,7 @@ public sealed class StreamStateMachine
         }
 
         // All checks passed - log execution allowed (permanent state-transition log)
+        // PHASE 3: Include both canonical and execution identities in event payload
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "EXECUTION_ALLOWED", State.ToString(),
             new
@@ -3709,6 +3814,8 @@ public sealed class StreamStateMachine
                 direction = direction,
                 entry_price = entryPrice,
                 trigger_reason = triggerReason,
+                execution_instrument = ExecutionInstrument,  // PHASE 3: Include execution identity
+                canonical_instrument = CanonicalInstrument,   // PHASE 3: Include canonical identity
                 note = "All gates passed, submitting entry order"
             }));
 
@@ -3720,15 +3827,40 @@ public sealed class StreamStateMachine
             return;
         }
 
-        // Submit entry order (quantity = 1 contract per stream)
+        // Submit entry order (quantity = code-controlled, Chart Trader ignored)
         // Use StopMarket for breakout entries, Limit for immediate entries
         var entryOrderType = triggerReason == "BREAKOUT" ? "STOP_MARKET" : "LIMIT";
+        // PHASE 3: Assert ExecutionInstrument is set before order placement
+        if (string.IsNullOrWhiteSpace(ExecutionInstrument))
+        {
+            throw new InvalidOperationException(
+                "PHASE 3 ASSERTION FAILED: ExecutionInstrument is null or empty. Cannot place orders without execution instrument."
+            );
+        }
+        
+        // PHASE 3: Assert ExecutionInstrument differs from canonical (for micro futures)
+        // This ensures we're not accidentally using canonical instrument for orders
+        if (ExecutionInstrument == CanonicalInstrument && ExecutionInstrument != "ES" && ExecutionInstrument != "NQ" && ExecutionInstrument != "YM" && ExecutionInstrument != "CL" && ExecutionInstrument != "NG" && ExecutionInstrument != "GC" && ExecutionInstrument != "RTY")
+        {
+            // Allow same for regular futures (ES, NQ, etc.), but warn if unexpected
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "EXECUTION_INSTRUMENT_SAME_AS_CANONICAL", State.ToString(),
+                new
+                {
+                    execution_instrument = ExecutionInstrument,
+                    canonical_instrument = CanonicalInstrument,
+                    note = "Execution and canonical instruments are the same (expected for regular futures)"
+                }));
+        }
+        
+        // PHASE 2: Use ExecutionInstrument for order placement (not canonical Instrument)
+        // PHASE 3.2: Use code-controlled order quantity (Chart Trader quantity ignored)
         var entryResult = _executionAdapter.SubmitEntryOrder(
             intentId,
-            Instrument,
+            ExecutionInstrument,
             direction,
             entryPrice,
-            1, // Quantity: 1 contract
+            _orderQuantity, // PHASE 3.2: Code-controlled quantity, not Chart Trader
             entryOrderType,
             utcNow);
 
@@ -3737,7 +3869,8 @@ public sealed class StreamStateMachine
         {
             if (entryResult.Success)
             {
-                _executionJournal.RecordSubmission(intentId, TradingDate, Stream, Instrument, "ENTRY", entryResult.BrokerOrderId, utcNow, entryPrice);
+                // PHASE 2: Journal uses ExecutionInstrument for execution tracking
+                _executionJournal.RecordSubmission(intentId, TradingDate, Stream, ExecutionInstrument, "ENTRY", entryResult.BrokerOrderId, utcNow, entryPrice);
             }
             else
             {
@@ -4346,6 +4479,9 @@ public sealed class StreamStateMachine
         }
     }
     
+    /// <summary>
+    /// PHASE 3: Transition to new state and log with both canonical and execution identities.
+    /// </summary>
     private void Transition(DateTimeOffset utcNow, StreamState next, string eventType, object? extra = null)
     {
         var previousState = State;
@@ -4364,6 +4500,7 @@ public sealed class StreamStateMachine
         _journals.Save(_journal);
         
         // MANDATORY: Emit STREAM_STATE_TRANSITION event for watchdog observability (plan requirement #2)
+        // PHASE 3: Include both canonical and execution identities in event payload
         // This event includes only state movement fields, not derived state like range_high/low
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, 
             "STREAM_STATE_TRANSITION", next.ToString(), 
@@ -4372,14 +4509,19 @@ public sealed class StreamStateMachine
                 previous_state = previousState.ToString(),
                 new_state = next.ToString(),
                 state_entry_time_utc = stateEntryTimeUtc.ToString("o"),
-                time_in_previous_state_minutes = timeInPreviousState.HasValue ? Math.Round(timeInPreviousState.Value, 2) : (double?)null
+                time_in_previous_state_minutes = timeInPreviousState.HasValue ? Math.Round(timeInPreviousState.Value, 2) : (double?)null,
+                execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
             }));
         
         // Log state transition with full context (original event for backward compatibility)
+        // PHASE 3: Include both identities in full context log
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, eventType, next.ToString(), 
             new
             {
-                instrument = Instrument,
+                instrument = Instrument,  // Canonical (top-level field for backward compatibility)
+                execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
+                canonical_instrument = CanonicalInstrument,   // PHASE 3: Canonical identity
                 stream_id = Stream,
                 trading_date = TradingDate,
                 previous_state = previousState.ToString(),

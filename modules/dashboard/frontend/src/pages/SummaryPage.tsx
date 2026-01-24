@@ -1,16 +1,28 @@
 /**
  * SummaryPage - Daily Summary page
  */
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useExecutionSummary } from '../hooks/useJournalData'
+import { useStreamPnl } from '../hooks/useStreamPnl'
+import { NavigationBar } from '../components/shared/NavigationBar'
 
 export function SummaryPage() {
   const [tradingDate, setTradingDate] = useState('')
   const { summary, loading, error } = useExecutionSummary(tradingDate)
+  const { pnl } = useStreamPnl(tradingDate)
+  
+  // Calculate total P&L
+  const totalPnl = useMemo(() => {
+    return Object.values(pnl).reduce((sum, s) => {
+      return sum + (s.realized_pnl || 0)
+    }, 0)
+  }, [pnl])
   
   return (
-    <div className="min-h-screen bg-black text-white p-8">
-      <h1 className="text-2xl font-bold mb-6">Daily Summary</h1>
+    <div className="min-h-screen bg-black text-white">
+      <NavigationBar />
+      <div className="p-8 pt-14">
+        <h1 className="text-2xl font-bold mb-6">Daily Summary</h1>
       
       {/* Date Picker */}
       <div className="bg-gray-800 rounded-lg p-4 mb-6">
@@ -53,6 +65,12 @@ export function SummaryPage() {
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="text-sm text-gray-400">Total Execution Cost</div>
               <div className="text-2xl font-bold">${summary.total_execution_cost.toFixed(2)}</div>
+            </div>
+            <div className="bg-gray-800 rounded-lg p-4">
+              <div className="text-sm text-gray-400">Total Realized P&L</div>
+              <div className={`text-2xl font-bold ${totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                ${totalPnl.toFixed(2)}
+              </div>
             </div>
           </div>
           
@@ -123,6 +141,7 @@ export function SummaryPage() {
       {!loading && !error && !summary && tradingDate && (
         <div className="text-gray-500 text-center py-8">No summary data for selected date</div>
       )}
+      </div>
     </div>
   )
 }

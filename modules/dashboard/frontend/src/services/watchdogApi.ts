@@ -246,3 +246,63 @@ export async function fetchActiveIntents(): Promise<ApiResponse<{ timestamp_chic
     return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
+
+/**
+ * Stream P&L types
+ */
+export interface StreamPnl {
+  stream: string
+  realized_pnl: number
+  open_positions: number
+  total_costs_realized: number
+  intent_count: number
+  closed_count: number
+  partial_count: number
+  open_count: number
+  pnl_confidence: 'HIGH' | 'MEDIUM' | 'LOW'
+}
+
+export interface StreamPnlResponse {
+  trading_date: string
+  stream?: string
+  streams?: StreamPnl[]
+  realized_pnl?: number
+  open_positions?: number
+  total_costs_realized?: number
+  intent_count?: number
+  closed_count?: number
+  partial_count?: number
+  open_count?: number
+  pnl_confidence?: 'HIGH' | 'MEDIUM' | 'LOW'
+}
+
+/**
+ * Fetch stream P&L
+ */
+export async function fetchStreamPnl(
+  tradingDate: string,
+  stream?: string
+): Promise<ApiResponse<StreamPnlResponse>> {
+  try {
+    const params = new URLSearchParams({ trading_date: tradingDate })
+    if (stream) params.append('stream', stream)
+    
+    const response = await fetch(`${API_BASE}/stream-pnl?${params.toString()}`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) {
+          errorDetail = errorData.detail
+        }
+      } catch {
+        // Ignore JSON parse errors
+      }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}

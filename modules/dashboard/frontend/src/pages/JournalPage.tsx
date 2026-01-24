@@ -3,6 +3,7 @@
  */
 import { useState } from 'react'
 import { useExecutionJournal } from '../hooks/useJournalData'
+import { NavigationBar } from '../components/shared/NavigationBar'
 
 export function JournalPage() {
   const [tradingDate, setTradingDate] = useState('')
@@ -12,8 +13,10 @@ export function JournalPage() {
   const { entries, loading, error } = useExecutionJournal(tradingDate, stream || undefined, intentId || undefined)
   
   return (
-    <div className="min-h-screen bg-black text-white p-8">
-      <h1 className="text-2xl font-bold mb-6">Execution Journal</h1>
+    <div className="min-h-screen bg-black text-white">
+      <NavigationBar />
+      <div className="p-8 pt-14">
+        <h1 className="text-2xl font-bold mb-6">Execution Journal</h1>
       
       {/* Filters */}
       <div className="bg-gray-800 rounded-lg p-4 mb-6">
@@ -108,6 +111,7 @@ export function JournalPage() {
           </div>
         </div>
       )}
+      </div>
     </div>
   )
 }

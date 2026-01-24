@@ -245,6 +245,21 @@ async def get_execution_summary(
         raise HTTPException(status_code=500, detail=f"Error reading summary: {e}")
 
 
+@router.get("/stream-pnl")
+async def get_stream_pnl(
+    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
+    stream: Optional[str] = Query(None, description="Filter by stream")
+):
+    """
+    Get realized P&L for stream(s).
+    
+    Separate endpoint - does not modify get_stream_states().
+    Frontend fetches P&L separately and joins by stream id.
+    """
+    aggregator = get_aggregator()
+    return aggregator.get_stream_pnl(trading_date, stream)
+
+
 def _convert_utc_to_chicago(utc_timestamp_str: str) -> Optional[str]:
     """Convert UTC timestamp string to Chicago timezone."""
     if not utc_timestamp_str:

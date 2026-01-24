@@ -36,6 +36,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Timer? _tickTimer;
         private readonly object _timerLock = new object();
         
+        // Heartbeat watchdog: Track last successful Tick() call to detect timer failures
+        private DateTimeOffset _lastSuccessfulTickUtc = DateTimeOffset.MinValue;
+        private const int HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS = 90; // Alert if no Tick() in 90 seconds
+        
         // Rate-limiting for timezone detection logging (per instrument)
         private readonly Dictionary<string, DateTimeOffset> _lastTimezoneDetectionLogUtc = new Dictionary<string, DateTimeOffset>();
         
@@ -207,6 +211,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // but we still need heartbeats for watchdog monitoring
                 // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
                 StartTickTimer();
+                
+                // Initialize heartbeat watchdog timestamp
+                _lastSuccessfulTickUtc = DateTimeOffset.UtcNow;
             }
             else if (State == State.Realtime)
             {
@@ -221,6 +228,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
                 // Note: Timer may already be started from DataLoaded state, but StartTickTimer() is idempotent
                 StartTickTimer();
+                
+                // Update heartbeat watchdog timestamp
+                _lastSuccessfulTickUtc = DateTimeOffset.UtcNow;
             }
             else if (State == State.Terminated)
             {
@@ -830,6 +840,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
             // NOTE: Tick() is now called by timer, not by bar arrivals
             // This ensures time-based state transitions occur even when no bars arrive
+            
+            // HEARTBEAT WATCHDOG: Check if timer is still calling Tick()
+            // If no Tick() in HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS, timer may have stopped
+            if (_engineReady && _lastSuccessfulTickUtc != DateTimeOffset.MinValue)
+            {
+                var elapsedSinceLastTick = (nowUtc - _lastSuccessfulTickUtc).TotalSeconds;
+                if (elapsedSinceLastTick > HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS)
+                {
+                    Log($"WARNING: Tick timer appears to have stopped. Last successful Tick() was {elapsedSinceLastTick:.1f} seconds ago. Attempting to restart timer.", LogLevel.Warning);
+                    // Attempt to restart timer
+                    lock (_timerLock)
+                    {
+                        if (_tickTimer != null)
+                        {
+                            _tickTimer.Dispose();
+                            _tickTimer = null;
+                        }
+                        StartTickTimer();
+                        _lastSuccessfulTickUtc = nowUtc; // Reset watchdog timestamp
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -926,12 +958,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 
                 var utcNow = DateTimeOffset.UtcNow;
+                
+                // CRITICAL: Call Tick() unconditionally - heartbeat emission is handled inside Tick()
+                // Tick() will emit heartbeats even if engine is not trading-ready
                 _engine.Tick(utcNow);
+                
+                // Update heartbeat watchdog timestamp on successful Tick() call
+                _lastSuccessfulTickUtc = utcNow;
             }
             catch (Exception ex)
             {
                 // Log but never throw - timer callbacks must not throw exceptions
-                Log($"ERROR in tick timer callback: {ex.Message}", LogLevel.Error);
+                // CRITICAL: Log full exception details to diagnose why Tick() might be failing
+                Log($"ERROR in tick timer callback: {ex.Message}\nStack trace: {ex.StackTrace}", LogLevel.Error);
+                
+                // CRITICAL: If timer callback fails repeatedly, NinjaTrader may stop calling it
+                // Try to restart the timer as a defensive measure
+                try
+                {
+                    lock (_timerLock)
+                    {
+                        if (_tickTimer != null)
+                        {
+                            // Timer still exists but callback is failing - log warning
+                            Log("WARNING: Timer callback failed but timer still exists. Timer may stop calling callback.", LogLevel.Warning);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore errors in defensive restart attempt
+                }
             }
         }
 

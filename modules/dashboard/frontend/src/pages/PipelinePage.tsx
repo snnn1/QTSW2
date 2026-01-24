@@ -13,6 +13,7 @@ import { ExportPanel } from '../components/pipeline/ExportPanel'
 import { EventsLog } from '../components/pipeline/EventsLog'
 import { ProcessingRateCard } from '../components/pipeline/ProcessingRateCard'
 import { checkBackendConnection } from '../services/pipelineManager'
+import { NavigationBar } from '../components/shared/NavigationBar'
 
 export function PipelinePage() {
   console.log('[App] Component rendering...')
@@ -93,6 +94,7 @@ export function PipelinePage() {
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-black text-white">
+        <NavigationBar />
         {/* Alert Popup */}
         {alertInfo && (
           <div className={`fixed top-4 right-4 p-4 rounded-lg shadow-lg z-50 ${
@@ -110,7 +112,7 @@ export function PipelinePage() {
           </div>
         )}
 
-        <div className="container mx-auto px-4 py-8">
+        <div className="container mx-auto px-4 py-8 pt-14">
           <PipelineControls
             chicagoTime={chicagoTime}
             scheduleInfo={scheduleInfo}
