@@ -51,6 +51,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "KILL_SWITCH_ACTIVE",
     # Stream State
     "STREAM_STAND_DOWN",
+    "MARKET_CLOSE_NO_TRADE",  # Stream commits at market close (treated same as STREAM_STAND_DOWN)
     "RANGE_INVALIDATED",
     # Execution Blocking
     "EXECUTION_BLOCKED",

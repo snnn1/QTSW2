@@ -2089,8 +2089,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
                 
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
-                // Pass logging config for diagnostic control
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
+                // NOTE: RobotCore_For_NinjaTrader doesn't have Phase 4 execution policy yet, so using default values
+                // TODO: Implement Phase 4 execution policy loading in RobotCore_For_NinjaTrader
+                var defaultOrderQuantity = 1; // Safe default until Phase 4 is implemented
+                var defaultMaxQuantity = 2; // Safe default (2x orderQuantity)
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, defaultOrderQuantity, defaultMaxQuantity, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
                 
                 // PHASE 4: Set alert callback for high-priority alerts only (RANGE_INVALIDATED)
                 // Non-critical alerts (gaps, pre-hydration, state transitions) are logged only, not notified

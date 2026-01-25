@@ -92,6 +92,7 @@ public sealed class StreamStateMachine
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
     private readonly int _orderQuantity; // PHASE 3.2: Fixed order quantity for all intents (code-controlled)
+    private readonly int _maxQuantity; // Policy max_size
     private bool _stopBracketsSubmittedAtLock = false;
     
     // PHASE 4: Alert callback for missing data incidents
@@ -165,6 +166,7 @@ public sealed class StreamStateMachine
     private DateTimeOffset? _lastTickTraceUtc = null; // Rate-limit TICK_TRACE (once per stream per 5 minutes)
     private DateTimeOffset? _lastTickCalledUtc = null; // Rate-limit TICK_CALLED (once per stream per 1 minute)
     private DateTimeOffset? _lastPreHydrationHandlerTraceUtc = null; // Rate-limit PRE_HYDRATION_HANDLER_TRACE (once per stream per 5 minutes)
+    private DateTimeOffset? _lastArmedWaitingForBarsLogUtc = null; // Rate-limit ARMED_WAITING_FOR_BARS (once per stream per 5 minutes)
     
     // Range tracking for change detection
     private decimal? _lastLoggedRangeHigh = null; // Track last logged range high for change detection
@@ -202,7 +204,8 @@ public sealed class StreamStateMachine
         string timetableHash,
         TimetableStream directive,
         ExecutionMode executionMode,
-        int orderQuantity, // PHASE 3.2: Fixed order quantity (mandatory, code-controlled)
+        int orderQuantity, // baseSize (PHASE 3.2: Fixed order quantity, mandatory, code-controlled)
+        int maxQuantity, // NEW: maxSize (policy max_size)
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
@@ -227,6 +230,23 @@ public sealed class StreamStateMachine
                 $"Order quantity must be positive, got {_orderQuantity}. " +
                 $"Execution instrument: {ExecutionInstrument}",
                 nameof(orderQuantity));
+        }
+        
+        // Store max quantity
+        _maxQuantity = maxQuantity;
+        if (_maxQuantity <= 0)
+        {
+            throw new ArgumentException(
+                $"Max quantity must be positive, got {_maxQuantity}. " +
+                $"Execution instrument: {ExecutionInstrument}",
+                nameof(maxQuantity));
+        }
+        
+        if (_orderQuantity > _maxQuantity)
+        {
+            throw new ArgumentException(
+                $"Order quantity ({_orderQuantity}) cannot exceed max quantity ({_maxQuantity}). " +
+                $"Execution instrument: {ExecutionInstrument}");
         }
 
         // Load diagnostic logging configuration
@@ -1388,6 +1408,40 @@ public sealed class StreamStateMachine
                 
                 if (utcNow >= RangeStartUtc)
                 {
+                    // Check if market is closed - if so, commit as NO_TRADE_MARKET_CLOSE instead of transitioning to RANGE_BUILDING
+                    if (utcNow >= MarketCloseUtc)
+                    {
+                        LogNoTradeMarketClose(utcNow);
+                        Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
+                        return;
+                    }
+                    
+                    // Check if there are bars available to build a range from
+                    var barCount = GetBarBufferCount();
+                    if (barCount == 0)
+                    {
+                        // No bars available - wait in ARMED state until bars arrive or market closes
+                        // Log diagnostic info to help understand why we're waiting (rate-limited to once per 5 minutes)
+                        var shouldLogWaitingForBars = !_lastArmedWaitingForBarsLogUtc.HasValue || 
+                            (utcNow - _lastArmedWaitingForBarsLogUtc.Value).TotalMinutes >= 5.0;
+                        
+                        if (shouldLogWaitingForBars)
+                        {
+                            _lastArmedWaitingForBarsLogUtc = utcNow;
+                            LogHealth("INFO", "ARMED_WAITING_FOR_BARS", $"Range start time reached but no bars available yet. Waiting for bars or market close.",
+                                new { 
+                                    range_start_chicago = RangeStartChicagoTime.ToString("o"), 
+                                    slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                                    utc_now = utcNow.ToString("o"),
+                                    range_start_utc = RangeStartUtc.ToString("o"),
+                                    market_close_utc = MarketCloseUtc.ToString("o"),
+                                    time_since_range_start_minutes = (utcNow - RangeStartUtc).TotalMinutes,
+                                    bar_count = barCount
+                                });
+                        }
+                        return; // Stay in ARMED state
+                    }
+                    
                     // A) Strategy lifecycle: New range window started
                     LogHealth("INFO", "RANGE_WINDOW_STARTED", $"Range window started for slot {SlotTimeChicago}",
                         new { 
@@ -1498,6 +1552,27 @@ public sealed class StreamStateMachine
     /// </summary>
     private void HandleRangeBuildingState(DateTimeOffset utcNow)
     {
+        // Check for market close cutoff (all execution modes)
+        // If market has closed and no entry detected, commit as NO_TRADE_MARKET_CLOSE
+        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        {
+            LogNoTradeMarketClose(utcNow);
+            Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
+            return;
+        }
+        
+        // Defensive check: ensure bars are available (should not happen with our fix, but adds safety)
+        var barCount = GetBarBufferCount();
+        if (barCount == 0)
+        {
+            // Should not happen (our fix prevents this), but defensive check
+            LogHealth("WARN", "RANGE_BUILDING_NO_BARS", 
+                "RANGE_BUILDING state reached with no bars available. This should not happen.",
+                new { bar_count = barCount });
+            // Wait for bars or market close
+            return;
+        }
+        
         // B) Heartbeat / watchdog (throttled)
         if (!_lastHeartbeatUtc.HasValue || (utcNow - _lastHeartbeatUtc.Value).TotalMinutes >= HEARTBEAT_INTERVAL_MINUTES)
         {
@@ -2029,6 +2104,12 @@ public sealed class StreamStateMachine
         {
             // Bar is from wrong trading date - ignore it
             // This should not happen (RobotEngine filters first), but this is a defensive check
+            return;
+        }
+        
+        // Early return if stream is committed (optimization - avoid unnecessary processing)
+        if (_journal.Committed)
+        {
             return;
         }
         
@@ -3761,6 +3842,25 @@ public sealed class StreamStateMachine
             triggerReason);
 
         var intentId = intent.ComputeIntentId();
+        
+        // Emit expectation declaration
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, ExecutionInstrument, 
+            "INTENT_EXECUTION_EXPECTATION_DECLARED", new
+        {
+            intent_id = intentId,
+            canonical_instrument = CanonicalInstrument,
+            execution_instrument = ExecutionInstrument,
+            policy_base_size = _orderQuantity,
+            policy_max_size = _maxQuantity,
+            source = "EXECUTION_POLICY_FILE"
+        }));
+        
+        // Register policy expectation with adapter
+        if (_executionAdapter is NinjaTraderSimAdapter ntAdapter)
+        {
+            ntAdapter.RegisterIntentPolicy(intentId, _orderQuantity, _maxQuantity, 
+                CanonicalInstrument, ExecutionInstrument, "EXECUTION_POLICY_FILE");
+        }
 
         // Check idempotency: Has this intent already been submitted?
         if (_executionJournal != null && _executionJournal.IsIntentSubmitted(intentId, TradingDate, Stream))

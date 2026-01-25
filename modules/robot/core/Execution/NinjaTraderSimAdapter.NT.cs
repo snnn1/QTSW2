@@ -113,8 +113,147 @@ public partial class NinjaTraderSimAdapter
                 ntEntryPrice = (double)entryPrice.Value;
             }
             
+            // Pre-submission invariant check
+            if (!_intentPolicy.TryGetValue(intentId, out var expectation))
+            {
+                // HARD BLOCK: expectation missing (fail-closed by default)
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ENTRY_SUBMIT_PRECHECK", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    expected_quantity = (int?)null,
+                    max_quantity = (int?)null,
+                    cumulative_filled_qty = 0,
+                    remaining_allowed_qty = (int?)null,
+                    chart_trader_quantity = (int?)null,
+                    allowed = false,
+                    reason = "Intent policy expectation missing"
+                }));
+                return OrderSubmissionResult.FailureResult(
+                    "Pre-submission check failed: intent policy expectation missing", utcNow);
+            }
+
+            var expectedQty = expectation.ExpectedQuantity;
+            var maxQty = expectation.MaxQuantity;
+            var filledQty = _orderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
+            var remainingAllowed = expectedQty - filledQty;
+
+            // Get Chart Trader quantity if accessible
+            int? chartTraderQty = null;
+            // Note: Strategy reference not available in adapter - would need to be passed if needed
+
+            // HARD BLOCK rules
+            bool hardBlock = false;
+            string? blockReason = null;
+
+            if (quantity <= 0)
+            {
+                hardBlock = true;
+                blockReason = $"Invalid quantity: {quantity}";
+            }
+            else if (filledQty > expectedQty)
+            {
+                hardBlock = true;
+                blockReason = $"Already overfilled: filled={filledQty}, expected={expectedQty}";
+            }
+            else if (quantity > remainingAllowed)
+            {
+                hardBlock = true;
+                blockReason = $"Quantity exceeds remaining allowed: {quantity} > {remainingAllowed}";
+            }
+            else if (quantity > maxQty)
+            {
+                hardBlock = true;
+                blockReason = $"Quantity exceeds max: {quantity} > {maxQty}";
+            }
+
+            if (hardBlock)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ENTRY_SUBMIT_PRECHECK", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    expected_quantity = expectedQty,
+                    max_quantity = maxQty,
+                    cumulative_filled_qty = filledQty,
+                    remaining_allowed_qty = remainingAllowed,
+                    chart_trader_quantity = chartTraderQty,
+                    allowed = false,
+                    reason = blockReason
+                }));
+                return OrderSubmissionResult.FailureResult($"Pre-submission check failed: {blockReason}", utcNow);
+            }
+
+            // WARN but allow if non-ideal (shouldn't happen)
+            bool warn = false;
+            string? warnReason = null;
+
+            if (quantity != expectedQty && filledQty == 0 && quantity <= expectedQty)
+            {
+                warn = true;
+                warnReason = $"Quantity mismatch: requested={quantity}, expected={expectedQty}";
+            }
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                "ENTRY_SUBMIT_PRECHECK", new
+            {
+                intent_id = intentId,
+                requested_quantity = quantity,
+                expected_quantity = expectedQty,
+                max_quantity = maxQty,
+                cumulative_filled_qty = filledQty,
+                remaining_allowed_qty = remainingAllowed,
+                chart_trader_quantity = chartTraderQty,
+                allowed = true,
+                warning = warn ? warnReason : null
+            }));
+            
             // Real NT API: CreateOrder
             var order = account.CreateOrder(ntInstrument, orderAction, orderType, quantity, ntEntryPrice);
+            
+            // Order creation verification
+            var verified = order.Quantity == quantity;
+            if (!verified)
+            {
+                // EMERGENCY: Quantity mismatch
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ORDER_CREATED_VERIFICATION", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    order_quantity = order.Quantity,
+                    order_id = order.OrderId,
+                    instrument = instrument,
+                    verified = false
+                }));
+                
+                // Trigger emergency handler (quantity mismatch, not overfill)
+                TriggerQuantityEmergency(intentId, "QUANTITY_MISMATCH_EMERGENCY", utcNow, new Dictionary<string, object>
+                {
+                    { "requested_quantity", quantity },
+                    { "order_quantity", order.Quantity },
+                    { "reason", "Order creation quantity mismatch" }
+                });
+                
+                return OrderSubmissionResult.FailureResult(
+                    $"Order quantity mismatch: requested {quantity}, order has {order.Quantity}", utcNow);
+            }
+            else
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ORDER_CREATED_VERIFICATION", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    order_quantity = order.Quantity,
+                    order_id = order.OrderId,
+                    instrument = instrument,
+                    verified = true
+                }));
+            }
+            
             order.Tag = RobotOrderIds.EncodeTag(intentId); // Robot-owned envelope
             order.TimeInForce = TimeInForce.Day;
 
@@ -133,6 +272,28 @@ public partial class NinjaTraderSimAdapter
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
+            
+            // Copy policy expectation from _intentPolicy if available
+            if (_intentPolicy.TryGetValue(intentId, out var expectation))
+            {
+                orderInfo.ExpectedQuantity = expectation.ExpectedQuantity;
+                orderInfo.MaxQuantity = expectation.MaxQuantity;
+                orderInfo.PolicySource = expectation.PolicySource;
+                orderInfo.CanonicalInstrument = expectation.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = expectation.ExecutionInstrument;
+            }
+            else
+            {
+                // Log warning if expectation missing
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "INTENT_POLICY_MISSING_AT_ORDER_CREATE", new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    warning = "Order created but policy expectation not registered"
+                }));
+            }
+            
             _orderMap[intentId] = orderInfo;
 
             // Real NT API: Submit order
@@ -287,6 +448,39 @@ public partial class NinjaTraderSimAdapter
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
         var filledTotal = orderInfo.FilledQuantity;
+        
+        // Get expectation for fill accounting
+        var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity : 
+            (_intentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
+        var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
+            (_intentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
+        var remainingQty = expectedQty - filledTotal;
+        var overfill = filledTotal > expectedQty;
+        
+        // Per-fill accounting log
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, 
+            "INTENT_FILL_UPDATE", new
+        {
+            intent_id = intentId,
+            fill_qty = fillQuantity,
+            cumulative_filled_qty = filledTotal,
+            expected_qty = expectedQty,
+            max_qty = maxQty,
+            remaining_qty = remainingQty,
+            overfill = overfill
+        }));
+        
+        if (overfill)
+        {
+            // Trigger emergency handler
+            TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
+            {
+                { "expected_qty", expectedQty },
+                { "actual_filled_qty", filledTotal },
+                { "last_fill_qty", fillQuantity },
+                { "reason", "Fill exceeded expected quantity" }
+            });
+        }
         
         // Get contract multiplier for slippage calculation
         decimal? contractMultiplier = null;
@@ -953,8 +1147,145 @@ public partial class NinjaTraderSimAdapter
         {
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
 
+            // Pre-submission invariant check
+            if (!_intentPolicy.TryGetValue(intentId, out var expectation))
+            {
+                // HARD BLOCK: expectation missing (fail-closed by default)
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ENTRY_SUBMIT_PRECHECK", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    expected_quantity = (int?)null,
+                    max_quantity = (int?)null,
+                    cumulative_filled_qty = 0,
+                    remaining_allowed_qty = (int?)null,
+                    chart_trader_quantity = (int?)null,
+                    allowed = false,
+                    reason = "Intent policy expectation missing"
+                }));
+                return OrderSubmissionResult.FailureResult(
+                    "Pre-submission check failed: intent policy expectation missing", utcNow);
+            }
+
+            var expectedQty = expectation.ExpectedQuantity;
+            var maxQty = expectation.MaxQuantity;
+            var filledQty = _orderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
+            var remainingAllowed = expectedQty - filledQty;
+
+            // Get Chart Trader quantity if accessible
+            int? chartTraderQty = null;
+
+            // HARD BLOCK rules
+            bool hardBlock = false;
+            string? blockReason = null;
+
+            if (quantity <= 0)
+            {
+                hardBlock = true;
+                blockReason = $"Invalid quantity: {quantity}";
+            }
+            else if (filledQty > expectedQty)
+            {
+                hardBlock = true;
+                blockReason = $"Already overfilled: filled={filledQty}, expected={expectedQty}";
+            }
+            else if (quantity > remainingAllowed)
+            {
+                hardBlock = true;
+                blockReason = $"Quantity exceeds remaining allowed: {quantity} > {remainingAllowed}";
+            }
+            else if (quantity > maxQty)
+            {
+                hardBlock = true;
+                blockReason = $"Quantity exceeds max: {quantity} > {maxQty}";
+            }
+
+            if (hardBlock)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ENTRY_SUBMIT_PRECHECK", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    expected_quantity = expectedQty,
+                    max_quantity = maxQty,
+                    cumulative_filled_qty = filledQty,
+                    remaining_allowed_qty = remainingAllowed,
+                    chart_trader_quantity = chartTraderQty,
+                    allowed = false,
+                    reason = blockReason
+                }));
+                return OrderSubmissionResult.FailureResult($"Pre-submission check failed: {blockReason}", utcNow);
+            }
+
+            // WARN but allow if non-ideal (shouldn't happen)
+            bool warn = false;
+            string? warnReason = null;
+
+            if (quantity != expectedQty && filledQty == 0 && quantity <= expectedQty)
+            {
+                warn = true;
+                warnReason = $"Quantity mismatch: requested={quantity}, expected={expectedQty}";
+            }
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                "ENTRY_SUBMIT_PRECHECK", new
+            {
+                intent_id = intentId,
+                requested_quantity = quantity,
+                expected_quantity = expectedQty,
+                max_quantity = maxQty,
+                cumulative_filled_qty = filledQty,
+                remaining_allowed_qty = remainingAllowed,
+                chart_trader_quantity = chartTraderQty,
+                allowed = true,
+                warning = warn ? warnReason : null
+            }));
+
             // Real NT API: Create stop-market entry
             var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, (double)stopPrice);
+            
+            // Order creation verification
+            var verified = order.Quantity == quantity;
+            if (!verified)
+            {
+                // EMERGENCY: Quantity mismatch
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ORDER_CREATED_VERIFICATION", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    order_quantity = order.Quantity,
+                    order_id = order.OrderId,
+                    instrument = instrument,
+                    verified = false
+                }));
+                
+                // Trigger emergency handler (quantity mismatch, not overfill)
+                TriggerQuantityEmergency(intentId, "QUANTITY_MISMATCH_EMERGENCY", utcNow, new Dictionary<string, object>
+                {
+                    { "requested_quantity", quantity },
+                    { "order_quantity", order.Quantity },
+                    { "reason", "Order creation quantity mismatch" }
+                });
+                
+                return OrderSubmissionResult.FailureResult(
+                    $"Order quantity mismatch: requested {quantity}, order has {order.Quantity}", utcNow);
+            }
+            else
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ORDER_CREATED_VERIFICATION", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    order_quantity = order.Quantity,
+                    order_id = order.OrderId,
+                    instrument = instrument,
+                    verified = true
+                }));
+            }
             order.Tag = RobotOrderIds.EncodeTag(intentId);
             order.TimeInForce = TimeInForce.Day;
             if (!string.IsNullOrEmpty(ocoGroup))
@@ -975,6 +1306,28 @@ public partial class NinjaTraderSimAdapter
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
+            
+            // Copy policy expectation from _intentPolicy if available
+            if (_intentPolicy.TryGetValue(intentId, out var expectationForOrder))
+            {
+                orderInfo.ExpectedQuantity = expectationForOrder.ExpectedQuantity;
+                orderInfo.MaxQuantity = expectationForOrder.MaxQuantity;
+                orderInfo.PolicySource = expectationForOrder.PolicySource;
+                orderInfo.CanonicalInstrument = expectationForOrder.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = expectationForOrder.ExecutionInstrument;
+            }
+            else
+            {
+                // Log warning if expectation missing
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "INTENT_POLICY_MISSING_AT_ORDER_CREATE", new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    warning = "Order created but policy expectation not registered"
+                }));
+            }
+            
             _orderMap[intentId] = orderInfo;
 
             var result = account.Submit(new[] { order });
@@ -1051,6 +1404,13 @@ public partial class NinjaTraderSimAdapter
 partial class OrderInfo
 {
     public object? NTOrder { get; set; } // NinjaTrader.Cbi.Order
+}
+
+// Emergency handler accessor (delegates to base class method)
+partial class NinjaTraderSimAdapter
+{
+    // TriggerQuantityEmergency is defined in NinjaTraderSimAdapter.cs
+    // This partial class declaration allows NT-specific code to call it
 }
 
 #endif

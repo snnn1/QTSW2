@@ -37,6 +37,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private string _specPath = "";
     private string _timetablePath = "";
+    private string _executionPolicyPath = ""; // PHASE 4: Execution policy file path
+    private ExecutionPolicy? _executionPolicy; // PHASE 4: Loaded execution policy
     
     // PHASE 3.1: Single-executor guard for canonical markets
     private CanonicalMarketLock? _canonicalMarketLock;
@@ -270,6 +272,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
+        _executionPolicyPath = Path.Combine(_root, "configs", "execution_policy.json"); // PHASE 4: Execution policy path (standardized)
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
@@ -376,7 +379,81 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
                     new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
                 
-                // PHASE 3.1: Acquire canonical market lock after spec is loaded (canonical instrument can be resolved)
+                // PHASE 4: Load execution policy (startup-only, not reloadable)
+                try
+                {
+                    _executionPolicy = ExecutionPolicy.LoadFromFile(_executionPolicyPath);
+                    
+                    // Compute file hash for audit trail
+                    var policyFileHash = "";
+                    try
+                    {
+                        var policyBytes = File.ReadAllBytes(_executionPolicyPath);
+                        using (var sha256 = System.Security.Cryptography.SHA256.Create())
+                        {
+                            var hashBytes = sha256.ComputeHash(policyBytes);
+                            policyFileHash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log but don't fail - hash is for audit only
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_HASH_ERROR", state: "ENGINE",
+                            new { error = ex.Message, note = "Failed to compute policy file hash (non-blocking)" }));
+                    }
+                    
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_LOADED", state: "ENGINE",
+                        new
+                        {
+                            file_path = _executionPolicyPath,
+                            file_hash = policyFileHash,
+                            schema_id = _executionPolicy.schema,
+                            note = "Execution policy loaded at startup; not reloadable"
+                        }));
+                }
+                catch (FileNotFoundException ex)
+                {
+                    var errorMsg = $"PHASE 4: Execution policy file not found: {_executionPolicyPath}. Execution blocked.";
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy file is required. Execution blocked."
+                        }));
+                    throw new InvalidOperationException(errorMsg, ex);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Policy validation failed
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy validation failed. Execution blocked."
+                        }));
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var errorMsg = $"PHASE 4: Failed to load execution policy: {ex.Message}";
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy load/parse failed. Execution blocked."
+                        }));
+                    throw new InvalidOperationException(errorMsg, ex);
+                }
+                
+                // PHASE 4: Policy validation occurs in ApplyTimetable based on actual enabled directives
+                // No single-instrument assumption validation here - enforcement happens where streams are created
+                
+                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging
+                // This ensures observability consistency: lock acquisition happens before policy activation logs
                 if (!string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
                 {
                     var canonicalInstrument = GetCanonicalInstrument(_executionInstrument);
@@ -412,6 +489,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }
                         
                         throw new InvalidOperationException(errorMsg);
+                    }
+                    
+                    // PHASE 4: Emit policy activation log AFTER lock acquisition (observability consistency)
+                    if (_executionPolicy != null)
+                    {
+                        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
+                        if (execInstPolicy != null && execInstPolicy.enabled)
+                        {
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
+                                new
+                                {
+                                    canonical_instrument = canonicalInstrument,
+                                    execution_instrument = _executionInstrument,
+                                    resolved_order_quantity = execInstPolicy.base_size,
+                                    base_size = execInstPolicy.base_size,
+                                    max_size = execInstPolicy.max_size,
+                                    note = "Policy loaded at startup; not reloadable"
+                                }));
+                        }
                     }
                 }
             }
@@ -707,13 +803,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var enabledStreams = _streams.Values.Where(s => !s.Committed).ToList();
         var enabledInstruments = enabledStreams.Select(s => s.Instrument).Distinct().ToList();
         
-        // PHASE 3.2: Build quantity mapping for enabled streams
+        // PHASE 4: Build quantity mapping for enabled streams (from policy)
+        // Note: Single-argument GetOrderQuantity() is acceptable here (banner/logging only, not stream creation)
         var quantityMapping = enabledStreams
             .GroupBy(s => s.ExecutionInstrument)
             .Select(g => new
             {
                 execution_instrument = g.Key,
-                quantity = GetOrderQuantity(g.Key),
+                quantity = GetOrderQuantity(g.Key), // Single-arg overload OK for logging
                 stream_count = g.Count()
             })
             .ToList();
@@ -732,24 +829,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             ["spec_revision"] = _spec?.spec_revision ?? "NOT_LOADED",
             ["kill_switch_enabled"] = _killSwitch != null && _killSwitch.IsEnabled(),
             ["health_monitor_enabled"] = _healthMonitor != null,
-            // PHASE 3.2: Order quantity control
+            // PHASE 4: Order quantity control (from policy file)
             ["order_quantity_mapping"] = quantityMapping,
-            ["order_quantity_source"] = "STRATEGY_CODE",
+            ["order_quantity_source"] = "EXECUTION_POLICY_FILE",
             ["chart_trader_quantity_ignored"] = true
         };
         
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
             eventType: "OPERATOR_BANNER", state: "ENGINE", bannerData));
         
-        // PHASE 3.2: Explicit log stating Chart Trader quantity is ignored
+        // PHASE 4: Explicit log stating Chart Trader quantity is ignored (policy-controlled)
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
             eventType: "EXECUTION_QUANTITY_CONTROL", state: "ENGINE",
             new
             {
-                order_quantity_source = "STRATEGY_CODE",
+                order_quantity_source = "EXECUTION_POLICY_FILE",
                 chart_trader_quantity_ignored = true,
                 execution_instrument_quantity_mapping = quantityMapping,
-                note = "Execution quantity is controlled by strategy code; Chart Trader quantity is ignored. All orders use instrument-specific quantities from code."
+                note = "Execution quantity is controlled by execution policy file; Chart Trader quantity is ignored. All orders use instrument-specific quantities from policy."
             }));
     }
 
@@ -1998,62 +2095,124 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return executionInstrument.ToUpperInvariant(); // ES → ES
     }
 
-    // PHASE 3.2: Execution quantity rules (authoritative dictionary)
-    // Quantity is code-controlled; Chart Trader quantity is ignored.
-    private static readonly Dictionary<string, int> _orderQuantityMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+    /// <summary>
+    /// PHASE 4: Get order quantity for execution instrument from execution policy (canonical + execution overload).
+    /// PRIMARY PATH: Use this overload for stream creation to avoid GetCanonicalInstrument divergence risk.
+    /// </summary>
+    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
+    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
+    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
+    /// <exception cref="ArgumentException">If instrument is null or empty</exception>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
+    public int GetOrderQuantity(string canonicalInstrument, string executionInstrument)
     {
-        // Minis
-        ["ES"] = 2,
-        ["NQ"] = 1,
-        ["YM"] = 2,
-        ["RTY"] = 2,
-        ["CL"] = 2,
-        ["GC"] = 2,
-        ["NG"] = 2,
+        if (string.IsNullOrWhiteSpace(canonicalInstrument))
+        {
+            throw new ArgumentException("Canonical instrument cannot be null or empty", nameof(canonicalInstrument));
+        }
+        if (string.IsNullOrWhiteSpace(executionInstrument))
+        {
+            throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
+        }
         
-        // Micros
-        ["MES"] = 2,
-        ["MNQ"] = 1,
-        ["MYM"] = 2,
-        ["M2K"] = 2,
-        ["MCL"] = 2,
-        ["MGC"] = 2,
-        ["MNG"] = 2
-    };
+        if (_executionPolicy == null)
+        {
+            throw new InvalidOperationException("PHASE 4: Execution policy not loaded. Cannot resolve order quantity.");
+        }
+        
+        var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
+        var execUpper = executionInstrument.Trim().ToUpperInvariant();
+        
+        // Get execution instrument policy
+        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalUpper, execUpper);
+        if (execInstPolicy == null)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Execution instrument '{executionInstrument}' not found in execution policy for canonical market '{canonicalInstrument}'. " +
+                $"Execution blocked.");
+        }
+        
+        if (!execInstPolicy.enabled)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Execution instrument '{executionInstrument}' is disabled in execution policy for canonical market '{canonicalInstrument}'. " +
+                $"Execution blocked.");
+        }
+        
+        // Return base_size (policy-controlled quantity)
+        var quantity = execInstPolicy.base_size;
+        
+        if (quantity <= 0)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Invalid quantity {quantity} for execution instrument '{executionInstrument}' in policy. " +
+                $"Quantity must be positive.");
+        }
+        
+        return quantity;
+    }
 
     /// <summary>
-    /// PHASE 3.2: Get order quantity for execution instrument.
-    /// Quantity is code-controlled; Chart Trader quantity is ignored.
+    /// PHASE 4: Get order quantity for execution instrument from execution policy (single-argument overload).
+    /// SECONDARY PATH: Use only for banner/logging, never for stream creation.
+    /// Relies on GetCanonicalInstrument() which could diverge from directive's canonical identity.
     /// </summary>
     /// <param name="executionInstrument">Execution instrument (e.g., "MES", "ES", "NQ")</param>
-    /// <returns>Order quantity for the instrument</returns>
+    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
     /// <exception cref="ArgumentException">If instrument is null or empty</exception>
-    /// <exception cref="InvalidOperationException">If instrument is unknown or quantity <= 0</exception>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
     public int GetOrderQuantity(string executionInstrument)
     {
         if (string.IsNullOrWhiteSpace(executionInstrument))
         {
             throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
         }
-
-        var instrumentTrimmed = executionInstrument.Trim();
         
-        if (!_orderQuantityMap.TryGetValue(instrumentTrimmed, out var quantity))
+        // GetCanonicalInstrument is pure and safe, but use canonical+execution overload for stream creation
+        var canonicalInstrument = GetCanonicalInstrument(executionInstrument);
+        return GetOrderQuantity(canonicalInstrument, executionInstrument);
+    }
+    
+    /// <summary>
+    /// Get order quantity info (baseSize, maxSize) from execution policy.
+    /// </summary>
+    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
+    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
+    /// <returns>Tuple of (baseSize, maxSize) from policy</returns>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument not found, not enabled, or sizes invalid</exception>
+    public (int baseSize, int maxSize) GetOrderQuantityInfo(string canonicalInstrument, string executionInstrument)
+    {
+        if (_executionPolicy == null)
         {
-            // Unknown instrument - fail closed
-            throw new InvalidOperationException(
-                $"PHASE 3.2: Unknown execution instrument '{executionInstrument}'. " +
-                $"No quantity rule defined. Execution blocked.");
+            throw new InvalidOperationException("Execution policy not loaded");
         }
         
-        if (quantity <= 0)
+        var policy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, executionInstrument);
+        if (policy == null)
         {
             throw new InvalidOperationException(
-                $"PHASE 3.2: Invalid quantity {quantity} for execution instrument '{executionInstrument}'. " +
-                $"Quantity must be positive.");
+                $"Execution instrument {executionInstrument} not found in policy for {canonicalInstrument}");
         }
         
-        return quantity;
+        if (!policy.enabled)
+        {
+            throw new InvalidOperationException(
+                $"Execution instrument {executionInstrument} not enabled for {canonicalInstrument}");
+        }
+        
+        if (policy.base_size <= 0 || policy.max_size <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Invalid policy sizes: baseSize={policy.base_size}, maxSize={policy.max_size}");
+        }
+        
+        if (policy.base_size > policy.max_size)
+        {
+            throw new InvalidOperationException(
+                $"Policy violation: baseSize ({policy.base_size}) > maxSize ({policy.max_size})");
+        }
+        
+        return (policy.base_size, policy.max_size);
     }
 
     private (FilePollResult Poll, TimetableContract? Timetable, Exception? ParseException) PollAndParseTimetable(DateTimeOffset utcNow)
@@ -2267,8 +2426,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var streamIdOccurrences = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
-        // PHASE 3.2: Validate order quantities for unique execution instruments before stream creation (fail-closed)
-        // Validate by unique execution instrument, not per stream (multiple streams can share same instrument)
+        // PHASE 4: Validate execution policy for unique execution instruments before stream creation (fail-closed)
+        // Validation logic lives in GetOrderQuantity() - do not duplicate policy rules here
+        // For each enabled directive:
+        //   1. Determine canonical market (already computed in loop below)
+        //   2. Call GetOrderQuantity(canonical, execution) - this validates policy
+        //   3. Aggregate exceptions and fail-closed once
         var uniqueExecutionInstruments = incoming
             .Select(d => (d.instrument ?? "").Trim())
             .Where(i => !string.IsNullOrWhiteSpace(i))
@@ -2280,7 +2443,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             try
             {
-                var qty = GetOrderQuantity(execInst);
+                // Get canonical instrument for this execution instrument
+                var canonicalInst = GetCanonicalInstrument(execInst);
+                
+                // PHASE 4: Call GetOrderQuantity - this validates policy (canonical market exists, instrument enabled, quantity valid)
+                // Do not manually re-encode policy rules here - validation logic must live in exactly one place
+                var qty = GetOrderQuantity(canonicalInst, execInst);
                 // GetOrderQuantity already validates qty > 0, so no double-check needed
             }
             catch (ArgumentException ex)
@@ -2295,14 +2463,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         if (quantityValidationErrors.Count > 0)
         {
-            var errorMsg = $"PHASE 3.2: Order quantity validation failed:\n{string.Join("\n", quantityValidationErrors)}";
+            var errorMsg = $"PHASE 4: Execution policy validation failed:\n{string.Join("\n", quantityValidationErrors)}";
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
-                eventType: "ORDER_QUANTITY_VALIDATION_FAILED", state: "ENGINE",
+                eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
                 new
                 {
                     errors = quantityValidationErrors,
                     unique_execution_instruments = uniqueExecutionInstruments,
-                    note = "Execution blocked due to invalid or unknown execution instruments"
+                    note = "Execution blocked due to execution policy validation failures"
                 }));
             throw new InvalidOperationException(errorMsg);
         }
@@ -2496,13 +2664,38 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     );
                 }
                 
-                // PHASE 3.2: Resolve order quantity for this execution instrument
-                var orderQuantity = GetOrderQuantity(executionInstrument);
+                // PHASE 4: Resolve order quantity from policy (canonical + execution)
+                // Use canonical+execution overload to avoid GetCanonicalInstrument divergence risk
+                // Add assertion that derived canonical matches directive's canonical identity
+                var derivedCanonical = GetCanonicalInstrument(executionInstrument);
+                if (derivedCanonical != canonicalInstrument)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 4 ASSERTION FAILED: GetCanonicalInstrument('{executionInstrument}') returned '{derivedCanonical}' " +
+                        $"but directive canonical is '{canonicalInstrument}'. Canonical identity divergence detected.");
+                }
+                
+                var orderQuantity = GetOrderQuantity(canonicalInstrument, executionInstrument);
+                var (baseSize, maxSize) = GetOrderQuantityInfo(canonicalInstrument, executionInstrument);
                 
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
-                // Pass logging config for diagnostic control
-                // PHASE 3.2: Pass order quantity (code-controlled, Chart Trader ignored)
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, orderQuantity, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
+                // PHASE 4: Pass order quantity (policy-controlled, Chart Trader ignored)
+                // Use named arguments after first optional parameter to avoid future breakage
+                var newSm = new StreamStateMachine(
+                    _time, 
+                    _spec, 
+                    _log, 
+                    _journals, 
+                    tradingDate, 
+                    _lastTimetableHash, 
+                    directive, 
+                    _executionMode, 
+                    orderQuantity, // baseSize (existing parameter)
+                    maxSize, // NEW: maxSize parameter
+                    executionAdapter: _executionAdapter, 
+                    riskGate: _riskGate, 
+                    executionJournal: _executionJournal, 
+                    loggingConfig: _loggingConfig);
                 
                 // PHASE 3: Post-creation assertion - verify stream properties match expectations
                 if (newSm.ExecutionInstrument != executionInstrument)

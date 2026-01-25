@@ -250,11 +250,25 @@ class WatchdogStateManager:
         stuck_streams = []
         now = datetime.now(timezone.utc)
         
+        # Check market status for market-aware stuck detection
+        try:
+            chicago_now = datetime.now(CHICAGO_TZ)
+            market_open = is_market_open(chicago_now)
+        except Exception as e:
+            logger.warning(f"Error checking market status: {e}, defaulting to market_open=True")
+            market_open = True  # Default to open to avoid missing stuck streams
+        
         for (trading_date, stream), info in self._stream_states.items():
             if info.state == "DONE" or info.committed:
                 continue
             
             stuck_duration = (now - info.state_entry_time_utc).total_seconds()
+            
+            # Priority 2: Market-aware stuck detection
+            # Skip stuck detection for ARMED/RANGE_BUILDING if market is closed
+            # (streams should commit at market close, but if they don't, that's a separate issue)
+            if not market_open and info.state in ("ARMED", "RANGE_BUILDING"):
+                continue  # Don't flag as stuck if market is closed
             
             # Special handling for PRE_HYDRATION: streams should transition within ~10 minutes
             # If stuck in PRE_HYDRATION for > 30 minutes, consider it stuck
@@ -269,6 +283,22 @@ class WatchdogStateManager:
                         "state_entry_time_chicago": info.state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat(),
                         "issue": "STUCK_IN_PRE_HYDRATION"
                     })
+            # Priority 1: ARMED State Timeout Extension
+            # ARMED streams can legitimately wait for bars or market open
+            # Use longer timeout: 2 hours (only flag if market is open)
+            elif info.state == "ARMED":
+                armed_timeout = 2 * 60 * 60  # 2 hours
+                if stuck_duration > armed_timeout:
+                    # Only flag as stuck if market is open (waiting during market hours is suspicious)
+                    if market_open:
+                        stuck_streams.append({
+                            "stream": stream,
+                            "instrument": info.instrument if hasattr(info, 'instrument') else "",
+                            "state": info.state,
+                            "stuck_duration_seconds": int(stuck_duration),
+                            "state_entry_time_chicago": info.state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat(),
+                            "issue": "STUCK_IN_ARMED"
+                        })
             elif stuck_duration > STUCK_STREAM_THRESHOLD_SECONDS:
                 stuck_streams.append({
                     "stream": stream,

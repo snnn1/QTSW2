@@ -34,6 +34,12 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     // Fill callback: intentId -> callback action (for protective order submission)
     private readonly ConcurrentDictionary<string, Action<string, decimal, int, DateTimeOffset>> _fillCallbacks = new();
     
+    // Intent policy tracking: intentId -> policy expectation
+    private readonly Dictionary<string, IntentPolicyExpectation> _intentPolicy = new();
+    
+    // Track which intents have already triggered emergency (idempotent)
+    private readonly HashSet<string> _emergencyTriggered = new();
+    
     // NT Account and Instrument references (injected from Strategy host)
     private object? _ntAccount; // NinjaTrader.Cbi.Account
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument
@@ -211,6 +217,28 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
+            
+            // Copy policy expectation from _intentPolicy if available
+            if (_intentPolicy.TryGetValue(intentId, out var expectation))
+            {
+                orderInfo.ExpectedQuantity = expectation.ExpectedQuantity;
+                orderInfo.MaxQuantity = expectation.MaxQuantity;
+                orderInfo.PolicySource = expectation.PolicySource;
+                orderInfo.CanonicalInstrument = expectation.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = expectation.ExecutionInstrument;
+            }
+            else
+            {
+                // Log warning if expectation missing
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "INTENT_POLICY_MISSING_AT_ORDER_CREATE", new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    warning = "Order created but policy expectation not registered"
+                }));
+            }
+            
             _orderMap[intentId] = orderInfo;
             
             var acknowledgedAt = utcNow.AddMilliseconds(50);
@@ -310,6 +338,28 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 IsEntryOrder = true,
                 FilledQuantity = 0
             };
+            
+            // Copy policy expectation from _intentPolicy if available
+            if (_intentPolicy.TryGetValue(intentId, out var expectation))
+            {
+                orderInfo.ExpectedQuantity = expectation.ExpectedQuantity;
+                orderInfo.MaxQuantity = expectation.MaxQuantity;
+                orderInfo.PolicySource = expectation.PolicySource;
+                orderInfo.CanonicalInstrument = expectation.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = expectation.ExecutionInstrument;
+            }
+            else
+            {
+                // Log warning if expectation missing
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "INTENT_POLICY_MISSING_AT_ORDER_CREATE", new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    warning = "Order created but policy expectation not registered"
+                }));
+            }
+            
             _orderMap[intentId] = orderInfo;
 
             var acknowledgedAt = utcNow.AddMilliseconds(50);
@@ -619,6 +669,58 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     internal void RegisterIntent(Intent intent)
     {
         _intentMap[intent.ComputeIntentId()] = intent;
+    }
+    
+    /// <summary>
+    /// Register intent policy expectation for quantity invariant tracking.
+    /// Called by StreamStateMachine after intent creation, before order submission.
+    /// 
+    /// VERIFICATION CHECKLIST:
+    /// 1. Check for INTENT_EXECUTION_EXPECTATION_DECLARED event after intent creation
+    ///    - Should show policy_base_size and policy_max_size matching policy file
+    /// 2. Check for INTENT_POLICY_REGISTERED event in adapter
+    ///    - Should match INTENT_EXECUTION_EXPECTATION_DECLARED values
+    /// 3. Check for ENTRY_SUBMIT_PRECHECK before every order submission
+    ///    - Should show allowed=true for valid submissions
+    ///    - Should show allowed=false and reason for blocked submissions
+    /// 4. Check for ORDER_CREATED_VERIFICATION after CreateOrder()
+    ///    - Should show verified=true for correct orders
+    ///    - Should show verified=false and QUANTITY_MISMATCH_EMERGENCY for mismatches
+    /// 5. Check for INTENT_FILL_UPDATE on every fill
+    ///    - Should show cumulative_filled_qty increasing
+    ///    - Should show overfill=false for normal fills
+    ///    - Should show overfill=true and INTENT_OVERFILL_EMERGENCY for overfills
+    /// 6. Verify end-to-end: policy_base_size → expected_quantity → order_quantity → cumulative_filled_qty
+    ///    - All should match for successful execution
+    /// </summary>
+    internal void RegisterIntentPolicy(
+        string intentId, 
+        int expectedQty, 
+        int maxQty, 
+        string canonical, 
+        string execution, 
+        string policySource = "EXECUTION_POLICY_FILE")
+    {
+        _intentPolicy[intentId] = new IntentPolicyExpectation
+        {
+            ExpectedQuantity = expectedQty,
+            MaxQuantity = maxQty,
+            PolicySource = policySource,
+            CanonicalInstrument = canonical,
+            ExecutionInstrument = execution
+        };
+        
+        // Emit log event
+        _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, execution, 
+            "INTENT_POLICY_REGISTERED", new
+        {
+            intent_id = intentId,
+            canonical_instrument = canonical,
+            execution_instrument = execution,
+            expected_qty = expectedQty,
+            max_qty = maxQty,
+            source = policySource
+        }));
     }
 
     /// <summary>
@@ -985,6 +1087,61 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     }
 
     /// <summary>
+    /// Trigger quantity emergency handler (idempotent).
+    /// Cancels orders, flattens intent, and stands down stream.
+    /// </summary>
+    private void TriggerQuantityEmergency(string intentId, string emergencyType, DateTimeOffset utcNow, Dictionary<string, object> details)
+    {
+        // Idempotent: only trigger once per intent unless reason changes
+        if (_emergencyTriggered.Contains(intentId))
+        {
+            // Already triggered - log but don't repeat actions
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", 
+                $"{emergencyType}_REPEAT", new
+            {
+                intent_id = intentId,
+                note = "Emergency already triggered for this intent"
+            }));
+            return;
+        }
+        
+        _emergencyTriggered.Add(intentId);
+        
+        // Cancel all remaining intent orders
+        CancelIntentOrders(intentId, utcNow);
+        
+        // Flatten intent exposure
+        if (_intentMap.TryGetValue(intentId, out var intent))
+        {
+            Flatten(intentId, intent.Instrument, utcNow);
+        }
+        
+        // Emit emergency log
+        var emergencyPayload = new Dictionary<string, object>(details)
+        {
+            { "intent_id", intentId },
+            { "action_taken", new[] { "CANCEL_ORDERS", "FLATTEN_INTENT" } }
+        };
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", emergencyType, emergencyPayload));
+        
+        // Emit notification (highest priority)
+        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+        if (notificationService != null)
+        {
+            var title = $"EMERGENCY: {emergencyType} - {intentId}";
+            var reason = details.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() ?? "Unknown" : "Unknown";
+            var message = $"Quantity invariant violated: {reason}. Orders cancelled, position flattened.";
+            notificationService.EnqueueNotification($"{emergencyType}:{intentId}", title, message, priority: 2); // Emergency priority
+        }
+        
+        // Stand down stream/intent (via callback)
+        if (_intentMap.TryGetValue(intentId, out var intentForCallback))
+        {
+            _standDownStreamCallback?.Invoke(intentForCallback.Stream, utcNow, emergencyType);
+        }
+    }
+    
+    /// <summary>
     /// Cancel orders for a specific intent only.
     /// </summary>
     public bool CancelIntentOrders(string intentId, DateTimeOffset utcNow)
@@ -1115,5 +1272,24 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         public DateTimeOffset? EntryFillTime { get; set; }
         public bool ProtectiveStopAcknowledged { get; set; }
         public bool ProtectiveTargetAcknowledged { get; set; }
+        
+        // Policy expectation snapshot (copied from _intentPolicy when OrderInfo is created)
+        public int ExpectedQuantity { get; set; }
+        public int MaxQuantity { get; set; }
+        public string PolicySource { get; set; } = "";
+        public string CanonicalInstrument { get; set; } = "";
+        public string ExecutionInstrument { get; set; } = "";
+    }
+    
+    /// <summary>
+    /// Intent policy expectation model for quantity invariant tracking.
+    /// </summary>
+    private sealed class IntentPolicyExpectation
+    {
+        public int ExpectedQuantity { get; set; }
+        public int MaxQuantity { get; set; }
+        public string PolicySource { get; set; } = "EXECUTION_POLICY_FILE";
+        public string CanonicalInstrument { get; set; } = "";
+        public string ExecutionInstrument { get; set; } = "";
     }
 }

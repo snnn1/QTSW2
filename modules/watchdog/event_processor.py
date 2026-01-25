@@ -198,8 +198,9 @@ class EventProcessor:
                     if slot_time_chicago:
                         info.slot_time_chicago = slot_time_chicago
         
-        elif event_type == "STREAM_STAND_DOWN":
+        elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
+            # MARKET_CLOSE_NO_TRADE is treated the same as STREAM_STAND_DOWN
             trading_date = event.get("trading_date")
             stream = event.get("stream")
             instrument = event.get("instrument")
@@ -226,9 +227,11 @@ class EventProcessor:
             
             if trading_date and canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
+                # For MARKET_CLOSE_NO_TRADE, use commit_reason from data, or default to event_type
+                commit_reason = data.get("commit_reason") or data.get("reason") or event_type
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, "DONE", committed=True,
-                    commit_reason=data.get("reason")
+                    commit_reason=commit_reason
                 )
                 # Update instrument info if available
                 if canonical_instrument:
