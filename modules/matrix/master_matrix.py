@@ -438,6 +438,17 @@ class MasterMatrix:
             time_snapshot_keys = None
             logger.warning("Time column missing post-sequencer - sequencer should have set Time column")
         
+        # CONTRACT: ProfitDollars must exist before filter_engine
+        # ProfitDollars is required by filter_engine for stream health gate calculations
+        # DataLoader should have already created it, but ensure it exists as defensive check
+        # (using statistics module helper - not synthesizing here)
+        if 'ProfitDollars' not in df.columns:
+            from .statistics import _ensure_profit_dollars_column_inplace
+            _ensure_profit_dollars_column_inplace(df, contract_multiplier=1.0)
+            logger.warning("ProfitDollars was missing - created by master_matrix (should have been created by data_loader)")
+        else:
+            logger.debug("ProfitDollars column exists (created by data_loader)")
+        
         # Add global columns (applies filters)
         df = self.add_global_columns(df)
         

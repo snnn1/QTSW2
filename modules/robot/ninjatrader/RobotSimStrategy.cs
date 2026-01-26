@@ -33,12 +33,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         private NinjaTraderSimAdapter? _adapter;
         private bool _simAccountVerified = false;
         private bool _engineReady = false; // Single latch: true once engine is fully initialized and ready
-        private Timer? _tickTimer;
-        private readonly object _timerLock = new object();
-        
-        // Heartbeat watchdog: Track last successful Tick() call to detect timer failures
-        private DateTimeOffset _lastSuccessfulTickUtc = DateTimeOffset.MinValue;
-        private const int HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS = 90; // Alert if no Tick() in 90 seconds
         
         // Rate-limiting for timezone detection logging (per instrument)
         private readonly Dictionary<string, DateTimeOffset> _lastTimezoneDetectionLogUtc = new Dictionary<string, DateTimeOffset>();
@@ -175,7 +169,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         // Streams are ready - request historical bars from NinjaTrader for pre-hydration (SIM mode)
                         // CRITICAL FIX: Wrap in try-catch to ensure _engineReady is set even if BarsRequest fails
-                        // This ensures the timer can still call Tick() and emit heartbeats even if BarsRequest fails
+                        // Engine can still process bars and emit heartbeats even if BarsRequest fails
                         try
                         {
                             RequestHistoricalBarsForPreHydration(instrumentNameUpper);
@@ -202,39 +196,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 // ENGINE_READY latch: Set once when all initialization is complete
                 // This flag guards all execution paths to simplify reasoning and reduce repetition
-                // CRITICAL: Set _engineReady even if BarsRequest failed, so timer can call Tick() and emit heartbeats
                 _engineReady = true;
                 Log("Engine ready - all initialization complete", LogLevel.Information);
-                
-                // CRITICAL FIX: Start timer in DataLoaded state for SIM mode
-                // In SIM mode, the strategy may never reach Realtime state if market is closed,
-                // but we still need heartbeats for watchdog monitoring
-                // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
-                StartTickTimer();
-                
-                // Initialize heartbeat watchdog timestamp
-                _lastSuccessfulTickUtc = DateTimeOffset.UtcNow;
             }
             else if (State == State.Realtime)
             {
-                // CRITICAL: Verify engine is ready before starting tick timer
-                // Use ENGINE_READY latch to simplify condition checks
-                if (!_engineReady)
-                {
-                    Log("ERROR: Cannot start tick timer - engine not ready. Engine may not be fully initialized.", LogLevel.Error);
-                    return;
-                }
-                
-                // Start periodic timer for time-based state transitions (decoupled from bar arrivals)
-                // Note: Timer may already be started from DataLoaded state, but StartTickTimer() is idempotent
-                StartTickTimer();
-                
-                // Update heartbeat watchdog timestamp
-                _lastSuccessfulTickUtc = DateTimeOffset.UtcNow;
+                // Engine is ready and strategy is in Realtime state
+                // No timer needed - Tick() is now driven by bar flow
             }
             else if (State == State.Terminated)
             {
-                StopTickTimer();
                 _engine?.Stop();
             }
         }
@@ -838,30 +809,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Deliver bar data to engine (bars only provide market data, not time advancement)
             _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
-            // NOTE: Tick() is now called by timer, not by bar arrivals
-            // This ensures time-based state transitions occur even when no bars arrive
             
-            // HEARTBEAT WATCHDOG: Check if timer is still calling Tick()
-            // If no Tick() in HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS, timer may have stopped
-            if (_engineReady && _lastSuccessfulTickUtc != DateTimeOffset.MinValue)
-            {
-                var elapsedSinceLastTick = (nowUtc - _lastSuccessfulTickUtc).TotalSeconds;
-                if (elapsedSinceLastTick > HEARTBEAT_WATCHDOG_THRESHOLD_SECONDS)
-                {
-                    Log($"WARNING: Tick timer appears to have stopped. Last successful Tick() was {elapsedSinceLastTick:.1f} seconds ago. Attempting to restart timer.", LogLevel.Warning);
-                    // Attempt to restart timer
-                    lock (_timerLock)
-                    {
-                        if (_tickTimer != null)
-                        {
-                            _tickTimer.Dispose();
-                            _tickTimer = null;
-                        }
-                        StartTickTimer();
-                        _lastSuccessfulTickUtc = nowUtc; // Reset watchdog timestamp
-                    }
-                }
-            }
+            // PATTERN 1: Drive Tick() from bar flow (bar-driven liveness)
+            // Tick() is now invoked only when bars arrive, not from a synthetic timer
+            _engine.Tick(nowUtc);
         }
 
         /// <summary>
@@ -900,97 +851,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             _adapter.HandleExecutionUpdate(e.Execution, e.Execution.Order);
         }
 
-        /// <summary>
-        /// Start periodic timer that calls Engine.Tick() every 1 second.
-        /// Timer ensures time-based state transitions occur even when no bars arrive.
-        /// </summary>
-        private void StartTickTimer()
-        {
-            lock (_timerLock)
-            {
-                if (_tickTimer != null)
-                {
-                    // Timer already started, ignore
-                    return;
-                }
-
-                // Create timer that fires every 1 second
-                // Timer callback must be thread-safe and never throw
-                _tickTimer = new Timer(TickTimerCallback, null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
-                Log("Tick timer started (1 second interval)", LogLevel.Information);
-            }
-        }
-
-        /// <summary>
-        /// Stop and dispose the tick timer.
-        /// </summary>
-        private void StopTickTimer()
-        {
-            lock (_timerLock)
-            {
-                if (_tickTimer != null)
-                {
-                    _tickTimer.Dispose();
-                    _tickTimer = null;
-                    Log("Tick timer stopped", LogLevel.Information);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Timer callback: calls Engine.Tick() with current UTC time.
-        /// Must be thread-safe, non-blocking, and never throw exceptions.
-        /// </summary>
-        private void TickTimerCallback(object? state)
-        {
-            try
-            {
-                // CRITICAL: Use ENGINE_READY latch to guard execution
-                // This simplifies reasoning and reduces repetition of multiple condition checks
-                if (!_engineReady || _engine is null)
-                {
-                    // Log error only if engine was ready before (to avoid spam on startup)
-                    if (_engineReady && _engine == null)
-                    {
-                        Log("ERROR: Tick timer callback called but engine became null after initialization", LogLevel.Error);
-                    }
-                    return;
-                }
-                
-                var utcNow = DateTimeOffset.UtcNow;
-                
-                // CRITICAL: Call Tick() unconditionally - heartbeat emission is handled inside Tick()
-                // Tick() will emit heartbeats even if engine is not trading-ready
-                _engine.Tick(utcNow);
-                
-                // Update heartbeat watchdog timestamp on successful Tick() call
-                _lastSuccessfulTickUtc = utcNow;
-            }
-            catch (Exception ex)
-            {
-                // Log but never throw - timer callbacks must not throw exceptions
-                // CRITICAL: Log full exception details to diagnose why Tick() might be failing
-                Log($"ERROR in tick timer callback: {ex.Message}\nStack trace: {ex.StackTrace}", LogLevel.Error);
-                
-                // CRITICAL: If timer callback fails repeatedly, NinjaTrader may stop calling it
-                // Try to restart the timer as a defensive measure
-                try
-                {
-                    lock (_timerLock)
-                    {
-                        if (_tickTimer != null)
-                        {
-                            // Timer still exists but callback is failing - log warning
-                            Log("WARNING: Timer callback failed but timer still exists. Timer may stop calling callback.", LogLevel.Warning);
-                        }
-                    }
-                }
-                catch
-                {
-                    // Ignore errors in defensive restart attempt
-                }
-            }
-        }
 
         protected override void OnConnectionStatusUpdate(ConnectionStatusEventArgs connectionStatusUpdate)
         {

@@ -25,7 +25,29 @@ export function useWatchdogStatus() {
       return
     }
     if (data) {
-      setStatus(data)
+      // Only update state if data actually changed (prevent unnecessary re-renders)
+      setStatus(prevStatus => {
+        // Deep equality check - only update if data actually changed
+        if (prevStatus) {
+          // Quick reference check first
+          if (prevStatus === data) {
+            return prevStatus
+          }
+          // Compare key fields that change frequently
+          if (
+            prevStatus.timestamp_chicago === data.timestamp_chicago &&
+            prevStatus.engine_activity_state === data.engine_activity_state &&
+            prevStatus.market_open === data.market_open &&
+            prevStatus.engine_alive === data.engine_alive &&
+            prevStatus.last_engine_tick_chicago === data.last_engine_tick_chicago &&
+            JSON.stringify(prevStatus.data_stall_detected) === JSON.stringify(data.data_stall_detected) &&
+            JSON.stringify(prevStatus.stuck_streams) === JSON.stringify(data.stuck_streams)
+          ) {
+            return prevStatus // Return previous reference if unchanged
+          }
+        }
+        return data
+      })
       setError(null)
       hasLoadedRef.current = true
     }

@@ -3,7 +3,7 @@
  * Scrollable list of last ~200 events, sorted by event_seq ASC
  */
 import { memo, useRef, useEffect } from 'react'
-import { formatChicagoTimeWithMs } from '../../utils/timeUtils'
+import { formatChicagoDateTime } from '../../utils/timeUtils'
 import { getEventLevel, extractEventMessage } from '../../utils/eventUtils'
 import type { WatchdogEvent } from '../../types/watchdog'
 
@@ -78,7 +78,7 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
         <table className="w-full text-sm">
           <thead className="bg-gray-700 sticky top-0">
             <tr>
-              <th className="px-2 py-1 text-left">Time (CT)</th>
+              <th className="px-2 py-1 text-left">Date & Time (CT)</th>
               <th className="px-2 py-1 text-left">Level</th>
               <th className="px-2 py-1 text-left">Stream</th>
               <th className="px-2 py-1 text-left">Event Type</th>
@@ -98,7 +98,7 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
                   className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
                 >
                   <td className="px-2 py-1 font-mono text-xs">
-                    {formatChicagoTimeWithMs(event.timestamp_chicago)}
+                    {formatChicagoDateTime(event.timestamp_chicago)}
                   </td>
                   <td className="px-2 py-1">
                     <span className={`px-1 py-0.5 rounded text-xs ${getLevelBadgeColor(level)}`}>

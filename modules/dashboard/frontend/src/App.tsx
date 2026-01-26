@@ -1,5 +1,12 @@
 /**
- * App.tsx - Main app with routing
+ * @deprecated This combined app is deprecated. Use AppDashboard.tsx or AppWatchdog.tsx instead.
+ * Kept for dev/testing purposes only.
+ * 
+ * To run separate apps:
+ * - Dashboard: npm run dev:dashboard (port 5173)
+ * - Watchdog: npm run dev:watchdog (port 5174)
+ * 
+ * App.tsx - Main app with routing (DEPRECATED)
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { WebSocketProvider } from './contexts/WebSocketContext'
@@ -14,7 +21,7 @@ function App() {
     <WebSocketProvider>
       <BrowserRouter>
         <Routes>
-          <Route path="/" element={<Navigate to="/watchdog" replace />} />
+          <Route path="/" element={<Navigate to="/pipeline" replace />} />
           <Route path="/watchdog" element={<WatchdogPage />} />
           <Route path="/journal" element={<JournalPage />} />
           <Route path="/summary" element={<SummaryPage />} />

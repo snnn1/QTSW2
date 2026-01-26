@@ -128,8 +128,7 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
           const dollarValue = profitValue * contractValue
           value = currencyFormatter.format(dollarValue)
         }
-        // Format stream_rolling_sum as currency (dollars)
-        if (col === 'stream_rolling_sum') {
+        if (false) { // Removed health gate column formatting
           if (value !== null && value !== undefined && value !== '') {
             const numValue = typeof value === 'number' ? value : parseFloat(value)
             if (!isNaN(numValue) && isFinite(numValue)) {
@@ -308,8 +307,7 @@ const DataTable = memo(function DataTable({
       'Result': 70,
       'Profit': 80,
       'Time Change': 100,
-      'Profit ($)': 120,
-      'stream_rolling_sum': 130
+      'Profit ($)': 120
     }
     return widths[col] || 120
   }
@@ -322,8 +320,7 @@ const DataTable = memo(function DataTable({
       <div className="flex bg-gray-800 sticky top-0 z-10 border-b border-gray-700" style={{ width: `${totalWidth}px` }}>
         {columnsToShow.map(col => {
           // Map column names to display names
-          const displayName = col === 'StopLoss' ? 'Stop Loss' : 
-                             col === 'stream_rolling_sum' ? 'Rolling Sum ($)' : col
+          const displayName = col === 'StopLoss' ? 'Stop Loss' : col
           return (
             <div 
               key={col} 

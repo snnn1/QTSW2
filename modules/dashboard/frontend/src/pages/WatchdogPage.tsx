@@ -17,7 +17,7 @@ import { useStreamStates } from '../hooks/useStreamStates'
 import { useActiveIntents } from '../hooks/useActiveIntents'
 import { useStreamPnl } from '../hooks/useStreamPnl'
 import { getCurrentChicagoTime } from '../utils/timeUtils'
-import { NavigationBar } from '../components/shared/NavigationBar'
+import { WatchdogNavigationBar } from '../components/shared/WatchdogNavigationBar'
 import type { StreamState, WatchdogEvent } from '../types/watchdog'
 
 export function WatchdogPage() {
@@ -64,7 +64,7 @@ export function WatchdogPage() {
     return timestamps.length > 0 ? Math.max(...timestamps) : null
   }, [statusPollTime, eventsPollTime, gatesPollTime, positionsPollTime, streamsPollTime, intentsPollTime])
   
-  // Determine engine status
+  // Determine engine status - memoized to prevent unnecessary recalculations
   const engineStatus = useMemo(() => {
     if (!status) return 'STALLED'
 
@@ -72,19 +72,25 @@ export function WatchdogPage() {
     if (status.recovery_state === 'DISCONNECT_FAIL_CLOSED') return 'FAIL_CLOSED'
     if (status.recovery_state === 'RECOVERY_RUNNING') return 'RECOVERY_IN_PROGRESS'
 
+    // PATTERN 1: Handle bar-driven states
     switch (status.engine_activity_state) {
       case 'ACTIVE':
+      case 'ENGINE_ACTIVE_PROCESSING':
         return 'ALIVE'
       case 'IDLE_MARKET_CLOSED':
+      case 'ENGINE_MARKET_CLOSED':
+      case 'ENGINE_IDLE_WAITING_FOR_DATA':
         return 'IDLE_MARKET_CLOSED'
       case 'STALLED':
+      case 'ENGINE_STALLED':
         return 'STALLED'
       default:
-        return 'STALLED'
+        // Default to IDLE if unknown (safer than STALLED)
+        return 'IDLE_MARKET_CLOSED'
     }
-  }, [status])
+  }, [status?.recovery_state, status?.engine_activity_state]) // Only depend on fields that affect result
   
-  // Determine data flow status
+  // Determine data flow status - memoized with stable dependencies
   const dataFlowStatus = useMemo(() => {
     if (!status) return 'UNKNOWN'
     
@@ -115,7 +121,7 @@ export function WatchdogPage() {
     
     // No stalls detected = data flowing
     return 'FLOWING'
-  }, [status])
+  }, [status?.data_stall_detected, status?.market_open]) // Only depend on fields that affect result
   
   // Build critical alerts
   const alerts = useMemo(() => {
@@ -131,12 +137,23 @@ export function WatchdogPage() {
       })
     }
     
-    if (status.engine_activity_state === 'STALLED') {
-      result.push({
-        type: 'critical',
-        message: 'ENGINE TICK STALL DETECTED (Market Open)',
-        scrollTo: 'watchdog-header'
-      })
+    // PATTERN 1: Only show stall alert if bars are expected but absent
+    if (status.engine_activity_state === 'STALLED' || status.engine_activity_state === 'ENGINE_STALLED') {
+      const barsExpected = status.bars_expected_count || 0
+      if (barsExpected > 0) {
+        result.push({
+          type: 'critical',
+          message: `ENGINE STALLED: ${barsExpected} instrument(s) expecting bars but none received`,
+          scrollTo: 'watchdog-header'
+        })
+      } else {
+        // No bars expected - this shouldn't happen, but handle gracefully
+        result.push({
+          type: 'critical',
+          message: 'ENGINE STALLED (No bars expected - check configuration)',
+          scrollTo: 'watchdog-header'
+        })
+      }
     }
     
     const stalls = Object.values(status.data_stall_detected || {})
@@ -187,9 +204,11 @@ export function WatchdogPage() {
         chicagoTime={chicagoTime}
         lastEngineTick={status?.last_engine_tick_chicago || null}
         lastSuccessfulPollTimestamp={lastSuccessfulPollTimestamp}
+        barsExpectedCount={status?.bars_expected_count}
+        worstLastBarAgeSeconds={status?.worst_last_bar_age_seconds}
       />
       
-      <NavigationBar />
+      <WatchdogNavigationBar />
       
       <CriticalAlertBanner alerts={alerts} />
       

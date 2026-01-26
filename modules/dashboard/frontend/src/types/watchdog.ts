@@ -5,7 +5,7 @@
 export interface WatchdogStatus {
   timestamp_chicago: string;
   engine_alive: boolean;
-  engine_activity_state: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED';
+  engine_activity_state: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED' | 'ENGINE_ACTIVE_PROCESSING' | 'ENGINE_MARKET_CLOSED' | 'ENGINE_IDLE_WAITING_FOR_DATA' | 'ENGINE_STALLED';
   last_engine_tick_chicago: string | null;
   engine_tick_stall_detected: boolean;
   recovery_state: string;
@@ -21,6 +21,9 @@ export interface WatchdogStatus {
   last_identity_invariants_pass: boolean | null;
   last_identity_invariants_event_chicago: string | null;
   last_identity_violations: string[];
+  // PATTERN 1: Bars expected observability
+  bars_expected_count?: number;
+  worst_last_bar_age_seconds?: number | null;
 }
 
 export interface StreamStuckInfo {

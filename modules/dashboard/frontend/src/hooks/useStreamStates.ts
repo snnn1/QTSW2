@@ -25,7 +25,15 @@ export function useStreamStates() {
       return
     }
     if (data) {
-      setStreams(data.streams || [])
+      // Only update state if data actually changed (prevent unnecessary re-renders)
+      setStreams(prevStreams => {
+        const newStreams = data.streams || []
+        if (prevStreams.length === newStreams.length && 
+            JSON.stringify(prevStreams) === JSON.stringify(newStreams)) {
+          return prevStreams // Return previous reference if unchanged
+        }
+        return newStreams
+      })
       setError(null)
       hasLoadedRef.current = true
     }

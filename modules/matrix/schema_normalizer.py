@@ -172,6 +172,14 @@ def create_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     if 'pnl' not in df.columns:
         df['pnl'] = df['Profit']
     
+    # ProfitDollars - computed from Profit * contract_value * contract_multiplier
+    # This is a derived column required by filter_engine for stream health gate calculations
+    # Created here alongside other derived columns (R, pnl, etc.)
+    if 'ProfitDollars' not in df.columns:
+        from .statistics import _ensure_profit_dollars_column_inplace
+        _ensure_profit_dollars_column_inplace(df, contract_multiplier=1.0)
+        logger.debug("ProfitDollars column created by schema_normalizer (derived column)")
+    
     # rs_value (Rolling Sum value - would need to calculate from sequential processor)
     if 'rs_value' not in df.columns:
         df['rs_value'] = np.nan

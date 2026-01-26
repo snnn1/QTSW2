@@ -26,7 +26,15 @@ export function useUnprotectedPositions() {
       return
     }
     if (data) {
-      setPositions(data.unprotected_positions || [])
+      // Only update state if data actually changed (prevent unnecessary re-renders)
+      setPositions(prevPositions => {
+        const newPositions = data.unprotected_positions || []
+        if (prevPositions.length === newPositions.length && 
+            JSON.stringify(prevPositions) === JSON.stringify(newPositions)) {
+          return prevPositions // Return previous reference if unchanged
+        }
+        return newPositions
+      })
       setError(null)
       hasLoadedRef.current = true
     }

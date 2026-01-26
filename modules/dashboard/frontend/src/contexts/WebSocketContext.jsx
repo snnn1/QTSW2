@@ -7,6 +7,16 @@
  * - Lives for the lifetime of the dashboard
  * - Never recreated unless actually closed
  * - All components consume events via context
+ * 
+ * SUBSCRIPTION SCOPE:
+ * - Dashboard App (AppDashboard.tsx): Subscribes to pipeline-relevant events
+ *   - Can use run_id filtering if needed: /ws/events?run_id=<run_id>
+ *   - Primary events: pipeline stage events, state changes, run lifecycle
+ * - Watchdog App (AppWatchdog.tsx): Subscribes to all events
+ *   - Uses /ws/events (no filtering) to receive all events
+ *   - Primary events: watchdog events, robot events, execution journal events
+ * 
+ * This explicit scoping prevents accidental coupling between apps.
  */
 
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react'
@@ -44,6 +54,9 @@ export function WebSocketProvider({ children }) {
   // Exponential backoff state
   const reconnectAttemptsRef = useRef(0)
   const stableConnectionTimeoutRef = useRef(null)
+  
+  // Tab visibility tracking - prevents reconnection attempts when tab is hidden
+  const isTabVisibleRef = useRef(!document.hidden)
 
   // Subscribe to events (components can register callbacks)
   const subscribe = useCallback((callback) => {
@@ -196,6 +209,12 @@ export function WebSocketProvider({ children }) {
 
   // Connect WebSocket (singleton - created once)
   const connect = useCallback(() => {
+    // Don't attempt connection if tab is hidden
+    if (!isTabVisibleRef.current) {
+      console.log('[WS] Tab is hidden, skipping connection attempt')
+      return
+    }
+    
     // Clear any pending reconnect
     if (reconnectTimerRef.current) {
       clearTimeout(reconnectTimerRef.current)
@@ -211,8 +230,15 @@ export function WebSocketProvider({ children }) {
     // This fixes connection failures when proxy is unstable
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     // Use direct backend URL in development, fallback to proxy in production
-    const isDev = window.location.hostname === 'localhost' && window.location.port === '5173'
+    // Note: Both Dashboard (5173) and Watchdog (5174) apps connect to same backend
+    const isDev = (window.location.hostname === 'localhost' && 
+                   (window.location.port === '5173' || window.location.port === '5174'))
     const backendHost = isDev ? 'localhost:8001' : window.location.host
+    
+    // SUBSCRIPTION SCOPE:
+    // - Dashboard app: Could filter by run_id if needed: /ws/events?run_id=<run_id>
+    // - Watchdog app: Subscribe to all events: /ws/events
+    // Currently both use /ws/events (all events), but intent is explicit above
     const wsUrl = `${protocol}//${backendHost}/ws/events`
 
     console.log(`[WS] Connecting to ${wsUrl}`)
@@ -273,19 +299,30 @@ export function WebSocketProvider({ children }) {
         }
 
         // Exponential backoff reconnection logic
-        if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
-          console.error(`[WS] Max reconnection attempts (${maxReconnectAttempts}) reached. Stopping reconnection.`)
+        // Skip reconnection if tab is hidden
+        if (!isTabVisibleRef.current) {
+          console.log('[WS] Tab is hidden, skipping reconnection attempt')
           return
         }
         
-        // Calculate exponential backoff delay: start at 1s, double each retry, max 30s
-        const delayMs = Math.min(baseDelayMs * Math.pow(2, reconnectAttemptsRef.current), maxDelayMs)
+        if (reconnectAttemptsRef.current >= WS_RECONNECT_MAX_ATTEMPTS) {
+          console.error(`[WS] Max reconnection attempts (${WS_RECONNECT_MAX_ATTEMPTS}) reached. Stopping reconnection.`)
+          return
+        }
+        
+        // Calculate exponential backoff delay: start at base delay, double each retry, max delay
+        const delayMs = Math.min(WS_RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttemptsRef.current), WS_RECONNECT_MAX_DELAY)
         reconnectAttemptsRef.current += 1
         
         console.log(`[WS] Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${WS_RECONNECT_MAX_ATTEMPTS} in ${Math.round(delayMs)}ms...`)
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null
-          connect()
+          // Check visibility again before attempting connection
+          if (isTabVisibleRef.current) {
+            connect()
+          } else {
+            console.log('[WS] Tab still hidden, skipping scheduled reconnect')
+          }
         }, delayMs)
       }
 
@@ -299,6 +336,12 @@ export function WebSocketProvider({ children }) {
       setIsConnected(false)
 
       // Exponential backoff retry logic (same as onclose)
+      // Skip reconnection if tab is hidden
+      if (!isTabVisibleRef.current) {
+        console.log('[WS] Tab is hidden, skipping reconnection attempt after error')
+        return
+      }
+      
       if (reconnectAttemptsRef.current >= WS_RECONNECT_MAX_ATTEMPTS) {
         console.error(`[WS] Max reconnection attempts (${WS_RECONNECT_MAX_ATTEMPTS}) reached. Stopping reconnection.`)
         return
@@ -310,10 +353,87 @@ export function WebSocketProvider({ children }) {
       console.log(`[WS] Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${WS_RECONNECT_MAX_ATTEMPTS} in ${Math.round(delayMs)}ms...`)
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null
-        connect()
+        // Check visibility again before attempting connection
+        if (isTabVisibleRef.current) {
+          connect()
+        } else {
+          console.log('[WS] Tab still hidden, skipping scheduled reconnect')
+        }
       }, delayMs)
     }
   }, [handleEvent])
+
+  // Handle tab visibility changes
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      const isVisible = !document.hidden
+      isTabVisibleRef.current = isVisible
+      
+      if (isVisible) {
+        console.log('[WS] Tab became visible, checking connection status')
+        // Tab became visible - check connection and reconnect if needed
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          console.log('[WS] Connection not open, attempting to reconnect')
+          // Reset reconnection attempts when tab becomes visible
+          reconnectAttemptsRef.current = 0
+          connect()
+        } else {
+          console.log('[WS] Connection already open')
+        }
+      } else {
+        console.log('[WS] Tab became hidden, pausing reconnection attempts')
+        // Tab became hidden - pause reconnection attempts but keep connection open if possible
+        // Clear any pending reconnection timers
+        if (reconnectTimerRef.current) {
+          clearTimeout(reconnectTimerRef.current)
+          reconnectTimerRef.current = null
+        }
+        // Don't close the connection - let it stay open in case tab becomes visible again quickly
+      }
+    }
+    
+    // Listen for visibility changes
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [connect])
+
+  // Handle page unload - ensure clean WebSocket closure
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      console.log('[WS] Page unloading, closing WebSocket connection')
+      // Clear reconnection timers
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      
+      if (stableConnectionTimeoutRef.current) {
+        clearTimeout(stableConnectionTimeoutRef.current)
+        stableConnectionTimeoutRef.current = null
+      }
+      
+      // Close WebSocket connection cleanly
+      if (wsRef.current) {
+        try {
+          if (wsRef.current.readyState !== WebSocket.CLOSED) {
+            wsRef.current.close(1000, 'Page unloading')
+          }
+        } catch (e) {
+          // Ignore errors during unload
+        }
+        wsRef.current = null
+      }
+    }
+    
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+    }
+  }, [])
 
   // Initialize WebSocket on mount (singleton - created once)
   useEffect(() => {

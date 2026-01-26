@@ -34,24 +34,35 @@ export function formatChicagoTimeWithMs(date: Date | string): string {
 }
 
 /**
- * Format date as full Chicago datetime (YYYY-MM-DD HH:mm:ss CT)
+ * Format date as full Chicago datetime (YYYY-MM-DD HH:mm:ss.mmm CT)
  */
 export function formatChicagoDateTime(date: Date | string): string {
   const d = typeof date === 'string' ? new Date(date) : date
-  const dateStr = d.toLocaleDateString('en-US', {
+  
+  // Use Intl.DateTimeFormat for consistent formatting
+  const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Chicago',
     year: 'numeric',
     month: '2-digit',
-    day: '2-digit'
-  })
-  const timeStr = d.toLocaleTimeString('en-US', {
-    timeZone: 'America/Chicago',
-    hour12: false,
+    day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit'
+    second: '2-digit',
+    hour12: false
   })
-  return `${dateStr} ${timeStr} CT`
+  
+  const parts = formatter.formatToParts(d)
+  const year = parts.find(p => p.type === 'year')?.value || '0000'
+  const month = parts.find(p => p.type === 'month')?.value || '01'
+  const day = parts.find(p => p.type === 'day')?.value || '01'
+  const hour = parts.find(p => p.type === 'hour')?.value || '00'
+  const minute = parts.find(p => p.type === 'minute')?.value || '00'
+  const second = parts.find(p => p.type === 'second')?.value || '00'
+  
+  // Add milliseconds
+  const ms = String(d.getMilliseconds()).padStart(3, '0')
+  
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}.${ms} CT`
 }
 
 /**

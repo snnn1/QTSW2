@@ -581,6 +581,7 @@ export function useMatrixController({
   return {
     // Backend data state
     masterData,
+    setMasterData, // Expose setMasterData for loadMoreRows function
     masterLoading,
     masterError,
     availableYearsFromAPI,

@@ -166,22 +166,30 @@ class TimetableEngine:
                 
                 all_trades.append(df)
             except Exception as e:
-                # Re-raise ValueError (contract violations)
+                # Log contract violations but continue (don't fail entire timetable generation)
+                # This allows timetable to be generated even if some files have issues
                 if isinstance(e, ValueError):
-                    raise
+                    logger.warning(
+                        f"Contract violation in {file_path.name}: {e}. "
+                        f"Skipping this file (timetable generation will continue with available data)."
+                    )
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+                    continue
                 # Log other errors but continue
                 logger.warning(f"Error loading {file_path}: {e}")
                 import traceback
                 logger.debug(f"Traceback: {traceback.format_exc()}")
                 continue
         
-        # CONTRACT ENFORCEMENT: No valid data → ValueError
+        # Handle missing data gracefully - return empty dict instead of raising error
+        # This allows timetable generation to continue even if some streams have no data
         if not all_trades:
-            raise ValueError(
+            logger.warning(
                 f"Stream {stream_id} session {session}: No valid trade data found for RS calculation. "
-                f"This violates analyzer output contract. "
-                f"Ensure analyzer output files have trade_date column and valid data."
+                f"Returning empty RS values (will use default time slot)."
             )
+            return {}
         
         # Merge and filter by session
         df = pd.concat(all_trades, ignore_index=True)
@@ -413,7 +421,14 @@ class TimetableEngine:
                 scf_s1, scf_s2 = scf_cache[stream_id]
                 
                 # Select best time based on RS
-                selected_time, time_reason = self.select_best_time(stream_id, session)
+                try:
+                    selected_time, time_reason = self.select_best_time(stream_id, session)
+                except Exception as e:
+                    logger.warning(f"Error selecting best time for {stream_id} {session}: {e}")
+                    # Fallback to default time on error
+                    available_times = self.session_time_slots.get(session, [])
+                    selected_time = available_times[0] if available_times else ""
+                    time_reason = f"error_fallback_{str(e)[:50]}"
                 
                 # CRITICAL: If time selection fails, use default time and mark as blocked
                 # NEVER skip streams - all streams must be present in timetable

@@ -236,6 +236,32 @@ class WatchdogStateManager:
         if keys_to_remove:
             logger.info(f"Cleaned up {len(keys_to_remove)} stale stream(s) (current_trading_date: {current_trading_date})")
     
+    def bars_expected(self, instrument: str, market_open: bool) -> bool:
+        """
+        PATTERN 1: Determine if bars are expected for an instrument.
+        Bars are expected if:
+        - market_open == True, AND
+        - at least one stream for that instrument is in a bar-dependent state.
+        
+        Bar-dependent states: PRE_HYDRATION, ARMED, RANGE_BUILDING, RANGE_LOCKED
+        Excluded states: DONE, COMMITTED, NO_TRADE, INVALIDATED
+        """
+        if not market_open:
+            return False
+        
+        # Check if any stream for this instrument is in a bar-dependent state
+        bar_dependent_states = {"PRE_HYDRATION", "ARMED", "RANGE_BUILDING", "RANGE_LOCKED"}
+        excluded_states = {"DONE", "COMMITTED", "NO_TRADE", "INVALIDATED"}
+        
+        for (trading_date, stream), info in self._stream_states.items():
+            # Check if this stream is for the given instrument
+            # Note: info.instrument may be canonical instrument
+            if info.instrument == instrument or stream.upper().startswith(instrument.upper()):
+                if info.state in bar_dependent_states and not info.committed:
+                    return True
+        
+        return False
+    
     def compute_engine_alive(self) -> bool:
         """Compute engine_alive derived field."""
         if self._last_engine_tick_utc is None:
@@ -317,9 +343,11 @@ class WatchdogStateManager:
         
         stream_armed = []
         for (trading_date, stream), info in self._stream_states.items():
+            # PATTERN 1: A stream is "armed" only when it's in the ARMED state
+            # Not when it's in PRE_HYDRATION, RANGE_BUILDING, etc.
             stream_armed.append({
                 "stream": stream,
-                "armed": not info.committed and info.state != "DONE"
+                "armed": info.state == "ARMED" and not info.committed
             })
         
         # Validate slot time against allowed slot times for each stream's session
@@ -383,21 +411,68 @@ class WatchdogStateManager:
             logger.warning(f"Error computing market_open: {e}, defaulting to False", exc_info=True)
             market_open = False
         
-        # Compute engine_activity_state (market-aware)
-        seconds_since_last_tick = (
-            (now - self._last_engine_tick_utc).total_seconds()
-            if self._last_engine_tick_utc
-            else None
+        # PATTERN 1: Compute engine_activity_state using bars_expected contract
+        # Determine which instruments have bars_expected
+        instruments_with_bars_expected = []
+        all_instruments = set(self._last_bar_utc_by_instrument.keys()) | set(
+            info.instrument for info in self._stream_states.values() if info.instrument
         )
+        for instrument in all_instruments:
+            if self.bars_expected(instrument, market_open):
+                instruments_with_bars_expected.append(instrument)
         
-        if market_open:
-            if seconds_since_last_tick is None or seconds_since_last_tick > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+        # Compute engine_activity_state based on bars_expected and last bar times
+        # Map to frontend-expected states: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED'
+        if not market_open:
+            # Market closed - no bars expected, engine is idle
+            engine_activity_state = "IDLE_MARKET_CLOSED"
+        elif not instruments_with_bars_expected:
+            # Market open but no streams require bars (waiting for range windows)
+            # This is IDLE, not STALLED - streams will activate when their windows arrive
+            engine_activity_state = "IDLE_MARKET_CLOSED"  # Use same state as market closed for UI consistency
+        else:
+            # Market open and at least one instrument requires bars
+            # Check if any instrument with bars_expected is missing bars beyond threshold
+            worst_bar_age = None
+            stalled_instruments = []
+            
+            # PATTERN 1: Grace period for initial bar arrival
+            # Only declare stalled if:
+            # 1. No bars received for an instrument that expects bars, AND
+            # 2. Enough time has passed since engine start (grace period)
+            # OR bars were received but stopped (actual stall)
+            engine_start_time = None
+            if self._last_engine_tick_utc:
+                # Use last engine tick as proxy for engine start time
+                # If we have engine ticks, engine has been running
+                engine_start_time = self._last_engine_tick_utc
+            
+            # Grace period: 5 minutes after engine start before declaring stall
+            GRACE_PERIOD_SECONDS = 300  # 5 minutes
+            engine_running_time = (now - engine_start_time).total_seconds() if engine_start_time else 0
+            grace_period_active = engine_running_time < GRACE_PERIOD_SECONDS
+            
+            for instrument in instruments_with_bars_expected:
+                last_bar_utc = self._last_bar_utc_by_instrument.get(instrument)
+                if last_bar_utc:
+                    # Bars were received - check if they stopped
+                    bar_age = (now - last_bar_utc).total_seconds()
+                    if worst_bar_age is None or bar_age > worst_bar_age:
+                        worst_bar_age = bar_age
+                    if bar_age > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+                        stalled_instruments.append(instrument)
+                else:
+                    # No bars received yet for this instrument
+                    # Only declare stalled if grace period has elapsed
+                    if not grace_period_active:
+                        worst_bar_age = float('inf')
+                        stalled_instruments.append(instrument)
+                    # During grace period, don't mark as stalled - engine may be starting up
+            
+            if stalled_instruments:
                 engine_activity_state = "STALLED"
             else:
                 engine_activity_state = "ACTIVE"
-        else:
-            # Market closed — lack of ticks is acceptable
-            engine_activity_state = "IDLE_MARKET_CLOSED"
         
         data_stall_detected = {}
         for instrument, last_bar_utc in self._last_bar_utc_by_instrument.items():
@@ -413,9 +488,33 @@ class WatchdogStateManager:
                 "market_open": market_open
             }
         
+        # PATTERN 1: Additional observability (recommended)
+        # Count instruments where bars_expected == True and worst last_bar_age
+        bars_expected_count = len(instruments_with_bars_expected)
+        worst_last_bar_age_seconds = None
+        if instruments_with_bars_expected:
+            for instrument in instruments_with_bars_expected:
+                last_bar_utc = self._last_bar_utc_by_instrument.get(instrument)
+                if last_bar_utc:
+                    bar_age = (now - last_bar_utc).total_seconds()
+                    if worst_last_bar_age_seconds is None or bar_age > worst_last_bar_age_seconds:
+                        worst_last_bar_age_seconds = bar_age
+        
+        # PATTERN 1: Map internal states to frontend-expected states
+        # Frontend expects: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED'
+        frontend_engine_state = engine_activity_state
+        if engine_activity_state == "ENGINE_MARKET_CLOSED":
+            frontend_engine_state = "IDLE_MARKET_CLOSED"
+        elif engine_activity_state == "ENGINE_IDLE_WAITING_FOR_DATA":
+            frontend_engine_state = "IDLE_MARKET_CLOSED"  # Use same state for UI consistency
+        elif engine_activity_state == "ENGINE_STALLED":
+            frontend_engine_state = "STALLED"
+        elif engine_activity_state == "ENGINE_ACTIVE_PROCESSING":
+            frontend_engine_state = "ACTIVE"
+        
         return {
             "engine_alive": engine_alive,
-            "engine_activity_state": engine_activity_state,
+            "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values
             "last_engine_tick_chicago": (
                 self._last_engine_tick_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_engine_tick_utc else None
@@ -433,6 +532,9 @@ class WatchdogStateManager:
             "protective_failures_count": len(self._protective_failure_events),
             "data_stall_detected": data_stall_detected,
             "market_open": market_open,  # Always included, even if error occurred
+            # PATTERN 1: Bars expected observability
+            "bars_expected_count": bars_expected_count,
+            "worst_last_bar_age_seconds": worst_last_bar_age_seconds,
             # PHASE 3.1: Identity invariants status
             "last_identity_invariants_pass": self._last_identity_invariants_pass,
             "last_identity_invariants_event_chicago": (

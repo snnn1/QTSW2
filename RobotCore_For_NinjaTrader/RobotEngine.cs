@@ -83,9 +83,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
     private int BAR_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.enable_diagnostic_logs ? 1 : 5; // More frequent if diagnostics enabled
     
-    // ENGINE-level tick heartbeat diagnostic (rate-limited)
-    private DateTimeOffset _lastTickHeartbeat = DateTimeOffset.MinValue;
-    private int TICK_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.diagnostic_rate_limits?.tick_heartbeat_minutes ?? (_loggingConfig.enable_diagnostic_logs ? 1 : 5);
+    // PATTERN 1: Bar-driven ENGINE_TICK_HEARTBEAT tracking (per instrument)
+    private readonly Dictionary<string, DateTimeOffset> _lastBarDrivenHeartbeatPerInstrument = new();
+    private readonly Dictionary<string, int> _barsSinceLastHeartbeatPerInstrument = new();
+    private const int BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS = 60; // Emit at most once per 60 seconds per instrument
     
     // Engine heartbeat tracking for liveness monitoring
     private DateTimeOffset _lastTickUtc = DateTimeOffset.MinValue;
@@ -767,25 +768,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 3: Update health monitor with engine tick timestamp
             _healthMonitor?.UpdateEngineTick(utcNow);
 
-            // ENGINE_TICK_HEARTBEAT: Always emit for watchdog monitoring (required for engine_alive detection)
-            // CRITICAL: Emit BEFORE any early returns to ensure watchdog always sees engine liveness
-            // Rate-limited: every 1 minute if diagnostics enabled, every 60 seconds otherwise (for watchdog)
-            var watchdogHeartbeatIntervalMinutes = 1.0; // Always emit at least every 60 seconds for watchdog
-            var timeSinceLastTickHeartbeat = (utcNow - _lastTickHeartbeat).TotalMinutes;
-            var shouldEmitHeartbeat = timeSinceLastTickHeartbeat >= watchdogHeartbeatIntervalMinutes || _lastTickHeartbeat == DateTimeOffset.MinValue;
-            
-            if (shouldEmitHeartbeat)
-            {
-                _lastTickHeartbeat = utcNow;
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
-                    new
-                    {
-                        utc_now = utcNow.ToString("o"),
-                        active_stream_count = _streams.Count,
-                        recovery_state = _recoveryState.ToString(),
-                        note = _loggingConfig.enable_diagnostic_logs ? "timer-based tick (diagnostic)" : "timer-based tick (watchdog monitoring)"
-                    }));
-            }
+            // PATTERN 1: ENGINE_TICK_HEARTBEAT is now emitted from OnBar() after bar acceptance
+            // Tick() no longer emits heartbeats - heartbeat is bar-driven only
 
             // TRADING READINESS: Guards that prevent trading logic from running when engine is not ready
             // CRITICAL: Defensive checks - engine must be initialized for trading logic
@@ -892,6 +876,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>
+    /// Process a bar update from NinjaTrader.
+    /// </summary>
+    /// <param name="barUtc">Bar timestamp in UTC. CONTRACT: This represents the bar open time.
+    /// NinjaTrader emits bars on close; this system normalizes all bars to open time for Analyzer parity and deterministic range logic.
+    /// This assumes 1-minute bars and is guarded by an invariant.</param>
+    /// <param name="instrument">Instrument symbol (e.g., "ES")</param>
+    /// <param name="open">Bar open price</param>
+    /// <param name="high">Bar high price</param>
+    /// <param name="low">Bar low price</param>
+    /// <param name="close">Bar close price</param>
+    /// <param name="utcNow">Current UTC time for age validation</param>
     public void OnBar(DateTimeOffset barUtc, string instrument, decimal open, decimal high, decimal low, decimal close, DateTimeOffset utcNow)
     {
         lock (_engineLock)
@@ -1273,8 +1269,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-            // Log bar delivery summary periodically (rate-limited)
-            LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
+        // Log bar delivery summary periodically (rate-limited)
+        LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
+        
+        // PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance and processing
+        // This heartbeat represents "bars are being processed" and is the authoritative liveness signal
+        EmitBarDrivenHeartbeatIfNeeded(utcNow, instrument, barUtc, barChicagoTime);
         }
     }
     
@@ -1371,6 +1371,50 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 total_streams_receiving = streamsReceivingBar.Count,
                 total_streams_filtered = streamsFilteredOut.Count,
                 note = $"Bar delivery distribution across streams (last {BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES} minutes)"
+            }));
+    }
+    
+    /// <summary>
+    /// PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance.
+    /// This heartbeat represents "bars are being processed" and is the authoritative liveness signal.
+    /// Rate-limited to once per 60 seconds per instrument.
+    /// </summary>
+    private void EmitBarDrivenHeartbeatIfNeeded(DateTimeOffset utcNow, string instrument, DateTimeOffset barUtc, DateTimeOffset barChicagoTime)
+    {
+        // Check if heartbeat is due for this instrument
+        var lastHeartbeatUtc = _lastBarDrivenHeartbeatPerInstrument.TryGetValue(instrument, out var last) ? last : DateTimeOffset.MinValue;
+        var timeSinceLastHeartbeat = (utcNow - lastHeartbeatUtc).TotalSeconds;
+        var shouldEmit = lastHeartbeatUtc == DateTimeOffset.MinValue || timeSinceLastHeartbeat >= BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS;
+        
+        if (!shouldEmit)
+        {
+            // Increment bar counter even if not emitting heartbeat
+            if (!_barsSinceLastHeartbeatPerInstrument.ContainsKey(instrument))
+            {
+                _barsSinceLastHeartbeatPerInstrument[instrument] = 0;
+            }
+            _barsSinceLastHeartbeatPerInstrument[instrument]++;
+            return;
+        }
+        
+        // Emit heartbeat
+        var barsSinceLastHeartbeat = _barsSinceLastHeartbeatPerInstrument.TryGetValue(instrument, out var count) ? count : 0;
+        _lastBarDrivenHeartbeatPerInstrument[instrument] = utcNow;
+        _barsSinceLastHeartbeatPerInstrument[instrument] = 0; // Reset counter
+        
+        // CONTRACT: bar_time_utc represents the bar open time.
+        // NinjaTrader emits bars on close; this system normalizes all bars to open time for Analyzer parity and deterministic range logic.
+        // This assumes 1-minute bars and is guarded by an invariant.
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
+            new
+            {
+                instrument = instrument,
+                bar_time_utc = barUtc.ToString("o"),
+                bar_time_chicago = barChicagoTime.ToString("o"),
+                bars_since_last_heartbeat = barsSinceLastHeartbeat,
+                active_stream_count = _streams.Count,
+                recovery_state = _recoveryState.ToString(),
+                note = "bar-driven heartbeat (Pattern 1)"
             }));
     }
 

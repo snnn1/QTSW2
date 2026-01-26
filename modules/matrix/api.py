@@ -547,7 +547,6 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
                 'EntryTime', 'ExitTime', 'Session', 'Direction', 'Target', 'Range', 
                 'StopLoss', 'Peak', 'Time Change',
                 'final_allowed', 'ProfitDollars', 'day_of_month', 'dow', 'dow_full', 'month', 'year',
-                'stream_rolling_sum'  # Rolling sum for health gate display
             ]
             # Only include columns that exist in the dataframe
             available_cols = [col for col in essential_cols if col in df.columns]
@@ -591,20 +590,6 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             df = df.drop(columns=["ProfitDollars"])
         from modules.matrix import statistics
         df = statistics._ensure_profit_dollars_column(df, contract_multiplier=contract_multiplier)
-        
-        # Ensure stream_rolling_sum column exists and has values (fallback for old matrices)
-        # If column is missing or all NaN, initialize with zeros
-        if 'stream_rolling_sum' not in df.columns:
-            df['stream_rolling_sum'] = 0.0
-            logger.warning("stream_rolling_sum column missing from parquet file - initialized with zeros. Rebuild matrix to calculate rolling sums.")
-        elif df['stream_rolling_sum'].isna().all() or (df['stream_rolling_sum'] == 0).all():
-            # Column exists but is empty - this means matrix was built before rolling sum was implemented
-            # Fill with zeros as fallback (user should rebuild to get real values)
-            df['stream_rolling_sum'] = df['stream_rolling_sum'].fillna(0.0)
-            logger.warning("stream_rolling_sum column is empty in parquet file - filled with zeros. Rebuild matrix to calculate rolling sums.")
-        else:
-            # Column exists and has values - ensure it's numeric and fill any NaN with 0
-            df['stream_rolling_sum'] = pd.to_numeric(df['stream_rolling_sum'], errors='coerce').fillna(0.0)
         
         # Clean data if requested (expensive operation, can be skipped for faster initial load)
         if not skip_cleaning:

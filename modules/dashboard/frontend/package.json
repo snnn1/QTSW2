@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:dashboard": "vite --config vite.config.dashboard.js",
+    "dev:watchdog": "vite --config vite.config.watchdog.js",
+    "dev:all": "concurrently -n dashboard,watchdog -c cyan,yellow \"npm run dev:dashboard\" \"npm run dev:watchdog\"",
     "build": "vite build",
+    "build:dashboard": "vite build --config vite.config.dashboard.js",
+    "build:watchdog": "vite build --config vite.config.watchdog.js",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -19,6 +24,7 @@
     "@types/react-router-dom": "^5.3.3",
     "@vitejs/plugin-react": "^4.2.1",
     "autoprefixer": "^10.4.16",
+    "concurrently": "^8.2.2",
     "postcss": "^8.4.32",
     "tailwindcss": "^3.3.6",
     "terser": "^5.44.1",

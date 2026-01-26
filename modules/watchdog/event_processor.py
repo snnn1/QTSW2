@@ -96,7 +96,18 @@ class EventProcessor:
                 self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc)
         
         elif event_type == "ENGINE_TICK_HEARTBEAT":
+            # PATTERN 1: Update engine tick timestamp AND track last bar time per instrument
             self._state_manager.update_engine_tick(timestamp_utc)
+            
+            # Extract instrument and bar_time_utc from heartbeat payload
+            instrument = data.get("instrument") or event.get("instrument")
+            bar_time_utc_str = data.get("bar_time_utc")
+            
+            if instrument and bar_time_utc_str:
+                bar_time_utc = self._parse_timestamp(bar_time_utc_str)
+                if bar_time_utc:
+                    # Update per-instrument last bar time from heartbeat payload
+                    self._state_manager.update_last_bar(instrument, bar_time_utc)
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status

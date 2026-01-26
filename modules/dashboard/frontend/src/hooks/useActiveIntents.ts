@@ -25,7 +25,15 @@ export function useActiveIntents() {
       return
     }
     if (data) {
-      setIntents(data.intents || [])
+      // Only update state if data actually changed (prevent unnecessary re-renders)
+      setIntents(prevIntents => {
+        const newIntents = data.intents || []
+        if (prevIntents.length === newIntents.length && 
+            JSON.stringify(prevIntents) === JSON.stringify(newIntents)) {
+          return prevIntents // Return previous reference if unchanged
+        }
+        return newIntents
+      })
       setError(null)
       hasLoadedRef.current = true
     }

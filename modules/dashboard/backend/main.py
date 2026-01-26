@@ -941,7 +941,11 @@ async def generate_timetable(request: TimetableRequest):
             "execution_file": "data/timetable/timetable_current.json"
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate timetable: {str(e)}")
+        import traceback
+        error_detail = f"Failed to generate timetable: {str(e)}"
+        logger.error(f"Timetable generation error: {error_detail}", exc_info=True)
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 # Matrix endpoints moved to modules.matrix.api router

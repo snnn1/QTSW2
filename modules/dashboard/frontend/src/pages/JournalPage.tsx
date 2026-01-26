@@ -3,7 +3,7 @@
  */
 import { useState } from 'react'
 import { useExecutionJournal } from '../hooks/useJournalData'
-import { NavigationBar } from '../components/shared/NavigationBar'
+import { WatchdogNavigationBar } from '../components/shared/WatchdogNavigationBar'
 
 export function JournalPage() {
   const [tradingDate, setTradingDate] = useState('')
@@ -14,7 +14,7 @@ export function JournalPage() {
   
   return (
     <div className="min-h-screen bg-black text-white">
-      <NavigationBar />
+      <WatchdogNavigationBar />
       <div className="p-8 pt-14">
         <h1 className="text-2xl font-bold mb-6">Execution Journal</h1>
       

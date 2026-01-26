@@ -17,6 +17,9 @@ interface WatchdogHeaderProps {
   // PHASE 3.1: Identity invariants status
   identityInvariantsPass: boolean | null
   identityViolations: string[]
+  // PATTERN 1: Bars expected observability
+  barsExpectedCount?: number
+  worstLastBarAgeSeconds?: number | null
 }
 
 export function WatchdogHeader({
@@ -29,7 +32,9 @@ export function WatchdogHeader({
   lastEngineTick,
   lastSuccessfulPollTimestamp,
   identityInvariantsPass,
-  identityViolations
+  identityViolations,
+  barsExpectedCount,
+  worstLastBarAgeSeconds
 }: WatchdogHeaderProps) {
   // Compute data freshness
   const dataFreshness = useMemo(() => {
@@ -44,13 +49,29 @@ export function WatchdogHeader({
       case 'ALIVE':
         return <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">ENGINE ALIVE</span>
       case 'IDLE_MARKET_CLOSED':
+        // PATTERN 1: Show more context for idle state
+        const idleMessage = marketOpen === false 
+          ? 'ENGINE IDLE (MARKET CLOSED)'
+          : barsExpectedCount === 0
+          ? 'ENGINE IDLE (WAITING FOR RANGE WINDOWS)'
+          : 'ENGINE IDLE'
         return (
-          <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            ENGINE IDLE (MARKET CLOSED)
+          <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap" title={idleMessage}>
+            ENGINE IDLE
           </span>
         )
       case 'STALLED':
-        return <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">ENGINE STALLED</span>
+        // PATTERN 1: Show bar age context in tooltip
+        const stallMessage = worstLastBarAgeSeconds !== null && worstLastBarAgeSeconds !== undefined
+          ? `ENGINE STALLED (No bars for ${Math.round(worstLastBarAgeSeconds / 60)} min)`
+          : barsExpectedCount !== undefined && barsExpectedCount > 0
+          ? `ENGINE STALLED (${barsExpectedCount} instrument(s) expecting bars)`
+          : 'ENGINE STALLED'
+        return (
+          <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap" title={stallMessage}>
+            ENGINE STALLED
+          </span>
+        )
       case 'FAIL_CLOSED':
         return <span className="px-3 py-1.5 bg-red-700 text-white rounded-full font-semibold text-sm whitespace-nowrap">FAIL-CLOSED</span>
       case 'RECOVERY_IN_PROGRESS':

@@ -4,7 +4,7 @@
 import { useState, useMemo } from 'react'
 import { useExecutionSummary } from '../hooks/useJournalData'
 import { useStreamPnl } from '../hooks/useStreamPnl'
-import { NavigationBar } from '../components/shared/NavigationBar'
+import { WatchdogNavigationBar } from '../components/shared/WatchdogNavigationBar'
 
 export function SummaryPage() {
   const [tradingDate, setTradingDate] = useState('')
@@ -20,7 +20,7 @@ export function SummaryPage() {
   
   return (
     <div className="min-h-screen bg-black text-white">
-      <NavigationBar />
+      <WatchdogNavigationBar />
       <div className="p-8 pt-14">
         <h1 className="text-2xl font-bold mb-6">Daily Summary</h1>
       

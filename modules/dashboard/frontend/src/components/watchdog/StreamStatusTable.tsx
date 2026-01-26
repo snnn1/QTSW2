@@ -38,11 +38,11 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
         </div>
       )
     } else if (marketOpen === true) {
-      // Market open but no streams - might be an issue
+      // Market open but no streams - streams will begin forming ranges when they enter their range windows
       return (
         <div className="bg-gray-800 rounded-lg p-8 text-center">
           <div className="text-amber-500 text-lg mb-2">No active streams</div>
-          <div className="text-gray-400 text-sm">Market is open — streams should be active</div>
+          <div className="text-gray-400 text-sm">Streams will begin forming ranges when they enter their range windows</div>
         </div>
       )
     } else {

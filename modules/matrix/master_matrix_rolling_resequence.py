@@ -260,6 +260,18 @@ def build_master_matrix_rolling_resequence(
         
         # Normalize schema and add global columns to resequenced data
         resequenced_df = master_matrix_instance.normalize_schema(sequencer_result)
+        
+        # CONTRACT: ProfitDollars must exist before filter_engine
+        # ProfitDollars is required by filter_engine for stream health gate calculations
+        # DataLoader should have already created it, but sequencer output might not preserve it
+        # Ensure it exists as defensive check (using statistics module helper - not synthesizing here)
+        if 'ProfitDollars' not in resequenced_df.columns:
+            from modules.matrix.statistics import _ensure_profit_dollars_column_inplace
+            _ensure_profit_dollars_column_inplace(resequenced_df, contract_multiplier=1.0)
+            logger.debug("ProfitDollars column created for resequenced data (required by filter_engine)")
+        else:
+            logger.debug("ProfitDollars column exists in resequenced data")
+        
         resequenced_df = master_matrix_instance.add_global_columns(resequenced_df)
         
         rows_resequenced = len(resequenced_df)

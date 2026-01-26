@@ -25,7 +25,13 @@ export function useRiskGates() {
       return
     }
     if (data) {
-      setGates(data)
+      // Only update state if data actually changed (prevent unnecessary re-renders)
+      setGates(prevGates => {
+        if (prevGates && JSON.stringify(prevGates) === JSON.stringify(data)) {
+          return prevGates // Return previous reference if unchanged
+        }
+        return data
+      })
       setError(null)
       hasLoadedRef.current = true
     }

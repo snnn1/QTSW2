@@ -136,6 +136,7 @@ function AppContent() {
   const {
     // Backend data state
     masterData,
+    setMasterData, // Exposed for loadMoreRows function
     masterLoading,
     masterError,
     availableYearsFromAPI,
@@ -299,12 +300,6 @@ function AppContent() {
         }
       })
       
-      // Ensure stream_rolling_sum is available if it exists in data or is in DEFAULT_COLUMNS
-      if (cols.includes('stream_rolling_sum') && !displayableCols.includes('stream_rolling_sum')) {
-        displayableCols.push('stream_rolling_sum')
-      } else if (DEFAULT_COLUMNS.includes('stream_rolling_sum') && !displayableCols.includes('stream_rolling_sum')) {
-        displayableCols.push('stream_rolling_sum')
-      }
       
       setAvailableColumns(displayableCols)
       
@@ -726,17 +721,6 @@ function AppContent() {
           // Add filter
           currentFilters.include_years = [...current, numValue]
         }
-      } else if (filterType === 'health_gate_enabled') {
-        // For health gate enabled, value is a boolean
-        currentFilters[filterType] = Boolean(value)
-      } else if (filterType === 'health_rolling_window') {
-        // For rolling window, value is the number of trades (or null to reset to default)
-        const intValue = value === null || value === '' ? null : parseInt(value)
-        currentFilters[filterType] = isNaN(intValue) || intValue <= 0 ? null : intValue
-      } else if (filterType === 'health_suspend_threshold' || filterType === 'health_resume_threshold') {
-        // For health thresholds, value is the new threshold value (or null to reset to default)
-        const numValue = value === null || value === '' ? null : parseFloat(value)
-        currentFilters[filterType] = isNaN(numValue) ? null : numValue
       }
       
       // Return a completely new object to trigger re-render
@@ -1732,11 +1716,7 @@ function AppContent() {
                       (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) || 
                       (filters.exclude_times && filters.exclude_times.length > 0) ||
                       (filters.include_years && filters.include_years.length > 0) ||
-                      (streamId === 'master' && filters.include_streams && filters.include_streams.length > 0) ||
-                      (streamId !== 'master' && filters.health_gate_enabled === false) ||
-                      (streamId !== 'master' && (filters.health_rolling_window !== null && filters.health_rolling_window !== undefined)) ||
-                      (streamId !== 'master' && (filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined)) ||
-                      (streamId !== 'master' && (filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined))
+                      (streamId === 'master' && filters.include_streams && filters.include_streams.length > 0)
     
     return (
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -2076,141 +2056,6 @@ function AppContent() {
               })()}
             </div>
           </div>
-          
-          {/* Stream Health Gate - Only for individual streams (not master) */}
-          {streamId !== 'master' && (
-            <div className="space-y-2 border-t border-gray-700 pt-3 mt-3">
-              <div className="flex items-center justify-between mb-2">
-                <label className="block text-xs font-medium text-gray-400">Stream Health Gate</label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={filters.health_gate_enabled !== undefined ? filters.health_gate_enabled : true}
-                    onChange={(e) => {
-                      updateStreamFilter(streamId, 'health_gate_enabled', e.target.checked)
-                    }}
-                    className="w-4 h-4 text-blue-600 bg-gray-800 border-gray-700 rounded focus:ring-blue-500"
-                  />
-                  <span className="text-xs text-gray-400">Enable Health Gate</span>
-                </label>
-              </div>
-              <div className="text-xs text-gray-500 mb-3">
-                Override system defaults for this stream. Leave empty to use system defaults.
-              </div>
-              
-              {/* All inputs horizontal */}
-              <div className={`flex gap-8 ${(filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false) ? 'opacity-50' : ''}`}>
-                {/* Rolling Window (Trade Amount) */}
-                <div className="flex-1 space-y-1 pr-4 border-r border-gray-700">
-                  <label className="block text-xs text-gray-400">Rolling Window (Trades)</label>
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="number"
-                      min="1"
-                      step="1"
-                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
-                      value={filters.health_rolling_window !== null && filters.health_rolling_window !== undefined ? filters.health_rolling_window : ''}
-                      onChange={(e) => {
-                        const value = e.target.value
-                        updateStreamFilter(streamId, 'health_rolling_window', value === '' ? null : value)
-                      }}
-                      placeholder="Default: 25"
-                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                    />
-                    {filters.health_rolling_window !== null && filters.health_rolling_window !== undefined && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          updateStreamFilter(streamId, 'health_rolling_window', null)
-                        }}
-                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
-                        title="Reset to system default"
-                      >
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  <div className="text-xs text-gray-500">
-                    Number of trades
-                  </div>
-                </div>
-                
-                {/* Suspend Threshold */}
-                <div className="flex-1 space-y-1 px-4 border-r border-gray-700">
-                  <label className="block text-xs text-gray-400">Suspend Threshold ($)</label>
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="number"
-                      step="0.01"
-                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
-                      value={filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined ? filters.health_suspend_threshold : ''}
-                      onChange={(e) => {
-                        const value = e.target.value
-                        updateStreamFilter(streamId, 'health_suspend_threshold', value === '' ? null : value)
-                      }}
-                      placeholder="Default: -750.00"
-                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                    />
-                    {filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          updateStreamFilter(streamId, 'health_suspend_threshold', null)
-                        }}
-                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
-                        title="Reset to system default"
-                      >
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  <div className="text-xs text-gray-500">
-                    Suspend when ≤ this
-                  </div>
-                </div>
-                
-                {/* Resume Threshold */}
-                <div className="flex-1 space-y-1 pl-4">
-                  <label className="block text-xs text-gray-400">Resume Threshold ($)</label>
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="number"
-                      step="0.01"
-                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
-                      value={filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined ? filters.health_resume_threshold : ''}
-                      onChange={(e) => {
-                        const value = e.target.value
-                        updateStreamFilter(streamId, 'health_resume_threshold', value === '' ? null : value)
-                      }}
-                      placeholder="Default: 0.00"
-                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
-                    />
-                    {filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined && (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          updateStreamFilter(streamId, 'health_resume_threshold', null)
-                        }}
-                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
-                        title="Reset to system default"
-                      >
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  <div className="text-xs text-gray-500">
-                    Resume when ≥ this
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     )
@@ -2389,8 +2234,7 @@ function AppContent() {
         <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
           {sortedColumns.map(col => {
             // Map column names to display names
-            const displayName = col === 'StopLoss' ? 'Stop Loss' : 
-                                col === 'stream_rolling_sum' ? 'Rolling Sum ($)' : col
+            const displayName = col === 'StopLoss' ? 'Stop Loss' : col
             return (
               <label key={col} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-900 p-2 rounded">
                 <input
