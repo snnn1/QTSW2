@@ -97,15 +97,27 @@ def _normalize_results(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize Result column for safe comparisons.
     Adds ResultNorm column (uppercase, stripped).
+    
+    NOTE: Returns copy for backward compatibility. Use _normalize_results_inplace for better performance.
     """
     df = df.copy()
     df["ResultNorm"] = df["Result"].apply(_normalize_result)
     return df
 
 
+def _normalize_results_inplace(df: pd.DataFrame) -> None:
+    """
+    Normalize Result column for safe comparisons (in-place).
+    Adds ResultNorm column (uppercase, stripped).
+    """
+    df["ResultNorm"] = df["Result"].apply(_normalize_result)
+
+
 def _ensure_final_allowed(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure final_allowed exists and is boolean.
+    
+    NOTE: Returns copy for backward compatibility. Use _ensure_final_allowed_inplace for better performance.
     """
     df = df.copy()
     if "final_allowed" in df.columns:
@@ -115,15 +127,36 @@ def _ensure_final_allowed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _ensure_final_allowed_inplace(df: pd.DataFrame) -> None:
+    """
+    Ensure final_allowed exists and is boolean (in-place).
+    """
+    if "final_allowed" in df.columns:
+        df["final_allowed"] = df["final_allowed"].astype(bool)
+    else:
+        df["final_allowed"] = True
+
+
 def _ensure_profit_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure Profit column exists and is numeric.
+    
+    NOTE: Returns copy for backward compatibility. Use _ensure_profit_column_inplace for better performance.
     """
     df = df.copy()
     if "Profit" not in df.columns:
         df["Profit"] = 0.0
     df["Profit"] = pd.to_numeric(df["Profit"], errors='coerce').fillna(0.0)
     return df
+
+
+def _ensure_profit_column_inplace(df: pd.DataFrame) -> None:
+    """
+    Ensure Profit column exists and is numeric (in-place).
+    """
+    if "Profit" not in df.columns:
+        df["Profit"] = 0.0
+    df["Profit"] = pd.to_numeric(df["Profit"], errors='coerce').fillna(0.0)
 
 
 def _ensure_profit_dollars_column(df: pd.DataFrame, contract_multiplier: float = 1.0) -> pd.DataFrame:
@@ -174,16 +207,133 @@ def _ensure_profit_dollars_column(df: pd.DataFrame, contract_multiplier: float =
     return df
 
 
+def _ensure_profit_dollars_column_inplace(df: pd.DataFrame, contract_multiplier: float = 1.0) -> None:
+    """
+    Ensure ProfitDollars column exists (in-place). ALWAYS recompute from Profit to ensure contract_multiplier is applied correctly.
+    
+    Args:
+        df: DataFrame to process (modified in-place)
+        contract_multiplier: Multiplier for contract size (e.g., 2.0 for trading 2 contracts)
+    """
+    # Complete contract value map (dollars per point)
+    contract_values = {
+        "ES": 50.0,
+        "MES": 5.0,
+        "NQ": 10.0,
+        "MNQ": 2.0,
+        "YM": 5.0,
+        "MYM": 0.5,
+        "RTY": 50.0,
+        "CL": 1000.0,  # Crude Oil
+        "NG": 10000.0,  # Natural Gas
+        "GC": 100.0,  # Gold
+    }
+    
+    def get_contract_value(instrument_str):
+        if pd.isna(instrument_str) or instrument_str is None:
+            return 50.0  # Default to ES
+        inst_str = str(instrument_str).strip().upper()
+        # Remove trailing digits if present (e.g., "ES2" -> "ES", "NQ1" -> "NQ")
+        base_inst = inst_str.rstrip("0123456789")
+        contract_val = contract_values.get(base_inst, 50.0)
+        # Debug logging for NQ streams to verify contract value
+        if base_inst == "NQ" and contract_val != 10.0:
+            logger.warning(f"NQ contract value mismatch: got {contract_val}, expected 10.0 for instrument {instrument_str}")
+        return contract_val
+    
+    # ALWAYS recompute ProfitDollars from Profit to ensure contract_multiplier is applied correctly
+    df["ProfitDollars"] = df.apply(
+        lambda row: (row.get("Profit", 0.0) or 0.0) * get_contract_value(row.get("Instrument")) * contract_multiplier,
+        axis=1
+    )
+    
+    df["ProfitDollars"] = pd.to_numeric(df["ProfitDollars"], errors='coerce').fillna(0.0)
+
+
 def _ensure_date_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure trade_date or Date column exists as datetime.
+    Ensure trade_date column exists and has correct dtype.
+    
+    DATE OWNERSHIP: DataLoader owns date normalization.
+    This function validates dtype/presence but does NOT parse dates.
     """
     df = df.copy()
-    if "trade_date" not in df.columns and "Date" in df.columns:
-        df["trade_date"] = pd.to_datetime(df["Date"], errors='coerce')
-    if "trade_date" in df.columns:
-        df["trade_date"] = pd.to_datetime(df["trade_date"], errors='coerce')
+    
+    # DATE OWNERSHIP: DataLoader should have normalized trade_date
+    # Validate presence and dtype, but don't parse
+    if "trade_date" not in df.columns:
+        # For backward compatibility, try to use Date if available
+        # But log this as a warning since it violates single ownership
+        if "Date" in df.columns:
+            logger.warning(
+                "Statistics: trade_date missing, using Date as fallback. "
+                "This violates single ownership - DataLoader should have normalized dates."
+            )
+            # Validate Date dtype first
+            from .data_loader import _validate_trade_date_dtype
+            try:
+                # Temporarily create trade_date from Date for validation
+                temp_df = df.copy()
+                temp_df['trade_date'] = temp_df['Date']
+                _validate_trade_date_dtype(temp_df, "statistics_fallback")
+                df["trade_date"] = df["Date"]
+            except ValueError:
+                logger.error("Statistics: Cannot create trade_date from Date - Date is not datetime dtype")
+                df["trade_date"] = pd.NaT
+        else:
+            logger.error("Statistics: Missing trade_date column - DataLoader should have normalized dates")
+            df["trade_date"] = pd.NaT
+    else:
+        # Validate trade_date dtype (should already be datetime from DataLoader)
+        from .data_loader import _validate_trade_date_dtype
+        try:
+            _validate_trade_date_dtype(df, "statistics")
+        except ValueError as e:
+            logger.error(f"Statistics: trade_date validation failed: {e}")
+            # Don't fail here - log error but continue with NaT
+    
     return df
+
+
+def _ensure_date_column_inplace(df: pd.DataFrame) -> None:
+    """
+    Ensure trade_date column exists and has correct dtype (in-place).
+    
+    DATE OWNERSHIP: DataLoader owns date normalization.
+    This function validates dtype/presence but does NOT parse dates.
+    """
+    # DATE OWNERSHIP: DataLoader should have normalized trade_date
+    # Validate presence and dtype, but don't parse
+    if "trade_date" not in df.columns:
+        # For backward compatibility, try to use Date if available
+        # But log this as a warning since it violates single ownership
+        if "Date" in df.columns:
+            logger.warning(
+                "Statistics: trade_date missing, using Date as fallback. "
+                "This violates single ownership - DataLoader should have normalized dates."
+            )
+            # Validate Date dtype first
+            from .data_loader import _validate_trade_date_dtype
+            try:
+                # Temporarily create trade_date from Date for validation
+                temp_df = df.copy()
+                temp_df['trade_date'] = temp_df['Date']
+                _validate_trade_date_dtype(temp_df, "statistics_fallback")
+                df["trade_date"] = df["Date"]
+            except ValueError:
+                logger.error("Statistics: Cannot create trade_date from Date - Date is not datetime dtype")
+                df["trade_date"] = pd.NaT
+        else:
+            logger.error("Statistics: Missing trade_date column - DataLoader should have normalized dates")
+            df["trade_date"] = pd.NaT
+    else:
+        # Validate trade_date dtype (should already be datetime from DataLoader)
+        from .data_loader import _validate_trade_date_dtype
+        try:
+            _validate_trade_date_dtype(df, "statistics")
+        except ValueError as e:
+            logger.error(f"Statistics: trade_date validation failed: {e}")
+            # Don't fail here - log error but continue with NaT
 
 
 # ---------------------------------------------------------------------
@@ -213,12 +363,16 @@ def calculate_summary_stats(
         logger.warning("No data for summary statistics")
         return _empty_stats()
     
-    # Prepare DataFrame
-    df = _ensure_final_allowed(df)
-    df = _normalize_results(df)
-    df = _ensure_profit_column(df)
-    df = _ensure_profit_dollars_column(df, contract_multiplier=contract_multiplier)
-    df = _ensure_date_column(df)
+    # PERFORMANCE OPTIMIZATION: Copy DataFrame once at the start instead of in each helper
+    # All helper functions modify the DataFrame, so we need one copy to avoid mutating input
+    df = df.copy()
+    
+    # Prepare DataFrame (helpers now modify in-place)
+    _ensure_final_allowed_inplace(df)
+    _normalize_results_inplace(df)
+    _ensure_profit_column_inplace(df)
+    _ensure_profit_dollars_column_inplace(df, contract_multiplier=contract_multiplier)
+    _ensure_date_column_inplace(df)
     
     # Add is_executed_trade flag
     df["is_executed_trade"] = df["ResultNorm"].apply(_is_executed_trade)
@@ -262,6 +416,83 @@ def calculate_summary_stats(
         executed_selected = executed_all.copy()
     else:
         executed_selected = executed_all[executed_all["final_allowed"]].copy()
+    
+    # ========================================================================
+    # PHASE 5.2: Population Alignment Diagnostics
+    # ========================================================================
+    logger.info("=" * 80)
+    logger.info("POPULATION ALIGNMENT DIAGNOSTICS")
+    logger.info("=" * 80)
+    
+    # For each population, log count, sum ProfitDollars, and count of each Result class
+    def log_population_diagnostics(population_df, population_name):
+        """Log diagnostics for a population DataFrame."""
+        count = len(population_df)
+        profit_sum = population_df['ProfitDollars'].sum()
+        
+        # Count each Result class (vectorized)
+        result_norm = population_df['ResultNorm'].astype(str)
+        wins = (result_norm == 'WIN').sum()
+        losses = (result_norm == 'LOSS').sum()
+        be = (result_norm.isin(['BE', 'BREAKEVEN'])).sum()
+        time = (result_norm == 'TIME').sum()
+        notrade = (result_norm == 'NOTRADE').sum()
+        other = count - (wins + losses + be + time + notrade)
+        
+        # Check if final_allowed was applied
+        if 'final_allowed' in population_df.columns:
+            allowed_count = population_df['final_allowed'].sum()
+            filtered_count = count - allowed_count
+        else:
+            allowed_count = None
+            filtered_count = None
+        
+        logger.info(f"{population_name}:")
+        logger.info(f"  count={count}, sum ProfitDollars={profit_sum:.2f}")
+        logger.info(f"  Result breakdown: WIN={wins}, LOSS={losses}, BE={be}, TIME={time}, NoTrade={notrade}, other={other}")
+        if allowed_count is not None:
+            logger.info(f"  final_allowed: allowed={allowed_count}, filtered={filtered_count}")
+        
+        # Hard check: Result classes should sum to count (if all are accounted for)
+        result_sum = wins + losses + be + time + notrade + other
+        if result_sum != count:
+            logger.error(f"  RESULT COUNT MISMATCH: {result_sum} != {count}")
+        
+        return {
+            'count': count,
+            'profit_sum': profit_sum,
+            'wins': wins,
+            'losses': losses,
+            'be': be,
+            'time': time,
+            'notrade': notrade,
+            'other': other
+        }
+    
+    # Log executed_all population
+    executed_all_diag = log_population_diagnostics(executed_all, "executed_all")
+    
+    # Log executed_selected population
+    executed_selected_diag = log_population_diagnostics(executed_selected, "executed_selected")
+    
+    # Hard check: allowed + filtered == executed_total (for same population definition)
+    if sample_counts['executed_trades_allowed'] + sample_counts['executed_trades_filtered'] != sample_counts['executed_trades_total']:
+        logger.error(
+            f"CATEGORY COUNT MISMATCH: allowed ({sample_counts['executed_trades_allowed']}) + "
+            f"filtered ({sample_counts['executed_trades_filtered']}) != "
+            f"total ({sample_counts['executed_trades_total']})"
+        )
+    
+    # Hard check: If headline says "Executed Trades 25005" but W/L/BE/TIME sums to 9842, that's a label mismatch
+    executed_result_sum = executed_all_diag['wins'] + executed_all_diag['losses'] + executed_all_diag['be'] + executed_all_diag['time']
+    if executed_result_sum != executed_all_diag['count']:
+        logger.warning(
+            f"POPULATION LABEL MISMATCH: Executed trades count ({executed_all_diag['count']}) != "
+            f"sum of WIN/LOSS/BE/TIME ({executed_result_sum}). "
+            f"Check if NoTrade or other results are incorrectly included."
+        )
+    
+    logger.info("=" * 80)
     
     if len(executed_selected) == 0:
         logger.warning("No executed trades in executed_selected")
@@ -537,11 +768,19 @@ def _calculate_day_counts(executed_df: pd.DataFrame) -> Dict[str, int]:
         return {"executed_trading_days": 0}
     
     # Remove rows with invalid dates
+    # PERFORMANCE: Copy only when we need to add column, not for filtering
     valid_dates = executed_df["trade_date"].notna()
-    daily_df = executed_df[valid_dates].copy()
+    daily_df = executed_df[valid_dates].copy()  # Need copy because we add "trade_date_only" column
     
     if daily_df.empty:
         return {"executed_trading_days": 0}
+    
+    # Dtype guard: assert trade_date is datetime-like before .dt accessor
+    if not pd.api.types.is_datetime64_any_dtype(daily_df["trade_date"]):
+        raise ValueError(
+            f"statistics._count_executed_trading_days: trade_date is {daily_df['trade_date'].dtype}, "
+            f"cannot use .dt accessor. No fallback to Date column."
+        )
     
     # Group by trading day (date only, not time)
     daily_df["trade_date_only"] = daily_df["trade_date"].dt.date
@@ -572,11 +811,19 @@ def _count_unique_days(df: pd.DataFrame) -> int:
         return 0
     
     # Remove rows with invalid dates
+    # PERFORMANCE: Copy only when we need to add column, not for filtering
     valid_dates = df["trade_date"].notna()
-    daily_df = df[valid_dates].copy()
+    daily_df = df[valid_dates].copy()  # Need copy because we add "trade_date_only" column
     
     if daily_df.empty:
         return 0
+    
+    # Dtype guard: assert trade_date is datetime-like before .dt accessor
+    if not pd.api.types.is_datetime64_any_dtype(daily_df["trade_date"]):
+        raise ValueError(
+            f"statistics._count_unique_days: trade_date is {daily_df['trade_date'].dtype}, "
+            f"cannot use .dt accessor. No fallback to Date column."
+        )
     
     # Group by trading day (date only, not time)
     daily_df["trade_date_only"] = daily_df["trade_date"].dt.date
@@ -635,8 +882,9 @@ def _calculate_risk_daily_metrics(
         }
     
     # Remove rows with invalid dates
+    # PERFORMANCE: Copy only when we need to add columns, not for filtering
     valid_dates = executed_selected["trade_date"].notna()
-    daily_df = executed_selected[valid_dates].copy()
+    daily_df = executed_selected[valid_dates].copy()  # Need copy because we add "trade_date_only" and "year_month" columns
     
     if daily_df.empty:
         return {
@@ -653,6 +901,13 @@ def _calculate_risk_daily_metrics(
     
     # Profit column (use ProfitDollars if available, else Profit)
     profit_col = "ProfitDollars" if "ProfitDollars" in daily_df.columns else "Profit"
+    
+    # Dtype guard: assert trade_date is datetime-like before .dt accessor
+    if not pd.api.types.is_datetime64_any_dtype(daily_df["trade_date"]):
+        raise ValueError(
+            f"statistics._calculate_risk_daily_metrics: trade_date is {daily_df['trade_date'].dtype}, "
+            f"cannot use .dt accessor. No fallback to Date column."
+        )
     
     # Group by trading day (date only, not time) - RISK METRICS NOW FOLLOW TOGGLE (use executed_selected)
     daily_df["trade_date_only"] = daily_df["trade_date"].dt.date
@@ -725,6 +980,13 @@ def _calculate_risk_daily_metrics(
         drawdown_episodes_per_year = len(drawdown_episodes) / total_trading_years if total_trading_years > 0 else 0.0
     else:
         drawdown_episodes_per_year = 0.0
+    
+    # Dtype guard: assert trade_date is datetime-like before .dt accessor
+    if not pd.api.types.is_datetime64_any_dtype(daily_df["trade_date"]):
+        raise ValueError(
+            f"statistics._calculate_risk_daily_metrics: trade_date is {daily_df['trade_date'].dtype}, "
+            f"cannot use .dt.to_period accessor. No fallback to Date column."
+        )
     
     # Monthly return std dev (Option 1: actual calendar months)
     daily_df["year_month"] = daily_df["trade_date"].dt.to_period("M")

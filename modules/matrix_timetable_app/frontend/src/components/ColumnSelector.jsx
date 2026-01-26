@@ -33,7 +33,8 @@ export default function ColumnSelector({
         {sortedColumns.map(col => {
           const currentCols = getSelectedColumnsForTab(activeTab)
           // Map column names to display names
-          const displayName = col === 'StopLoss' ? 'Stop Loss' : col
+          const displayName = col === 'StopLoss' ? 'Stop Loss' : 
+                              col === 'stream_rolling_sum' ? 'Rolling Sum ($)' : col
           return (
             <label key={col} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-900 p-2 rounded">
               <input

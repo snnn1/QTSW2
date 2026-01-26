@@ -269,8 +269,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Start()
     {
+        // DEFENSIVE: Guarantee run_id is always set before any operations
+        if (string.IsNullOrEmpty(_runId))
+        {
+            _runId = Guid.NewGuid().ToString("N");
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RUN_ID_AUTO_GENERATED", state: "ENGINE",
+                new
+                {
+                    run_id = _runId,
+                    note = "run_id was missing and auto-generated at Start() - this should not happen under normal operation"
+                }));
+        }
+        
         // CRITICAL: Set run_id before any Start-path logs
-        _runId = Guid.NewGuid().ToString("N");
         _log.SetRunId(_runId);
 
         var utcNow = DateTimeOffset.UtcNow;

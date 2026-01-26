@@ -64,19 +64,23 @@ class RangeDetector:
             # Pandas treats different timezone objects as different even if they represent the same timezone
             chicago_tz = pytz.timezone("America/Chicago")
             if df["timestamp"].dt.tz is not None and len(df) > 0:
-                # Check if timezone needs normalization by comparing string representation
+                # Check if timezone needs normalization by comparing timezone objects
                 first_data_ts = df["timestamp"].iloc[0]
                 first_data_tz = first_data_ts.tz if hasattr(first_data_ts, 'tz') else None
-                # Normalize if timezone is different (compare by string to handle object instance differences)
-                if first_data_tz is not None and str(first_data_tz) != "America/Chicago":
-                    # Always normalize to Chicago timezone to ensure timezone objects match
-                    df = df.copy()
-                    df["timestamp"] = df["timestamp"].dt.tz_convert(chicago_tz)
-                elif first_data_tz is not None:
-                    # Timezone is already America/Chicago, but might be different object instance
-                    # Convert anyway to ensure we use the same timezone object
-                    df = df.copy()
-                    df["timestamp"] = df["timestamp"].dt.tz_convert(chicago_tz)
+                # Only convert if timezone is actually different (not just different object instance)
+                if first_data_tz is not None:
+                    # Compare timezone objects directly - if they represent different timezones, convert
+                    # Use string comparison as fallback for different pytz object instances of same timezone
+                    tz_str = str(first_data_tz)
+                    if tz_str != "America/Chicago":
+                        # Timezone is different - convert to Chicago
+                        df = df.copy()
+                        df["timestamp"] = df["timestamp"].dt.tz_convert(chicago_tz)
+                    elif first_data_tz is not chicago_tz:
+                        # Same timezone but different object instance - convert to ensure same object
+                        # This handles cases where data has pytz timezone but we're using a different instance
+                        df = df.copy()
+                        df["timestamp"] = df["timestamp"].dt.tz_convert(chicago_tz)
             
             # Get session start time
             session_start = self.slot_start.get(session, "02:00")

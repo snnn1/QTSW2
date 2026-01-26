@@ -85,6 +85,15 @@ export function useMatrixWorker() {
               setFilteredRows(payload.rows)
               // Clear any stale loaded rows - new filtered rows are coming
             }
+            
+            // Debug logging when filter results in 0 rows
+            if (payload.length === 0) {
+              console.warn('[Worker] Filter resulted in 0 rows. Check filters:', {
+                streamId: payload.requestId ? 'unknown' : 'check console',
+                indicesLength: payload.indices?.length || 0,
+                hasRows: !!payload.rows
+              })
+            }
             // #region agent log
             logDebug('useMatrixWorker.js:55', 'FILTERED state updated', {duration: Date.now() - filteredReceivedStart, hypothesisId: 'A'});
             // #endregion
@@ -210,11 +219,10 @@ export function useMatrixWorker() {
       return
     }
     
-    // Clear previous filter outputs to prevent stale data from being displayed
-    // This ensures the UI doesn't show data from a previous tab while filtering
-    setFilteredLength(0)
-    setFilteredIndices([])
-    setFilteredRows([])
+    // Only clear previous filter outputs if we have data initialized
+    // This prevents showing "0 of 0" while worker is still initializing
+    // The worker will send back the filtered length, which will update the UI
+    // We keep the previous filteredLength visible until new results arrive to avoid flickering
     
     // Generate request ID and track active request
     const requestId = requestManager.nextRequestId()

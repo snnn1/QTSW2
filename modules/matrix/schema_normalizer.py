@@ -7,6 +7,9 @@ missing columns with default values and normalizing data types.
 IMPORTANT: This module READS the Time column but NEVER mutates it.
 The Time column is OWNED by sequencer_logic.py. This module may COPY Time
 to other columns (entry_time, exit_time, etc.) but never modifies Time itself.
+
+DATE OWNERSHIP: DataLoader owns date normalization. This module MUST NOT
+re-parse dates. It MAY only validate dtype/presence of trade_date column.
 """
 
 import logging
@@ -28,6 +31,9 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         Normalized DataFrame with consistent schema
     """
     logger.info("Normalizing schema...")
+    
+    # Ensure we have a copy before modifying (avoid SettingWithCopyWarning and dtype issues)
+    df = df.copy()
     
     # Required columns from analyzer output
     required_columns = {
@@ -57,12 +63,40 @@ def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
         'original_date': 'object',  # Original Date value before repair
     }
     
-    # Ensure Date is datetime
-    if 'Date' in df.columns:
-        if df['Date'].dtype == 'object':
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        elif not pd.api.types.is_datetime64_any_dtype(df['Date']):
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    # DATE OWNERSHIP: DataLoader owns date normalization
+    # This module MUST NOT re-parse dates, MAY only validate dtype/presence
+    # Ensure we have a copy before modifying (avoid SettingWithCopyWarning)
+    df = df.copy()
+    
+    # Validate that trade_date exists and has correct dtype (if present)
+    if 'trade_date' in df.columns:
+        from .data_loader import _validate_trade_date_dtype
+        try:
+            _validate_trade_date_dtype(df, "schema_normalizer")
+        except ValueError as e:
+            logger.error(f"Schema normalization: trade_date validation failed: {e}")
+            raise
+        
+        # CRITICAL: Ensure trade_date is datetime dtype before any operations
+        # Operations like df['Date'] = df['trade_date'] can sometimes change dtype
+        if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+            logger.warning(
+                f"trade_date column is {df['trade_date'].dtype} in schema_normalizer, "
+                f"converting to datetime64. This should not happen - check data processing pipeline."
+            )
+            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+    
+    # Keep Date column for backward compatibility (may be used by downstream code)
+    # But trade_date is the canonical column
+    if 'Date' not in df.columns and 'trade_date' in df.columns:
+        # Create Date column from trade_date for backward compatibility
+        # Ensure trade_date is datetime before copying
+        if pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+            df['Date'] = df['trade_date']
+        else:
+            # trade_date is not datetime - convert first
+            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+            df['Date'] = df['trade_date']
     
     # Add missing required columns
     for col, dtype in required_columns.items():
@@ -150,25 +184,43 @@ def create_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     if 'time_bucket' not in df.columns:
         df['time_bucket'] = df['Time']
     
-    # trade_date (same as Date) - keep as datetime for consistent sorting
+    # trade_date: DataLoader owns normalization - should already exist
+    # If trade_date doesn't exist, this is an error (should have been normalized by DataLoader)
     if 'trade_date' not in df.columns:
+        logger.error(
+            "trade_date column missing - DataLoader should have normalized Date to trade_date. "
+            "This indicates a contract violation in the data loading pipeline."
+        )
+        # For backward compatibility, try to create from Date if available
+        # But log this as an error since it violates single ownership
         if 'Date' in df.columns:
-            # Keep as datetime (not date objects) to avoid type mixing issues
-            # Use errors='coerce' to convert invalid dates to NaT, but log warnings for debugging
-            df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
-            
-            # Log if any dates failed to parse
-            invalid_dates = df['trade_date'].isna() & df['Date'].notna()
-            if invalid_dates.any():
-                invalid_count = invalid_dates.sum()
-                invalid_samples = df[invalid_dates]['Date'].head(10).tolist()
-                logger.warning(
-                    f"Failed to parse {invalid_count} date(s) to trade_date. "
-                    f"Sample invalid values: {invalid_samples}"
-                )
+            logger.error(
+                "Creating trade_date from Date as fallback - this violates single ownership. "
+                "DataLoader should have normalized dates before schema normalization."
+            )
+            # Convert Date to datetime and create trade_date
+            try:
+                df['trade_date'] = pd.to_datetime(df['Date'], errors='raise')
+            except (ValueError, TypeError) as e:
+                logger.error(f"Cannot create trade_date from Date - Date conversion failed: {e}")
+                df['trade_date'] = pd.NaT
         else:
             df['trade_date'] = pd.NaT
-            logger.warning("No 'Date' column found - trade_date set to NaT for all rows")
+            logger.error("No 'Date' or 'trade_date' column found - trade_date set to NaT")
+    
+    # CRITICAL: Ensure trade_date is datetime dtype before returning
+    # This is a final safeguard - trade_date must be datetime for downstream .dt accessor
+    if 'trade_date' in df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+            logger.warning(
+                f"trade_date column is {df['trade_date'].dtype} at end of normalize_schema, "
+                f"converting to datetime64. This should not happen - check data processing pipeline."
+            )
+            # Only convert if not all NaT (which would fail with errors='raise')
+            if not df['trade_date'].isna().all():
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+            else:
+                logger.warning("trade_date is all NaT - cannot convert to datetime")
     
     return df
 

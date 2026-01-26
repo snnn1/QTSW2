@@ -32,6 +32,7 @@ export function useMatrixController({
   const [availableYearsFromAPI, setAvailableYearsFromAPI] = useState([])
   const [lastMergeTime, setLastMergeTime] = useState(null)
   const [availableColumns, setAvailableColumns] = useState([])
+  const [totalRowsInFile, setTotalRowsInFile] = useState(null) // Track total rows available in file
   
   // File change detection
   const [matrixFileId, setMatrixFileId] = useState(null)
@@ -140,6 +141,11 @@ export function useMatrixController({
       })
       
       const trades = data.data || []
+      const totalRowsInFile = data.total || trades.length // Total rows available in file
+      const loadedRows = data.loaded || trades.length // Rows actually returned
+      
+      // Store total rows available for pagination
+      setTotalRowsInFile(totalRowsInFile)
       
       // Store full-dataset stats if available
       if (data.stats_full) {
@@ -152,6 +158,10 @@ export function useMatrixController({
       }
       
       if (trades.length > 0) {
+        // Log if we didn't get all available rows
+        if (loadedRows < totalRowsInFile) {
+          console.log(`[Matrix] Loaded ${loadedRows} of ${totalRowsInFile} total rows. More data available.`)
+        }
         // Detect file change
         const currentFileId = data.matrix_file_id || data.file || null
         const fileChanged = lastMatrixFileIdRef.current !== null && 
@@ -611,6 +621,7 @@ export function useMatrixController({
     workerGetRows,
     calculateProfitBreakdown,
     workerCalculateTimetable,
+    workerInitData,
     
     // Controller functions
     loadMasterMatrix,
@@ -618,6 +629,9 @@ export function useMatrixController({
     buildMasterMatrix,
     reloadLatestMatrix,
     refetchMasterStats,
-    hasLoadedRef
+    hasLoadedRef,
+    
+    // Pagination state
+    totalRowsInFile
   }
 }

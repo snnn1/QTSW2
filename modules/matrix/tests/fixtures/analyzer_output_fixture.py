@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import List
 
 # Fixture directory
 FIXTURE_DIR = Path(__file__).parent / "data" / "analyzed"
@@ -69,6 +70,56 @@ def create_fixture_data():
         fixture_data[stream_id] = df
     
     return fixture_data
+
+
+def create_test_analyzer_output(
+    streams: List[str],
+    dates: List[str],
+    times: List[str]
+) -> pd.DataFrame:
+    """
+    Create test analyzer output DataFrame for testing.
+    
+    Args:
+        streams: List of stream IDs (e.g., ['ES1', 'ES2'])
+        dates: List of date strings in YYYY-MM-DD format
+        times: List of time strings (e.g., ['07:30', '08:00'])
+        
+    Returns:
+        DataFrame with analyzer output format (Date, Time, Stream, Result, etc.)
+    """
+    all_trades = []
+    
+    for stream_id in streams:
+        instrument = stream_id[:-1]  # Remove trailing digit
+        session = 'S1' if times[0] in ['07:30', '08:00', '09:00'] else 'S2'
+        
+        for date_str in dates:
+            for time_str in times:
+                # Create deterministic trade
+                trade = {
+                    'Date': date_str,
+                    'Time': time_str,
+                    'Stream': stream_id,
+                    'Instrument': instrument,
+                    'Session': session,
+                    'Direction': 'Long' if len(all_trades) % 2 == 0 else 'Short',
+                    'Result': 'WIN' if len(all_trades) % 3 != 0 else 'LOSS',
+                    'Target': 10.0,
+                    'Range': 20.0,
+                    'StopLoss': 5.0,
+                    'Peak': 12.0,
+                    'Profit': 10.0 if len(all_trades) % 3 != 0 else -5.0,
+                }
+                all_trades.append(trade)
+    
+    df = pd.DataFrame(all_trades)
+    
+    # Ensure trade_date column exists (canonical) - DataLoader will normalize this
+    # For test purposes, create it from Date
+    df['trade_date'] = pd.to_datetime(df['Date'], errors='raise')
+    
+    return df
 
 
 def save_fixture_parquet():

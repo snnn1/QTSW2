@@ -189,8 +189,11 @@ class MatrixTester:
         
         try:
             # Create sample data for testing
+            # NOTE: Must include trade_date column (canonical date column) for contract-first validation
+            dates = pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03'] * 3)
             sample_data = pd.DataFrame({
-                'Date': pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03'] * 3),
+                'Date': dates,
+                'trade_date': dates,  # Required canonical column
                 'Time': ['08:00', '09:00', '10:00'] * 3,
                 'Stream': ['ES1'] * 9,
                 'Instrument': ['ES'] * 9,

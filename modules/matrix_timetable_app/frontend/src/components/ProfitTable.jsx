@@ -20,9 +20,25 @@ export default function ProfitTable({ data, periodType }) {
   // Get all unique streams from data
   const allStreams = new Set()
   Object.values(data).forEach(periodData => {
-    Object.keys(periodData).forEach(stream => allStreams.add(stream))
+    if (periodData && typeof periodData === 'object' && !Array.isArray(periodData)) {
+      Object.keys(periodData).forEach(stream => {
+        // Skip 'profit' and 'trades' keys (legacy format)
+        if (stream !== 'profit' && stream !== 'trades') {
+          allStreams.add(stream)
+        }
+      })
+    }
   })
   const sortedStreams = Array.from(allStreams).sort()
+  
+  // Debug logging for month breakdown
+  if (periodType === 'month' && sortedStreams.length === 0 && Object.keys(data).length > 0) {
+    console.warn('[ProfitTable] Month data has periods but no streams found:', {
+      periods: Object.keys(data),
+      samplePeriod: Object.keys(data)[0],
+      sampleValue: data[Object.keys(data)[0]]
+    })
+  }
   
   // Get sorted periods
   // For DOM (Day of Month), sort numerically; for month/year, sort descending (newest first); otherwise sort as strings
@@ -72,6 +88,11 @@ export default function ProfitTable({ data, periodType }) {
             const periodData = data[period]
             let total = 0
             
+            // Validate periodData structure
+            if (!periodData || typeof periodData !== 'object' || Array.isArray(periodData)) {
+              console.warn(`[ProfitTable] Invalid periodData for ${periodType} period "${period}":`, periodData)
+            }
+            
             return (
               <tr key={period} className="hover:bg-gray-900">
                 <td className="p-3 border border-gray-700 font-medium">
@@ -82,11 +103,28 @@ export default function ProfitTable({ data, periodType }) {
                     : periodType === 'dom'
                     ? `${period}${getOrdinalSuffix(period)}` // e.g., "1st", "2nd", "3rd"
                     : periodType === 'month'
-                    ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
+                    ? (() => {
+                        // Period should be in format "YYYY-MM" (e.g., "2024-01")
+                        // Convert to full date string by appending '-01' and parse
+                        try {
+                          const dateStr = String(period) + '-01'
+                          const date = new Date(dateStr)
+                          if (isNaN(date.getTime())) {
+                            console.warn(`[ProfitTable] Invalid month period format: ${period}`)
+                            return String(period)
+                          }
+                          return date.toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
+                        } catch (e) {
+                          console.error(`[ProfitTable] Error parsing month period: ${period}`, e)
+                          return String(period)
+                        }
+                      })()
                     : period}
                 </td>
-                {sortedStreams.map(stream => {
-                  const profit = periodData[stream] || 0
+                {sortedStreams.length > 0 ? sortedStreams.map(stream => {
+                  const profit = (periodData && typeof periodData === 'object' && !Array.isArray(periodData)) 
+                    ? (periodData[stream] || 0)
+                    : 0
                   total += profit
                   return (
                     <td key={stream} className={`p-3 border border-gray-700 text-right ${
@@ -95,7 +133,11 @@ export default function ProfitTable({ data, periodType }) {
                       {formatCurrency(profit)}
                     </td>
                   )
-                })}
+                }) : (
+                  <td colSpan={sortedStreams.length || 1} className="p-3 border border-gray-700 text-center text-gray-400">
+                    No stream data
+                  </td>
+                )}
                 <td className={`p-3 border border-gray-700 text-right font-semibold bg-gray-800 ${
                   total > 0 ? 'text-green-400' : total < 0 ? 'text-red-400' : 'text-gray-400'
                 }`}>

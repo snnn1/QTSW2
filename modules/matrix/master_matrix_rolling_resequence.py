@@ -14,6 +14,7 @@ from .checkpoint_manager import CheckpointManager
 from .trading_days import find_trading_days_back
 from .file_manager import load_existing_matrix, save_master_matrix
 from .logging_config import setup_matrix_logger
+from .utils import _enforce_trade_date_invariants
 
 logger = setup_matrix_logger(__name__, console=True, level=logging.INFO)
 
@@ -82,17 +83,23 @@ def build_master_matrix_rolling_resequence(
             return pd.DataFrame(), {"error": error_msg}
         
         # Get latest date from analyzer data
-        if 'trade_date' in all_analyzer_data.columns:
-            all_analyzer_data['trade_date'] = pd.to_datetime(all_analyzer_data['trade_date'], errors='coerce')
-            latest_analyzer_date = all_analyzer_data['trade_date'].max()
-        elif 'Date' in all_analyzer_data.columns:
-            all_analyzer_data['Date'] = pd.to_datetime(all_analyzer_data['Date'], errors='coerce')
-            latest_analyzer_date = all_analyzer_data['Date'].max()
-            all_analyzer_data['trade_date'] = all_analyzer_data['Date']
-        else:
-            error_msg = "No date column found in analyzer data"
+        # DATE OWNERSHIP: DataLoader owns date normalization
+        # Validate that trade_date exists and has correct dtype (no parsing)
+        from .data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
+        
+        if 'trade_date' not in all_analyzer_data.columns:
+            error_msg = "No trade_date column found in analyzer data - DataLoader should have normalized dates"
             logger.error(error_msg)
             return pd.DataFrame(), {"error": error_msg}
+        
+        # Validate trade_date dtype (should already be datetime from DataLoader)
+        try:
+            _validate_trade_date_dtype(all_analyzer_data, "rolling_resequence")
+        except ValueError as e:
+            logger.error(f"Rolling resequence: trade_date validation failed: {e}")
+            return pd.DataFrame(), {"error": str(e)}
+        
+        latest_analyzer_date = all_analyzer_data['trade_date'].max()
         
         if pd.isna(latest_analyzer_date):
             error_msg = "Could not determine latest analyzer date"
@@ -128,15 +135,19 @@ def build_master_matrix_rolling_resequence(
         logger.info(f"Existing matrix has {rows_before_resequence} rows")
         
         # Step 4: Remove all rows where trade_date >= resequence_start_date
+        # DATE OWNERSHIP: Existing matrix should have trade_date already normalized
+        # Validate dtype but don't parse
         if 'trade_date' not in existing_df.columns:
-            if 'Date' in existing_df.columns:
-                existing_df['trade_date'] = pd.to_datetime(existing_df['Date'], errors='coerce')
-            else:
-                error_msg = "No date column found in existing matrix"
-                logger.error(error_msg)
-                return pd.DataFrame(), {"error": error_msg}
+            error_msg = "No trade_date column found in existing matrix - matrix should have trade_date from DataLoader normalization"
+            logger.error(error_msg)
+            return pd.DataFrame(), {"error": error_msg}
         
-        existing_df['trade_date'] = pd.to_datetime(existing_df['trade_date'], errors='coerce')
+        # Validate trade_date dtype (should already be datetime)
+        try:
+            _validate_trade_date_dtype(existing_df, "existing_matrix")
+        except ValueError as e:
+            logger.error(f"Rolling resequence: Existing matrix trade_date validation failed: {e}")
+            return pd.DataFrame(), {"error": str(e)}
         resequence_start_dt = pd.to_datetime(resequence_start_date)
         
         # Preserve historical rows (before resequence_start_date)
@@ -154,7 +165,11 @@ def build_master_matrix_rolling_resequence(
         latest_checkpoint = checkpoint_mgr.load_latest_checkpoint()
         
         if not latest_checkpoint:
-            error_msg = "No checkpoint found. Please run a full rebuild first."
+            error_msg = (
+                "No checkpoint found. Rolling resequence requires a checkpoint to restore sequencer state. "
+                "RECOVERY: Run a full rebuild first using build_master_matrix() to create the initial checkpoint. "
+                "Checkpoints are created automatically after successful builds."
+            )
             logger.error(error_msg)
             return pd.DataFrame(), {"error": error_msg}
         
@@ -201,10 +216,18 @@ def build_master_matrix_rolling_resequence(
         all_data_for_sequencer = master_matrix_instance._load_all_streams_with_sequencer_for_state()
         
         # Filter to dates >= resequence_start_date for sequencer processing
-        if 'trade_date' not in all_data_for_sequencer.columns and 'Date' in all_data_for_sequencer.columns:
-            all_data_for_sequencer['trade_date'] = pd.to_datetime(all_data_for_sequencer['Date'], errors='coerce')
+        # DATE OWNERSHIP: DataLoader should have normalized trade_date
+        if 'trade_date' not in all_data_for_sequencer.columns:
+            error_msg = "No trade_date column in sequencer data - DataLoader should have normalized dates"
+            logger.error(error_msg)
+            return pd.DataFrame(), {"error": error_msg}
         
-        all_data_for_sequencer['trade_date'] = pd.to_datetime(all_data_for_sequencer['trade_date'], errors='coerce')
+        # Validate trade_date dtype (should already be datetime from DataLoader)
+        try:
+            _validate_trade_date_dtype(all_data_for_sequencer, "sequencer_data")
+        except ValueError as e:
+            logger.error(f"Rolling resequence: Sequencer data trade_date validation failed: {e}")
+            return pd.DataFrame(), {"error": str(e)}
         window_data_for_sequencer = all_data_for_sequencer[all_data_for_sequencer['trade_date'] >= resequence_start_dt].copy()
         
         if window_data_for_sequencer.empty:
@@ -246,6 +269,16 @@ def build_master_matrix_rolling_resequence(
         if historical_df.empty:
             final_df = resequenced_df
         else:
+            # INVARIANT: trade_date is canonical datetime column, Date is legacy-derived only
+            # Ensure we're working with copies, not views
+            historical_df = historical_df.copy()
+            resequenced_df = resequenced_df.copy()
+            
+            # Pre-concat enforcement: enforce invariants on both DataFrames
+            # trade_date canonical, Date derived for legacy compatibility only
+            _enforce_trade_date_invariants(historical_df, "rolling_resequence_pre_concat_historical")
+            _enforce_trade_date_invariants(resequenced_df, "rolling_resequence_pre_concat_resequenced")
+            
             # Ensure both DataFrames have same columns
             all_columns = set(historical_df.columns) | set(resequenced_df.columns)
             for col in all_columns:
@@ -256,10 +289,13 @@ def build_master_matrix_rolling_resequence(
             
             # Append resequenced rows to historical rows
             final_df = pd.concat([historical_df, resequenced_df], ignore_index=True)
+            
+            # Post-concat enforcement: enforce invariants on final DataFrame
+            # trade_date canonical, Date derived for legacy compatibility only
+            _enforce_trade_date_invariants(final_df, "rolling_resequence_post_concat")
         
-        # Ensure trade_date is datetime for sorting
-        if 'trade_date' in final_df.columns:
-            final_df['trade_date'] = pd.to_datetime(final_df['trade_date'], errors='coerce')
+        # Invariants already enforced above via _enforce_trade_date_invariants
+        # No need for additional validation here
         
         # Fill None values in string columns before sorting to avoid comparison errors
         # entry_time: use sentinel '23:59:59' so None sorts after valid times

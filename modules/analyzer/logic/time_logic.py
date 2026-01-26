@@ -6,6 +6,7 @@ Handles time and date calculations and conversions
 import pandas as pd
 from typing import Optional, List
 from dataclasses import dataclass
+from .config_logic import ConfigManager
 
 @dataclass
 class TimeSlot:
@@ -69,7 +70,7 @@ class TimeManager:
         """
         if date.weekday() == 4:  # Friday
             # Friday trades continue to Monday same slot
-            days_ahead = 3  # Friday to Monday
+            days_ahead = ConfigManager.FRIDAY_TO_MONDAY_DAYS
             next_date = date + pd.Timedelta(days=days_ahead)
         else:
             # Regular day - next day same slot
@@ -105,7 +106,7 @@ class TimeManager:
         # Calculate expiry time (next trading day same slot)
         if date.weekday() == 4:  # Friday
             # Friday trades expire Monday (skip weekend)
-            days_ahead = 3
+            days_ahead = ConfigManager.FRIDAY_TO_MONDAY_DAYS
         else:
             # Regular day trades expire next day
             days_ahead = 1

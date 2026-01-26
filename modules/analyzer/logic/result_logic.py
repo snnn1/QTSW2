@@ -69,7 +69,8 @@ class ResultProcessor:
                          exit_time: Optional[pd.Timestamp] = None,
                          entry_price: Optional[float] = None,
                          exit_price: Optional[float] = None,
-                         stop_loss: Optional[float] = None) -> Dict[str, object]:
+                         stop_loss: Optional[float] = None,
+                         open_as_of_time: Optional[pd.Timestamp] = None) -> Dict[str, object]:
         """
         Create a result row dictionary
         
@@ -168,6 +169,14 @@ class ResultProcessor:
             else:
                 exit_time_str = str(exit_time)
         
+        # Format open_as_of_time (only populated for OPEN trades)
+        open_as_of_time_str = ""
+        if result == "OPEN" and open_as_of_time is not None and not pd.isna(open_as_of_time):
+            if isinstance(open_as_of_time, pd.Timestamp):
+                open_as_of_time_str = open_as_of_time.strftime("%d/%m/%y %H:%M")
+            else:
+                open_as_of_time_str = str(open_as_of_time)
+        
         # Calculate stop loss distance in points (not price)
         stop_loss_points = 0.0
         if stop_loss is not None and entry_price is not None and direction != "NA":
@@ -193,7 +202,8 @@ class ResultProcessor:
             "Instrument": instrument.upper(),
             "Session": session,
             "Profit": profit,
-            "_sortTime": sort_time_value
+            "_sortTime": sort_time_value,
+            "open_as_of_time": open_as_of_time_str  # Latest bar timestamp for OPEN trades, empty for closed trades
         }
         
         return row
@@ -209,7 +219,7 @@ class ResultProcessor:
             Processed DataFrame sorted by Date and Time (earliest first)
         """
         # Define base columns (always present) - EntryTime and ExitTime after Time to match expected schema
-        base_columns = ["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","_sortTime"]
+        base_columns = ["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit","open_as_of_time","_sortTime"]
         
         if rows:
             # Create DataFrame
@@ -252,8 +262,8 @@ class ResultProcessor:
                 warnings.warn(f"Filtered out {invalid_count} rows with invalid Time values", UserWarning)
             out = out[valid_time_mask].copy()
         
-        # Define result ranking
-        rank = {"Win":5,"BE":4,"Loss":3,"TIME":2}
+        # Define result ranking (OPEN has lowest rank for deduplication)
+        rank = {"Win":5,"BE":4,"Loss":3,"TIME":2,"OPEN":1}
         out["_rank"] = out["Result"].map(rank).fillna(-1)
         
         # Ensure _sortTime is valid for all rows before sorting
@@ -310,17 +320,21 @@ class ResultProcessor:
         Classify trade result based on exit reason and trigger
         
         Args:
-            exit_reason: Reason for trade exit ("Win", "Loss", "TIME")
+            exit_reason: Reason for trade exit ("Win", "Loss", "TIME", "OPEN")
             t1_triggered: Whether T1 trigger was activated
             target_hit: Whether target was hit
             
         Returns:
-            Result classification ("Win", "BE", "Loss")
+            Result classification ("Win", "BE", "Loss", "TIME", "OPEN")
         """
+        # Handle OPEN trades (trade still open)
+        if exit_reason == "OPEN":
+            return "OPEN"
+        
         if target_hit or exit_reason == "Win":
             return "Win"
         
-        # Handle time expiry first - this should override trigger status
+        # Handle time expiry - TIME only when trade is closed
         if exit_reason == "TIME":
             return "TIME"
         

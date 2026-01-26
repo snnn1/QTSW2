@@ -3,6 +3,10 @@ Data loading for Master Matrix.
 
 This module handles loading trade data from analyzer_runs directory,
 including parallel loading, retry logic, and date filtering.
+
+SINGLE OWNERSHIP: DataLoader is the sole owner of date normalization.
+Canonical internal column name is 'trade_date'. Date normalization happens
+once, immediately after reading analyzer output.
 """
 
 import logging
@@ -14,7 +18,124 @@ from typing import List, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
+from .config import ALLOW_INVALID_DATES_SALVAGE
+
 logger = logging.getLogger(__name__)
+
+
+def _normalize_date_to_trade_date(df: pd.DataFrame, stream_id: str) -> pd.DataFrame:
+    """
+    Normalize Date column to trade_date column (canonical datetime dtype).
+    
+    SINGLE OWNERSHIP: This is the ONLY place where date normalization happens.
+    All downstream modules MUST NOT re-parse dates, MAY only validate dtype/presence.
+    
+    Args:
+        df: DataFrame with 'Date' column from analyzer output
+        stream_id: Stream ID for error reporting
+        
+    Returns:
+        DataFrame with 'trade_date' column (canonical datetime dtype)
+        
+    Raises:
+        ValueError: If invalid dates found in strict mode (default)
+    """
+    if 'Date' not in df.columns:
+        logger.error(f"Stream {stream_id}: Missing 'Date' column in analyzer output")
+        raise ValueError(f"Stream {stream_id}: Missing 'Date' column")
+    
+    df = df.copy()  # Copy before modifying
+    
+    if ALLOW_INVALID_DATES_SALVAGE:
+        # Salvage mode: Never propagate NaT downstream
+        # Either drop invalid rows or fail stream with salvage report
+        df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
+        invalid_mask = df['trade_date'].isna() & df['Date'].notna()
+        
+        if invalid_mask.any():
+            invalid_count = invalid_mask.sum()
+            invalid_samples = df.loc[invalid_mask, 'Date'].head(5).tolist()
+            logger.error(
+                f"Stream {stream_id}: Found {invalid_count} rows with invalid dates in salvage mode. "
+                f"Sample invalid values: {invalid_samples}. "
+                f"Dropping invalid rows (salvage mode never propagates NaT downstream)."
+            )
+            # Drop invalid rows (salvage mode never propagates NaT)
+            df = df[~invalid_mask].copy()
+            
+            if df.empty:
+                logger.error(f"Stream {stream_id}: All rows dropped due to invalid dates. Stream failed.")
+                raise ValueError(f"Stream {stream_id}: All rows have invalid dates - stream failed")
+    else:
+        # Strict mode (default): Invalid dates are contract violations
+        try:
+            df['trade_date'] = pd.to_datetime(df['Date'], errors='raise')
+        except (ValueError, TypeError) as e:
+            invalid_samples = df['Date'].head(5).tolist() if len(df) > 0 else []
+            logger.error(
+                f"Stream {stream_id}: Contract violation - invalid dates found. "
+                f"Sample invalid values: {invalid_samples}. "
+                f"Error: {e}. "
+                f"This violates analyzer output contract. Fix analyzer output before proceeding."
+            )
+            raise ValueError(
+                f"Stream {stream_id}: Invalid dates found - contract violation. "
+                f"Sample values: {invalid_samples}. "
+                f"Set ALLOW_INVALID_DATES_SALVAGE=True for salvage mode (debugging only)."
+            ) from e
+    
+    # Ensure trade_date is canonical datetime dtype
+    if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+        logger.error(f"Stream {stream_id}: trade_date is not datetime dtype after normalization")
+        raise ValueError(f"Stream {stream_id}: trade_date normalization failed")
+    
+    return df
+
+
+def _validate_trade_date_dtype(df: pd.DataFrame, stream_id: str) -> None:
+    """
+    Validate that trade_date column has correct dtype (datetime).
+    
+    Downstream modules MAY validate dtype/presence but MUST NOT re-parse dates.
+    
+    Args:
+        df: DataFrame to validate
+        stream_id: Stream ID for error reporting
+        
+    Raises:
+        ValueError: If trade_date dtype is incorrect
+    """
+    if 'trade_date' not in df.columns:
+        logger.error(f"Stream {stream_id}: Missing 'trade_date' column")
+        raise ValueError(f"Stream {stream_id}: Missing 'trade_date' column")
+    
+    if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+        logger.error(
+            f"Stream {stream_id}: trade_date has incorrect dtype: {df['trade_date'].dtype}. "
+            f"Expected datetime64. This indicates date normalization was not performed by DataLoader."
+        )
+        raise ValueError(
+            f"Stream {stream_id}: trade_date has incorrect dtype: {df['trade_date'].dtype}. "
+            f"DataLoader must normalize dates before downstream processing."
+        )
+
+
+def _validate_trade_date_presence(df: pd.DataFrame, stream_id: str) -> None:
+    """
+    Validate that trade_date column exists.
+    
+    Downstream modules MAY validate presence but MUST NOT re-parse dates.
+    
+    Args:
+        df: DataFrame to validate
+        stream_id: Stream ID for error reporting
+        
+    Raises:
+        ValueError: If trade_date column is missing
+    """
+    if 'trade_date' not in df.columns:
+        logger.error(f"Stream {stream_id}: Missing 'trade_date' column")
+        raise ValueError(f"Stream {stream_id}: Missing 'trade_date' column")
 
 
 def find_parquet_files(stream_dir: Path, stream_id: str) -> List[Path]:
@@ -68,12 +189,13 @@ def apply_date_filters(
     specific_date: Optional[str] = None
 ) -> pd.DataFrame:
     """
-    Apply date filters to a DataFrame.
+    Apply date filters to a DataFrame using trade_date column.
     
-    OPTIMIZED: Only converts Date column to datetime if filtering is needed.
+    NOTE: This function expects trade_date to already be normalized by DataLoader.
+    It does NOT parse dates - only filters using existing trade_date column.
     
     Args:
-        df: Input DataFrame with 'Date' column
+        df: Input DataFrame with 'trade_date' column (already normalized)
         start_date: Start date for filtering (YYYY-MM-DD) or None
         end_date: End date for filtering (YYYY-MM-DD) or None
         specific_date: Specific date to filter (YYYY-MM-DD) or None
@@ -81,30 +203,28 @@ def apply_date_filters(
     Returns:
         Filtered DataFrame
     """
-    if 'Date' not in df.columns:
+    if 'trade_date' not in df.columns:
+        # If trade_date doesn't exist, this is an error (should have been normalized)
+        logger.warning("apply_date_filters called on DataFrame without trade_date column")
         return df
     
-    # If no date filters provided, return DataFrame as-is (no conversion needed)
+    # If no date filters provided, return DataFrame as-is
     if not specific_date and not start_date and not end_date:
         return df
-    
-    # Only convert to datetime if we need to filter (optimization)
-    if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df = df.copy()  # Only copy if we need to modify
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
     
     # Pre-compute date filters for efficiency
     specific_date_dt = pd.to_datetime(specific_date).date() if specific_date else None
     start_date_dt = pd.to_datetime(start_date) if start_date else None
     end_date_dt = pd.to_datetime(end_date) if end_date else None
     
+    # Filter using trade_date (already datetime dtype from normalization)
     if specific_date_dt:
-        df = df[df['Date'].dt.date == specific_date_dt]
+        df = df[df['trade_date'].dt.date == specific_date_dt]
     elif start_date_dt or end_date_dt:
         if start_date_dt:
-            df = df[df['Date'] >= start_date_dt]
+            df = df[df['trade_date'] >= start_date_dt]
         if end_date_dt:
-            df = df[df['Date'] <= end_date_dt]
+            df = df[df['trade_date'] <= end_date_dt]
     
     return df
 
@@ -192,7 +312,11 @@ def load_stream_data(
                 df = df.copy()  # Only copy if we need to modify
                 df['Stream'] = stream_id
             
-            # Apply date filters (only filters if dates provided - otherwise loads all data)
+            # SINGLE OWNERSHIP: Normalize Date to trade_date immediately after reading
+            # This is the ONLY place where date normalization happens
+            df = _normalize_date_to_trade_date(df, stream_id)
+            
+            # Apply date filters using trade_date (already normalized)
             df = apply_date_filters(df, start_date, end_date, specific_date)
             
             if not df.empty:
@@ -351,22 +475,38 @@ def load_all_streams(
     
     logger.info(f"Total trades loaded (before sequencer logic): {len(master_df)}")
     
-    # Log date range if available
-    if not master_df.empty and 'Date' in master_df.columns:
+    # Log date range if available (using trade_date, already normalized)
+    if not master_df.empty and 'trade_date' in master_df.columns:
         try:
-            if not pd.api.types.is_datetime64_any_dtype(master_df['Date']):
-                master_df['Date'] = pd.to_datetime(master_df['Date'], errors='coerce')
-            valid_dates = master_df['Date'].notna()
+            valid_dates = master_df['trade_date'].notna()
             if valid_dates.any():
-                min_date = master_df.loc[valid_dates, 'Date'].min()
-                max_date = master_df.loc[valid_dates, 'Date'].max()
+                min_date = master_df.loc[valid_dates, 'trade_date'].min()
+                max_date = master_df.loc[valid_dates, 'trade_date'].max()
                 logger.info(f"Date range in loaded data: {min_date.date()} to {max_date.date()}")
         except Exception as e:
             logger.debug(f"Could not determine date range: {e}")
     
     logger.info(f"Streams loaded successfully: {streams_loaded} ({len(streams_loaded)}/{len(streams)})")
     if streams_failed:
-        logger.warning(f"Streams that failed to load: {list(streams_failed.keys())}")
+        # Validate empty streams based on criticality
+        from .config import CRITICAL_STREAMS
+        critical_failed = [s for s in streams_failed.keys() if s in CRITICAL_STREAMS]
+        non_critical_failed = [s for s in streams_failed.keys() if s not in CRITICAL_STREAMS]
+        
+        if critical_failed:
+            error_msg = (
+                f"CRITICAL STREAMS FAILED TO LOAD: {sorted(critical_failed)}. "
+                f"Critical streams must have data. Aborting load."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        if non_critical_failed:
+            logger.warning(
+                f"Non-critical streams failed to load: {sorted(non_critical_failed)}. "
+                f"Continuing with available streams."
+            )
+            logger.warning(f"Streams that failed to load: {list(streams_failed.keys())}")
     
     # Apply sequencer logic if provided
     if apply_sequencer_logic:

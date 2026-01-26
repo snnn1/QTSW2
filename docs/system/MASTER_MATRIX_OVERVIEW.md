@@ -17,7 +17,7 @@ The Master Matrix serves as the central data structure that:
 ### 1. Sequencer Logic (Time Change System)
 The Master Matrix uses sophisticated **sequencer logic** to select trades:
 
-- **Points-based selection**: Each trade result is scored (Win = +2, Loss = -2, BE = 0, NoTrade = 0)
+- **Points-based selection**: Each trade result is scored (Win = +1, Loss = -2, BE = 0, NoTrade = 0)
 - **Rolling 13-trade history**: Maintains a rolling window of the last 13 trades per time slot
 - **Time change on loss**: When a trade loses, the system automatically switches to a better-performing time slot
 - **Session management**: Trades are organized into S1 (07:30, 08:00, 09:00) and S2 (09:30, 10:00, 10:30, 11:00) sessions

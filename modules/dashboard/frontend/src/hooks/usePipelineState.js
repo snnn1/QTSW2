@@ -6,16 +6,21 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { start as startAppService } from '../services/appsManager'
 import { useWebSocket } from '../contexts/WebSocketContext'
+import {
+  API_TIMEOUT_SHORT,
+  API_TIMEOUT_DEFAULT,
+  API_TIMEOUT_LONG,
+  POLL_INTERVAL_IDLE,
+  POLL_INTERVAL_RUNNING
+} from '../config/constants'
 
 const API_BASE = '/api'
 const HEALTH_URL = '/health'
 
-const DEFAULT_TIMEOUT = 8000
-
 /* -------------------------------------------------------
    Fetch helper with timeout
 ------------------------------------------------------- */
-async function fetchWithTimeout(url, options = {}, timeout = DEFAULT_TIMEOUT) {
+async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT_DEFAULT) {
   const controller = new AbortController()
   const id = setTimeout(() => controller.abort(), timeout)
 
@@ -41,7 +46,7 @@ async function safeJson(response) {
 export async function getFileCounts() {
   try {
     // Short timeout - cache should make this instant
-    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, 2000)
+    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, API_TIMEOUT_SHORT)
     if (!res.ok) throw new Error(res.status)
     const data = await safeJson(res)
 
@@ -62,7 +67,7 @@ export async function getFileCounts() {
 export async function getNextScheduledRun() {
   try {
     // Short timeout for fast failure
-    const res = await fetchWithTimeout(`${API_BASE}/schedule/next`, {}, 2000)
+    const res = await fetchWithTimeout(`${API_BASE}/schedule/next`, {}, API_TIMEOUT_SHORT)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -75,7 +80,7 @@ export async function getNextScheduledRun() {
 ------------------------------------------------------- */
 export async function getPipelineSnapshot() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/pipeline/snapshot`, {}, 8000)
+    const res = await fetchWithTimeout(`${API_BASE}/pipeline/snapshot`, {}, API_TIMEOUT_DEFAULT)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -110,7 +115,7 @@ export async function startPipeline(manualOverride = false) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ manual: true, manual_override: manualOverride }),
     },
-    15000
+    API_TIMEOUT_LONG
   )
 
     console.log('[API] Response status:', res.status, res.statusText)
@@ -153,7 +158,7 @@ export async function startStage(stageName) {
 export async function getSchedulerStatus() {
   try {
     // Short timeout for fast failure
-    const res = await fetchWithTimeout(`${API_BASE}/scheduler/status`, {}, 2000)
+    const res = await fetchWithTimeout(`${API_BASE}/scheduler/status`, {}, API_TIMEOUT_SHORT)
     if (!res.ok) return null
     return await safeJson(res)
   } catch {
@@ -162,7 +167,7 @@ export async function getSchedulerStatus() {
 }
 
 export async function enableScheduler() {
-  const res = await fetchWithTimeout(`${API_BASE}/scheduler/enable`, { method: 'POST' }, 15000)
+  const res = await fetchWithTimeout(`${API_BASE}/scheduler/enable`, { method: 'POST' }, API_TIMEOUT_LONG)
   if (!res.ok) throw new Error(await res.text())
   return await safeJson(res)
 }
@@ -177,7 +182,7 @@ export async function disableScheduler() {
    Reset pipeline
 ------------------------------------------------------- */
 export async function resetPipeline() {
-  const res = await fetchWithTimeout(`${API_BASE}/pipeline/reset`, { method: 'POST' }, 8000)
+  const res = await fetchWithTimeout(`${API_BASE}/pipeline/reset`, { method: 'POST' }, API_TIMEOUT_DEFAULT)
   if (!res.ok) throw new Error(await res.text())
   return await safeJson(res)
 }
@@ -197,7 +202,7 @@ export async function clearPipelineLock() {
 ------------------------------------------------------- */
 export async function checkBackendConnection() {
   try {
-    const res = await fetchWithTimeout(HEALTH_URL, {}, 3000)
+    const res = await fetchWithTimeout(HEALTH_URL, {}, API_TIMEOUT_SHORT)
     return res.ok
   } catch {
     return false
@@ -250,22 +255,18 @@ export function usePipelineState() {
     metricsRef.current = metrics
   }, [metrics])
 
+  // Phase-1 always-on: Consume events from WebSocket context (singleton at App level)
+  const { events: wsEvents, subscribe: subscribeToWebSocket, isConnected: wsConnected } = useWebSocket()
+
   // Update pipeline status from backend response
   // Phase-1: Only update state when backend explicitly provides valid data
   // Never reset state on polling failure - keep last known state
   const updatePipelineStatus = useCallback((statusData, source = 'unknown') => {
-    // #region agent log BTN1
-    const _logData = { source, statusData: statusData ? { state: statusData.state, run_id: statusData.run_id || statusData.runId } : null };
-    // #endregion
-    
     // Phase-1 rule: If status fails → do nothing, keep last known state
     // Only change state when backend explicitly tells you to
     if (!statusData || statusData.state === 'unavailable') {
       // Don't reset state - just log and return
       console.warn('[Status] Status unavailable or missing, keeping last known state')
-      // #region agent log BTN1
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:'status unavailable - keeping state',data:_logData,timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
-      // #endregion
       return
     }
 
@@ -282,13 +283,6 @@ export function usePipelineState() {
     const runId = statusData.run_id || statusData.runId || null
     
     setPipelineStatus(prev => {
-      // #region agent log BTN1
-      const _prevState = { isRunning: prev.isRunning, state: prev.state, runId: prev.runId };
-      const _newState = { isRunning, state, runId };
-      const _stateChanged = prev.isRunning !== isRunning || prev.state !== state || prev.runId !== runId;
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:_stateChanged?'state changed':'state unchanged',data:{..._logData,prev:_prevState,new:_newState,internal_state:internalState,is_success:isSuccess,state_changed:_stateChanged},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
-      // #endregion
-      
       const newStatus = {
         state,
         isRunning,
@@ -297,9 +291,6 @@ export function usePipelineState() {
       
       // If pipeline finished (success or transitioned from running to idle), reset isStarting flag
       if (isSuccess || (prev.isRunning && !isRunning && state === 'idle')) {
-        // #region agent log BTN1
-        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:updatePipelineStatus',message:'pipeline finished - resetting isStarting',data:{prev:_prevState,new:newStatus,internal_state:internalState,is_success:isSuccess},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN1'})}).catch(()=>{});
-        // #endregion
         // Pipeline finished - reset isStarting flag and clear recently started flag
         setIsStarting(false)
         if (recentlyStartedRunIdRef.current === runId || recentlyStartedRunIdRef.current === prev.runId) {
@@ -314,20 +305,11 @@ export function usePipelineState() {
 
   // Poll pipeline status (lightweight - just status, no snapshot)
   const pollPipelineStatus = useCallback(async () => {
-    // #region agent log BTN2
-    const _pollStart = Date.now();
-    // #endregion
     try {
       const status = await getPipelineStatus()
-      // #region agent log BTN2
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:pollPipelineStatus',message:'poll complete',data:{duration_ms:Date.now()-_pollStart,status:status?{state:status.state,run_id:status.run_id||status.runId}:null},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN2'})}).catch(()=>{});
-      // #endregion
       updatePipelineStatus(status, 'polling')
     } catch (error) {
       console.error('Error polling pipeline status:', error)
-      // #region agent log BTN2
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:pollPipelineStatus',message:'poll error',data:{duration_ms:Date.now()-_pollStart,error:error.message},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN2'})}).catch(()=>{});
-      // #endregion
     }
   }, [updatePipelineStatus])
 
@@ -335,10 +317,6 @@ export function usePipelineState() {
   // OPTIMIZED: File counts update immediately (cached), others update as they arrive
   // Never reset to 0 on timeout - keep last-known-good values
   const loadMetadata = useCallback(async () => {
-    // #region agent log LOAD3
-    const _t0 = Date.now()
-    // #endregion
-    
     // File counts is cached - load it first and update immediately (don't wait for validation)
     getFileCounts()
       .then(fileCounts => {
@@ -374,27 +352,42 @@ export function usePipelineState() {
         console.error('Error loading next scheduled run:', error)
         // Keep last-known-good value
       })
-    
-    // Log completion after a short delay (don't block on it)
-    setTimeout(() => {
-      // #region agent log LOAD3
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:loadMetadata',message:'metadata load started (non-blocking)',data:{duration_ms:Date.now()-_t0},timestamp:Date.now(),sessionId:'debug-session',runId:'load-audit-1',hypothesisId:'LOAD3'})}).catch(()=>{});
-      // #endregion
-    }, 100)
   }, [])
 
+  // State Priority Order:
+  // 1. WebSocket events (authoritative real-time state)
+  // 2. WebSocket snapshot (initial sync)
+  // 3. Polling (fallback only when WebSocket is disconnected)
+  //
+  // Polling must never overwrite newer WebSocket-derived state
+  // Polling frequency should remain reduced when WebSocket is healthy
+  
   // Phase-1 always-on: Minimal polling - WebSocket is primary source of truth
-  // Poll status + metadata every 30 seconds (just for button state, WebSocket handles events)
+  // Poll status + metadata at reduced frequency when WebSocket is connected
+  // Increase polling frequency when WebSocket is disconnected (fallback mode)
   useEffect(() => {
     // Initial load - prioritize status for Run ID, then metadata
     pollPipelineStatus()  // Get Run ID immediately from status endpoint
     loadMetadata()  // Load metadata (file counts, scheduler) - non-blocking
     
-    // Poll every 30 seconds (lightweight, just for status/metadata)
-      statusPollingRef.current = setInterval(() => {
-        pollPipelineStatus()
-        loadMetadata()
-    }, 30000)  // 30 seconds - WebSocket handles real-time events
+    // Adaptive polling based on WebSocket connection state
+    // When WebSocket connected: poll every 60s idle, 10s running (lightweight fallback)
+    // When WebSocket disconnected: poll every 10s (more aggressive fallback)
+    const getPollInterval = () => {
+      if (!wsConnected) {
+        return 10000  // 10 seconds when WebSocket disconnected (fallback mode)
+      }
+      // WebSocket connected - use reduced frequency
+      return pipelineStatus.isRunning ? 10000 : 60000  // 10s running, 60s idle
+    }
+    
+    const pollInterval = getPollInterval()
+    
+    // Poll at adaptive interval (lightweight, just for status/metadata)
+    statusPollingRef.current = setInterval(() => {
+      pollPipelineStatus()
+      loadMetadata()
+    }, pollInterval)
     
     return () => {
       if (statusPollingRef.current) {
@@ -402,10 +395,50 @@ export function usePipelineState() {
         statusPollingRef.current = null
       }
     }
-  }, [pollPipelineStatus, loadMetadata])  // Fixed interval, don't depend on isRunning
+  }, [pollPipelineStatus, loadMetadata, pipelineStatus.isRunning, wsConnected])  // Re-run when running state or WebSocket connection changes
 
-  // Phase-1 always-on: Consume events from WebSocket context (singleton at App level)
-  const { events: wsEvents, subscribe: subscribeToWebSocket } = useWebSocket()
+  // State Priority Order:
+  // 1. WebSocket events (authoritative real-time state)
+  // 2. WebSocket snapshot (initial sync)
+  // 3. Polling (fallback only when WebSocket is disconnected)
+  //
+  // Polling must never overwrite newer WebSocket-derived state
+  // Polling frequency should remain reduced when WebSocket is healthy
+  
+  // Phase-1 always-on: Minimal polling - WebSocket is primary source of truth
+  // Poll status + metadata at reduced frequency when WebSocket is connected
+  // Increase polling frequency when WebSocket is disconnected (fallback mode)
+  useEffect(() => {
+    // Initial load - prioritize status for Run ID, then metadata
+    pollPipelineStatus()  // Get Run ID immediately from status endpoint
+    loadMetadata()  // Load metadata (file counts, scheduler) - non-blocking
+    
+    // Adaptive polling based on WebSocket connection state
+    // When WebSocket connected: poll every 60s idle, 10s running (lightweight fallback)
+    // When WebSocket disconnected: poll every 10s (more aggressive fallback)
+    const getPollInterval = () => {
+      if (!wsConnected) {
+        return 10000  // 10 seconds when WebSocket disconnected (fallback mode)
+      }
+      // WebSocket connected - use reduced frequency
+      return pipelineStatus.isRunning ? 10000 : 60000  // 10s running, 60s idle
+    }
+    
+    const pollInterval = getPollInterval()
+    
+    // Poll at adaptive interval (lightweight, just for status/metadata)
+    statusPollingRef.current = setInterval(() => {
+      pollPipelineStatus()
+      loadMetadata()
+    }, pollInterval)
+    
+    return () => {
+      if (statusPollingRef.current) {
+        clearInterval(statusPollingRef.current)
+        statusPollingRef.current = null
+      }
+    }
+  }, [pollPipelineStatus, loadMetadata, pipelineStatus.isRunning, wsConnected])  // Re-run when running state or WebSocket connection changes
   
   // Subscribe to WebSocket events and handle them
   useEffect(() => {
@@ -465,10 +498,6 @@ export function usePipelineState() {
       // CRITICAL: Use complete canonical_state from event for truthfulness
       // This ensures WebSocket and polling always agree
       if (event.event === 'state_change' && event.data) {
-        // #region agent log BTN3
-        const _wsEventData = { event: event.event, has_canonical: !!event.data.canonical_state, has_new_state: !!event.data.new_state, run_id: event.run_id };
-        // #endregion
-        
         // Prefer canonical_state if available (complete truth)
         if (event.data.canonical_state) {
           const canonical = event.data.canonical_state
@@ -497,10 +526,6 @@ export function usePipelineState() {
             }, 30000)
           }
           
-          // #region agent log BTN3
-          fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleEvent',message:'websocket state_change (canonical)',data:{..._wsEventData,internal_state:internalState,canonical_state:canonicalState,canonical_run_id:canonical.run_id},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN3'})}).catch(()=>{});
-          // #endregion
-          
           updatePipelineStatus({
             state: canonicalState,
             run_id: canonical.run_id || event.run_id || activeRunId,
@@ -524,9 +549,6 @@ export function usePipelineState() {
                 }
               }, 30000)
             }
-            // #region agent log BTN3
-            fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleEvent',message:'websocket state_change (fallback)',data:{..._wsEventData,new_state:newState},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN3'})}).catch(()=>{});
-            // #endregion
             updatePipelineStatus({ state: newState, run_id: event.run_id || activeRunId }, 'websocket')
           }
         }
@@ -548,24 +570,14 @@ export function usePipelineState() {
 
   // Start pipeline
   const handleStartPipeline = useCallback(async (manualOverride = false) => {
-    // #region agent log BTN4
-    const _clickTime = Date.now();
-    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'button clicked',data:{isStarting,isRunning:pipelineStatus.isRunning,state:pipelineStatus.state,runId:pipelineStatus.runId,manualOverride},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-    // #endregion
     console.log('[Pipeline] Start button clicked', { isStarting, isRunning: pipelineStatus.isRunning, state: pipelineStatus.state, manualOverride })
     
     if (isStarting || pipelineStatus.isRunning) {
       console.log('[Pipeline] Start blocked - already starting or running')
-      // #region agent log BTN4
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'start blocked',data:{isStarting,isRunning:pipelineStatus.isRunning},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-      // #endregion
       return
     }
     
     setIsStarting(true)
-    // #region agent log BTN4
-    fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'setIsStarting(true)',data:{},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-    // #endregion
     try {
       console.log('[Pipeline] Calling startPipeline API...', { manualOverride })
       const result = await startPipeline(manualOverride)
@@ -585,9 +597,6 @@ export function usePipelineState() {
         
         // Immediately set running state so button disables right away
         // WebSocket events will update this later, but we want immediate UI feedback
-        // #region agent log BTN4
-        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'setting running state',data:{run_id:result.run_id,api_duration_ms:Date.now()-_clickTime},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-        // #endregion
         setPipelineStatus({
           state: 'running',
           isRunning: true,
@@ -610,9 +619,6 @@ export function usePipelineState() {
         }, 1000)  // Wait 1 second before polling to let backend update
       } else {
         console.warn('[Pipeline] Start API returned no run_id:', result)
-        // #region agent log BTN4
-        fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'no run_id in response',data:{result},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-        // #endregion
         setIsStarting(false)  // Only reset on error
         setAlertInfo({
           type: 'error',
@@ -621,9 +627,6 @@ export function usePipelineState() {
       }
     } catch (error) {
       console.error('[Pipeline] Start failed:', error)
-      // #region agent log BTN4
-      fetch('http://127.0.0.1:7242/ingest/eade699f-d61f-42de-a82b-fcbc1c4af825',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'modules/dashboard/frontend/src/hooks/usePipelineState.js:handleStartPipeline',message:'start error',data:{error:error.message,api_duration_ms:Date.now()-_clickTime},timestamp:Date.now(),sessionId:'debug-session',runId:'btn-state-1',hypothesisId:'BTN4'})}).catch(()=>{});
-      // #endregion
       setIsStarting(false)  // Reset on error
       
       // Check if this is a health override requirement

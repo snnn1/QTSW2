@@ -29,10 +29,17 @@ print("="*80)
 trading_date_events = [e for e in events if e.get('event') == 'TRADING_DATE_LOCKED']
 if trading_date_events:
     latest = trading_date_events[-1]
-    payload = latest.get('data', {}).get('payload', {})
+    # Handle both dict payload and string payload
+    data = latest.get('data', {})
+    if isinstance(data, dict):
+        payload = data.get('payload', {})
+        if isinstance(payload, str):
+            payload = json.loads(payload) if payload else {}
+    else:
+        payload = {}
     print(f"\n[TRADING_DATE_LOCKED]")
-    print(f"  Trading Date: {payload.get('trading_date', 'N/A')}")
-    print(f"  Source: {payload.get('source', 'N/A')}")
+    print(f"  Trading Date: {payload.get('trading_date', 'N/A') if isinstance(payload, dict) else 'N/A'}")
+    print(f"  Source: {payload.get('source', 'N/A') if isinstance(payload, dict) else 'N/A'}")
     print(f"  Timestamp: {latest.get('ts_utc', 'N/A')}")
 else:
     print("\n[WARNING] No TRADING_DATE_LOCKED events found")

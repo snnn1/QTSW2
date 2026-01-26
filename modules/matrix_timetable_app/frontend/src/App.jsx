@@ -171,13 +171,16 @@ function AppContent() {
     workerGetRows,
     calculateProfitBreakdown,
     workerCalculateTimetable,
+    workerInitData,
     // Controller functions
     loadMasterMatrix,
     resequenceMasterMatrix,
     buildMasterMatrix,
     reloadLatestMatrix,
     refetchMasterStats,
-    hasLoadedRef
+    hasLoadedRef,
+    // Pagination state
+    totalRowsInFile
   } = useMatrixController({
     streamFilters,
     masterContractMultiplier,
@@ -295,6 +298,13 @@ function AppContent() {
           displayableCols.push(col)
         }
       })
+      
+      // Ensure stream_rolling_sum is available if it exists in data or is in DEFAULT_COLUMNS
+      if (cols.includes('stream_rolling_sum') && !displayableCols.includes('stream_rolling_sum')) {
+        displayableCols.push('stream_rolling_sum')
+      } else if (DEFAULT_COLUMNS.includes('stream_rolling_sum') && !displayableCols.includes('stream_rolling_sum')) {
+        displayableCols.push('stream_rolling_sum')
+      }
       
       setAvailableColumns(displayableCols)
       
@@ -485,8 +495,11 @@ function AppContent() {
   // Fetch backend stats for individual streams (full dataset)
   // CRITICAL: Always fetch backend stats for individual streams to ensure stats cover ALL data
   useEffect(() => {
-    // Only fetch for individual stream tabs (not 'master' or 'timetable')
-    if (deferredActiveTab && deferredActiveTab !== 'master' && deferredActiveTab !== 'timetable') {
+    // Breakdown tabs that are NOT streams: timetable, master, time, day, dom, date, month, year, stats
+    const breakdownTabs = ['timetable', 'master', 'time', 'day', 'dom', 'date', 'month', 'year', 'stats']
+    
+    // Only fetch for individual stream tabs (not breakdown tabs)
+    if (deferredActiveTab && !breakdownTabs.includes(deferredActiveTab)) {
       const streamId = deferredActiveTab
       
       // Check if includeFilteredExecuted just changed - if so, force refetch
@@ -713,6 +726,17 @@ function AppContent() {
           // Add filter
           currentFilters.include_years = [...current, numValue]
         }
+      } else if (filterType === 'health_gate_enabled') {
+        // For health gate enabled, value is a boolean
+        currentFilters[filterType] = Boolean(value)
+      } else if (filterType === 'health_rolling_window') {
+        // For rolling window, value is the number of trades (or null to reset to default)
+        const intValue = value === null || value === '' ? null : parseInt(value)
+        currentFilters[filterType] = isNaN(intValue) || intValue <= 0 ? null : intValue
+      } else if (filterType === 'health_suspend_threshold' || filterType === 'health_resume_threshold') {
+        // For health thresholds, value is the new threshold value (or null to reset to default)
+        const numValue = value === null || value === '' ? null : parseFloat(value)
+        currentFilters[filterType] = isNaN(numValue) ? null : numValue
       }
       
       // Return a completely new object to trigger re-render
@@ -1708,7 +1732,11 @@ function AppContent() {
                       (filters.exclude_days_of_month && filters.exclude_days_of_month.length > 0) || 
                       (filters.exclude_times && filters.exclude_times.length > 0) ||
                       (filters.include_years && filters.include_years.length > 0) ||
-                      (streamId === 'master' && filters.include_streams && filters.include_streams.length > 0)
+                      (streamId === 'master' && filters.include_streams && filters.include_streams.length > 0) ||
+                      (streamId !== 'master' && filters.health_gate_enabled === false) ||
+                      (streamId !== 'master' && (filters.health_rolling_window !== null && filters.health_rolling_window !== undefined)) ||
+                      (streamId !== 'master' && (filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined)) ||
+                      (streamId !== 'master' && (filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined))
     
     return (
       <div className="bg-gray-800 rounded-lg p-4 mb-4">
@@ -2048,6 +2076,141 @@ function AppContent() {
               })()}
             </div>
           </div>
+          
+          {/* Stream Health Gate - Only for individual streams (not master) */}
+          {streamId !== 'master' && (
+            <div className="space-y-2 border-t border-gray-700 pt-3 mt-3">
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-xs font-medium text-gray-400">Stream Health Gate</label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={filters.health_gate_enabled !== undefined ? filters.health_gate_enabled : true}
+                    onChange={(e) => {
+                      updateStreamFilter(streamId, 'health_gate_enabled', e.target.checked)
+                    }}
+                    className="w-4 h-4 text-blue-600 bg-gray-800 border-gray-700 rounded focus:ring-blue-500"
+                  />
+                  <span className="text-xs text-gray-400">Enable Health Gate</span>
+                </label>
+              </div>
+              <div className="text-xs text-gray-500 mb-3">
+                Override system defaults for this stream. Leave empty to use system defaults.
+              </div>
+              
+              {/* All inputs horizontal */}
+              <div className={`flex gap-8 ${(filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false) ? 'opacity-50' : ''}`}>
+                {/* Rolling Window (Trade Amount) */}
+                <div className="flex-1 space-y-1 pr-4 border-r border-gray-700">
+                  <label className="block text-xs text-gray-400">Rolling Window (Trades)</label>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
+                      value={filters.health_rolling_window !== null && filters.health_rolling_window !== undefined ? filters.health_rolling_window : ''}
+                      onChange={(e) => {
+                        const value = e.target.value
+                        updateStreamFilter(streamId, 'health_rolling_window', value === '' ? null : value)
+                      }}
+                      placeholder="Default: 25"
+                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                    {filters.health_rolling_window !== null && filters.health_rolling_window !== undefined && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          updateStreamFilter(streamId, 'health_rolling_window', null)
+                        }}
+                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
+                        title="Reset to system default"
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Number of trades
+                  </div>
+                </div>
+                
+                {/* Suspend Threshold */}
+                <div className="flex-1 space-y-1 px-4 border-r border-gray-700">
+                  <label className="block text-xs text-gray-400">Suspend Threshold ($)</label>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      step="0.01"
+                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
+                      value={filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined ? filters.health_suspend_threshold : ''}
+                      onChange={(e) => {
+                        const value = e.target.value
+                        updateStreamFilter(streamId, 'health_suspend_threshold', value === '' ? null : value)
+                      }}
+                      placeholder="Default: -750.00"
+                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                    {filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          updateStreamFilter(streamId, 'health_suspend_threshold', null)
+                        }}
+                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
+                        title="Reset to system default"
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Suspend when ≤ this
+                  </div>
+                </div>
+                
+                {/* Resume Threshold */}
+                <div className="flex-1 space-y-1 pl-4">
+                  <label className="block text-xs text-gray-400">Resume Threshold ($)</label>
+                  <div className="flex items-center gap-1">
+                    <input
+                      type="number"
+                      step="0.01"
+                      disabled={filters.health_gate_enabled !== undefined ? !filters.health_gate_enabled : false}
+                      value={filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined ? filters.health_resume_threshold : ''}
+                      onChange={(e) => {
+                        const value = e.target.value
+                        updateStreamFilter(streamId, 'health_resume_threshold', value === '' ? null : value)
+                      }}
+                      placeholder="Default: 0.00"
+                      className="flex-1 px-2 py-1 text-xs bg-gray-700 border border-gray-600 rounded text-white focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                    {filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          updateStreamFilter(streamId, 'health_resume_threshold', null)
+                        }}
+                        className="px-1.5 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded text-gray-300"
+                        title="Reset to system default"
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Resume when ≥ this
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     )
@@ -2120,7 +2283,13 @@ function AppContent() {
   }
   
   const getSelectedColumnsForTab = (tabId) => {
-    const cols = selectedColumns[tabId] || DEFAULT_COLUMNS
+    const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
+    const getDefaultColumns = () => {
+      return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
+    }
+    
+    // If no saved selection for this tab, use default columns (excluding certain ones)
+    const cols = selectedColumns[tabId] || getDefaultColumns()
     // Ensure columns are always in the correct order
     return sortColumnsByDefaultOrder(cols)
   }
@@ -2156,6 +2325,45 @@ function AppContent() {
     })
   }
 
+  // Initialize columns for active tab when column selector opens
+  useEffect(() => {
+    if (showColumnSelector && availableColumns.length > 0) {
+      const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
+      const getDefaultColumns = () => {
+        return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
+      }
+      
+      setSelectedColumns(prev => {
+        const updated = { ...prev }
+        let changed = false
+        
+        // Initialize activeTab if it doesn't have columns set
+        if (!updated[activeTab] || updated[activeTab].length === 0) {
+          updated[activeTab] = getDefaultColumns()
+          changed = true
+        }
+        
+        if (changed) {
+          localStorage.setItem('matrix_selected_columns', JSON.stringify(updated))
+        }
+        return updated
+      })
+    }
+  }, [showColumnSelector, activeTab, availableColumns.length])
+
+  // Memoize selected columns for current tab to ensure consistent rendering
+  const currentTabSelectedColumns = useMemo(() => {
+    const excludedFromDefault = ['Revised Score', 'Revised Profit ($)']
+    const getDefaultColumns = () => {
+      return DEFAULT_COLUMNS.filter(col => !excludedFromDefault.includes(col))
+    }
+    
+    // If no saved selection for this tab, use default columns (excluding certain ones)
+    const cols = selectedColumns[activeTab] || getDefaultColumns()
+    // Ensure columns are always in the correct order
+    return sortColumnsByDefaultOrder(cols)
+  }, [selectedColumns, activeTab])
+
   const renderColumnSelector = () => {
     if (!showColumnSelector || availableColumns.length === 0) return null
     
@@ -2163,6 +2371,9 @@ function AppContent() {
     const filteredColumns = getFilteredColumns(availableColumns, activeTab)
     // Sort columns to maintain DEFAULT_COLUMNS order in the selector too
     const sortedColumns = sortColumnsByDefaultOrder(filteredColumns)
+    
+    // Use memoized selected columns for this tab
+    const currentCols = currentTabSelectedColumns
     
     return (
       <div className="mb-4 bg-gray-900 rounded-lg p-4 border border-gray-700">
@@ -2177,9 +2388,9 @@ function AppContent() {
         </div>
         <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
           {sortedColumns.map(col => {
-            const currentCols = getSelectedColumnsForTab(activeTab)
             // Map column names to display names
-            const displayName = col === 'StopLoss' ? 'Stop Loss' : col
+            const displayName = col === 'StopLoss' ? 'Stop Loss' : 
+                                col === 'stream_rolling_sum' ? 'Rolling Sum ($)' : col
             return (
               <label key={col} className="flex items-center space-x-2 cursor-pointer hover:bg-gray-900 p-2 rounded">
                 <input
@@ -2360,8 +2571,8 @@ function AppContent() {
     loadedRowsRef.current = loadedRows
   }, [loadedRows])
   
-  const loadMoreRows = useCallback((startIndex, stopIndex) => {
-    if (!workerReady || !workerGetRows || !workerFilteredIndices || loadingMoreRows) {
+  const loadMoreRows = useCallback(async (startIndex, stopIndex) => {
+    if (!workerReady || !workerGetRows || !workerFilteredIndices) {
       return
     }
     
@@ -2371,17 +2582,64 @@ function AppContent() {
       : (workerFilteredRows || [])
     const currentLoadedLength = currentLoaded.length
     
-    // REMOVED LIMIT: Load ALL remaining rows, not just chunks
-    // Load all remaining rows if we're near the end or scrolling
+    // Check if we need to fetch more data from backend
+    // If we have fewer rows than total available, fetch more from backend first
+    if (totalRowsInFile !== null && masterData.length < totalRowsInFile && !loadingMoreRows) {
+      console.log(`[LoadMore] Fetching more data from backend: ${masterData.length} < ${totalRowsInFile}`)
+      setLoadingMoreRows(true)
+      try {
+        // Get master stream inclusion filter
+        const masterFilters = streamFilters['master'] || {}
+        const masterIncludeStreams = masterFilters.include_streams || []
+        const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
+        
+        // Fetch ALL remaining rows (limit=0 means no limit)
+        const data = await matrixApi.getMatrixData({
+          limit: 0, // Get all rows
+          order: 'newest',
+          essentialColumnsOnly: true,
+          skipCleaning: true,
+          contractMultiplier: masterContractMultiplier,
+          includeFilteredExecuted: includeFilteredExecuted,
+          streamInclude: streamIncludeParam
+        })
+        
+        const newTrades = data.data || []
+        if (newTrades.length > masterData.length) {
+          console.log(`[LoadMore] Fetched ${newTrades.length} rows from backend (had ${masterData.length})`)
+          // Update masterData with all rows
+          setMasterData(newTrades)
+          // Reinitialize worker with new data
+          if (workerInitData) {
+            workerInitData(newTrades)
+          }
+        }
+        setLoadingMoreRows(false)
+        return // Worker will filter and we'll load rows from filtered indices
+      } catch (error) {
+        console.error('[LoadMore] Failed to fetch more data from backend:', error)
+        setLoadingMoreRows(false)
+        // Fall through to load from worker indices
+      }
+    }
+    
+    // Load rows from worker's filtered indices
     const shouldLoad = workerFilteredIndices.length > currentLoadedLength
     
-    if (shouldLoad) {
+    if (shouldLoad && !loadingMoreRows) {
       setLoadingMoreRows(true)
       // Load ALL remaining rows - no limit
       const neededIndices = workerFilteredIndices.slice(currentLoadedLength)
       
+      // Set a timeout to reset loading flag if it gets stuck (safety measure)
+      const loadingTimeout = setTimeout(() => {
+        console.warn('loadMoreRows: Loading timeout - resetting loadingMoreRows flag')
+        setLoadingMoreRows(false)
+      }, 10000) // 10 second timeout
+      
       if (neededIndices.length > 0) {
         workerGetRows(neededIndices, (newRows) => {
+          clearTimeout(loadingTimeout)
           setLoadedRows(prev => {
             // Avoid duplicates - check if we already have these rows
             const existingLength = prev.length
@@ -2394,10 +2652,11 @@ function AppContent() {
           setLoadingMoreRows(false)
         })
       } else {
+        clearTimeout(loadingTimeout)
         setLoadingMoreRows(false)
       }
     }
-  }, [workerReady, workerGetRows, workerFilteredIndices, loadingMoreRows, workerFilteredRows])
+  }, [workerReady, workerGetRows, workerFilteredIndices, loadingMoreRows, workerFilteredRows, totalRowsInFile, masterData.length, streamFilters, masterContractMultiplier, includeFilteredExecuted, workerInitData])
   
   // renderDataTable function removed - using DataTable component instead
   
@@ -2733,7 +2992,7 @@ function AppContent() {
   // Track previous breakdown tab to clear old breakdown types when switching
   const prevBreakdownTabRef = useRef(null)
   
-  // Calculate profit breakdowns - use backend for full-dataset breakdowns (DOW/DOM/TIME), worker for filtered view (date/month/year)
+  // Calculate profit breakdowns - use backend for full-dataset breakdowns (DOW/DOM/TIME/YEAR), worker for filtered view (date/month)
   // Use activeTab (not deferredActiveTab) for breakdowns since they're less performance-critical
   // and we want them to trigger immediately when user clicks a breakdown tab
   useEffect(() => {
@@ -2748,9 +3007,9 @@ function AppContent() {
     prevBreakdownTabRef.current = activeTab
     const streamId = 'master' // Breakdowns always use master stream
     
-    // For DOW, DOM, and TIME tabs, fetch from backend (full dataset)
-    // For other tabs (date, month, year), use worker (filtered view is fine)
-    if (activeTab === 'day' || activeTab === 'dom' || activeTab === 'time') {
+    // For DOW, DOM, TIME, YEAR, and MONTH tabs, fetch from backend (full dataset, canonical)
+    // For other tabs (date), use worker (filtered view is fine)
+    if (activeTab === 'day' || activeTab === 'dom' || activeTab === 'time' || activeTab === 'year' || activeTab === 'month') {
       // Fetch full-dataset breakdowns from backend
       const fetchBreakdownFromBackend = async (useFiltered) => {
         try {
@@ -2761,6 +3020,10 @@ function AppContent() {
             breakdownType = 'dom'
           } else if (activeTab === 'time') {
             breakdownType = 'time'
+          } else if (activeTab === 'year') {
+            breakdownType = 'year'
+          } else if (activeTab === 'month') {
+            breakdownType = 'month'
           }
           
           // Get master stream inclusion filter
@@ -2792,13 +3055,22 @@ function AppContent() {
                 }
               }
             }
+            // Verify month breakdown format
+            if (activeTab === 'month') {
+              const sampleKeys = Object.keys(data.breakdown).slice(0, 3)
+              console.log(`[Breakdown] Month breakdown sample keys:`, sampleKeys)
+              sampleKeys.forEach(key => {
+                const value = data.breakdown[key]
+                console.log(`[Breakdown] Month ${key}:`, typeof value === 'object' ? Object.keys(value) : value)
+              })
+            }
             setProfitBreakdowns(prev => ({
               ...prev,
               [`${activeTab}_${suffix}`]: data.breakdown
             }))
             console.log(`[Breakdown] Updated ${activeTab}_${suffix} breakdown from backend (${Object.keys(data.breakdown).length} entries)`)
           } else {
-            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`)
+            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`, data)
           }
         } catch (error) {
           console.error(`Failed to fetch ${activeTab} breakdown from backend:`, error)
@@ -2865,28 +3137,24 @@ function AppContent() {
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
   
   const memoizedMonthProfitBefore = useMemo(() => {
-    if (profitBreakdowns['month_before']) return profitBreakdowns['month_before']
-    if (!workerReady) return calculateMonthlyProfitLocal(masterData)
-    return {}
-  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+    // Month breakdown is canonical - fetched from backend (full dataset)
+    return profitBreakdowns['month_before'] || {}
+  }, [profitBreakdowns])
   
   const memoizedMonthProfitAfter = useMemo(() => {
-    if (profitBreakdowns['month_after']) return profitBreakdowns['month_after']
-    if (!workerReady) return calculateMonthlyProfitLocal(memoizedMasterFilteredData)
-    return {}
-  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+    // Month breakdown is canonical - fetched from backend (full dataset)
+    return profitBreakdowns['month_after'] || {}
+  }, [profitBreakdowns])
   
   const memoizedYearProfitBefore = useMemo(() => {
-    if (profitBreakdowns['year_before']) return profitBreakdowns['year_before']
-    if (!workerReady) return calculateYearlyProfitLocal(masterData)
-    return {}
-  }, [profitBreakdowns, workerReady, masterData, masterContractMultiplier])
+    // Year breakdown is canonical - fetched from backend (full dataset)
+    return profitBreakdowns['year_before'] || {}
+  }, [profitBreakdowns])
   
   const memoizedYearProfitAfter = useMemo(() => {
-    if (profitBreakdowns['year_after']) return profitBreakdowns['year_after']
-    if (!workerReady) return calculateYearlyProfitLocal(memoizedMasterFilteredData)
-    return {}
-  }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+    // Year breakdown is canonical - fetched from backend (full dataset)
+    return profitBreakdowns['year_after'] || {}
+  }, [profitBreakdowns])
   
   const memoizedDateProfitBefore = useMemo(() => {
     if (profitBreakdowns['date_before']) return profitBreakdowns['date_before']

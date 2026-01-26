@@ -2,9 +2,14 @@
  * Pipeline API service
  */
 
+import {
+  API_TIMEOUT_SHORT,
+  API_TIMEOUT_DEFAULT,
+  API_TIMEOUT_LONG
+} from '../config/constants'
+
 const API_BASE = '/api'
 const HEALTH_URL = '/health'
-const REQUEST_TIMEOUT = 10000
 
 /* ===============================
    Core helpers
@@ -43,7 +48,7 @@ async function parseJSONSafe(res) {
 
 export async function getFileCounts() {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, 5000)
+    const res = await fetchWithTimeout(`${API_BASE}/metrics/files`, {}, API_TIMEOUT_SHORT)
     const data = await parseJSONSafe(res)
 
     return {
@@ -146,7 +151,7 @@ export async function enableScheduler() {
   const res = await fetchWithTimeout(
     `${API_BASE}/scheduler/enable`,
     { method: 'POST' },
-    30000
+    API_TIMEOUT_LONG
   )
 
   return parseJSONSafe(res)
@@ -185,7 +190,7 @@ export async function checkBackendConnection() {
     // This fixes connection failures when proxy is unstable
     const isDev = window.location.hostname === 'localhost' && window.location.port === '5173'
     const healthUrl = isDev ? 'http://localhost:8001/health' : HEALTH_URL
-    const res = await fetchWithTimeout(healthUrl, {}, 5000) // Increased timeout to 5s
+    const res = await fetchWithTimeout(healthUrl, {}, API_TIMEOUT_SHORT)
     if (!res.ok) {
       console.warn(`[Health Check] Backend returned status ${res.status}`)
       return false

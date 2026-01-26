@@ -19,7 +19,7 @@ export const ANALYZER_COLUMN_ORDER = [
 export const DEFAULT_COLUMNS = [
   'Date', 'DOW', 'Time', 'EntryTime', 'ExitTime', 'Instrument', 'Stream', 
   'Session', 'Direction', 'Target', 'Range', 'StopLoss', 'Peak', 'Result', 
-  'Profit', 'Time Change', 'Profit ($)'
+  'Profit', 'Time Change', 'Profit ($)', 'stream_rolling_sum'
 ]
 
 // Storage keys

@@ -128,6 +128,22 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
           const dollarValue = profitValue * contractValue
           value = currencyFormatter.format(dollarValue)
         }
+        // Format stream_rolling_sum as currency (dollars)
+        if (col === 'stream_rolling_sum') {
+          if (value !== null && value !== undefined && value !== '') {
+            const numValue = typeof value === 'number' ? value : parseFloat(value)
+            if (!isNaN(numValue) && isFinite(numValue)) {
+              // Always show currency format, even for zero
+              value = currencyFormatter.format(numValue)
+            } else {
+              // Invalid number - show as zero instead of dash
+              value = currencyFormatter.format(0)
+            }
+          } else {
+            // Null/undefined/empty - show as zero instead of dash
+            value = currencyFormatter.format(0)
+          }
+        }
         // Format time slot columns
         if (col.includes(' Rolling') && value !== null && value !== undefined) {
           const numValue = parseFloat(value)
@@ -242,9 +258,18 @@ const DataTable = memo(function DataTable({
   // When showFilteredDays is true, show all rows (including final_allowed === false)
   
   if (totalFiltered === 0) {
+    // Check if we have data but filters are excluding everything
+    const hasDataButFilteredOut = (data && data.length > 0) || 
+                                   (workerReady && workerFilteredIndices && workerFilteredIndices.length === 0)
+    
     return (
       <div className="text-center py-8 text-gray-400">
-        No data available{streamId ? ` for ${streamId}` : ''}
+        <div className="mb-2">No data available{streamId ? ` for ${streamId}` : ''}</div>
+        <div className="text-xs text-gray-500 mt-2">
+          {hasDataButFilteredOut
+            ? 'Filters are excluding all rows. Check year filters and stream filters in the Filters section above.'
+            : 'Data may not be loaded yet. Try clicking "Refresh Data" or "Full Rebuild".'}
+        </div>
       </div>
     )
   }
@@ -283,7 +308,8 @@ const DataTable = memo(function DataTable({
       'Result': 70,
       'Profit': 80,
       'Time Change': 100,
-      'Profit ($)': 120
+      'Profit ($)': 120,
+      'stream_rolling_sum': 130
     }
     return widths[col] || 120
   }
@@ -296,7 +322,8 @@ const DataTable = memo(function DataTable({
       <div className="flex bg-gray-800 sticky top-0 z-10 border-b border-gray-700" style={{ width: `${totalWidth}px` }}>
         {columnsToShow.map(col => {
           // Map column names to display names
-          const displayName = col === 'StopLoss' ? 'Stop Loss' : col
+          const displayName = col === 'StopLoss' ? 'Stop Loss' : 
+                             col === 'stream_rolling_sum' ? 'Rolling Sum ($)' : col
           return (
             <div 
               key={col} 
@@ -318,8 +345,13 @@ const DataTable = memo(function DataTable({
         style={{ height: 600, width: `${totalWidth}px` }} // Fixed height and width for virtual list
         onRowsRendered={({ startIndex, stopIndex }) => {
           // Load more rows when user scrolls near the end
+          // Trigger loading when we're within 50 rows of the end of loaded data
           if (workerReady && workerFilteredIndices && workerFilteredIndices.length > 0 && onLoadMoreRows) {
-            onLoadMoreRows(startIndex, stopIndex)
+            const loadedCount = filtered.length
+            const threshold = Math.max(50, Math.floor(totalFiltered * 0.1)) // Load when within 10% of end or 50 rows
+            if (stopIndex >= loadedCount - threshold && loadedCount < totalFiltered) {
+              onLoadMoreRows(startIndex, stopIndex)
+            }
           }
         }}
       />

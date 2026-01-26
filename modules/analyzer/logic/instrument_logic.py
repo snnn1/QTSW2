@@ -314,9 +314,25 @@ class InstrumentManager:
                 return self.get_display_profit(instrument, actual_profit)
             return actual_profit
         
+        # Handle OPEN result (trade still open)
+        elif result == "OPEN":
+            # Open trades: Calculate current PnL based on current price
+            if direction == "Long":
+                pnl_pts = exit_price - entry_price
+            else:
+                pnl_pts = entry_price - exit_price
+            
+            # Scale for micro-futures
+            actual_profit = self.scale_profit(instrument, pnl_pts)
+            
+            if use_display_profit:
+                return self.get_display_profit(instrument, actual_profit)
+            return actual_profit
+        
         # Handle TIME expiry result
         elif result == "TIME":
             # Time expiry trades: Calculate actual PnL based on exit price
+            # TIME only used when trade is closed (exit_time != NaT)
             if direction == "Long":
                 pnl_pts = exit_price - entry_price
             else:

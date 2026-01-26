@@ -22,6 +22,11 @@ class RunParams(BaseModel):
 class ConfigManager:
     """Handles configuration management and validation"""
     
+    # Constants for strategy parameters
+    T1_TRIGGER_THRESHOLD = 0.65  # T1 trigger threshold (65% of target)
+    FRIDAY_TO_MONDAY_DAYS = 3  # Days from Friday to Monday (for expiry/MFE calculation)
+    STOP_LOSS_MAX_MULTIPLIER = 3.0  # Maximum stop loss multiplier (max stop loss = 3× target)
+    
     def __init__(self):
         """Initialize configuration manager"""
         self.slot_ends = {

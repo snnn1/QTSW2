@@ -11,6 +11,13 @@
 
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react'
 import { formatEventTimestamp } from '../utils/timeUtils'
+import {
+  WS_RECONNECT_BASE_DELAY,
+  WS_RECONNECT_MAX_DELAY,
+  WS_RECONNECT_MAX_ATTEMPTS,
+  WS_STABLE_CONNECTION_DURATION,
+  MAX_EVENTS_IN_UI
+} from '../config/constants'
 
 const WebSocketContext = createContext({
   events: [],
@@ -33,6 +40,10 @@ export function WebSocketProvider({ children }) {
   const reconnectTimerRef = useRef(null)
   const seenEventsRef = useRef(new Set())
   const subscribersRef = useRef(new Set())  // Set of callback functions
+  
+  // Exponential backoff state
+  const reconnectAttemptsRef = useRef(0)
+  const stableConnectionTimeoutRef = useRef(null)
 
   // Subscribe to events (components can register callbacks)
   const subscribe = useCallback((callback) => {
@@ -55,10 +66,19 @@ export function WebSocketProvider({ children }) {
   }, [])
 
   // Generate deduplication key for an event
+  // Prefer event_id (if present) as part of the deduplication key
+  // Use timestamp-based deduplication only as a fallback when no ID exists
+  // Use millisecond-level granularity for timestamp-based deduplication
   const getEventKey = useCallback((e) => {
+    // Prefer event_id if present (most reliable)
+    if (e.event_id) {
+      return `id:${e.event_id}`
+    }
+    
+    // Fallback to timestamp-based deduplication with millisecond-level granularity
     const eventTime = e.timestamp ? new Date(e.timestamp).getTime() : 0
-    const timeWindow = Math.floor(eventTime / 1000) // Round to nearest second
-    return `${timeWindow}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
+    // Use millisecond-level granularity instead of second-level
+    return `${eventTime}|${e.stage || 'null'}|${e.event || 'null'}|${e.run_id || 'null'}`
   }, [])
 
   // Handle incoming events
@@ -95,10 +115,10 @@ export function WebSocketProvider({ children }) {
           return timeA - timeB
         })
         
-        if (combined.length > 100) {
-          const removed = combined.slice(0, combined.length - 100)
+        if (combined.length > MAX_EVENTS_IN_UI) {
+          const removed = combined.slice(0, combined.length - MAX_EVENTS_IN_UI)
           removed.forEach(rem => seenEventsRef.current.delete(getEventKey(rem)))
-          return combined.slice(-100)
+          return combined.slice(-MAX_EVENTS_IN_UI)
         }
         
         return combined
@@ -160,11 +180,11 @@ export function WebSocketProvider({ children }) {
         return timeA - timeB
       })
 
-      // Limit to last 100 events
-      if (combined.length > 100) {
-        const removed = combined.slice(0, combined.length - 100)
+      // Limit to max events in UI
+      if (combined.length > MAX_EVENTS_IN_UI) {
+        const removed = combined.slice(0, combined.length - MAX_EVENTS_IN_UI)
         removed.forEach(e => seenEventsRef.current.delete(getEventKey(e)))
-        return combined.slice(-100)
+        return combined.slice(-MAX_EVENTS_IN_UI)
       }
 
       return combined
@@ -204,6 +224,18 @@ export function WebSocketProvider({ children }) {
       ws.onopen = () => {
         console.log('[WS] Connected')
         setIsConnected(true)
+        
+        // Start stable connection timer - connection must remain open long enough to receive data
+        // This prevents flapping connections from prematurely resetting backoff
+        if (stableConnectionTimeoutRef.current) {
+          clearTimeout(stableConnectionTimeoutRef.current)
+        }
+        stableConnectionTimeoutRef.current = setTimeout(() => {
+          // Connection has been stable - reset retry counter
+          console.log('[WS] Connection stable, resetting retry counter')
+          reconnectAttemptsRef.current = 0
+          stableConnectionTimeoutRef.current = null
+        }, WS_STABLE_CONNECTION_DURATION)
       }
 
       ws.onmessage = (event) => {
@@ -214,6 +246,16 @@ export function WebSocketProvider({ children }) {
             console.log('[WS] Raw snapshot message:', data.type, data.chunk_index !== undefined ? `chunk ${data.chunk_index}/${data.total_chunks}` : '', data.events ? `${data.events.length} events` : '')
           }
           handleEvent(data)
+          
+          // Receiving data indicates connection is working - reset retry counter if stable timer hasn't fired yet
+          // This helps reset backoff faster when connection is clearly working
+          if (stableConnectionTimeoutRef.current && reconnectAttemptsRef.current > 0) {
+            // Connection is receiving data, consider it stable
+            clearTimeout(stableConnectionTimeoutRef.current)
+            console.log('[WS] Connection receiving data, resetting retry counter')
+            reconnectAttemptsRef.current = 0
+            stableConnectionTimeoutRef.current = null
+          }
         } catch (error) {
           console.error('[WS] Failed to parse message:', error, event.data)
         }
@@ -223,14 +265,28 @@ export function WebSocketProvider({ children }) {
         console.log(`[WS] Closed (code: ${event.code}, reason: ${event.reason || 'none'})`)
         wsRef.current = null
         setIsConnected(false)
+        
+        // Clear stable connection timer if connection closed before becoming stable
+        if (stableConnectionTimeoutRef.current) {
+          clearTimeout(stableConnectionTimeoutRef.current)
+          stableConnectionTimeoutRef.current = null
+        }
 
-        // Phase-1: Simple reconnect - retry every 2-5 seconds
-        const reconnectDelay = 2000 + Math.random() * 3000  // 2000-5000ms
-        console.log(`[WS] Scheduling reconnect in ${Math.round(reconnectDelay)}ms...`)
+        // Exponential backoff reconnection logic
+        if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
+          console.error(`[WS] Max reconnection attempts (${maxReconnectAttempts}) reached. Stopping reconnection.`)
+          return
+        }
+        
+        // Calculate exponential backoff delay: start at 1s, double each retry, max 30s
+        const delayMs = Math.min(baseDelayMs * Math.pow(2, reconnectAttemptsRef.current), maxDelayMs)
+        reconnectAttemptsRef.current += 1
+        
+        console.log(`[WS] Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${WS_RECONNECT_MAX_ATTEMPTS} in ${Math.round(delayMs)}ms...`)
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null
           connect()
-        }, reconnectDelay)
+        }, delayMs)
       }
 
       ws.onerror = (error) => {
@@ -242,12 +298,20 @@ export function WebSocketProvider({ children }) {
       wsRef.current = null
       setIsConnected(false)
 
-      // Retry if allowed
-      const reconnectDelay = 2000 + Math.random() * 3000
+      // Exponential backoff retry logic (same as onclose)
+      if (reconnectAttemptsRef.current >= WS_RECONNECT_MAX_ATTEMPTS) {
+        console.error(`[WS] Max reconnection attempts (${WS_RECONNECT_MAX_ATTEMPTS}) reached. Stopping reconnection.`)
+        return
+      }
+      
+      const delayMs = Math.min(WS_RECONNECT_BASE_DELAY * Math.pow(2, reconnectAttemptsRef.current), WS_RECONNECT_MAX_DELAY)
+      reconnectAttemptsRef.current += 1
+      
+      console.log(`[WS] Scheduling reconnect attempt ${reconnectAttemptsRef.current}/${WS_RECONNECT_MAX_ATTEMPTS} in ${Math.round(delayMs)}ms...`)
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null
         connect()
-      }, reconnectDelay)
+      }, delayMs)
     }
   }, [handleEvent])
 
@@ -260,6 +324,11 @@ export function WebSocketProvider({ children }) {
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current)
         reconnectTimerRef.current = null
+      }
+      
+      if (stableConnectionTimeoutRef.current) {
+        clearTimeout(stableConnectionTimeoutRef.current)
+        stableConnectionTimeoutRef.current = null
       }
 
       // Close WebSocket connection

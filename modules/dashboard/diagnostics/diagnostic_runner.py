@@ -54,9 +54,11 @@ class DiagnosticRunner:
     def __init__(self):
         self.results: List[TestResult] = []
         self.start_time = datetime.now()
-        self.backend_url = "http://localhost:8000"
+        # Use DASHBOARD_PORT environment variable, default to 8001 (production port)
+        backend_port = int(os.getenv("DASHBOARD_PORT", "8001"))
+        self.backend_url = f"http://localhost:{backend_port}"
         self.frontend_url = "http://localhost:5173"
-        self.ws_url = "ws://localhost:8000/ws"
+        self.ws_url = f"ws://localhost:{backend_port}/ws"
         self.event_logs_dir = QTSW2_ROOT / "automation" / "logs" / "events"
         self.event_logs_dir.mkdir(parents=True, exist_ok=True)
         
@@ -356,22 +358,57 @@ class DiagnosticRunner:
     # 2. Backend Diagnostics
     # ============================================================
     
-    def test_port_8000_available(self) -> tuple:
-        """Test if port 8000 is available"""
+    def test_backend_port_available(self) -> tuple:
+        """Test if backend port is available (in use means backend is running)"""
         try:
+            backend_port = int(os.getenv("DASHBOARD_PORT", "8001"))
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            result = sock.connect_ex(('localhost', 8000))
+            result = sock.connect_ex(('localhost', backend_port))
             sock.close()
             
             if result == 0:
-                return True, {"status": "Port in use (expected if backend running)"}
+                return True, {"status": f"Port {backend_port} in use (expected if backend running)"}
             else:
-                return True, {"status": "Port available"}
+                return True, {"status": f"Port {backend_port} available"}
         except Exception as e:
             return False, {"error": str(e)}
     
+    def _validate_backend_preconditions(self) -> tuple:
+        """Precondition Validation (Fail Fast): Verify backend is reachable before running tests"""
+        backend_port = int(os.getenv("DASHBOARD_PORT", "8001"))
+        
+        # Check if backend API is reachable
+        try:
+            response = requests.get(f"{self.backend_url}/health", timeout=2)
+            if response.status_code >= 500:
+                return False, f"Backend health check returned status {response.status_code}"
+        except requests.exceptions.ConnectionError:
+            return False, f"Backend not reachable on port {backend_port}. Ensure backend is running."
+        except requests.exceptions.Timeout:
+            return False, f"Backend health check timed out on port {backend_port}. Backend may be overloaded or not responding."
+        except Exception as e:
+            return False, f"Backend precondition check failed: {str(e)}"
+        
+        # Check if WebSocket endpoint is reachable (basic connectivity check)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex(('localhost', backend_port))
+            sock.close()
+            if result != 0:
+                return False, f"Backend port {backend_port} is not accessible"
+        except Exception as e:
+            return False, f"WebSocket endpoint precondition check failed: {str(e)}"
+        
+        return True, None
+    
     def test_backend_routes(self) -> tuple:
         """Test all backend API routes"""
+        # Precondition Validation (Fail Fast)
+        precond_passed, precond_error = self._validate_backend_preconditions()
+        if not precond_passed:
+            return False, {"precondition_failed": True, "error": precond_error}
+        
         routes_to_test = [
             ("/", "GET"),
             ("/api/schedule", "GET"),
@@ -402,7 +439,10 @@ class DiagnosticRunner:
                     all_passed = False
                     
             except requests.exceptions.ConnectionError:
-                results[route] = {"error": "Backend not running"}
+                results[route] = {"error": f"Backend not running on port {int(os.getenv('DASHBOARD_PORT', '8001'))}"}
+                all_passed = False
+            except requests.exceptions.Timeout:
+                results[route] = {"error": f"Request timed out after 5 seconds"}
                 all_passed = False
             except Exception as e:
                 results[route] = {"error": str(e)}
@@ -453,6 +493,11 @@ class DiagnosticRunner:
     
     def test_websocket_burst(self) -> tuple:
         """Test WebSocket endpoint under burst load"""
+        # Precondition Validation (Fail Fast)
+        precond_passed, precond_error = self._validate_backend_preconditions()
+        if not precond_passed:
+            return False, {"precondition_failed": True, "error": precond_error}
+        
         try:
             # Create test event log
             test_log = self.event_logs_dir / "pipeline_test-burst.jsonl"
@@ -1385,7 +1430,7 @@ class DiagnosticRunner:
         # 2. Backend Diagnostics
         print("2. Backend Diagnostics")
         print("-" * 80)
-        self.run_test("Port 8000 Availability", "Backend", self.test_port_8000_available)
+        self.run_test("Backend Port Availability", "Backend", self.test_backend_port_available)
         self.run_test("Backend API Routes", "Backend", self.test_backend_routes)
         self.run_test("File System Error Handling", "Backend", self.test_file_system_errors)
         self.run_test("JSONL Malformed Line Handling", "Backend", self.test_jsonl_malformed_handling)

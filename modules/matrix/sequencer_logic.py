@@ -21,6 +21,12 @@ HARD RULE: Time must NEVER be re-derived or mutated downstream.
 - The sequencer overwrites Time with current_time regardless of trade row's original Time
 - This ensures Time always reflects sequencer intent, not analyzer output
 
+DATE OWNERSHIP:
+===============
+DataLoader owns date normalization. This module MUST NOT re-parse dates.
+It MAY only validate dtype/presence of trade_date column.
+Canonical date column is 'trade_date' (normalized by DataLoader).
+
 SEQUENCING CONTRACT - FILTERED TIMES:
 =====================================
 Matrix filtering affects time SELECTION only. It does NOT affect:
@@ -84,26 +90,49 @@ def apply_sequencer_logic_with_state(
     if df.empty:
         return df, {}
     
-    # Pre-convert Date column once for all streams (only if needed)
-    if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df = df.copy()
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    # DATE OWNERSHIP: DataLoader owns date normalization
+    # Validate that trade_date exists and has correct dtype (no parsing)
+    from .data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
     
-    # Sort once by Stream and Date
+    # PERFORMANCE OPTIMIZATION: Validate trade_date once for entire DataFrame (contract-first)
+    # Global validation enforces the contract (fail-fast on any violation)
+    # Per-stream validation is only for diagnostics when the global check fails
+    try:
+        _validate_trade_date_presence(df, "all_streams")
+        _validate_trade_date_dtype(df, "all_streams")
+    except ValueError as e:
+        # If validation fails, validate per-stream for detailed diagnostics
+        logger.error(f"Sequencer logic: trade_date validation failed globally: {e}")
+        for stream_id in df['Stream'].unique() if 'Stream' in df.columns else []:
+            stream_mask = df['Stream'] == stream_id
+            stream_df = df[stream_mask]
+            try:
+                _validate_trade_date_presence(stream_df, stream_id)
+                _validate_trade_date_dtype(stream_df, stream_id)
+            except ValueError:
+                pass  # Already logged in global validation
+        raise  # Re-raise original error
+    
+    # Create Date column from trade_date for backward compatibility (if needed)
+    if 'Date' not in df.columns and 'trade_date' in df.columns:
+        df = df.copy()
+        df['Date'] = df['trade_date']
+    
+    # Sort once by Stream and trade_date (canonical column)
     needs_sorting = True
     if len(df) > 1:
         try:
-            if df['Stream'].is_monotonic_increasing and df['Date'].is_monotonic_increasing:
+            if df['Stream'].is_monotonic_increasing and df['trade_date'].is_monotonic_increasing:
                 needs_sorting = False
         except:
             pass
     
     if needs_sorting:
-        for col in ['Stream', 'Date']:
+        for col in ['Stream', 'trade_date']:
             if col in df.columns:
                 if col == 'Stream' and df[col].dtype == 'object':
                     df[col] = df[col].fillna('')
-        df = df.sort_values(['Stream', 'Date'], kind='mergesort').reset_index(drop=True)
+        df = df.sort_values(['Stream', 'trade_date'], kind='mergesort').reset_index(drop=True)
     
     unique_streams = df['Stream'].unique()
     logger.info(f"Processing {len(unique_streams)} streams with sequencer logic (capturing state)...")
@@ -262,12 +291,18 @@ def process_stream_daily(
     # Selectable times: canonical_times minus filtered_times
     selectable_times = [t for t in canonical_times if t not in filtered_times_normalized]
     
+    # Pre-processing validation: All times filtered is a configuration error
+    # Do not silently skip - provide actionable error message
     if not selectable_times:
-        logger.error(
-            f"Stream {stream_id}: No selectable times! All canonical times are filtered. "
-            f"Canonical times: {canonical_times}, Filtered times: {sorted(filtered_times_normalized)}"
+        error_msg = (
+            f"Stream {stream_id}: CONFIGURATION ERROR - All canonical times are filtered. "
+            f"This is a user configuration error, not a system error. "
+            f"Canonical times for session {session}: {sorted(canonical_times)}. "
+            f"Filtered times: {sorted(filtered_times_normalized)}. "
+            f"ACTION REQUIRED: Remove filters or add selectable times to enable processing for this stream."
         )
-        return []
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     # Initialize current_time: use restored state or default to first selectable time
     if initial_state:
@@ -317,19 +352,25 @@ def process_stream_daily(
     if stream_df.empty:
         return []
     
-    # OPTIMIZATION: Pre-normalize dates and create Time_str column once (not per-day)
-    # This avoids repeated operations
-    if not pd.api.types.is_datetime64_any_dtype(stream_df['Date']):
-        stream_df = stream_df.copy()  # Only copy if we need to modify
-        stream_df['Date'] = pd.to_datetime(stream_df['Date'], errors='coerce')
+    # DATE OWNERSHIP: DataLoader owns date normalization
+    # Validate trade_date dtype (no parsing)
+    from .data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
+    _validate_trade_date_presence(stream_df, stream_id)
+    _validate_trade_date_dtype(stream_df, stream_id)
     
     # Pre-normalize all Time values once (vectorized operation)
     if 'Time_str' not in stream_df.columns:
         stream_df = stream_df.copy()  # Only copy if we need to add column
         stream_df['Time_str'] = stream_df['Time'].astype(str).str.strip().apply(normalize_time)
     
-    # Pre-normalize dates for efficient filtering
-    stream_df['Date_normalized'] = stream_df['Date'].dt.normalize()
+    # Pre-normalize dates for efficient filtering (using trade_date, already datetime)
+    # PERFORMANCE: If we already copied for Time_str, we can add Date_normalized without another copy
+    # Otherwise, we need to copy before adding column
+    if 'Date_normalized' not in stream_df.columns:
+        # Check if we already have a copy (indicated by Time_str existing)
+        if 'Time_str' not in stream_df.columns:
+            stream_df = stream_df.copy()  # Only copy if we haven't already
+        stream_df['Date_normalized'] = stream_df['trade_date'].dt.normalize()
     
     # CRITICAL: Iterate only over dates present in analyzer data (data-driven, not calendar)
     # No weekends, no holidays unless present in data
@@ -442,19 +483,22 @@ def process_stream_daily(
             trade_dict = dict(trade_row)
             
             # CRITICAL: Ensure Date is in ISO string format (YYYY-MM-DD) to match analyzer output format
-            # This prevents date formatting issues when Date is a Timestamp object
-            if 'Date' in trade_dict:
+            # Use trade_date (canonical column) to create Date for backward compatibility
+            # trade_date is already datetime from DataLoader normalization
+            if 'trade_date' in trade_dict:
+                trade_date_value = trade_dict['trade_date']
+                if isinstance(trade_date_value, pd.Timestamp):
+                    trade_dict['Date'] = trade_date_value.strftime('%Y-%m-%d')
+                elif pd.notna(trade_date_value):
+                    # trade_date should already be datetime, but handle edge cases
+                    trade_dict['Date'] = str(trade_date_value)[:10]  # YYYY-MM-DD format
+            elif 'Date' in trade_dict:
+                # Fallback: format existing Date (shouldn't happen if trade_date exists)
                 date_value = trade_dict['Date']
                 if isinstance(date_value, pd.Timestamp):
                     trade_dict['Date'] = date_value.strftime('%Y-%m-%d')
                 elif pd.notna(date_value):
-                    # Try to parse and reformat if it's already a string in wrong format
-                    try:
-                        parsed_date = pd.to_datetime(date_value, errors='coerce')
-                        if pd.notna(parsed_date):
-                            trade_dict['Date'] = parsed_date.strftime('%Y-%m-%d')
-                    except:
-                        pass  # Keep original if parsing fails
+                    trade_dict['Date'] = str(date_value)[:10]  # YYYY-MM-DD format
             
             # CRITICAL: Preserve original analyzer time before overwriting Time column
             # This is needed for downstream filtering (exclude_times filter needs actual trade time)
@@ -470,11 +514,13 @@ def process_stream_daily(
         else:
             # Sequencer NoTrade: sequencer chose current_time but no trade exists at that slot
             # This is structural - no analyzer data at this time slot
+            # date is already datetime from trade_date normalization
             # Format date as ISO string (YYYY-MM-DD) to match analyzer output format
-            date_str = date.strftime('%Y-%m-%d') if isinstance(date, pd.Timestamp) else str(date)
+            date_str = date.strftime('%Y-%m-%d') if isinstance(date, pd.Timestamp) else str(date)[:10]
             trade_dict = {
                 'Stream': stream_id,
                 'Date': date_str,
+                'trade_date': date,  # Already datetime from trade_date normalization
                 'Time': str(current_time).strip(),  # Still set Time to current_time (sequencer's intent)
                 'actual_trade_time': '',  # No actual trade, so no actual time
                 'Result': 'NoTrade',
@@ -496,21 +542,31 @@ def process_stream_daily(
                 sl_value = min(sl_value, trade_dict['Range'])
         trade_dict['SL'] = sl_value
         
-        # Format Time Change column - show only the time it's being changed to
+        # Format Time Change column - show only FUTURE time changes (what time it WILL change to)
+        # TimeChange should only show upcoming changes, not past changes
         time_change_display = ''
-        if previous_time is not None and str(old_time_for_today) != str(previous_time):
-            time_change_display = str(old_time_for_today).strip()
-        elif next_time is not None:
-            time_change_display = str(next_time).strip()
+        if next_time is not None:
+            # Normalize both times for comparison using normalize_time() to ensure consistency
+            # normalize_time is already imported at the top of process_stream_daily
+            next_time_normalized = normalize_time(str(next_time))
+            old_time_normalized = normalize_time(str(old_time_for_today))
+            # Only show if next_time is actually different from current time
+            if next_time_normalized != old_time_normalized:
+                time_change_display = next_time_normalized
+            else:
+                # Debug: Log when next_time equals current_time (shouldn't happen normally)
+                logger.debug(
+                    f"Stream {stream_id} {date}: next_time '{next_time}' equals current_time '{old_time_for_today}', "
+                    f"leaving TimeChange empty"
+                )
+        # If next_time is None or equals current time, leave time_change_display empty
         trade_dict['Time Change'] = time_change_display
         
         # Add to chosen_trades (filter by year if needed)
-        trade_date = pd.to_datetime(date, errors='coerce')
-        if display_year is None or (pd.notna(trade_date) and trade_date.year == display_year):
-            if pd.notna(trade_date):
-                trade_dict['trade_date'] = trade_date
-            else:
-                trade_dict['trade_date'] = pd.to_datetime(date)
+        # date is already a datetime from Date_normalized (which comes from trade_date)
+        # Use it directly - no parsing needed
+        if display_year is None or (pd.notna(date) and date.year == display_year):
+            trade_dict['trade_date'] = date  # Already datetime from trade_date normalization
             chosen_trades.append(trade_dict)
         
         # ============================================================================
@@ -580,26 +636,51 @@ def apply_sequencer_logic(
     if df.empty:
         return df
     
-    # Pre-convert Date column once for all streams (only if needed)
-    if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df = df.copy()  # Only copy if we need to modify
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    # DATE OWNERSHIP: DataLoader owns date normalization
+    # Validate that trade_date exists and has correct dtype (no parsing)
+    from .data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
     
-    # Sort once by Stream and Date for better cache locality
+    if 'trade_date' not in df.columns:
+        logger.error("apply_sequencer_logic: Missing trade_date column - DataLoader should have normalized dates")
+        raise ValueError("Missing trade_date column - DataLoader must normalize dates before sequencer logic")
+    
+    # PERFORMANCE OPTIMIZATION: Validate trade_date dtype once for entire DataFrame (contract-first)
+    # Global validation enforces the contract (fail-fast on any violation)
+    # Per-stream validation is only for diagnostics when the global check fails
+    try:
+        _validate_trade_date_dtype(df, "all_streams")
+    except ValueError as e:
+        # If validation fails, validate per-stream for detailed diagnostics
+        logger.error(f"apply_sequencer_logic: trade_date validation failed globally: {e}")
+        for stream_id in df['Stream'].unique() if 'Stream' in df.columns else []:
+            stream_mask = df['Stream'] == stream_id
+            stream_df = df[stream_mask]
+            try:
+                _validate_trade_date_dtype(stream_df, stream_id)
+            except ValueError:
+                pass  # Already logged in global validation
+        raise  # Re-raise original error
+    
+    # Create Date column from trade_date for backward compatibility (if needed)
+    if 'Date' not in df.columns:
+        df = df.copy()
+        df['Date'] = df['trade_date']
+    
+    # Sort once by Stream and trade_date (canonical column) for better cache locality
     # OPTIMIZED: Use mergesort for stability, but only sort if not already sorted
     # Debug: Check for None values before sorting
     needs_sorting = True
     if len(df) > 1:
-        # Quick check: if Stream and Date are already sorted, skip sorting
+        # Quick check: if Stream and trade_date are already sorted, skip sorting
         # This is a heuristic - if data comes pre-sorted, we save time
         try:
-            if df['Stream'].is_monotonic_increasing and df['Date'].is_monotonic_increasing:
+            if df['Stream'].is_monotonic_increasing and df['trade_date'].is_monotonic_increasing:
                 needs_sorting = False
         except:
             pass  # If check fails, proceed with sorting
     
     if needs_sorting:
-        for col in ['Stream', 'Date']:
+        for col in ['Stream', 'trade_date']:
             if col in df.columns:
                 none_count = df[col].isna().sum() if hasattr(df[col], 'isna') else (df[col] == None).sum()
                 if none_count > 0:
@@ -607,13 +688,13 @@ def apply_sequencer_logic(
                     # Log sample of problematic rows
                     problematic = df[df[col].isna()] if hasattr(df[col], 'isna') else df[df[col] == None]
                     if len(problematic) > 0 and len(problematic) <= 10:
-                        logger.debug(f"[apply_sequencer_logic] Rows with None in '{col}': {problematic[['Stream', 'Date']].head(5).to_dict('records') if all(c in problematic.columns for c in ['Stream', 'Date']) else 'N/A'}")
+                        logger.debug(f"[apply_sequencer_logic] Rows with None in '{col}': {problematic[['Stream', 'trade_date']].head(5).to_dict('records') if all(c in problematic.columns for c in ['Stream', 'trade_date']) else 'N/A'}")
                 # Replace None with empty string for string columns to avoid comparison errors
                 if col == 'Stream' and df[col].dtype == 'object':
                     df[col] = df[col].fillna('')
                     logger.debug(f"[apply_sequencer_logic] Filled None values in 'Stream' with empty string for sorting")
         
-        df = df.sort_values(['Stream', 'Date'], kind='mergesort').reset_index(drop=True)
+        df = df.sort_values(['Stream', 'trade_date'], kind='mergesort').reset_index(drop=True)
     
     # Get unique streams
     unique_streams = df['Stream'].unique()
@@ -718,24 +799,46 @@ def apply_sequencer_logic(
         
         # Check that all Time values are in selectable_times
         # This is a critical invariant: sequencer should never select a filtered time
+        # PERFORMANCE OPTIMIZATION: Use vectorized operations instead of iterrows()
+        # Vectorization preserves exact indices and values (no logic changes)
+        # Row-by-row iteration is retained only for error reporting (to collect specific row details)
+        time_values = stream_rows['Time'].astype(str).str.strip().apply(normalize_time)
+        invalid_mask = ~time_values.isin(selectable_times_set)
+        
         invalid_times = []
-        for idx, row in stream_rows.iterrows():
-            time_value = normalize_time(str(row['Time']))
-            if time_value not in selectable_times_set:
-                date = row.get('Date', 'unknown')
-                invalid_times.append((idx, date, time_value))
+        if invalid_mask.any():
+            invalid_indices = stream_rows[invalid_mask].index
+            if 'Date' in stream_rows.columns:
+                invalid_dates = stream_rows.loc[invalid_mask, 'Date'].fillna('unknown').astype(str)
+            else:
+                invalid_dates = pd.Series(['unknown'] * len(invalid_indices), index=invalid_indices)
+            invalid_times = [
+                (idx, invalid_dates.loc[idx], time_values.loc[idx])
+                for idx in invalid_indices
+            ]
         
         # CRITICAL: Also check actual_trade_time to ensure excluded times don't appear
         # This catches cases where Time was overwritten but actual_trade_time contains excluded time
+        # PERFORMANCE OPTIMIZATION: Use vectorized operations instead of iterrows()
         excluded_times_in_output = []
         if 'actual_trade_time' in stream_rows.columns:
-            for idx, row in stream_rows.iterrows():
-                actual_time = row.get('actual_trade_time', '')
-                if actual_time:
-                    actual_time_normalized = normalize_time(str(actual_time))
-                    if actual_time_normalized in filtered_times_set:
-                        date = row.get('Date', 'unknown')
-                        excluded_times_in_output.append((idx, date, actual_time_normalized))
+            actual_times = stream_rows['actual_trade_time'].astype(str).str.strip()
+            # Filter out empty strings before normalization
+            non_empty_mask = actual_times != ''
+            if non_empty_mask.any():
+                actual_times_normalized = actual_times[non_empty_mask].apply(normalize_time)
+                excluded_mask = actual_times_normalized.isin(filtered_times_set)
+                
+                if excluded_mask.any():
+                    excluded_indices = stream_rows[non_empty_mask][excluded_mask].index
+                    if 'Date' in stream_rows.columns:
+                        excluded_dates = stream_rows.loc[excluded_indices, 'Date'].fillna('unknown').astype(str)
+                    else:
+                        excluded_dates = pd.Series(['unknown'] * len(excluded_indices), index=excluded_indices)
+                    excluded_times_in_output = [
+                        (idx, excluded_dates.loc[idx], actual_times_normalized.loc[idx])
+                        for idx in excluded_indices
+                    ]
         
         if invalid_times:
             # Log all invalid times before raising error

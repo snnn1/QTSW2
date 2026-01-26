@@ -4,10 +4,14 @@ Handles trade entry detection and validation
 """
 
 import pandas as pd
+import logging
+import sys
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from .loss_logic import LossManager, StopLossConfig
 from .config_logic import ConfigManager
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class EntryResult:
@@ -65,7 +69,7 @@ class EntryDetector:
             
             if immediate_long and immediate_short:
                 # Both conditions met - use first breakout by timestamp
-                result = self._handle_dual_immediate_entry(freeze_close, brk_long, brk_short)
+                result = self._handle_dual_immediate_entry(freeze_close, brk_long, brk_short, end_ts_pd)
                 # Set entry_time and breakout_time to end_ts for immediate entries
                 return EntryResult(result.entry_direction, result.entry_price, end_ts_pd, True, end_ts_pd)
             elif immediate_long:
@@ -96,14 +100,6 @@ class EntryDetector:
             else:
                 # Naive timestamp: use replace directly
                 market_close = end_ts_pd.replace(hour=market_close_hour, minute=market_close_minute, second=0, microsecond=0)
-            
-            if immediate_long and immediate_short:
-                # Both conditions met - use first breakout by timestamp
-                return self._handle_dual_immediate_entry(freeze_close, brk_long, brk_short)
-            elif immediate_long:
-                return EntryResult("Long", brk_long, end_ts, True, end_ts)
-            elif immediate_short:
-                return EntryResult("Short", brk_short, end_ts, True, end_ts)
             
             # Find first breakout after range period
             long_breakout = post[post["high"] >= brk_long]
@@ -138,11 +134,14 @@ class EntryDetector:
                 return EntryResult("NoTrade", None, None, False, None)
                 
         except Exception as e:
-            print(f"Error detecting entry: {e}")
+            error_msg = f"Error detecting entry: {e}"
+            logger.error(error_msg, exc_info=True)
+            print(error_msg, file=sys.stderr, flush=True)
             return EntryResult(None, None, None, False, None)
     
     def _handle_dual_immediate_entry(self, freeze_close: float, 
-                                   brk_long: float, brk_short: float) -> EntryResult:
+                                   brk_long: float, brk_short: float,
+                                   end_ts_pd: pd.Timestamp) -> EntryResult:
         """
         Handle case where both immediate entry conditions are met
         
@@ -150,9 +149,10 @@ class EntryDetector:
             freeze_close: Freeze close price
             brk_long: Long breakout level
             brk_short: Short breakout level
+            end_ts_pd: Range end timestamp (pandas Timestamp)
             
         Returns:
-            EntryResult for the chosen direction
+            EntryResult for the chosen direction with valid timestamps
         """
         # Calculate distances to breakout levels
         long_distance = abs(freeze_close - brk_long)
@@ -160,9 +160,9 @@ class EntryDetector:
         
         # Choose the closer breakout level
         if long_distance <= short_distance:
-            return EntryResult("Long", brk_long, None, True, None)
+            return EntryResult("Long", brk_long, end_ts_pd, True, end_ts_pd)
         else:
-            return EntryResult("Short", brk_short, None, True, None)
+            return EntryResult("Short", brk_short, end_ts_pd, True, end_ts_pd)
     
     def validate_entry(self, entry_result: EntryResult, 
                       min_range_size: float = 5.0) -> bool:

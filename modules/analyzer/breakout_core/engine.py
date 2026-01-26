@@ -94,8 +94,9 @@ def _process_single_range(
     # For MFE calculation, we need data until next day same slot
     # Calculate MFE end time
     if time_label:
+        from logic.config_logic import ConfigManager
         if R.date.weekday() == 4:  # Friday
-            mfe_end_date = R.date + pd.Timedelta(days=3)  # Friday to Monday
+            mfe_end_date = R.date + pd.Timedelta(days=ConfigManager.FRIDAY_TO_MONDAY_DAYS)  # Friday to Monday
         else:
             mfe_end_date = R.date + pd.Timedelta(days=1)  # Regular day
         
@@ -140,7 +141,8 @@ def _process_single_range(
                 stream, inst, sess, 0.0,
                 entry_price=0.0,
                 exit_price=0.0,
-                stop_loss=0.0
+                stop_loss=0.0,
+                open_as_of_time=None  # NoTrade has no open_as_of_time
             )
         return None
     
@@ -186,7 +188,8 @@ def _process_single_range(
         exit_time=trade_execution.exit_time,
         entry_price=entry_px,
         exit_price=trade_execution.exit_price,
-        stop_loss=initial_sl  # Store initial stop loss (before T1 adjustment)
+        stop_loss=initial_sl,  # Store initial stop loss (before T1 adjustment)
+        open_as_of_time=trade_execution.open_as_of_time  # Latest bar timestamp for OPEN trades
     )
 
 
@@ -353,7 +356,7 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
 
 
 
-def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.DataFrame:
+def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_progress: bool = True) -> pd.DataFrame:
     """
     Run the breakout trading strategy using modular logic components
     
@@ -361,6 +364,7 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
         df: Market data DataFrame (must have timestamp, open, high, low, close, instrument columns)
         rp: Run parameters (instrument, sessions, slots, trade days, etc.)
         debug: Enable debug output for detailed logging
+        show_progress: Show progress logging (default: True for backward compatibility)
         
     Returns:
         DataFrame with trade results (Date, Time, Target, Peak, Direction, Result, Range, Stream, Instrument, Session, Profit)
@@ -584,8 +588,8 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
                     if time_label:
                         slots_per_day[current_date].add(time_label)
                     
-                    # Log when date changes (once per day) - ALWAYS log, not just in debug mode
-                    if last_logged_date != current_date:
+                    # Log when date changes (once per day) - conditional on show_progress
+                    if show_progress and last_logged_date != current_date:
                         # Log summary for previous day if it exists
                         if last_logged_date is not None:
                             prev_slots = sorted(slots_per_day[last_logged_date])
@@ -596,26 +600,26 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
                             
                             slots_str = ", ".join(prev_slots) if prev_slots else "none"
                             print(f"\n{'='*70}")
-                            print(f"✓ COMPLETED DATE: {last_logged_date}")
+                            print(f"[COMPLETED] DATE: {last_logged_date}")
                             print(f"  Slots processed: {slots_str}")
                             print(f"  Ranges processed: {len([r for r in ranges[:ranges_processed] if r.date.date() == last_logged_date])}")
                             print(f"  Trades generated: {prev_trades_this_day} (Total so far: {prev_row_end})")
                             print(f"{'='*70}\n")
                         
-                        # Start new day - ALWAYS log
+                        # Start new day - conditional on show_progress
                         day_ranges = len([r for r in ranges if r.date.date() == current_date])
                         print(f"\n{'#'*70}")
                         print(f"PROCESSING DATE: {current_date} ({day_ranges} ranges)")
                         print(f"{'#'*70}")
                         last_logged_date = current_date
                     
-                    # Log progress periodically (every 500 ranges or at milestones)
-                    if ranges_processed == 1 or ranges_processed % progress_interval == 0 or ranges_processed == len(ranges):
+                    # Log progress periodically (every 500 ranges or at milestones) - conditional on show_progress
+                    if show_progress and (ranges_processed == 1 or ranges_processed % progress_interval == 0 or ranges_processed == len(ranges)):
                         current_day_trades = len(rows) - day_start_row_count.get(current_date, 0)
                         log(f"  Progress: Range {ranges_processed}/{len(ranges)} | Date: {current_date} | Slot: {time_label} | Trades today: {current_day_trades} | Total trades: {len(rows)}")
                     
-                    # Also log every 1000 ranges for very large datasets
-                    if ranges_processed % 1000 == 0:
+                    # Also log every 1000 ranges for very large datasets - conditional on show_progress
+                    if show_progress and ranges_processed % 1000 == 0:
                         current_day_trades = len(rows) - day_start_row_count.get(current_date, 0)
                         log(f"  Milestone: {ranges_processed}/{len(ranges)} ranges ({ranges_processed*100//len(ranges)}%) | Trades today: {current_day_trades} | Total trades: {len(rows)}")
                         
@@ -636,8 +640,8 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
                 if current_date is not None and current_date in trades_per_day:
                     trades_per_day[current_date] = len(rows) - day_start_row_count[current_date]
         
-        # Log final day's summary - ALWAYS log, not just in debug mode
-        if last_logged_date is not None:
+        # Log final day's summary - conditional on show_progress
+        if show_progress and last_logged_date is not None:
             try:
                 final_slots = sorted(slots_per_day.get(last_logged_date, set()))
                 final_trades = trades_per_day.get(last_logged_date, 0)
@@ -654,8 +658,8 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False) -> pd.Dat
             except Exception as e:
                 log(f"WARNING: Error logging final day summary: {e}")
         
-        # Print comprehensive summary of all days processed
-        if slots_per_day:
+        # Print comprehensive summary of all days processed - conditional on show_progress
+        if show_progress and slots_per_day:
             log(f"\n{'#'*70}")
             log(f"PROCESSING SUMMARY - ALL DAYS")
             log(f"{'#'*70}")

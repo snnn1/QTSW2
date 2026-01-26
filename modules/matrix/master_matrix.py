@@ -28,6 +28,7 @@ from .config import DOM_BLOCKED_DAYS, MATRIX_REPROCESS_TRADING_DAYS, MATRIX_CHEC
 from .checkpoint_manager import CheckpointManager
 from .trading_days import find_trading_days_back, get_merged_data_date_range
 from .run_history import RunHistory
+from .utils import _enforce_trade_date_invariants
 
 # Configure logging using centralized configuration
 from .logging_config import setup_matrix_logger
@@ -143,8 +144,9 @@ class MasterMatrix:
         # Note: Sequencer logic already filters by stream list, so no additional filtering needed
         new_df = self._load_all_streams_with_sequencer(start_date=None, end_date=None, specific_date=None)
         
+        # Validate empty streams based on criticality
         if new_df.empty:
-            logger.warning(f"[WARNING] No trades loaded for streams: {streams_to_load}")
+            self._validate_empty_streams(streams_to_load, "partial rebuild")
         else:
             logger.info(f"Loaded {len(new_df)} trades from requested streams: {streams_to_load}")
             for stream_id in streams_to_load:
@@ -159,7 +161,23 @@ class MasterMatrix:
         # Merge with existing data
         if not existing_df.empty:
             if not new_df.empty:
+                # INVARIANT: trade_date is canonical datetime column, Date is legacy-derived only
+                # Ensure both DataFrames are safe to mutate (copy if they might be slices)
+                existing_df = existing_df.copy()
+                new_df = new_df.copy()
+                
+                # Pre-concat enforcement: enforce invariants on both DataFrames
+                # trade_date canonical, Date derived for legacy compatibility only
+                _enforce_trade_date_invariants(existing_df, "partial_rebuild_pre_concat_existing")
+                _enforce_trade_date_invariants(new_df, "partial_rebuild_pre_concat_new")
+                
+                # Concatenate
                 df = pd.concat([existing_df, new_df], ignore_index=True)
+                
+                # Post-concat enforcement: enforce invariants on combined DataFrame
+                # trade_date canonical, Date derived for legacy compatibility only
+                _enforce_trade_date_invariants(df, "partial_rebuild_post_concat")
+                
                 logger.info(f"Merged with existing data: {len(df)} total trades")
             else:
                 df = existing_df
@@ -167,9 +185,85 @@ class MasterMatrix:
         else:
             df = new_df
             if df.empty:
-                logger.warning(f"[WARNING] Final result is empty - no trades for streams: {streams_to_load}")
+                self._validate_empty_streams(streams_to_load, "final result")
         
         return df
+    
+    def _is_critical_stream(self, stream_id: str) -> bool:
+        """
+        Check if a stream is marked as critical.
+        
+        Args:
+            stream_id: Stream ID to check
+            
+        Returns:
+            True if stream is critical, False otherwise
+        """
+        from .config import CRITICAL_STREAMS
+        return stream_id in CRITICAL_STREAMS
+    
+    def _validate_streams(self, streams: List[str], context: str = "") -> None:
+        """
+        Validate that streams exist and are discoverable.
+        
+        Args:
+            streams: List of stream IDs to validate
+            context: Context string for error messages
+            
+        Raises:
+            ValueError: If critical streams are missing
+        """
+        discovered_streams = set(stream_manager.discover_streams(self.analyzer_runs_dir))
+        missing_streams = set(streams) - discovered_streams
+        
+        if missing_streams:
+            critical_missing = [s for s in missing_streams if self._is_critical_stream(s)]
+            non_critical_missing = [s for s in missing_streams if not self._is_critical_stream(s)]
+            
+            if critical_missing:
+                error_msg = (
+                    f"{context}: Critical streams missing: {sorted(critical_missing)}. "
+                    f"Critical streams must exist and have data."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            if non_critical_missing:
+                logger.warning(
+                    f"{context}: Non-critical streams missing: {sorted(non_critical_missing)}. "
+                    f"Continuing with available streams."
+                )
+    
+    def _validate_empty_streams(self, stream_ids: List[str], context: str = "") -> None:
+        """
+        Validate empty streams based on criticality.
+        
+        Critical streams cause ERROR (fail-closed).
+        Non-critical streams cause WARN (continue processing).
+        
+        Args:
+            stream_ids: List of stream IDs that are empty
+            context: Context string for error messages
+            
+        Raises:
+            ValueError: If critical streams are empty
+        """
+        critical_empty = [s for s in stream_ids if self._is_critical_stream(s)]
+        non_critical_empty = [s for s in stream_ids if not self._is_critical_stream(s)]
+        
+        if critical_empty:
+            error_msg = (
+                f"{context}: Critical streams are empty: {sorted(critical_empty)}. "
+                f"Critical streams must have data. Aborting build."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        if non_critical_empty:
+            logger.warning(
+                f"{context}: Non-critical streams are empty: {sorted(non_critical_empty)}. "
+                f"Continuing with available streams."
+            )
         
     def _create_sequencer_callback(self) -> Callable:
         """
@@ -327,6 +421,23 @@ class MasterMatrix:
         # Normalize schema
         df = self.normalize_schema(df)
         
+        # TIME COLUMN PROTECTION: Capture Time column snapshot immediately post-sequencer
+        # This is the first checkpoint - Time column is owned by sequencer at this point
+        # Also capture key columns for row matching after sorting (sorting reorders rows)
+        if 'Time' in df.columns:
+            time_snapshot_post_sequencer = df['Time'].copy()
+            # Capture key columns for row matching (needed because sorting will reorder rows)
+            if all(col in df.columns for col in ['Stream', 'trade_date', 'entry_time']):
+                time_snapshot_keys = df[['Stream', 'trade_date', 'entry_time']].copy()
+            else:
+                time_snapshot_keys = None
+                logger.warning("Missing key columns for Time snapshot matching - using positional comparison")
+            logger.debug("Time column snapshot captured post-sequencer (first checkpoint)")
+        else:
+            time_snapshot_post_sequencer = None
+            time_snapshot_keys = None
+            logger.warning("Time column missing post-sequencer - sequencer should have set Time column")
+        
         # Add global columns (applies filters)
         df = self.add_global_columns(df)
         
@@ -337,122 +448,146 @@ class MasterMatrix:
             logger.warning("Time Change column missing, adding with empty values")
             df['Time Change'] = ''
         
-        # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
-        # Output from build_master_matrix() is fully sorted by: trade_date, entry_time, Instrument, Stream
-        # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
-        # Ensure trade_date is datetime (not date objects) for consistent sorting
-        if 'trade_date' in df.columns:
-            if df['trade_date'].dtype == 'object' or not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
-                # Convert date objects to datetime for proper sorting
-                from .utils import normalize_date
-                df['trade_date'] = df['trade_date'].apply(normalize_date)
+        # DATE OWNERSHIP: DataLoader owns date normalization
+        # Validate that trade_date exists and has correct dtype (no parsing)
+        from .data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
         
-        # Initialize date_repaired and date_repair_quality columns (for backward compatibility)
-        # Note: With analyzer contract enforcement, invalid dates should not occur
-        # But we keep these columns for existing data compatibility
-        if 'date_repaired' not in df.columns:
-            df['date_repaired'] = False
-        if 'date_repair_quality' not in df.columns:
-            df['date_repair_quality'] = 1.0  # 1.0 = original date was valid, no repair needed
+        if 'trade_date' not in df.columns:
+            logger.error("build_master_matrix: Missing trade_date column - DataLoader should have normalized dates")
+            raise ValueError("Missing trade_date column - DataLoader must normalize dates before master matrix build")
         
-        # Handle rows with invalid trade_date - preserve with sentinel date only
-        # CONTRACT ENFORCEMENT: AnalyzerOutputValidator ensures all dates are valid
-        # This code path should rarely execute, but preserves rows for sorting stability
+        # PERFORMANCE OPTIMIZATION: Validate trade_date dtype once for entire DataFrame (contract-first)
+        # Global validation enforces the contract (fail-fast on any violation)
+        # Per-stream validation is only for diagnostics when the global check fails
+        try:
+            _validate_trade_date_dtype(df, "all_streams")
+        except ValueError as e:
+            # If validation fails, validate per-stream for detailed diagnostics
+            logger.error(f"build_master_matrix: trade_date validation failed globally: {e}")
+            for stream_id in df['Stream'].unique() if 'Stream' in df.columns else []:
+                stream_mask = df['Stream'] == stream_id
+                stream_df = df[stream_mask]
+                try:
+                    _validate_trade_date_dtype(stream_df, stream_id)
+                except ValueError:
+                    pass  # Already logged in global validation
+            raise  # Re-raise original error
+        
+        # FAIL-CLOSED: Invalid dates are Tier-0 risk (hard contract violations)
+        # Check for invalid dates and fail fast
         valid_dates = df['trade_date'].notna()
         if not valid_dates.all():
             invalid_count = (~valid_dates).sum()
             invalid_df = df[~valid_dates].copy()
             invalid_percentage = invalid_count / len(df) * 100
             
-            # Log warning - invalid dates should not occur with contract enforcement
+            # Collect stream-level details for error reporting
+            invalid_by_stream = {}
+            invalid_samples_by_stream = {}
             if 'Stream' in df.columns:
-                invalid_by_stream = invalid_df.groupby('Stream').size()
-                for stream_id, count in invalid_by_stream.items():
-                    logger.error(
-                        f"[CONTRACT VIOLATION] {stream_id} has {count} trades with invalid trade_date! "
-                        f"This violates analyzer output contract (Invariant 1). "
-                        f"Preserving rows with sentinel date for sorting stability."
-                    )
+                invalid_by_stream = invalid_df.groupby('Stream').size().to_dict()
+                for stream_id in invalid_by_stream.keys():
+                    stream_invalid = invalid_df[invalid_df['Stream'] == stream_id]
+                    invalid_samples_by_stream[stream_id] = stream_invalid['trade_date'].head(5).tolist()
             
-            # Preserve rows with sentinel date (no repair attempts - analyzer should provide valid dates)
-            for idx in invalid_df.index:
-                df.loc[idx, 'date_repaired'] = False
-                df.loc[idx, 'date_repair_quality'] = 0.0  # Failed - should not occur
-                # Set to sentinel date (far future) so it sorts last but is preserved
-                df.loc[idx, 'trade_date'] = pd.Timestamp('2099-12-31')
-            
-            logger.error(
+            # Build comprehensive error message
+            error_msg = (
                 f"[CONTRACT VIOLATION] Found {invalid_count} rows with invalid trade_date ({invalid_percentage:.1f}%). "
                 f"Analyzer output contract requires valid dates (Invariant 1). "
-                f"Rows preserved with sentinel date for sorting stability."
+                f"This is a Tier-0 risk - invalid dates cause hard failures."
             )
+            
+            if invalid_by_stream:
+                error_msg += "\nInvalid dates by stream:"
+                for stream_id, count in invalid_by_stream.items():
+                    samples = invalid_samples_by_stream.get(stream_id, [])
+                    error_msg += f"\n  - {stream_id}: {count} rows. Sample values: {samples}"
+            
+            logger.error(error_msg)
+            
+            # FAIL-CLOSED: Abort build or fail affected streams
+            from .config import ALLOW_INVALID_DATES_SALVAGE
+            if not ALLOW_INVALID_DATES_SALVAGE:
+                # Default: Fail fast
+                raise ValueError(
+                    f"Master Matrix build aborted: {invalid_count} rows with invalid trade_date. "
+                    f"Fix analyzer output before proceeding. "
+                    f"Set ALLOW_INVALID_DATES_SALVAGE=True for salvage mode (debugging only)."
+                )
+            else:
+                # Salvage mode: Drop invalid rows (never propagate NaT downstream)
+                logger.error(
+                    f"Salvage mode enabled: Dropping {invalid_count} rows with invalid trade_date. "
+                    f"Salvage mode never propagates NaT downstream."
+                )
+                df = df[valid_dates].copy()
+                
+                # Ensure trade_date remains datetime dtype after copy operation
+                if 'trade_date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                    logger.warning(
+                        f"trade_date column lost datetime dtype after copy operation ({df['trade_date'].dtype}), "
+                        f"converting to datetime64."
+                    )
+                    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+                
+                if df.empty:
+                    raise ValueError(
+                        f"Master Matrix build aborted: All rows dropped due to invalid dates. "
+                        f"Stream failed."
+                    )
         
-        # Sort with invalid dates (sentinel date 2099-12-31) at the end
-        # entry_time None/empty values are now '23:59:59' so they sort after valid times
+        # CANONICAL SORTING: MasterMatrix is the ONLY layer that sorts the output.
+        # Output from build_master_matrix() is fully sorted by: Stream, trade_date, entry_time (grouping-first order)
+        # This grouping-first order enables Time Change loop optimization (no per-stream copy/sort needed)
+        # API and UI layers must NOT re-sort - they should assume data is already correctly sorted.
+        # Ensure trade_date is datetime dtype before sorting (operations can sometimes change dtype)
+        if 'trade_date' in df.columns:
+            if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                logger.warning(
+                    f"trade_date column is {df['trade_date'].dtype} before sorting, "
+                    f"converting to datetime64. This should not happen - check data processing pipeline."
+                )
+                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+        
         df = df.sort_values(
-            by=['trade_date', 'entry_time', 'Instrument', 'Stream'],
-            ascending=[True, True, True, True],
+            by=['Stream', 'trade_date', 'entry_time'],
+            ascending=[True, True, True],
             na_position='last'
         ).reset_index(drop=True)
         
         # Update global_trade_id after sorting
         df['global_trade_id'] = range(1, len(df) + 1)
         
-        # Calculate Time Change column from sequencer output (Time column)
-        # This must be done AFTER sorting to ensure correct chronological order per stream
-        from .utils import normalize_time
-        
+        # Time Change column is already set correctly by sequencer_logic.py
+        # sequencer_logic sets TimeChange to show FUTURE changes (what time it WILL change to)
+        # We should NOT recalculate it here - that would overwrite the correct values
+        # Just ensure the column exists (sequencer should have already set it)
         if 'Time Change' not in df.columns:
             df['Time Change'] = ''
+            logger.warning("Time Change column missing from sequencer output - sequencer should have set it")
         
-        # Calculate Time Change per stream (each stream has its own time sequence)
-        # According to sequencer logic:
-        # - Time column shows the time used FOR that day
-        # - Time changes happen at the END of a day (after trade selection)
-        # - The change affects the NEXT day's Time column
-        # - So Time Change should show on the day when Time actually changed
-        if 'Time' in df.columns and 'trade_date' in df.columns and 'Stream' in df.columns:
-            df['Time Change'] = ''  # Reset to empty
-            
-            # Process each stream separately (each has independent time sequence)
-            for stream_id in df['Stream'].unique():
-                stream_mask = df['Stream'] == stream_id
-                stream_subset = df[stream_mask].copy()
-                
-                if len(stream_subset) < 2:
-                    continue  # Need at least 2 days to detect changes
-                
-                # Ensure chronological order within this stream
-                stream_subset = stream_subset.sort_values('trade_date')
-                
-                # Compare consecutive days: Time Change should only show when:
-                # 1. Time changed from previous day to current day
-                # 2. Previous day had Result = 'LOSS' (time changes only happen after losses)
-                prev_idx = None
-                prev_time_normalized = None
-                for idx in stream_subset.index:
-                    curr_time_str = str(df.loc[idx, 'Time'])
-                    curr_time_normalized = normalize_time(curr_time_str)
-                    
-                    if prev_time_normalized is not None and prev_idx is not None and prev_time_normalized != curr_time_normalized:
-                        # Check if previous day had a LOSS (time changes only happen after losses)
-                        prev_result = str(df.loc[prev_idx, 'Result']).upper().strip()
-                        if prev_result == 'LOSS':
-                            # Time changed from previous day after a loss - show on previous day (when change occurred)
-                            # Format: show only the new time (time changed to)
-                            df.loc[prev_idx, 'Time Change'] = curr_time_normalized
-                    
-                    prev_idx = idx
-                    prev_time_normalized = curr_time_normalized
+        # PERFORMANCE OPTIMIZATION: Cache unique streams for reuse (used in logging)
+        unique_streams_cached = df['Stream'].unique() if 'Stream' in df.columns else []
         
         self.master_df = df
         
         logger.info(f"Master matrix built: {len(df)} trades")
+        # Ensure trade_date is datetime before using .min()/.max() (safeguard)
+        if 'trade_date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+            logger.warning(
+                f"trade_date column is {df['trade_date'].dtype} before logging date range, "
+                f"converting to datetime64."
+            )
+            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
         logger.info(f"Date range: {df['trade_date'].min()} to {df['trade_date'].max()}")
         
+        # PERFORMANCE OPTIMIZATION: Reuse cached unique_streams_cached (already computed above)
+        # Cache unique_instruments for logging
+        unique_instruments_cached = df['Instrument'].unique() if 'Instrument' in df.columns else []
+        
         # Safe sorting with None handling
-        stream_values = [s for s in df['Stream'].unique() if s is not None and pd.notna(s)] if 'Stream' in df.columns else []
-        instrument_values = [i for i in df['Instrument'].unique() if i is not None and pd.notna(i)] if 'Instrument' in df.columns else []
+        stream_values = [s for s in unique_streams_cached if s is not None and pd.notna(s)]
+        instrument_values = [i for i in unique_instruments_cached if i is not None and pd.notna(i)]
         try:
             logger.info(f"Streams: {sorted(stream_values) if stream_values else 'N/A'}")
             logger.info(f"Instruments: {sorted(instrument_values) if instrument_values else 'N/A'}")
@@ -460,6 +595,11 @@ class MasterMatrix:
             logger.warning(f"Error sorting streams/instruments for logging: {e}")
             logger.info(f"Streams (unsorted): {stream_values[:10] if stream_values else 'N/A'}")
             logger.info(f"Instruments (unsorted): {instrument_values[:10] if instrument_values else 'N/A'}")
+        
+        # TIME COLUMN PROTECTION: Verify Time column just before final write (second checkpoint)
+        # Check that Time column hasn't been mutated downstream
+        if time_snapshot_post_sequencer is not None and 'Time' in df.columns:
+            self._verify_time_column_postcondition(df, time_snapshot_post_sequencer, time_snapshot_keys)
         
         # Calculate and log summary statistics
         self._log_summary_stats(df)
@@ -471,6 +611,13 @@ class MasterMatrix:
         # Create checkpoint after successful build (for window updates)
         if not df.empty and 'trade_date' in df.columns:
             try:
+                # Ensure trade_date is datetime before using .max() (safeguard)
+                if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                    logger.warning(
+                        f"trade_date column is {df['trade_date'].dtype} before checkpoint creation, "
+                        f"converting to datetime64."
+                    )
+                    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
                 max_date = df['trade_date'].max()
                 if pd.notna(max_date):
                     max_date_str = pd.to_datetime(max_date).strftime('%Y-%m-%d')
@@ -479,6 +626,142 @@ class MasterMatrix:
                 logger.warning(f"Failed to create checkpoint after build: {e}")
         
         return df
+    
+    def _verify_time_column_postcondition(
+        self, 
+        df: pd.DataFrame, 
+        time_snapshot: pd.Series, 
+        time_snapshot_keys: Optional[pd.DataFrame] = None
+    ) -> None:
+        """
+        Verify Time column post-condition: Time column should not be mutated downstream.
+        
+        After sequencer, Time column is treated as owned. Downstream mutation is detected
+        via equality/invariant checks. Solution is pragmatic and pandas-safe.
+        
+        CRITICAL: After sorting, rows are reordered, so we must match rows by key columns
+        (Stream + trade_date + entry_time) rather than positionally.
+        
+        Args:
+            df: Current DataFrame (after downstream processing, may be sorted)
+            time_snapshot: Snapshot of Time column immediately post-sequencer (before sorting)
+            time_snapshot_keys: Optional DataFrame with key columns (Stream, trade_date, entry_time)
+                              from when snapshot was taken. If None, uses positional comparison
+                              (which will fail if rows were sorted).
+            
+        Raises:
+            AssertionError: If Time column has been mutated
+        """
+        if 'Time' not in df.columns:
+            logger.error("Time column missing - sequencer should have set Time column")
+            raise AssertionError("Time column missing - sequencer contract violation")
+        
+        if len(df) != len(time_snapshot):
+            logger.warning(
+                f"Time snapshot length mismatch: snapshot={len(time_snapshot)}, current={len(df)}. "
+                f"This may indicate rows were added/removed downstream."
+            )
+            # Still check what we can
+            min_len = min(len(df), len(time_snapshot))
+            df_time_subset = df['Time'].iloc[:min_len]
+            snapshot_subset = time_snapshot.iloc[:min_len]
+        else:
+            df_time_subset = df['Time']
+            snapshot_subset = time_snapshot
+        
+        # Match rows by key columns if available (needed because sorting reorders rows)
+        if time_snapshot_keys is not None and all(col in df.columns for col in ['Stream', 'trade_date', 'entry_time']):
+            # Create composite key for matching rows
+            # Normalize trade_date to string for comparison (handles datetime objects and NaT)
+            def create_key(row):
+                stream = str(row.get('Stream', '')) if pd.notna(row.get('Stream')) else ''
+                trade_date_val = row.get('trade_date')
+                if pd.isna(trade_date_val):
+                    trade_date = ''
+                elif isinstance(trade_date_val, pd.Timestamp):
+                    trade_date = trade_date_val.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    trade_date = str(trade_date_val)
+                entry_time = str(row.get('entry_time', '')) if pd.notna(row.get('entry_time')) else ''
+                return f"{stream}|{trade_date}|{entry_time}"
+            
+            # Create keys for current DataFrame
+            df_keys = df[['Stream', 'trade_date', 'entry_time']].apply(create_key, axis=1)
+            # Create keys for snapshot DataFrame (using original index from snapshot)
+            snapshot_keys = time_snapshot_keys.apply(create_key, axis=1)
+            
+            # Create a mapping from snapshot key to snapshot index for efficient lookup
+            snapshot_key_to_idx = {}
+            for snapshot_idx in snapshot_keys.index:
+                key = snapshot_keys.loc[snapshot_idx]
+                if key not in snapshot_key_to_idx:
+                    snapshot_key_to_idx[key] = snapshot_idx
+                else:
+                    # Duplicate key - log warning but use first match
+                    logger.warning(f"Duplicate snapshot key {key} - multiple rows match")
+            
+            # Match rows by key and compare Time values
+            from .utils import normalize_time
+            
+            mismatches = []
+            matched_count = 0
+            for idx in df.index:
+                df_key = df_keys.loc[idx]
+                # Find matching row in snapshot
+                if df_key in snapshot_key_to_idx:
+                    snapshot_idx = snapshot_key_to_idx[df_key]
+                    df_time_val = normalize_time(str(df_time_subset.loc[idx]))
+                    snapshot_time_val = normalize_time(str(snapshot_subset.loc[snapshot_idx]))
+                    
+                    if df_time_val != snapshot_time_val:
+                        mismatches.append((idx, snapshot_time_val, df_time_val))
+                    matched_count += 1
+                else:
+                    # Row not found in snapshot (shouldn't happen if no rows added/removed)
+                    logger.warning(f"Row {idx} with key {df_key} not found in snapshot - may have been added/removed")
+            
+            if matched_count == 0:
+                logger.error("No rows matched between snapshot and current DataFrame - key matching failed")
+                # This is a serious error - cannot verify Time column without matching rows
+                raise AssertionError(
+                    "Time column verification failed: No rows matched between snapshot and current DataFrame. "
+                    "This may indicate rows were added/removed or key columns changed."
+                )
+        else:
+            # Fallback to positional comparison (will fail if rows were sorted)
+            # Pandas-safe comparison: handle NaN, None, string normalization
+            from .utils import normalize_time
+            
+            # Normalize both for comparison
+            df_time_normalized = df_time_subset.astype(str).str.strip().apply(normalize_time)
+            snapshot_normalized = snapshot_subset.astype(str).str.strip().apply(normalize_time)
+            
+            # Check for differences
+            mismatches_mask = df_time_normalized != snapshot_normalized
+            if mismatches_mask.any():
+                mismatch_indices = df_time_subset[mismatches_mask].index.tolist()
+                mismatches = [
+                    (idx, snapshot_normalized.iloc[i], df_time_normalized.iloc[i])
+                    for i, idx in enumerate(mismatch_indices)
+                ]
+            else:
+                mismatches = []
+        
+        if mismatches:
+            mismatch_count = len(mismatches)
+            mismatch_pairs = mismatches[:10]  # First 10 mismatches
+            
+            logger.error(
+                f"TIME COLUMN MUTATION DETECTED: {mismatch_count} rows have mutated Time column. "
+                f"Time column is owned by sequencer and must not be mutated downstream. "
+                f"Sample mismatches: {mismatch_pairs[:5]}"
+            )
+            raise AssertionError(
+                f"Time column mutation detected: {mismatch_count} rows mutated. "
+                f"Time column is owned by sequencer_logic.py and must not be mutated downstream."
+            )
+        
+        logger.debug("Time column post-condition verified: No mutations detected")
     
     def get_master_matrix(self) -> pd.DataFrame:
         """
@@ -643,8 +926,11 @@ def main():
         print("=" * 80)
         print(f"Total trades: {len(master_df)}")
         print(f"Date range: {master_df['trade_date'].min()} to {master_df['trade_date'].max()}")
-        stream_values = [s for s in master_df['Stream'].unique() if s is not None and pd.notna(s)]
-        instrument_values = [i for i in master_df['Instrument'].unique() if i is not None and pd.notna(i)]
+        # PERFORMANCE OPTIMIZATION: Cache unique values
+        unique_streams_main = master_df['Stream'].unique()
+        unique_instruments_main = master_df['Instrument'].unique()
+        stream_values = [s for s in unique_streams_main if s is not None and pd.notna(s)]
+        instrument_values = [i for i in unique_instruments_main if i is not None and pd.notna(i)]
         print(f"Streams: {sorted(stream_values)}")
         print(f"Instruments: {sorted(instrument_values)}")
         

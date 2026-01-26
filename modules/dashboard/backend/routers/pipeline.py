@@ -132,16 +132,21 @@ async def list_runs(
     Returns:
         List of run summaries, most recent first
     """
-    orchestrator = get_orchestrator()
-    if not orchestrator:
-        return {"runs": []}
-    
-    runs = orchestrator.run_history.list_runs(limit=limit, result_filter=result)
-    
-    return {
-        "runs": [run.to_dict() for run in runs],
-        "total": len(runs)
-    }
+    try:
+        orchestrator = get_orchestrator()
+        if not orchestrator:
+            return {"runs": []}
+        
+        runs = orchestrator.run_history.list_runs(limit=limit, result_filter=result)
+        
+        return {
+            "runs": [run.to_dict() for run in runs],
+            "total": len(runs)
+        }
+    except Exception as e:
+        logger.exception("Failed to list runs")
+        # Return empty list on error rather than crashing
+        return {"runs": [], "total": 0, "error": str(e)}
 
 
 @router.get("/runs/{run_id}")
@@ -152,59 +157,76 @@ async def get_run(run_id: str):
     Returns:
         Run summary or 404 if not found
     """
-    orchestrator = get_orchestrator()
-    if not orchestrator:
-        raise HTTPException(status_code=404, detail="Orchestrator not available")
-    
-    run = orchestrator.run_history.get_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    
-    return run.to_dict()
+    try:
+        orchestrator = get_orchestrator()
+        if not orchestrator:
+            raise HTTPException(status_code=404, detail="Orchestrator not available")
+        
+        run = orchestrator.run_history.get_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        
+        return run.to_dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to get run {run_id}")
+        raise HTTPException(status_code=500, detail=f"Failed to get run: {str(e)}")
 
 
 @router.get("/status")
 async def get_pipeline_status():
-    orchestrator = get_orchestrator()
-    if not orchestrator:
-        return {"state": "unavailable"}
+    try:
+        orchestrator = get_orchestrator()
+        if not orchestrator:
+            return {"state": "unavailable"}
 
-    # ADDITION 1: Canonical pipeline state - only 4 valid values: idle, running, stopped, error
-    # No inferred states, no starting_up, ready, waiting, initializing
-    from modules.orchestrator.state import canonical_state, PipelineRunState
-    
-    # CRITICAL: Read from single canonical state source (state_manager.get_state())
-    # This ensures polling and WebSocket always agree on state
-    status = await orchestrator.get_status()
-    if status:
-        # Map internal FSM state to canonical state
-        canonical = canonical_state(status.state)
-        # Return canonical state in same format as state_change events
-        # This ensures consistency between polling and WebSocket
-        resp = {
-            "state": canonical,
-            "run_id": status.run_id,
-            "current_stage": status.current_stage.value if status.current_stage else None,
-            "started_at": status.started_at.isoformat() if status.started_at else None,
-            "updated_at": status.updated_at.isoformat() if status.updated_at else None,
-            "error": status.error,
-            "retry_count": status.retry_count,
-            "metadata": status.metadata,
-            # Include internal state for debugging (not used by frontend)
-            "_internal_state": status.state.value,
-        }
-        return resp
-    else:
-        return {"state": "idle"}
+        # ADDITION 1: Canonical pipeline state - only 4 valid values: idle, running, stopped, error
+        # No inferred states, no starting_up, ready, waiting, initializing
+        from modules.orchestrator.state import canonical_state, PipelineRunState
+        
+        # CRITICAL: Read from single canonical state source (state_manager.get_state())
+        # This ensures polling and WebSocket always agree on state
+        status = await orchestrator.get_status()
+        if status:
+            # Map internal FSM state to canonical state
+            canonical = canonical_state(status.state)
+            # Return canonical state in same format as state_change events
+            # This ensures consistency between polling and WebSocket
+            resp = {
+                "state": canonical,
+                "run_id": status.run_id,
+                "current_stage": status.current_stage.value if status.current_stage else None,
+                "started_at": status.started_at.isoformat() if status.started_at else None,
+                "updated_at": status.updated_at.isoformat() if status.updated_at else None,
+                "error": status.error,
+                "retry_count": status.retry_count,
+                "metadata": status.metadata,
+                # Include internal state for debugging (not used by frontend)
+                "_internal_state": status.state.value,
+            }
+            return resp
+        else:
+            return {"state": "idle"}
+    except Exception as e:
+        logger.exception("Failed to get pipeline status")
+        # Return unavailable state on error rather than crashing
+        return {"state": "unavailable", "error": str(e)}
 
 
 @router.get("/snapshot")
 async def get_pipeline_snapshot():
-    orchestrator = get_orchestrator()
-    if not orchestrator:
-        raise HTTPException(503, "Pipeline orchestrator not available")
+    try:
+        orchestrator = get_orchestrator()
+        if not orchestrator:
+            raise HTTPException(503, "Pipeline orchestrator not available")
 
-    return await orchestrator.get_snapshot()
+        return await orchestrator.get_snapshot()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Failed to get pipeline snapshot")
+        raise HTTPException(500, f"Failed to get snapshot: {str(e)}")
 
 
 # ---------------------------------------------------------------------

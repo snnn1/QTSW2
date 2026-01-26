@@ -49,6 +49,20 @@ export async function buildMatrix({ streamFilters = {}, visibleYears = [], rebui
         exclude_days_of_month: filters.exclude_days_of_month || [],
         exclude_times: filters.exclude_times || []
       }
+      // Add health gate enabled flag (defaults to true if not specified)
+      if (filters.health_gate_enabled !== undefined) {
+        streamFiltersApi[streamId].health_gate_enabled = Boolean(filters.health_gate_enabled)
+      }
+      // Add health gate settings if set (not null/undefined)
+      if (filters.health_rolling_window !== null && filters.health_rolling_window !== undefined) {
+        streamFiltersApi[streamId].health_rolling_window = filters.health_rolling_window
+      }
+      if (filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined) {
+        streamFiltersApi[streamId].health_suspend_threshold = filters.health_suspend_threshold
+      }
+      if (filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined) {
+        streamFiltersApi[streamId].health_resume_threshold = filters.health_resume_threshold
+      }
     }
   })
 
@@ -245,6 +259,20 @@ export async function resequenceMatrix({ streamFilters = {}, resequenceDays = 40
         exclude_days_of_week: filters.exclude_days_of_week || [],
         exclude_days_of_month: filters.exclude_days_of_month || [],
         exclude_times: filters.exclude_times || []
+      }
+      // Add health gate enabled flag (defaults to true if not specified)
+      if (filters.health_gate_enabled !== undefined) {
+        streamFiltersApi[streamId].health_gate_enabled = Boolean(filters.health_gate_enabled)
+      }
+      // Add health gate settings if set (not null/undefined)
+      if (filters.health_rolling_window !== null && filters.health_rolling_window !== undefined) {
+        streamFiltersApi[streamId].health_rolling_window = filters.health_rolling_window
+      }
+      if (filters.health_suspend_threshold !== null && filters.health_suspend_threshold !== undefined) {
+        streamFiltersApi[streamId].health_suspend_threshold = filters.health_suspend_threshold
+      }
+      if (filters.health_resume_threshold !== null && filters.health_resume_threshold !== undefined) {
+        streamFiltersApi[streamId].health_resume_threshold = filters.health_resume_threshold
       }
     }
   })

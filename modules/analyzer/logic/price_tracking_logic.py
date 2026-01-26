@@ -12,12 +12,16 @@ Instead, it provides a consistent, auditable resolution rule that favors conserv
 
 import pandas as pd
 import numpy as np
+import logging
+import sys
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 from .debug_logic import DebugManager, DebugInfo
 from .instrument_logic import InstrumentManager
 from .config_logic import ConfigManager
+
+logger = logging.getLogger(__name__)
 
 # Optional scipy import with fallback
 try:
@@ -38,7 +42,7 @@ class TradeExecution:
     """Result of trade execution with MFE and break even data"""
     exit_price: float
     exit_time: Optional[pd.Timestamp]  # None/NaT for open trades
-    exit_reason: str  # "Win", "Loss", "TIME"
+    exit_reason: str  # "Win", "Loss", "TIME", "OPEN", "BE"
     target_hit: bool
     stop_hit: bool
     time_expired: bool
@@ -52,6 +56,7 @@ class TradeExecution:
     final_stop_loss: float
     result_classification: str
     profit: float = 0.0  # Calculated profit
+    open_as_of_time: Optional[pd.Timestamp] = None  # Latest bar timestamp for OPEN trades, None for closed trades
 
 class PriceTracker:
     """Handles real-time price tracking, trade execution, MFE calculation, and break even logic"""
@@ -190,20 +195,18 @@ class PriceTracker:
                     # Data doesn't extend to MFE end time - use all available data
                     # This is expected behavior when data doesn't extend to exact minute boundaries
                     mfe_bars = df[(df["timestamp"] >= entry_time)].copy()
-                    # Log MFE data gap warnings - this is expected but useful to see in debug terminal
-                    # Use logging instead of print so it shows up in debug window
-                    import logging
-                    logger = logging.getLogger(__name__)
+                    # Log MFE data gap warnings to stderr for immediate visibility
+                    import sys
                     time_diff = (mfe_end_time - data_end_time).total_seconds() / 60
                     if time_diff <= 1:
                         # Very small gap (1 minute or less) - just a note
-                        logger.debug(f"MFE: Data ends {time_diff:.1f} min before expected (using available data)")
+                        print(f"MFE: Data ends {time_diff:.1f} min before expected (using available data)", file=sys.stderr, flush=True)
                     elif time_diff <= 5:
                         # Small gap (1-5 minutes) - info level
-                        logger.info(f"MFE: Data ends {time_diff:.1f} min before expected end time (using available data)")
+                        print(f"MFE: Data ends {time_diff:.1f} min before expected end time (using available data)", file=sys.stderr, flush=True)
                     else:
                         # Larger gap (>5 minutes) - warning level
-                        logger.warning(f"MFE: Data ends {time_diff:.1f} min before expected end time (using available data)")
+                        print(f"WARNING: MFE: Data ends {time_diff:.1f} min before expected end time (using available data)", file=sys.stderr, flush=True)
                 else:
                     # Data extends to MFE end time - use normal filtering
                     mfe_bars = df[(df["timestamp"] >= entry_time) & (df["timestamp"] < mfe_end_time)].copy()
@@ -639,21 +642,23 @@ class PriceTracker:
             # Trade is still open if expiry_time is in the future
             if expiry_time and expiry_time > current_time:
                 # Trade hasn't expired yet - exit time should be empty (trade is still ongoing)
-                # ExitTime = empty/None (trade is still open)
-                exit_time_for_time_expiry = pd.NaT  # Use NaT (Not a Time) for open trades
+                # ExitTime = NaT (trade is still open)
+                exit_time_for_open = pd.NaT  # Use NaT (Not a Time) for open trades
                 # Use the absolute last bar's close price (most recent price in entire dataset)
                 # This ensures we get the latest price even if new data was added since entry
-                exit_price_for_time_expiry = float(last_bar_in_data["close"])  # Current/last available price from most recent bar in dataset
+                exit_price_for_open = float(last_bar_in_data["close"])  # Current/last available price from most recent bar in dataset
+                # Capture the latest bar timestamp for open_as_of_time
+                open_as_of_time = last_bar_in_data["timestamp"]  # Latest bar timestamp confirming trade is still open
                 
-                # Use "TIME" as exit_reason but time_expired=False (trade still ongoing)
-                # Pass None for exit_time to _classify_result since trade is still open
+                # Use "OPEN" as exit_reason for trades still open
+                # Pass NaT for exit_time to _classify_result to get OPEN result
                 result_classification = self._classify_result(
-                    t1_triggered, "TIME", False, entry_price, None, df, direction, t1_removed
+                    t1_triggered, "OPEN", False, entry_price, exit_time_for_open, df, direction, t1_removed
                 )
                 
                 # Calculate profit based on current price (trade still open)
                 profit = self.calculate_profit(
-                    entry_price, exit_price_for_time_expiry, direction, result_classification,
+                    entry_price, exit_price_for_open, direction, result_classification,
                     t1_triggered, target_pts, instrument,
                     target_hit=False
                 )
@@ -673,11 +678,12 @@ class PriceTracker:
                     peak_price = entry_price
                 
                 # Return trade execution with current state (still open)
-                # Result = "TIME", ExitTime = empty/None (trade still open), Profit = current price
+                # Result = "OPEN", ExitTime = NaT (trade still open), Profit = current price
                 return self._create_trade_execution(
-                    exit_price_for_time_expiry, exit_time_for_time_expiry, "TIME", False, False, False,  # exit_reason="TIME", time_expired=False, exit_time=NaT
+                    exit_price_for_open, exit_time_for_open, "OPEN", False, False, False,  # exit_reason="OPEN", exit_time=NaT
                     max_favorable, peak_time, peak_price, t1_triggered,
-                    stop_loss_adjusted, current_stop_loss, result_classification, profit
+                    stop_loss_adjusted, current_stop_loss, result_classification, profit,
+                    open_as_of_time=open_as_of_time  # Latest bar timestamp for OPEN trades
                 )
             
             # Trade has expired (expiry_time has passed or data extends to it)
@@ -829,7 +835,9 @@ class PriceTracker:
             )
             
         except Exception as e:
-            print(f"Error executing trade: {e}")
+            error_msg = f"Error executing trade: {e}"
+            logger.error(error_msg, exc_info=True)
+            print(error_msg, file=sys.stderr, flush=True)
             return self._create_trade_execution(
                 entry_price, entry_time, "TIME", False, False, True,
                 0.0, entry_time, entry_price, False, False,
@@ -916,7 +924,7 @@ class PriceTracker:
         # Calculate expiry time (next day same slot + 1 minute)
         if date.weekday() == 4:  # Friday
             # Friday trades expire Monday
-            days_ahead = 3
+            days_ahead = self.config_manager.FRIDAY_TO_MONDAY_DAYS
         else:
             # Regular day trades expire next day
             days_ahead = 1
@@ -967,7 +975,7 @@ class PriceTracker:
         """
         if date.weekday() == 4:  # Friday
             # Peak continues to Monday same slot
-            days_ahead = 3  # Friday to Monday
+            days_ahead = self.config_manager.FRIDAY_TO_MONDAY_DAYS
             peak_end_date = date + pd.Timedelta(days=days_ahead)
         else:
             # Regular day - peak continues to next day same slot
@@ -1074,7 +1082,7 @@ class PriceTracker:
     
     def _get_trigger_threshold(self, target_pts: float, instrument: str = "ES") -> float:
         """Get T1 trigger threshold - always 65% of target"""
-        return target_pts * 0.65  # 65% of target
+        return target_pts * self.config_manager.T1_TRIGGER_THRESHOLD
     
     def _calculate_favorable_movement(self, high: float, low: float, 
                                     entry_price: float, direction: str) -> float:
@@ -1291,14 +1299,33 @@ class PriceTracker:
                         entry_price: float = 0.0, 
                         exit_time: pd.Timestamp = None, data: pd.DataFrame = None,
                         direction: str = "Long", t1_removed: bool = False) -> str:
-        """Classify trade result based on trigger and exit reason"""
+        """
+        Classify trade result based on trigger and exit reason
+        
+        Result Types:
+        - OPEN: Trade still open (exit_time is NaT/None)
+        - Win: Target hit → Full target profit
+        - BE: T1 triggered + stop hit → 1 tick loss
+        - Loss: Stop hit without T1 → Actual loss
+        - TIME: Time expired AND trade closed (exit_time != NaT)
+        """
         if self.debug_manager.is_debug_enabled():
             try:
                 print(f"\nTRADE CLASSIFICATION:")
                 print(f"   T1 Triggered: {t1_triggered}")
                 print(f"   Exit reason: {exit_reason}, Target hit: {target_hit}")
+                print(f"   Exit time: {exit_time}")
             except Exception:
                 pass
+        
+        # Check for OPEN trade first (exit_time is NaT/None)
+        if exit_time is None or pd.isna(exit_time):
+            if self.debug_manager.is_debug_enabled():
+                try:
+                    print(f"   -> OPEN (trade still open, exit_time is NaT/None)")
+                except Exception:
+                    pass
+            return "OPEN"
         
         # Explicit BE check: if exit_reason is "BE", return immediately
         # Do not rely solely on t1_triggered to infer BE
@@ -1323,10 +1350,10 @@ class PriceTracker:
         if exit_reason == "Win":
             return "Win"  # Always Win regardless of triggers
         
-        # Handle time expiry first - this should override trigger status
+        # Handle time expiry - TIME only when trade is closed (exit_time != NaT)
         if exit_reason == "TIME":
             if self.debug_manager.is_debug_enabled():
-                print(f"  -> TIME (time expiry)")
+                print(f"  -> TIME (time expiry, trade closed)")
             return "TIME"
         
         # T1 triggered trades
@@ -1475,7 +1502,8 @@ class PriceTracker:
                               time_expired: bool, peak: float, peak_time: pd.Timestamp,
                               peak_price: float, t1_triggered: bool,
                               stop_loss_adjusted: bool, final_stop_loss: float,
-                              result_classification: str, profit: float = 0.0) -> TradeExecution:
+                              result_classification: str, profit: float = 0.0,
+                              open_as_of_time: Optional[pd.Timestamp] = None) -> TradeExecution:
         """Create TradeExecution object with all data"""
         return TradeExecution(
             exit_price=exit_price,
@@ -1491,7 +1519,8 @@ class PriceTracker:
             stop_loss_adjusted=stop_loss_adjusted,
             final_stop_loss=final_stop_loss,
             result_classification=result_classification,
-            profit=profit
+            profit=profit,
+            open_as_of_time=open_as_of_time
         )
     
     def calculate_profit(self, entry_price: float, exit_price: float,
@@ -1508,7 +1537,7 @@ class PriceTracker:
             entry_price: Trade entry price
             exit_price: Trade exit price
             direction: Trade direction ("Long" or "Short")
-            result: Trade result ("Win", "BE", "Loss", "TIME")
+            result: Trade result ("Win", "BE", "Loss", "TIME", "OPEN")
             t1_triggered: Whether T1 trigger is activated
             target_pts: Target points (unscaled)
             instrument: Trading instrument
@@ -1570,7 +1599,7 @@ class PriceTracker:
                 "classification": "Win",
                 "exit_reason": "Win",
                 "first_hit": "None",
-                "profit": target_pts * 0.65  # 6.5 points profit
+                "profit": target_pts * self.config_manager.T1_TRIGGER_THRESHOLD  # 6.5 points profit (65% of target)
             }
         
         # Track what happens after 6.5 stop loss

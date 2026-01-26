@@ -7,6 +7,9 @@ and score calculation used throughout the master matrix processing pipeline.
 
 from typing import Dict, Optional
 import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
 
 def time_sort_key(time_str: str) -> tuple:
     """
@@ -133,4 +136,63 @@ def calculate_time_score(result: str) -> int:
         return 0
 
 
+def _enforce_trade_date_invariants(df: pd.DataFrame, context: str) -> pd.DataFrame:
+    """
+    Enforce trade_date invariants: canonical datetime column, Date synced from trade_date.
+    
+    INVARIANT MODEL:
+    - trade_date is the canonical datetime-like column (source of truth; datetime64 with or without timezone)
+    - Date is legacy-derived only: if present, always set Date = trade_date.copy(); never use Date as source-of-truth
+    
+    FAIL-CLOSED BEHAVIOR:
+    - Missing trade_date → ValueError (contract violation)
+    - trade_date exists but not datetime-like → attempt repair with pd.to_datetime(errors='raise')
+    - If repair fails or dtype still not datetime-like → ValueError (fail-closed)
+    - Warnings logged for repair attempts (visibility), but failures must hard error
+    
+    Args:
+        df: DataFrame to enforce invariants on (mutated in place)
+        context: Context string for error messages (e.g., "rolling_resequence_pre_concat")
+        
+    Returns:
+        DataFrame (same reference, mutated in place)
+        
+    Raises:
+        ValueError: If trade_date is missing (contract violation) or repair fails (fail-closed)
+    """
+    # Contract check: trade_date must exist
+    if 'trade_date' not in df.columns:
+        raise ValueError(
+            f"{context}: trade_date column missing (contract violation). "
+            f"trade_date is the canonical datetime column and must exist."
+        )
+    
+    # Repair attempt: if trade_date not datetime-like, attempt conversion
+    if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+        logger.warning(
+            f"{context}: trade_date is {df['trade_date'].dtype}, attempting repair to datetime64"
+        )
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
+        
+        # Verify repair succeeded (fail-closed)
+        if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+            raise ValueError(
+                f"{context}: Failed to repair trade_date dtype after conversion. "
+                f"Current dtype: {df['trade_date'].dtype}. This is a fail-closed invariant violation."
+            )
+    
+    # Date sync: always derive Date from trade_date (never parse Date into trade_date)
+    # trade_date is canonical, Date is legacy-derived only
+    if 'Date' in df.columns:
+        df['Date'] = df['trade_date'].copy()
+        
+        # Verify Date dtype matches trade_date (fail-closed)
+        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+            raise ValueError(
+                f"{context}: Date column dtype mismatch after sync from trade_date. "
+                f"Date dtype: {df['Date'].dtype}, trade_date dtype: {df['trade_date'].dtype}. "
+                f"This is a fail-closed invariant violation."
+            )
+    
+    return df
 

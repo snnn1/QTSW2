@@ -496,7 +496,12 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         years = []
         if 'trade_date' in df.columns:
             df_years = df.copy()
-            df_years['trade_date'] = pd.to_datetime(df_years['trade_date'], errors='coerce')
+            # Dtype guard: assert trade_date is datetime-like before .dt accessor
+            if not pd.api.types.is_datetime64_any_dtype(df_years['trade_date']):
+                raise ValueError(
+                    f"api.get_matrix_data: trade_date is {df_years['trade_date'].dtype}, "
+                    f"cannot use .dt accessor. No fallback to Date column."
+                )
             year_values = df_years['trade_date'].dt.year.dropna().unique().tolist()
             year_values = [int(y) for y in year_values if not pd.isna(y)]
             if year_values:
@@ -512,11 +517,19 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             if order == "newest":
                 # Sort by trade_date descending to get newest rows first
                 # Ensure trade_date is datetime for proper sorting
+                # DATE OWNERSHIP: trade_date should already be normalized in saved parquet files
+                # Validate dtype but don't parse
                 if 'trade_date' in df.columns:
-                    df = df.copy()
-                    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+                    from modules.matrix.data_loader import _validate_trade_date_dtype
+                    try:
+                        _validate_trade_date_dtype(df, "api_load")
+                    except ValueError:
+                        # If validation fails, log warning but continue (file may be from old version)
+                        logger.warning("API: trade_date validation failed - file may be from old version")
                     df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
                 elif 'Date' in df.columns:
+                    # Fallback for old files without trade_date
+                    logger.warning("API: Using Date column as fallback - file may be from old version")
                     df = df.copy()
                     df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
                     df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
@@ -533,7 +546,8 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
                 'Date', 'trade_date', 'Stream', 'Instrument', 'Profit', 'Result', 'Time',
                 'EntryTime', 'ExitTime', 'Session', 'Direction', 'Target', 'Range', 
                 'StopLoss', 'Peak', 'Time Change',
-                'final_allowed', 'ProfitDollars', 'day_of_month', 'dow', 'dow_full', 'month', 'year'
+                'final_allowed', 'ProfitDollars', 'day_of_month', 'dow', 'dow_full', 'month', 'year',
+                'stream_rolling_sum'  # Rolling sum for health gate display
             ]
             # Only include columns that exist in the dataframe
             available_cols = [col for col in essential_cols if col in df.columns]
@@ -552,13 +566,22 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         returned_min_trade_date = None
         returned_max_trade_date = None
         
+        # DATE OWNERSHIP: trade_date should already be normalized in saved parquet files
+        # Validate dtype but don't parse
         if 'trade_date' in df_full.columns:
-            df_full['trade_date'] = pd.to_datetime(df_full['trade_date'], errors='coerce')
+            from modules.matrix.data_loader import _validate_trade_date_dtype
+            try:
+                _validate_trade_date_dtype(df_full, "api_full")
+            except ValueError:
+                logger.warning("API: trade_date validation failed for full dataset - file may be from old version")
             full_min_trade_date = df_full['trade_date'].min()
             full_max_trade_date = df_full['trade_date'].max()
         
         if 'trade_date' in df.columns:
-            df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+            try:
+                _validate_trade_date_dtype(df, "api_returned")
+            except ValueError:
+                logger.warning("API: trade_date validation failed for returned dataset - file may be from old version")
             returned_min_trade_date = df['trade_date'].min()
             returned_max_trade_date = df['trade_date'].max()
         
@@ -568,6 +591,20 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             df = df.drop(columns=["ProfitDollars"])
         from modules.matrix import statistics
         df = statistics._ensure_profit_dollars_column(df, contract_multiplier=contract_multiplier)
+        
+        # Ensure stream_rolling_sum column exists and has values (fallback for old matrices)
+        # If column is missing or all NaN, initialize with zeros
+        if 'stream_rolling_sum' not in df.columns:
+            df['stream_rolling_sum'] = 0.0
+            logger.warning("stream_rolling_sum column missing from parquet file - initialized with zeros. Rebuild matrix to calculate rolling sums.")
+        elif df['stream_rolling_sum'].isna().all() or (df['stream_rolling_sum'] == 0).all():
+            # Column exists but is empty - this means matrix was built before rolling sum was implemented
+            # Fill with zeros as fallback (user should rebuild to get real values)
+            df['stream_rolling_sum'] = df['stream_rolling_sum'].fillna(0.0)
+            logger.warning("stream_rolling_sum column is empty in parquet file - filled with zeros. Rebuild matrix to calculate rolling sums.")
+        else:
+            # Column exists and has values - ensure it's numeric and fill any NaN with 0
+            df['stream_rolling_sum'] = pd.to_numeric(df['stream_rolling_sum'], errors='coerce').fillna(0.0)
         
         # Clean data if requested (expensive operation, can be skipped for faster initial load)
         if not skip_cleaning:
@@ -850,25 +887,83 @@ async def calculate_profit_breakdown(request: BreakdownRequest):
                 logger.info(f"Time breakdown: {len(breakdown)} time slots, streams: {set([s for slots in breakdown.values() for s in slots.keys()])}")
         
         elif request.breakdown_type == 'month':
-            # Month breakdown
-            if 'month' in df.columns:
-                grouped = df.groupby('month')['ProfitDollars'].agg(['sum', 'count']).to_dict('index')
-                for month, data in grouped.items():
-                    breakdown[int(month)] = {
-                        'profit': float(data['sum']),
-                        'trades': int(data['count'])
-                    }
+            # Month breakdown - format matches frontend worker output (grouped by Month and Stream)
+            # Returns: {"2024-01": {"ES1": 1000, "ES2": 2000}, "2024-02": {...}}
+            # Frontend expects format "YYYY-MM" (e.g., "2024-01")
+            if 'trade_date' in df.columns and 'Stream' in df.columns:
+                # Dtype guard: assert trade_date is datetime-like before .dt accessor
+                if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                    raise ValueError(
+                        f"api.calculate_profit_breakdown: trade_date is {df['trade_date'].dtype}, "
+                        f"cannot use .dt accessor. No fallback to Date column."
+                    )
+                # Create a copy to avoid modifying the original dataframe
+                df_month = df.copy()
+                # Create year-month string in format "YYYY-MM"
+                # Use strftime to ensure consistent "YYYY-MM" format
+                # CRITICAL: Use unique column name 'year_month_str' to avoid conflicts with existing 'month' column
+                df_month['year_month_str'] = df_month['trade_date'].dt.strftime('%Y-%m')
+                
+                # Verify the format is correct and log for debugging
+                if len(df_month) > 0:
+                    sample_year_month = df_month['year_month_str'].iloc[0]
+                    logger.info(f"Month breakdown: Created year_month_str column, sample value: '{sample_year_month}' (type: {type(sample_year_month).__name__})")
+                    # Check if 'month' column exists (should NOT be used)
+                    if 'month' in df_month.columns:
+                        sample_month = df_month['month'].iloc[0]
+                        logger.warning(f"Month breakdown: Existing 'month' column found (value: {sample_month}), but using year_month_str instead")
+                
+                # Group by both Year-Month and Stream to show each stream's data separately
+                # CRITICAL: Must use 'year_month_str', NOT 'month'
+                grouped = df_month.groupby(['year_month_str', 'Stream'])['ProfitDollars'].sum().reset_index()
+                logger.info(f"Month breakdown: Grouped into {len(grouped)} rows using year_month_str column")
+                
+                # Debug: Verify grouped result has correct column
+                if len(grouped) > 0:
+                    first_year_month = grouped['year_month_str'].iloc[0]
+                    logger.info(f"Month breakdown: First grouped year_month_str value: '{first_year_month}' (type: {type(first_year_month).__name__})")
+                
+                for _, row in grouped.iterrows():
+                    # year_month_str is already a string in "YYYY-MM" format from strftime
+                    year_month = str(row['year_month_str']).strip()
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    
+                    # Validate format (should be "YYYY-MM")
+                    if len(year_month) != 7 or year_month[4] != '-':
+                        logger.error(f"Month breakdown: Invalid year_month format: '{year_month}' (expected 'YYYY-MM'), row: {dict(row)}")
+                        continue
+                    
+                    if year_month not in breakdown:
+                        breakdown[year_month] = {}
+                    breakdown[year_month][stream] = profit
+                
+                sample_keys = list(breakdown.keys())[:3] if len(breakdown) > 0 else []
+                logger.info(f"Month breakdown: {len(breakdown)} months, sample keys: {sample_keys}, streams: {set([s for months in breakdown.values() for s in months.keys()])}")
         
         elif request.breakdown_type == 'year':
-            # Year breakdown
-            if 'trade_date' in df.columns:
-                df['year'] = pd.to_datetime(df['trade_date']).dt.year
-                grouped = df.groupby('year')['ProfitDollars'].agg(['sum', 'count']).to_dict('index')
-                for year, data in grouped.items():
-                    breakdown[int(year)] = {
-                        'profit': float(data['sum']),
-                        'trades': int(data['count'])
-                    }
+            # Year breakdown - format matches frontend worker output (grouped by Year and Stream)
+            # Returns: {2024: {"ES1": 1000, "ES2": 2000}, 2025: {...}}
+            # trade_date should already be datetime from DataLoader normalization
+            if 'trade_date' in df.columns and 'Stream' in df.columns:
+                # Dtype guard: assert trade_date is datetime-like before .dt accessor
+                if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                    raise ValueError(
+                        f"api.calculate_profit_breakdown: trade_date is {df['trade_date'].dtype}, "
+                        f"cannot use .dt accessor. No fallback to Date column."
+                    )
+                df['year'] = df['trade_date'].dt.year
+                # Group by both Year and Stream to show each stream's data separately
+                grouped = df.groupby(['year', 'Stream'])['ProfitDollars'].sum().reset_index()
+                for _, row in grouped.iterrows():
+                    year = int(row['year'])
+                    stream = str(row['Stream'])
+                    profit = float(row['ProfitDollars'])
+                    if year not in breakdown:
+                        breakdown[year] = {}
+                    breakdown[year][stream] = profit
+                
+                logger.info(f"Year breakdown: {len(breakdown)} years, streams: {set([s for years in breakdown.values() for s in years.keys()])}")
         
         return {
             "breakdown": breakdown,

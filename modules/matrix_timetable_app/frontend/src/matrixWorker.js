@@ -1070,6 +1070,22 @@ self.onmessage = function(e) {
           filteredIndices = createFilteredIndices(self.columnarData, streamFilters || {}, streamId, showFilteredDays)
           // Cache the result
           self.filterCache.set(cacheKey, filteredIndices)
+          
+          // Debug logging when filters result in 0 rows
+          if (filteredIndices.length === 0 && self.columnarData.length > 0) {
+            const masterFilters = streamFilters?.['master'] || {}
+            const masterIncludeStreams = masterFilters.include_streams || []
+            const masterIncludeYears = masterFilters.include_years || []
+            console.warn('[Worker] Filter resulted in 0 rows:', {
+              streamId,
+              totalRows: self.columnarData.length,
+              showFilteredDays,
+              masterIncludeStreams: masterIncludeStreams.length > 0 ? masterIncludeStreams : 'none (all streams)',
+              masterIncludeYears: masterIncludeYears.length > 0 ? masterIncludeYears : 'none (all years)',
+              streamFilters: Object.keys(streamFilters || {}),
+              suggestion: 'Check if year filters or stream filters are excluding all data'
+            })
+          }
         }
         
         // Sort indices if requested

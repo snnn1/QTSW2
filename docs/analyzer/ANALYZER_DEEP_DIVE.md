@@ -214,7 +214,8 @@ modules/analyzer/
    - **Win**: Target hit → Full target profit
    - **BE**: T1 triggered + stop hit → 1 tick loss
    - **Loss**: Stop hit without T1 → Actual loss
-   - **TIME**: Time expired → Actual PnL at expiry
+   - **TIME**: Time expired AND trade closed → Actual PnL at expiry
+   - **OPEN**: Trade still open (exit_time = NaT) → Current PnL
 
 **MFE End Time Calculation**:
 - Regular day: Next day same slot
@@ -474,7 +475,8 @@ When both target and stop are possible in the same bar:
 - `Win`: Target hit → Full target profit
 - `BE`: T1 triggered + stop hit → 1 tick loss
 - `Loss`: Stop hit without T1 → Actual loss
-- `TIME`: Time expired → Actual PnL
+- `TIME`: Time expired AND trade closed (exit_time != NaT) → Actual PnL at expiry
+- `OPEN`: Trade still open (exit_time = NaT) → Current PnL
 - `NoTrade`: No entry occurred
 
 ### NoTrade Entries
@@ -491,7 +493,7 @@ When both target and stop are possible in the same bar:
 
 **Deduplication Logic**:
 - Groups by: Date, Time, Target, Direction, Session, Instrument
-- Keeps first occurrence (highest rank: Win > BE > Loss > TIME)
+- Keeps first occurrence (highest rank: Win > BE > Loss > TIME > OPEN)
 - Removes duplicates from same slot/date combination
 
 ### Sorting

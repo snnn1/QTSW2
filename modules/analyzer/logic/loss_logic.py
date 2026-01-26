@@ -7,6 +7,7 @@ import pandas as pd
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass
 from enum import Enum
+from .config_logic import ConfigManager
 
 class LossType(Enum):
     """Types of losses in the trading system"""
@@ -85,8 +86,8 @@ class LossManager:
         Returns:
             Initial stop loss price
         """
-        # Calculate stop loss in points: min(range_size, 3 * target_pts)
-        max_sl_points = 3 * target_pts
+        # Calculate stop loss in points: min(range_size, max_multiplier * target_pts)
+        max_sl_points = ConfigManager.STOP_LOSS_MAX_MULTIPLIER * target_pts
         
         if range_size is None:
             # Fallback to 3x target if no range size provided

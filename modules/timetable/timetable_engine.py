@@ -27,6 +27,21 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from modules.matrix.config import SLOT_ENDS, DOM_BLOCKED_DAYS, SCF_THRESHOLD
 
+# CONTRACT: Only import validation helpers, never normalization functions
+# Timetable Engine validates, enforces, and fails — it never normalizes dates.
+try:
+    from modules.matrix.data_loader import (
+        _validate_trade_date_dtype,
+        _validate_trade_date_presence
+    )
+except ImportError:
+    # Fallback: add parent directory to path
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.matrix.data_loader import (
+        _validate_trade_date_dtype,
+        _validate_trade_date_presence
+    )
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -123,30 +138,50 @@ class TimetableEngine:
                     continue
                 
                 # Validate required columns
-                if 'Date' not in df.columns:
-                    logger.warning(f"File {file_path.name} missing 'Date' column, skipping")
-                    continue
                 if 'Result' not in df.columns:
                     logger.warning(f"File {file_path.name} missing 'Result' column, skipping")
                     continue
                 
-                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-                # Skip rows with invalid dates
-                valid_dates = df['Date'].notna()
-                if not valid_dates.any():
-                    logger.warning(f"File {file_path.name} has no valid dates, skipping")
-                    continue
+                # CONTRACT ENFORCEMENT: Require trade_date column
+                if 'trade_date' not in df.columns:
+                    raise ValueError(
+                        f"File {file_path.name} missing trade_date column - "
+                        f"analyzer output contract requires trade_date. "
+                        f"Timetable Engine does not normalize dates. "
+                        f"Fix analyzer output before proceeding."
+                    )
                 
-                df = df[valid_dates].copy()
+                # Validate dtype/presence only (no normalization)
+                _validate_trade_date_dtype(df, stream_id)
+                _validate_trade_date_presence(df, stream_id)
+                
+                # CONTRACT ENFORCEMENT: Invalid trade_date values → ValueError
+                invalid_dates = df['trade_date'].isna()
+                if invalid_dates.any():
+                    invalid_count = invalid_dates.sum()
+                    raise ValueError(
+                        f"File {file_path.name}: Found {invalid_count} rows with invalid trade_date. "
+                        f"This violates analyzer output contract. Fix analyzer output before proceeding."
+                    )
+                
                 all_trades.append(df)
             except Exception as e:
+                # Re-raise ValueError (contract violations)
+                if isinstance(e, ValueError):
+                    raise
+                # Log other errors but continue
                 logger.warning(f"Error loading {file_path}: {e}")
                 import traceback
                 logger.debug(f"Traceback: {traceback.format_exc()}")
                 continue
         
+        # CONTRACT ENFORCEMENT: No valid data → ValueError
         if not all_trades:
-            return {}
+            raise ValueError(
+                f"Stream {stream_id} session {session}: No valid trade data found for RS calculation. "
+                f"This violates analyzer output contract. "
+                f"Ensure analyzer output files have trade_date column and valid data."
+            )
         
         # Merge and filter by session
         df = pd.concat(all_trades, ignore_index=True)
@@ -155,8 +190,8 @@ class TimetableEngine:
         if df.empty:
             return {}
         
-        # Sort by date
-        df = df.sort_values('Date').reset_index(drop=True)
+        # Sort by trade_date (already datetime dtype)
+        df = df.sort_values('trade_date').reset_index(drop=True)
         
         # Get last N trades per time slot
         time_slot_rs = {}
@@ -288,8 +323,14 @@ class TimetableEngine:
                 try:
                     df = pd.read_parquet(pf)
                     if not df.empty:
-                        df['Date'] = pd.to_datetime(df['Date'])
-                        if (df['Date'].dt.date == trade_date).any():
+                        # CONTRACT ENFORCEMENT: Require trade_date column
+                        if 'trade_date' not in df.columns:
+                            continue  # Skip files without trade_date
+                        _validate_trade_date_dtype(df, stream_id)
+                        # Ensure trade_date is datetime dtype before using .dt accessor
+                        if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                            continue  # Skip files with invalid dtype
+                        if (df['trade_date'].dt.date == trade_date).any():
                             file_path = pf
                             break
                 except:
@@ -300,8 +341,25 @@ class TimetableEngine:
         
         try:
             df = pd.read_parquet(file_path)
-            df['Date'] = pd.to_datetime(df['Date'])
-            day_data = df[df['Date'].dt.date == trade_date]
+            
+            # CONTRACT ENFORCEMENT: Require trade_date column
+            if 'trade_date' not in df.columns:
+                raise ValueError(
+                    f"File {file_path.name} missing trade_date column - "
+                    f"analyzer output contract requires trade_date. "
+                    f"Timetable Engine does not normalize dates. "
+                    f"Fix analyzer output before proceeding."
+                )
+            
+            # Validate dtype only (no normalization, no re-parsing)
+            _validate_trade_date_dtype(df, stream_id)
+            # Ensure trade_date is datetime dtype before using .dt accessor
+            if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
+                raise ValueError(
+                    f"File {file_path.name} trade_date column is not datetime dtype after validation: {df['trade_date'].dtype}. "
+                    f"This is a contract violation. Analyzer output must have normalized trade_date column."
+                )
+            day_data = df[df['trade_date'].dt.date == trade_date]
             
             if day_data.empty:
                 return None, None
@@ -461,27 +519,33 @@ class TimetableEngine:
             logger.warning("Master matrix is empty, cannot generate execution timetable")
             return
         
+        # CONTRACT ENFORCEMENT: Require trade_date column
+        if 'trade_date' not in master_matrix_df.columns:
+            raise ValueError(
+                "Master matrix missing trade_date column - DataLoader must normalize dates before timetable generation. "
+                "This is a contract violation. Timetable Engine does not normalize dates."
+            )
+        
+        # Validate dtype/presence only (no normalization, no re-parsing)
+        _validate_trade_date_presence(master_matrix_df, "master_matrix")
+        _validate_trade_date_dtype(master_matrix_df, "master_matrix")
+        
+        # Ensure trade_date is datetime dtype before using .dt accessor
+        if not pd.api.types.is_datetime64_any_dtype(master_matrix_df['trade_date']):
+            raise ValueError(
+                f"Master matrix trade_date column is not datetime dtype after validation: {master_matrix_df['trade_date'].dtype}. "
+                f"This is a contract violation. DataLoader must normalize dates before timetable generation."
+            )
+        
         # Get latest date from master matrix if not provided
         if trade_date is None:
-            if 'trade_date' in master_matrix_df.columns:
-                latest_date = pd.to_datetime(master_matrix_df['trade_date']).max()
-                trade_date = latest_date.strftime('%Y-%m-%d')
-            elif 'Date' in master_matrix_df.columns:
-                latest_date = pd.to_datetime(master_matrix_df['Date']).max()
-                trade_date = latest_date.strftime('%Y-%m-%d')
-            else:
-                logger.error("Master matrix missing date columns, cannot generate execution timetable")
-                return
+            latest_date = master_matrix_df['trade_date'].max()
+            trade_date = latest_date.strftime('%Y-%m-%d')
         
         trade_date_obj = pd.to_datetime(trade_date).date()
         
-        # Filter to latest date
-        if 'trade_date' in master_matrix_df.columns:
-            latest_df = master_matrix_df[pd.to_datetime(master_matrix_df['trade_date']).dt.date == trade_date_obj].copy()
-        elif 'Date' in master_matrix_df.columns:
-            latest_df = master_matrix_df[pd.to_datetime(master_matrix_df['Date']).dt.date == trade_date_obj].copy()
-        else:
-            latest_df = master_matrix_df.copy()
+        # Filter to latest date (trade_date is already datetime dtype)
+        latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
         
         if latest_df.empty:
             logger.warning(f"No data for date {trade_date}, cannot generate execution timetable")
@@ -514,7 +578,16 @@ class TimetableEngine:
             
             # Extract instrument and session from stream
             instrument = stream[:-1] if len(stream) > 1 else ''
-            session = 'S1' if stream.endswith('1') else 'S2'
+            
+            # Use Session column from master matrix if available
+            if 'Session' in row and pd.notna(row.get('Session')):
+                session = str(row['Session']).strip()
+                if session not in ['S1', 'S2']:
+                    logger.warning(f"Stream {stream}: Invalid session '{session}', using stream_id pattern")
+                    session = 'S1' if stream.endswith('1') else 'S2'
+            else:
+                # Fall back to stream_id pattern
+                session = 'S1' if stream.endswith('1') else 'S2'
             
             # Get time (use Time Change if available, otherwise Time)
             # Time Change can be either:
@@ -532,6 +605,22 @@ class TimetableEngine:
                 else:
                     # Current format: Time Change is just the new time
                     time = time_change_str
+            
+            # Validate that parsed time is in session_time_slots
+            if time:
+                from modules.matrix.utils import normalize_time
+                normalized_time = normalize_time(str(time))
+                available_times_normalized = [normalize_time(str(t)) for t in self.session_time_slots.get(session, [])]
+                
+                if normalized_time not in available_times_normalized:
+                    logger.warning(
+                        f"Stream {stream}: Parsed time '{time}' (normalized: '{normalized_time}') "
+                        f"is not in available times for session {session}. "
+                        f"Available: {self.session_time_slots.get(session, [])}"
+                    )
+                    # Use default time instead
+                    available_times = self.session_time_slots.get(session, [])
+                    time = available_times[0] if available_times else ""
             
             # If no time, use default for session
             if not time:
@@ -629,7 +718,48 @@ class TimetableEngine:
                 instrument = stream_id[:-1] if len(stream_id) > 1 else ''
                 session = 'S1' if stream_id.endswith('1') else 'S2'
                 available_times = self.session_time_slots.get(session, [])
-                default_time = available_times[0] if available_times else ""
+                default_time = ""
+                
+                # CONTRACT ENFORCEMENT: Select first non-filtered time
+                if stream_filters:
+                    from modules.matrix.utils import normalize_time
+                    exclude_times_list = []
+                    
+                    # Collect exclude_times from stream and master filters
+                    stream_filter = stream_filters.get(stream_id, {})
+                    if stream_filter.get('exclude_times'):
+                        exclude_times_list.extend(stream_filter['exclude_times'])
+                    
+                    master_filter = stream_filters.get('master', {})
+                    if master_filter.get('exclude_times'):
+                        exclude_times_list.extend(master_filter['exclude_times'])
+                    
+                    # Select first NON-FILTERED time
+                    if exclude_times_list:
+                        exclude_times_normalized = [normalize_time(str(t)) for t in exclude_times_list]
+                        for time_slot in available_times:
+                            if normalize_time(time_slot) not in exclude_times_normalized:
+                                default_time = time_slot
+                                break
+                        
+                        # CONTRACT ENFORCEMENT: All times filtered → ValueError
+                        if not default_time:
+                            raise ValueError(
+                                f"Stream {stream_id} (session {session}): All available times are filtered. "
+                                f"Available times: {available_times}, Filtered times: {exclude_times_list}. "
+                                f"This is a configuration error - cannot select default time for missing stream."
+                            )
+                    else:
+                        default_time = available_times[0] if available_times else ""
+                else:
+                    default_time = available_times[0] if available_times else ""
+                
+                # CONTRACT ENFORCEMENT: No available time slots → ValueError
+                if not default_time:
+                    raise ValueError(
+                        f"Stream {stream_id} (session {session}): No available time slots. "
+                        f"This is a configuration error."
+                    )
                 
                 streams_dict[stream_id] = {
                     'stream': stream_id,
@@ -693,13 +823,13 @@ class TimetableEngine:
             f"rollover_applied={rollover_applied}"
         )
         
-        # Validation: Flag if as_of >= 17:00 but trading_date would be same day (should never happen)
+        # CONTRACT ENFORCEMENT: CME rollover logic failure is a runtime contract violation
         if chicago_hour >= 17 and trading_date == chicago_date.isoformat():
-            logger.warning(
-                f"CME_TRADING_DATE_VALIDATION_FAILED: "
+            raise ValueError(
+                f"CME_TRADING_DATE_ROLLOVER_CONTRACT_VIOLATION: "
                 f"as_of={as_of} (>= 17:00) but trading_date={trading_date} "
                 f"equals calendar date {chicago_date.isoformat()}. "
-                f"This should never happen after the fix."
+                f"This violates the CME rollover contract - rollover logic is broken."
             )
         
         # Optional: Log if trade_date parameter differs from computed trading_date
