@@ -15,7 +15,7 @@ const HEALTH_URL = '/health'
    Core helpers
 ================================ */
 
-async function fetchWithTimeout(url, options = {}, timeout = REQUEST_TIMEOUT) {
+async function fetchWithTimeout(url, options = {}, timeout = API_TIMEOUT_DEFAULT) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeout)
 

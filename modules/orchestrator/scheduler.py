@@ -18,10 +18,31 @@ import json
 import logging
 import subprocess
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 from datetime import datetime, timedelta
 import pytz
+
+def _is_elevated() -> bool:
+    """Check if the current process is running with administrator privileges"""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        # Fallback: try to check via whoami
+        try:
+            result = subprocess.run(
+                ["whoami", "/groups"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                return "S-1-5-32-544" in result.stdout  # Administrators group SID
+        except Exception:
+            pass
+        return False
 
 
 class Scheduler:
@@ -329,8 +350,23 @@ class Scheduler:
             current_status = self._check_windows_task_status()
             self.logger.info(f"[SCHEDULER] Current task status: enabled={current_status.get('enabled')}, state={current_status.get('state')}")
             
+            # Check if process is elevated before attempting
+            if not _is_elevated():
+                error_msg = (
+                    "Permission denied. The backend process must be running as Administrator to enable/disable Windows Task Scheduler tasks. "
+                    "Please restart the dashboard backend as Administrator:\n"
+                    "1. Close the current backend\n"
+                    "2. Right-click PowerShell/Command Prompt\n"
+                    "3. Select 'Run as administrator'\n"
+                    "4. Navigate to the project directory\n"
+                    "5. Run: batch\\START_DASHBOARD.bat\n\n"
+                    "Alternatively, manually enable/disable the task in Task Scheduler (taskschd.msc) or run:\n"
+                    f"schtasks /change /tn \"{actual_task_name}\" /enable"
+                )
+                self.logger.error(f"[SCHEDULER] Process not elevated - cannot enable task '{actual_task_name}'")
+                return (False, error_msg)
+            
             # Use schtasks.exe /change (more reliable than PowerShell Enable-ScheduledTask)
-            # schtasks.exe works better when running as admin via subprocess
             self.logger.info(f"[SCHEDULER] Executing: schtasks /change /tn \"{actual_task_name}\" /enable")
             result = subprocess.run(
                 ["schtasks", "/change", "/tn", actual_task_name, "/enable"],
@@ -421,8 +457,23 @@ class Scheduler:
             current_status = self._check_windows_task_status()
             self.logger.info(f"[SCHEDULER] Current task status: enabled={current_status.get('enabled')}, state={current_status.get('state')}")
             
+            # Check if process is elevated before attempting
+            if not _is_elevated():
+                error_msg = (
+                    "Permission denied. The backend process must be running as Administrator to enable/disable Windows Task Scheduler tasks. "
+                    "Please restart the dashboard backend as Administrator:\n"
+                    "1. Close the current backend\n"
+                    "2. Right-click PowerShell/Command Prompt\n"
+                    "3. Select 'Run as administrator'\n"
+                    "4. Navigate to the project directory\n"
+                    "5. Run: batch\\START_DASHBOARD.bat\n\n"
+                    "Alternatively, manually enable/disable the task in Task Scheduler (taskschd.msc) or run:\n"
+                    f"schtasks /change /tn \"{actual_task_name}\" /disable"
+                )
+                self.logger.error(f"[SCHEDULER] Process not elevated - cannot disable task '{actual_task_name}'")
+                return (False, error_msg)
+            
             # Use schtasks.exe /change (more reliable than PowerShell Disable-ScheduledTask)
-            # schtasks.exe works better when running as admin via subprocess
             self.logger.info(f"[SCHEDULER] Executing: schtasks /change /tn \"{actual_task_name}\" /disable")
             result = subprocess.run(
                 ["schtasks", "/change", "/tn", actual_task_name, "/disable"],

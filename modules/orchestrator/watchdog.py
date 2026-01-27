@@ -120,6 +120,48 @@ class Watchdog:
                         except Exception as e:
                             self.logger.error(f"Watchdog: Failed to transition hung run to FAILED: {e}", exc_info=True)
                 
+                # ADDITIONAL SAFEGUARD: Check for state inconsistencies
+                # If state shows running but lock doesn't exist, or vice versa
+                try:
+                    is_locked = await self.orchestrator.lock_manager.is_locked()
+                    lock_info = await self.orchestrator.lock_manager.get_lock_info()
+                    
+                    # If we're in a running state but lock doesn't exist, something is wrong
+                    if status.state not in {
+                        PipelineRunState.IDLE,
+                        PipelineRunState.SUCCESS,
+                        PipelineRunState.FAILED,
+                        PipelineRunState.STOPPED,
+                    } and not is_locked:
+                        self.logger.warning(
+                            f"Watchdog: State inconsistency detected - Run {status.run_id[:8]} "
+                            f"is in {status.state.value} state but no lock exists. "
+                            f"This may indicate a stuck state. Clearing state."
+                        )
+                        # Clear the stuck state
+                        await self.state_manager.clear_run()
+                        await self.event_bus.publish({
+                            "run_id": status.run_id,
+                            "stage": "watchdog",
+                            "event": "state_inconsistency",
+                            "timestamp": datetime.now().isoformat(),
+                            "msg": f"State inconsistency detected - cleared stuck state",
+                            "data": {
+                                "state": status.state.value,
+                                "lock_exists": False
+                            }
+                        })
+                    
+                    # If lock exists but doesn't match current run_id, clear it
+                    if is_locked and lock_info and lock_info.get("run_id") != status.run_id:
+                        self.logger.warning(
+                            f"Watchdog: Lock mismatch - Lock held by {lock_info.get('run_id', 'unknown')[:8]} "
+                            f"but state shows {status.run_id[:8]}. Clearing stale lock."
+                        )
+                        await self.orchestrator.lock_manager.force_clear_all()
+                except Exception as e:
+                    self.logger.debug(f"Watchdog: Error checking state consistency: {e}")
+                
                 # Check if lock is stale (additional safety check)
                 try:
                     is_locked = await self.orchestrator.lock_manager.is_locked()

@@ -16,7 +16,7 @@ import { useUnprotectedPositions } from '../hooks/useUnprotectedPositions'
 import { useStreamStates } from '../hooks/useStreamStates'
 import { useActiveIntents } from '../hooks/useActiveIntents'
 import { useStreamPnl } from '../hooks/useStreamPnl'
-import { getCurrentChicagoTime } from '../utils/timeUtils'
+import { getCurrentChicagoTime } from '../utils/timeUtils.ts'
 import { WatchdogNavigationBar } from '../components/shared/WatchdogNavigationBar'
 import type { StreamState, WatchdogEvent } from '../types/watchdog'
 
@@ -226,7 +226,7 @@ export function WatchdogPage() {
               {intentsError && <div>Intents: {intentsError}</div>}
             </div>
             <div className="mt-2 text-xs text-gray-400">
-              Make sure the backend is running on http://localhost:8001
+              Make sure the watchdog backend is running on http://localhost:8002
             </div>
           </div>
         </div>

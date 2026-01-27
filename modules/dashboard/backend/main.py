@@ -45,37 +45,6 @@ import logging
 import pandas as pd
 import numpy as np
 
-# Import configuration constants
-try:
-    from .config import (
-        DASHBOARD_PORT,
-        API_TIMEOUT_SHORT,
-        API_TIMEOUT_DEFAULT,
-        API_TIMEOUT_LONG,
-        FILE_COUNTS_CACHE_TTL,
-        SNAPSHOT_CACHE_TTL,
-        MAX_EVENTS_IN_UI,
-        SNAPSHOT_MAX_EVENTS,
-        SNAPSHOT_WINDOW_HOURS,
-        SNAPSHOT_CHUNK_SIZE,
-        SNAPSHOT_LOAD_TIMEOUT,
-    )
-except ImportError:
-    # Fallback if import fails
-    from config import (
-        DASHBOARD_PORT,
-        API_TIMEOUT_SHORT,
-        API_TIMEOUT_DEFAULT,
-        API_TIMEOUT_LONG,
-        FILE_COUNTS_CACHE_TTL,
-        SNAPSHOT_CACHE_TTL,
-        MAX_EVENTS_IN_UI,
-        SNAPSHOT_MAX_EVENTS,
-        SNAPSHOT_WINDOW_HOURS,
-        SNAPSHOT_CHUNK_SIZE,
-        SNAPSHOT_LOAD_TIMEOUT,
-    )
-
 # Configuration
 # Calculate project root: modules/dashboard/backend/main.py -> QTSW2 root (go up 3 levels)
 QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
@@ -104,9 +73,6 @@ SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "configs" / "schedule.json"
 # Global orchestrator instance
 orchestrator_instance = None
 
-# Global watchdog aggregator instance
-watchdog_aggregator_instance = None
-
 # File counts cache (for fast response times)
 _file_counts_cache = {
     "raw_files": 0,
@@ -116,15 +82,13 @@ _file_counts_cache = {
     "last_duration_ms": 0,
     "refresh_task": None,
 }
-_file_counts_cache_ttl_seconds = FILE_COUNTS_CACHE_TTL  # Refresh cache if older than TTL
-_file_counts_cache_lock = asyncio.Lock()  # Lock to protect cache updates
-_refresh_in_progress = False  # Guard to prevent scheduling redundant refresh tasks
+_file_counts_cache_ttl_seconds = 30  # Refresh cache if older than 30 seconds
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
-    global orchestrator_instance, watchdog_aggregator_instance
+    global orchestrator_instance
     logger = logging.getLogger(__name__)
     logger.info("Pipeline Dashboard API started")
     
@@ -167,13 +131,13 @@ async def lifespan(app: FastAPI):
         # Warm snapshot cache in background so WebSocket snapshots are instant
         try:
             orchestrator_instance.event_bus.start_snapshot_warmer(
-                hours=SNAPSHOT_WINDOW_HOURS,
-                max_events=SNAPSHOT_MAX_EVENTS,
+                hours=4.0,
+                max_events=100,
                 exclude_verbose=True,
-                ttl_seconds=SNAPSHOT_CACHE_TTL,
-                interval_seconds=SNAPSHOT_CACHE_TTL,
+                ttl_seconds=15,
+                interval_seconds=15,
             )
-            logger.info(f"Snapshot cache warmer started ({SNAPSHOT_WINDOW_HOURS}h window, {SNAPSHOT_MAX_EVENTS} events, {SNAPSHOT_CACHE_TTL}s interval)")
+            logger.info("Snapshot cache warmer started (4h window, 100 events, 15s interval)")
         except Exception as warm_err:
             logger.warning(f"Failed to start snapshot cache warmer: {warm_err}")
     except Exception as e:
@@ -190,44 +154,6 @@ async def lifespan(app: FastAPI):
         traceback.print_exc()
         print("=" * 60 + "\n")
         orchestrator_instance = None
-    
-    # Initialize watchdog aggregator (independent of orchestrator)
-    print("\n" + "=" * 60)
-    print("INITIALIZING WATCHDOG AGGREGATOR")
-    print("=" * 60)
-    try:
-        print("Step 1: Importing watchdog aggregator...")
-        logger.info("Initializing Watchdog Aggregator...")
-        try:
-            from modules.watchdog.aggregator import WatchdogAggregator
-        except ImportError:
-            import sys
-            sys.path.insert(0, str(QTSW2_ROOT))
-            from modules.watchdog.aggregator import WatchdogAggregator
-        print("   [OK] Imported")
-        
-        print("Step 2: Creating aggregator instance...")
-        watchdog_aggregator_instance = WatchdogAggregator()
-        print("   [OK] Instance created")
-        
-        print("Step 3: Starting aggregator...")
-        await watchdog_aggregator_instance.start()
-        print("   [OK] Aggregator started successfully!")
-        print("=" * 60 + "\n")
-        
-        # Set aggregator instance in watchdog router
-        watchdog.aggregator_instance = watchdog_aggregator_instance
-        logger.info("Watchdog Aggregator started successfully")
-    except Exception as e:
-        import traceback
-        error_msg = f"Failed to start watchdog aggregator: {e}\nFull traceback:\n{traceback.format_exc()}"
-        logger.error(error_msg, exc_info=True)
-        print("\n" + "=" * 60)
-        print("[WARNING] Watchdog aggregator failed to start!")
-        print("=" * 60)
-        print(f"Error: {str(e)}")
-        print("=" * 60 + "\n")
-        watchdog_aggregator_instance = None
     
     # Legacy scheduler removed - Windows Task Scheduler runs pipeline directly via automation/run_pipeline_standalone.py
     
@@ -248,12 +174,6 @@ async def lifespan(app: FastAPI):
     yield  # Application runs here
     
     # Shutdown
-    if watchdog_aggregator_instance:
-        try:
-            await watchdog_aggregator_instance.stop()
-            logger.info("Watchdog Aggregator stopped")
-        except Exception as e:
-            logger.error(f"Error stopping watchdog aggregator: {e}")
     logger = logging.getLogger(__name__)
     
     # Stop orchestrator
@@ -306,14 +226,9 @@ root_logger.setLevel(logging.DEBUG)
 
 
 # CORS middleware for React frontend
-# Use environment variable for allowed origins, default to localhost in development
-# Example production: DASHBOARD_CORS_ORIGINS="https://dashboard.example.com,https://www.example.com"
-cors_origins_env = os.getenv("DASHBOARD_CORS_ORIGINS", "http://localhost:5173,http://localhost:5174,http://localhost:3000")
-cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://192.168.1.171:5174"],  # Vite default ports + network
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -325,7 +240,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1K
 # Import and include routers
 # Handle both module import (dashboard.backend.main) and direct script execution
 try:
-    from .routers import pipeline, schedule, websocket, apps, metrics, watchdog
+    from .routers import pipeline, schedule, websocket, apps, metrics
 except (ImportError, ValueError):
     # Fallback: Add parent directory to path and import
     import sys
@@ -339,10 +254,10 @@ except (ImportError, ValueError):
     if str(dashboard_path) not in sys.path:
         sys.path.insert(0, str(dashboard_path))
     try:
-        from routers import pipeline, schedule, websocket, apps, metrics, watchdog
+        from routers import pipeline, schedule, websocket, apps, metrics
     except ImportError as e:
         # Last resort: try absolute import
-        from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics, watchdog
+        from dashboard.backend.routers import pipeline, schedule, websocket, apps, metrics
 
 # Import matrix API router from matrix module
 try:
@@ -358,7 +273,6 @@ app.include_router(schedule.router)
 app.include_router(websocket.router)
 app.include_router(apps.router)
 app.include_router(metrics.router)
-app.include_router(watchdog.router)
 app.include_router(matrix_router)  # Matrix API from modules.matrix.api
 
 # Legacy scheduler removed - no process to set
@@ -413,10 +327,8 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring"""
-    # Health checks are frequent - use DEBUG level but don't write to file in production
-    # This reduces log noise while still allowing debugging when needed
+    # Use DEBUG level to reduce log noise (health checks are frequent)
     logger = logging.getLogger(__name__)
-    # Only log at DEBUG level (won't appear in production logs unless DEBUG is enabled)
     logger.debug("Health check requested")
     return {
         "status": "healthy",
@@ -424,42 +336,20 @@ async def health_check():
         "service": "Pipeline Dashboard API"
     }
 
-# Debug endpoints - gated behind environment variable for security
-# Set DASHBOARD_DEBUG=true to enable debug endpoints in development
-if os.getenv("DASHBOARD_DEBUG", "false").lower() == "true":
-    @app.get("/api/debug/connection")
-    async def debug_connection():
-        """Debug endpoint to test connection and CORS (requires DASHBOARD_DEBUG=true)"""
-        return {
-            "status": "connected",
-            "timestamp": datetime.now().isoformat(),
-            "backend": "running",
-            "cors": "configured",
-            "endpoints": {
-                "health": "/health",
-                "pipeline_status": "/api/pipeline/status",
-                "scheduler_status": "/api/scheduler/status"
-            }
+@app.get("/api/debug/connection")
+async def debug_connection():
+    """Debug endpoint to test connection and CORS"""
+    return {
+        "status": "connected",
+        "timestamp": datetime.now().isoformat(),
+        "backend": "running",
+        "cors": "configured",
+        "endpoints": {
+            "health": "/health",
+            "pipeline_status": "/api/pipeline/status",
+            "scheduler_status": "/api/scheduler/status"
         }
-
-    @app.get("/api/test-debug-log")
-    async def test_debug_log():
-        """Test endpoint to verify debug logging works (requires DASHBOARD_DEBUG=true)"""
-        from datetime import datetime
-        master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
-        master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        test_msg = f"[{timestamp}] TEST: Debug log endpoint works!\n"
-        
-        try:
-            with open(master_matrix_log, 'a', encoding='utf-8') as f:
-                f.write(test_msg)
-                f.flush()
-                os.fsync(f.fileno())
-            return {"status": "success", "message": "Debug log written successfully", "file": str(master_matrix_log)}
-        except Exception as e:
-            return {"status": "error", "message": str(e), "file": str(master_matrix_log)}
+    }
 
 @app.get("/api/matrix/test")
 async def test_matrix_endpoint():
@@ -467,6 +357,27 @@ async def test_matrix_endpoint():
     logger = logging.getLogger(__name__)
     logger.info("TEST ENDPOINT HIT - Frontend can reach backend!")
     return {"status": "success", "message": "Backend is reachable from frontend"}
+
+
+@app.get("/api/test-debug-log")
+async def test_debug_log():
+    """Test endpoint to verify debug logging works"""
+    import os
+    from datetime import datetime
+    master_matrix_log = QTSW2_ROOT / "logs" / "master_matrix.log"
+    master_matrix_log.parent.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    test_msg = f"[{timestamp}] TEST: Debug log endpoint works!\n"
+    
+    try:
+        with open(master_matrix_log, 'a', encoding='utf-8') as f:
+            f.write(test_msg)
+            f.flush()
+            os.fsync(f.fileno())
+        return {"status": "success", "message": "Debug log written successfully", "file": str(master_matrix_log)}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "file": str(master_matrix_log)}
 
 
 @app.get("/api/schedule", response_model=ScheduleConfig)
@@ -639,108 +550,88 @@ async def run_data_merger():
 
 async def _refresh_file_counts_cache():
     """Background task to refresh file counts cache."""
-    global _file_counts_cache, _refresh_in_progress
+    global _file_counts_cache
     
-    async with _file_counts_cache_lock:
-        # Check guard - prevent redundant refresh tasks
-        if _refresh_in_progress:
-            logger.debug("File counts cache refresh already in progress, skipping")
-            return
-        
-        _refresh_in_progress = True
+    t0 = time.perf_counter()
     
-    try:
-        t0 = time.perf_counter()
+    # These paths should match your actual data directories
+    data_raw = QTSW2_ROOT / "data" / "raw"  # Raw CSV files from DataExporter
+    data_translated = QTSW2_ROOT / "data" / "translated"  # Translated Parquet files (translator output)
+    analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
+    
+    # OPTIMIZED: Count files using streaming counter (no list materialization)
+    # This prevents blocking the event loop and uses less memory
+    async def count_files_streaming(pattern: str, directory: Path, exclude_logs: bool = True) -> int:
+        """Count files matching pattern using streaming (no list materialization)."""
+        if not directory.exists():
+            return 0
         
-        # These paths should match your actual data directories
-        data_raw = QTSW2_ROOT / "data" / "raw"  # Raw CSV files from DataExporter
-        data_translated = QTSW2_ROOT / "data" / "translated"  # Translated Parquet files (translator output)
-        analyzer_runs = QTSW2_ROOT / "data" / "analyzer_runs"  # Analyzer output folder
-        
-        # OPTIMIZED: Count files using streaming counter (no list materialization)
-        # This prevents blocking the event loop and uses less memory
-        async def count_files_streaming(pattern: str, directory: Path, exclude_logs: bool = True) -> int:
-            """Count files matching pattern using streaming (no list materialization)."""
-            if not directory.exists():
-                return 0
-            
-            loop = asyncio.get_event_loop()
-            def scan_files():
-                count = 0
-                for file_path in directory.rglob(pattern):
-                    if exclude_logs and "logs" in str(file_path):
-                        continue
-                    count += 1
-                return count
-            return await loop.run_in_executor(None, scan_files)
-        
-        # Count all file types in parallel
-        raw_count, translated_count, analyzed_count = await asyncio.gather(
-            count_files_streaming("*.csv", data_raw, exclude_logs=True),
-            count_files_streaming("*.parquet", data_translated, exclude_logs=False),
-            count_files_streaming("*.parquet", QTSW2_ROOT / "data" / "analyzed", exclude_logs=True)
-        )
-        
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        
-        # Update cache with lock protection
-        async with _file_counts_cache_lock:
-            _file_counts_cache.update({
-                "raw_files": raw_count,
-                "translated_files": translated_count,
-                "analyzed_files": analyzed_count,
-                "computed_at": datetime.now(),
-                "last_duration_ms": duration_ms,
-            })
-            _refresh_in_progress = False
-    except Exception as e:
-        logger.error(f"Error refreshing file counts cache: {e}", exc_info=True)
-        async with _file_counts_cache_lock:
-            _refresh_in_progress = False
+        loop = asyncio.get_event_loop()
+        def scan_files():
+            count = 0
+            for file_path in directory.rglob(pattern):
+                if exclude_logs and "logs" in str(file_path):
+                    continue
+                count += 1
+            return count
+        return await loop.run_in_executor(None, scan_files)
+    
+    # Count all file types in parallel
+    raw_count, translated_count, analyzed_count = await asyncio.gather(
+        count_files_streaming("*.csv", data_raw, exclude_logs=True),
+        count_files_streaming("*.parquet", data_translated, exclude_logs=False),
+        count_files_streaming("*.parquet", QTSW2_ROOT / "data" / "analyzed", exclude_logs=True)
+    )
+    
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    
+    # Update cache
+    _file_counts_cache.update({
+        "raw_files": raw_count,
+        "translated_files": translated_count,
+        "analyzed_files": analyzed_count,
+        "computed_at": datetime.now(),
+        "last_duration_ms": duration_ms,
+    })
     
 
 
 @app.get("/api/metrics/files")
 async def get_file_counts():
     """Get file counts from data directories (cached for fast response)."""
-    global _file_counts_cache, _refresh_in_progress
+    global _file_counts_cache
     
     # ALWAYS return immediately - even if cache is empty (return zeros, refresh in background)
     # This ensures instant response on first request
     
     # Trigger background refresh if cache is stale or doesn't exist
-    async with _file_counts_cache_lock:
-        cache_age = None
-        if _file_counts_cache["computed_at"]:
-            cache_age = (datetime.now() - _file_counts_cache["computed_at"]).total_seconds()
+    cache_age = None
+    if _file_counts_cache["computed_at"]:
+        cache_age = (datetime.now() - _file_counts_cache["computed_at"]).total_seconds()
+    
+    should_refresh = (
+        _file_counts_cache["computed_at"] is None or
+        cache_age is None or
+        cache_age > _file_counts_cache_ttl_seconds
+    )
+    
+    if should_refresh and _file_counts_cache["refresh_task"] is None:
+        # Start background refresh task (don't await - return cached immediately)
+        _file_counts_cache["refresh_task"] = asyncio.create_task(_refresh_file_counts_cache())
         
-        should_refresh = (
-            _file_counts_cache["computed_at"] is None or
-            cache_age is None or
-            cache_age > _file_counts_cache_ttl_seconds
-        )
+        # Clear refresh task reference when done
+        def clear_task(task):
+            if _file_counts_cache["refresh_task"] == task:
+                _file_counts_cache["refresh_task"] = None
         
-        # Use guard to prevent scheduling redundant refresh tasks
-        if should_refresh and _file_counts_cache["refresh_task"] is None and not _refresh_in_progress:
-            # Start background refresh task (don't await - return cached immediately)
-            _file_counts_cache["refresh_task"] = asyncio.create_task(_refresh_file_counts_cache())
-            
-            # Clear refresh task reference when done
-            def clear_task(task):
-                async def clear():
-                    async with _file_counts_cache_lock:
-                        if _file_counts_cache["refresh_task"] == task:
-                            _file_counts_cache["refresh_task"] = None
-                asyncio.create_task(clear())
-            
-            _file_counts_cache["refresh_task"].add_done_callback(clear_task)
-        
-        # Return cached values immediately (even if zeros - cache will update in background)
-        return {
-            "raw_files": _file_counts_cache["raw_files"],
-            "translated_files": _file_counts_cache["translated_files"],
-            "analyzed_files": _file_counts_cache["analyzed_files"]
-        }
+        _file_counts_cache["refresh_task"].add_done_callback(clear_task)
+    
+    # Return cached values immediately (even if zeros - cache will update in background)
+    return {
+        "raw_files": _file_counts_cache["raw_files"],
+        "translated_files": _file_counts_cache["translated_files"],
+        "analyzed_files": _file_counts_cache["analyzed_files"]
+    }
 
 
 # ============================================================
@@ -941,11 +832,7 @@ async def generate_timetable(request: TimetableRequest):
             "execution_file": "data/timetable/timetable_current.json"
         }
     except Exception as e:
-        import traceback
-        error_detail = f"Failed to generate timetable: {str(e)}"
-        logger.error(f"Timetable generation error: {error_detail}", exc_info=True)
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=error_detail)
+        raise HTTPException(status_code=500, detail=f"Failed to generate timetable: {str(e)}")
 
 
 # Matrix endpoints moved to modules.matrix.api router
@@ -1110,7 +997,5 @@ if __name__ == "__main__":
         f.flush()
     
     # Set log level to info so we can see SL calculation logs
-    # Port configuration: Use DASHBOARD_PORT environment variable, default to 8001 for consistency
-    # with batch files and frontend configuration
-    uvicorn.run(app, host="0.0.0.0", port=DASHBOARD_PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 

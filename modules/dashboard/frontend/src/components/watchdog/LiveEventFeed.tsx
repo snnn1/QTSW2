@@ -3,7 +3,7 @@
  * Scrollable list of last ~200 events, sorted by event_seq ASC
  */
 import { memo, useRef, useEffect } from 'react'
-import { formatChicagoDateTime } from '../../utils/timeUtils'
+import { formatChicagoDateTime } from '../../utils/timeUtils.ts'
 import { getEventLevel, extractEventMessage } from '../../utils/eventUtils'
 import type { WatchdogEvent } from '../../types/watchdog'
 

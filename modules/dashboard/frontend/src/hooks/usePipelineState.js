@@ -256,7 +256,10 @@ export function usePipelineState() {
   }, [metrics])
 
   // Phase-1 always-on: Consume events from WebSocket context (singleton at App level)
-  const { events: wsEvents, subscribe: subscribeToWebSocket, isConnected: wsConnected } = useWebSocket()
+  const wsContext = useWebSocket()
+  const wsEvents = wsContext?.events || []
+  const subscribeToWebSocket = wsContext?.subscribe
+  const wsConnected = wsContext?.isConnected || false
 
   // Update pipeline status from backend response
   // Phase-1: Only update state when backend explicitly provides valid data
@@ -555,16 +558,24 @@ export function usePipelineState() {
       }
     }
     
-    // Subscribe to WebSocket events
+    // Subscribe to WebSocket events (if subscribe function is available)
+    if (!subscribeToWebSocket || typeof subscribeToWebSocket !== 'function') {
+      // WebSocket context not ready yet - return no-op cleanup
+      return () => {}
+    }
+    
     const unsubscribe = subscribeToWebSocket(handleEvent)
     
     return () => {
-      unsubscribe()
+      if (unsubscribe && typeof unsubscribe === 'function') {
+        unsubscribe()
+      }
     }
   }, [subscribeToWebSocket, updatePipelineStatus, activeRunId])
   
   // Sync WebSocket events to local state (for EventsLog component)
   useEffect(() => {
+    console.log(`[Events] Syncing ${wsEvents.length} events from WebSocket to UI`)
     setEventsFormatted(wsEvents)
   }, [wsEvents])
 

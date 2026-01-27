@@ -80,15 +80,47 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Request bars asynchronously using callback
                 barsRequest.Request((request, errorCode, errorMessage) =>
                 {
+                    // BINARY TRUTH EVENT: Prove callback path is executed and not exception-swallowed
+                    string? firstCloseTimeUtc = null;
+                    string? lastCloseTimeUtc = null;
+                    int barsCountReceived = 0;
+                    Exception? callbackException = null;
+                    
                     try
                     {
                         if (errorCode == ErrorCode.NoError && request.Bars != null)
                         {
                             barsSeries = request.Bars;
+                            barsCountReceived = barsSeries.Count;
+                            
+                            // Extract first and last bar close times (bars are in UTC)
+                            if (barsCountReceived > 0)
+                            {
+                                try
+                                {
+                                    var firstBarTimeRaw = barsSeries.GetTime(0);
+                                    firstCloseTimeUtc = new DateTimeOffset(DateTime.SpecifyKind(firstBarTimeRaw, DateTimeKind.Utc), TimeSpan.Zero).ToString("o");
+                                }
+                                catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                                {
+                                    // Index 0 may be invalid - ignore
+                                }
+                                
+                                try
+                                {
+                                    var lastBarTimeRaw = barsSeries.GetTime(barsCountReceived - 1);
+                                    lastCloseTimeUtc = new DateTimeOffset(DateTime.SpecifyKind(lastBarTimeRaw, DateTimeKind.Utc), TimeSpan.Zero).ToString("o");
+                                }
+                                catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
+                                {
+                                    // Last index may be invalid - ignore
+                                }
+                            }
                         }
                     }
                     catch (Exception callbackEx)
                     {
+                        callbackException = callbackEx;
                         // Catch any errors in callback (e.g., DateTimeOffset creation issues)
                         // Log callback error if callback provided
                         if (logCallback != null)
@@ -107,6 +139,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     finally
                     {
+                        // Emit BARSREQUEST_CALLBACK_RECEIVED event (binary truth event)
+                        if (logCallback != null)
+                        {
+                            logCallback("BARSREQUEST_CALLBACK_RECEIVED", new
+                            {
+                                execution_instrument = instrument.MasterInstrument.Name,
+                                bars_count_received = barsCountReceived,
+                                first_close_time_utc = firstCloseTimeUtc,
+                                last_close_time_utc = lastCloseTimeUtc,
+                                exception = callbackException?.Message,
+                                error_code = errorCode.ToString(),
+                                error_message = errorMessage
+                            });
+                        }
                         waitHandle.Set();
                     }
                 });
@@ -134,9 +180,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                             if (rawBars > 0)
                             {
                                 // Use GetTime() method to access bar times - wrap in try-catch for safety
+                                // CRITICAL: Bars are already UTC, so create DateTimeOffset directly
                                 try
                                 {
-                                    firstBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(0)).ToString("o");
+                                    var firstBarTimeRaw = barsSeries.GetTime(0);
+                                    firstBarTime = new DateTimeOffset(DateTime.SpecifyKind(firstBarTimeRaw, DateTimeKind.Utc), TimeSpan.Zero).ToString("o");
                                 }
                                 catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
                                 {
@@ -145,7 +193,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 
                                 try
                                 {
-                                    lastBarTime = NinjaTraderExtensions.ConvertBarTimeToUtc(barsSeries.GetTime(rawBars - 1)).ToString("o");
+                                    var lastBarTimeRaw = barsSeries.GetTime(rawBars - 1);
+                                    lastBarTime = new DateTimeOffset(DateTime.SpecifyKind(lastBarTimeRaw, DateTimeKind.Utc), TimeSpan.Zero).ToString("o");
                                 }
                                 catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is IndexOutOfRangeException)
                                 {
@@ -204,17 +253,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Convert NinjaTrader bars to Robot.Core.Bar format
                     // Wrap individual bar access in try-catch to handle sparse collections
                     // Use barsCount (safely retrieved) instead of barsSeries.Count
+                    
+                    // DEFENSIVE: Track close times for assertion
+                    var firstCloseTimeUtc = (DateTimeOffset?)null;
+                    var lastCloseTimeUtc = (DateTimeOffset?)null;
+                    var barsOutsideRange = 0;
+                    
                     for (int i = 0; i < barsCount; i++)
                     {
                         try
                         {
                             // Access bar data using Bars collection methods
-                            var barExchangeTime = barsSeries.GetTime(i); // Exchange time (Chicago, Unspecified kind)
-                            var barUtc = NinjaTraderExtensions.ConvertBarTimeToUtc(barExchangeTime);
+                            var barExchangeTime = barsSeries.GetTime(i); // Exchange time (UTC, Unspecified kind)
                             
-                            // Skip bars outside requested range (compare in UTC)
-                            if (barUtc < startUtcForComparison || barUtc >= endUtcForComparison)
+                            // CRITICAL: Bars from NinjaTrader are already UTC, so create DateTimeOffset directly
+                            // No conversion needed - just specify UTC kind and zero offset
+                            // This represents the CLOSE time of the bar
+                            var barCloseTimeUtc = new DateTimeOffset(DateTime.SpecifyKind(barExchangeTime, DateTimeKind.Utc), TimeSpan.Zero);
+                            
+                            // DEFENSIVE ADMISSION: Only accept bars with CLOSE times in requested range [startUtc, endUtc)
+                            // This is the explicit contract: BarsRequest returns bars with close times in this range
+                            if (barCloseTimeUtc < startUtcForComparison || barCloseTimeUtc >= endUtcForComparison)
+                            {
+                                barsOutsideRange++;
                                 continue;
+                            }
+                            
+                            // Track first and last close times for assertion
+                            if (firstCloseTimeUtc == null || barCloseTimeUtc < firstCloseTimeUtc)
+                                firstCloseTimeUtc = barCloseTimeUtc;
+                            if (lastCloseTimeUtc == null || barCloseTimeUtc > lastCloseTimeUtc)
+                                lastCloseTimeUtc = barCloseTimeUtc;
                             
                             // Get OHLCV data using Bars collection methods
                             var open = (decimal)barsSeries.GetOpen(i);
@@ -223,13 +292,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                             var close = (decimal)barsSeries.GetClose(i);
                             var volume = barsSeries.GetVolume(i);
                             
-                            // Convert bar timestamp from close time to open time (Analyzer parity)
+                            // Convert bar timestamp from CLOSE time to OPEN time (Analyzer parity)
                             // INVARIANT: BarsPeriod == 1 minute (enforced above)
-                            var barUtcOpenTime = barUtc.AddMinutes(-1);
+                            // This conversion is deterministic: close_time - 1min = open_time
+                            var barUtcOpenTime = barCloseTimeUtc.AddMinutes(-1);
                             
-                            // Create CoreBar struct
+                            // Create CoreBar struct with OPEN time
                             var bar = new CoreBar(
-                                timestampUtc: barUtcOpenTime,  // Use open time instead of close time
+                                timestampUtc: barUtcOpenTime,  // OPEN time (converted from close time)
                                 open: open,
                                 high: high,
                                 low: low,
@@ -245,6 +315,54 @@ namespace NinjaTrader.NinjaScript.Strategies
                             continue;
                         }
                     }
+                    
+                    // ASSERTION: Verify returned close times are exactly within requested range
+                    // This ensures determinism and auditability
+                    if (bars.Count > 0)
+                    {
+                        // Assert: First bar close time >= requested start
+                        if (firstCloseTimeUtc.HasValue && firstCloseTimeUtc.Value < startUtcForComparison)
+                        {
+                            var errorMsg = $"ASSERTION FAILED: First bar close time {firstCloseTimeUtc.Value:o} is before requested start {startUtcForComparison:o}";
+                            if (logCallback != null)
+                            {
+                                try { logCallback("BARSREQUEST_ASSERTION_FAILED", new Dictionary<string, object> { { "error", errorMsg } }); }
+                                catch { }
+                            }
+                            throw new InvalidOperationException(errorMsg);
+                        }
+                        
+                        // Assert: Last bar close time < requested end (exclusive)
+                        if (lastCloseTimeUtc.HasValue && lastCloseTimeUtc.Value >= endUtcForComparison)
+                        {
+                            var errorMsg = $"ASSERTION FAILED: Last bar close time {lastCloseTimeUtc.Value:o} is at or after requested end {endUtcForComparison:o}";
+                            if (logCallback != null)
+                            {
+                                try { logCallback("BARSREQUEST_ASSERTION_FAILED", new Dictionary<string, object> { { "error", errorMsg } }); }
+                                catch { }
+                            }
+                            throw new InvalidOperationException(errorMsg);
+                        }
+                        
+                        // Log assertion success for auditability
+                        if (logCallback != null)
+                        {
+                            try
+                            {
+                                logCallback("BARSREQUEST_CLOSE_TIME_VERIFIED", new Dictionary<string, object>
+                                {
+                                    { "bars_returned", bars.Count },
+                                    { "bars_filtered_out", barsOutsideRange },
+                                    { "first_close_time_utc", firstCloseTimeUtc.Value.ToString("o") },
+                                    { "last_close_time_utc", lastCloseTimeUtc.Value.ToString("o") },
+                                    { "requested_start_utc", startUtcForComparison.ToString("o") },
+                                    { "requested_end_utc", endUtcForComparison.ToString("o") },
+                                    { "assertion_passed", true }
+                                });
+                            }
+                            catch { }
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -258,14 +376,27 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         /// <summary>
         /// Request historical bars for a trading date range.
+        /// 
+        /// SEMANTICS (CRITICAL):
+        /// - Inputs (rangeStartChicago, slotTimeChicago) specify desired OPEN times
+        /// - NinjaTrader BarsRequest operates on CLOSE times
+        /// - We convert CLOSE time → OPEN time by subtracting 1 minute
+        /// 
+        /// REQUEST LOGIC:
+        /// - To get OPEN times [rangeStart, slotTime), we request CLOSE times [rangeStart+1min, slotTime+1min)
+        /// - This ensures: close_time - 1min = open_time yields exactly [rangeStart, slotTime) open times
+        /// 
+        /// ASSERTIONS:
+        /// - Returned bars are verified to have close times within requested range
+        /// - Admission logic filters defensively to ensure exactness
         /// </summary>
         /// <param name="instrument">NinjaTrader instrument</param>
         /// <param name="tradingDate">Trading date (Chicago time)</param>
-        /// <param name="rangeStartChicago">Range start time (Chicago time, e.g., "07:30")</param>
-        /// <param name="slotTimeChicago">Slot time (Chicago time, e.g., "09:00")</param>
+        /// <param name="rangeStartChicago">Desired OPEN time start (Chicago time, e.g., "08:00")</param>
+        /// <param name="slotTimeChicago">Desired OPEN time end (Chicago time, e.g., "11:00") - exclusive</param>
         /// <param name="timeService">TimeService for timezone conversions</param>
         /// <param name="logCallback">Optional callback for logging events</param>
-        /// <returns>List of bars in chronological order</returns>
+        /// <returns>List of bars in chronological order, with OPEN times in [rangeStart, slotTime)</returns>
         public static List<CoreBar> RequestBarsForTradingDate(
             Instrument instrument,
             QTSW2.Robot.Core.DateOnly tradingDate,
@@ -274,16 +405,41 @@ namespace NinjaTrader.NinjaScript.Strategies
             QTSW2.Robot.Core.TimeService timeService,
             Action<string, object>? logCallback = null)
         {
-            // Construct Chicago times for the trading date
-            var rangeStartChicagoTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
-            var slotTimeChicagoTime = timeService.ConstructChicagoTime(tradingDate, slotTimeChicago);
+            // STEP 1: Construct desired OPEN time boundaries (Chicago time)
+            var desiredOpenStartChicagoTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
+            var desiredOpenEndChicagoTime = timeService.ConstructChicagoTime(tradingDate, slotTimeChicago);
             
-            // Extract DateTime (already Unspecified kind) - BarsRequest wants Chicago local time, no offsets
-            var rangeStartLocal = rangeStartChicagoTime.DateTime; // Already Unspecified kind from ConstructChicagoTime
-            var slotTimeLocal = slotTimeChicagoTime.DateTime; // Already Unspecified kind from ConstructChicagoTime
+            // STEP 2: Convert to CLOSE time request boundaries
+            // NinjaTrader timestamps bars at CLOSE time, so we shift by +1 minute
+            // Request CLOSE times [desiredOpenStart+1min, desiredOpenEnd+1min)
+            // After conversion (close - 1min), we get OPEN times [desiredOpenStart, desiredOpenEnd)
+            var requestCloseStartChicagoTime = desiredOpenStartChicagoTime.AddMinutes(1);
+            var requestCloseEndChicagoTime = desiredOpenEndChicagoTime.AddMinutes(1);
             
-            // Request bars directly with Chicago local DateTime - no UTC conversion needed
-            return RequestHistoricalBars(instrument, rangeStartLocal, slotTimeLocal, barSizeMinutes: 1, logCallback: logCallback);
+            // STEP 3: Extract DateTime for BarsRequest (Chicago local time, Unspecified kind)
+            var requestCloseStartLocal = requestCloseStartChicagoTime.DateTime;
+            var requestCloseEndLocal = requestCloseEndChicagoTime.DateTime;
+            
+            // STEP 4: Request bars with CLOSE time boundaries
+            // Log the explicit CLOSE time request for auditability
+            if (logCallback != null)
+            {
+                try
+                {
+                    logCallback("BARSREQUEST_CLOSE_TIME_BOUNDARIES", new Dictionary<string, object>
+                    {
+                        { "desired_open_start_chicago", desiredOpenStartChicagoTime.ToString("o") },
+                        { "desired_open_end_chicago", desiredOpenEndChicagoTime.ToString("o") },
+                        { "request_close_start_chicago", requestCloseStartChicagoTime.ToString("o") },
+                        { "request_close_end_chicago", requestCloseEndChicagoTime.ToString("o") },
+                        { "note", "BarsRequest operates on CLOSE times; will convert to OPEN times by subtracting 1 minute" }
+                    });
+                }
+                catch { /* Log callback optional */ }
+            }
+            
+            // Request bars with explicit CLOSE time range
+            return RequestHistoricalBars(instrument, requestCloseStartLocal, requestCloseEndLocal, barSizeMinutes: 1, logCallback: logCallback);
         }
     }
 }

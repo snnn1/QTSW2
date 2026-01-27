@@ -10,7 +10,6 @@
  */
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { WebSocketProvider } from './contexts/WebSocketContext'
-import { WatchdogPage } from './pages/WatchdogPage'
 import { JournalPage } from './pages/JournalPage'
 import { SummaryPage } from './pages/SummaryPage'
 import { PipelinePage } from './pages/PipelinePage'
@@ -22,7 +21,6 @@ function App() {
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Navigate to="/pipeline" replace />} />
-          <Route path="/watchdog" element={<WatchdogPage />} />
           <Route path="/journal" element={<JournalPage />} />
           <Route path="/summary" element={<SummaryPage />} />
           <Route path="/pipeline" element={<PipelinePage />} />

@@ -10,23 +10,6 @@ import time
 import json
 from pathlib import Path
 
-# Import configuration constants
-try:
-    from ..config import (
-        SNAPSHOT_MAX_EVENTS,
-        SNAPSHOT_WINDOW_HOURS,
-        SNAPSHOT_CHUNK_SIZE,
-        SNAPSHOT_LOAD_TIMEOUT,
-    )
-except ImportError:
-    # Fallback if import fails
-    from config import (
-        SNAPSHOT_MAX_EVENTS,
-        SNAPSHOT_WINDOW_HOURS,
-        SNAPSHOT_CHUNK_SIZE,
-        SNAPSHOT_LOAD_TIMEOUT,
-    )
-
 # Lazy import to avoid circular dependency - only import when needed
 def get_orchestrator():
     """Get orchestrator instance with lazy import to avoid circular dependencies."""
@@ -98,23 +81,15 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 logger.error(f"[WebSocket] Orchestrator or event_bus not available for snapshot ({client_info})")
                 return
             
-            # Snapshot: configurable window and max events
+            # Snapshot: last 4 hours, max 100 events (UI already caps to 100)
             # Pull from cached snapshot (threaded) so it returns instantly if fresh
-            # Add timeout to prevent snapshot loading from hanging
-            try:
-                historical_events = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        orchestrator.event_bus.get_snapshot_cached,
-                        SNAPSHOT_WINDOW_HOURS,
-                        SNAPSHOT_MAX_EVENTS,
-                        True,
-                        orchestrator.event_bus._snapshot_cache_ttl_seconds,
-                    ),
-                    timeout=SNAPSHOT_LOAD_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"[WebSocket] Snapshot loading timed out after {SNAPSHOT_LOAD_TIMEOUT}s ({client_info})")
-                return
+            historical_events = await asyncio.to_thread(
+                orchestrator.event_bus.get_snapshot_cached,
+                4.0,
+                100,
+                True,
+                orchestrator.event_bus._snapshot_cache_ttl_seconds,
+            )
             # Filter by run_id if provided
             if run_id:
                 historical_events = [
@@ -125,10 +100,10 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
             # Only send snapshot if we have events; trim to cap if oversized
             if historical_events and len(historical_events) > 0:
                 logger.info(f"[WebSocket] Snapshot loaded: {len(historical_events)} events found ({client_info})")
-                if len(historical_events) > SNAPSHOT_MAX_EVENTS:
-                    # Keep most recent events up to max
-                    historical_events = historical_events[-SNAPSHOT_MAX_EVENTS:]
-                    logger.info(f"[WebSocket] Snapshot oversized -> trimmed to {SNAPSHOT_MAX_EVENTS} events ({client_info})")
+                if len(historical_events) > 100:
+                    # Keep most recent 100 events
+                    historical_events = historical_events[-100:]
+                    logger.info(f"[WebSocket] Snapshot oversized -> trimmed to 100 events ({client_info})")
                 
                 logger.info(f"[WebSocket] Starting to send snapshot: {len(historical_events)} events in chunks ({client_info})")
 
@@ -136,17 +111,17 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 historical_events = list(reversed(historical_events))
 
                 # Stream snapshot in chunks to keep UI responsive
-                # Chunk size configured for optimal performance
-                chunk_size = SNAPSHOT_CHUNK_SIZE
+                # Increased chunk size from 5 to 25 for better performance (100 events max = 4 chunks)
+                chunk_size = 25
                 total_events = len(historical_events)
                 total_chunks = (total_events + chunk_size - 1) // chunk_size
 
                 if websocket.client_state == WebSocketState.CONNECTED:
                     logger.info(f"[WebSocket] WebSocket connected, sending {total_chunks} chunks ({client_info})")
                     for idx in range(total_chunks):
-                        # Check connection state before each chunk - cancel if disconnected
+                        # Check connection state before each chunk
                         if websocket.client_state != WebSocketState.CONNECTED:
-                            logger.info(f"[WebSocket] Connection closed during snapshot send, cancelling remaining chunks ({client_info})")
+                            logger.info(f"[WebSocket] Connection closed during snapshot send ({client_info})")
                             break
                         
                         chunk = historical_events[idx * chunk_size:(idx + 1) * chunk_size]
@@ -155,8 +130,8 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                         try:
                             await websocket.send_json({
                                 "type": "snapshot_chunk",
-                                "window_hours": SNAPSHOT_WINDOW_HOURS,
-                                "max_events": SNAPSHOT_MAX_EVENTS,
+                                "window_hours": 4.0,
+                                "max_events": 100,
                                 "chunk_index": idx,
                                 "total_chunks": total_chunks,
                                 "events": chunk,
@@ -164,11 +139,6 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                             # Small delay between chunks to keep UI responsive
                             await asyncio.sleep(0.05)  # Reduced from 0.1s since chunks are larger
                         except Exception as chunk_err:
-                            # Check if error is due to disconnection
-                            error_msg = str(chunk_err).lower()
-                            if "not connected" in error_msg or "closed" in error_msg or "disconnect" in error_msg:
-                                logger.info(f"[WebSocket] Connection closed while sending chunk {idx}/{total_chunks}, cancelling ({client_info})")
-                                break
                             logger.error(f"[WebSocket] Error sending chunk {idx}/{total_chunks}: {chunk_err} ({client_info})")
                             break
                     
@@ -177,8 +147,8 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                         try:
                             await websocket.send_json({
                                 "type": "snapshot_done",
-                                "window_hours": SNAPSHOT_WINDOW_HOURS,
-                                "max_events": SNAPSHOT_MAX_EVENTS,
+                                "window_hours": 4.0,
+                                "max_events": 100,
                                 "total_events": total_events,
                                 "total_chunks": total_chunks,
                             })

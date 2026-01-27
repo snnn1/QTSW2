@@ -1063,7 +1063,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Validate bar falls within trading session window for active trading date
         // Session window: [previous_day session_start CST, trading_date 16:00 CST)
         // This replaces calendar date comparison which was invalid for futures (session starts evening before)
-        var (sessionStartChicago, sessionEndChicago) = GetSessionWindow(_activeTradingDate.Value, instrument);
+        // PHASE 3: Use canonical instrument for session window lookup (session windows are per canonical market)
+        var canonicalInstrumentForSession = GetCanonicalInstrument(instrument);
+        var (sessionStartChicago, sessionEndChicago) = GetSessionWindow(_activeTradingDate.Value, canonicalInstrumentForSession);
         
         // CRITICAL FIX: Allow historical bars from dates before the trading date
         // Bars from dates before the trading date are historical data and should be accepted
@@ -1450,6 +1452,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     /// <param name="instrument">Instrument name</param>
     /// <returns>Session start time in HH:MM format</returns>
+    /// <summary>
+    /// PHASE 3: Get canonical instrument for a given execution instrument.
+    /// Maps micro futures (MES, MNQ, MYM, etc.) to their base instruments (ES, NQ, YM, etc.).
+    /// Returns execution instrument unchanged if not a micro or if spec is unavailable.
+    /// </summary>
+    private string GetCanonicalInstrument(string executionInstrument)
+    {
+        if (_spec != null &&
+            _spec.TryGetInstrument(executionInstrument, out var inst) &&
+            inst.is_micro &&
+            !string.IsNullOrWhiteSpace(inst.base_instrument))
+        {
+            return inst.base_instrument.ToUpperInvariant(); // MYM → YM
+        }
+
+        return executionInstrument.ToUpperInvariant(); // YM → YM
+    }
+    
     private string GetSessionStartTime(string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument))
@@ -1523,6 +1543,38 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         lock (_engineLock)
         {
+            // BINARY TRUTH EVENT: Prove LoadPreHydrationBars is called and show matching results
+            // Count matching streams before any early returns or filtering
+            var matchingStreams = new List<StreamStateMachine>();
+            var enabledStreamsTotal = 0;
+            string? canonicalOfInstrument = null;
+            
+            if (_spec != null && _time != null && bars != null && bars.Count > 0 && _streams.Count > 0)
+            {
+                canonicalOfInstrument = GetCanonicalInstrument(instrument);
+                enabledStreamsTotal = _streams.Values.Count(s => !s.Committed);
+                
+                // Count streams that match this instrument via IsSameInstrument
+                foreach (var stream in _streams.Values)
+                {
+                    if (stream.IsSameInstrument(instrument))
+                    {
+                        matchingStreams.Add(stream);
+                    }
+                }
+            }
+            
+            // Emit LOADPREHYDRATIONBARS_ENTERED event (always, even if early return)
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "LOADPREHYDRATIONBARS_ENTERED", state: "ENGINE",
+                new
+                {
+                    instrumentName = instrument,
+                    bars_count_input = bars?.Count ?? 0,
+                    streams_matched_count = matchingStreams.Count,
+                    enabled_streams_total = enabledStreamsTotal,
+                    canonical_of_instrument = canonicalOfInstrument ?? "N/A"
+                }));
+            
             if (_spec is null || _time is null) return;
             if (bars == null || bars.Count == 0) return;
 
@@ -2851,22 +2903,156 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         lock (_engineLock)
         {
-            if (_spec is null || _time is null || !_activeTradingDate.HasValue) return false;
+            if (_spec is null || _time is null || !_activeTradingDate.HasValue)
+            {
+                // Diagnostic logging for readiness check failure
+                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, eventType: "ARESTREAMSREADY_DECISION", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument = instrument,
+                        canonical_of_execution = GetCanonicalInstrument(instrument),
+                        result = false,
+                        reasons = new[] { "SPEC_NULL_OR_TIME_NULL_OR_NO_TRADING_DATE" }
+                    }));
+                return false;
+            }
 
-            var instrumentUpper = instrument.ToUpperInvariant();
-            var allStreamsForInstrument = _streams.Values
-                .Where(s => s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+            // FIXED CONTRACT: Use canonical-matched streams for BarsRequest readiness
+            // Get canonical of execution instrument (e.g., MCL → CL)
+            var canonicalOfExecution = GetCanonicalInstrument(instrument);
+            
+            // Match streams where stream.CanonicalInstrument equals canonical of execution instrument
+            // This ensures AreStreamsReadyForInstrument("MCL") matches CL streams
+            var allStreams = _streams.Values.ToList();
+            var allStreamsForInstrument = allStreams
+                .Where(s => string.Equals(s.CanonicalInstrument, canonicalOfExecution, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
-            if (allStreamsForInstrument.Count == 0) return false;
+            var matchedStreamIds = allStreamsForInstrument.Select(s => s.Stream).ToList();
+            
+            if (allStreamsForInstrument.Count == 0)
+            {
+                // Diagnostic logging for no matched streams
+                var reasons = new List<string> { "NO_MATCHED_STREAMS" };
+                if (allStreams.Count == 0) reasons.Add("NO_STREAMS_EXIST");
+                else if (allStreams.All(s => s.Committed)) reasons.Add("ALL_STREAMS_COMMITTED");
+                
+                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, eventType: "ARESTREAMSREADY_DECISION", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument = instrument,
+                        canonical_of_execution = canonicalOfExecution,
+                        enabled_streams_considered = allStreams.Count,
+                        matched_streams_count = 0,
+                        matched_stream_ids = new string[0],
+                        result = false,
+                        reasons = reasons.ToArray()
+                    }));
+                return false;
+            }
 
             // Check if at least one stream is enabled (not committed)
             var enabledStreams = allStreamsForInstrument
                 .Where(s => !s.Committed)
                 .ToList();
 
-            return enabledStreams.Count > 0;
+            var result = enabledStreams.Count > 0;
+            
+            // Diagnostic logging for readiness decision
+            var resultReasons = new List<string>();
+            if (!result)
+            {
+                resultReasons.Add("ALL_MATCHED_STREAMS_COMMITTED");
+            }
+            
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString, eventType: "ARESTREAMSREADY_DECISION", state: "ENGINE",
+                new
+                {
+                    execution_instrument = instrument,
+                    canonical_of_execution = canonicalOfExecution,
+                    enabled_streams_considered = allStreams.Count,
+                    matched_streams_count = allStreamsForInstrument.Count,
+                    matched_stream_ids = matchedStreamIds,
+                    result = result,
+                    reasons = resultReasons.ToArray()
+                }));
+
+            return result;
         }
+    }
+
+    /// <summary>
+    /// Get all unique execution instruments from enabled streams.
+    /// Used to determine which instruments need BarsRequest for pre-hydration.
+    /// CRITICAL: Maps base instruments (YM, CL) to micro futures (MYM, MCL) for BarsRequest.
+    /// </summary>
+    public List<string> GetAllExecutionInstrumentsForBarsRequest()
+    {
+        lock (_engineLock)
+        {
+            if (_spec is null || _time is null || !_activeTradingDate.HasValue) return new List<string>();
+
+            // Get all enabled streams (not committed)
+            var enabledStreams = _streams.Values
+                .Where(s => !s.Committed)
+                .ToList();
+
+            // Extract unique execution instruments from streams
+            var executionInstruments = enabledStreams
+                .Where(s => !string.IsNullOrEmpty(s.ExecutionInstrument))
+                .Select(s => s.ExecutionInstrument.ToUpperInvariant())
+                .Distinct()
+                .ToList();
+
+            // CRITICAL: Map base instruments to micro futures for BarsRequest
+            // If stream has ExecutionInstrument = YM, we need to request MYM bars
+            // If stream has ExecutionInstrument = CL, we need to request MCL bars
+            var barsRequestInstruments = new List<string>();
+            foreach (var execInst in executionInstruments)
+            {
+                // Check if this is already a micro future
+                var microFuture = GetMicroFutureForBaseInstrument(execInst);
+                if (!string.IsNullOrEmpty(microFuture))
+                {
+                    barsRequestInstruments.Add(microFuture);
+                }
+                else
+                {
+                    // Not a base instrument that maps to micro, use as-is (e.g., already a micro or no mapping)
+                    barsRequestInstruments.Add(execInst);
+                }
+            }
+
+            return barsRequestInstruments
+                .Distinct()
+                .OrderBy(i => i)
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Maps base instruments to their micro future equivalents for BarsRequest.
+    /// Returns micro future if available, otherwise returns null.
+    /// </summary>
+    private string? GetMicroFutureForBaseInstrument(string baseInstrument)
+    {
+        if (_spec?.instruments == null) return null;
+
+        var baseInstUpper = baseInstrument.ToUpperInvariant();
+        
+        // Look for a micro future that maps to this base instrument
+        foreach (var kvp in _spec.instruments)
+        {
+            var inst = kvp.Value;
+            if (inst.is_micro && 
+                !string.IsNullOrWhiteSpace(inst.base_instrument) &&
+                inst.base_instrument.ToUpperInvariant() == baseInstUpper)
+            {
+                return kvp.Key.ToUpperInvariant(); // Return micro future name (e.g., MYM, MCL)
+            }
+        }
+
+        return null; // No micro future found for this base instrument
     }
 
     public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
@@ -2878,9 +3064,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var instrumentUpper = instrument.ToUpperInvariant();
             var utcNow = DateTimeOffset.UtcNow;
 
+            // PHASE 3: Use IsSameInstrument() to handle canonical mapping (e.g., MNQ → NQ)
             // Log all streams for this instrument for diagnostics
             var allStreamsForInstrument = _streams.Values
-                .Where(s => s.Instrument.Equals(instrumentUpper, StringComparison.OrdinalIgnoreCase))
+                .Where(s => s.IsSameInstrument(instrument))
                 .ToList();
 
             if (allStreamsForInstrument.Count == 0)
@@ -2929,72 +3116,74 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 return null;
             }
 
-            // Find earliest range_start across all sessions used by enabled streams
+            // CRITICAL FIX: Find the union of all [range_start, slot_time) windows for all enabled streams
+            // Previous logic incorrectly mixed earliest range_start with latest slot_time from different sessions
+            // This caused bars to be requested for wrong time windows (e.g., 02:00-09:30 instead of 08:00-11:00)
+            
             var sessionsUsed = enabledStreams.Select(s => s.Session).Distinct().ToList();
-            string? earliestRangeStart = null;
             var sessionRangeStarts = new Dictionary<string, string>();
+            var streamWindows = new List<(string rangeStart, string slotTime, string streamId, string session)>();
 
-            foreach (var session in sessionsUsed)
+            // Build list of [range_start, slot_time) windows for each enabled stream
+            foreach (var stream in enabledStreams)
             {
-                if (_spec.sessions.TryGetValue(session, out var sessionInfo))
+                if (_spec.sessions.TryGetValue(stream.Session, out var sessionInfo))
                 {
                     var rangeStart = sessionInfo.range_start_time;
-                    if (!string.IsNullOrWhiteSpace(rangeStart))
+                    var slotTime = stream.SlotTimeChicago;
+                    
+                    if (!string.IsNullOrWhiteSpace(rangeStart) && !string.IsNullOrWhiteSpace(slotTime))
                     {
-                        sessionRangeStarts[session] = rangeStart;
-                        if (earliestRangeStart == null || string.Compare(rangeStart, earliestRangeStart, StringComparison.Ordinal) < 0)
-                        {
-                            earliestRangeStart = rangeStart;
-                        }
+                        sessionRangeStarts[stream.Session] = rangeStart;
+                        streamWindows.Add((rangeStart, slotTime, stream.Stream, stream.Session));
                     }
                 }
             }
-        
-        if (string.IsNullOrWhiteSpace(earliestRangeStart))
-        {
-            LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+            
+            if (streamWindows.Count == 0)
+            {
+                LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                {
+                    instrument = instrumentUpper,
+                    result = "NO_VALID_WINDOWS_FOUND",
+                    enabled_streams = enabledStreams.Count,
+                    sessions_used = sessionsUsed,
+                    note = "No valid [range_start, slot_time) windows found for enabled streams"
+                });
+                return null;
+            }
+            
+            // Find the union: earliest range_start and latest slot_time across all windows
+            // This ensures we request bars covering all streams' needs
+            var earliestRangeStart = streamWindows
+                .Select(w => w.rangeStart)
+                .OrderBy(rs => rs, StringComparer.Ordinal)
+                .First();
+            
+            var latestSlotTime = streamWindows
+                .Select(w => w.slotTime)
+                .OrderByDescending(st => st, StringComparer.Ordinal)
+                .First();
+            
+            // Log successful range determination with stream details
+            LogEngineEvent(utcNow, "BARSREQUEST_RANGE_DETERMINED", new
             {
                 instrument = instrumentUpper,
-                result = "NO_RANGE_START_FOUND",
-                enabled_streams = enabledStreams.Count,
+                earliest_range_start = earliestRangeStart,
+                latest_slot_time = latestSlotTime,
+                enabled_stream_count = enabledStreams.Count,
                 sessions_used = sessionsUsed,
-                note = "No range_start_time found in session definitions"
+                session_range_starts = sessionRangeStarts,
+                stream_windows = streamWindows.Select(w => new { 
+                    stream_id = w.streamId, 
+                    session = w.session, 
+                    range_start = w.rangeStart,
+                    slot_time = w.slotTime 
+                }).ToList(),
+                note = "Union of all stream windows - ensures bars cover all enabled streams"
             });
-            return null;
-        }
-        
-        // Find latest slot_time across all enabled streams
-        var latestSlotTime = enabledStreams
-            .Select(s => s.SlotTimeChicago)
-            .Where(st => !string.IsNullOrWhiteSpace(st))
-            .OrderByDescending(st => st, StringComparer.Ordinal)
-            .FirstOrDefault();
-        
-        if (string.IsNullOrWhiteSpace(latestSlotTime))
-        {
-            LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
-            {
-                instrument = instrumentUpper,
-                result = "NO_SLOT_TIME_FOUND",
-                enabled_streams = enabledStreams.Count,
-                note = "No valid slot_time found in enabled streams"
-            });
-            return null;
-        }
-        
-        // Log successful range determination
-        LogEngineEvent(utcNow, "BARSREQUEST_RANGE_DETERMINED", new
-        {
-            instrument = instrumentUpper,
-            earliest_range_start = earliestRangeStart,
-            latest_slot_time = latestSlotTime,
-            enabled_stream_count = enabledStreams.Count,
-            sessions_used = sessionsUsed,
-            session_range_starts = sessionRangeStarts,
-            stream_slot_times = enabledStreams.Select(s => new { stream_id = s.Stream, session = s.Session, slot_time = s.SlotTimeChicago }).ToList()
-        });
-        
-        return (earliestRangeStart!, latestSlotTime);
+            
+            return (earliestRangeStart, latestSlotTime);
         }
     }
 }

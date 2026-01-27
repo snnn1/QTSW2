@@ -44,6 +44,11 @@ public sealed class HealthMonitor
     private DateTimeOffset _lastEvaluateUtc = DateTimeOffset.MinValue;
     private const int EVALUATE_RATE_LIMIT_SECONDS = 1; // Max 1 evaluation per second
     
+    // Emergency notification rate limiting: track last notification time per event type (not per run_id)
+    // This prevents spam when the same critical event happens across multiple engine runs
+    private readonly Dictionary<string, DateTimeOffset> _lastEmergencyNotifyUtcByEventType = new(StringComparer.OrdinalIgnoreCase);
+    private const int EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS = 300; // 5 minutes between emergency notifications of same type
+    
     // Critical event notification tracking: one notification per (eventType, run_id)
     // Key format: "{eventType}:{run_id}" where run_id defaults to trading_date if not provided
     private readonly HashSet<string> _criticalNotificationsSent = new(StringComparer.OrdinalIgnoreCase);
@@ -511,19 +516,57 @@ public sealed class HealthMonitor
             }
         }
 
-        // Decide + mark sent under lock (thread-safe)
+        // Emergency notification rate limiting: check if we've sent this event type recently
+        // This prevents spam when the same critical event happens across multiple engine runs
+        var utcNow = DateTimeOffset.UtcNow;
+        bool shouldSendEmergencyNotification = true;
+        
         lock (_notifyLock)
         {
+            if (_lastEmergencyNotifyUtcByEventType.TryGetValue(eventType, out var lastEmergencyNotify))
+            {
+                var timeSinceLastEmergencyNotify = (utcNow - lastEmergencyNotify).TotalSeconds;
+                if (timeSinceLastEmergencyNotify < EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS)
+                {
+                    shouldSendEmergencyNotification = false;
+                }
+            }
+            
+            // Check dedupe key (per run_id) - still prevent duplicate notifications for same run_id
             if (_criticalNotificationsSent.Contains(dedupeKey))
                 return;
             _criticalNotificationsSent.Add(dedupeKey);
+            
+            // Update emergency notification timestamp if we're going to send
+            if (shouldSendEmergencyNotification)
+            {
+                _lastEmergencyNotifyUtcByEventType[eventType] = utcNow;
+            }
+        }
+        
+        // Skip notification if rate limited
+        if (!shouldSendEmergencyNotification)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "CRITICAL_NOTIFICATION_SKIPPED", state: "ENGINE",
+                new
+                {
+                    event_type = eventType,
+                    run_id = _runId,
+                    dedupe_key = dedupeKey,
+                    reason = "EMERGENCY_RATE_LIMIT",
+                    min_interval_seconds = EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS,
+                    note = $"Emergency notification rate limited - same event type notified within {EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS}s"
+                }));
+            return;
         }
         
         // Build notification message from payload
         var title = eventType.Replace("_", " ");
         var message = BuildCriticalEventMessage(eventType, payload);
         
-        // Send notification: Emergency priority (2), immediate enqueue (skip rate limit)
+        // Send notification: Emergency priority (2)
+        // Note: Emergency rate limiting is already handled above, so we can skip the regular rate limit
+        // to avoid double-checking (we've already ensured 5 minutes have passed for this event type)
         SendNotification(dedupeKey, title, message, priority: 2, skipRateLimit: true);
         
         // Log that critical event was reported

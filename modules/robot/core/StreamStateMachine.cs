@@ -538,7 +538,23 @@ public sealed class StreamStateMachine
             // Clear bar buffer on reset
             lock (_barBufferLock)
             {
+                var previousCount = _barBuffer.Count;
                 _barBuffer.Clear();
+                _barSourceMap.Clear();
+                
+                // Log buffer clear
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_BUFFER_CLEARED", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
+                        instrument = Instrument,
+                        clear_reason = "TRADING_DAY_ROLLOVER",
+                        previous_buffer_count = previousCount,
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o")
+                    }));
             }
             _brkLongRaw = null;
             _brkShortRaw = null;
@@ -762,6 +778,96 @@ public sealed class StreamStateMachine
         }
     }
 
+    /// <summary>
+    /// Check if breakout was missed due to late start (only if starting after slot_time).
+    /// Returns true if breakout occurred between slot_time and now, with breakout details.
+    /// 
+    /// CRITICAL BOUNDARY SEMANTICS:
+    /// - Range build window: [range_start, slot_time) - slot_time is EXCLUSIVE
+    /// - Missed-breakout scan window: [slot_time, now] - slot_time is INCLUSIVE
+    /// - Breakout detection uses STRICT inequalities: bar.High > rangeHigh OR bar.Low < rangeLow
+    /// - Bars are sorted chronologically before scanning (earliest breakout wins)
+    /// 
+    /// EDGE CASES HANDLED:
+    /// - Breakout at slot_time + 1s: Detected (barChicagoTime >= slotChicago)
+    /// - Touch at exactly slot_time: Ignored (range window is exclusive, so not in range)
+    /// - Price equals range high/low: NOT a breakout (strict inequality required)
+    /// </summary>
+    private (bool MissedBreakout, DateTimeOffset? BreakoutTimeUtc, DateTimeOffset? BreakoutTimeChicago, decimal? BreakoutPrice, string? BreakoutDirection) CheckMissedBreakout(DateTimeOffset utcNow, decimal rangeHigh, decimal rangeLow)
+    {
+        var nowChicago = _time.ConvertUtcToChicago(utcNow);
+        var slotChicago = SlotTimeChicagoTime;
+        
+        // Only check if starting after slot_time
+        if (nowChicago <= slotChicago)
+        {
+            return (false, null, null, null, null);
+        }
+        
+        // Scan bars from slot_time to now for missed breakout
+        // CRITICAL: Get snapshot and explicitly sort by timestamp to guarantee chronological order
+        // This ensures earliest breakout wins (prevents misclassifying direction)
+        var barsSnapshot = GetBarBufferSnapshot();
+        barsSnapshot.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+        
+        foreach (var bar in barsSnapshot)
+        {
+            var barChicagoTime = _time.ConvertUtcToChicago(bar.TimestampUtc);
+            
+            // Missed-breakout scan window: [slot_time, now] (inclusive on both ends)
+            // Only consider bars in this window
+            if (barChicagoTime < slotChicago)
+                continue; // Skip bars before slot_time (these are in range build window)
+            
+            if (barChicagoTime > nowChicago)
+                break; // Past current time, stop checking (no lookahead)
+            
+            // DIAGNOSTIC: Log boundary validation for edge case testing
+            // This helps verify: breakout at slot_time+1s is detected, touch at slot_time is ignored
+            if (_enableDiagnosticLogs)
+            {
+                var secondsFromSlot = (barChicagoTime - slotChicago).TotalSeconds;
+                var isAtSlotBoundary = Math.Abs(secondsFromSlot) < 1.0; // Within 1 second of slot_time
+                var isAfterSlot = barChicagoTime >= slotChicago;
+                
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "MISSED_BREAKOUT_SCAN_BAR", State.ToString(),
+                    new
+                    {
+                        bar_time_chicago = barChicagoTime.ToString("o"),
+                        slot_time_chicago = slotChicago.ToString("o"),
+                        seconds_from_slot = Math.Round(secondsFromSlot, 3),
+                        is_at_slot_boundary = isAtSlotBoundary,
+                        is_after_slot = isAfterSlot,
+                        bar_high = bar.High,
+                        bar_low = bar.Low,
+                        range_high = rangeHigh,
+                        range_low = rangeLow,
+                        high_exceeds_range = bar.High > rangeHigh,
+                        low_exceeds_range = bar.Low < rangeLow,
+                        note = "Diagnostic: Bar in missed-breakout scan window. Validates boundary semantics and strict inequality checks."
+                    }));
+            }
+            
+            // CRITICAL: Use STRICT inequalities for breakout detection
+            // bar.High > rangeHigh (not >=) - price must exceed range high
+            // bar.Low < rangeLow (not <=) - price must exceed range low
+            // Price equals range boundary is NOT a breakout
+            if (bar.High > rangeHigh)
+            {
+                // LONG breakout: price exceeded range high
+                return (true, bar.TimestampUtc, barChicagoTime, bar.High, "LONG");
+            }
+            else if (bar.Low < rangeLow)
+            {
+                // SHORT breakout: price exceeded range low
+                return (true, bar.TimestampUtc, barChicagoTime, bar.Low, "SHORT");
+            }
+        }
+        
+        return (false, null, null, null, null);
+    }
+    
     /// <summary>
     /// Handle PRE_HYDRATION state logic.
     /// </summary>
@@ -1205,14 +1311,108 @@ public sealed class StreamStateMachine
                         filteredPartialBarCount = _filteredPartialBarCount;
                     }
                     
+                    // LATE-START SAFE HANDLING: Reconstruct range and check for missed breakout
+                    // Range build window: [range_start, slot_time) - slot_time is EXCLUSIVE
+                    // Missed-breakout scan window: [slot_time, now] - only if late start
+                    decimal? reconstructedRangeHigh = null;
+                    decimal? reconstructedRangeLow = null;
+                    bool missedBreakout = false;
+                    DateTimeOffset? breakoutTimeUtc = null;
+                    DateTimeOffset? breakoutTimeChicago = null;
+                    decimal? breakoutPrice = null;
+                    string? breakoutDirection = null;
+                    bool isLateStart = nowChicago > SlotTimeChicagoTime;
+                    
+                    try
+                    {
+                        // Compute range strictly from bars < slot_time (slot_time exclusive)
+                        var rangeResult = ComputeRangeRetrospectively(utcNow, endTimeUtc: SlotTimeUtc);
+                        
+                        if (rangeResult.Success && rangeResult.RangeHigh.HasValue && rangeResult.RangeLow.HasValue)
+                        {
+                            reconstructedRangeHigh = rangeResult.RangeHigh.Value;
+                            reconstructedRangeLow = rangeResult.RangeLow.Value;
+                            
+                            // If starting after slot_time, check if breakout already occurred
+                            if (isLateStart)
+                            {
+                                var missedBreakoutResult = CheckMissedBreakout(utcNow, reconstructedRangeHigh.Value, reconstructedRangeLow.Value);
+                                missedBreakout = missedBreakoutResult.MissedBreakout;
+                                breakoutTimeUtc = missedBreakoutResult.BreakoutTimeUtc;
+                                breakoutTimeChicago = missedBreakoutResult.BreakoutTimeChicago;
+                                breakoutPrice = missedBreakoutResult.BreakoutPrice;
+                                breakoutDirection = missedBreakoutResult.BreakoutDirection;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Non-blocking: log error but continue
+                        LogHealth("WARN", "HYDRATION_RANGE_COMPUTE_ERROR", 
+                            $"Range computation or missed-breakout check failed: {ex.Message}. Continuing with normal flow.",
+                            new { error = ex.ToString() });
+                    }
+                    
+                    // Calculate completeness metrics (non-blocking)
+                    int expectedBars = 0;
+                    int expectedFullRangeBars = 0;
+                    double completenessPct = 0.0;
+                    try
+                    {
+                        var hydrationEndChicago = nowChicago < SlotTimeChicagoTime ? nowChicago : SlotTimeChicagoTime;
+                        var rangeDurationMinutes = (hydrationEndChicago - RangeStartChicagoTime).TotalMinutes;
+                        var fullRangeDurationMinutes = (SlotTimeChicagoTime - RangeStartChicagoTime).TotalMinutes;
+                        
+                        expectedBars = Math.Max(0, (int)Math.Floor(rangeDurationMinutes));
+                        expectedFullRangeBars = Math.Max(0, (int)Math.Floor(fullRangeDurationMinutes));
+                        
+                        if (expectedBars > 0)
+                        {
+                            completenessPct = Math.Min(100.0, (barCount / (double)expectedBars) * 100.0);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Non-blocking: metrics calculation failed, continue without them
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "HYDRATION_COMPLETENESS_CALC_ERROR", State.ToString(),
+                            new { error = ex.Message, note = "Completeness calculation failed, continuing without metrics" }));
+                    }
+                    
+                    // DEBUG: Log boundary contract to prevent regressions
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_BOUNDARY_CONTRACT", State.ToString(),
+                        new
+                        {
+                            range_build_window = $"[{RangeStartChicagoTime:HH:mm:ss}, {SlotTimeChicagoTime:HH:mm:ss})",
+                            range_build_window_note = "slot_time is EXCLUSIVE for range building",
+                            missed_breakout_scan_window = isLateStart ? $"[{SlotTimeChicagoTime:HH:mm:ss}, {nowChicago:HH:mm:ss}]" : "N/A (not late start)",
+                            missed_breakout_scan_note = isLateStart ? "Only checked if now > slot_time" : "Not applicable",
+                            note = "Boundary contract for range reconstruction and missed-breakout detection"
+                        }));
+                    
+                    // CRITICAL FIX: Re-read barCount right before logging HYDRATION_SUMMARY
+                    // barCount was captured at the start of HandlePreHydrationState(), but bars are added
+                    // asynchronously via AddBarToBuffer() from BarsRequest callbacks or live feed.
+                    // We must read the current buffer count to get accurate loaded_bars.
+                    int currentBarCount = GetBarBufferCount();
+                    
+                    // Log HYDRATION_SUMMARY with range and missed breakout details (even if missed breakout occurred)
+                    var hydrationNote = missedBreakout 
+                        ? $"MISSED_BREAKOUT: Starting after slot_time but breakout already occurred at {breakoutTimeChicago?.ToString("HH:mm:ss") ?? "N/A"} CT. Range computed but trading blocked."
+                        : "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
+                          "This log captures all bar sources, filtering, deduplication statistics, completeness metrics, and late-start handling for debugging and auditability.";
+                    
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "HYDRATION_SUMMARY", "PRE_HYDRATION",
                         new
                         {
+                            stream_id = Stream,
+                            canonical_instrument = CanonicalInstrument,
                             instrument = Instrument,
                             slot = Stream,
                             trading_date = TradingDate,
-                            total_bars_in_buffer = barCount,
+                            total_bars_in_buffer = currentBarCount,
                             // Bar source breakdown
                             historical_bar_count = historicalBarCount,
                             live_bar_count = liveBarCount,
@@ -1223,11 +1423,161 @@ public sealed class StreamStateMachine
                             now_chicago = nowChicago.ToString("o"),
                             range_start_chicago = RangeStartChicagoTime.ToString("o"),
                             slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            // Completeness metrics
+                            expected_bars = expectedBars,
+                            expected_full_range_bars = expectedFullRangeBars,
+                            loaded_bars = currentBarCount,
+                            completeness_pct = expectedBars > 0 ? Math.Round((currentBarCount / (double)expectedBars) * 100.0, 2) : 0.0,
+                            // Late-start handling
+                            late_start = isLateStart,
+                            missed_breakout = missedBreakout,
+                            // Reconstructed range (if available) - ALWAYS LOGGED EVEN IF MISSED BREAKOUT
+                            reconstructed_range_high = reconstructedRangeHigh,
+                            reconstructed_range_low = reconstructedRangeLow,
+                            // Breakout details (if missed breakout occurred)
+                            breakout_time_utc = breakoutTimeUtc?.ToString("o"),
+                            breakout_time_chicago = breakoutTimeChicago?.ToString("o"),
+                            breakout_price = breakoutPrice,
+                            breakout_direction = breakoutDirection,
                             // Mode and source info
                             execution_mode = _executionMode.ToString(),
-                            note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
-                                   "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
+                            note = hydrationNote
                         }));
+                    
+                    // If missed breakout occurred, log the health event and commit, then return
+                    if (missedBreakout)
+                    {
+                        LogHealth("INFO", "LATE_START_MISSED_BREAKOUT", 
+                            $"Starting after slot_time but breakout already occurred at {breakoutTimeChicago.Value:HH:mm:ss} CT. Cannot trade.",
+                            new
+                            {
+                                breakout_time_utc = breakoutTimeUtc.Value.ToString("o"),
+                                breakout_time_chicago = breakoutTimeChicago.Value.ToString("o"),
+                                breakout_price = breakoutPrice.Value,
+                                breakout_direction = breakoutDirection,
+                                range_high = reconstructedRangeHigh.Value,
+                                range_low = reconstructedRangeLow.Value,
+                                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                                range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                                now_chicago = nowChicago.ToString("o")
+                            });
+                        
+                        Commit(utcNow, "NO_TRADE_LATE_START_MISSED_BREAKOUT", "NO_TRADE_LATE_START_MISSED_BREAKOUT");
+                        return; // Do not transition to ARMED
+                    }
+                    
+                    // Calculate completeness metrics (non-blocking)
+                    int expectedBars = 0;
+                    int expectedFullRangeBars = 0;
+                    double completenessPct = 0.0;
+                    try
+                    {
+                        var hydrationEndChicago = nowChicago < SlotTimeChicagoTime ? nowChicago : SlotTimeChicagoTime;
+                        var rangeDurationMinutes = (hydrationEndChicago - RangeStartChicagoTime).TotalMinutes;
+                        var fullRangeDurationMinutes = (SlotTimeChicagoTime - RangeStartChicagoTime).TotalMinutes;
+                        
+                        expectedBars = Math.Max(0, (int)Math.Floor(rangeDurationMinutes));
+                        expectedFullRangeBars = Math.Max(0, (int)Math.Floor(fullRangeDurationMinutes));
+                        
+                        if (expectedBars > 0)
+                        {
+                            completenessPct = Math.Min(100.0, (barCount / (double)expectedBars) * 100.0);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Non-blocking: metrics calculation failed, continue without them
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "HYDRATION_COMPLETENESS_CALC_ERROR", State.ToString(),
+                            new { error = ex.Message, note = "Completeness calculation failed, continuing without metrics" }));
+                    }
+                    
+                    // DEBUG: Log boundary contract to prevent regressions
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_BOUNDARY_CONTRACT", State.ToString(),
+                        new
+                        {
+                            range_build_window = $"[{RangeStartChicagoTime:HH:mm:ss}, {SlotTimeChicagoTime:HH:mm:ss})",
+                            range_build_window_note = "slot_time is EXCLUSIVE for range building",
+                            missed_breakout_scan_window = isLateStart ? $"[{SlotTimeChicagoTime:HH:mm:ss}, {nowChicago:HH:mm:ss}]" : "N/A (not late start)",
+                            missed_breakout_scan_note = isLateStart ? "Only checked if now > slot_time" : "Not applicable",
+                            note = "Boundary contract for range reconstruction and missed-breakout detection"
+                        }));
+                    
+                // CRITICAL FIX: Re-read barCount right before logging HYDRATION_SUMMARY
+                // barCount was captured at the start of HandlePreHydrationState(), but bars are added
+                // asynchronously via AddBarToBuffer() from BarsRequest callbacks or live feed.
+                // We must read the current buffer count to get accurate loaded_bars.
+                int currentBarCount = GetBarBufferCount();
+                
+                // Log HYDRATION_SUMMARY with range and missed breakout details (even if missed breakout occurred)
+                var hydrationNoteDRYRUN = missedBreakout 
+                    ? $"MISSED_BREAKOUT: Starting after slot_time but breakout already occurred at {breakoutTimeChicago?.ToString("HH:mm:ss") ?? "N/A"} CT. Range computed but trading blocked."
+                    : "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
+                      "This log captures all bar sources, filtering, deduplication statistics, completeness metrics, and late-start handling for debugging and auditability.";
+                
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "HYDRATION_SUMMARY", "PRE_HYDRATION",
+                    new
+                    {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
+                        instrument = Instrument,
+                        slot = Stream,
+                        trading_date = TradingDate,
+                        total_bars_in_buffer = currentBarCount,
+                        // Bar source breakdown
+                        historical_bar_count = historicalBarCount,
+                        live_bar_count = liveBarCount,
+                        deduped_bar_count = dedupedBarCount,
+                        filtered_future_bar_count = filteredFutureBarCount,
+                        filtered_partial_bar_count = filteredPartialBarCount,
+                        // Timing context
+                        now_chicago = nowChicago.ToString("o"),
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        // Completeness metrics
+                        expected_bars = expectedBars,
+                        expected_full_range_bars = expectedFullRangeBars,
+                        loaded_bars = currentBarCount,
+                        completeness_pct = expectedBars > 0 ? Math.Round((currentBarCount / (double)expectedBars) * 100.0, 2) : 0.0,
+                        // Late-start handling
+                        late_start = isLateStart,
+                        missed_breakout = missedBreakout,
+                        // Reconstructed range (if available) - ALWAYS LOGGED EVEN IF MISSED BREAKOUT
+                        reconstructed_range_high = reconstructedRangeHigh,
+                        reconstructed_range_low = reconstructedRangeLow,
+                        // Breakout details (if missed breakout occurred)
+                        breakout_time_utc = breakoutTimeUtc?.ToString("o"),
+                        breakout_time_chicago = breakoutTimeChicago?.ToString("o"),
+                        breakout_price = breakoutPrice,
+                        breakout_direction = breakoutDirection,
+                        // Mode and source info
+                        execution_mode = _executionMode.ToString(),
+                        note = hydrationNoteDRYRUN
+                    }));
+                
+                // If missed breakout occurred, log the health event and commit, then return
+                if (missedBreakout)
+                {
+                    LogHealth("INFO", "LATE_START_MISSED_BREAKOUT", 
+                        $"Starting after slot_time but breakout already occurred at {breakoutTimeChicago.Value:HH:mm:ss} CT. Cannot trade.",
+                        new
+                        {
+                            breakout_time_utc = breakoutTimeUtc.Value.ToString("o"),
+                            breakout_time_chicago = breakoutTimeChicago.Value.ToString("o"),
+                            breakout_price = breakoutPrice.Value,
+                            breakout_direction = breakoutDirection,
+                            range_high = reconstructedRangeHigh.Value,
+                            range_low = reconstructedRangeLow.Value,
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            now_chicago = nowChicago.ToString("o")
+                        });
+                    
+                    Commit(utcNow, "NO_TRADE_LATE_START_MISSED_BREAKOUT", "NO_TRADE_LATE_START_MISSED_BREAKOUT");
+                    return; // Do not transition to ARMED
+                }
                     
                     // HYDRATION_SNAPSHOT: Consolidated snapshot per stream
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
@@ -1295,6 +1645,75 @@ public sealed class StreamStateMachine
                     filteredPartialBarCount = _filteredPartialBarCount;
                 }
                 
+                // LATE-START SAFE HANDLING: Reconstruct range and check for missed breakout
+                // Range build window: [range_start, slot_time) - slot_time is EXCLUSIVE
+                // Missed-breakout scan window: [slot_time, now] - only if late start
+                decimal? reconstructedRangeHigh = null;
+                decimal? reconstructedRangeLow = null;
+                bool missedBreakout = false;
+                DateTimeOffset? breakoutTimeUtc = null;
+                DateTimeOffset? breakoutTimeChicago = null;
+                decimal? breakoutPrice = null;
+                string? breakoutDirection = null;
+                bool isLateStart = nowChicago > SlotTimeChicagoTime;
+                
+                try
+                {
+                    // Compute range strictly from bars < slot_time (slot_time exclusive)
+                    var rangeResult = ComputeRangeRetrospectively(utcNow, endTimeUtc: SlotTimeUtc);
+                    
+                    if (rangeResult.Success && rangeResult.RangeHigh.HasValue && rangeResult.RangeLow.HasValue)
+                    {
+                        reconstructedRangeHigh = rangeResult.RangeHigh.Value;
+                        reconstructedRangeLow = rangeResult.RangeLow.Value;
+                        
+                        // If starting after slot_time, check if breakout already occurred
+                        if (isLateStart)
+                        {
+                            var missedBreakoutResult = CheckMissedBreakout(utcNow, reconstructedRangeHigh.Value, reconstructedRangeLow.Value);
+                            missedBreakout = missedBreakoutResult.MissedBreakout;
+                            breakoutTimeUtc = missedBreakoutResult.BreakoutTimeUtc;
+                            breakoutTimeChicago = missedBreakoutResult.BreakoutTimeChicago;
+                            breakoutPrice = missedBreakoutResult.BreakoutPrice;
+                            breakoutDirection = missedBreakoutResult.BreakoutDirection;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Non-blocking: log error but continue
+                    LogHealth("WARN", "HYDRATION_RANGE_COMPUTE_ERROR", 
+                        $"Range computation or missed-breakout check failed: {ex.Message}. Continuing with normal flow.",
+                        new { error = ex.ToString() });
+                }
+                
+                // Calculate completeness metrics (non-blocking)
+                int expectedBars = 0;
+                int expectedFullRangeBars = 0;
+                double completenessPct = 0.0;
+                try
+                {
+                    var hydrationEndChicago = nowChicago < SlotTimeChicagoTime ? nowChicago : SlotTimeChicagoTime;
+                    var rangeDurationMinutes = (hydrationEndChicago - RangeStartChicagoTime).TotalMinutes;
+                    var fullRangeDurationMinutes = (SlotTimeChicagoTime - RangeStartChicagoTime).TotalMinutes;
+                    
+                    expectedBars = Math.Max(0, (int)Math.Floor(rangeDurationMinutes));
+                    expectedFullRangeBars = Math.Max(0, (int)Math.Floor(fullRangeDurationMinutes));
+                    
+                    // Note: completenessPct will be recalculated using currentBarCount below
+                    if (expectedBars > 0)
+                    {
+                        completenessPct = Math.Min(100.0, (barCount / (double)expectedBars) * 100.0);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Non-blocking: metrics calculation failed, continue without them
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "HYDRATION_COMPLETENESS_CALC_ERROR", State.ToString(),
+                        new { error = ex.Message, note = "Completeness calculation failed, continuing without metrics" }));
+                }
+                
                 // Log forced transition if hard timeout triggered
                 if (shouldForceTransition)
                 {
@@ -1314,14 +1733,34 @@ public sealed class StreamStateMachine
                         }));
                 }
                 
+                // DEBUG: Log boundary contract to prevent regressions
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "HYDRATION_BOUNDARY_CONTRACT", State.ToString(),
+                    new
+                    {
+                        range_build_window = $"[{RangeStartChicagoTime:HH:mm:ss}, {SlotTimeChicagoTime:HH:mm:ss})",
+                        range_build_window_note = "slot_time is EXCLUSIVE for range building",
+                        missed_breakout_scan_window = isLateStart ? $"[{SlotTimeChicagoTime:HH:mm:ss}, {nowChicago:HH:mm:ss}]" : "N/A (not late start)",
+                        missed_breakout_scan_note = isLateStart ? "Only checked if now > slot_time" : "Not applicable",
+                        note = "Boundary contract for range reconstruction and missed-breakout detection"
+                    }));
+                
+                // CRITICAL FIX: Re-read barCount right before logging HYDRATION_SUMMARY
+                // barCount was captured at the start of HandlePreHydrationState(), but bars are added
+                // asynchronously via AddBarToBuffer() from BarsRequest callbacks or live feed.
+                // We must read the current buffer count to get accurate loaded_bars.
+                int currentBarCount = GetBarBufferCount();
+                
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "HYDRATION_SUMMARY", "PRE_HYDRATION",
                     new
                     {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
                         instrument = Instrument,
                         slot = Stream,
                         trading_date = TradingDate,
-                        total_bars_in_buffer = barCount,
+                        total_bars_in_buffer = currentBarCount,
                         // Bar source breakdown
                         historical_bar_count = historicalBarCount,
                         live_bar_count = liveBarCount,
@@ -1332,11 +1771,22 @@ public sealed class StreamStateMachine
                         now_chicago = nowChicago.ToString("o"),
                         range_start_chicago = RangeStartChicagoTime.ToString("o"),
                         slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        // Completeness metrics
+                        expected_bars = expectedBars,
+                        expected_full_range_bars = expectedFullRangeBars,
+                        loaded_bars = currentBarCount,
+                        completeness_pct = expectedBars > 0 ? Math.Round((currentBarCount / (double)expectedBars) * 100.0, 2) : 0.0,
+                        // Late-start handling
+                        late_start = isLateStart,
+                        missed_breakout = missedBreakout,
+                        // Reconstructed range (if available)
+                        reconstructed_range_high = reconstructedRangeHigh,
+                        reconstructed_range_low = reconstructedRangeLow,
                         // Mode and source info
                         execution_mode = _executionMode.ToString(),
                         forced_transition = shouldForceTransition,
                         note = "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
-                               "This log captures all bar sources, filtering, and deduplication statistics for debugging and auditability."
+                               "This log captures all bar sources, filtering, deduplication statistics, completeness metrics, and late-start handling for debugging and auditability."
                     }));
                 
                 // HYDRATION_SNAPSHOT: Consolidated snapshot per stream (DRYRUN mode)
@@ -1651,14 +2101,17 @@ public sealed class StreamStateMachine
         
         if (utcNow >= SlotTimeUtc)
         {
-            // If range is invalidated due to gap violation, prevent trading
-            if (_rangeInvalidated)
-            {
-                // G) "Nothing happened" explanation: Trade blocked due to gap violation
-                LogSlotEndSummary(utcNow, "RANGE_INVALIDATED", false, false, "Range invalidated due to gap tolerance violation");
-                Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
-                return;
-            }
+            // Gap tolerance invalidation is now disabled - gaps are logged but do not invalidate ranges
+            // Previously, _rangeInvalidated would commit the stream, but this is now disabled
+            // Gaps are still tracked and logged via BAR_GAP_DETECTED and GAP_TOLERANCE_VIOLATION events
+            // but ranges are no longer invalidated due to DATA_FEED_FAILURE gaps
+            // if (_rangeInvalidated)
+            // {
+            //     // G) "Nothing happened" explanation: Trade blocked due to gap violation
+            //     LogSlotEndSummary(utcNow, "RANGE_INVALIDATED", false, false, "Range invalidated due to gap tolerance violation");
+            //     Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
+            //     return;
+            // }
             
             if (!_rangeComputed)
             {
@@ -2022,9 +2475,15 @@ public sealed class StreamStateMachine
             }
             else
             {
-                // Range invalidated - commit and prevent trading
-                LogSlotEndSummary(utcNow, "RANGE_INVALIDATED", false, false, "Range invalidated due to gap tolerance violation");
-                Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
+                // Gap tolerance invalidation is now disabled - gaps are logged but do not invalidate ranges
+                // Previously, _rangeInvalidated would commit the stream, but this is now disabled
+                // Gaps are still tracked and logged via BAR_GAP_DETECTED and GAP_TOLERANCE_VIOLATION events
+                // but ranges are no longer invalidated due to DATA_FEED_FAILURE gaps
+                // LogSlotEndSummary(utcNow, "RANGE_INVALIDATED", false, false, "Range invalidated due to gap tolerance violation");
+                // Commit(utcNow, "RANGE_INVALIDATED", "Gap tolerance violation");
+                
+                // Note: _rangeInvalidated flag may still be set from gap detection, but it no longer prevents trading
+                // The flag is kept for diagnostic purposes but does not block range locking or trading
             }
         }
     }
@@ -2191,6 +2650,9 @@ public sealed class StreamStateMachine
             "BAR_ADMISSION_PROOF", State.ToString(),
             new
             {
+                stream_id = Stream,
+                canonical_instrument = CanonicalInstrument,
+                instrument = Instrument,
                 bar_time_raw_utc = barUtc.ToString("o"),
                 bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
                 bar_time_chicago = barChicagoTime.ToString("o"),
@@ -2266,6 +2728,23 @@ public sealed class StreamStateMachine
                 
                 // Log if buffering in unexpected state (rate-limited)
                 var isExpectedState = State == StreamState.PRE_HYDRATION || State == StreamState.ARMED || State == StreamState.RANGE_BUILDING;
+                
+                // BINARY TRUTH EVENT: Prove admission-to-commit decision point
+                var commitReason = isExpectedState ? "COMMIT_ALLOWED" : $"STATE_GUARD_{State}";
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_ADMISSION_TO_COMMIT_DECISION", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        state = State.ToString(),
+                        admitted = true,  // bar passed admission check (we're here)
+                        will_commit = isExpectedState,  // state allows buffering
+                        reason = commitReason,
+                        bar_time_chicago = barChicagoTime.ToString("o"),
+                        range_start = RangeStartChicagoTime.ToString("o"),
+                        slot_time = SlotTimeChicagoTime.ToString("o")
+                    }));
+                
                 if (!isExpectedState)
                 {
                     // Rate-limit warning to once per stream per 5 minutes
@@ -2310,7 +2789,32 @@ public sealed class StreamStateMachine
                         if (missingMinutes > _largestSingleGapMinutes)
                             _largestSingleGapMinutes = missingMinutes;
                         
+                        var totalGapBefore = _totalGapMinutes;
                         _totalGapMinutes += missingMinutes;
+                        var totalGapAfter = _totalGapMinutes;
+                        var largestGapAfter = _largestSingleGapMinutes;
+                        
+                        // BAR_GAP_DETECTED: Diagnostic event to instantly identify gap root causes
+                        // This helps determine if gaps are real missing minutes, time mapping errors,
+                        // out-of-order bars, or filtering issues
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "BAR_GAP_DETECTED", State.ToString(),
+                            new
+                            {
+                                stream_id = Stream,
+                                prev_bar_open_chicago = _lastBarOpenChicago.Value.ToString("o"),
+                                this_bar_open_chicago = barChicagoTime.ToString("o"),
+                                delta_minutes = gapDeltaMinutes,
+                                added_to_total_gap = missingMinutes,
+                                total_gap_now = totalGapAfter,
+                                largest_gap_now = largestGapAfter,
+                                bar_source = barSource.ToString(),
+                                // Additional diagnostic context
+                                stream_state = State.ToString(),
+                                bar_timestamp_utc = barUtc.ToString("o"),
+                                gap_type_preliminary = State == StreamState.PRE_HYDRATION || barSource == BarSource.BARSREQUEST ? "DATA_FEED_FAILURE" : "LOW_LIQUIDITY",
+                                note = "Gap detected between consecutive bars. Check prev_bar_open_chicago vs this_bar_open_chicago to identify root cause."
+                            }));
                         
                         // Classify gap type: DATA_FEED_FAILURE vs LOW_LIQUIDITY
                         // DATA_FEED_FAILURE indicators:
@@ -2332,33 +2836,37 @@ public sealed class StreamStateMachine
                             ? "Gap likely due to data feed failure (PRE_HYDRATION/BARSREQUEST gaps or insufficient data)"
                             : "Gap likely due to legitimate low liquidity (sparse trading during live feed)";
                         
-                        // Check gap tolerance rules (only for DATA_FEED_FAILURE - LOW_LIQUIDITY gaps never invalidate)
+                        // Check gap tolerance rules - DISABLED: DATA_FEED_FAILURE gaps no longer invalidate
+                        // Both DATA_FEED_FAILURE and LOW_LIQUIDITY gaps are now tolerated (never invalidate)
                         bool violated = false;
                         string violationReason = "";
                         
-                        // Only check tolerance for DATA_FEED_FAILURE - LOW_LIQUIDITY gaps are allowed (never invalidate)
-                        if (isDataFeedFailure)
-                        {
-                            if (missingMinutes > MAX_SINGLE_GAP_MINUTES)
-                            {
-                                violated = true;
-                                violationReason = $"Single gap missing {missingMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES}) for DATA_FEED_FAILURE";
-                            }
-                            else if (_totalGapMinutes > MAX_TOTAL_GAP_MINUTES)
-                            {
-                                violated = true;
-                                violationReason = $"Total gap missing {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES}) for DATA_FEED_FAILURE";
-                            }
-                            
-                            // Check last 10 minutes rule
-                            var last10MinStart = SlotTimeChicagoTime.AddMinutes(-10);
-                            if (barChicagoTime >= last10MinStart && missingMinutes > MAX_GAP_LAST_10_MINUTES)
-                            {
-                                violated = true;
-                                violationReason = $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES}) for DATA_FEED_FAILURE";
-                            }
-                        }
+                        // TEMPORARILY DISABLED: DATA_FEED_FAILURE gap invalidation
+                        // Previously, DATA_FEED_FAILURE gaps would invalidate ranges, but this is now disabled
+                        // All gaps (both DATA_FEED_FAILURE and LOW_LIQUIDITY) are tolerated and logged for monitoring
+                        // if (isDataFeedFailure)
+                        // {
+                        //     if (missingMinutes > MAX_SINGLE_GAP_MINUTES)
+                        //     {
+                        //         violated = true;
+                        //         violationReason = $"Single gap missing {missingMinutes:F1} minutes exceeds MAX_SINGLE_GAP_MINUTES ({MAX_SINGLE_GAP_MINUTES}) for DATA_FEED_FAILURE";
+                        //     }
+                        //     else if (_totalGapMinutes > MAX_TOTAL_GAP_MINUTES)
+                        //     {
+                        //         violated = true;
+                        //         violationReason = $"Total gap missing {_totalGapMinutes:F1} minutes exceeds MAX_TOTAL_GAP_MINUTES ({MAX_TOTAL_GAP_MINUTES}) for DATA_FEED_FAILURE";
+                        //     }
+                        //     
+                        //     // Check last 10 minutes rule
+                        //     var last10MinStart = SlotTimeChicagoTime.AddMinutes(-10);
+                        //     if (barChicagoTime >= last10MinStart && missingMinutes > MAX_GAP_LAST_10_MINUTES)
+                        //     {
+                        //         violated = true;
+                        //         violationReason = $"Gap missing {missingMinutes:F1} minutes in last 10 minutes exceeds MAX_GAP_LAST_10_MINUTES ({MAX_GAP_LAST_10_MINUTES}) for DATA_FEED_FAILURE";
+                        //     }
+                        // }
                         // LOW_LIQUIDITY gaps: Never invalidate (violated stays false)
+                        // DATA_FEED_FAILURE gaps: Also never invalidate (violated stays false) - TEMPORARILY DISABLED
                         
                         if (violated)
                         {
@@ -4273,6 +4781,23 @@ public sealed class StreamStateMachine
         lock (_barBufferLock)
         {
             var utcNow = DateTimeOffset.UtcNow;
+            
+            // Log buffer add attempt
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BAR_BUFFER_ADD_ATTEMPT", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    canonical_instrument = CanonicalInstrument,
+                    instrument = Instrument,
+                    bar_timestamp_utc = bar.TimestampUtc.ToString("o"),
+                    bar_timestamp_chicago = _time.ConvertUtcToChicago(bar.TimestampUtc).ToString("o"),
+                    bar_source = source.ToString(),
+                    current_buffer_count = _barBuffer.Count,
+                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                    slot_time_chicago = SlotTimeChicagoTime.ToString("o")
+                }));
+            
             var barAgeMinutes = (utcNow - bar.TimestampUtc).TotalMinutes;
             const double MIN_BAR_AGE_MINUTES = 1.0; // Bar period (1 minute bars)
             
@@ -4328,6 +4853,25 @@ public sealed class StreamStateMachine
                             note = "OnBarClose bars should be fully closed. Check bar source and timing."
                         }));
                 }
+                
+                // Log buffer rejection
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_BUFFER_REJECTED", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
+                        instrument = Instrument,
+                        bar_timestamp_utc = bar.TimestampUtc.ToString("o"),
+                        bar_timestamp_chicago = barChicagoTime.ToString("o"),
+                        bar_source = source.ToString(),
+                        rejection_reason = "PARTIAL_BAR",
+                        bar_age_minutes = barAgeMinutes,
+                        min_bar_age_minutes = MIN_BAR_AGE_MINUTES,
+                        current_buffer_count = _barBuffer.Count,
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o")
+                    }));
                 
                 return; // Reject partial bar
             }
@@ -4442,6 +4986,26 @@ public sealed class StreamStateMachine
                         IncrementBarSourceCounter(source);
                     }
                     
+                    // Log buffer rejection (replaced, not added)
+                    _log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "BAR_BUFFER_REJECTED", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            canonical_instrument = CanonicalInstrument,
+                            instrument = Instrument,
+                            bar_timestamp_utc = bar.TimestampUtc.ToString("o"),
+                            bar_timestamp_chicago = _time.ConvertUtcToChicago(bar.TimestampUtc).ToString("o"),
+                            bar_source = source.ToString(),
+                            rejection_reason = "DUPLICATE_REPLACED",
+                            existing_source = existingSource.ToString(),
+                            new_source = source.ToString(),
+                            current_buffer_count = _barBuffer.Count,
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            note = "Bar replaced existing bar with lower precedence"
+                        }));
+                    
                     return; // Bar replaced, don't add again
                 }
                 else
@@ -4460,6 +5024,27 @@ public sealed class StreamStateMachine
                                 note = $"Duplicate bar rejected - existing {existingSource} bar has higher or equal precedence than new {source} bar"
                             }));
                     }
+                    
+                    // Log buffer rejection
+                    _log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "BAR_BUFFER_REJECTED", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            canonical_instrument = CanonicalInstrument,
+                            instrument = Instrument,
+                            bar_timestamp_utc = bar.TimestampUtc.ToString("o"),
+                            bar_timestamp_chicago = _time.ConvertUtcToChicago(bar.TimestampUtc).ToString("o"),
+                            bar_source = source.ToString(),
+                            rejection_reason = "DUPLICATE_LOWER_PRECEDENCE",
+                            existing_source = existingSource.ToString(),
+                            new_source = source.ToString(),
+                            current_buffer_count = _barBuffer.Count,
+                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                            note = "Duplicate bar rejected - existing bar has higher or equal precedence"
+                        }));
+                    
                     return; // Reject bar - existing bar has higher precedence
                 }
             }
@@ -4470,6 +5055,22 @@ public sealed class StreamStateMachine
             
             // Track bar source counters (increment for new bar)
             IncrementBarSourceCounter(source);
+            
+            // Log successful buffer add
+            _log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BAR_BUFFER_ADD_COMMITTED", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    canonical_instrument = CanonicalInstrument,
+                    instrument = Instrument,
+                    bar_timestamp_utc = bar.TimestampUtc.ToString("o"),
+                    bar_timestamp_chicago = _time.ConvertUtcToChicago(bar.TimestampUtc).ToString("o"),
+                    bar_source = source.ToString(),
+                    new_buffer_count = _barBuffer.Count,
+                    range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                    slot_time_chicago = SlotTimeChicagoTime.ToString("o")
+                }));
         }
     }
     

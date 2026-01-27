@@ -71,6 +71,8 @@ export interface StreamState {
   freeze_close: number | null;
   range_invalidated: boolean;
   state_entry_time_utc: string;
+  range_locked_time_utc: string | null;
+  range_locked_time_chicago: string | null;
 }
 
 export enum StreamStateEnum {

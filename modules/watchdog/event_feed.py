@@ -155,11 +155,13 @@ class EventFeedGenerator:
         last_pos = self._last_read_positions.get(str(log_file), 0)
         
         try:
-            with open(log_file, 'r', encoding='utf-8') as f:
+            # Use utf-8-sig to automatically handle UTF-8 BOM markers
+            with open(log_file, 'r', encoding='utf-8-sig') as f:
                 # Seek to last read position
                 f.seek(last_pos)
                 
                 # Read new lines
+                parse_errors = 0
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -168,9 +170,14 @@ class EventFeedGenerator:
                     try:
                         event = json.loads(line)
                         events.append(event)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse JSON line in {log_file}: {e}")
+                    except json.JSONDecodeError:
+                        # Silently skip malformed JSON lines (common in log files)
+                        parse_errors += 1
                         continue
+                
+                # Log parse errors only once per file read, not per line
+                if parse_errors > 0:
+                    logger.debug(f"Skipped {parse_errors} malformed JSON lines in {log_file.name}")
                 
                 # Update last read position
                 self._last_read_positions[str(log_file)] = f.tell()

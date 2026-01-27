@@ -435,6 +435,30 @@ class PipelineOrchestrator:
         # Generate run_id if not provided (for scheduled runs or direct calls)
         if run_id is None:
             run_id = str(uuid.uuid4())
+        else:
+            # SAFEGUARD: Prevent reusing an existing run_id that's still active
+            # Check if this run_id exists in recent run history and is still active
+            if status and status.run_id == run_id:
+                raise ValueError(f"Run ID {run_id[:8]}... is already active. Cannot reuse run_id.")
+            
+            # Check run history for this run_id
+            existing_run = self.run_history.get_run(run_id)
+            if existing_run:
+                # Check if run completed recently (within last hour) - might be stale state
+                # Use module-level datetime import (already imported at top)
+                try:
+                    ended_at = datetime.fromisoformat(existing_run.ended_at.replace('Z', '+00:00'))
+                    if ended_at.tzinfo is None:
+                        ended_at = ended_at.replace(tzinfo=timezone.utc)
+                    
+                    age = (datetime.now(timezone.utc) - ended_at).total_seconds()
+                    if age < 3600:  # Less than 1 hour old
+                        self.logger.warning(
+                            f"Run ID {run_id[:8]}... was used recently ({age:.0f}s ago). "
+                            f"This may indicate a duplicate run attempt."
+                        )
+                except Exception as e:
+                    self.logger.debug(f"Could not check run history age: {e}")
         
         # Emit pipeline/start event - this is the ONLY place that emits pipeline/start
         # Ensures exactly one pipeline/start per run_id, ever

@@ -180,6 +180,11 @@ public static class RobotEventTypes
         ["RANGE_LOCK_ASSERT"] = "DEBUG",
         ["RANGE_INVALIDATED"] = "WARN",
         
+        // Gap detection
+        ["BAR_GAP_DETECTED"] = "DEBUG",
+        ["GAP_TOLERANCE_VIOLATION"] = "ERROR",
+        ["GAP_TOLERATED"] = "WARN",
+        
         // Execution
         ["EXECUTION_MODE_SET"] = "INFO",
         ["EXECUTION_BLOCKED"] = "WARN",
@@ -403,6 +408,9 @@ public static class RobotEventTypes
         "RANGE_COMPUTE_NO_BARS_DIAGNOSTIC", "RANGE_COMPUTE_BAR_FILTERING",
         "RANGE_FIRST_BAR_ACCEPTED", "RANGE_INTENT_ASSERT", "RANGE_LOCK_ASSERT",
         "RANGE_INVALIDATED",
+        
+        // Gap detection
+        "BAR_GAP_DETECTED", "GAP_TOLERANCE_VIOLATION", "GAP_TOLERATED",
         
         // Execution
         "EXECUTION_MODE_SET", "EXECUTION_BLOCKED", "EXECUTION_ERROR", "EXECUTION_FILLED",

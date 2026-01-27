@@ -3,7 +3,7 @@
  */
 import { useMemo } from 'react'
 import { CopyableText } from '../ui/CopyableText'
-import { formatChicagoTime } from '../../utils/timeUtils'
+import { formatChicagoTime } from '../../utils/timeUtils.ts'
 
 interface WatchdogHeaderProps {
   runId: string | null

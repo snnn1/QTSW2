@@ -136,57 +136,73 @@ namespace NinjaTrader.NinjaScript.Strategies
                     throw new InvalidOperationException(errorMsg);
                 }
 
-                // CRITICAL FIX: Gate BarsRequest on stream readiness (Option A - deterministic, no retries)
-                // Pattern: Streams created THEN BarsRequest (single-shot, deterministic)
-                // This ensures streams exist before requesting bars, preventing race conditions
-                // CRITICAL: Wrap stream readiness check in try-catch to ensure _engineReady is set even if no streams exist
-                // This allows the engine to start and emit heartbeats even if the timetable has no enabled streams for this instrument
-                var instrumentNameUpper = engineInstrumentName.ToUpperInvariant();
+                // CRITICAL FIX: Request bars for ALL execution instruments from enabled streams
+                // This ensures micro futures (MYM, MCL) route to base instrument streams (YM, CL) via canonical mapping
+                // Pattern: Get all execution instruments → Request bars for each → Bars route via IsSameInstrument()
                 try
                 {
-                    if (!_engine.AreStreamsReadyForInstrument(instrumentNameUpper))
+                    var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
+                    
+                    if (executionInstruments.Count == 0)
                     {
-                        var warningMsg = $"WARNING: Cannot request historical bars - streams not ready for {instrumentNameUpper}. " +
+                        var warningMsg = $"WARNING: No execution instruments found for BarsRequest. " +
                                        $"This may indicate: " +
-                                       $"1) Timetable has no enabled streams for {instrumentNameUpper}, " +
+                                       $"1) Timetable has no enabled streams, " +
                                        $"2) Streams were not created during engine.Start(), " +
-                                       $"3) All streams for {instrumentNameUpper} are committed. " +
+                                       $"3) All streams are committed. " +
                                        $"Skipping BarsRequest - engine will continue without pre-hydration bars. " +
                                        $"Check logs for STREAMS_CREATED events.";
                         Log(warningMsg, LogLevel.Warning);
                         
                         _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
                         {
-                            { "instrument", instrumentNameUpper },
-                            { "reason", "Streams not ready" },
-                            { "note", "Skipping BarsRequest - no enabled streams for this instrument. Engine will continue without pre-hydration bars." }
+                            { "reason", "No execution instruments found" },
+                            { "note", "Skipping BarsRequest - no enabled streams. Engine will continue without pre-hydration bars." }
                         });
-                        
-                        // Don't throw - allow engine to continue without bars for this instrument
-                        // This is expected if timetable doesn't have enabled streams for CL
                     }
                     else
                     {
-                        // Streams are ready - request historical bars from NinjaTrader for pre-hydration (SIM mode)
-                        // CRITICAL FIX: Wrap in try-catch to ensure _engineReady is set even if BarsRequest fails
-                        // Engine can still process bars and emit heartbeats even if BarsRequest fails
-                        try
+                        Log($"Requesting historical bars for {executionInstruments.Count} execution instrument(s): {string.Join(", ", executionInstruments)}", LogLevel.Information);
+                        
+                        // Request bars for each execution instrument
+                        foreach (var executionInstrument in executionInstruments)
                         {
-                            RequestHistoricalBarsForPreHydration(instrumentNameUpper);
-                        }
-                        catch (Exception ex)
-                        {
-                            // Log error but don't prevent engine from being marked ready
-                            // Engine can still process ticks and emit heartbeats even if BarsRequest fails
-                            Log($"WARNING: BarsRequest failed but engine will continue: {ex.Message}", LogLevel.Warning);
+                            try
+                            {
+                                // Check if streams are ready for this instrument (handles canonical mapping)
+                                if (!_engine.AreStreamsReadyForInstrument(executionInstrument))
+                                {
+                                    var warningMsg = $"WARNING: Cannot request historical bars - streams not ready for {executionInstrument}. " +
+                                                   $"This may indicate streams were committed or timetable configuration issue. " +
+                                                   $"Skipping BarsRequest for this instrument.";
+                                    Log(warningMsg, LogLevel.Warning);
+                                    
+                                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                                    {
+                                        { "instrument", executionInstrument },
+                                        { "reason", "Streams not ready" },
+                                        { "note", "Skipping BarsRequest - no enabled streams for this instrument." }
+                                    });
+                                    continue;
+                                }
+                                
+                                // Request bars for this execution instrument
+                                RequestHistoricalBarsForPreHydration(executionInstrument);
+                            }
+                            catch (Exception ex)
+                            {
+                                // Log error but continue with other instruments
+                                // Engine can still process bars and emit heartbeats even if BarsRequest fails for one instrument
+                                Log($"WARNING: BarsRequest failed for {executionInstrument} but will continue with other instruments: {ex.Message}", LogLevel.Warning);
+                            }
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Catch any unexpected errors during stream readiness check
+                    // Catch any unexpected errors during BarsRequest loop
                     // Log but don't prevent engine from being marked ready
-                    Log($"WARNING: Stream readiness check failed but engine will continue: {ex.Message}", LogLevel.Warning);
+                    Log($"WARNING: BarsRequest loop failed but engine will continue: {ex.Message}", LogLevel.Warning);
                 }
 
                 // Get the adapter instance and wire NT context
@@ -405,8 +421,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 // Log intent before request
-                var requestStartUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, rangeStartChicago);
-                var requestEndUtc = timeService.ConvertChicagoLocalToUtc(tradingDate, endTimeChicago);
+                // CRITICAL: Use ConstructChicagoTime + ConvertChicagoToUtc instead of deprecated ConvertChicagoLocalToUtc
+                var requestStartChicago = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
+                var requestStartUtc = timeService.ConvertChicagoToUtc(requestStartChicago);
+                var requestEndChicago = timeService.ConstructChicagoTime(tradingDate, endTimeChicago);
+                var requestEndUtc = timeService.ConvertChicagoToUtc(requestEndChicago);
                 
                 // Log BARSREQUEST_REQUESTED event
                 try
@@ -549,8 +568,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else
                 {
                     // Feed bars to engine for pre-hydration
+                    // CRITICAL: Use instrumentName (from BarsRequest) not Instrument.MasterInstrument.Name (strategy instrument)
+                    // This ensures micro futures (MYM) route to base instrument streams (YM) via canonical mapping
                     // Note: Streams should exist by now (created in engine.Start())
-                    _engine.LoadPreHydrationBars(Instrument.MasterInstrument.Name, bars, DateTimeOffset.UtcNow);
+                    _engine.LoadPreHydrationBars(instrumentName, bars, DateTimeOffset.UtcNow);
                     Log($"Loaded {bars.Count} historical bars from NinjaTrader for pre-hydration", LogLevel.Information);
                     
                     // FIX #3: Log final disposition - EXECUTED with bar count and timestamps

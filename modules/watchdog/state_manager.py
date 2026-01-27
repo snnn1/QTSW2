@@ -22,22 +22,12 @@ from .market_session import is_market_open
 
 logger = logging.getLogger(__name__)
 
-# Import slot times from matrix config (single source of truth)
-try:
-    import sys
-    from pathlib import Path
-    # Add modules path if needed
-    modules_path = Path(__file__).parent.parent.parent
-    if str(modules_path) not in sys.path:
-        sys.path.insert(0, str(modules_path))
-    from matrix.config import SLOT_ENDS
-except ImportError:
-    # Fallback if import fails
-    logger.warning("Failed to import SLOT_ENDS from matrix.config, using hardcoded fallback")
-    SLOT_ENDS = {
-        "S1": ["07:30", "08:00", "09:00"],
-        "S2": ["09:30", "10:00", "10:30", "11:00"],
-    }
+# Slot times - watchdog defines its own (standalone, no matrix dependency)
+# These match the canonical trading time slots but watchdog owns this definition
+SLOT_ENDS = {
+    "S1": ["07:30", "08:00", "09:00"],
+    "S2": ["09:30", "10:00", "10:30", "11:00"],
+}
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 

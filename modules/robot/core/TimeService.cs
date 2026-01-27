@@ -62,23 +62,25 @@ public sealed class TimeService
 
     /// <summary>
     /// Convert Chicago time to UTC (derived representation).
-    /// Use ConstructChicagoTime first, then call ToUniversalTime() or this method.
+    /// Use ConstructChicagoTime first, then call this method.
+    /// CRITICAL: Uses TimeZoneInfo.ConvertTime to ensure correct timezone conversion.
     /// </summary>
     /// <param name="chicagoTime">DateTimeOffset in Chicago timezone</param>
     /// <returns>DateTimeOffset in UTC</returns>
     public DateTimeOffset ConvertChicagoToUtc(DateTimeOffset chicagoTime)
-        => chicagoTime.ToUniversalTime();
+        => TimeZoneInfo.ConvertTime(chicagoTime, TimeZoneInfo.Utc);
 
     /// <summary>
     /// DEPRECATED: Use ConstructChicagoTime + ConvertChicagoToUtc instead.
     /// This method constructs Chicago time then converts to UTC, which is fine,
     /// but the round-trip pattern (Chicago→UTC→Chicago) should be avoided.
+    /// CRITICAL: Fixed to use TimeZoneInfo.ConvertTime instead of ToUniversalTime() for correctness.
     /// </summary>
     [Obsolete("Prefer ConstructChicagoTime + ConvertChicagoToUtc for clarity. This method is kept for backward compatibility.")]
     public DateTimeOffset ConvertChicagoLocalToUtc(DateOnly tradingDate, string hhmm)
     {
         var chicagoTime = ConstructChicagoTime(tradingDate, hhmm);
-        return chicagoTime.ToUniversalTime();
+        return TimeZoneInfo.ConvertTime(chicagoTime, TimeZoneInfo.Utc);
     }
 
     public static bool TryParseDateOnly(string yyyyMmDd, out DateOnly date)

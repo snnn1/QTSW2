@@ -3,7 +3,7 @@
  * Main stream status table with live timers
  */
 import { useState, useEffect } from 'react'
-import { formatDuration, computeTimeInState } from '../../utils/timeUtils'
+import { formatDuration, computeTimeInState } from '../../utils/timeUtils.ts'
 import { useStreamPnl } from '../../hooks/useStreamPnl'
 import type { StreamState } from '../../types/watchdog'
 
@@ -126,10 +126,23 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   <td className={`px-4 py-2 font-mono ${getTimeInStateColor(timeInState)}`}>
                     {formatDuration(timeInState)}
                   </td>
-                  <td className="px-4 py-2 font-mono">{stream.slot_time_chicago || '-'}</td>
                   <td className="px-4 py-2 font-mono">
-                    {stream.state === 'RANGE_LOCKED' && stream.range_high && stream.range_low
-                      ? `H: ${stream.range_high} / L: ${stream.range_low}`
+                    {(() => {
+                      const slotTime = stream.slot_time_chicago
+                      if (!slotTime || slotTime === '-') return '-'
+                      // Extract time portion if it's in ISO format (e.g., "2026-01-26T07:30:00-06:00" -> "07:30")
+                      if (slotTime.includes('T')) {
+                        try {
+                          const match = slotTime.match(/T(\d{2}):(\d{2})/)
+                          if (match) return `${match[1]}:${match[2]}`
+                        } catch {}
+                      }
+                      return slotTime
+                    })()}
+                  </td>
+                  <td className="px-4 py-2 font-mono">
+                    {stream.range_high !== null && stream.range_low !== null
+                      ? `${stream.range_high.toFixed(2)} / ${stream.range_low.toFixed(2)}`
                       : '-'}
                   </td>
                   <td className="px-4 py-2 font-mono">

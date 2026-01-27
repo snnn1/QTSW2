@@ -2,7 +2,7 @@
  * StreamDetailDrawer component
  * Right-side slide-out drawer with stream details
  */
-import { formatChicagoDateTime } from '../../utils/timeUtils'
+import { formatChicagoDateTime } from '../../utils/timeUtils.ts'
 import type { StreamState } from '../../types/watchdog'
 
 interface StreamDetailDrawerProps {

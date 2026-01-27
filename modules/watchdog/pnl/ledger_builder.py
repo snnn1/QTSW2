@@ -125,7 +125,8 @@ class LedgerBuilder:
             return exit_fills
         
         try:
-            with open(FRONTEND_FEED_FILE, 'r') as f:
+            # Use utf-8-sig to handle UTF-8 BOM markers
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -160,6 +161,7 @@ class LedgerBuilder:
                         if intent_id:
                             exit_fills[intent_id].append(normalized)
                     except json.JSONDecodeError:
+                        # Silently skip malformed JSON lines
                         continue
                     except Exception as e:
                         logger.debug(f"Error processing event line: {e}")
@@ -182,7 +184,8 @@ class LedgerBuilder:
             return execution_fills
         
         try:
-            with open(FRONTEND_FEED_FILE, 'r') as f:
+            # Use utf-8-sig to handle UTF-8 BOM markers
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
                 for line in f:
                     if not line.strip():
                         continue

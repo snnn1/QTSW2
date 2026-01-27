@@ -1,6 +1,7 @@
 @echo off
 REM Start Watchdog UI Frontend (Development Mode)
-REM This starts the frontend dev server and opens the browser to /watchdog
+REM Watchdog frontend runs standalone on port 5175
+REM Assumes watchdog backend is already running on port 8002
 
 cd /d "%~dp0\.."
 
@@ -10,7 +11,7 @@ echo ============================================================
 echo   Starting Watchdog UI Frontend (Development Mode)
 echo ============================================================
 echo.
-echo Make sure the backend is running on http://localhost:8001
+echo Make sure the watchdog backend is running on http://localhost:8002
 echo.
 echo Press Ctrl+C to stop the frontend.
 echo ============================================================
@@ -36,25 +37,32 @@ if not exist "node_modules" (
     echo.
 )
 
-REM Wait a moment for server to start, then open browser
-echo Starting frontend dev server...
+REM Start frontend dev server (will run in this window)
+echo Starting watchdog frontend dev server...
+echo Frontend will be available at: http://localhost:5175
 echo.
-echo Frontend will be available at: http://localhost:5173/watchdog
+echo IMPORTANT: This will open ONLY the Watchdog UI at http://localhost:5175
+echo Do NOT open dashboard (5173) or matrix (5174) - those are separate apps
 echo.
-echo Opening browser in 3 seconds...
-timeout /t 3 /nobreak >nul
-start http://localhost:5173/watchdog
+
+REM Open ONLY watchdog URL after a delay (frontend needs time to start)
+REM Wait 8 seconds for frontend to fully start, then open ONLY watchdog URL
+echo Waiting 8 seconds for frontend to start, then opening watchdog...
+timeout /t 8 /nobreak >nul
+echo Opening watchdog UI at http://localhost:5175...
+start "" "http://localhost:5175"
 
 echo.
 echo ============================================================
-echo   Watchdog UI Ready!
+echo   Watchdog UI Starting!
 echo ============================================================
 echo.
-echo Frontend: http://localhost:5173/watchdog
-echo Backend:  http://localhost:8001
+echo Watchdog Frontend: http://localhost:5175
+echo Watchdog Backend:  http://localhost:8002
 echo.
+echo Browser will open ONLY watchdog at http://localhost:5175 in 5 seconds
 echo Press Ctrl+C to stop frontend
 echo ============================================================
 echo.
 
-call npm run dev
+call npm run dev:watchdog

@@ -326,8 +326,10 @@ class EventProcessor:
             
             if trading_date and canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
+                # Pass event timestamp so state_entry_time_utc reflects when range was actually locked
                 self._state_manager.update_stream_state(
-                    trading_date, canonical_stream, "RANGE_LOCKED"
+                    trading_date, canonical_stream, "RANGE_LOCKED",
+                    state_entry_time_utc=timestamp_utc
                 )
                 # Update instrument, session, slot_time, and range values
                 key = (trading_date, canonical_stream)

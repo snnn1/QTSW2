@@ -3,7 +3,7 @@
  * Shows active intents and unprotected positions
  */
 import { useState, useEffect } from 'react'
-import { formatChicagoTime } from '../../utils/timeUtils'
+import { formatChicagoTime } from '../../utils/timeUtils.ts'
 import type { IntentExposure, UnprotectedPosition } from '../../types/watchdog'
 
 interface ActiveIntentPanelProps {

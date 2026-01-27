@@ -216,7 +216,8 @@ class WatchdogAggregator:
             run_ids_to_track = set(cursor.keys())
             
             # Also track any new run_ids we encounter
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8') as f:
+            # Use utf-8-sig to handle UTF-8 BOM markers
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
                 # If we have positions, seek to the minimum position (earliest unread)
                 if self._feed_file_positions:
                     min_pos = min(self._feed_file_positions.values())
@@ -226,6 +227,7 @@ class WatchdogAggregator:
                     f.seek(0)
                 
                 # Read new lines since last position
+                parse_errors = 0
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -246,9 +248,14 @@ class WatchdogAggregator:
                             # Track this run_id
                             run_ids_to_track.add(run_id)
                     
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse JSON line: {e}")
+                    except json.JSONDecodeError:
+                        # Silently skip malformed JSON lines
+                        parse_errors += 1
                         continue
+                
+                # Log parse errors only once per read, not per line
+                if parse_errors > 0:
+                    logger.debug(f"Skipped {parse_errors} malformed JSON lines in feed file")
                 
                 # Update file positions for all tracked run_ids
                 current_pos = f.tell()
@@ -270,7 +277,8 @@ class WatchdogAggregator:
             return events
         
         try:
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8') as f:
+            # Use utf-8-sig to handle UTF-8 BOM markers
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
                 for line in f:
                     line = line.strip()
                     if not line:
@@ -285,6 +293,7 @@ class WatchdogAggregator:
                             events.append(event)
                     
                     except json.JSONDecodeError:
+                        # Silently skip malformed JSON lines
                         continue
         
         except Exception as e:
@@ -388,6 +397,16 @@ class WatchdogAggregator:
                     if trading_date != current_trading_date:
                         continue
                     
+                    state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
+                    slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
+                    # Extract time portion from slot_time_chicago if it's in ISO format
+                    if slot_time_chicago and 'T' in slot_time_chicago:
+                        try:
+                            slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
+                            slot_time_chicago = slot_dt.strftime("%H:%M")
+                        except Exception:
+                            pass  # Keep original if parsing fails
+                    
                     streams.append({
                         "trading_date": trading_date,
                         "stream": stream,
@@ -396,13 +415,22 @@ class WatchdogAggregator:
                         "state": getattr(info, 'state', ''),
                         "committed": getattr(info, 'committed', False),
                         "commit_reason": getattr(info, 'commit_reason', None),
-                        "slot_time_chicago": getattr(info, 'slot_time_chicago', None) or "",
+                        "slot_time_chicago": slot_time_chicago,
                         "slot_time_utc": getattr(info, 'slot_time_utc', None) or "",
                         "range_high": getattr(info, 'range_high', None),
                         "range_low": getattr(info, 'range_low', None),
                         "freeze_close": getattr(info, 'freeze_close', None),
                         "range_invalidated": getattr(info, 'range_invalidated', False),
-                        "state_entry_time_utc": getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc)).isoformat()
+                        "state_entry_time_utc": state_entry_time_utc.isoformat(),
+                        # Range lock time: when the range was locked (only for RANGE_LOCKED state)
+                        "range_locked_time_utc": (
+                            state_entry_time_utc.isoformat()
+                            if getattr(info, 'state', '') == "RANGE_LOCKED" else None
+                        ),
+                        "range_locked_time_chicago": (
+                            state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                            if getattr(info, 'state', '') == "RANGE_LOCKED" else None
+                        )
                     })
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
