@@ -1233,12 +1233,13 @@ self.onmessage = function(e) {
       }
       
       case WORKER_MESSAGE_TYPES.CALCULATE_TIMETABLE: {
-        if (!self.columnarData) {
-          self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: 'CALCULATE_TIMETABLE: Data not initialized', operation: 'CALCULATE_TIMETABLE' } })
-          return
-        }
-        
-        const { streamFilters = {}, currentTradingDay, requestId } = payload
+        try {
+          if (!self.columnarData) {
+            self.postMessage({ type: WORKER_RESPONSE_TYPES.ERROR, payload: { message: 'CALCULATE_TIMETABLE: Data not initialized', operation: 'CALCULATE_TIMETABLE' } })
+            return
+          }
+          
+          const { streamFilters = {}, currentTradingDay, requestId } = payload
         
         const DateColumn = self.columnarData.getColumn('Date')
         const trade_date = self.columnarData.getColumn('trade_date')
@@ -1386,6 +1387,57 @@ self.onmessage = function(e) {
           console.log(`[Worker] No ES1 rows found for date ${dataDateToUse}`)
         }
         
+        // CRITICAL FIX: To determine the time slot for a given date, we need to look at the PREVIOUS day's row.
+        // The Time Change column in the previous day's row tells us what time to use today.
+        // If Time Change is empty, the time stays the same (use previous day's Time value).
+        // This ensures that time slots only change on losses, not on wins.
+        // Calculate previous day's date
+        let previousDateStr = null
+        let previousDateParsed = null
+        if (filterDate) {
+          const prevDate = new Date(filterDate)
+          prevDate.setDate(prevDate.getDate() - 1)
+          previousDateParsed = prevDate
+          previousDateStr = dateToYYYYMMDD(prevDate)
+        }
+        
+        // First pass: Collect previous day's rows for time slot determination
+        const previousDayRows = new Map() // stream -> {time, timeChange}
+        console.log('[Worker] Collecting previous day rows:', {
+          filterDate: filterDate ? dateToYYYYMMDD(filterDate) : null,
+          previousDateStr,
+          currentTradingDayStr,
+          latestDateStr
+        })
+        for (let i = 0; i < self.columnarData.length; i++) {
+          const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
+          if (!dateValue) continue
+          
+          const parsed = parseDateCached(dateValue)
+          if (!parsed) continue
+          
+          const dayKey = dateToYYYYMMDD(parsed)
+          // Look for previous day's rows
+          if (previousDateStr && dayKey === previousDateStr) {
+            const stream = Stream[i] || ''
+            const time = Time[i] || ''
+            const timeChange = TimeChange[i] || ''
+            
+            if (stream && time && !previousDayRows.has(stream)) {
+              previousDayRows.set(stream, { time, timeChange })
+              if (stream === 'NQ2') {
+                console.log(`[Worker] Found NQ2 previous day row:`, {
+                  date: dayKey,
+                  time,
+                  timeChange: timeChange || '(empty)'
+                })
+              }
+            }
+          }
+        }
+        console.log('[Worker] Previous day rows collected:', Array.from(previousDayRows.keys()))
+        
+        // Second pass: Process current day's rows (for filters) but use previous day's time slot
         for (let i = 0; i < self.columnarData.length; i++) {
           const dateValue = getCanonicalDateValue(trade_date, DateColumn, i)
           if (!dateValue) continue
@@ -1413,28 +1465,55 @@ self.onmessage = function(e) {
             continue
           }
           
-          // Use Time Change if available, otherwise use Time
-          // Time Change can be either:
-          // 1. Just the new time (e.g., "08:00") - current format
-          // 2. "old -> new" format (e.g., "07:30 -> 08:00") - backward compatibility
-          // NOTE: If 07:30 is filtered, sequencer never selects it, so Time column is already correct
-          let displayTime = time
-          if (timeChange && timeChange.trim()) {
-            if (timeChange.includes('->')) {
-              // Backward compatibility: parse "old -> new" format
-              const parts = timeChange.split('->')
-              if (parts.length === 2) {
-                displayTime = parts[1].trim()
+          // CRITICAL FIX: Get time from PREVIOUS day's row
+          // The sequencer sets Time Change only when there's a LOSS
+          // Time Change in previous day's row tells us what time to use TODAY
+          // If Time Change is empty (WIN/BE/NoTrade), time stays the same (use previous day's Time value)
+          // This ensures time slots only change on losses, not on wins
+          let displayTime = time // Default fallback
+          const previousDayRow = previousDayRows.get(stream)
+          if (previousDayRow) {
+            // Use previous day's Time Change if it exists (this is the time for today)
+            const prevTime = previousDayRow.time
+            const prevTimeChange = previousDayRow.timeChange || ''
+            
+            if (prevTimeChange && prevTimeChange.trim()) {
+              // Time Change exists → use it (time changed due to loss)
+              if (prevTimeChange.includes('->')) {
+                // Backward compatibility: parse "old -> new" format
+                const parts = prevTimeChange.split('->')
+                if (parts.length === 2) {
+                  displayTime = parts[1].trim()
+                }
+              } else {
+                // Current format: Time Change is just the new time
+                displayTime = prevTimeChange.trim()
               }
             } else {
-              // Current format: Time Change is just the new time
-              displayTime = timeChange.trim()
+              // Time Change is empty → time stays the same (use previous day's Time value)
+              displayTime = prevTime
             }
+          } else {
+            // No previous day data found, fall back to current day's Time
+            // This handles the case where we're generating the first day's timetable
+            displayTime = time
           }
           
-          // Debug logging for es1 to understand what's being read
-          if (stream === 'ES1') {
-            console.log(`[Worker] ES1 timetable processing: date=${dayKey}, Time=${time}, TimeChange="${timeChange}", displayTime=${displayTime}, dataDateToUse=${dataDateToUse}`)
+          // Debug logging for NQ2 and ES1 to understand what's being read
+          if (stream === 'NQ2' || stream === 'ES1') {
+            console.log(`[Worker] ${stream} timetable processing:`, {
+              date: dayKey,
+              currentTime: time,
+              currentTimeChange: timeChange,
+              previousDayRow: previousDayRow ? {
+                time: previousDayRow.time,
+                timeChange: previousDayRow.timeChange
+              } : null,
+              displayTime,
+              dataDateToUse,
+              previousDateStr,
+              filterDate: filterDate ? dateToYYYYMMDD(filterDate) : null
+            })
           }
           
           // Check filters and determine enabled status
@@ -1537,7 +1616,8 @@ self.onmessage = function(e) {
           })
         }
         
-        // Second pass: Ensure ALL 14 streams are present (add missing ones as blocked)
+        // Second pass: Ensure ALL 14 streams are present (add missing ones)
+        // CRITICAL FIX: If stream exists in previous day but not current day, use previous day's time slot
         const allStreams = ['ES1', 'ES2', 'GC1', 'GC2', 'CL1', 'CL2', 'NQ1', 'NQ2', 'NG1', 'NG2', 'YM1', 'YM2', 'RTY1', 'RTY2']
         const sessionTimeSlots = {
           'S1': ['07:30', '08:00', '09:00'],
@@ -1546,42 +1626,81 @@ self.onmessage = function(e) {
         
         for (const streamId of allStreams) {
           if (!seenStreams.has(streamId)) {
-            // Stream not in master matrix for this date
+            // Stream not in master matrix for this date - check if it exists in previous day
             const session = streamId.endsWith('1') ? 'S1' : 'S2'
             
-            // Get stream and master filters to determine excluded times
+            // Get stream and master filters (needed for both previous day logic and default time selection)
             const streamFilter = streamFilters[streamId]
             const masterFilter = streamFilters['master']
             
-            // Collect all exclude_times (stream-specific + master)
-            const excludeTimesList = []
-            if (streamFilter?.exclude_times?.length > 0) {
-              excludeTimesList.push(...streamFilter.exclude_times)
-            }
-            if (masterFilter?.exclude_times?.length > 0) {
-              excludeTimesList.push(...masterFilter.exclude_times)
+            // CRITICAL FIX: Check if stream exists in previous day's data
+            let displayTime = ''
+            let defaultTime = '' // Initialize defaultTime here so it's always in scope
+            const previousDayRow = previousDayRows.get(streamId)
+            if (previousDayRow) {
+              // Stream exists in previous day - use previous day's time slot logic
+              const prevTime = previousDayRow.time
+              const prevTimeChange = previousDayRow.timeChange || ''
+              
+              if (prevTimeChange && prevTimeChange.trim()) {
+                // Time Change exists → use it (time changed due to loss)
+                if (prevTimeChange.includes('->')) {
+                  const parts = prevTimeChange.split('->')
+                  if (parts.length === 2) {
+                    displayTime = parts[1].trim()
+                  } else {
+                    displayTime = prevTimeChange.trim()
+                  }
+                } else {
+                  displayTime = prevTimeChange.trim()
+                }
+              } else {
+                // Time Change is empty → time stays the same (use previous day's Time value)
+                displayTime = prevTime
+              }
+              
+              if (streamId === 'NQ2') {
+                console.log(`[Worker] NQ2 missing from current day, using previous day:`, {
+                  prevTime,
+                  prevTimeChange: prevTimeChange || '(empty)',
+                  displayTime
+                })
+              }
             }
             
-            // Select first NON-FILTERED time from session slots
-            // If 07:30 is filtered, sequencer never selects it, so we shouldn't either
-            let defaultTime = ''
-            if (excludeTimesList.length > 0) {
-              const excludeTimesNormalized = excludeTimesList.map(t => normalizeTime(t))
-              const availableTimes = sessionTimeSlots[session] || []
-              // Find first time that's NOT in exclude_times
-              for (const timeSlot of availableTimes) {
-                if (!excludeTimesNormalized.includes(normalizeTime(timeSlot))) {
-                  defaultTime = timeSlot
-                  break
+            // If no previous day data, fall back to default time selection
+            if (!displayTime) {
+              // Collect all exclude_times (stream-specific + master)
+              
+              // Collect all exclude_times (stream-specific + master)
+              const excludeTimesList = []
+              if (streamFilter?.exclude_times?.length > 0) {
+                excludeTimesList.push(...streamFilter.exclude_times)
+              }
+              if (masterFilter?.exclude_times?.length > 0) {
+                excludeTimesList.push(...masterFilter.exclude_times)
+              }
+              
+              // Select first NON-FILTERED time from session slots
+              // If 07:30 is filtered, sequencer never selects it, so we shouldn't either
+              if (excludeTimesList.length > 0) {
+                const excludeTimesNormalized = excludeTimesList.map(t => normalizeTime(t))
+                const availableTimes = sessionTimeSlots[session] || []
+                // Find first time that's NOT in exclude_times
+                for (const timeSlot of availableTimes) {
+                  if (!excludeTimesNormalized.includes(normalizeTime(timeSlot))) {
+                    defaultTime = timeSlot
+                    break
+                  }
                 }
+                // If all times are filtered, use first time anyway (will be blocked below)
+                if (!defaultTime && availableTimes.length > 0) {
+                  defaultTime = availableTimes[0]
+                }
+              } else {
+                // No exclude_times, use first available time
+                defaultTime = sessionTimeSlots[session]?.[0] || ''
               }
-              // If all times are filtered, use first time anyway (will be blocked below)
-              if (!defaultTime && availableTimes.length > 0) {
-                defaultTime = availableTimes[0]
-              }
-            } else {
-              // No exclude_times, use first available time
-              defaultTime = sessionTimeSlots[session]?.[0] || ''
             }
             
             // If displayed date doesn't exist in matrix, we can't determine enabled status
@@ -1655,14 +1774,59 @@ self.onmessage = function(e) {
               }
             }
             
+            // Use displayTime from previous day if available, otherwise use defaultTime
+            let finalTime = displayTime || defaultTime
+            
+            // CRITICAL: If finalTime is still empty, use first session time as fallback
+            if (!finalTime) {
+              finalTime = sessionTimeSlots[session]?.[0] || ''
+              if (streamId === 'NQ2') {
+                console.warn(`[Worker] NQ2 finalTime was empty, using fallback: ${finalTime}`)
+              }
+            }
+            
             // If still enabled but no data, mark as needing backend generation
-            if (enabled && !displayedDateExists) {
+            if (enabled && !displayedDateExists && !previousDayRow && !finalTime) {
               blockReason = 'requires_backend_rs_calculation'
+            }
+            
+            // CRITICAL: Check if the final time is in exclude_times filter (if we're using previous day's time)
+            if (enabled && displayTime && displayTime !== defaultTime) {
+              const normalizedDisplayTime = normalizeTime(displayTime)
+              
+              // Check stream-specific exclude_times
+              if (streamFilter?.exclude_times?.length > 0) {
+                const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
+                if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+                  enabled = false
+                  blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
+                }
+              }
+              
+              // Check master exclude_times if stream filter didn't block it
+              if (enabled && masterFilter?.exclude_times?.length > 0) {
+                const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
+                if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+                  enabled = false
+                  blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
+                }
+              }
+            }
+            
+            if (streamId === 'NQ2') {
+              console.log(`[Worker] NQ2 second pass result:`, {
+                previousDayRow: previousDayRow ? { time: previousDayRow.time, timeChange: previousDayRow.timeChange || '(empty)' } : null,
+                displayTime,
+                defaultTime,
+                finalTime,
+                enabled,
+                session
+              })
             }
             
             seenStreams.set(streamId, {
               Stream: streamId,
-              Time: defaultTime,
+              Time: finalTime,
               Enabled: enabled,
               BlockReason: blockReason
             })
@@ -1727,6 +1891,18 @@ self.onmessage = function(e) {
             requestId
           } 
         })
+        } catch (error) {
+          console.error('[Worker] Error calculating timetable:', error)
+          self.postMessage({ 
+            type: WORKER_RESPONSE_TYPES.ERROR, 
+            payload: { 
+              message: `CALCULATE_TIMETABLE error: ${error.message}`,
+              operation: 'CALCULATE_TIMETABLE',
+              error: error.stack,
+              requestId
+            } 
+          })
+        }
         break
       }
       

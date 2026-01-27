@@ -35,6 +35,12 @@ public sealed class NotificationService : IDisposable
     private const int WORKER_SLEEP_MS = 100;
     private const int HEARTBEAT_INTERVAL_SECONDS = 60;
     private const int STALL_DETECTION_SECONDS = 120;
+    private const int EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS = 300; // 5 minutes between emergency notifications of same type
+    
+    // Emergency notification rate limiting: track last notification time per event type (cross-run persistence)
+    // This prevents spam when the same critical event happens across multiple engine runs
+    private readonly Dictionary<string, DateTimeOffset> _lastEmergencyNotifyUtcByEventType = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _rateLimitLock = new();
     
     private readonly string _projectRoot;
     private readonly HealthMonitorConfig _config;
@@ -59,6 +65,34 @@ public sealed class NotificationService : IDisposable
             }
             
             return instance;
+        }
+    }
+    
+    /// <summary>
+    /// Check if an emergency notification (priority 2) should be rate limited.
+    /// Returns true if notification should be sent, false if rate limited.
+    /// Thread-safe, uses singleton state for cross-run persistence.
+    /// </summary>
+    public bool ShouldSendEmergencyNotification(string eventType)
+    {
+        if (_disposed) return false;
+        
+        lock (_rateLimitLock)
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            
+            if (_lastEmergencyNotifyUtcByEventType.TryGetValue(eventType, out var lastNotify))
+            {
+                var timeSinceLastNotify = (utcNow - lastNotify).TotalSeconds;
+                if (timeSinceLastNotify < EMERGENCY_NOTIFY_MIN_INTERVAL_SECONDS)
+                {
+                    return false; // Rate limited
+                }
+            }
+            
+            // Update timestamp immediately to prevent other calls from sending
+            _lastEmergencyNotifyUtcByEventType[eventType] = utcNow;
+            return true; // Not rate limited
         }
     }
     

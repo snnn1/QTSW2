@@ -1,3 +1,7 @@
+// CRITICAL: Define NINJATRADER for NinjaTrader's compiler
+// NinjaTrader compiles to tmp folder and may not respect .csproj DefineConstants
+#define NINJATRADER
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -19,7 +23,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed class NinjaTraderSimAdapter : IExecutionAdapter
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 {
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
@@ -33,6 +37,12 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     
     // Fill callback: intentId -> callback action (for protective order submission)
     private readonly ConcurrentDictionary<string, Action<string, decimal, int, DateTimeOffset>> _fillCallbacks = new();
+    
+    // Intent policy tracking: intentId -> policy expectation
+    private readonly Dictionary<string, IntentPolicyExpectation> _intentPolicy = new();
+    
+    // Track which intents have already triggered emergency (idempotent)
+    private readonly HashSet<string> _emergencyTriggered = new();
     
     // NT Account and Instrument references (injected from Strategy host)
     private object? _ntAccount; // NinjaTrader.Cbi.Account
@@ -56,7 +66,7 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         _executionJournal = executionJournal;
         
         // Note: SIM account verification happens when NT context is set via SetNTContext()
-        // This allows adapter to work in both harness (mock) and NT Strategy (real) contexts
+        // Mock mode has been removed - only real NT API execution is supported
     }
     
     /// <summary>
@@ -92,60 +102,30 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
 
     /// <summary>
     /// STEP 1: Verify we're connected to NT Sim account (fail closed if not).
-    /// Routes to real NT API when NT context is available, otherwise uses mock for harness testing.
+    /// REQUIRES: NINJATRADER preprocessor directive and NT context to be set.
     /// </summary>
     private void VerifySimAccount()
     {
-        // If NT context is set, use real NT API verification (when compiled with NINJATRADER)
-#if NINJATRADER
-        if (_ntContextSet)
-        {
-            VerifySimAccountReal();
-            return;
-        }
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
 #endif
 
-        // Otherwise, use mock for harness testing (will fail in real NT environment)
-        try
+        if (!_ntContextSet)
         {
-            // Mock NT account resolution (for harness testing only)
-            var mockAccount = new { IsSimAccount = true, Name = "Sim101" };
-            _ntAccount = mockAccount;
-            
-            if (_ntAccount == null)
-            {
-                var error = "NT account is null - cannot verify Sim account";
-                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                    new { reason = "NOT_SIM_ACCOUNT", error }));
-                throw new InvalidOperationException(error);
-            }
-            
-            // Mock: assume Sim for harness testing
-            var isSim = true;
-            
-            if (!isSim)
-            {
-                var error = $"Account is not Sim account - aborting execution";
-                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                    new { reason = "NOT_SIM_ACCOUNT", account_name = "UNKNOWN", error }));
-                throw new InvalidOperationException(error);
-            }
-            
-            _simAccountVerified = true;
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "SIM_ACCOUNT_VERIFIED", state: "ENGINE",
-                new { account_name = "Sim101", note = "SIM account verification passed (MOCK - harness mode)" }));
-        }
-        catch (InvalidOperationException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            var error = $"SIM account verification failed: {ex.Message}";
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                new { reason = "SIM_ACCOUNT_VERIFICATION_FAILED", error }));
-            throw new InvalidOperationException(error, ex);
+                new { reason = "NT_CONTEXT_NOT_SET", error }));
+            throw new InvalidOperationException(error);
         }
+
+        VerifySimAccountReal();
     }
 
     /// <summary>
@@ -182,54 +162,34 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        try
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
         {
-            // STEP 2: Route to real NT API if context is set, otherwise use mock
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
-            }
+            error,
+            reason = "NINJATRADER_NOT_DEFINED"
+        }));
+        return OrderSubmissionResult.FailureResult(error, utcNow);
 #endif
 
-            // Mock implementation for harness testing
-            var mockOrderId = $"NT_{intentId}_{utcNow:yyyyMMddHHmmss}";
-            var orderAction = direction == "Long" ? "Buy" : "SellShort";
-            // Determine order type: use entryOrderType if provided, otherwise infer from entryPrice
-            var orderType = entryOrderType ?? (entryPrice.HasValue ? "Limit" : "Market");
-            
-            var orderInfo = new OrderInfo
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
-                IntentId = intentId,
-                Instrument = instrument,
-                OrderId = mockOrderId,
-                OrderType = "ENTRY",
-                Direction = direction,
-                Quantity = quantity,
-                Price = entryPrice,
-                State = "SUBMITTED",
-                IsEntryOrder = true,
-                FilledQuantity = 0
-            };
-            _orderMap[intentId] = orderInfo;
-            
-            var acknowledgedAt = utcNow.AddMilliseconds(50);
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", mockOrderId, acknowledgedAt);
-            
-            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
-            {
-                broker_order_id = mockOrderId,
-                order_type = "ENTRY",
-                direction,
-                entry_price = entryPrice,
-                quantity,
-                account = "SIM",
-                order_action = orderAction,
-                order_type_nt = orderType,
-                note = "MOCK - harness mode"
+                error,
+                reason = "NT_CONTEXT_NOT_SET"
             }));
-            
-            return OrderSubmissionResult.SuccessResult(mockOrderId, utcNow, acknowledgedAt);
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
+        try
+        {
+            return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
         }
         catch (Exception ex)
         {
@@ -283,65 +243,36 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        try
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
         {
-            // Route to real NT API if context is set, otherwise use mock
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return SubmitStopEntryOrderReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
-            }
+            error,
+            reason = "NINJATRADER_NOT_DEFINED",
+            order_type = "ENTRY_STOP"
+        }));
+        return OrderSubmissionResult.FailureResult(error, utcNow);
 #endif
 
-            // Mock implementation for harness testing
-            var mockOrderId = $"NT_STOP_{intentId}_{utcNow:yyyyMMddHHmmss}";
-            var orderAction = direction == "Long" ? "Buy" : "SellShort";
-
-            var orderInfo = new OrderInfo
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
-                IntentId = intentId,
-                Instrument = instrument,
-                OrderId = mockOrderId,
-                OrderType = "ENTRY_STOP",
-                Direction = direction,
-                Quantity = quantity,
-                Price = stopPrice,
-                State = "SUBMITTED",
-                IsEntryOrder = true,
-                FilledQuantity = 0
-            };
-            _orderMap[intentId] = orderInfo;
-
-            var acknowledgedAt = utcNow.AddMilliseconds(50);
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY_STOP", mockOrderId, acknowledgedAt);
-
-            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
-            {
-                broker_order_id = mockOrderId,
-                order_type = "ENTRY_STOP",
-                direction,
-                stop_price = stopPrice,
-                quantity,
-                oco_group = ocoGroup,
-                account = "SIM",
-                order_action = orderAction,
-                order_type_nt = "StopMarket",
-                note = "MOCK - harness mode"
+                error,
+                reason = "NT_CONTEXT_NOT_SET",
+                order_type = "ENTRY_STOP"
             }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
 
-            // Alias event for easier grepping (user-facing)
-            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMITTED", new
-            {
-                broker_order_id = mockOrderId,
-                order_type = "ENTRY_STOP",
-                direction,
-                stop_price = stopPrice,
-                quantity,
-                oco_group = ocoGroup,
-                account = "SIM"
-            }));
-
-            return OrderSubmissionResult.SuccessResult(mockOrderId, utcNow, acknowledgedAt);
+        try
+        {
+            return SubmitStopEntryOrderReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
         }
         catch (Exception ex)
         {
@@ -365,14 +296,15 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     /// </summary>
     public void HandleOrderUpdate(object order, object orderUpdate)
     {
-#if NINJATRADER
-        // Real NT implementation in .NT.cs file
-        HandleOrderUpdateReal(order, orderUpdate);
-#else
-        // Mock: No-op in harness mode
-        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "ORDER_UPDATE_MOCK", state: "ENGINE",
-            new { note = "OrderUpdate received (MOCK - harness mode)" }));
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
 #endif
+        HandleOrderUpdateReal(order, orderUpdate);
     }
 
     /// <summary>
@@ -381,14 +313,15 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     /// </summary>
     public void HandleExecutionUpdate(object execution, object order)
     {
-#if NINJATRADER
-        // Real NT implementation in .NT.cs file
-        HandleExecutionUpdateReal(execution, order);
-#else
-        // Mock: No-op in harness mode
-        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_UPDATE_MOCK", state: "ENGINE",
-            new { note = "ExecutionUpdate received (MOCK - harness mode)" }));
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
 #endif
+        HandleExecutionUpdateReal(execution, order);
     }
     
     /// <summary>
@@ -620,6 +553,58 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     {
         _intentMap[intent.ComputeIntentId()] = intent;
     }
+    
+    /// <summary>
+    /// Register intent policy expectation for quantity invariant tracking.
+    /// Called by StreamStateMachine after intent creation, before order submission.
+    /// 
+    /// VERIFICATION CHECKLIST:
+    /// 1. Check for INTENT_EXECUTION_EXPECTATION_DECLARED event after intent creation
+    ///    - Should show policy_base_size and policy_max_size matching policy file
+    /// 2. Check for INTENT_POLICY_REGISTERED event in adapter
+    ///    - Should match INTENT_EXECUTION_EXPECTATION_DECLARED values
+    /// 3. Check for ENTRY_SUBMIT_PRECHECK before every order submission
+    ///    - Should show allowed=true for valid submissions
+    ///    - Should show allowed=false and reason for blocked submissions
+    /// 4. Check for ORDER_CREATED_VERIFICATION after CreateOrder()
+    ///    - Should show verified=true for correct orders
+    ///    - Should show verified=false and QUANTITY_MISMATCH_EMERGENCY for mismatches
+    /// 5. Check for INTENT_FILL_UPDATE on every fill
+    ///    - Should show cumulative_filled_qty increasing
+    ///    - Should show overfill=false for normal fills
+    ///    - Should show overfill=true and INTENT_OVERFILL_EMERGENCY for overfills
+    /// 6. Verify end-to-end: policy_base_size → expected_quantity → order_quantity → cumulative_filled_qty
+    ///    - All should match for successful execution
+    /// </summary>
+    internal void RegisterIntentPolicy(
+        string intentId, 
+        int expectedQty, 
+        int maxQty, 
+        string canonical, 
+        string execution, 
+        string policySource = "EXECUTION_POLICY_FILE")
+    {
+        _intentPolicy[intentId] = new IntentPolicyExpectation
+        {
+            ExpectedQuantity = expectedQty,
+            MaxQuantity = maxQty,
+            PolicySource = policySource,
+            CanonicalInstrument = canonical,
+            ExecutionInstrument = execution
+        };
+        
+        // Emit log event
+        _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, execution, 
+            "INTENT_POLICY_REGISTERED", new
+        {
+            intent_id = intentId,
+            canonical_instrument = canonical,
+            execution_instrument = execution,
+            expected_qty = expectedQty,
+            max_qty = maxQty,
+            source = policySource
+        }));
+    }
 
     /// <summary>
     /// STEP 4: Protective Orders (ON FILL ONLY)
@@ -648,32 +633,36 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        try
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
         {
-            // STEP 4: Route to real NT API if context is set
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, utcNow);
-            }
+            error,
+            reason = "NINJATRADER_NOT_DEFINED",
+            order_type = "PROTECTIVE_STOP"
+        }));
+        return OrderSubmissionResult.FailureResult(error, utcNow);
 #endif
 
-            // Mock implementation for harness testing
-            var mockOrderId = $"NT_{intentId}_STOP_{utcNow:yyyyMMddHHmmss}";
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "STOP", mockOrderId, utcNow);
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
-                broker_order_id = mockOrderId,
-                order_type = "PROTECTIVE_STOP",
-                direction,
-                stop_price = stopPrice,
-                quantity,
-                account = "SIM",
-                note = "MOCK - harness mode"
+                error,
+                reason = "NT_CONTEXT_NOT_SET",
+                order_type = "PROTECTIVE_STOP"
             }));
-            
-            return OrderSubmissionResult.SuccessResult(mockOrderId, utcNow, utcNow);
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
+        try
+        {
+            return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, utcNow);
         }
         catch (Exception ex)
         {
@@ -714,32 +703,36 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        try
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
         {
-            // STEP 4: Route to real NT API if context is set
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, utcNow);
-            }
+            error,
+            reason = "NINJATRADER_NOT_DEFINED",
+            order_type = "TARGET"
+        }));
+        return OrderSubmissionResult.FailureResult(error, utcNow);
 #endif
 
-            // Mock implementation for harness testing
-            var mockOrderId = $"NT_{intentId}_TARGET_{utcNow:yyyyMMddHHmmss}";
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "TARGET", mockOrderId, utcNow);
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
-                broker_order_id = mockOrderId,
-                order_type = "TARGET",
-                direction,
-                target_price = targetPrice,
-                quantity,
-                account = "SIM",
-                note = "MOCK - harness mode"
+                error,
+                reason = "NT_CONTEXT_NOT_SET",
+                order_type = "TARGET"
             }));
-            
-            return OrderSubmissionResult.SuccessResult(mockOrderId, utcNow, utcNow);
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
+        try
+        {
+            return SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, utcNow);
         }
         catch (Exception ex)
         {
@@ -792,25 +785,32 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
                 return OrderModificationResult.FailureResult(error, utcNow);
             }
             
-            // STEP 5: Route to real NT API if context is set
-#if NINJATRADER
-            if (_ntContextSet)
+#if !NINJATRADER
+            var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                       "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_FAIL", new
             {
-                return ModifyStopToBreakEvenReal(intentId, instrument, beStopPrice, utcNow);
-            }
+                error,
+                reason = "NINJATRADER_NOT_DEFINED"
+            }));
+            return OrderModificationResult.FailureResult(error, utcNow);
 #endif
 
-            // Mock implementation for harness testing
-            _executionJournal.RecordBEModification(intentId, "", "", beStopPrice, utcNow);
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_SUCCESS", new
+            if (!_ntContextSet)
             {
-                be_stop_price = beStopPrice,
-                account = "SIM",
-                note = "MOCK - harness mode"
-            }));
-            
-            return OrderModificationResult.SuccessResult(utcNow);
+                var error = "CRITICAL: NT context is not set. " +
+                           "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                           "Mock mode has been removed - only real NT API execution is supported.";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_FAIL", new
+                {
+                    error,
+                    reason = "NT_CONTEXT_NOT_SET"
+                }));
+                return OrderModificationResult.FailureResult(error, utcNow);
+            }
+
+            return ModifyStopToBreakEvenReal(intentId, instrument, beStopPrice, utcNow);
         }
         catch (Exception ex)
         {
@@ -841,21 +841,34 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return FlattenResult.FailureResult(error, utcNow);
         }
 
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAIL", new
+        {
+            error,
+            reason = "NINJATRADER_NOT_DEFINED"
+        }));
+        return FlattenResult.FailureResult(error, utcNow);
+#endif
+
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAIL", new
+            {
+                error,
+                reason = "NT_CONTEXT_NOT_SET"
+            }));
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+
         try
         {
-            // In NT8 API:
-            // var position = _ntAccount.GetPosition(instrument);
-            // if (position.MarketPosition != MarketPosition.Flat) {
-            //     _ntAccount.Flatten(instrument);
-            // }
-            
-            // Mock flatten
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_SUCCESS", new
-            {
-                account = "SIM"
-            }));
-            
-            return FlattenResult.SuccessResult(utcNow);
+            return FlattenIntentReal(intentId, instrument, utcNow);
         }
         catch (Exception ex)
         {
@@ -871,56 +884,74 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
 
     public int GetCurrentPosition(string instrument)
     {
-        // In NT8 API:
-        // var position = _ntAccount?.GetPosition(instrument);
-        // return position?.Quantity ?? 0;
-        
-        // Mock: return 0
-        return 0;
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
+#endif
+
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+                new { reason = "NT_CONTEXT_NOT_SET", error }));
+            throw new InvalidOperationException(error);
+        }
+
+        return GetCurrentPositionReal(instrument);
     }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {
-        // Route to real NT API if context is set, otherwise use mock
-#if NINJATRADER
-        if (_ntContextSet)
-        {
-            return GetAccountSnapshotReal(utcNow);
-        }
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
 #endif
-        
-        // Mock implementation for harness testing
-        return new AccountSnapshot
+
+        if (!_ntContextSet)
         {
-            Positions = new List<PositionSnapshot>(),
-            WorkingOrders = new List<WorkingOrderSnapshot>()
-        };
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+                new { reason = "NT_CONTEXT_NOT_SET", error }));
+            throw new InvalidOperationException(error);
+        }
+
+        return GetAccountSnapshotReal(utcNow);
     }
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
-        // Route to real NT API if context is set, otherwise use mock
-#if NINJATRADER
-        if (_ntContextSet)
-        {
-            CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
-            return;
-        }
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
 #endif
-        
-        // Mock implementation for harness testing
-        var robotOwnedOrders = snap.WorkingOrders?.Where(o => 
-            (!string.IsNullOrEmpty(o.Tag) && o.Tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) ||
-            (!string.IsNullOrEmpty(o.OcoGroup) && o.OcoGroup.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
-        ).ToList() ?? new List<WorkingOrderSnapshot>();
-        
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_MOCK", state: "ENGINE",
-            new
-            {
-                robot_owned_count = robotOwnedOrders.Count,
-                robot_owned_order_ids = robotOwnedOrders.Select(o => o.OrderId).ToList(),
-                note = "MOCK - harness mode"
-            }));
+
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+                new { reason = "NT_CONTEXT_NOT_SET", error }));
+            throw new InvalidOperationException(error);
+        }
+
+        CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
     }
 
     /// <summary>
@@ -985,6 +1016,61 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
     }
 
     /// <summary>
+    /// Trigger quantity emergency handler (idempotent).
+    /// Cancels orders, flattens intent, and stands down stream.
+    /// </summary>
+    private void TriggerQuantityEmergency(string intentId, string emergencyType, DateTimeOffset utcNow, Dictionary<string, object> details)
+    {
+        // Idempotent: only trigger once per intent unless reason changes
+        if (_emergencyTriggered.Contains(intentId))
+        {
+            // Already triggered - log but don't repeat actions
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", 
+                $"{emergencyType}_REPEAT", new
+            {
+                intent_id = intentId,
+                note = "Emergency already triggered for this intent"
+            }));
+            return;
+        }
+        
+        _emergencyTriggered.Add(intentId);
+        
+        // Cancel all remaining intent orders
+        CancelIntentOrders(intentId, utcNow);
+        
+        // Flatten intent exposure
+        if (_intentMap.TryGetValue(intentId, out var intent))
+        {
+            Flatten(intentId, intent.Instrument, utcNow);
+        }
+        
+        // Emit emergency log
+        var emergencyPayload = new Dictionary<string, object>(details)
+        {
+            { "intent_id", intentId },
+            { "action_taken", new[] { "CANCEL_ORDERS", "FLATTEN_INTENT" } }
+        };
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", emergencyType, emergencyPayload));
+        
+        // Emit notification (highest priority)
+        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+        if (notificationService != null)
+        {
+            var title = $"EMERGENCY: {emergencyType} - {intentId}";
+            var reason = details.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() ?? "Unknown" : "Unknown";
+            var message = $"Quantity invariant violated: {reason}. Orders cancelled, position flattened.";
+            notificationService.EnqueueNotification($"{emergencyType}:{intentId}", title, message, priority: 2); // Emergency priority
+        }
+        
+        // Stand down stream/intent (via callback)
+        if (_intentMap.TryGetValue(intentId, out var intentForCallback))
+        {
+            _standDownStreamCallback?.Invoke(intentForCallback.Stream, utcNow, emergencyType);
+        }
+    }
+    
+    /// <summary>
     /// Cancel orders for a specific intent only.
     /// </summary>
     public bool CancelIntentOrders(string intentId, DateTimeOffset utcNow)
@@ -996,34 +1082,28 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return false;
         }
         
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_BLOCKED", state: "ENGINE",
+            new { intent_id = intentId, reason = "NINJATRADER_NOT_DEFINED", error }));
+        return false;
+#endif
+
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_BLOCKED", state: "ENGINE",
+                new { intent_id = intentId, reason = "NT_CONTEXT_NOT_SET", error }));
+            return false;
+        }
+
         try
         {
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return CancelIntentOrdersReal(intentId, utcNow);
-            }
-#endif
-            
-            // Mock implementation
-            var ordersToCancel = _orderMap.Values
-                .Where(o => o.IntentId == intentId && (o.State == "SUBMITTED" || o.State == "WORKING"))
-                .ToList();
-            
-            foreach (var orderInfo in ordersToCancel)
-            {
-                orderInfo.State = "CANCELLED";
-            }
-            
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_MOCK", state: "ENGINE",
-                new
-                {
-                    intent_id = intentId,
-                    cancelled_count = ordersToCancel.Count,
-                    note = "MOCK - harness mode"
-                }));
-            
-            return true;
+            return CancelIntentOrdersReal(intentId, utcNow);
         }
         catch (Exception ex)
         {
@@ -1056,25 +1136,28 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
             return FlattenResult.FailureResult(error, utcNow);
         }
         
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
+                   "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
+                   "Mock mode has been removed - only real NT API execution is supported.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
+            new { intent_id = intentId, instrument, reason = "NINJATRADER_NOT_DEFINED", error }));
+        return FlattenResult.FailureResult(error, utcNow);
+#endif
+
+        if (!_ntContextSet)
+        {
+            var error = "CRITICAL: NT context is not set. " +
+                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
+                       "Mock mode has been removed - only real NT API execution is supported.";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
+                new { intent_id = intentId, instrument, reason = "NT_CONTEXT_NOT_SET", error }));
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+
         try
         {
-#if NINJATRADER
-            if (_ntContextSet)
-            {
-                return FlattenIntentReal(intentId, instrument, utcNow);
-            }
-#endif
-            
-            // Mock implementation
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
-                new
-                {
-                    intent_id = intentId,
-                    instrument = instrument,
-                    note = "MOCK - harness mode"
-                }));
-            
-            return FlattenResult.SuccessResult(utcNow);
+            return FlattenIntentReal(intentId, instrument, utcNow);
         }
         catch (Exception ex)
         {
@@ -1115,5 +1198,29 @@ public sealed class NinjaTraderSimAdapter : IExecutionAdapter
         public DateTimeOffset? EntryFillTime { get; set; }
         public bool ProtectiveStopAcknowledged { get; set; }
         public bool ProtectiveTargetAcknowledged { get; set; }
+        
+        // Policy expectation snapshot (copied from _intentPolicy when OrderInfo is created)
+        public int ExpectedQuantity { get; set; }
+        public int MaxQuantity { get; set; }
+        public string PolicySource { get; set; } = "";
+        public string CanonicalInstrument { get; set; } = "";
+        public string ExecutionInstrument { get; set; } = "";
+        
+        // NT-specific: Store NT Order object for callbacks (only when NINJATRADER is defined)
+#if NINJATRADER
+        public object? NTOrder { get; set; } // NinjaTrader.Cbi.Order
+#endif
+    }
+    
+    /// <summary>
+    /// Intent policy expectation model for quantity invariant tracking.
+    /// </summary>
+    private sealed class IntentPolicyExpectation
+    {
+        public int ExpectedQuantity { get; set; }
+        public int MaxQuantity { get; set; }
+        public string PolicySource { get; set; } = "EXECUTION_POLICY_FILE";
+        public string CanonicalInstrument { get; set; } = "";
+        public string ExecutionInstrument { get; set; } = "";
     }
 }

@@ -31,6 +31,9 @@ public sealed class HealthMonitor
     
     // Incident state
     private readonly Dictionary<string, bool> _dataStallActive = new(StringComparer.OrdinalIgnoreCase);
+    // Rate limiting for DATA_LOSS_DETECTED per instrument (reduce log verbosity)
+    private readonly Dictionary<string, DateTimeOffset> _lastDataLossLogUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+    private const int DATA_LOSS_LOG_RATE_LIMIT_MINUTES = 15; // Log at most once per 15 minutes per instrument
     private bool _connectionLostActive = false;
     private bool _connectionLostNotified = false; // Track if notification already sent
     private bool _engineTickStallActive = false;
@@ -43,6 +46,9 @@ public sealed class HealthMonitor
     private readonly Dictionary<string, DateTimeOffset> _lastNotifyUtcByKey = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastEvaluateUtc = DateTimeOffset.MinValue;
     private const int EVALUATE_RATE_LIMIT_SECONDS = 1; // Max 1 evaluation per second
+    
+    // Emergency notification rate limiting is now handled by NotificationService singleton
+    // This ensures rate limiting state persists across engine runs
     
     // Critical event notification tracking: one notification per (eventType, run_id)
     // Key format: "{eventType}:{run_id}" where run_id defaults to trading_date if not provided
@@ -430,16 +436,29 @@ public sealed class HealthMonitor
                     // First detection: mark active and log (no notification)
                     _dataStallActive[instrument] = true;
                     
-                    // LOG ONLY - no notification (handled by gap tolerance + range invalidation)
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
-                        new
-                        {
-                            instrument = instrument,
-                            last_bar_utc = lastBarUtc.ToString("o"),
-                            elapsed_seconds = elapsed,
-                            threshold_seconds = threshold,
-                            note = "Notification suppressed - handled by gap tolerance + range invalidation (log only)"
-                        }));
+                    // Rate limit logging to reduce verbosity (log at most once per 15 minutes per instrument)
+                    var shouldLog = true;
+                    if (_lastDataLossLogUtcByInstrument.TryGetValue(instrument, out var lastLogUtc))
+                    {
+                        var timeSinceLastLog = (utcNow - lastLogUtc).TotalMinutes;
+                        shouldLog = timeSinceLastLog >= DATA_LOSS_LOG_RATE_LIMIT_MINUTES;
+                    }
+                    
+                    if (shouldLog)
+                    {
+                        _lastDataLossLogUtcByInstrument[instrument] = utcNow;
+                        
+                        // LOG ONLY - no notification (handled by gap tolerance + range invalidation)
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
+                            new
+                            {
+                                instrument = instrument,
+                                last_bar_utc = lastBarUtc.ToString("o"),
+                                elapsed_seconds = elapsed,
+                                threshold_seconds = threshold,
+                                note = "Notification suppressed - handled by gap tolerance + range invalidation (log only, rate-limited)"
+                            }));
+                    }
                     
                     // NOTIFICATION DISABLED: Data loss is handled by gap tolerance + range invalidation
                     // SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1);
@@ -511,19 +530,50 @@ public sealed class HealthMonitor
             }
         }
 
-        // Decide + mark sent under lock (thread-safe)
+        // Emergency notification rate limiting: check if we've sent this event type recently
+        // This prevents spam when the same critical event happens across multiple engine runs
+        // CRITICAL: Check rate limit FIRST before dedupe to prevent multiple simultaneous notifications
+        // Rate limiting is now handled by NotificationService singleton for cross-run persistence
+        var utcNow = DateTimeOffset.UtcNow;
+        bool shouldSendEmergencyNotification = true;
+        
+        // Check emergency rate limit via NotificationService (singleton, persists across runs)
+        if (_notificationService != null)
+        {
+            shouldSendEmergencyNotification = _notificationService.ShouldSendEmergencyNotification(eventType);
+        }
+        
         lock (_notifyLock)
         {
+            // Check dedupe key (per run_id) - still prevent duplicate notifications for same run_id
             if (_criticalNotificationsSent.Contains(dedupeKey))
                 return;
             _criticalNotificationsSent.Add(dedupeKey);
+        }
+        
+        // Skip notification if rate limited
+        if (!shouldSendEmergencyNotification)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "CRITICAL_NOTIFICATION_SKIPPED", state: "ENGINE",
+                new
+                {
+                    event_type = eventType,
+                    run_id = _runId,
+                    dedupe_key = dedupeKey,
+                    reason = "EMERGENCY_RATE_LIMIT",
+                    min_interval_seconds = 300, // 5 minutes (constant in NotificationService)
+                    note = "Emergency notification rate limited - same event type notified within 5 minutes (rate limiting via NotificationService singleton)"
+                }));
+            return;
         }
         
         // Build notification message from payload
         var title = eventType.Replace("_", " ");
         var message = BuildCriticalEventMessage(eventType, payload);
         
-        // Send notification: Emergency priority (2), immediate enqueue (skip rate limit)
+        // Send notification: Emergency priority (2)
+        // Note: Emergency rate limiting is already handled above, so we can skip the regular rate limit
+        // to avoid double-checking (we've already ensured 5 minutes have passed for this event type)
         SendNotification(dedupeKey, title, message, priority: 2, skipRateLimit: true);
         
         // Log that critical event was reported

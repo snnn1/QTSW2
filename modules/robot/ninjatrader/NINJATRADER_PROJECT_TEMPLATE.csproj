@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 
+  TEMPLATE: Add this to your NinjaTrader Strategy project's .csproj file
+  
+  This file shows what needs to be added to enable real NT API compilation.
+  Copy the DefineConstants section below into your actual NinjaTrader project file.
+-->
+
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <!-- Add NINJATRADER to conditional compilation symbols -->
+    <DefineConstants>NINJATRADER</DefineConstants>
+    <!-- OR if you have existing constants, add it like this: -->
+    <!-- <DefineConstants>$(DefineConstants);NINJATRADER</DefineConstants> -->
+  </PropertyGroup>
+  
+  <!-- If you have separate Debug/Release configurations, add to both: -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DefineConstants>DEBUG;NINJATRADER</DefineConstants>
+  </PropertyGroup>
+  
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <DefineConstants>NINJATRADER</DefineConstants>
+  </PropertyGroup>
+  
+  <!-- Your project references, etc. -->
+</Project>

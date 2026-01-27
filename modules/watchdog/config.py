@@ -28,6 +28,12 @@ RISK_GATE_UPDATE_FREQUENCY = 5
 WATCHDOG_STATUS_UPDATE_FREQUENCY = 5
 UNPROTECTED_POSITION_UPDATE_FREQUENCY = 2
 
+# WebSocket configuration
+WS_SEND_TIMEOUT_SECONDS = 5  # Timeout for send operations
+WS_HEARTBEAT_INTERVAL_SECONDS = 30  # Heartbeat interval
+WS_MAX_SEND_FAILURES = 10  # Max failures before closing connection
+WS_MAX_BUFFER_SIZE = 100  # Max events in buffer (if buffer used)
+
 # Live-critical event types (from specification section 5.1)
 LIVE_CRITICAL_EVENT_TYPES = {
     # PHASE 3.1: Identity invariants status for ongoing monitoring
@@ -78,7 +84,12 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "EXECUTION_GATE_INVARIANT_VIOLATION",
     # Additional events needed for state tracking
     "RANGE_LOCKED",
+    "RANGE_LOCK_SNAPSHOT",  # Contains range data for RANGE_LOCKED streams
     "TIMETABLE_VALIDATED",
     # Stream State Machine transitions (plan requirement #2)
     "STREAM_STATE_TRANSITION",
+    # Diagnostic events (for troubleshooting OnBarUpdate and bar routing)
+    "ONBARUPDATE_CALLED",
+    "ONBARUPDATE_DIAGNOSTIC",
+    "BAR_ROUTING_DIAGNOSTIC",
 }

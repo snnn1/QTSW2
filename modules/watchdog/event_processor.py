@@ -5,6 +5,7 @@ Processes events from frontend_feed.jsonl and updates state manager.
 """
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
@@ -89,11 +90,18 @@ class EventProcessor:
         if event_type == "ENGINE_START":
             # Initialize engine tick timestamp on start so watchdog knows engine is alive from the beginning
             self._state_manager.update_engine_tick(timestamp_utc)
-            # Clear stale streams on engine start (new run)
-            # Keep only streams from today's trading date
+            # Clear ALL streams on engine start (new run) - they will be re-initialized
+            # This prevents showing stale ARMED/RANGE_BUILDING states from previous runs
             trading_date = event.get("trading_date")
             if trading_date:
-                self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc)
+                self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc, clear_all_for_date=True)
+            else:
+                # If no trading_date in event, use today's date and clear all streams
+                from datetime import datetime
+                import pytz
+                chicago_tz = pytz.timezone("America/Chicago")
+                today_str = datetime.now(chicago_tz).strftime("%Y-%m-%d")
+                self._state_manager.cleanup_stale_streams(today_str, timestamp_utc, clear_all_for_date=True)
         
         elif event_type == "ENGINE_TICK_HEARTBEAT":
             # PATTERN 1: Update engine tick timestamp AND track last bar time per instrument
@@ -184,7 +192,19 @@ class EventProcessor:
                 execution_instrument = instrument or ""
             
             if trading_date and canonical_stream and new_state:
+                # Parse state_entry_time_utc from event, but validate it's not too old
                 state_entry_time_utc = self._parse_timestamp(state_entry_time_utc_str) if state_entry_time_utc_str else timestamp_utc
+                
+                # Safety check: If state_entry_time_utc is more than 5 minutes old, use current time instead
+                # This prevents streams from showing incorrect "time in state" due to old event timestamps
+                if state_entry_time_utc:
+                    age_seconds = (timestamp_utc - state_entry_time_utc).total_seconds()
+                    if age_seconds > 300:  # More than 5 minutes old
+                        logger.warning(
+                            f"Stream state transition has old timestamp (age: {age_seconds:.0f}s), using current time: "
+                            f"{canonical_stream} ({trading_date}) {previous_state} -> {new_state}"
+                        )
+                        state_entry_time_utc = timestamp_utc
                 
                 # Log state transition for debugging
                 logger.debug(
@@ -198,7 +218,7 @@ class EventProcessor:
                     trading_date, canonical_stream, new_state,
                     state_entry_time_utc=state_entry_time_utc
                 )
-                # Update instrument, session, and slot_time_chicago if available
+                # Update instrument, session, slot_time_chicago, and range data if available
                 key = (trading_date, canonical_stream)
                 if key in self._state_manager._stream_states:
                     info = self._state_manager._stream_states[key]
@@ -208,6 +228,50 @@ class EventProcessor:
                         info.session = session
                     if slot_time_chicago:
                         info.slot_time_chicago = slot_time_chicago
+                    # Extract range values from data dict if transitioning to RANGE_LOCKED
+                    if new_state == "RANGE_LOCKED":
+                        # Range data might be in data directly, or nested in extra_data (dict or string)
+                        extra_data = data.get("extra_data", {})
+                        range_high = data.get("range_high")
+                        range_low = data.get("range_low")
+                        freeze_close = data.get("freeze_close")
+                        
+                        # If range values not found, try to extract from extra_data
+                        if (range_high is None or range_low is None) and extra_data:
+                            if isinstance(extra_data, dict):
+                                # extra_data is a dict - extract directly
+                                range_high = range_high or extra_data.get("range_high")
+                                range_low = range_low or extra_data.get("range_low")
+                                freeze_close = freeze_close or extra_data.get("freeze_close")
+                            elif isinstance(extra_data, str):
+                                # extra_data is a string (C# anonymous object serialized)
+                                # Parse format: "{ range_high = 49564, range_low = 49090, ... }"
+                                try:
+                                    # Extract range_high
+                                    high_match = re.search(r'range_high\s*=\s*([0-9.]+)', extra_data)
+                                    if high_match and range_high is None:
+                                        range_high = float(high_match.group(1))
+                                    # Extract range_low
+                                    low_match = re.search(r'range_low\s*=\s*([0-9.]+)', extra_data)
+                                    if low_match and range_low is None:
+                                        range_low = float(low_match.group(1))
+                                    # Extract freeze_close
+                                    freeze_match = re.search(r'freeze_close\s*=\s*([0-9.]+)', extra_data)
+                                    if freeze_match and freeze_close is None:
+                                        freeze_close = float(freeze_match.group(1))
+                                except Exception as e:
+                                    logger.debug(f"Failed to parse extra_data string in STREAM_STATE_TRANSITION: {e}")
+                                    pass
+                        slot_time_utc_str = event.get("slot_time_utc") or data.get("slot_time_utc")
+                        
+                        if slot_time_utc_str:
+                            info.slot_time_utc = slot_time_utc_str
+                        if range_high is not None:
+                            info.range_high = float(range_high) if range_high is not None else None
+                        if range_low is not None:
+                            info.range_low = float(range_low) if range_low is not None else None
+                        if freeze_close is not None:
+                            info.freeze_close = float(freeze_close) if freeze_close is not None else None
         
         elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
@@ -299,7 +363,7 @@ class EventProcessor:
             canonical_instrument_field = event.get("canonical_instrument")  # PHASE 3: Robot may emit both
             session = event.get("session")
             slot_time_chicago = event.get("slot_time_chicago") or data.get("slot_time_chicago")
-            slot_time_utc_str = data.get("slot_time_utc")
+            slot_time_utc_str = event.get("slot_time_utc") or data.get("slot_time_utc")
             
             # PHASE 3: Trust robot canonical fields if present, otherwise canonicalize
             if canonical_instrument_field:
@@ -320,9 +384,39 @@ class EventProcessor:
                 execution_instrument = instrument or ""
             
             # Extract range values from data dict
+            # Range data might be in data directly, or nested in extra_data
+            # extra_data can be a dict OR a string (C# anonymous object serialized as string)
+            extra_data = data.get("extra_data", {})
             range_high = data.get("range_high")
             range_low = data.get("range_low")
             freeze_close = data.get("freeze_close")
+            
+            # If range values not found, try to extract from extra_data
+            if (range_high is None or range_low is None) and extra_data:
+                if isinstance(extra_data, dict):
+                    # extra_data is a dict - extract directly
+                    range_high = range_high or extra_data.get("range_high")
+                    range_low = range_low or extra_data.get("range_low")
+                    freeze_close = freeze_close or extra_data.get("freeze_close")
+                elif isinstance(extra_data, str):
+                    # extra_data is a string (C# anonymous object serialized)
+                    # Parse format: "{ range_high = 49564, range_low = 49090, ... }"
+                    try:
+                        # Extract range_high
+                        high_match = re.search(r'range_high\s*=\s*([0-9.]+)', extra_data)
+                        if high_match and range_high is None:
+                            range_high = float(high_match.group(1))
+                        # Extract range_low
+                        low_match = re.search(r'range_low\s*=\s*([0-9.]+)', extra_data)
+                        if low_match and range_low is None:
+                            range_low = float(low_match.group(1))
+                        # Extract freeze_close
+                        freeze_match = re.search(r'freeze_close\s*=\s*([0-9.]+)', extra_data)
+                        if freeze_match and freeze_close is None:
+                            freeze_close = float(freeze_match.group(1))
+                    except Exception as e:
+                        logger.debug(f"Failed to parse extra_data string: {e}")
+                        pass
             
             if trading_date and canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
@@ -350,6 +444,86 @@ class EventProcessor:
                         info.range_low = float(range_low) if range_low is not None else None
                     if freeze_close is not None:
                         info.freeze_close = float(freeze_close) if freeze_close is not None else None
+        
+        elif event_type == "RANGE_LOCK_SNAPSHOT":
+            # Handle RANGE_LOCK_SNAPSHOT events as fallback/update source for range data
+            # This ensures range data is captured even if RANGE_LOCKED event doesn't have all fields
+            trading_date = event.get("trading_date")
+            stream = event.get("stream")
+            instrument = event.get("instrument")
+            execution_instrument = event.get("execution_instrument")
+            canonical_instrument_field = event.get("canonical_instrument")
+            session = event.get("session")
+            slot_time_chicago = event.get("slot_time_chicago") or data.get("slot_time_chicago")
+            slot_time_utc_str = event.get("slot_time_utc") or data.get("slot_time_utc")
+            
+            # PHASE 3: Trust robot canonical fields if present, otherwise canonicalize
+            if canonical_instrument_field:
+                canonical_instrument = canonical_instrument_field
+                canonical_stream = stream
+                if not execution_instrument:
+                    execution_instrument = instrument if instrument != canonical_instrument else instrument
+            elif execution_instrument:
+                canonical_instrument = get_canonical_instrument(execution_instrument)
+                canonical_stream = canonicalize_stream(stream, execution_instrument) if stream else stream
+            elif instrument:
+                canonical_instrument = get_canonical_instrument(instrument)
+                canonical_stream = canonicalize_stream(stream, instrument) if stream else stream
+                execution_instrument = instrument
+            else:
+                canonical_instrument = instrument or ""
+                canonical_stream = stream or ""
+                execution_instrument = instrument or ""
+            
+            # Extract range values from data dict
+            range_high = data.get("range_high")
+            range_low = data.get("range_low")
+            freeze_close = data.get("freeze_close")
+            
+            if trading_date and canonical_stream:
+                # Update existing stream state if it exists, or create new one
+                key = (trading_date, canonical_stream)
+                if key in self._state_manager._stream_states:
+                    info = self._state_manager._stream_states[key]
+                    # Only update if state is RANGE_LOCKED or we're creating it
+                    if info.state == "RANGE_LOCKED" or info.state == "":
+                        if canonical_instrument:
+                            info.instrument = canonical_instrument
+                        if session:
+                            info.session = session
+                        if slot_time_chicago:
+                            info.slot_time_chicago = slot_time_chicago
+                        if slot_time_utc_str:
+                            info.slot_time_utc = slot_time_utc_str
+                        # Range values can be None (nullable decimals in C#)
+                        if range_high is not None:
+                            info.range_high = float(range_high) if range_high is not None else None
+                        if range_low is not None:
+                            info.range_low = float(range_low) if range_low is not None else None
+                        if freeze_close is not None:
+                            info.freeze_close = float(freeze_close) if freeze_close is not None else None
+                else:
+                    # Create new stream state if it doesn't exist
+                    self._state_manager.update_stream_state(
+                        trading_date, canonical_stream, "RANGE_LOCKED",
+                        state_entry_time_utc=timestamp_utc
+                    )
+                    if key in self._state_manager._stream_states:
+                        info = self._state_manager._stream_states[key]
+                        if canonical_instrument:
+                            info.instrument = canonical_instrument
+                        if session:
+                            info.session = session
+                        if slot_time_chicago:
+                            info.slot_time_chicago = slot_time_chicago
+                        if slot_time_utc_str:
+                            info.slot_time_utc = slot_time_utc_str
+                        if range_high is not None:
+                            info.range_high = float(range_high) if range_high is not None else None
+                        if range_low is not None:
+                            info.range_low = float(range_low) if range_low is not None else None
+                        if freeze_close is not None:
+                            info.freeze_close = float(freeze_close) if freeze_close is not None else None
         
         elif event_type == "EXECUTION_BLOCKED":
             self._state_manager.record_execution_blocked(timestamp_utc)

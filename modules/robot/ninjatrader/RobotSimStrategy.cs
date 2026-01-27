@@ -47,6 +47,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Rate-limit to once per minute per instrument to prevent log flooding and NinjaTrader slowdown
         private readonly Dictionary<string, DateTimeOffset> _lastBarTimeMismatchLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BAR_TIME_MISMATCH_RATE_LIMIT_MINUTES = 1; // Log at most once per minute per instrument
+        
+        // Diagnostic Point #1: Rate-limited OnBarUpdate logging
+        private readonly Dictionary<string, DateTimeOffset> _lastOnBarUpdateLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int ON_BAR_UPDATE_RATE_LIMIT_MINUTES = 1; // Log at most once per minute per instrument
 
         protected override void OnStateChange()
         {
@@ -56,6 +60,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Calculate = Calculate.OnBarClose; // Bar-close series
                 IsUnmanaged = true; // Required for manual order management
                 IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only
+                
+                // Diagnostic: Check if NINJATRADER is defined
+#if NINJATRADER
+                // NINJATRADER is defined - real NT API will be used
+#else
+                // WARNING: NINJATRADER is NOT defined - mock implementation will be used
+                // Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file
+#endif
             }
             else if (State == State.DataLoaded)
             {
@@ -83,6 +95,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 _simAccountVerified = true;
                 Log($"SIM account verified: {Account.Name}", LogLevel.Information);
+
+                // Diagnostic: Log NINJATRADER compilation status
+#if NINJATRADER
+                Log("NINJATRADER preprocessor directive is DEFINED - real NT API will be used", LogLevel.Information);
+#else
+                Log("WARNING: NINJATRADER preprocessor directive is NOT DEFINED - mock implementation will be used. " +
+                    "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild.", LogLevel.Warning);
+#endif
 
                 // Initialize RobotEngine in SIM mode
                 var projectRoot = ProjectRootResolver.ResolveProjectRoot();
@@ -678,9 +698,56 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
+            // 🔴 Diagnostic Point #0: Fire BEFORE any early returns to confirm OnBarUpdate() is being called
+            // This will help us understand if NinjaTrader is calling OnBarUpdate() at all
+            if (_engine != null)
+            {
+                var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                var diagTimeUtc = DateTimeOffset.UtcNow;
+                var diagCanLog = !_lastOnBarUpdateLogUtc.TryGetValue(diagInstrument, out var diagPrevLogUtc) ||
+                               (diagTimeUtc - diagPrevLogUtc).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
+                
+                if (diagCanLog)
+                {
+                    _lastOnBarUpdateLogUtc[diagInstrument] = diagTimeUtc;
+                    _engine.LogEngineEvent(diagTimeUtc, "ONBARUPDATE_CALLED", new Dictionary<string, object>
+                    {
+                        { "instrument", diagInstrument },
+                        { "engine_ready", _engineReady },
+                        { "engine_null", _engine is null },
+                        { "current_bar", CurrentBar },
+                        { "state", State.ToString() },
+                        { "note", "Diagnostic Point #0: Confirms OnBarUpdate() is being called by NinjaTrader. If this doesn't fire, NinjaTrader isn't calling OnBarUpdate() at all." }
+                    });
+                }
+            }
+            
             // Use ENGINE_READY latch to guard execution
             if (!_engineReady || _engine is null) return;
             if (CurrentBar < 1) return;
+            
+            // 🔴 Diagnostic Point #1: Rate-limited OnBarUpdate logging (ground truth)
+            // NOTE: This diagnostic fires even if enable_diagnostic_logs is false, because it's the ground truth
+            // If this doesn't fire, OnBarUpdate() isn't being called by NinjaTrader
+            var diagInstrument1 = Instrument.MasterInstrument.Name;
+            var diagTimeUtc1 = DateTimeOffset.UtcNow;
+            var diagCanLog1 = !_lastOnBarUpdateLogUtc.TryGetValue(diagInstrument1, out var diagPrevLogUtc1) ||
+                           (diagTimeUtc1 - diagPrevLogUtc1).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
+            
+            if (diagCanLog1 && _engine != null)
+            {
+                _lastOnBarUpdateLogUtc[diagInstrument1] = diagTimeUtc1;
+                _engine.LogEngineEvent(diagTimeUtc1, "ONBARUPDATE_DIAGNOSTIC", new Dictionary<string, object>
+                {
+                    { "instrument", diagInstrument1 },
+                    { "bars_in_progress", BarsInProgress },
+                    { "bar_time", Times[0][0].ToString("o") },
+                    { "state", State.ToString() },
+                    { "current_bar", CurrentBar },
+                    { "engine_ready", _engineReady },
+                    { "note", "Diagnostic Point #1: Ground truth - what NinjaTrader is feeding. If this doesn't fire, OnBarUpdate() isn't being called." }
+                });
+            }
 
             // CRITICAL FIX: NinjaTrader Times[0][0] timezone handling with locking
             // Lock interpretation after first detection to prevent mid-run flips

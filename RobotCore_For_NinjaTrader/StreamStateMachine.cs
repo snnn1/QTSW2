@@ -83,6 +83,8 @@ public sealed class StreamStateMachine
     private readonly ParitySpec _spec;
     private readonly RobotLogger _log;
     private readonly JournalStore _journals;
+    private readonly string _projectRoot;
+    private readonly RangeLockedEventPersister? _rangePersister;
     private StreamJournal _journal;
     private readonly decimal _tickSize;
     private readonly string _timetableHash;
@@ -206,6 +208,7 @@ public sealed class StreamStateMachine
         ExecutionMode executionMode,
         int orderQuantity, // baseSize (PHASE 3.2: Fixed order quantity, mandatory, code-controlled)
         int maxQuantity, // NEW: maxSize (policy max_size)
+        string projectRoot, // Project root directory for range event persistence
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
@@ -216,11 +219,15 @@ public sealed class StreamStateMachine
         _spec = spec;
         _log = log;
         _journals = journals;
+        _projectRoot = projectRoot;
         _timetableHash = timetableHash;
         _executionMode = executionMode;
         _executionAdapter = executionAdapter;
         _riskGate = riskGate;
         _executionJournal = executionJournal;
+        
+        // Initialize range event persister (singleton)
+        _rangePersister = RangeLockedEventPersister.GetInstance(_projectRoot);
         
         // PHASE 3.2: Store and validate order quantity
         _orderQuantity = orderQuantity;
@@ -338,11 +345,56 @@ public sealed class StreamStateMachine
             CommitReason = null,
             LastState = State.ToString(),
             LastUpdateUtc = DateTimeOffset.MinValue.ToString("o"),
-            TimetableHashAtCommit = null
+            TimetableHashAtCommit = null,
+            StopBracketsSubmittedAtLock = false,
+            EntryDetected = false
         };
         
         // Initialize state entry time tracking
         _stateEntryTimeUtc = DateTimeOffset.UtcNow;
+        
+        // RESTART RECOVERY: Restore flags from persisted state
+        if (isRestart && existing != null)
+        {
+            // Restore order submission flag from journal
+            _stopBracketsSubmittedAtLock = existing.StopBracketsSubmittedAtLock;
+            
+            // Restore entry detection from execution journal (Option B)
+            if (_executionJournal != null && !existing.EntryDetected)
+            {
+                // Scan execution journal for any filled entry
+                _entryDetected = _executionJournal.HasEntryFillForStream(tradingDateStr, Stream);
+            }
+            else
+            {
+                // Use journal value if available, otherwise default to false
+                _entryDetected = existing.EntryDetected;
+            }
+            
+            // RESTART RECOVERY: Recompute breakout levels if state is RANGE_LOCKED
+            // Note: State is not restored from LastState - it starts as PRE_HYDRATION and transitions naturally
+            // But if LastState indicates RANGE_LOCKED, we need breakout levels ready for when state transitions back
+            if (existing.LastState == "RANGE_LOCKED" && 
+                (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) &&
+                RangeHigh.HasValue && RangeLow.HasValue)
+            {
+                // Recompute breakout levels deterministically
+                var utcNow = DateTimeOffset.UtcNow;
+                ComputeBreakoutLevelsAndLog(utcNow);
+                
+                log.Write(RobotEvents.Base(time, utcNow, tradingDateStr, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RESTART_BREAKOUT_LEVELS_RECOMPUTED", State.ToString(),
+                    new
+                    {
+                        brk_long_rounded = _brkLongRounded,
+                        brk_short_rounded = _brkShortRounded,
+                        range_high = RangeHigh,
+                        range_low = RangeLow,
+                        previous_state = existing.LastState,
+                        note = "Breakout levels recomputed on restart in RANGE_LOCKED state"
+                    }));
+            }
+        }
     }
 
     /// <summary>
@@ -1466,119 +1518,6 @@ public sealed class StreamStateMachine
                         return; // Do not transition to ARMED
                     }
                     
-                    // Calculate completeness metrics (non-blocking)
-                    int expectedBars = 0;
-                    int expectedFullRangeBars = 0;
-                    double completenessPct = 0.0;
-                    try
-                    {
-                        var hydrationEndChicago = nowChicago < SlotTimeChicagoTime ? nowChicago : SlotTimeChicagoTime;
-                        var rangeDurationMinutes = (hydrationEndChicago - RangeStartChicagoTime).TotalMinutes;
-                        var fullRangeDurationMinutes = (SlotTimeChicagoTime - RangeStartChicagoTime).TotalMinutes;
-                        
-                        expectedBars = Math.Max(0, (int)Math.Floor(rangeDurationMinutes));
-                        expectedFullRangeBars = Math.Max(0, (int)Math.Floor(fullRangeDurationMinutes));
-                        
-                        if (expectedBars > 0)
-                        {
-                            completenessPct = Math.Min(100.0, (barCount / (double)expectedBars) * 100.0);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // Non-blocking: metrics calculation failed, continue without them
-                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                            "HYDRATION_COMPLETENESS_CALC_ERROR", State.ToString(),
-                            new { error = ex.Message, note = "Completeness calculation failed, continuing without metrics" }));
-                    }
-                    
-                    // DEBUG: Log boundary contract to prevent regressions
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "HYDRATION_BOUNDARY_CONTRACT", State.ToString(),
-                        new
-                        {
-                            range_build_window = $"[{RangeStartChicagoTime:HH:mm:ss}, {SlotTimeChicagoTime:HH:mm:ss})",
-                            range_build_window_note = "slot_time is EXCLUSIVE for range building",
-                            missed_breakout_scan_window = isLateStart ? $"[{SlotTimeChicagoTime:HH:mm:ss}, {nowChicago:HH:mm:ss}]" : "N/A (not late start)",
-                            missed_breakout_scan_note = isLateStart ? "Only checked if now > slot_time" : "Not applicable",
-                            note = "Boundary contract for range reconstruction and missed-breakout detection"
-                        }));
-                    
-                // CRITICAL FIX: Re-read barCount right before logging HYDRATION_SUMMARY
-                // barCount was captured at the start of HandlePreHydrationState(), but bars are added
-                // asynchronously via AddBarToBuffer() from BarsRequest callbacks or live feed.
-                // We must read the current buffer count to get accurate loaded_bars.
-                int currentBarCount = GetBarBufferCount();
-                
-                // Log HYDRATION_SUMMARY with range and missed breakout details (even if missed breakout occurred)
-                var hydrationNoteDRYRUN = missedBreakout 
-                    ? $"MISSED_BREAKOUT: Starting after slot_time but breakout already occurred at {breakoutTimeChicago?.ToString("HH:mm:ss") ?? "N/A"} CT. Range computed but trading blocked."
-                    : "Consolidated hydration summary - forensic snapshot at PRE_HYDRATION → ARMED transition. " +
-                      "This log captures all bar sources, filtering, deduplication statistics, completeness metrics, and late-start handling for debugging and auditability.";
-                
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "HYDRATION_SUMMARY", "PRE_HYDRATION",
-                    new
-                    {
-                        stream_id = Stream,
-                        canonical_instrument = CanonicalInstrument,
-                        instrument = Instrument,
-                        slot = Stream,
-                        trading_date = TradingDate,
-                        total_bars_in_buffer = currentBarCount,
-                        // Bar source breakdown
-                        historical_bar_count = historicalBarCount,
-                        live_bar_count = liveBarCount,
-                        deduped_bar_count = dedupedBarCount,
-                        filtered_future_bar_count = filteredFutureBarCount,
-                        filtered_partial_bar_count = filteredPartialBarCount,
-                        // Timing context
-                        now_chicago = nowChicago.ToString("o"),
-                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
-                        // Completeness metrics
-                        expected_bars = expectedBars,
-                        expected_full_range_bars = expectedFullRangeBars,
-                        loaded_bars = currentBarCount,
-                        completeness_pct = expectedBars > 0 ? Math.Round((currentBarCount / (double)expectedBars) * 100.0, 2) : 0.0,
-                        // Late-start handling
-                        late_start = isLateStart,
-                        missed_breakout = missedBreakout,
-                        // Reconstructed range (if available) - ALWAYS LOGGED EVEN IF MISSED BREAKOUT
-                        reconstructed_range_high = reconstructedRangeHigh,
-                        reconstructed_range_low = reconstructedRangeLow,
-                        // Breakout details (if missed breakout occurred)
-                        breakout_time_utc = breakoutTimeUtc?.ToString("o"),
-                        breakout_time_chicago = breakoutTimeChicago?.ToString("o"),
-                        breakout_price = breakoutPrice,
-                        breakout_direction = breakoutDirection,
-                        // Mode and source info
-                        execution_mode = _executionMode.ToString(),
-                        note = hydrationNoteDRYRUN
-                    }));
-                
-                // If missed breakout occurred, log the health event and commit, then return
-                if (missedBreakout)
-                {
-                    LogHealth("INFO", "LATE_START_MISSED_BREAKOUT", 
-                        $"Starting after slot_time but breakout already occurred at {breakoutTimeChicago.Value:HH:mm:ss} CT. Cannot trade.",
-                        new
-                        {
-                            breakout_time_utc = breakoutTimeUtc.Value.ToString("o"),
-                            breakout_time_chicago = breakoutTimeChicago.Value.ToString("o"),
-                            breakout_price = breakoutPrice.Value,
-                            breakout_direction = breakoutDirection,
-                            range_high = reconstructedRangeHigh.Value,
-                            range_low = reconstructedRangeLow.Value,
-                            slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
-                            range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                            now_chicago = nowChicago.ToString("o")
-                        });
-                    
-                    Commit(utcNow, "NO_TRADE_LATE_START_MISSED_BREAKOUT", "NO_TRADE_LATE_START_MISSED_BREAKOUT");
-                    return; // Do not transition to ARMED
-                }
-                    
                     // HYDRATION_SNAPSHOT: Consolidated snapshot per stream
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
                         SlotTimeChicago, SlotTimeUtc,
@@ -2436,8 +2375,58 @@ public sealed class StreamStateMachine
                 // G) "Nothing happened" explanation: Range locked summary
                 LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
                 
+                // Compute breakout levels FIRST (before event creation)
+                ComputeBreakoutLevelsAndLog(utcNow);
+                
+                // Assert breakout values exist before creating event
+                if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+                {
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "RANGE_LOCKED_EVENT_SKIP", State.ToString(),
+                        new { error = "BREAKOUT_LEVELS_MISSING", note = "Cannot create RANGE_LOCKED event - breakout levels not computed" }));
+                }
+                else if (RangeHigh.HasValue && RangeLow.HasValue && FreezeClose.HasValue)
+                {
+                    // Create and persist canonical RANGE_LOCKED event
+                    try
+                    {
+                        var rangeLockedEvent = new RangeLockedEvent(
+                            tradingDay: TradingDate,
+                            streamId: Stream,
+                            canonicalInstrument: CanonicalInstrument,
+                            executionInstrument: ExecutionInstrument,
+                            rangeHigh: RangeHigh.Value,
+                            rangeLow: RangeLow.Value,
+                            rangeSize: RangeHigh.Value - RangeLow.Value,
+                            freezeClose: FreezeClose.Value,
+                            rangeHighRounded: RangeHigh.Value, // Currently same as raw, but explicit for future-proofing
+                            rangeLowRounded: RangeLow.Value,   // Currently same as raw, but explicit for future-proofing
+                            breakoutLong: _brkLongRounded.Value,
+                            breakoutShort: _brkShortRounded.Value,
+                            rangeStartTimeChicago: RangeStartChicagoTime.ToString("o"),
+                            rangeStartTimeUtc: RangeStartUtc.ToString("o"),
+                            rangeEndTimeChicago: SlotTimeChicagoTime.ToString("o"),
+                            rangeEndTimeUtc: SlotTimeUtc.ToString("o"),
+                            lockedAtChicago: _time.ConvertUtcToChicago(utcNow).ToString("o"),
+                            lockedAtUtc: utcNow.ToString("o")
+                        );
+                        
+                        // Persist via dedicated persister (fail-safe, never throws)
+                        _rangePersister?.Persist(rangeLockedEvent);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Persister should never throw, but guard anyway
+                        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                            "RANGE_LOCKED_PERSIST_FAIL", State.ToString(),
+                            new { error = ex.Message, note = "Persistence failure does not affect execution" }));
+                        // Continue execution - persistence failure does not affect state machine
+                    }
+                }
+                
                 // Log range lock snapshot (all modes - was DRYRUN-only, now unconditional for consistency)
                 // PHASE 3: Include both canonical and execution identities
+                // NOTE: This existing logging is kept unchanged for backward compatibility
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "RANGE_LOCK_SNAPSHOT", State.ToString(),
                     new
@@ -2452,8 +2441,6 @@ public sealed class StreamStateMachine
                         canonical_instrument = CanonicalInstrument,   // PHASE 3: Canonical identity
                         slot_time_utc = SlotTimeUtc.ToString("o")
                     }));
-
-                ComputeBreakoutLevelsAndLog(utcNow);
 
                 // Check for immediate entry at lock (all execution modes)
                 if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue)
@@ -3075,14 +3062,42 @@ public sealed class StreamStateMachine
             }));
 
         // INVARIANT CHECK: If slot time has passed and execution should be allowed but isn't, log ERROR
+        // Only trigger violation if execution is blocked for UNEXPECTED reasons (not legitimate blocks)
         // Estimate bar interval (typically 1 minute for NG)
         var estimatedBarIntervalMinutes = 1;
         var barInterval = TimeSpan.FromMinutes(estimatedBarIntervalMinutes);
         var slotTimePlusInterval = slotTimeUtcParsed.Add(barInterval);
         
-        if (barUtc >= slotTimePlusInterval && !finalAllowed && stateOk && slotReached)
+        // Determine which gates are failing
+        var failedGates = new List<string>();
+        if (!realtimeOk) failedGates.Add("REALTIME_OK");
+        if (string.IsNullOrEmpty(tradingDay)) failedGates.Add("TRADING_DAY_SET");
+        if (!sessionActive) failedGates.Add("SESSION_ACTIVE");
+        if (!slotReached) failedGates.Add("SLOT_REACHED");
+        if (!timetableEnabled) failedGates.Add("TIMETABLE_ENABLED");
+        if (!streamArmed) failedGates.Add("STREAM_ARMED");
+        if (!stateOk) failedGates.Add("STATE_OK");
+        if (!entryDetectionModeOk) failedGates.Add("ENTRY_DETECTION_MODE_OK");
+        if (!canDetectEntries) failedGates.Add("CAN_DETECT_ENTRIES");
+        
+        // Only violate if execution is blocked for UNEXPECTED reasons:
+        // - State is OK (RANGE_LOCKED)
+        // - Slot has been reached
+        // - Stream is armed (not committed/done)
+        // - Entry not detected yet (still waiting for entry)
+        // - Breakout levels are computed (ready to detect entries)
+        // This excludes legitimate blocks: entry already detected, journal committed, breakout levels not ready
+        var unexpectedBlock = barUtc >= slotTimePlusInterval && 
+                             !finalAllowed && 
+                             stateOk && 
+                             slotReached && 
+                             streamArmed &&  // Stream should be armed
+                             !_entryDetected &&  // Entry not detected yet
+                             _brkLongRounded.HasValue && _brkShortRounded.HasValue;  // Breakout levels ready
+        
+        if (unexpectedBlock)
         {
-            // This should not happen - execution should be allowed by now
+            // This is a real violation - execution should be allowed but isn't
             var payload = new Dictionary<string, object>
             {
                 ["error"] = "EXECUTION_SHOULD_BE_ALLOWED_BUT_IS_NOT",
@@ -3103,7 +3118,9 @@ public sealed class StreamStateMachine
                 ["instrument"] = Instrument,
                 ["stream"] = Stream,
                 ["trading_date"] = TradingDate,
-                ["message"] = "Slot time has passed but execution is not allowed. Check gate states above."
+                ["state"] = State.ToString(),
+                ["failed_gates"] = string.Join(", ", failedGates),  // List of gates that failed
+                ["message"] = $"Slot time has passed but execution is not allowed. Failed gates: {string.Join(", ", failedGates)}"
             };
             
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -3238,10 +3255,13 @@ public sealed class StreamStateMachine
         var shortIntentId = shortIntent.ComputeIntentId();
 
         // Already submitted? then treat as done.
-        if (_executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
-            _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream))
+        if (_executionJournal != null && 
+            (_executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
+             _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream)))
         {
             _stopBracketsSubmittedAtLock = true;
+            _journal.StopBracketsSubmittedAtLock = true; // PERSIST: Update journal
+            _journals.Save(_journal);
             return;
         }
 
@@ -3290,6 +3310,11 @@ public sealed class StreamStateMachine
         if (longRes.Success && shortRes.Success)
         {
             _stopBracketsSubmittedAtLock = true;
+            
+            // PERSIST: Save flag to journal immediately
+            _journal.StopBracketsSubmittedAtLock = true;
+            _journals.Save(_journal);
+            
             _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_SUBMITTED", new
             {
                 stream_id = Stream,
@@ -3300,6 +3325,7 @@ public sealed class StreamStateMachine
                 long_broker_order_id = longRes.BrokerOrderId,
                 short_broker_order_id = shortRes.BrokerOrderId,
                 oco_group = ocoGroup,
+                persisted_to_journal = true,
                 note = "Stop entry brackets submitted; breakout fill should not require additional submission"
             }));
         }
@@ -4118,6 +4144,7 @@ public sealed class StreamStateMachine
 
         _journal.Committed = true;
         _journal.CommitReason = commitReason;
+        _journal.EntryDetected = _entryDetected; // Ensure persisted on commit
         _journal.LastState = StreamState.DONE.ToString();
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journal.TimetableHashAtCommit = _timetableHash;
@@ -4297,6 +4324,10 @@ public sealed class StreamStateMachine
         _intendedEntryTimeUtc = entryTimeUtc;
         _triggerReason = triggerReason;
 
+        // PERSIST: Save entry detection to journal
+        _journal.EntryDetected = true;
+        _journals.Save(_journal);
+
         // Compute protective orders (stop/target/BE trigger)
         ComputeAndLogProtectiveOrders(utcNow);
 
@@ -4326,7 +4357,7 @@ public sealed class StreamStateMachine
         }
         
         // PHASE 3: Assert Stream ID is canonical (does not contain execution instrument)
-        if (ExecutionInstrument != CanonicalInstrument && Stream.Contains(ExecutionInstrument, StringComparison.OrdinalIgnoreCase))
+        if (ExecutionInstrument != CanonicalInstrument && Stream.IndexOf(ExecutionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
         {
             throw new InvalidOperationException(
                 $"PHASE 3 ASSERTION FAILED: Execution instrument '{ExecutionInstrument}' found in Stream ID '{Stream}'. " +
@@ -4364,9 +4395,9 @@ public sealed class StreamStateMachine
         }));
         
         // Register policy expectation with adapter
-        if (_executionAdapter is NinjaTraderSimAdapter ntAdapter)
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapterForPolicy)
         {
-            ntAdapter.RegisterIntentPolicy(intentId, _orderQuantity, _maxQuantity, 
+            simAdapterForPolicy.RegisterIntentPolicy(intentId, _orderQuantity, _maxQuantity, 
                 CanonicalInstrument, ExecutionInstrument, "EXECUTION_POLICY_FILE");
         }
 
@@ -4492,9 +4523,9 @@ public sealed class StreamStateMachine
         {
             // Register intent with adapter for fill callback handling
             // Use type check and cast instead of reflection (RegisterIntent is internal)
-            if (_executionAdapter is NinjaTraderSimAdapter ntAdapter)
+            if (_executionAdapter is NinjaTraderSimAdapter simAdapterForIntent)
             {
-                ntAdapter.RegisterIntent(intent);
+                simAdapterForIntent.RegisterIntent(intent);
             }
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "ENTRY_SUBMITTED",

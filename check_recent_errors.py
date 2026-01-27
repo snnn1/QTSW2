@@ -1,97 +1,104 @@
-"""Check recent ERROR messages in robot_ENGINE.jsonl"""
 import json
-from pathlib import Path
-from datetime import datetime, timezone
-import pytz
-
-CHICAGO_TZ = pytz.timezone("America/Chicago")
-log_file = Path('logs/robot/robot_ENGINE.jsonl')
+from datetime import datetime, timedelta
+from collections import Counter
 
 print("=" * 80)
-print("RECENT ERROR MESSAGES IN robot_ENGINE.jsonl")
+print("RECENT ERROR CHECK")
 print("=" * 80)
 
-if not log_file.exists():
-    print("Log file not found")
-    exit(1)
+# Read ENGINE log
+log_file = r'logs\robot\robot_ENGINE.jsonl'
+micro_contracts = ['MES', 'MNQ', 'MYM', 'M2K', 'MGC', 'MNG', 'MCL']
 
 with open(log_file, 'r', encoding='utf-8') as f:
-    lines = f.readlines()
+    lines = f.readlines()[-5000:]
 
-print(f"\n[INFO] Checking last 100 lines of {log_file.name}")
-
-recent_lines = lines[-100:] if len(lines) > 100 else lines
-
-errors = []
-for i, line in enumerate(recent_lines):
+events = []
+for line in lines:
     if line.strip():
         try:
-            event = json.loads(line.strip())
-            level = event.get('level', '')
-            if level == 'ERROR':
-                line_num = len(lines) - len(recent_lines) + i + 1
-                errors.append((line_num, event))
+            events.append(json.loads(line))
         except:
-            continue
+            pass
 
-print(f"\n[INFO] Found {len(errors)} ERROR messages in last 100 lines")
+print(f"\nTotal events analyzed: {len(events)}")
 
-if errors:
-    print("\n  Recent errors:")
-    for line_num, event in errors[-20:]:  # Last 20 errors
-        ts_utc_str = event.get('ts_utc', '')
-        try:
-            ts_utc = datetime.fromisoformat(ts_utc_str.replace('Z', '+00:00'))
-            if ts_utc.tzinfo is None:
-                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-            ts_chicago = ts_utc.astimezone(CHICAGO_TZ)
-        except:
-            ts_chicago = ts_utc_str[:19]
-        
-        event_type = event.get('event_type', '')
-        message = event.get('message', '')
-        data = event.get('data', {})
-        
-        print(f"\n    Line {line_num}: {ts_chicago.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-        print(f"      Event Type: {event_type}")
-        if message:
-            print(f"      Message: {message[:200]}")
-        if data:
-            data_str = str(data)[:200]
-            print(f"      Data: {data_str}")
+# Check for errors in last 30 minutes
+now = datetime.utcnow()
+thirty_min_ago = now - timedelta(minutes=30)
+
+recent_errors = []
+for e in events:
+    try:
+        ts_str = str(e.get('ts_utc', ''))
+        if ts_str:
+            ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00').replace('+00:00', ''))
+            if ts.tzinfo:
+                ts = ts.replace(tzinfo=None)
+            if ts >= thirty_min_ago:
+                inst = str(e.get('data', {}).get('instrument', '') or e.get('instrument', ''))
+                if any(x in inst.upper() for x in micro_contracts):
+                    event = str(e.get('event', '')).upper()
+                    if any(kw in event for kw in ['ERROR', 'FAIL', 'REJECT', 'BLOCKED']):
+                        recent_errors.append(e)
+    except:
+        pass
+
+print(f"\n{'='*80}")
+print(f"ERRORS IN LAST 30 MINUTES: {len(recent_errors)}")
+print("="*80)
+
+if recent_errors:
+    error_types = Counter([e.get('event', 'UNKNOWN') for e in recent_errors])
+    print("\nError types:")
+    for err_type, count in error_types.most_common():
+        print(f"  {err_type}: {count}")
+    
+    print("\nMost recent errors:")
+    for e in recent_errors[-20:]:
+        ts = str(e.get('ts_utc', ''))[:19]
+        event = e.get('event', '')
+        inst = e.get('data', {}).get('instrument', 'N/A')
+        error_msg = str(e.get('data', {}).get('error', ''))[:150]
+        print(f"  {ts} | {event} | Inst: {inst}")
+        if error_msg:
+            print(f"    Error: {error_msg}")
 else:
-    print("\n  No ERROR messages found in recent lines")
+    print("\n  No errors found in last 30 minutes!")
 
-# Also check for WARN messages
-warnings = []
-for i, line in enumerate(recent_lines):
-    if line.strip():
-        try:
-            event = json.loads(line.strip())
-            level = event.get('level', '')
-            if level == 'WARN':
-                line_num = len(lines) - len(recent_lines) + i + 1
-                warnings.append((line_num, event))
-        except:
-            continue
+# Check specifically for CreateOrder errors
+createorder_errors = [e for e in recent_errors if 'CREATEORDER' in str(e.get('data', {}).get('error', '')).upper() or 'ORDER_SUBMIT_FAIL' in str(e.get('event', '')).upper()]
+print(f"\n{'='*80}")
+print(f"CreateOrder API ERRORS (last 30 min): {len(createorder_errors)}")
+print("="*80)
 
-print(f"\n[INFO] Found {len(warnings)} WARN messages in last 100 lines")
-if warnings:
-    print("\n  Recent warnings:")
-    for line_num, event in warnings[-10:]:  # Last 10 warnings
-        ts_utc_str = event.get('ts_utc', '')
-        try:
-            ts_utc = datetime.fromisoformat(ts_utc_str.replace('Z', '+00:00'))
-            if ts_utc.tzinfo is None:
-                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-            ts_chicago = ts_utc.astimezone(CHICAGO_TZ)
-        except:
-            ts_chicago = ts_utc_str[:19]
-        
-        event_type = event.get('event_type', '')
-        message = event.get('message', '')
-        print(f"    Line {line_num}: {ts_chicago.strftime('%H:%M:%S')} {event_type}")
-        if message:
-            print(f"      {message[:150]}")
+if createorder_errors:
+    print("These errors indicate CreateOrder API issues:")
+    for e in createorder_errors[-10:]:
+        ts = str(e.get('ts_utc', ''))[:19]
+        inst = e.get('data', {}).get('instrument', 'N/A')
+        error_msg = str(e.get('data', {}).get('error', ''))
+        print(f"  {ts} | Inst: {inst} | {error_msg}")
+else:
+    print("  No CreateOrder errors found in last 30 minutes!")
 
-print("\n" + "=" * 80)
+# Check per-instrument status
+print(f"\n{'='*80}")
+print("PER-INSTRUMENT STATUS (last 30 min)")
+print("="*80)
+
+for inst in micro_contracts:
+    inst_errors = [e for e in recent_errors if e.get('data', {}).get('instrument', '') == inst]
+    if inst_errors:
+        print(f"\n{inst}: {len(inst_errors)} errors")
+        latest = inst_errors[-1]
+        error_msg = str(latest.get('data', {}).get('error', ''))[:100]
+        print(f"  Latest: {str(latest.get('ts_utc', ''))[:19]} | {latest.get('event', '')}")
+        if error_msg:
+            print(f"  Error: {error_msg}")
+    else:
+        print(f"\n{inst}: No errors")
+
+print("\n" + "="*80)
+print("CHECK COMPLETE")
+print("="*80)

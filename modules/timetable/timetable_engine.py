@@ -559,14 +559,29 @@ class TimetableEngine:
         
         trade_date_obj = pd.to_datetime(trade_date).date()
         
-        # Filter to latest date (trade_date is already datetime dtype)
-        latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
+        # CRITICAL FIX: To determine the time slot for a given date, we need to look at the PREVIOUS day's row.
+        # The Time Change column in the previous day's row tells us what time to use today.
+        # If Time Change is empty, the time stays the same (use previous day's Time value).
+        # This ensures that time slots only change on losses, not on wins.
+        from datetime import timedelta
+        previous_date_obj = trade_date_obj - timedelta(days=1)
+        previous_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == previous_date_obj].copy()
         
-        if latest_df.empty:
-            logger.warning(f"No data for date {trade_date}, cannot generate execution timetable")
+        # If no previous day data exists, fall back to using the current date's data
+        # (this handles the case where we're generating the first day's timetable)
+        if previous_df.empty:
+            logger.info(f"No data for previous date {previous_date_obj}, using current date {trade_date_obj} data")
+            source_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
+            use_previous_day_logic = False
+        else:
+            source_df = previous_df
+            use_previous_day_logic = True
+        
+        if source_df.empty:
+            logger.warning(f"No data for date {trade_date_obj}, cannot generate execution timetable")
             return
         
-        # Extract day-of-week and day-of-month for filtering
+        # Extract day-of-week and day-of-month for filtering (use target date, not source date)
         target_dow = trade_date_obj.weekday()  # 0=Monday, 6=Sunday
         target_dom = trade_date_obj.day
         
@@ -581,10 +596,13 @@ class TimetableEngine:
         target_dow_name = day_names[target_dow]
         
         # Check if final_allowed column exists (authoritative filter indicator)
-        has_final_allowed = 'final_allowed' in latest_df.columns
+        # Use current date's data for final_allowed check (filters apply to target date, not source date)
+        latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
+        has_final_allowed = 'final_allowed' in latest_df.columns if not latest_df.empty else False
         
         # First pass: Process streams that exist in master matrix
-        for _, row in latest_df.iterrows():
+        # Use previous day's data to determine time slot, but current day's data for filters
+        for _, row in source_df.iterrows():
             stream = row.get('Stream', '')
             if not stream or stream in seen_streams:
                 continue
@@ -604,22 +622,32 @@ class TimetableEngine:
                 # Fall back to stream_id pattern
                 session = 'S1' if stream.endswith('1') else 'S2'
             
-            # Get time (use Time Change if available, otherwise Time)
-            # Time Change can be either:
-            # 1. Just the new time (e.g., "08:00") - current format
-            # 2. "old -> new" format (e.g., "07:30 -> 08:00") - backward compatibility
-            time = row.get('Time', '')
-            time_change = row.get('Time Change', '')
-            if time_change and str(time_change).strip():
-                time_change_str = str(time_change).strip()
-                if '->' in time_change_str:
-                    # Backward compatibility: parse "old -> new" format
-                    parts = time_change_str.split('->')
-                    if len(parts) == 2:
-                        time = parts[1].strip()
-                else:
-                    # Current format: Time Change is just the new time
-                    time = time_change_str
+            # CRITICAL FIX: Get time from PREVIOUS day's row
+            # The sequencer sets Time Change only when there's a LOSS (decide_time_change returns non-None)
+            # Time Change in previous day's row tells us what time to use TODAY
+            # If Time Change is empty (WIN/BE/NoTrade), time stays the same (use previous day's Time value)
+            # This ensures time slots only change on losses, not on wins
+            # Example: Monday WIN at 11:00 → Time Change is empty → Tuesday uses 11:00 (same as Monday)
+            # Example: Monday LOSS at 11:00 → Time Change is 09:30 → Tuesday uses 09:30 (changed)
+            if use_previous_day_logic:
+                # Use previous day's Time Change if it exists (this is the time for today)
+                time = row.get('Time', '')
+                time_change = row.get('Time Change', '')
+                if time_change and str(time_change).strip():
+                    time_change_str = str(time_change).strip()
+                    if '->' in time_change_str:
+                        # Backward compatibility: parse "old -> new" format
+                        parts = time_change_str.split('->')
+                        if len(parts) == 2:
+                            time = parts[1].strip()
+                    else:
+                        # Current format: Time Change is just the new time
+                        time = time_change_str
+                # If Time Change is empty, time stays the same (use previous day's Time value)
+                # This is already set above, so no change needed
+            else:
+                # Fallback: No previous day data, use current day's Time
+                time = row.get('Time', '')
             
             # Validate that parsed time is in session_time_slots
             if time:
@@ -647,12 +675,16 @@ class TimetableEngine:
             block_reason = None
             
             # Check final_allowed column first (if exists, this is the authoritative filter)
-            if has_final_allowed:
-                final_allowed = row.get('final_allowed')
-                # If final_allowed is False/NaN/None, mark as blocked
-                if final_allowed is not True:
-                    enabled = False
-                    block_reason = f"master_matrix_filtered_{final_allowed}"
+            # CRITICAL: Use current date's row for final_allowed (filters apply to target date, not source date)
+            if has_final_allowed and not latest_df.empty:
+                # Find the current date's row for this stream
+                current_day_row = latest_df[latest_df['Stream'] == stream]
+                if not current_day_row.empty:
+                    final_allowed = current_day_row.iloc[0].get('final_allowed')
+                    # If final_allowed is False/NaN/None, mark as blocked
+                    if final_allowed is not True:
+                        enabled = False
+                        block_reason = f"master_matrix_filtered_{final_allowed}"
             else:
                 # No final_allowed column - check filters manually
                 if stream_filters:

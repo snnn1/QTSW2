@@ -3,9 +3,12 @@ Event Feed Generator
 
 Reads raw robot JSONL files, filters live-critical events, adds event_seq and timestamp_chicago,
 and writes to frontend_feed.jsonl.
+
+Automatically rotates frontend_feed.jsonl when it exceeds 100 MB to prevent disk space issues.
 """
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timezone
@@ -125,10 +128,52 @@ class EventFeedGenerator:
         instrument = self._extract_instrument(event)
         session = self._extract_session(event)
         
+        # Extract slot_time_chicago and slot_time_utc (standardized top-level fields)
+        slot_time_chicago = event.get("slot_time_chicago")
+        slot_time_utc = event.get("slot_time_utc")
+        
+        # Extract execution_instrument and canonical_instrument (PHASE 3 fields)
+        execution_instrument = event.get("execution_instrument")
+        canonical_instrument = event.get("canonical_instrument")
+        
         # Get data payload (flatten if needed)
         data = event.get("data", {})
         if not isinstance(data, dict):
             data = {}
+        
+        # For RANGE_LOCKED and RANGE_LOCK_SNAPSHOT events, extract range data from data dict
+        # and ensure it's available at top level for event processor
+        if event_type in ("RANGE_LOCKED", "RANGE_LOCK_SNAPSHOT"):
+            # Range data might be in data dict or extra_data (dict or string)
+            if "range_high" not in data and "extra_data" in data:
+                extra_data = data.get("extra_data")
+                if isinstance(extra_data, dict):
+                    # extra_data is a dict - promote to data dict
+                    if "range_high" in extra_data:
+                        data["range_high"] = extra_data.get("range_high")
+                    if "range_low" in extra_data:
+                        data["range_low"] = extra_data.get("range_low")
+                    if "freeze_close" in extra_data:
+                        data["freeze_close"] = extra_data.get("freeze_close")
+                elif isinstance(extra_data, str):
+                    # extra_data is a string (C# anonymous object serialized)
+                    # Parse format: "{ range_high = 49564, range_low = 49090, ... }"
+                    try:
+                        import re
+                        # Extract range_high
+                        high_match = re.search(r'range_high\s*=\s*([0-9.]+)', extra_data)
+                        if high_match:
+                            data["range_high"] = float(high_match.group(1))
+                        # Extract range_low
+                        low_match = re.search(r'range_low\s*=\s*([0-9.]+)', extra_data)
+                        if low_match:
+                            data["range_low"] = float(low_match.group(1))
+                        # Extract freeze_close
+                        freeze_match = re.search(r'freeze_close\s*=\s*([0-9.]+)', extra_data)
+                        if freeze_match:
+                            data["freeze_close"] = float(freeze_match.group(1))
+                    except Exception:
+                        pass  # Keep original extra_data if parsing fails
         
         # Build frontend feed event
         feed_event = {
@@ -141,6 +186,10 @@ class EventFeedGenerator:
             "stream": stream,
             "instrument": instrument,
             "session": session,
+            "slot_time_chicago": slot_time_chicago,
+            "slot_time_utc": slot_time_utc,
+            "execution_instrument": execution_instrument,
+            "canonical_instrument": canonical_instrument,
             "data": data,
         }
         
@@ -199,6 +248,34 @@ class EventFeedGenerator:
         
         return sorted(log_files)
     
+    def _rotate_feed_file_if_needed(self):
+        """Rotate frontend_feed.jsonl if it exceeds size limit."""
+        MAX_FILE_SIZE_MB = 100  # Rotate at 100 MB
+        MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+        
+        if not FRONTEND_FEED_FILE.exists():
+            return
+        
+        try:
+            file_size = FRONTEND_FEED_FILE.stat().st_size
+            if file_size >= MAX_FILE_SIZE_BYTES:
+                # Create archive directory
+                archive_dir = FRONTEND_FEED_FILE.parent / "archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate archive filename with timestamp
+                timestamp = datetime.now(CHICAGO_TZ).strftime("%Y%m%d_%H%M%S")
+                archive_path = archive_dir / f"frontend_feed_{timestamp}.jsonl"
+                
+                # Move current file to archive
+                shutil.move(str(FRONTEND_FEED_FILE), str(archive_path))
+                logger.info(f"Rotated frontend_feed.jsonl ({file_size / (1024*1024):.2f} MB) -> archive/{archive_path.name}")
+                
+                # Reset read positions since we're starting fresh
+                self._last_read_positions.clear()
+        except Exception as e:
+            logger.warning(f"Failed to rotate frontend_feed.jsonl: {e}")
+    
     def process_new_events(self) -> int:
         """
         Process new events from robot log files and append to frontend_feed.jsonl.
@@ -211,6 +288,9 @@ class EventFeedGenerator:
         
         # Ensure frontend feed file exists
         FRONTEND_FEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Rotate if needed before processing
+        self._rotate_feed_file_if_needed()
         
         processed_count = 0
         

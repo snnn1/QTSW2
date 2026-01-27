@@ -198,8 +198,15 @@ class WatchdogStateManager:
         if trading_date:
             self._trading_date = trading_date
     
-    def cleanup_stale_streams(self, current_trading_date: str, utc_now: datetime):
-        """Clean up stale streams from previous runs or old trading dates."""
+    def cleanup_stale_streams(self, current_trading_date: str, utc_now: datetime, clear_all_for_date: bool = False):
+        """
+        Clean up stale streams from previous runs or old trading dates.
+        
+        Args:
+            current_trading_date: Current trading date to keep
+            utc_now: Current UTC time for age calculations
+            clear_all_for_date: If True, clear streams for current_trading_date that haven't been updated recently
+        """
         # Remove streams from different trading dates
         keys_to_remove = []
         for (trading_date, stream), info in self._stream_states.items():
@@ -210,6 +217,23 @@ class WatchdogStateManager:
                     f"(date: {trading_date}, current: {current_trading_date})"
                 )
                 keys_to_remove.append((trading_date, stream))
+            # If clear_all_for_date is True (ENGINE_START), only remove streams that haven't been updated recently
+            # This prevents clearing active streams that are still transitioning
+            elif clear_all_for_date and trading_date == current_trading_date:
+                # Only clear if stream hasn't been updated in the last 30 seconds
+                # This allows streams to be re-initialized after restart while preserving active ones
+                time_since_update = (utc_now - info.state_entry_time_utc).total_seconds()
+                if time_since_update > 30:  # 30 seconds
+                    logger.info(
+                        f"Removing stale stream on ENGINE_START (not updated recently): {stream} "
+                        f"(state: {info.state}, last_update: {time_since_update:.1f}s ago, trading_date: {trading_date})"
+                    )
+                    keys_to_remove.append((trading_date, stream))
+                else:
+                    logger.debug(
+                        f"Keeping active stream on ENGINE_START: {stream} "
+                        f"(state: {info.state}, updated {time_since_update:.1f}s ago)"
+                    )
             # Also remove streams stuck in PRE_HYDRATION for > 2 hours (likely stale)
             elif info.state == "PRE_HYDRATION":
                 stuck_duration = (utc_now - info.state_entry_time_utc).total_seconds()
@@ -224,7 +248,7 @@ class WatchdogStateManager:
             del self._stream_states[key]
         
         if keys_to_remove:
-            logger.info(f"Cleaned up {len(keys_to_remove)} stale stream(s) (current_trading_date: {current_trading_date})")
+            logger.info(f"Cleaned up {len(keys_to_remove)} stale stream(s) (current_trading_date: {current_trading_date}, clear_all: {clear_all_for_date})")
     
     def bars_expected(self, instrument: str, market_open: bool) -> bool:
         """

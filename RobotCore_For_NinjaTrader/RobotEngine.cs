@@ -37,6 +37,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private string _specPath = "";
     private string _timetablePath = "";
+    
+    // PHASE 3.1: Execution instrument from constructor (MES, ES, MNG, NG, etc.)
+    private readonly string? _executionInstrument;
 
     private string? _lastTimetableHash;
     private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
@@ -192,6 +195,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         _root = projectRoot;
         _executionMode = executionMode;
+        _executionInstrument = instrument; // PHASE 3.1: Store execution instrument for canonical lock
         
         // Load logging configuration
         _loggingConfig = LoggingConfig.LoadFromFile(projectRoot);
@@ -366,7 +370,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     archive_days = _loggingConfig.archive_days
                 }));
 
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE"));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE",
+                new
+                {
+                    ninjatrader_instrument = _executionInstrument ?? "NULL",
+                    note = "Instrument passed from NinjaTrader strategy constructor"
+                }));
 
             try
             {
@@ -809,11 +818,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             {
                                 recovery_state = _recoveryState.ToString(),
                                 reconnect_utc = _reconnectUtc?.ToString("o"),
+                                last_tick_utc = _lastTickUtc != DateTimeOffset.MinValue ? _lastTickUtc.ToString("o") : null,
                                 last_order_update_utc = _lastOrderUpdateUtc?.ToString("o"),
                                 last_execution_update_utc = _lastExecutionUpdateUtc?.ToString("o"),
                                 last_connection_status = _lastConnectionStatus.ToString(),
                                 quiet_window_seconds = 5,
-                                note = "Waiting for broker synchronization before starting recovery"
+                                note = "Waiting for broker synchronization (bar/order/execution updates) before starting recovery"
                             }));
                     }
                     return; // Don't proceed with normal tick processing while waiting
@@ -967,6 +977,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         // Health monitor: record bar reception (early, before other processing)
         _healthMonitor?.OnBar(instrument, barUtc);
+        
+        // Update last tick timestamp for broker synchronization check
+        // Bar updates indicate connection health, so track them for recovery sync
+        _lastTickUtc = utcNow;
 
         // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
         // Only logged if diagnostic logs are enabled
@@ -1914,9 +1928,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
+        // Only proceed if timetable actually changed (or forced)
         if (!force && !poll.Changed) return;
 
         var previousHash = _lastTimetableHash;
+        var timetableActuallyChanged = poll.Changed && previousHash != null;
         _lastTimetableHash = poll.Hash;
 
         if (timetable is null)
@@ -2006,23 +2022,28 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var isReplayTimetable = timetable.metadata?.replay == true;
 
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
-            new 
-            { 
-                previous_hash = previousHash,
-                new_hash = _lastTimetableHash,
-                enabled_stream_count = timetable.streams.Count(s => s.enabled),
-                total_stream_count = timetable.streams.Count,
-                trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
-                date_locked = dateWasLocked,
-                note = "Timetable structure validated - trading date locked from timetable"
-            }));
+        // Only log timetable events when actually changed (or forced/initial load)
+        // This reduces log verbosity when timetable hasn't changed
+        if (force || timetableActuallyChanged || previousHash == null)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_UPDATED", state: "ENGINE",
+                new 
+                { 
+                    previous_hash = previousHash,
+                    new_hash = _lastTimetableHash,
+                    enabled_stream_count = timetable.streams.Count(s => s.enabled),
+                    total_stream_count = timetable.streams.Count,
+                    trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                    date_locked = dateWasLocked,
+                    note = "Timetable structure validated - trading date locked from timetable"
+                }));
 
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_LOADED", state: "ENGINE",
-            new { streams = timetable.streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
-        
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
-            new { is_replay = isReplayTimetable, trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"), note = "Trading date locked from timetable" }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_LOADED", state: "ENGINE",
+                new { streams = timetable.streams.Count, timetable_hash = _lastTimetableHash, timetable_path = _timetablePath }));
+            
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_VALIDATED", state: "ENGINE",
+                new { is_replay = isReplayTimetable, trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"), note = "Trading date locked from timetable" }));
+        }
 
         // Store timetable for later application
         _lastTimetable = timetable;
@@ -2088,19 +2109,57 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         foreach (var directive in incoming)
         {
-            var streamId = directive.stream;
+            var timetableInstrument = (directive.instrument ?? "").ToUpperInvariant();
+            var canonicalInstrument = GetCanonicalInstrument(timetableInstrument);
+            var session = directive.session ?? "";
+            var slotTimeChicago = directive.slot_time ?? "";
             
-            // Track stream ID occurrences for duplicate detection
+            // CRITICAL: Use NinjaTrader instrument if it matches timetable instrument or its canonical equivalent
+            // If NinjaTrader has MNG and timetable says NG, use MNG for ExecutionInstrument
+            // If NinjaTrader has NG and timetable says NG, use NG for ExecutionInstrument
+            // This allows the robot to use whatever instrument is actually enabled in NinjaTrader
+            var executionInstrument = timetableInstrument;
+            if (!string.IsNullOrWhiteSpace(_executionInstrument))
+            {
+                var ntInstrument = _executionInstrument.ToUpperInvariant();
+                var ntCanonical = GetCanonicalInstrument(ntInstrument);
+                
+                // If NinjaTrader instrument's canonical matches timetable's canonical, use NinjaTrader instrument
+                // This handles: NG (timetable) + MNG (NinjaTrader) -> use MNG
+                // And: NG (timetable) + NG (NinjaTrader) -> use NG
+                if (string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
+                {
+                    executionInstrument = ntInstrument;
+                }
+            }
+            
+            // PHASE 2: Canonicalize stream ID - must use canonical instrument, not execution
+            var streamId = directive.stream;
+            if (!string.IsNullOrWhiteSpace(streamId) && !string.IsNullOrWhiteSpace(executionInstrument))
+            {
+                // Map execution instrument in stream ID to canonical instrument
+                // e.g., "MES1" -> "ES1"
+                // Use case-insensitive comparison
+                var streamIdUpper = streamId.ToUpperInvariant();
+                var execInstUpper = executionInstrument.ToUpperInvariant();
+                if (streamIdUpper.Contains(execInstUpper))
+                {
+                    // Replace with case-insensitive matching - find the index and replace
+                    var index = streamIdUpper.IndexOf(execInstUpper);
+                    if (index >= 0)
+                    {
+                        streamId = streamId.Substring(0, index) + canonicalInstrument + streamId.Substring(index + executionInstrument.Length);
+                    }
+                }
+            }
+            
+            // Track stream ID occurrences for duplicate detection (using canonical stream ID)
             if (!string.IsNullOrWhiteSpace(streamId))
             {
                 if (!streamIdOccurrences.TryGetValue(streamId, out var count))
                     count = 0;
                 streamIdOccurrences[streamId] = count + 1;
             }
-            
-            var instrument = (directive.instrument ?? "").ToUpperInvariant();
-            var session = directive.session ?? "";
-            var slotTimeChicago = directive.slot_time ?? "";
             DateTimeOffset? slotTimeUtc = null;
             try
             {
@@ -2117,17 +2176,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
 
             var tradingDateStr = tradingDate.ToString("yyyy-MM-dd"); // Use parameter, not _activeTradingDate
+            
+            // Log execution instrument override if it occurred (after slotTimeUtc is computed)
+            if (!string.IsNullOrWhiteSpace(_executionInstrument) && 
+                !string.Equals(executionInstrument, timetableInstrument, StringComparison.OrdinalIgnoreCase))
+            {
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc ?? DateTimeOffset.UtcNow,
+                    "EXECUTION_INSTRUMENT_OVERRIDE", "ENGINE",
+                    new
+                    {
+                        timetable_instrument = timetableInstrument,
+                        ninjatrader_instrument = _executionInstrument.ToUpperInvariant(),
+                        execution_instrument = executionInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        note = "Using NinjaTrader instrument for execution (matches timetable canonical)"
+                    }));
+            }
 
             if (string.IsNullOrWhiteSpace(streamId) ||
-                string.IsNullOrWhiteSpace(instrument) ||
+                string.IsNullOrWhiteSpace(executionInstrument) ||
                 string.IsNullOrWhiteSpace(session) ||
                 string.IsNullOrWhiteSpace(slotTimeChicago))
             {
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("MISSING_FIELDS", out var count)) count = 0;
                 skippedReasons["MISSING_FIELDS"] = count + 1;
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", instrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "MISSING_FIELDS", stream_id = streamId, instrument = instrument, session = session, slot_time = slotTimeChicago }));
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_SKIPPED", "ENGINE", new { reason = "MISSING_FIELDS", stream_id = streamId, instrument = executionInstrument, session = session, slot_time = slotTimeChicago }));
                 continue;
             }
 
@@ -2136,7 +2211,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_SESSION", out var count2)) count2 = 0;
                 skippedReasons["UNKNOWN_SESSION"] = count2 + 1;
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_SESSION", stream_id = streamId, session = session }));
                 continue;
             }
@@ -2148,18 +2223,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("INVALID_SLOT_TIME", out var count3)) count3 = 0;
                 skippedReasons["INVALID_SLOT_TIME"] = count3 + 1;
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
                     "STREAM_SKIPPED", "ENGINE", new { reason = "INVALID_SLOT_TIME", stream_id = streamId, slot_time = slotTimeChicago, allowed_times = allowed }));
                 continue;
             }
 
-            if (!_spec.TryGetInstrument(instrument, out _))
+            if (!_spec.TryGetInstrument(canonicalInstrument, out _))
             {
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_INSTRUMENT", out var count4)) count4 = 0;
                 skippedReasons["UNKNOWN_INSTRUMENT"] = count4 + 1;
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_INSTRUMENT", stream_id = streamId, instrument = instrument }));
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_INSTRUMENT", stream_id = streamId, instrument = canonicalInstrument }));
                 continue;
             }
 
@@ -2170,7 +2245,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 if (sm.Committed)
                 {
-                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
                         "UPDATE_IGNORED_COMMITTED", "ENGINE", new { reason = "STREAM_COMMITTED" }));
                     continue;
                 }
@@ -2179,7 +2254,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (string.IsNullOrWhiteSpace(directive.slot_time))
                 {
                     // Fail closed: skip update if slot_time is null/empty
-                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, sm.SlotTimeChicago, null,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, sm.SlotTimeChicago, null,
                         "STREAM_UPDATE_SKIPPED", "ENGINE", new 
                         { 
                             reason = "EMPTY_SLOT_TIME",
@@ -2195,12 +2270,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
                 
+                // CRITICAL: Create modified directive with executionInstrument override
+                // This ensures StreamStateMachine uses the NinjaTrader instrument (e.g., MNG) instead of timetable instrument (e.g., NG)
+                var modifiedDirective = new TimetableStream
+                {
+                    stream = directive.stream,
+                    instrument = executionInstrument, // Use computed executionInstrument (may be MNG if NinjaTrader has MNG)
+                    session = directive.session,
+                    slot_time = directive.slot_time,
+                    enabled = directive.enabled,
+                    block_reason = directive.block_reason,
+                    decision_time = directive.decision_time
+                };
+                
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
                 // NOTE: RobotCore_For_NinjaTrader doesn't have Phase 4 execution policy yet, so using default values
                 // TODO: Implement Phase 4 execution policy loading in RobotCore_For_NinjaTrader
                 var defaultOrderQuantity = 1; // Safe default until Phase 4 is implemented
                 var defaultMaxQuantity = 2; // Safe default (2x orderQuantity)
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, directive, _executionMode, defaultOrderQuantity, defaultMaxQuantity, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
+                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, modifiedDirective, _executionMode, defaultOrderQuantity, defaultMaxQuantity, _root, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig);
                 
                 // PHASE 4: Set alert callback for high-priority alerts only (RANGE_INVALIDATED)
                 // Non-critical alerts (gaps, pre-hydration, state transitions) are logged only, not notified
@@ -2234,11 +2322,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     });
                 }
                 
+                // PHASE 3: Post-creation assertion - verify stream ExecutionInstrument matches expected
+                if (newSm.ExecutionInstrument != executionInstrument)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream ExecutionInstrument '{newSm.ExecutionInstrument}' does not match expected '{executionInstrument}'."
+                    );
+                }
+                
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)
                 {
-                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, slotTimeChicago, slotTimeUtc,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
                         "STREAM_SKIPPED", "ENGINE", new { reason = "ALREADY_COMMITTED_JOURNAL" }));
                     continue;
                 }
@@ -2587,6 +2683,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     /// <summary>
     /// Check if broker is synchronized (connection stable and quiet window passed).
+    /// Accepts bar updates OR order/execution updates as proof of connection health.
     /// </summary>
     private bool IsBrokerSynchronized(DateTimeOffset utcNow)
     {
@@ -2602,17 +2699,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return false;
         }
         
-        // Require at least one order/execution update after reconnect
+        // Accept bar updates OR order/execution updates as proof of connection health
+        // Bar updates indicate the data feed is working, which is sufficient for SIM mode
+        // or when there are no open positions/orders
+        var hasBarUpdateAfterReconnect = _lastTickUtc != DateTimeOffset.MinValue && _lastTickUtc >= _reconnectUtc.Value;
         var hasOrderUpdateAfterReconnect = _lastOrderUpdateUtc.HasValue && _lastOrderUpdateUtc.Value >= _reconnectUtc.Value;
         var hasExecutionUpdateAfterReconnect = _lastExecutionUpdateUtc.HasValue && _lastExecutionUpdateUtc.Value >= _reconnectUtc.Value;
         
-        if (!hasOrderUpdateAfterReconnect && !hasExecutionUpdateAfterReconnect)
+        if (!hasBarUpdateAfterReconnect && !hasOrderUpdateAfterReconnect && !hasExecutionUpdateAfterReconnect)
         {
             return false;
         }
         
         // Require quiet window: at least 5 seconds since last update
+        // Use the most recent update (bar, order, or execution) for quiet window calculation
         var lastUpdateUtc = DateTimeOffset.MinValue;
+        if (hasBarUpdateAfterReconnect && _lastTickUtc > lastUpdateUtc)
+        {
+            lastUpdateUtc = _lastTickUtc;
+        }
         if (_lastOrderUpdateUtc.HasValue && _lastOrderUpdateUtc.Value > lastUpdateUtc)
         {
             lastUpdateUtc = _lastOrderUpdateUtc.Value;

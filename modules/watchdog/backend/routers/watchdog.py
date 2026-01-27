@@ -23,6 +23,7 @@ from modules.watchdog.config import (
     EXECUTION_SUMMARIES_DIR,
     ROBOT_JOURNAL_DIR,
 )
+from modules.watchdog.websocket_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,10 @@ aggregator_instance: Optional[WatchdogAggregator] = None
 def get_aggregator() -> WatchdogAggregator:
     """Get aggregator instance."""
     if aggregator_instance is None:
-        raise HTTPException(status_code=503, detail="Watchdog aggregator not initialized")
+        error_msg = "Watchdog aggregator not initialized - check startup logs"
+        print(f"ERROR: {error_msg}")
+        logger.error(error_msg)
+        raise HTTPException(status_code=503, detail=error_msg)
     return aggregator_instance
 
 
@@ -55,11 +59,14 @@ async def get_watchdog_status():
     """Get current WatchdogStatus (pre-computed by backend)."""
     try:
         aggregator = get_aggregator()
-        return aggregator.get_watchdog_status()
+        status = aggregator.get_watchdog_status()
+        return status
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting watchdog status: {e}", exc_info=True)
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Error getting watchdog status: {e}\n{error_trace}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting watchdog status: {str(e)}")
 
 
@@ -143,6 +150,18 @@ async def get_active_intents():
     except Exception as e:
         logger.error(f"Error getting active intents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting active intents: {str(e)}")
+
+
+@router.get("/ws-health")
+async def get_ws_health():
+    """Get WebSocket health status and connection metrics."""
+    try:
+        tracker = get_tracker()
+        snapshot = await tracker.get_snapshot()
+        return snapshot
+    except Exception as e:
+        logger.error(f"Error getting WebSocket health: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting WebSocket health: {str(e)}")
 
 
 # Historical journal endpoints

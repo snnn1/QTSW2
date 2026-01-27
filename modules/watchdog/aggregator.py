@@ -7,7 +7,7 @@ import logging
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
-from collections import defaultdict
+from collections import defaultdict, deque
 import pytz
 
 from .event_feed import EventFeedGenerator
@@ -29,6 +29,11 @@ class WatchdogAggregator:
         self._event_processor = EventProcessor(self._state_manager)
         self._cursor_manager = CursorManager()
         self._running = False
+        
+        # In-memory ring buffer for important WebSocket events
+        # Buffer size: 200 events (configurable)
+        self._important_events_buffer: deque = deque(maxlen=200)
+        self._event_seq_counter: int = 0  # Monotonic sequence ID counter
     
     async def start(self):
         """Start the aggregator service."""
@@ -133,14 +138,23 @@ class WatchdogAggregator:
     async def _process_events_loop(self):
         """Background loop to process new events."""
         cleanup_counter = 0
+        import concurrent.futures
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
         while self._running:
             try:
-                # Generate new events from raw logs
-                processed_count = self._event_feed.process_new_events()
+                # Generate new events from raw logs (run in thread pool to avoid blocking event loop)
+                # This reads large log files synchronously, so we need to offload it
+                loop = asyncio.get_event_loop()
+                processed_count = await loop.run_in_executor(
+                    executor,
+                    self._event_feed.process_new_events
+                )
                 
                 # Read and process new events from frontend_feed.jsonl
+                # Run in thread pool to avoid blocking event loop (file is large: ~1GB)
                 if FRONTEND_FEED_FILE.exists():
-                    await self._process_feed_events()
+                    await loop.run_in_executor(executor, self._process_feed_events_sync)
                 
                 # Periodic cleanup: every 60 seconds, remove stale streams
                 cleanup_counter += 1
@@ -172,18 +186,26 @@ class WatchdogAggregator:
         except Exception as e:
             logger.warning(f"Error in periodic cleanup: {e}")
     
-    async def _process_feed_events(self):
-        """Process new events from frontend_feed.jsonl."""
+    def _process_feed_events_sync(self):
+        """Process new events from frontend_feed.jsonl (synchronous, runs in thread pool)."""
         try:
             # Load cursor to know where we left off
             cursor = self._cursor_manager.load_cursor()
             
-            # Read events from feed file
+            # Check if state manager is empty - if so, rebuild state from most recent events
+            # This handles the case where streams were cleared but events were already processed
+            if len(self._state_manager._stream_states) == 0:
+                logger.info("State manager is empty - rebuilding stream states from most recent events")
+                self._rebuild_stream_states_from_recent_events()
+            
+            # Normal incremental processing - read new events since cursor
             events = self._read_feed_events_since(cursor)
             
             # Process each event
             for event in events:
                 self._event_processor.process_event(event)
+                # Add important events to ring buffer for WebSocket streaming
+                self._add_to_ring_buffer_if_important(event)
             
             # Update cursor
             if events:
@@ -217,7 +239,8 @@ class WatchdogAggregator:
             
             # Also track any new run_ids we encounter
             # Use utf-8-sig to handle UTF-8 BOM markers
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+            # Use binary mode to track positions accurately
+            with open(FRONTEND_FEED_FILE, 'rb') as f:
                 # If we have positions, seek to the minimum position (earliest unread)
                 if self._feed_file_positions:
                     min_pos = min(self._feed_file_positions.values())
@@ -228,8 +251,16 @@ class WatchdogAggregator:
                 
                 # Read new lines since last position
                 parse_errors = 0
-                for line in f:
-                    line = line.strip()
+                for line_bytes in f:
+                    # Track position before processing line
+                    line_start_pos = f.tell() - len(line_bytes)
+                    
+                    try:
+                        line = line_bytes.decode('utf-8-sig').strip()
+                    except UnicodeDecodeError:
+                        parse_errors += 1
+                        continue
+                    
                     if not line:
                         continue
                     
@@ -247,6 +278,9 @@ class WatchdogAggregator:
                             events.append(event)
                             # Track this run_id
                             run_ids_to_track.add(run_id)
+                        
+                        # Update position for this run_id (position after this line)
+                        self._feed_file_positions[run_id] = f.tell()
                     
                     except json.JSONDecodeError:
                         # Silently skip malformed JSON lines
@@ -256,16 +290,84 @@ class WatchdogAggregator:
                 # Log parse errors only once per read, not per line
                 if parse_errors > 0:
                     logger.debug(f"Skipped {parse_errors} malformed JSON lines in feed file")
-                
-                # Update file positions for all tracked run_ids
-                current_pos = f.tell()
-                for run_id in run_ids_to_track:
-                    self._feed_file_positions[run_id] = current_pos
         
         except Exception as e:
             logger.error(f"Error reading feed file: {e}")
         
         return events
+    
+    def _rebuild_stream_states_from_recent_events(self):
+        """
+        Rebuild stream states by finding the most recent state for each stream.
+        This is more efficient than reprocessing all events - we just find the latest state.
+        """
+        import json
+        from collections import defaultdict
+        
+        if not FRONTEND_FEED_FILE.exists():
+            logger.warning("Feed file does not exist, cannot rebuild stream states")
+            return
+        
+        try:
+            # Track the most recent state for each (trading_date, stream) pair
+            # Key: (trading_date, stream), Value: (event, timestamp)
+            latest_states: Dict[tuple, tuple] = {}
+            
+            # Read recent events (last 5000 lines should be enough to find current states)
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+                # Read last N lines
+                all_lines = f.readlines()
+                recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+                
+                for line in recent_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get("event_type")
+                        
+                        # Only process STREAM_STATE_TRANSITION events
+                        if event_type != "STREAM_STATE_TRANSITION":
+                            continue
+                        
+                        trading_date = event.get("trading_date")
+                        stream = event.get("stream")
+                        timestamp_str = event.get("timestamp_utc")
+                        
+                        if not trading_date or not stream or not timestamp_str:
+                            continue
+                        
+                        # Parse timestamp for comparison
+                        try:
+                            from datetime import datetime
+                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        except Exception:
+                            continue
+                        
+                        key = (trading_date, stream)
+                        
+                        # Keep the most recent state for this stream
+                        if key not in latest_states or timestamp > latest_states[key][1]:
+                            latest_states[key] = (event, timestamp)
+                    
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Process the most recent state for each stream
+            if latest_states:
+                logger.info(f"Found {len(latest_states)} streams to rebuild from recent events")
+                for (trading_date, stream), (event, timestamp) in latest_states.items():
+                    # Process this event to rebuild the stream state
+                    self._event_processor.process_event(event)
+                
+                logger.info(f"Rebuilt {len(latest_states)} stream states from most recent events")
+            else:
+                logger.info("No stream state transitions found in recent events")
+        
+        except Exception as e:
+            logger.error(f"Error rebuilding stream states from recent events: {e}", exc_info=True)
     
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
         """Get events since event_seq for a run_id."""
@@ -277,10 +379,14 @@ class WatchdogAggregator:
             return events
         
         try:
-            # Use utf-8-sig to handle UTF-8 BOM markers
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                for line in f:
-                    line = line.strip()
+            # Use binary mode to avoid tell() issues
+            with open(FRONTEND_FEED_FILE, 'rb') as f:
+                for line_bytes in f:
+                    try:
+                        line = line_bytes.decode('utf-8-sig').strip()
+                    except UnicodeDecodeError:
+                        continue
+                    
                     if not line:
                         continue
                     
@@ -400,12 +506,19 @@ class WatchdogAggregator:
                     state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
                     slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
                     # Extract time portion from slot_time_chicago if it's in ISO format
+                    # But preserve if already formatted as "HH:MM"
                     if slot_time_chicago and 'T' in slot_time_chicago:
                         try:
                             slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
+                            # Convert to Chicago timezone if needed
+                            if slot_dt.tzinfo:
+                                slot_dt = slot_dt.astimezone(CHICAGO_TZ)
                             slot_time_chicago = slot_dt.strftime("%H:%M")
                         except Exception:
                             pass  # Keep original if parsing fails
+                    # If empty string, set to None so frontend can display "-"
+                    if slot_time_chicago == "":
+                        slot_time_chicago = None
                     
                     streams.append({
                         "trading_date": trading_date,
@@ -415,8 +528,8 @@ class WatchdogAggregator:
                         "state": getattr(info, 'state', ''),
                         "committed": getattr(info, 'committed', False),
                         "commit_reason": getattr(info, 'commit_reason', None),
-                        "slot_time_chicago": slot_time_chicago,
-                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or "",
+                        "slot_time_chicago": slot_time_chicago if slot_time_chicago else None,
+                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or None,
                         "range_high": getattr(info, 'range_high', None),
                         "range_low": getattr(info, 'range_low', None),
                         "freeze_close": getattr(info, 'freeze_close', None),
@@ -438,6 +551,107 @@ class WatchdogAggregator:
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
             "streams": streams
         }
+    
+    def _add_to_ring_buffer_if_important(self, event: Dict) -> None:
+        """
+        Add event to ring buffer if it's an important event type.
+        
+        Selection rule: only event types that affect UI display OR represent anomalies.
+        """
+        event_type = event.get("event_type", "")
+        
+        # Canonical list of important event types (only events that exist in feed)
+        important_types = {
+            "CONNECTION_LOST",
+            "CONNECTION_LOST_SUSTAINED",
+            "CONNECTION_RECOVERED",
+            "ENGINE_TICK_STALL_DETECTED",
+            "ENGINE_TICK_STALL_RECOVERED",
+            "STREAM_STATE_TRANSITION",
+            "DATA_STALL_RECOVERED",  # Actual event from feed
+            "IDENTITY_INVARIANTS_STATUS",  # Actual event from feed
+            "KILL_SWITCH_ACTIVE",
+            "EXECUTION_BLOCKED",
+            "EXECUTION_ALLOWED",
+            # Note: DATA_STALL_DETECTED, UNPROTECTED_POSITION_DETECTED are computed, not feed events
+            # Note: RISK_GATE_CHANGED, TRADING_ALLOWED_CHANGED are derived, can be added later
+        }
+        
+        # Exclude to avoid spam
+        excluded_types = {
+            "ENGINE_TICK_HEARTBEAT",  # Too frequent
+        }
+        
+        # Check if event is important
+        if event_type in excluded_types:
+            return
+        
+        # Special handling for IDENTITY_INVARIANTS_STATUS - only include if violations detected
+        if event_type == "IDENTITY_INVARIANTS_STATUS":
+            data = event.get("data", {})
+            violations = data.get("violations", [])
+            if not violations or len(violations) == 0:
+                return  # No violations, skip
+        
+        if event_type in important_types:
+            # Increment sequence counter
+            self._event_seq_counter += 1
+            
+            # Build standardized event payload
+            ws_event = {
+                "seq": self._event_seq_counter,
+                "type": event_type,
+                "ts_utc": event.get("timestamp_utc", datetime.now(timezone.utc).isoformat()),
+                "run_id": event.get("run_id"),
+                "stream_id": event.get("stream_id") or event.get("stream"),
+                "severity": self._determine_severity(event_type),
+            }
+            
+            # Add event data if present
+            if event.get("data"):
+                ws_event["data"] = event["data"]
+            
+            # Add to ring buffer
+            self._important_events_buffer.append(ws_event)
+    
+    def _determine_severity(self, event_type: str) -> Optional[str]:
+        """Determine severity level for event type."""
+        critical_types = {
+            "CONNECTION_LOST",
+            "ENGINE_TICK_STALL_DETECTED",
+            "IDENTITY_INVARIANT_VIOLATION",
+            "KILL_SWITCH_ACTIVE",
+            "EXECUTION_BLOCKED",
+            "UNPROTECTED_POSITION_DETECTED",
+            "DATA_STALL_DETECTED",
+        }
+        
+        warning_types = {
+            "CONNECTION_LOST_SUSTAINED",
+            "RISK_GATE_CHANGED",
+            "TRADING_ALLOWED_CHANGED",
+        }
+        
+        if event_type in critical_types:
+            return "critical"
+        elif event_type in warning_types:
+            return "warning"
+        else:
+            return "info"
+    
+    def get_important_events_since(self, seq_id: int) -> List[Dict]:
+        """
+        Get important events from ring buffer since sequence ID.
+        
+        This is for WebSocket live event streaming (not REST).
+        
+        Args:
+            seq_id: Sequence ID to start from (exclusive)
+        
+        Returns:
+            List of events with seq > seq_id, ordered by seq
+        """
+        return [event for event in self._important_events_buffer if event.get("seq", 0) > seq_id]
     
     def get_active_intents(self) -> Dict:
         """Get current active intents."""

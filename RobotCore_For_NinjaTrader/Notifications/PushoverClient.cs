@@ -14,7 +14,7 @@ public static class PushoverClient
     public const string PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json";
     private static readonly HttpClient _httpClient = new HttpClient
     {
-        Timeout = TimeSpan.FromSeconds(5)
+        Timeout = TimeSpan.FromSeconds(12)  // Slightly longer than NotificationService guard timeout (10s) to ensure guard timeout triggers first
     };
 
     /// <summary>

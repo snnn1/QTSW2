@@ -491,6 +491,49 @@ public sealed class ExecutionJournal
         }
     }
 
+    /// <summary>
+    /// Check if any entry intent was filled for the given stream and trading day.
+    /// Used for restoring _entryDetected flag on restart.
+    /// </summary>
+    public bool HasEntryFillForStream(string tradingDate, string stream)
+    {
+        lock (_lock)
+        {
+            // Scan journal directory for entries matching tradingDate_stream_*
+            var pattern = $"{tradingDate}_{stream}_*.json";
+            
+            try
+            {
+                if (!Directory.Exists(_journalDir)) return false;
+                
+                var files = Directory.GetFiles(_journalDir, pattern);
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var json = File.ReadAllText(file);
+                        var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                        if (entry != null && entry.EntryFilled)
+                        {
+                            return true; // Found at least one filled entry
+                        }
+                    }
+                    catch
+                    {
+                        // Skip corrupted files, continue scanning
+                    }
+                }
+            }
+            catch
+            {
+                // Fail-safe: return false on error (assume no fill)
+                return false;
+            }
+            
+            return false;
+        }
+    }
+
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 

@@ -114,5 +114,11 @@ public sealed class StreamJournal
     public string LastUpdateUtc { get; set; } = "";
 
     public string? TimetableHashAtCommit { get; set; }
+    
+    // RESTART RECOVERY: Persist order submission state
+    public bool StopBracketsSubmittedAtLock { get; set; } = false;
+    
+    // RESTART RECOVERY: Persist entry detection state (backup to execution journal)
+    public bool EntryDetected { get; set; } = false;
 }
 
