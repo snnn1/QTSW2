@@ -63,6 +63,11 @@ class WatchdogStateManager:
         self._timetable_validated: bool = False
         self._trading_date: Optional[str] = None
         
+        # Timetable-derived state (from timetable_current.json polling)
+        self._enabled_streams: Optional[Set[str]] = None  # None = timetable unavailable
+        self._timetable_hash: Optional[str] = None
+        self._timetable_last_ok_utc: Optional[datetime] = None
+        
         # Risk gate state
         self._allowed_slot_times: List[str] = []  # From timetable config
         
@@ -72,7 +77,11 @@ class WatchdogStateManager:
         self._last_identity_violations: List[str] = []
         
     def update_engine_tick(self, timestamp_utc: datetime):
-        """Update engine tick timestamp."""
+        """
+        Update engine tick timestamp from ENGINE_HEARTBEAT event.
+        This represents engine loop (Tick()) execution, not bar processing.
+        ENGINE_TICK_HEARTBEAT tracks bar processing separately.
+        """
         self._last_engine_tick_utc = timestamp_utc
     
     def update_recovery_state(self, state: str, timestamp_utc: datetime):
@@ -198,6 +207,40 @@ class WatchdogStateManager:
         if trading_date:
             self._trading_date = trading_date
     
+    def update_timetable_streams(
+        self,
+        enabled_streams: Optional[Set[str]],
+        trading_date: str,
+        timetable_hash: Optional[str],
+        utc_now: datetime
+    ):
+        """
+        Update timetable-derived state.
+        
+        - Sets trading_date always (authoritative)
+        - Sets enabled_streams only when non-None (preserves None on failure)
+        - Updates timetable_hash when non-None
+        - Records last_ok timestamp when successful
+        """
+        self._trading_date = trading_date
+        if enabled_streams is not None:
+            self._enabled_streams = enabled_streams
+        if timetable_hash is not None:
+            self._timetable_hash = timetable_hash
+            self._timetable_last_ok_utc = utc_now
+    
+    def get_enabled_streams(self) -> Optional[Set[str]]:
+        """Get enabled streams set (None if timetable unavailable)."""
+        return self._enabled_streams
+    
+    def get_timetable_hash(self) -> Optional[str]:
+        """Get current timetable hash."""
+        return self._timetable_hash
+    
+    def get_trading_date(self) -> Optional[str]:
+        """Get current trading_date (CME rollover)."""
+        return self._trading_date
+    
     def cleanup_stale_streams(self, current_trading_date: str, utc_now: datetime, clear_all_for_date: bool = False):
         """
         Clean up stale streams from previous runs or old trading dates.
@@ -283,7 +326,22 @@ class WatchdogStateManager:
         
         now = datetime.now(timezone.utc)
         elapsed = (now - self._last_engine_tick_utc).total_seconds()
-        return elapsed < ENGINE_TICK_STALL_THRESHOLD_SECONDS
+        engine_alive = elapsed < ENGINE_TICK_STALL_THRESHOLD_SECONDS
+        
+        # Phase 4: Diagnostic logging (rate-limited to every ~30 seconds)
+        if not hasattr(self, '_last_engine_alive_log_utc'):
+            self._last_engine_alive_log_utc = None
+        
+        if self._last_engine_alive_log_utc is None or (now - self._last_engine_alive_log_utc).total_seconds() >= 30:
+            self._last_engine_alive_log_utc = now
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"ENGINE_ALIVE_STATUS: last_engine_tick_utc={self._last_engine_tick_utc.isoformat() if self._last_engine_tick_utc else None}, "
+                f"elapsed_seconds={elapsed:.2f}, engine_alive={engine_alive}, threshold={ENGINE_TICK_STALL_THRESHOLD_SECONDS}"
+            )
+        
+        return engine_alive
     
     def compute_stuck_streams(self) -> List[Dict]:
         """Compute stuck streams derived field."""

@@ -41,7 +41,19 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Engine Health
     "ENGINE_START",
     "ENGINE_STOP",
-    "ENGINE_TICK_HEARTBEAT",
+    "ENGINE_HEARTBEAT",  # Unconditional Tick() liveness (every 5s)
+    "ENGINE_HEARTBEAT_SKIPPED",  # Diagnostic: heartbeat skipped due to interval gate
+    "ENGINE_HEARTBEAT_EXCEPTION",  # Diagnostic: exception during heartbeat emission
+    "ENGINE_HEARTBEAT_REACHED",  # Diagnostic: heartbeat code path reached
+    "ENGINE_HEARTBEAT_CHECK",  # Diagnostic: heartbeat interval check
+    "ENGINE_HEARTBEAT_ENTRY",  # Diagnostic: heartbeat code block entry (unconditional)
+    "ENGINE_TICK_EXECUTED",  # Diagnostic: Tick() execution (Phase 1)
+    "ENGINE_TICK_CALLSITE",  # Diagnostic: Tick() call site (Phase 2)
+    "ENGINE_TICK_BEFORE_LOCK",  # Diagnostic: before lock acquisition
+    "ENGINE_TICK_LOCK_ACQUIRED",  # Diagnostic: after lock acquired
+    "ENGINE_TICK_AFTER_LOCK",  # Diagnostic: after lock released
+    "ENGINE_BUILD_STAMP",  # Diagnostic: engine build and instance ID
+    "ENGINE_TICK_HEARTBEAT",  # Bar-driven heartbeat (keep for bar tracking)
     "ENGINE_TICK_STALL_DETECTED",
     "ENGINE_TICK_STALL_RECOVERED",
     # Recovery State

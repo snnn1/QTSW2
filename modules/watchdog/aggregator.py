@@ -13,6 +13,7 @@ import pytz
 from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor
 from .state_manager import WatchdogStateManager, CursorManager
+from .timetable_poller import TimetablePoller, compute_timetable_trading_date
 from .config import FRONTEND_FEED_FILE
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class WatchdogAggregator:
         self._state_manager = WatchdogStateManager()
         self._event_processor = EventProcessor(self._state_manager)
         self._cursor_manager = CursorManager()
+        self._timetable_poller = TimetablePoller()
         self._running = False
         
         # In-memory ring buffer for important WebSocket events
@@ -46,6 +48,9 @@ class WatchdogAggregator:
         
         # Start background task for processing events
         asyncio.create_task(self._process_events_loop())
+        
+        # Start background task for polling timetable
+        asyncio.create_task(self._poll_timetable_loop())
     
     async def stop(self):
         """Stop the aggregator service."""
@@ -169,17 +174,73 @@ class WatchdogAggregator:
                 logger.error(f"Error in event processing loop: {e}", exc_info=True)
                 await asyncio.sleep(5)  # Wait longer on error
     
+    async def _poll_timetable_loop(self):
+        """Poll timetable every 60 seconds. Never throws, never blocks event loop."""
+        previous_trading_date = None
+        
+        while self._running:
+            try:
+                utc_now = datetime.now(timezone.utc)
+                trading_date, enabled_streams_set, timetable_hash = self._timetable_poller.poll()
+                
+                # CRITICAL: Always compute trading_date on every poll (CME rollover)
+                # Trading date advances at 17:00 CT regardless of timetable file changes
+                if trading_date:
+                    previous_trading_date = self._state_manager.get_trading_date()
+                    
+                    # Update state manager (always updates trading_date, conditionally updates enabled_streams)
+                    self._state_manager.update_timetable_streams(
+                        enabled_streams_set, trading_date, timetable_hash, utc_now
+                    )
+                    
+                    # CRITICAL FIX: Detect day rollover by TIME comparison, NOT hash change
+                    # Hash change ≠ day change. Day rollover happens at 17:00 CT every day,
+                    # even if timetable file content is unchanged.
+                    if previous_trading_date and previous_trading_date != trading_date:
+                        # Day rollover detected - cleanup stale streams safely
+                        self._state_manager.cleanup_stale_streams(
+                            trading_date, utc_now, clear_all_for_date=False
+                        )
+                        logger.info(
+                            f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}"
+                        )
+                    
+                    # Hash change detection (separate from day rollover)
+                    # Only used for enabled_streams updates, not day changes
+                    if timetable_hash and timetable_hash != self._state_manager.get_timetable_hash():
+                        # Timetable content changed (enabled streams may have changed)
+                        # This is logged below in TIMETABLE_POLL_OK
+                        pass
+                    
+                    # Log successful poll
+                    if enabled_streams_set is not None:
+                        logger.info(
+                            f"TIMETABLE_POLL_OK: trading_date={trading_date}, "
+                            f"enabled_count={len(enabled_streams_set)}, hash={timetable_hash[:8] if timetable_hash else 'N/A'}"
+                        )
+                    else:
+                        logger.warning(
+                            f"TIMETABLE_POLL_FAIL: trading_date={trading_date} computed, "
+                            f"but timetable file missing/invalid (fail-open mode)"
+                        )
+            except Exception as e:
+                # Never throw - log and continue
+                # Keep last known good enabled_streams on failure
+                logger.error(f"TIMETABLE_POLL_FAIL: Unexpected error: {e}", exc_info=True)
+            
+            await asyncio.sleep(60)
+    
     def _cleanup_stale_streams_periodic(self):
         """Periodically clean up stale streams (runs every 60 seconds)."""
         try:
-            # Get current trading date from state manager
-            current_trading_date = self._state_manager._trading_date
+            # Get current trading date from state manager (use getter, not private field)
+            current_trading_date = self._state_manager.get_trading_date()
             
-            # Fallback: if trading_date not set, use today's date (Chicago timezone)
+            # Fallback: if trading_date not set, use CME rollover helper
             if not current_trading_date:
                 chicago_now = datetime.now(CHICAGO_TZ)
-                current_trading_date = chicago_now.strftime("%Y-%m-%d")
-                logger.debug(f"Trading date not set, using today's date: {current_trading_date}")
+                current_trading_date = compute_timetable_trading_date(chicago_now)
+                logger.debug(f"Trading date not set, using CME rollover: {current_trading_date}")
             
             utc_now = datetime.now(timezone.utc)
             self._state_manager.cleanup_stale_streams(current_trading_date, utc_now)
@@ -487,21 +548,37 @@ class WatchdogAggregator:
         return run_id
     
     def get_stream_states(self) -> Dict:
-        """Get current stream states."""
+        """Get current stream states, filtered by enabled streams when available."""
         streams = []
+        timetable_unavailable = False
+        
         try:
-            # Get current trading date (filter out stale streams from previous days)
-            current_trading_date = self._state_manager._trading_date
+            # CRITICAL: Use getter, never access private fields directly
+            current_trading_date = self._state_manager.get_trading_date()
             if not current_trading_date:
-                # Fallback: use today's date
+                # Fallback: compute using CME rollover
                 chicago_now = datetime.now(CHICAGO_TZ)
-                current_trading_date = chicago_now.strftime("%Y-%m-%d")
+                current_trading_date = compute_timetable_trading_date(chicago_now)
             
-            if hasattr(self._state_manager, '_stream_states'):
-                for (trading_date, stream), info in self._state_manager._stream_states.items():
-                    # Only include streams from current trading date
-                    if trading_date != current_trading_date:
-                        continue
+            # CRITICAL: Use getter, never access _enabled_streams directly
+            enabled_streams = self._state_manager.get_enabled_streams()
+            if enabled_streams is None:
+                timetable_unavailable = True  # Flag for UI warning
+            
+            # NOTE: Direct access to _stream_states is needed for now
+            # TODO: Refactor StateManager to provide get_stream_states_dict() getter
+            # For now, use getattr with safe fallback
+            stream_states_dict = getattr(self._state_manager, '_stream_states', {})
+            for (trading_date, stream), info in stream_states_dict.items():
+                # Only include streams from current trading date
+                if trading_date != current_trading_date:
+                    continue
+                
+                # FAIL-OPEN: Filter by enabled streams only when available
+                # If enabled_streams is None (timetable unavailable), show all streams
+                if enabled_streams is not None:
+                    if stream not in enabled_streams:
+                        continue  # Skip disabled streams
                     
                     state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
                     slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
@@ -549,7 +626,8 @@ class WatchdogAggregator:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
         return {
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
-            "streams": streams
+            "streams": streams,
+            "timetable_unavailable": timetable_unavailable  # Flag for UI warning banner
         }
     
     def _add_to_ring_buffer_if_important(self, event: Dict) -> None:

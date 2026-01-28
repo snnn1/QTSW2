@@ -103,8 +103,29 @@ class EventProcessor:
                 today_str = datetime.now(chicago_tz).strftime("%Y-%m-%d")
                 self._state_manager.cleanup_stale_streams(today_str, timestamp_utc, clear_all_for_date=True)
         
+        elif event_type == "ENGINE_HEARTBEAT":
+            # Unconditional engine loop liveness signal from Tick()
+            # This represents engine loop (Tick()) execution, not bar processing
+            # Phase 4: Diagnostic logging for watchdog receipt
+            import asyncio
+            now_utc = datetime.now(timezone.utc)
+            delta_seconds = (now_utc - timestamp_utc).total_seconds()
+            try:
+                current_task = asyncio.current_task()
+                task_id = id(current_task) if current_task else None
+            except RuntimeError:
+                task_id = None
+            logger.debug(
+                f"ENGINE_HEARTBEAT received: event_type={event_type}, "
+                f"timestamp_utc={timestamp_utc.isoformat()}, now_utc={now_utc.isoformat()}, "
+                f"delta_seconds={delta_seconds:.2f}, thread={task_id}"
+            )
+            self._state_manager.update_engine_tick(timestamp_utc)
+        
         elif event_type == "ENGINE_TICK_HEARTBEAT":
             # PATTERN 1: Update engine tick timestamp AND track last bar time per instrument
+            # Note: ENGINE_TICK_HEARTBEAT is bar-driven and tracks bar processing
+            # ENGINE_HEARTBEAT (above) is the authoritative Tick() liveness signal
             self._state_manager.update_engine_tick(timestamp_utc)
             
             # Extract instrument and bar_time_utc from heartbeat payload
@@ -607,8 +628,19 @@ class EventProcessor:
         
         elif event_type == "TIMETABLE_VALIDATED":
             # Standardized fields are now always at top level (plan requirement #1)
+            # Keep existing TIMETABLE_VALIDATED handling for compatibility
+            # Do NOT override timetable_current-derived trading_date when timetable is available
+            # Only use event trading_date if StateManager trading_date is None (early startup)
             trading_date = event.get("trading_date")
-            self._state_manager.update_timetable_state(True, trading_date)
+            current_trading_date = self._state_manager.get_trading_date()
+            
+            # Only update trading_date from event if StateManager doesn't have one yet
+            # (timetable_current.json takes precedence when available)
+            if not current_trading_date and trading_date:
+                self._state_manager.update_timetable_state(True, trading_date)
+            else:
+                # Just mark as validated, but keep existing trading_date
+                self._state_manager.update_timetable_state(True, None)
     
     def get_last_processed_seq(self, run_id: str) -> int:
         """Get last processed event_seq for a run_id."""
