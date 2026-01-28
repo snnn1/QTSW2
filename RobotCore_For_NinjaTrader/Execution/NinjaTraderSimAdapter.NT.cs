@@ -487,52 +487,106 @@ public sealed partial class NinjaTraderSimAdapter
                     return OrderSubmissionResult.FailureResult(error, utcNow);
                 }
                 
-                // Create order using official NT8 CreateOrder factory method
-                try
+                // Create StopMarket order using dynamic typing (same pattern as Market/Limit orders)
+                // Try multiple signatures since NT8 CreateOrder overloads vary
+                // Note: dynAccount already declared at method scope (line 397)
+                bool orderCreated = false;
+                string? lastError = null;
+                
+                // Attempt 1: 5-argument version (instrument, action, type, quantity, stopPrice)
+                if (!orderCreated)
                 {
-                    order = account.CreateOrder(
-                        ntInstrument,                           // Instrument
-                        orderAction,                            // OrderAction
-                        OrderType.StopMarket,                   // OrderType
-                        OrderEntry.Manual,                      // OrderEntry
-                        TimeInForce.Day,                        // TimeInForce
-                        quantity,                               // Quantity
-                        0.0,                                    // LimitPrice (0 for StopMarket)
-                        ntEntryPrice,                           // StopPrice
-                        null,                                   // Oco (entry orders from SubmitEntryOrderReal don't have ocoGroup)
-                        RobotOrderIds.EncodeTag(intentId),      // OrderName
-                        DateTime.MinValue,                      // Gtd
-                        null                                    // CustomOrder
-                    );
-                    
-                    // Log success before Submit
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_STOPMARKET", new
+                    try
                     {
-                        order_name = RobotOrderIds.EncodeTag(intentId),
-                        stop_price = ntEntryPrice,
-                        quantity = quantity,
-                        order_action = orderAction.ToString(),
-                        instrument = instrument
-                    }));
-                    
-                    // Set order tag
-                    SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
+                        order = dynAccount.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity, ntEntryPrice);
+                        orderCreated = true;
+                    }
+                    catch (RuntimeBinderException ex)
+                    {
+                        lastError = $"Attempt 1 (5-arg): {ex.Message}";
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = $"Attempt 1 (5-arg): {ex.Message}";
+                    }
                 }
-                catch (Exception ex)
+                
+                // Attempt 2: 3-argument version + set StopPrice property
+                if (!orderCreated)
                 {
+                    try
+                    {
+                        order = dynAccount.CreateOrder(ntInstrument, orderAction, quantity);
+                        dynamic dynOrder = order;
+                        dynOrder.OrderType = OrderType.StopMarket;
+                        dynOrder.StopPrice = ntEntryPrice;
+                        orderCreated = true;
+                    }
+                    catch (RuntimeBinderException ex)
+                    {
+                        lastError = $"Attempt 2 (3-arg + StopPrice property): {ex.Message}";
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = $"Attempt 2 (3-arg + StopPrice property): {ex.Message}";
+                    }
+                }
+                
+                // Attempt 3: 4-argument version + StopPrice property
+                if (!orderCreated)
+                {
+                    try
+                    {
+                        order = dynAccount.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, quantity);
+                        dynamic dynOrder = order;
+                        dynOrder.StopPrice = ntEntryPrice;
+                        orderCreated = true;
+                    }
+                    catch (RuntimeBinderException ex)
+                    {
+                        lastError = $"Attempt 3 (4-arg + StopPrice property): {ex.Message}";
+                    }
+                    catch (Exception ex)
+                    {
+                        lastError = $"Attempt 3 (4-arg + StopPrice property): {ex.Message}";
+                    }
+                }
+                
+                if (!orderCreated)
+                {
+                    string errorMsg = $"Failed to create StopMarket order: No compatible CreateOrder overload found. " +
+                                  $"Tried signatures: (instrument, action, type, qty, stopPrice), (instrument, action, qty) + StopPrice property, " +
+                                  $"(instrument, action, type, qty) + StopPrice property. OrderType=StopMarket, Action={orderAction}, " +
+                                  $"Quantity={quantity}, StopPrice={ntEntryPrice}. Last error: {lastError}";
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
                     {
-                        error = $"Failed to create StopMarket order: {ex.Message}",
+                        error = errorMsg,
                         order_type = "StopMarket",
                         order_action = orderAction.ToString(),
                         quantity = quantity,
                         stop_price = ntEntryPrice,
                         instrument = instrument,
                         intent_id = intentId,
-                        account = "SIM"
+                        account = "SIM",
+                        last_error = lastError
                     }));
-                    return OrderSubmissionResult.FailureResult($"Failed to create StopMarket order: {ex.Message}", utcNow);
+                    return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
                 }
+                
+                // Set order properties
+                dynamic dynOrderFinal = order;
+                dynOrderFinal.TimeInForce = TimeInForce.Day;
+                SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
+                
+                // Log success before Submit
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_STOPMARKET", new
+                {
+                    order_name = RobotOrderIds.EncodeTag(intentId),
+                    stop_price = ntEntryPrice,
+                    quantity = quantity,
+                    order_action = orderAction.ToString(),
+                    instrument = instrument
+                }));
             }
             else
             {

@@ -138,6 +138,24 @@ class EventProcessor:
                     # Update per-instrument last bar time from heartbeat payload
                     self._state_manager.update_last_bar(instrument, bar_time_utc)
         
+        elif event_type == "ONBARUPDATE_CALLED":
+            # OnBarUpdate is called constantly while engine is running (when bars arrive)
+            # Use this as a reliable heartbeat indicator for engine liveness
+            # This is more frequent than ENGINE_HEARTBEAT and confirms NinjaTrader is calling OnBarUpdate
+            self._state_manager.update_engine_tick(timestamp_utc)
+            
+            # Also track last bar time per instrument if available
+            instrument = data.get("instrument") or event.get("instrument")
+            if instrument:
+                # Use event timestamp as bar time proxy (OnBarUpdate is called when bar arrives)
+                self._state_manager.update_last_bar(instrument, timestamp_utc)
+        
+        elif event_type == "ENGINE_TICK_CALLSITE":
+            # ENGINE_TICK_CALLSITE is emitted every time Tick() is called (very frequent)
+            # Use this as the primary heartbeat indicator since ENGINE_HEARTBEAT may not be emitted
+            # This ensures engine_alive stays true as long as Tick() is being called
+            self._state_manager.update_engine_tick(timestamp_utc)
+        
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status
             pass_value = data.get("pass", False)

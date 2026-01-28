@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <DefineConstants>NINJATRADER</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Net.Http" />
+    <Reference Include="Microsoft.CSharp" />
+    <Reference Include="NinjaTrader.Core">
+      <HintPath>C:\Program Files\NinjaTrader 8\bin\NinjaTrader.Core.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Exclude NT wrapper files that reference Strategy types (not available at DLL compile time) -->
+    <Compile Remove="NinjaTraderBarProviderRequest.cs" />
+    <Compile Remove="NinjaTraderBarProviderWrapper.cs" />
+  </ItemGroup>
+</Project>
