@@ -40,11 +40,6 @@ export function useWatchdogEvents() {
     }
     
     if (data) {
-      // Debug: Check if ENGINE_TICK_CALLSITE events are in the response
-      const tickCallsiteEvents = data.events.filter(e => e.event_type === 'ENGINE_TICK_CALLSITE')
-      if (tickCallsiteEvents.length > 0) {
-        console.log(`[DEBUG] Received ${tickCallsiteEvents.length} ENGINE_TICK_CALLSITE event(s) from API`)
-      }
       // Update run_id if changed
       if (data.run_id && data.run_id !== cursor.runId) {
         // New run_id detected - reset cursor and clear events
@@ -62,30 +57,14 @@ export function useWatchdogEvents() {
       const filtered = filterRepetitiveEvents(deduplicated, 60000) // 60 second window
       
       // Filter out already processed events
-      let duplicateCount = 0
       const unseenEvents = filtered.filter(event => {
         const key = `${event.run_id}:${event.event_seq}`
         if (processedEventsRef.current.has(key)) {
-          duplicateCount++
           return false
         }
         processedEventsRef.current.add(key)
         return true
       })
-      
-      // Debug: Check what event types are in unseenEvents
-      const eventTypeCounts = unseenEvents.reduce((acc, e) => {
-        acc[e.event_type] = (acc[e.event_type] || 0) + 1
-        return acc
-      }, {} as Record<string, number>)
-      const tickCallsiteCount = eventTypeCounts['ENGINE_TICK_CALLSITE'] || 0
-      const tickCallsiteInFiltered = filtered.filter(e => e.event_type === 'ENGINE_TICK_CALLSITE').length
-      
-      console.log(`[DEBUG] Filtering results: ${tickCallsiteInFiltered} ENGINE_TICK_CALLSITE in filtered, ${duplicateCount} duplicates filtered out, ${tickCallsiteCount} ENGINE_TICK_CALLSITE in unseenEvents`)
-      
-      if (tickCallsiteCount > 0) {
-        console.log(`[DEBUG] After filtering: ${tickCallsiteCount} ENGINE_TICK_CALLSITE events will be added to UI`)
-      }
       
       if (unseenEvents.length > 0) {
         // Add new events and keep only last MAX_EVENTS
@@ -111,28 +90,6 @@ export function useWatchdogEvents() {
           const combined = [...prev, ...unseenEvents]
           const sorted = sortEventsBySeq(combined)
           const final = sorted.slice(-MAX_EVENTS)
-          
-          // Debug: Check what's in the final array
-          const finalEventTypeCounts = final.reduce((acc, e) => {
-            acc[e.event_type] = (acc[e.event_type] || 0) + 1
-            return acc
-          }, {} as Record<string, number>)
-          const finalTickCallsiteCount = finalEventTypeCounts['ENGINE_TICK_CALLSITE'] || 0
-          const combinedTickCallsiteCount = combined.filter(e => e.event_type === 'ENGINE_TICK_CALLSITE').length
-          
-          console.log(
-            `[DEBUG] Event limiting: ${combined.length} total events, ` +
-            `${combinedTickCallsiteCount} ENGINE_TICK_CALLSITE in combined, ` +
-            `${final.length} events after MAX_EVENTS limit, ` +
-            `${finalTickCallsiteCount} ENGINE_TICK_CALLSITE in final array`
-          )
-          
-          if (combinedTickCallsiteCount > 0 && finalTickCallsiteCount === 0) {
-            console.warn(
-              `[DEBUG] WARNING: ${combinedTickCallsiteCount} ENGINE_TICK_CALLSITE events were pushed out by MAX_EVENTS limit! ` +
-              `Consider increasing MAX_EVENTS or filtering ENGINE_TICK_CALLSITE before limiting.`
-            )
-          }
           
           return final
         })

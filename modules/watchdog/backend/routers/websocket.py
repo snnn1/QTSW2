@@ -270,7 +270,8 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
             if connect_start_time:
                 try:
                     duration_seconds_value = (datetime.now(timezone.utc) - connect_start_time).total_seconds()
-                except:
+                except Exception as e:
+                    logger.debug(f"Failed to calculate duration: {e}")
                     duration_seconds_value = None
             
             # Format duration string safely
@@ -279,20 +280,23 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
             else:
                 try:
                     duration_seconds_str = f"{duration_seconds_value:.1f}"
-                except:
+                except Exception as e:
+                    logger.debug(f"Failed to format duration: {e}")
                     duration_seconds_str = str(duration_seconds_value)
             
             # Get close code/reason safely
             try:
                 close_code = getattr(websocket, 'close_code', None)
                 close_code_str = str(close_code) if close_code is not None else "None"
-            except:
+            except Exception as e:
+                logger.debug(f"Failed to get close code: {e}")
                 close_code_str = "unknown"
             
             try:
                 close_reason = getattr(websocket, 'close_reason', None)
                 close_reason_str = str(close_reason) if close_reason else "none"
-            except:
+            except Exception as e:
+                logger.debug(f"Failed to get close reason: {e}")
                 close_reason_str = "unknown"
             
             # Build log message from precomputed strings

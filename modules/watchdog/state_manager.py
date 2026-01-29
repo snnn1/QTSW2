@@ -5,6 +5,7 @@ Maintains in-memory state for derived fields and cursor management.
 """
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timezone, timedelta
@@ -157,9 +158,23 @@ class WatchdogStateManager:
             )
         else:
             info = self._stream_states[key]
+            previous_state = info.state
             if info.state != state:
                 info.state = state
                 info.state_entry_time_utc = state_entry_time_utc or datetime.now(timezone.utc)
+                
+                # CRITICAL: Clear ranges when transitioning away from RANGE_LOCKED
+                # This prevents old ranges from persisting across state transitions
+                if previous_state == "RANGE_LOCKED" and state != "RANGE_LOCKED":
+                    logger.debug(
+                        f"Clearing ranges for stream {stream} ({trading_date}): "
+                        f"transitioning from RANGE_LOCKED to {state}"
+                    )
+                    info.range_high = None
+                    info.range_low = None
+                    info.freeze_close = None
+                    info.range_invalidated = False
+                    
             info.committed = committed
             if commit_reason:
                 info.commit_reason = commit_reason
@@ -771,9 +786,17 @@ class CursorManager:
             return {}
     
     def save_cursor(self, cursor: Dict[str, int]):
-        """Save cursor state to file."""
-        try:
-            with open(self._cursor_file, 'w') as f:
-                json.dump(cursor, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save cursor: {e}")
+        """Save cursor state to file with retry logic."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with open(self._cursor_file, 'w') as f:
+                    json.dump(cursor, f, indent=2)
+                return  # Success
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 0.1 * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Failed to save cursor (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Failed to save cursor after {max_retries} attempts: {e}")

@@ -204,12 +204,16 @@ class WatchdogAggregator:
                             f"new_date={trading_date}, source=timetable. "
                             f"This triggers stream cleanup and UI reset."
                         )
-                        # Day rollover detected - cleanup stale streams safely
+                        # Day rollover detected - cleanup stale streams aggressively
+                        # Use clear_all_for_date=True to ensure all old states are removed immediately
+                        streams_before = len(self._state_manager._stream_states)
                         self._state_manager.cleanup_stale_streams(
-                            trading_date, utc_now, clear_all_for_date=False
+                            trading_date, utc_now, clear_all_for_date=True
                         )
+                        streams_after = len(self._state_manager._stream_states)
                         logger.info(
-                            f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}"
+                            f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}, "
+                            f"cleaned up {streams_before - streams_after} stale stream(s)"
                         )
                     
                     # Hash change detection (separate from day rollover)
@@ -411,7 +415,8 @@ class WatchdogAggregator:
                                 ticks.append(event)
                                 if len(ticks) >= max_events:
                                     break
-                        except (json.JSONDecodeError, UnicodeDecodeError):
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            logger.debug(f"Skipping malformed JSON line (reading from end of file, position ~{position}): {e}")
                             continue
                 
                 # Process remaining buffer if we haven't found enough ticks
@@ -422,7 +427,8 @@ class WatchdogAggregator:
                             event = json.loads(line)
                             if event.get("event_type") == "ENGINE_TICK_CALLSITE":
                                 ticks.append(event)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        logger.debug(f"Skipping malformed JSON in buffer: {e}")
                         pass
             
             # Reverse to get chronological order (oldest to newest)
@@ -800,6 +806,37 @@ class WatchdogAggregator:
                         slot_time_chicago = slot_time
                     
                     # Use watchdog data for: state, time_in_state, range, commit, issues
+                    # CRITICAL: watchdog_key = (current_trading_date, stream_id) ensures we only get states for current date
+                    # Double-check trading_date to prevent showing ranges from yesterday's session
+                    if watchdog_info:
+                        # Verify trading_date matches (defensive check in case cleanup hasn't run)
+                        watchdog_trading_date = getattr(watchdog_info, 'trading_date', None)
+                        if watchdog_trading_date and watchdog_trading_date != current_trading_date:
+                            logger.warning(
+                                f"get_stream_states: Found watchdog state for stream {stream_id} with wrong trading_date: "
+                                f"{watchdog_trading_date} (expected {current_trading_date}). Skipping watchdog data. "
+                                f"This indicates cleanup may not have run yet."
+                            )
+                            # Treat as if no watchdog state exists - use timetable defaults
+                            watchdog_info = None
+                        else:
+                            # CRITICAL: Also verify ranges are None if state is not RANGE_LOCKED
+                            # This prevents showing stale ranges from previous sessions
+                            watchdog_state = getattr(watchdog_info, 'state', '')
+                            if watchdog_state != "RANGE_LOCKED":
+                                # If state is not RANGE_LOCKED, ranges should be None
+                                # Clear them defensively to prevent stale data
+                                if getattr(watchdog_info, 'range_high', None) is not None or \
+                                   getattr(watchdog_info, 'range_low', None) is not None:
+                                    logger.warning(
+                                        f"get_stream_states: Found non-RANGE_LOCKED stream {stream_id} ({current_trading_date}) "
+                                        f"with ranges (state: {watchdog_state}). Clearing ranges to prevent stale data."
+                                    )
+                                    # Clear ranges to prevent stale data display
+                                    watchdog_info.range_high = None
+                                    watchdog_info.range_low = None
+                                    watchdog_info.freeze_close = None
+                    
                     if watchdog_info:
                         # Watchdog state exists - merge with timetable data
                         state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
@@ -844,6 +881,7 @@ class WatchdogAggregator:
                         })
                     else:
                         # No watchdog state - use timetable data with defaults for watchdog fields
+                        # CRITICAL: Ensure ranges are None (not from yesterday)
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
@@ -854,9 +892,9 @@ class WatchdogAggregator:
                             "commit_reason": None,
                             "slot_time_chicago": slot_time_chicago,
                             "slot_time_utc": None,
-                            "range_high": None,
-                            "range_low": None,
-                            "freeze_close": None,
+                            "range_high": None,  # Explicitly None - no ranges from previous sessions
+                            "range_low": None,   # Explicitly None - no ranges from previous sessions
+                            "freeze_close": None, # Explicitly None - no ranges from previous sessions
                             "range_invalidated": False,
                             "state_entry_time_utc": datetime.now(timezone.utc).isoformat(),  # Use current time for time_in_state calculation
                             "range_locked_time_utc": None,
