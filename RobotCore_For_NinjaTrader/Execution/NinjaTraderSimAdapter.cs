@@ -1119,6 +1119,42 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     }
     
     /// <summary>
+    /// Get active intents that need break-even monitoring.
+    /// Returns intents with filled entries that haven't had BE triggered yet.
+    /// </summary>
+    public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, string direction)> GetActiveIntentsForBEMonitoring()
+    {
+        var activeIntents = new List<(string, Intent, decimal, decimal, string)>();
+        
+        foreach (var kvp in _orderMap)
+        {
+            var intentId = kvp.Key;
+            var orderInfo = kvp.Value;
+            
+            // Only check entry orders that are filled
+            if (!orderInfo.IsEntryOrder || orderInfo.State != "FILLED" || !orderInfo.EntryFillTime.HasValue)
+                continue;
+            
+            // Check if intent exists and has BE trigger price
+            if (!_intentMap.TryGetValue(intentId, out var intent))
+                continue;
+            
+            if (intent.BeTrigger == null || intent.EntryPrice == null || intent.Direction == null)
+                continue;
+            
+            // Check if BE has already been triggered (idempotency check)
+            // Note: We need trading date and stream from intent to check journal
+            // For now, use empty strings - IsBEModified will check disk if not in cache
+            if (_executionJournal.IsBEModified(intentId, intent.TradingDate ?? "", intent.Stream ?? ""))
+                continue;
+            
+            activeIntents.Add((intentId, intent, intent.BeTrigger.Value, intent.EntryPrice.Value, intent.Direction));
+        }
+        
+        return activeIntents;
+    }
+    
+    /// <summary>
     /// Flatten exposure for a specific intent only.
     /// </summary>
     public FlattenResult FlattenIntent(string intentId, string instrument, DateTimeOffset utcNow)

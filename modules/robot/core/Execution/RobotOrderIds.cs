@@ -21,8 +21,13 @@ public static class RobotOrderIds
     public static string EncodeTargetTag(string intentId) =>
         $"{Prefix}{intentId}:TARGET";
 
+    /// <summary>
+    /// Encode OCO group ID for entry orders.
+    /// CRITICAL: Must be unique per OCO group - NinjaTrader doesn't allow reusing OCO IDs.
+    /// Adds GUID to ensure uniqueness even if same stream locks multiple times on same date/slot.
+    /// </summary>
     public static string EncodeEntryOco(string tradingDate, string stream, string slotTimeChicago) =>
-        $"{Prefix}OCO_ENTRY:{tradingDate}:{stream}:{slotTimeChicago}";
+        $"{Prefix}OCO_ENTRY:{tradingDate}:{stream}:{slotTimeChicago}:{Guid.NewGuid():N}";
 
     /// <summary>
     /// Strict decode:

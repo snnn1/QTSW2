@@ -204,17 +204,29 @@ public sealed partial class NinjaTraderSimAdapter
         Instrument? ntInstrument = null;
         try
         {
-            // Try to get Instrument from the string parameter (execution instrument)
-            ntInstrument = Instrument.GetInstrument(instrument);
+            // CRITICAL: Trim whitespace from instrument string to prevent "MGC " / "MES " errors
+            var trimmedInstrument = instrument?.Trim() ?? instrument;
+            
+            // HARDENING FIX 4: Instrument resolution is single-shot - no contract month fallback
+            // Contract month fallback removed to prevent repeated resolution attempts and stalls
+            // If exact match fails, fallback to strategy instrument immediately
+            ntInstrument = Instrument.GetInstrument(trimmedInstrument);
+            
             if (ntInstrument == null)
             {
                 // Fallback: If resolution fails, log warning and use strategy's instrument
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                // HARDENING FIX: Log as WARNING (not ERROR) since fallback exists and works
+                // This is expected behavior for micro futures (MYM, M2K, MNQ) - they fallback to strategy instrument
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
                     "INSTRUMENT_RESOLUTION_FAILED", new
                     {
-                        requested_instrument = instrument,
+                        requested_instrument = trimmedInstrument,
+                        original_instrument = instrument,
+                        had_whitespace = instrument != trimmedInstrument,
                         fallback_to_strategy_instrument = _ntInstrument != null ? (_ntInstrument as Instrument)?.MasterInstrument?.Name : "NULL",
-                        warning = "Could not resolve Instrument from string, using strategy instrument as fallback"
+                        warning = "Could not resolve Instrument from string, using strategy instrument as fallback",
+                        note = "Instrument.GetInstrument() returned null. This is expected for micro futures - fallback to strategy instrument works.",
+                        severity = "WARNING" // Indicates this is expected, not an error
                     }));
                 
                 // Fallback to strategy's instrument
@@ -222,22 +234,24 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else
             {
-                // Log successful resolution (especially if different from strategy instrument)
-                if (_ntInstrument != null)
-                {
-                    var strategyInstrument = (_ntInstrument as Instrument)?.MasterInstrument?.Name ?? "UNKNOWN";
-                    if (ntInstrument.MasterInstrument.Name != strategyInstrument)
+                    // Log successful resolution (especially if different from strategy instrument)
+                    if (_ntInstrument != null)
                     {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
-                            "INSTRUMENT_OVERRIDE", new
-                            {
-                                requested_instrument = instrument,
-                                resolved_instrument = ntInstrument.MasterInstrument.Name,
-                                strategy_instrument = strategyInstrument,
-                                note = "Using execution instrument (different from strategy instrument)"
-                            }));
+                        var strategyInstrument = (_ntInstrument as Instrument)?.MasterInstrument?.Name ?? "UNKNOWN";
+                        if (ntInstrument.MasterInstrument.Name != strategyInstrument)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
+                                "INSTRUMENT_OVERRIDE", new
+                                {
+                                    requested_instrument = trimmedInstrument,
+                                    original_instrument = instrument,
+                                    had_whitespace = instrument != trimmedInstrument,
+                                    resolved_instrument = ntInstrument.MasterInstrument.Name,
+                                    strategy_instrument = strategyInstrument,
+                                    note = "Using execution instrument (different from strategy instrument)"
+                                }));
+                        }
                     }
-                }
             }
         }
         catch (Exception ex)
@@ -675,8 +689,25 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Set order tag/name (try Tag first, fallback to Name)
-            SetOrderTag(order, RobotOrderIds.EncodeTag(intentId)); // Robot-owned envelope
+            var encodedTag = RobotOrderIds.EncodeTag(intentId);
+            SetOrderTag(order, encodedTag); // Robot-owned envelope
             order.TimeInForce = TimeInForce.Day;
+            
+            // CRITICAL: Verify tag was set correctly
+            var verifyTag = GetOrderTag(order);
+            if (verifyTag != encodedTag)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_FAILED",
+                    new
+                    {
+                        intent_id = intentId,
+                        expected_tag = encodedTag,
+                        actual_tag = verifyTag ?? "NULL",
+                        broker_order_id = order.OrderId,
+                        error = "Order tag verification failed - tag may not be set correctly",
+                        note = "This may cause fills to be ignored if tag cannot be decoded"
+                    }));
+            }
 
             // Store order info for callback correlation
             var orderInfo = new OrderInfo
@@ -835,8 +866,22 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (!_orderMap.TryGetValue(intentId, out var orderInfo))
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo?.Instrument ?? "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
-                new { error = "Order not found in tracking map", broker_order_id = order.OrderId, tag = encodedTag }));
+            // CRITICAL FIX: Handle execution updates for untracked orders gracefully
+            // This can happen if:
+            // 1. Order was rejected before being tracked
+            // 2. Order tracking failed but execution update arrived
+            // 3. Multiple execution updates for same order (race condition)
+            // Log as INFO (not WARN) since this is often expected for rejected orders
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
+                new 
+                { 
+                    error = "Order not found in tracking map", 
+                    broker_order_id = order.OrderId, 
+                    tag = encodedTag,
+                    order_state = orderState.ToString(),
+                    note = "Execution update received for untracked order - may indicate order was rejected before tracking or tracking race condition",
+                    severity = "INFO" // Not an error - often expected for rejected orders
+                }));
             return;
         }
 
@@ -858,13 +903,160 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderState == OrderState.Rejected)
         {
-            // Get error message using dynamic typing
-            dynamic dynOrder = order;
-            var errorMsg = (string?)dynOrder.ErrorMessage ?? (string?)dynOrder.Error ?? "Order rejected";
-            _executionJournal.RecordRejection(intentId, "", "", $"ORDER_REJECTED: {errorMsg}", utcNow);
+            // CRITICAL FIX: NinjaTrader OrderEventArgs doesn't have ErrorMessage property
+            // Error information comes from Order object properties and OrderEventArgs.ErrorCode
+            string errorMsg = "Order rejected";
+            string? errorCode = null;
+            string? comment = null;
+            Dictionary<string, object> errorDetails = new();
+            
+            try
+            {
+                // CRITICAL FIX: NinjaTrader OrderEventArgs doesn't have ErrorMessage property
+                // Error information comes from Order object properties and OrderEventArgs.ErrorCode
+                dynamic dynOrderUpdate = orderUpdate;
+                
+                // Try to get ErrorCode from OrderEventArgs (this property exists)
+                try 
+                { 
+                    var errCode = dynOrderUpdate.ErrorCode;
+                    if (errCode != null) 
+                    {
+                        errorCode = errCode.ToString();
+                        // ErrorCode enum often contains descriptive error names
+                        errorMsg = $"Order rejected (ErrorCode: {errorCode})";
+                    }
+                } 
+                catch { }
+                
+                // Try to get Comment from OrderEventArgs
+                try 
+                { 
+                    comment = (string?)dynOrderUpdate.Comment;
+                    if (!string.IsNullOrEmpty(comment))
+                    {
+                        errorMsg = $"Order rejected: {comment}";
+                    }
+                } 
+                catch { }
+                
+                // Get error message from Order object properties using dynamic typing
+                // NinjaTrader Order may have error info in Name or other properties
+                try
+                {
+                    dynamic dynOrder = order;
+                    
+                    // Try Order.Name (sometimes contains error info)
+                    try
+                    {
+                        var orderName = dynOrder.Name as string;
+                        if (!string.IsNullOrEmpty(orderName) && orderName.IndexOf("reject", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            errorMsg = $"Order rejected: {orderName}";
+                        }
+                    }
+                    catch { }
+                    
+                    // Try to get Comment from Order using dynamic (may not exist)
+                    try
+                    {
+                        var orderComment = dynOrder.Comment as string;
+                        if (!string.IsNullOrEmpty(orderComment))
+                        {
+                            errorMsg = $"Order rejected: {orderComment}";
+                        }
+                    }
+                    catch { }
+                    
+                    // If we have ErrorCode but no message, use ErrorCode
+                    if (!string.IsNullOrEmpty(errorCode) && errorMsg == "Order rejected")
+                    {
+                        errorMsg = $"Order rejected (ErrorCode: {errorCode})";
+                    }
+                }
+                catch { }
+                
+                // Log all available properties from OrderEventArgs for debugging
+                try
+                {
+                    var props = new List<string>();
+                    foreach (var prop in dynOrderUpdate.GetType().GetProperties())
+                    {
+                        try
+                        {
+                            var val = prop.GetValue(dynOrderUpdate);
+                            if (val != null)
+                            {
+                                props.Add($"{prop.Name}={val}");
+                                errorDetails[$"orderUpdate_{prop.Name}"] = val?.ToString() ?? "null";
+                            }
+                        }
+                        catch { }
+                    }
+                    errorDetails["available_properties"] = string.Join(", ", props);
+                }
+                catch { }
+            }
+            catch (Exception ex)
+            {
+                errorDetails["extraction_exception"] = ex.Message;
+                errorDetails["extraction_stack"] = ex.StackTrace ?? "";
+                
+                // Final fallback: try to get error info from Order using dynamic typing
+                try
+                {
+                    dynamic dynOrder = order;
+                    
+                    // Try Order.Comment (may not exist, so use dynamic)
+                    try
+                    {
+                        var orderComment = dynOrder.Comment as string;
+                        if (!string.IsNullOrEmpty(orderComment))
+                        {
+                            errorMsg = $"Order rejected: {orderComment}";
+                        }
+                        else
+                        {
+                            errorMsg = $"Order rejected (error extraction failed: {ex.Message})";
+                        }
+                    }
+                    catch
+                    {
+                        errorMsg = $"Order rejected (error extraction failed: {ex.Message})";
+                    }
+                }
+                catch (Exception ex2)
+                {
+                    errorMsg = $"Order rejected (unable to extract error details: {ex.Message})";
+                    errorDetails["fallback_exception"] = ex2.Message;
+                }
+            }
+            
+            // Add order details for debugging
+            errorDetails["order_id"] = order.OrderId ?? "null";
+            errorDetails["order_instrument"] = order.Instrument?.MasterInstrument?.Name ?? "null";
+            errorDetails["order_state"] = orderState.ToString();
+            try { errorDetails["order_action"] = order.OrderAction.ToString(); } catch { errorDetails["order_action"] = "null"; }
+            try { errorDetails["order_type"] = order.OrderType.ToString(); } catch { errorDetails["order_type"] = "null"; }
+            try { errorDetails["order_quantity"] = order.Quantity.ToString(); } catch { errorDetails["order_quantity"] = "null"; }
+            try { errorDetails["order_limit_price"] = order.LimitPrice.ToString(); } catch { errorDetails["order_limit_price"] = "null"; }
+            try { errorDetails["order_stop_price"] = order.StopPrice.ToString(); } catch { errorDetails["order_stop_price"] = "null"; }
+            
+            var fullErrorMsg = errorMsg;
+            if (!string.IsNullOrEmpty(errorCode)) fullErrorMsg += $" (ErrorCode: {errorCode})";
+            if (!string.IsNullOrEmpty(comment)) fullErrorMsg += $" (Comment: {comment})";
+            
+            _executionJournal.RecordRejection(intentId, "", "", $"ORDER_REJECTED: {fullErrorMsg}", utcNow);
             orderInfo.State = "REJECTED";
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
-                new { broker_order_id = order.OrderId, error = errorMsg }));
+                new 
+                { 
+                    broker_order_id = order.OrderId, 
+                    error = fullErrorMsg,
+                    error_code = errorCode,
+                    comment = comment,
+                    error_details = errorDetails
+                }));
         }
         else if (orderState == OrderState.Cancelled)
         {
@@ -887,16 +1079,50 @@ public sealed partial class NinjaTraderSimAdapter
 
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
-        if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
-
         var utcNow = DateTimeOffset.UtcNow;
+        
+        // CRITICAL: Log when orders are ignored due to missing/invalid tags
+        if (string.IsNullOrEmpty(intentId))
+        {
+            var fillPrice = (decimal)execution.Price;
+            var fillQuantity = execution.Quantity;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", "", "EXECUTION_UPDATE_IGNORED_NO_TAG",
+                new 
+                { 
+                    error = "Execution update ignored - order tag missing or invalid",
+                    broker_order_id = order.OrderId,
+                    order_tag = encodedTag ?? "NULL",
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
+                    note = "Order may not be robot-managed or tag was not set correctly"
+                }));
+            return; // strict: non-robot orders ignored
+        }
+
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
 
         if (!_orderMap.TryGetValue(intentId, out var orderInfo))
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
-                new { error = "Order not found in tracking map", broker_order_id = order.OrderId, tag = encodedTag }));
+            // CRITICAL FIX: Handle execution updates (fills) for untracked orders gracefully
+            // This can happen if:
+            // 1. Order was rejected before being tracked but still got filled
+            // 2. Order tracking failed but execution update arrived
+            // 3. Multiple execution updates for same order (race condition)
+            // Log as INFO (not WARN) since this is often expected for rejected orders that still fill
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
+                new 
+                { 
+                    error = "Order not found in tracking map", 
+                    broker_order_id = order.OrderId, 
+                    tag = encodedTag,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
+                    note = "Execution update (fill) received for untracked order - may indicate order was rejected before tracking or tracking race condition",
+                    severity = "INFO" // Not an error - often expected for rejected orders that still fill
+                }));
             return;
         }
 
@@ -978,13 +1204,81 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         // STEP 4: Register entry fill with coordinator
-        if (orderInfo.IsEntryOrder && _intentMap.TryGetValue(intentId, out var entryIntent))
+        if (orderInfo.IsEntryOrder)
         {
-            // Register exposure with coordinator
-            _coordinator?.OnEntryFill(intentId, filledTotal, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
-            
-            // Ensure we protect the currently filled quantity (no market-close gating)
-            HandleEntryFill(intentId, entryIntent, fillPrice, filledTotal, utcNow);
+            if (_intentMap.TryGetValue(intentId, out var entryIntent))
+            {
+                // Register exposure with coordinator
+                _coordinator?.OnEntryFill(intentId, filledTotal, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+                
+                // Ensure we protect the currently filled quantity (no market-close gating)
+                HandleEntryFill(intentId, entryIntent, fillPrice, filledTotal, utcNow);
+            }
+            else
+            {
+                // CRITICAL: Intent not found - protective orders cannot be placed
+                // EMERGENCY FIX: Flatten position immediately to prevent unprotected exposure
+                // Note: Cannot get stream from OrderInfo (it doesn't have Stream property) - use empty string
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new 
+                    { 
+                        error = "Intent not found in _intentMap - cannot submit protective orders",
+                        intent_id = intentId,
+                        fill_price = fillPrice,
+                        fill_quantity = filledTotal,
+                        order_type = orderInfo.OrderType,
+                        broker_order_id = order.OrderId,
+                        instrument = orderInfo.Instrument,
+                        stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                        action_taken = "FLATTENING_POSITION",
+                        note = "Entry order filled but intent was not registered - flattening position immediately to prevent unprotected exposure"
+                    }));
+                
+                // Emergency flatten to prevent unprotected position
+                try
+                {
+                    var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
+                    
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_NOT_FOUND_FLATTENED", state: "ENGINE",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = orderInfo.Instrument,
+                            stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                            fill_price = fillPrice,
+                            fill_quantity = filledTotal,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            note = "Position flattened due to missing intent - protective orders could not be placed"
+                        }));
+                    
+                    // Stand down stream to prevent further trading (use empty string since stream not available)
+                    _standDownStreamCallback?.Invoke("", utcNow, $"INTENT_NOT_FOUND:{intentId}");
+                    
+                    // Raise high-priority alert
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Intent Not Found - {orderInfo.Instrument}";
+                        var message = $"Entry order filled but intent was not registered. Position flattened. Stream: UNKNOWN, Intent: {intentId}";
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2); // Emergency priority
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Log flatten failure but don't throw - we've already logged the error
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_NOT_FOUND_FLATTEN_FAILED", state: "ENGINE",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = orderInfo.Instrument,
+                            stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            note = "Failed to flatten position after intent not found - manual intervention may be required"
+                        }));
+                }
+            }
         }
         else if (orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET")
         {
@@ -1065,10 +1359,43 @@ public sealed partial class NinjaTraderSimAdapter
                             changeRes = changeArray;
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Change returns void - check order state directly
-                        changeRes = new[] { existingStop };
+                        // Change() call failed - log and attempt fallback
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FALLBACK", new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            order_type = "PROTECTIVE_STOP",
+                            broker_order_id = existingStop.OrderId,
+                            note = "Change() call failed, attempting fallback (Change returns void)"
+                        }));
+                        
+                        // Fallback: Change returns void - check order state directly
+                        try
+                        {
+                            // Try calling Change() again (void return)
+                            dynAccountChange.Change(new[] { existingStop });
+                            changeRes = new[] { existingStop };
+                        }
+                        catch (Exception fallbackEx)
+                        {
+                            // Both attempts failed - reject change
+                            var errorMsg = $"Stop order change failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
+                            _executionJournal.RecordRejection(intentId, "", "", $"STOP_CHANGE_FAILED: {errorMsg}", utcNow);
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
+                            {
+                                error = errorMsg,
+                                first_error = ex.Message,
+                                fallback_error = fallbackEx.Message,
+                                order_type = "PROTECTIVE_STOP",
+                                broker_order_id = existingStop.OrderId,
+                                account = "SIM",
+                                exception_type = ex.GetType().Name,
+                                fallback_exception_type = fallbackEx.GetType().Name
+                            }));
+                            return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+                        }
                     }
                     if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
                     {
@@ -1385,10 +1712,43 @@ public sealed partial class NinjaTraderSimAdapter
                             changeRes = changeArray;
                         }
                     }
-                    catch
+                    catch (Exception ex)
                     {
-                        // Change returns void - check order state directly
-                        changeRes = new[] { existingTarget };
+                        // Change() call failed - log and attempt fallback
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FALLBACK", new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            order_type = "PROTECTIVE_TARGET",
+                            broker_order_id = existingTarget.OrderId,
+                            note = "Change() call failed, attempting fallback (Change returns void)"
+                        }));
+                        
+                        // Fallback: Change returns void - check order state directly
+                        try
+                        {
+                            // Try calling Change() again (void return)
+                            dynAccountChange.Change(new[] { existingTarget });
+                            changeRes = new[] { existingTarget };
+                        }
+                        catch (Exception fallbackEx)
+                        {
+                            // Both attempts failed - reject change
+                            var errorMsg = $"Target order change failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
+                            _executionJournal.RecordRejection(intentId, "", "", $"TARGET_CHANGE_FAILED: {errorMsg}", utcNow);
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
+                            {
+                                error = errorMsg,
+                                first_error = ex.Message,
+                                fallback_error = fallbackEx.Message,
+                                order_type = "PROTECTIVE_TARGET",
+                                broker_order_id = existingTarget.OrderId,
+                                account = "SIM",
+                                exception_type = ex.GetType().Name,
+                                fallback_exception_type = fallbackEx.GetType().Name
+                            }));
+                            return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+                        }
                     }
                     if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
                     {
@@ -1529,10 +1889,42 @@ public sealed partial class NinjaTraderSimAdapter
                     result = changeArray;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Change returns void - check order state directly
-                result = new[] { stopOrder };
+                // Change() call failed - log and attempt fallback
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FALLBACK", new
+                {
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    order_type = "STOP_BREAK_EVEN",
+                    broker_order_id = stopOrder.OrderId,
+                    note = "Change() call failed for BE modification, attempting fallback (Change returns void)"
+                }));
+                
+                // Fallback: Change returns void - check order state directly
+                try
+                {
+                    // Try calling Change() again (void return)
+                    dynAccountChange.Change(new[] { stopOrder });
+                    result = new[] { stopOrder };
+                }
+                catch (Exception fallbackEx)
+                {
+                    // Both attempts failed - reject modification
+                    var errorMsg = $"BE modification failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
+                    {
+                        error = errorMsg,
+                        first_error = ex.Message,
+                        fallback_error = fallbackEx.Message,
+                        order_type = "STOP_BREAK_EVEN",
+                        broker_order_id = stopOrder.OrderId,
+                        account = "SIM",
+                        exception_type = ex.GetType().Name,
+                        fallback_exception_type = fallbackEx.GetType().Name
+                    }));
+                    return OrderModificationResult.FailureResult(errorMsg, utcNow);
+                }
             }
 
             if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
@@ -2020,6 +2412,118 @@ public sealed partial class NinjaTraderSimAdapter
                 warning = warn ? warnReason : null
             }));
 
+            // PRICE LIMIT VALIDATION: Check stop price distance from current market price
+            // Prevents NinjaTrader rejections due to stale breakout levels or market gaps
+            decimal? currentMarketPrice = null;
+            decimal stopDistance = 0;
+            bool priceValidationFailed = false;
+            string? priceValidationReason = null;
+            
+            try
+            {
+                // Get current market price using dynamic typing (API varies by NT version)
+                dynamic dynInstrument = ntInstrument;
+                var marketData = dynInstrument.MarketData;
+                if (marketData != null)
+                {
+                    try
+                    {
+                        // Try GetBid()/GetAsk() methods first
+                        double? bid = (double?)marketData.GetBid(0);
+                        double? ask = (double?)marketData.GetAsk(0);
+                        
+                        if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
+                        {
+                            // For long stops: use ask (buy stop triggers above ask)
+                            // For short stops: use bid (sell stop triggers below bid)
+                            currentMarketPrice = direction == "Long" ? (decimal)ask.Value : (decimal)bid.Value;
+                        }
+                    }
+                    catch
+                    {
+                        // Fallback to Bid/Ask properties
+                        try
+                        {
+                            double? bid = (double?)marketData.Bid;
+                            double? ask = (double?)marketData.Ask;
+                            
+                            if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
+                            {
+                                currentMarketPrice = direction == "Long" ? (decimal)ask.Value : (decimal)bid.Value;
+                            }
+                        }
+                        catch
+                        {
+                            // Market data unavailable - skip validation (fail open)
+                            // This is acceptable as NT will reject invalid prices anyway
+                        }
+                    }
+                }
+                
+                if (currentMarketPrice.HasValue)
+                {
+                    // Calculate distance from stop price to current market price
+                    stopDistance = Math.Abs(stopPrice - currentMarketPrice.Value);
+                    
+                    // Configurable threshold: Maximum allowed stop distance in points
+                    // M2K: ~100 points (10.0) is reasonable limit
+                    // ES: ~200 points (50.0) is reasonable limit
+                    // Use instrument-specific thresholds based on typical range sizes
+                    decimal maxStopDistancePoints = 100.0m; // Default: 100 points
+                    
+                    // Adjust threshold based on instrument (micro futures have smaller ranges)
+                    var instrumentName = ntInstrument.MasterInstrument?.Name ?? "";
+                    if (instrumentName.StartsWith("M", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Micro futures: tighter limit (e.g., M2K, MGC, MES)
+                        maxStopDistancePoints = 50.0m; // 50 points for micros
+                    }
+                    else if (instrumentName == "ES" || instrumentName == "NQ")
+                    {
+                        // Mini futures: larger limit
+                        maxStopDistancePoints = 200.0m; // 200 points for minis
+                    }
+                    
+                    if (stopDistance > maxStopDistancePoints)
+                    {
+                        priceValidationFailed = true;
+                        priceValidationReason = $"Stop price {stopPrice} is {stopDistance:F2} points from current market {currentMarketPrice.Value:F2}, exceeding limit of {maxStopDistancePoints} points. This indicates a stale breakout level or market gap.";
+                    }
+                }
+            }
+            catch (Exception priceEx)
+            {
+                // Market data access failed - log but don't block (fail open)
+                // NT will reject invalid prices anyway
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "PRICE_VALIDATION_WARNING", new
+                {
+                    warning = "Could not access market data for price validation",
+                    error = priceEx.Message,
+                    stop_price = stopPrice,
+                    direction = direction,
+                    note = "Proceeding with order submission - NinjaTrader will validate price"
+                }));
+            }
+            
+            if (priceValidationFailed)
+            {
+                // HARD BLOCK: Stop price too far from market (fail-closed)
+                _executionJournal.RecordRejection(intentId, "", "", $"STOP_PRICE_VALIDATION_FAILED: {priceValidationReason}", utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "STOP_PRICE_VALIDATION_FAILED", new
+                {
+                    intent_id = intentId,
+                    stop_price = stopPrice,
+                    current_market_price = currentMarketPrice,
+                    stop_distance_points = stopDistance,
+                    direction = direction,
+                    reason = priceValidationReason,
+                    note = "Order rejected before submission to prevent NinjaTrader price limit error. This indicates a stale breakout level or significant market gap."
+                }));
+                return OrderSubmissionResult.FailureResult($"Stop price validation failed: {priceValidationReason}", utcNow);
+            }
+
             // Real NT API: Create stop-market entry using official NT8 CreateOrder factory method
             // Runtime safety checks BEFORE CreateOrder
             if (!_ntContextSet)
@@ -2261,11 +2765,40 @@ public sealed partial class NinjaTraderSimAdapter
                     submitResult = order;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Submit returns void - use the order we created
-                dynAccountSubmit.Submit(new[] { order });
-                submitResult = order;
+                // First Submit() call failed - log and attempt fallback
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FALLBACK", new
+                {
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    order_type = "ENTRY_STOP",
+                    note = "First Submit() call failed, attempting fallback (Submit returns void)"
+                }));
+                
+                // Fallback: Submit returns void - try again
+                try
+                {
+                    dynAccountSubmit.Submit(new[] { order });
+                    submitResult = order;
+                }
+                catch (Exception fallbackEx)
+                {
+                    // Both attempts failed - reject order
+                    var errorMsg = $"Entry stop order submission failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
+                    _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {errorMsg}", utcNow);
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+                    {
+                        error = errorMsg,
+                        first_error = ex.Message,
+                        fallback_error = fallbackEx.Message,
+                        broker_order_id = order.OrderId,
+                        account = "SIM",
+                        exception_type = ex.GetType().Name,
+                        fallback_exception_type = fallbackEx.GetType().Name
+                    }));
+                    return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+                }
             }
             var acknowledgedAt = DateTimeOffset.UtcNow;
 

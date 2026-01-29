@@ -4,6 +4,8 @@
     <LangVersion>10.0</LangVersion>
     <Nullable>enable</Nullable>
     <DefineConstants>NINJATRADER</DefineConstants>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.0" />

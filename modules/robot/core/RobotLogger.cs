@@ -98,6 +98,39 @@ public sealed class RobotLogger
                     _loggingService.Log(logEvent);
                     return; // Successfully routed through service
                 }
+                else
+                {
+                    // CRITICAL: Conversion returned null - log diagnostic info for ENGINE events
+                    if (evt is Dictionary<string, object?> evtDict)
+                    {
+                        var streamVal = evtDict.TryGetValue("stream", out var s) ? s?.ToString() : "UNKNOWN";
+                        var eventTypeVal = evtDict.TryGetValue("event_type", out var et) ? et?.ToString() : "UNKNOWN";
+                        if (streamVal == "__engine__")
+                        {
+                            // ENGINE events being dropped - this is a critical issue
+                            // Log to fallback path so we can see what's happening
+                            var diagnosticEvent = new Dictionary<string, object?>
+                            {
+                                ["ts_utc"] = DateTimeOffset.UtcNow.ToString("o"),
+                                ["event_type"] = "LOGGER_CONVERSION_RETURNED_NULL",
+                                ["stream"] = "__engine__",
+                                ["instrument"] = "",
+                                ["data"] = new Dictionary<string, object?>
+                                {
+                                    ["payload"] = new Dictionary<string, object?>
+                                    {
+                                        ["original_event_type"] = eventTypeVal,
+                                        ["original_stream"] = streamVal,
+                                        ["error"] = "ConvertToRobotLogEvent() returned null for ENGINE event",
+                                        ["note"] = "This indicates a validation failure in conversion - check event structure"
+                                    }
+                                }
+                            };
+                            // Try to log diagnostic via fallback (but ENGINE events are dropped, so this won't work)
+                            // This is a last-ditch attempt - the real fix is in ConvertToRobotLogEvent()
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -251,14 +284,20 @@ public sealed class RobotLogger
                 source = "StreamStateMachine";
         }
 
-        var instrument = dict.TryGetValue("instrument", out var inst) ? inst?.ToString() ?? "" : "";
+        var instrumentRaw = dict.TryGetValue("instrument", out var inst) ? inst?.ToString() : null;
+        var instrument = string.IsNullOrWhiteSpace(instrumentRaw) ? "" : instrumentRaw ?? "";
         var message = eventType;
         
         // Extract standardized top-level fields (per plan requirement #1)
-        var tradingDate = dict.TryGetValue("trading_date", out var td) ? td?.ToString() : null;
-        var stream = dict.TryGetValue("stream", out var str) ? str?.ToString() : null;
-        var session = dict.TryGetValue("session", out var sess) ? sess?.ToString() : null;
-        var slotTimeChicago = dict.TryGetValue("slot_time_chicago", out var stc) ? stc?.ToString() : null;
+        // Keep empty strings as-is (matching successful ENGINE events in logs)
+        var tradingDateRaw = dict.TryGetValue("trading_date", out var td) ? td?.ToString() : null;
+        var tradingDate = string.IsNullOrWhiteSpace(tradingDateRaw) ? "" : tradingDateRaw ?? "";
+        var streamRaw = dict.TryGetValue("stream", out var str) ? str?.ToString() : null;
+        var stream = string.IsNullOrWhiteSpace(streamRaw) ? null : streamRaw; // stream can be null for ENGINE events
+        var sessionRaw = dict.TryGetValue("session", out var sess) ? sess?.ToString() : null;
+        var session = string.IsNullOrWhiteSpace(sessionRaw) ? "" : sessionRaw ?? "";
+        var slotTimeChicagoRaw = dict.TryGetValue("slot_time_chicago", out var stc) ? stc?.ToString() : null;
+        var slotTimeChicago = string.IsNullOrWhiteSpace(slotTimeChicagoRaw) ? "" : slotTimeChicagoRaw ?? "";
         
         // Extract data payload
         var data = new Dictionary<string, object?>();
@@ -323,15 +362,16 @@ public static class RobotEvents
     {
         // Engine events still need the full base schema; use Chicago conversion independent of spec.
         var chicagoNow = ConvertUtcToChicago(utcNow);
+        // Use empty strings for ENGINE events (matching successful ENGINE events in logs)
         return new Dictionary<string, object?>
         {
             ["ts_utc"] = utcNow.ToString("o"),
             ["ts_chicago"] = chicagoNow.ToString("o"),
-            ["trading_date"] = tradingDate,
+            ["trading_date"] = tradingDate ?? "",
             ["stream"] = "__engine__",
-            ["instrument"] = "",
-            ["session"] = "",
-            ["slot_time_chicago"] = "",
+            ["instrument"] = "", // Use empty string for ENGINE events (matching successful ENGINE events)
+            ["session"] = "", // Use empty string (matching successful ENGINE events)
+            ["slot_time_chicago"] = "", // Use empty string (matching successful ENGINE events)
             ["slot_time_utc"] = null,
             ["event_type"] = eventType,
             ["state"] = state,

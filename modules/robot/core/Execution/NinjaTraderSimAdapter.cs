@@ -329,10 +329,29 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// </summary>
     private void HandleEntryFill(string intentId, Intent intent, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow)
     {
-        if (intent.Direction == null || intent.StopPrice == null || intent.TargetPrice == null)
+        // CRITICAL: Validate intent has all required fields for protective orders
+        var missingFields = new List<string>();
+        if (intent.Direction == null) missingFields.Add("Direction");
+        if (intent.StopPrice == null) missingFields.Add("StopPrice");
+        if (intent.TargetPrice == null) missingFields.Add("TargetPrice");
+        
+        if (missingFields.Count > 0)
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
-                new { error = "Intent incomplete - cannot submit protective orders", intent_id = intentId }));
+                new 
+                { 
+                    error = "Intent incomplete - cannot submit protective orders",
+                    intent_id = intentId,
+                    missing_fields = missingFields,
+                    direction = intent.Direction,
+                    stop_price = intent.StopPrice,
+                    target_price = intent.TargetPrice,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    stream = intent.Stream,
+                    instrument = intent.Instrument,
+                    note = "Entry order filled but protective orders cannot be placed due to incomplete intent data"
+                }));
             return;
         }
         
@@ -551,7 +570,25 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// </summary>
     internal void RegisterIntent(Intent intent)
     {
-        _intentMap[intent.ComputeIntentId()] = intent;
+        var intentId = intent.ComputeIntentId();
+        _intentMap[intentId] = intent;
+        
+        // Log intent registration for debugging
+        _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, intent.Instrument, "INTENT_REGISTERED",
+            new
+            {
+                intent_id = intentId,
+                stream = intent.Stream,
+                instrument = intent.Instrument,
+                direction = intent.Direction,
+                entry_price = intent.EntryPrice,
+                stop_price = intent.StopPrice,
+                target_price = intent.TargetPrice,
+                has_direction = intent.Direction != null,
+                has_stop_price = intent.StopPrice != null,
+                has_target_price = intent.TargetPrice != null,
+                note = "Intent registered - required for protective order placement on fill"
+            }));
     }
     
     /// <summary>
@@ -1068,6 +1105,42 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         {
             _standDownStreamCallback?.Invoke(intentForCallback.Stream, utcNow, emergencyType);
         }
+    }
+    
+    /// <summary>
+    /// Get active intents that need break-even monitoring.
+    /// Returns intents with filled entries that haven't had BE triggered yet.
+    /// </summary>
+    public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, string direction)> GetActiveIntentsForBEMonitoring()
+    {
+        var activeIntents = new List<(string, Intent, decimal, decimal, string)>();
+        
+        foreach (var kvp in _orderMap)
+        {
+            var intentId = kvp.Key;
+            var orderInfo = kvp.Value;
+            
+            // Only check entry orders that are filled
+            if (!orderInfo.IsEntryOrder || orderInfo.State != "FILLED" || !orderInfo.EntryFillTime.HasValue)
+                continue;
+            
+            // Check if intent exists and has BE trigger price
+            if (!_intentMap.TryGetValue(intentId, out var intent))
+                continue;
+            
+            if (intent.BeTrigger == null || intent.EntryPrice == null || intent.Direction == null)
+                continue;
+            
+            // Check if BE has already been triggered (idempotency check)
+            // Note: We need trading date and stream from intent to check journal
+            // For now, use empty strings - IsBEModified will check disk if not in cache
+            if (_executionJournal.IsBEModified(intentId, intent.TradingDate ?? "", intent.Stream ?? ""))
+                continue;
+            
+            activeIntents.Add((intentId, intent, intent.BeTrigger.Value, intent.EntryPrice.Value, intent.Direction));
+        }
+        
+        return activeIntents;
     }
     
     /// <summary>
