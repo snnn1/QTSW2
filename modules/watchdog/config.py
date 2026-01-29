@@ -16,10 +16,16 @@ FRONTEND_FEED_FILE = ROBOT_LOGS_DIR / "frontend_feed.jsonl"
 FRONTEND_CURSOR_FILE = QTSW2_ROOT / "data" / "frontend_cursor.json"
 
 # Thresholds (from specification)
-ENGINE_TICK_STALL_THRESHOLD_SECONDS = 120
+# ENGINE_TICK_STALL_THRESHOLD_SECONDS: Threshold for detecting engine tick stalls
+# ENGINE_TICK_CALLSITE is rate-limited in feed to every 5 seconds
+# Set to 15 seconds (3x rate limit) to detect stalls quickly while avoiding false positives
+ENGINE_TICK_STALL_THRESHOLD_SECONDS = 15
 STUCK_STREAM_THRESHOLD_SECONDS = 300
 UNPROTECTED_TIMEOUT_SECONDS = 10
-DATA_STALL_THRESHOLD_SECONDS = 60  # Default, can be configurable per instrument
+# DATA_STALL_THRESHOLD_SECONDS must be > rate limit of bar tracking events
+# ONBARUPDATE_CALLED and ENGINE_TICK_HEARTBEAT are rate-limited to 60 seconds
+# Set threshold to 90 seconds (1.5x rate limit) to avoid false positives
+DATA_STALL_THRESHOLD_SECONDS = 90  # Default, can be configurable per instrument
 
 # Update frequencies (seconds)
 ENGINE_ALIVE_UPDATE_FREQUENCY = 5
@@ -41,14 +47,10 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Engine Health
     "ENGINE_START",
     "ENGINE_STOP",
-    "ENGINE_HEARTBEAT",  # Unconditional Tick() liveness (every 5s)
-    "ENGINE_HEARTBEAT_SKIPPED",  # Diagnostic: heartbeat skipped due to interval gate
-    "ENGINE_HEARTBEAT_EXCEPTION",  # Diagnostic: exception during heartbeat emission
-    "ENGINE_HEARTBEAT_REACHED",  # Diagnostic: heartbeat code path reached
-    "ENGINE_HEARTBEAT_CHECK",  # Diagnostic: heartbeat interval check
-    "ENGINE_HEARTBEAT_ENTRY",  # Diagnostic: heartbeat code block entry (unconditional)
+    # ENGINE_HEARTBEAT removed: Only works if HeartbeatAddOn/Strategy is installed, unreliable
+    # Use ENGINE_TICK_CALLSITE (rate-limited) instead for reliable liveness monitoring
     "ENGINE_TICK_EXECUTED",  # Diagnostic: Tick() execution (Phase 1)
-    "ENGINE_TICK_CALLSITE",  # Diagnostic: Tick() call site (Phase 2)
+    "ENGINE_TICK_CALLSITE",  # Diagnostic: Tick() call site (rate-limited in event feed to every 5s)
     "ENGINE_TICK_BEFORE_LOCK",  # Diagnostic: before lock acquisition
     "ENGINE_TICK_LOCK_ACQUIRED",  # Diagnostic: after lock acquired
     "ENGINE_TICK_AFTER_LOCK",  # Diagnostic: after lock released

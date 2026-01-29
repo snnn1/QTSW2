@@ -181,22 +181,29 @@ class WatchdogAggregator:
         while self._running:
             try:
                 utc_now = datetime.now(timezone.utc)
-                trading_date, enabled_streams_set, timetable_hash = self._timetable_poller.poll()
+                trading_date, enabled_streams_set, timetable_hash, enabled_streams_metadata = self._timetable_poller.poll()
                 
-                # CRITICAL: Always compute trading_date on every poll (CME rollover)
-                # Trading date advances at 17:00 CT regardless of timetable file changes
+                # CRITICAL: Extract trading_date from timetable (fallback to CME rollover if unavailable)
+                # Trading date from timetable is authoritative - matches what robot uses
                 if trading_date:
                     previous_trading_date = self._state_manager.get_trading_date()
                     
                     # Update state manager (always updates trading_date, conditionally updates enabled_streams)
                     self._state_manager.update_timetable_streams(
-                        enabled_streams_set, trading_date, timetable_hash, utc_now
+                        enabled_streams_set, trading_date, timetable_hash, utc_now,
+                        enabled_streams_metadata=enabled_streams_metadata
                     )
                     
                     # CRITICAL FIX: Detect day rollover by TIME comparison, NOT hash change
                     # Hash change ≠ day change. Day rollover happens at 17:00 CT every day,
                     # even if timetable file content is unchanged.
                     if previous_trading_date and previous_trading_date != trading_date:
+                        # Refinement 1: Explicit trading_date change event (first-class lifecycle event)
+                        logger.info(
+                            f"WATCHDOG_TRADING_DATE_CHANGED: old_date={previous_trading_date}, "
+                            f"new_date={trading_date}, source=timetable. "
+                            f"This triggers stream cleanup and UI reset."
+                        )
                         # Day rollover detected - cleanup stale streams safely
                         self._state_manager.cleanup_stale_streams(
                             trading_date, utc_now, clear_all_for_date=False
@@ -209,18 +216,14 @@ class WatchdogAggregator:
                     # Only used for enabled_streams updates, not day changes
                     if timetable_hash and timetable_hash != self._state_manager.get_timetable_hash():
                         # Timetable content changed (enabled streams may have changed)
-                        # This is logged below in TIMETABLE_POLL_OK
+                        # This is logged in timetable_poller.py
                         pass
                     
-                    # Log successful poll
-                    if enabled_streams_set is not None:
-                        logger.info(
-                            f"TIMETABLE_POLL_OK: trading_date={trading_date}, "
-                            f"enabled_count={len(enabled_streams_set)}, hash={timetable_hash[:8] if timetable_hash else 'N/A'}"
-                        )
-                    else:
+                    # Note: TIMETABLE_POLL_OK is now logged in timetable_poller.py with trading_date source
+                    # Only log here if timetable unavailable (enabled_streams_set is None)
+                    if enabled_streams_set is None:
                         logger.warning(
-                            f"TIMETABLE_POLL_FAIL: trading_date={trading_date} computed, "
+                            f"TIMETABLE_POLL_FAIL: trading_date={trading_date}, "
                             f"but timetable file missing/invalid (fail-open mode)"
                         )
             except Exception as e:
@@ -240,12 +243,22 @@ class WatchdogAggregator:
             if not current_trading_date:
                 chicago_now = datetime.now(CHICAGO_TZ)
                 current_trading_date = compute_timetable_trading_date(chicago_now)
-                logger.debug(f"Trading date not set, using CME rollover: {current_trading_date}")
+                logger.debug(
+                    f"_cleanup_stale_streams_periodic: trading_date not set in state manager, "
+                    f"using computed fallback: {current_trading_date}"
+                )
             
             utc_now = datetime.now(timezone.utc)
+            streams_before = len(self._state_manager._stream_states)
             self._state_manager.cleanup_stale_streams(current_trading_date, utc_now)
+            streams_after = len(self._state_manager._stream_states)
+            if streams_before != streams_after:
+                logger.info(
+                    f"_cleanup_stale_streams_periodic: Cleaned up {streams_before - streams_after} stream(s) "
+                    f"(before: {streams_before}, after: {streams_after}, trading_date: {current_trading_date})"
+                )
         except Exception as e:
-            logger.warning(f"Error in periodic cleanup: {e}")
+            logger.warning(f"Error in periodic cleanup: {e}", exc_info=True)
     
     def _process_feed_events_sync(self):
         """Process new events from frontend_feed.jsonl (synchronous, runs in thread pool)."""
@@ -259,14 +272,79 @@ class WatchdogAggregator:
                 logger.info("State manager is empty - rebuilding stream states from most recent events")
                 self._rebuild_stream_states_from_recent_events()
             
+            # CRITICAL: Always check for the most recent ENGINE_TICK_CALLSITE event from the end of file
+            # This ensures we catch ticks even if cursor is ahead or events are out of order
+            # We only need the most recent one to update liveness timestamp
+            try:
+                recent_ticks = self._read_recent_ticks_from_end(max_events=1)
+                if recent_ticks:
+                    # Process the most recent tick to update liveness immediately
+                    most_recent_tick = recent_ticks[-1]  # Get the newest one
+                    tick_timestamp_str = most_recent_tick.get("timestamp_utc")
+                    if tick_timestamp_str:
+                        try:
+                            from datetime import datetime, timezone
+                            tick_timestamp = datetime.fromisoformat(tick_timestamp_str.replace('Z', '+00:00'))
+                            if tick_timestamp.tzinfo is None:
+                                tick_timestamp = tick_timestamp.replace(tzinfo=timezone.utc)
+                            
+                            # Check if this is newer than what we already have
+                            current_tick_utc = self._state_manager._last_engine_tick_utc
+                            if not current_tick_utc or tick_timestamp > current_tick_utc:
+                                # Process it to update state manager
+                                self._event_processor.process_event(most_recent_tick)
+                                logger.info(
+                                    f"✅ Updated liveness from end-of-file: tick_timestamp={tick_timestamp.isoformat()}, "
+                                    f"previous_tick={current_tick_utc.isoformat() if current_tick_utc else 'None'}, "
+                                    f"tick_age={(datetime.now(timezone.utc) - tick_timestamp).total_seconds():.1f}s"
+                                )
+                            else:
+                                logger.debug(
+                                    f"End-of-file tick not newer: tick={tick_timestamp.isoformat()}, "
+                                    f"current={current_tick_utc.isoformat() if current_tick_utc else 'None'}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Failed to parse tick timestamp for end-of-file check: {e}", exc_info=True)
+                else:
+                    # No ticks found - this is a problem if engine should be running
+                    current_tick_utc = self._state_manager._last_engine_tick_utc
+                    if current_tick_utc:
+                        tick_age = (datetime.now(timezone.utc) - current_tick_utc).total_seconds()
+                        from .config import ENGINE_TICK_STALL_THRESHOLD_SECONDS
+                        logger.warning(
+                            f"⚠️ No ENGINE_TICK_CALLSITE events found in feed file. "
+                            f"Current tick age: {tick_age:.1f}s, threshold: {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s"
+                        )
+            except Exception as e:
+                logger.error(f"Error reading ticks from end of file: {e}", exc_info=True)
+            
             # Normal incremental processing - read new events since cursor
             events = self._read_feed_events_since(cursor)
             
             # Process each event
+            tick_events_count = 0
+            latest_tick_timestamp = None
             for event in events:
+                event_type = event.get("event_type", "")
+                if event_type == "ENGINE_TICK_CALLSITE":
+                    tick_events_count += 1
+                    timestamp_utc = event.get("timestamp_utc")
+                    if timestamp_utc:
+                        latest_tick_timestamp = timestamp_utc
                 self._event_processor.process_event(event)
                 # Add important events to ring buffer for WebSocket streaming
                 self._add_to_ring_buffer_if_important(event)
+            
+            # Diagnostic: Log when ENGINE_TICK_CALLSITE events are read from feed
+            if tick_events_count > 0:
+                logger.info(
+                    f"Processed {tick_events_count} ENGINE_TICK_CALLSITE event(s) from feed. "
+                    f"Latest tick timestamp: {latest_tick_timestamp}"
+                )
+            elif len(events) > 0:
+                # No tick events in this batch - log what we did get
+                event_types = [e.get("event_type", "UNKNOWN") for e in events[:5]]
+                logger.debug(f"Processed {len(events)} events (no ENGINE_TICK_CALLSITE): {event_types}")
             
             # Update cursor
             if events:
@@ -278,6 +356,93 @@ class WatchdogAggregator:
         
         except Exception as e:
             logger.error(f"Error processing feed events: {e}", exc_info=True)
+    
+    def _read_recent_ticks_from_end(self, max_events: int = 10) -> List[Dict]:
+        """
+        Read the most recent ENGINE_TICK_CALLSITE events from the end of the feed file.
+        This ensures we always have the latest tick timestamp for liveness, regardless of cursor position.
+        """
+        import json
+        
+        if not FRONTEND_FEED_FILE.exists():
+            return []
+        
+        ticks = []
+        try:
+            # Read file in reverse to find most recent ticks
+            with open(FRONTEND_FEED_FILE, 'rb') as f:
+                # Seek to end
+                f.seek(0, 2)  # 2 = SEEK_END
+                file_size = f.tell()
+                
+                # Read backwards in chunks
+                chunk_size = 8192  # 8KB chunks
+                buffer = b''
+                position = file_size
+                
+                while position > 0 and len(ticks) < max_events:
+                    # Read chunk
+                    read_size = min(chunk_size, position)
+                    position -= read_size
+                    f.seek(position)
+                    chunk = f.read(read_size)
+                    buffer = chunk + buffer
+                    
+                    # Process complete lines from buffer (in reverse order)
+                    while b'\n' in buffer and len(ticks) < max_events:
+                        # Extract last complete line
+                        last_newline = buffer.rfind(b'\n')
+                        if last_newline == -1:
+                            break
+                        
+                        line_bytes = buffer[last_newline+1:]
+                        buffer = buffer[:last_newline]
+                        
+                        if not line_bytes.strip():
+                            continue
+                        
+                        try:
+                            line = line_bytes.decode('utf-8-sig').strip()
+                            if not line:
+                                continue
+                            
+                            event = json.loads(line)
+                            if event.get("event_type") == "ENGINE_TICK_CALLSITE":
+                                ticks.append(event)
+                                if len(ticks) >= max_events:
+                                    break
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                
+                # Process remaining buffer if we haven't found enough ticks
+                if len(ticks) < max_events and buffer.strip():
+                    try:
+                        line = buffer.decode('utf-8-sig').strip()
+                        if line:
+                            event = json.loads(line)
+                            if event.get("event_type") == "ENGINE_TICK_CALLSITE":
+                                ticks.append(event)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+            
+            # Reverse to get chronological order (oldest to newest)
+            ticks.reverse()
+            
+            # Diagnostic logging
+            if ticks:
+                latest_tick = ticks[-1]
+                logger.info(
+                    f"Found {len(ticks)} ENGINE_TICK_CALLSITE event(s) from end of file. "
+                    f"Latest: timestamp={latest_tick.get('timestamp_utc')}, "
+                    f"event_seq={latest_tick.get('event_seq')}, run_id={latest_tick.get('run_id')}"
+                )
+            else:
+                logger.debug("No ENGINE_TICK_CALLSITE events found when reading from end of file")
+            
+        except Exception as e:
+            logger.error(f"Error reading recent ticks from end of file: {e}", exc_info=True)
+        
+        return ticks
     
     def _read_feed_events_since(self, cursor: Dict[str, int]) -> List[Dict]:
         """Read events from frontend_feed.jsonl since cursor position."""
@@ -329,6 +494,7 @@ class WatchdogAggregator:
                         event = json.loads(line)
                         run_id = event.get("run_id")
                         event_seq = event.get("event_seq", 0)
+                        event_type = event.get("event_type", "")
                         
                         if not run_id:
                             continue
@@ -339,6 +505,11 @@ class WatchdogAggregator:
                             events.append(event)
                             # Track this run_id
                             run_ids_to_track.add(run_id)
+                        elif event_type == "ENGINE_TICK_CALLSITE":
+                            # Debug: Log when ENGINE_TICK_CALLSITE events are skipped due to cursor
+                            logger.debug(
+                                f"ENGINE_TICK_CALLSITE skipped by cursor: event_seq={event_seq} <= cursor[{run_id}]={last_seq}"
+                            )
                         
                         # Update position for this run_id (position after this line)
                         self._feed_file_positions[run_id] = f.tell()
@@ -431,7 +602,12 @@ class WatchdogAggregator:
             logger.error(f"Error rebuilding stream states from recent events: {e}", exc_info=True)
     
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
-        """Get events since event_seq for a run_id."""
+        """
+        Get events since event_seq for a run_id.
+        
+        Optimized: Reads forward but stops early when possible.
+        For very large files, consider using cursor-based incremental reading.
+        """
         import json
         
         events = []
@@ -442,6 +618,11 @@ class WatchdogAggregator:
         try:
             # Use binary mode to avoid tell() issues
             with open(FRONTEND_FEED_FILE, 'rb') as f:
+                # Track if we've seen events for this run_id to optimize early stopping
+                seen_run_id_events = False
+                consecutive_non_matching = 0
+                max_consecutive_skip = 1000  # Stop if we see 1000 non-matching events in a row
+                
                 for line_bytes in f:
                     try:
                         line = line_bytes.decode('utf-8-sig').strip()
@@ -456,15 +637,32 @@ class WatchdogAggregator:
                         event_run_id = event.get("run_id")
                         event_seq = event.get("event_seq", 0)
                         
-                        if event_run_id == run_id and event_seq > since_seq:
-                            events.append(event)
+                        if event_run_id == run_id:
+                            seen_run_id_events = True
+                            consecutive_non_matching = 0
+                            if event_seq > since_seq:
+                                events.append(event)
+                            elif event_seq <= since_seq and seen_run_id_events:
+                                # We've found matching run_id but seq is <= since_seq
+                                # If we've already collected events, we can stop (events are sequential)
+                                if events:
+                                    break
+                        else:
+                            # Not matching run_id
+                            if seen_run_id_events:
+                                # We've seen events for this run_id, but now seeing different run_id
+                                # This could mean we've moved to a different run_id section
+                                consecutive_non_matching += 1
+                                if consecutive_non_matching > max_consecutive_skip:
+                                    # Likely moved past this run_id's events, stop
+                                    break
                     
                     except json.JSONDecodeError:
                         # Silently skip malformed JSON lines
                         continue
         
         except Exception as e:
-            logger.error(f"Error reading feed file: {e}")
+            logger.error(f"Error reading feed file: {e}", exc_info=True)
         
         return events
     
@@ -548,7 +746,12 @@ class WatchdogAggregator:
         return run_id
     
     def get_stream_states(self) -> Dict:
-        """Get current stream states, filtered by enabled streams when available."""
+        """
+        Get current stream states, merging timetable data with watchdog state data.
+        
+        Returns all enabled streams from timetable, with watchdog state data merged in.
+        If timetable unavailable, falls back to showing only streams with watchdog state.
+        """
         streams = []
         timetable_unavailable = False
         
@@ -556,44 +759,147 @@ class WatchdogAggregator:
             # CRITICAL: Use getter, never access private fields directly
             current_trading_date = self._state_manager.get_trading_date()
             if not current_trading_date:
-                # Fallback: compute using CME rollover
+                # Fallback: compute using CME rollover (timetable unavailable)
                 chicago_now = datetime.now(CHICAGO_TZ)
                 current_trading_date = compute_timetable_trading_date(chicago_now)
+                logger.debug(
+                    f"get_stream_states: trading_date not set in state manager, "
+                    f"using computed fallback: {current_trading_date}"
+                )
+            
+            # Get timetable stream metadata (instrument, session, slot_time)
+            timetable_streams_metadata = self._state_manager.get_timetable_streams_metadata()
             
             # CRITICAL: Use getter, never access _enabled_streams directly
             enabled_streams = self._state_manager.get_enabled_streams()
             if enabled_streams is None:
                 timetable_unavailable = True  # Flag for UI warning
             
-            # NOTE: Direct access to _stream_states is needed for now
-            # TODO: Refactor StateManager to provide get_stream_states_dict() getter
-            # For now, use getattr with safe fallback
+            # Get watchdog state data
             stream_states_dict = getattr(self._state_manager, '_stream_states', {})
-            for (trading_date, stream), info in stream_states_dict.items():
-                # Only include streams from current trading date
-                if trading_date != current_trading_date:
-                    continue
-                
-                # FAIL-OPEN: Filter by enabled streams only when available
-                # If enabled_streams is None (timetable unavailable), show all streams
-                if enabled_streams is not None:
-                    if stream not in enabled_streams:
-                        continue  # Skip disabled streams
+            
+            # If timetable metadata is available, use it as the source of truth for enabled streams
+            if timetable_streams_metadata and enabled_streams:
+                # Merge timetable data with watchdog state data
+                for stream_id in enabled_streams:
+                    timetable_meta = timetable_streams_metadata.get(stream_id, {})
                     
+                    # Get watchdog state if available
+                    watchdog_key = (current_trading_date, stream_id)
+                    watchdog_info = stream_states_dict.get(watchdog_key)
+                    
+                    # Use timetable data for: stream, instrument, session, slot_time
+                    instrument = timetable_meta.get('instrument', '')
+                    session = timetable_meta.get('session', '')
+                    slot_time = timetable_meta.get('slot_time', '')
+                    
+                    # Format slot_time as "HH:MM" if it's not already formatted
+                    slot_time_chicago = None
+                    if slot_time:
+                        # Already in "HH:MM" format from timetable
+                        slot_time_chicago = slot_time
+                    
+                    # Use watchdog data for: state, time_in_state, range, commit, issues
+                    if watchdog_info:
+                        # Watchdog state exists - merge with timetable data
+                        state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
+                        watchdog_slot_time = getattr(watchdog_info, 'slot_time_chicago', None) or ""
+                        
+                        # Prefer watchdog slot_time if available (more recent), otherwise use timetable
+                        if watchdog_slot_time and watchdog_slot_time != "":
+                            if 'T' in watchdog_slot_time:
+                                try:
+                                    slot_dt = datetime.fromisoformat(watchdog_slot_time.replace('Z', '+00:00'))
+                                    if slot_dt.tzinfo:
+                                        slot_dt = slot_dt.astimezone(CHICAGO_TZ)
+                                    slot_time_chicago = slot_dt.strftime("%H:%M")
+                                except Exception:
+                                    pass
+                            else:
+                                slot_time_chicago = watchdog_slot_time
+                        
+                        streams.append({
+                            "trading_date": current_trading_date,
+                            "stream": stream_id,
+                            "instrument": getattr(watchdog_info, 'instrument', None) or instrument,
+                            "session": getattr(watchdog_info, 'session', None) or session,
+                            "state": getattr(watchdog_info, 'state', ''),
+                            "committed": getattr(watchdog_info, 'committed', False),
+                            "commit_reason": getattr(watchdog_info, 'commit_reason', None),
+                            "slot_time_chicago": slot_time_chicago,
+                            "slot_time_utc": getattr(watchdog_info, 'slot_time_utc', None) or None,
+                            "range_high": getattr(watchdog_info, 'range_high', None),
+                            "range_low": getattr(watchdog_info, 'range_low', None),
+                            "freeze_close": getattr(watchdog_info, 'freeze_close', None),
+                            "range_invalidated": getattr(watchdog_info, 'range_invalidated', False),
+                            "state_entry_time_utc": state_entry_time_utc.isoformat(),
+                            "range_locked_time_utc": (
+                                state_entry_time_utc.isoformat()
+                                if getattr(watchdog_info, 'state', '') == "RANGE_LOCKED" else None
+                            ),
+                            "range_locked_time_chicago": (
+                                state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                                if getattr(watchdog_info, 'state', '') == "RANGE_LOCKED" else None
+                            )
+                        })
+                    else:
+                        # No watchdog state - use timetable data with defaults for watchdog fields
+                        streams.append({
+                            "trading_date": current_trading_date,
+                            "stream": stream_id,
+                            "instrument": instrument,
+                            "session": session,
+                            "state": "",  # No state yet
+                            "committed": False,
+                            "commit_reason": None,
+                            "slot_time_chicago": slot_time_chicago,
+                            "slot_time_utc": None,
+                            "range_high": None,
+                            "range_low": None,
+                            "freeze_close": None,
+                            "range_invalidated": False,
+                            "state_entry_time_utc": datetime.now(timezone.utc).isoformat(),  # Use current time for time_in_state calculation
+                            "range_locked_time_utc": None,
+                            "range_locked_time_chicago": None
+                        })
+                
+                logger.info(
+                    f"get_stream_states: Returning {len(streams)} streams from timetable "
+                    f"(enabled_streams: {len(enabled_streams)}, "
+                    f"with_watchdog_state: {sum(1 for s in streams if s.get('state'))}, "
+                    f"without_watchdog_state: {sum(1 for s in streams if not s.get('state'))})"
+                )
+            else:
+                # Fallback: Timetable unavailable - show only streams with watchdog state
+                logger.debug(
+                    f"get_stream_states: Timetable unavailable, falling back to watchdog-only streams"
+                )
+                
+                filtered_by_date = 0
+                filtered_by_enabled = 0
+                for (trading_date, stream), info in stream_states_dict.items():
+                    # Only include streams from current trading date
+                    if trading_date != current_trading_date:
+                        filtered_by_date += 1
+                        continue
+                    
+                    # If enabled_streams is available, filter by it
+                    if enabled_streams is not None:
+                        if stream not in enabled_streams:
+                            filtered_by_enabled += 1
+                            continue
+                    
+                    # Build stream data from watchdog state only
                     state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
                     slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
-                    # Extract time portion from slot_time_chicago if it's in ISO format
-                    # But preserve if already formatted as "HH:MM"
                     if slot_time_chicago and 'T' in slot_time_chicago:
                         try:
                             slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
-                            # Convert to Chicago timezone if needed
                             if slot_dt.tzinfo:
                                 slot_dt = slot_dt.astimezone(CHICAGO_TZ)
                             slot_time_chicago = slot_dt.strftime("%H:%M")
                         except Exception:
-                            pass  # Keep original if parsing fails
-                    # If empty string, set to None so frontend can display "-"
+                            pass
                     if slot_time_chicago == "":
                         slot_time_chicago = None
                     
@@ -612,7 +918,6 @@ class WatchdogAggregator:
                         "freeze_close": getattr(info, 'freeze_close', None),
                         "range_invalidated": getattr(info, 'range_invalidated', False),
                         "state_entry_time_utc": state_entry_time_utc.isoformat(),
-                        # Range lock time: when the range was locked (only for RANGE_LOCKED state)
                         "range_locked_time_utc": (
                             state_entry_time_utc.isoformat()
                             if getattr(info, 'state', '') == "RANGE_LOCKED" else None
@@ -622,6 +927,12 @@ class WatchdogAggregator:
                             if getattr(info, 'state', '') == "RANGE_LOCKED" else None
                         )
                     })
+                
+                logger.info(
+                    f"get_stream_states: Returning {len(streams)} streams (fallback mode - watchdog only), "
+                    f"filtered_by_date: {filtered_by_date}, filtered_by_enabled: {filtered_by_enabled}"
+                )
+            
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
         return {
@@ -658,6 +969,7 @@ class WatchdogAggregator:
         # Exclude to avoid spam
         excluded_types = {
             "ENGINE_TICK_HEARTBEAT",  # Too frequent
+            "ENGINE_TICK_CALLSITE",  # Diagnostic event, used for backend liveness only
         }
         
         # Check if event is important

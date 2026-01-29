@@ -98,14 +98,24 @@ export function WatchdogPage() {
     
     const stalls = Object.values(status.data_stall_detected || {})
     
-    // If no instruments tracked yet, we can't determine data flow status
-    // But if market is closed, we can infer acceptable silence
+    // If no instruments tracked yet, check if bars are being received
+    // If worst_last_bar_age_seconds is set and recent, data is flowing
     if (stalls.length === 0) {
       // If market is known to be closed, show acceptable silence
-      // Otherwise, show unknown (waiting for first bar)
       if (status.market_open === false) {
         return 'ACCEPTABLE_SILENCE'
       }
+      
+      // If bars are being received (worst_last_bar_age_seconds is set and recent), show FLOWING
+      // This handles the case where streams are in PRE_HYDRATION but bars are arriving
+      if (status.worst_last_bar_age_seconds !== null && status.worst_last_bar_age_seconds !== undefined) {
+        // Bars are being received - show FLOWING if recent (< 2 minutes), otherwise UNKNOWN
+        if (status.worst_last_bar_age_seconds < 120) {
+          return 'FLOWING'
+        }
+      }
+      
+      // Otherwise, show unknown (waiting for first bar or streams to transition)
       return 'UNKNOWN'
     }
     
@@ -123,7 +133,7 @@ export function WatchdogPage() {
     
     // No stalls detected = data flowing
     return 'FLOWING'
-  }, [status?.data_stall_detected, status?.market_open]) // Only depend on fields that affect result
+  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds]) // Only depend on fields that affect result
   
   // Build critical alerts
   const alerts = useMemo(() => {

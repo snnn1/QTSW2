@@ -32,6 +32,9 @@ class EventFeedGenerator:
     def __init__(self):
         self._event_seq_by_run_id: Dict[str, int] = defaultdict(int)
         self._last_read_positions: Dict[str, int] = {}  # File path -> byte position
+        # Rate limiting for very frequent events (per run_id)
+        self._last_engine_tick_callsite_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
+        self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5  # Only write ENGINE_TICK_CALLSITE every 5 seconds
         
     def _convert_utc_to_chicago(self, utc_timestamp_str: str) -> str:
         """Convert UTC timestamp string to Chicago timezone."""
@@ -106,6 +109,39 @@ class EventFeedGenerator:
         if not run_id:
             logger.debug(f"Event missing run_id: {event_type}, skipping")
             return None
+        
+        # Rate limit ENGINE_TICK_CALLSITE events (very frequent, only write every 5 seconds)
+        if event_type == "ENGINE_TICK_CALLSITE":
+            timestamp_utc = self._extract_timestamp_utc(event)
+            if timestamp_utc:
+                try:
+                    event_time = datetime.fromisoformat(timestamp_utc.replace('Z', '+00:00'))
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+                    
+                    last_written = self._last_engine_tick_callsite_time.get(run_id)
+                    if last_written:
+                        elapsed = (event_time - last_written).total_seconds()
+                        if elapsed < self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS:
+                            # Rate limited - skip this event
+                            logger.debug(
+                                f"ENGINE_TICK_CALLSITE rate-limited: run_id={run_id}, "
+                                f"elapsed={elapsed:.1f}s < {self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS}s"
+                            )
+                            return None
+                    
+                    # Update last written time
+                    self._last_engine_tick_callsite_time[run_id] = event_time
+                    # Diagnostic: Log when ENGINE_TICK_CALLSITE is written to feed (rate-limited to avoid spam)
+                    if not hasattr(self, '_last_tick_write_log_time'):
+                        self._last_tick_write_log_time = {}
+                    if run_id not in self._last_tick_write_log_time or \
+                       (event_time - self._last_tick_write_log_time.get(run_id, event_time)).total_seconds() >= 30:
+                        self._last_tick_write_log_time[run_id] = event_time
+                        logger.debug(f"ENGINE_TICK_CALLSITE written to feed: run_id={run_id}, timestamp={event_time.isoformat()}")
+                except Exception as e:
+                    # If timestamp parsing fails, allow event through (better to log than miss)
+                    logger.debug(f"Failed to parse timestamp for rate limiting: {e}")
         
         # Increment event_seq for this run_id (starts at 1, increments by 1)
         if run_id not in self._event_seq_by_run_id:
@@ -206,6 +242,16 @@ class EventFeedGenerator:
         try:
             # Use utf-8-sig to automatically handle UTF-8 BOM markers
             with open(log_file, 'r', encoding='utf-8-sig') as f:
+                # Check if file was rotated (file size is smaller than last position)
+                current_size = f.seek(0, 2)  # Seek to end to get file size
+                if current_size < last_pos:
+                    # File was rotated or truncated - reset position to start
+                    logger.info(
+                        f"File rotation detected for {log_file.name}: "
+                        f"file_size={current_size}, last_pos={last_pos}, resetting to 0"
+                    )
+                    last_pos = 0
+                
                 # Seek to last read position
                 f.seek(last_pos)
                 
@@ -232,7 +278,7 @@ class EventFeedGenerator:
                 self._last_read_positions[str(log_file)] = f.tell()
         
         except Exception as e:
-            logger.error(f"Error reading log file {log_file}: {e}")
+            logger.error(f"Error reading log file {log_file}: {e}", exc_info=True)
         
         return events
     
@@ -304,15 +350,40 @@ class EventFeedGenerator:
         all_events.sort(key=lambda e: e.get("timestamp_utc", ""))
         
         # Process events and write to frontend feed
+        tick_callsite_written = 0
         with open(FRONTEND_FEED_FILE, 'a', encoding='utf-8') as f:
             for event in all_events:
                 feed_event = self._process_event(event)
                 if feed_event:
+                    if feed_event.get("event_type") == "ENGINE_TICK_CALLSITE":
+                        tick_callsite_written += 1
                     f.write(json.dumps(feed_event) + '\n')
                     processed_count += 1
         
+        # Diagnostic: Log when ENGINE_TICK_CALLSITE events are written
+        if tick_callsite_written > 0:
+            logger.info(f"EventFeedGenerator: Wrote {tick_callsite_written} ENGINE_TICK_CALLSITE event(s) to feed")
+        
         if processed_count > 0:
             logger.debug(f"Processed {processed_count} new events")
+        
+        # Diagnostic: Check if ENGINE_TICK_CALLSITE events are in the raw logs
+        tick_callsite_in_raw = False
+        for event in all_events:
+            event_type = self._extract_event_type(event)
+            if event_type == "ENGINE_TICK_CALLSITE":
+                tick_callsite_in_raw = True
+                break
+        
+        if tick_callsite_in_raw:
+            logger.debug("ENGINE_TICK_CALLSITE events found in raw robot logs")
+        else:
+            # Only warn if we processed events but no ENGINE_TICK_CALLSITE
+            if processed_count > 0:
+                logger.warning(
+                    f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE found. "
+                    f"This may indicate the robot is not emitting ENGINE_TICK_CALLSITE events."
+                )
         
         return processed_count
     

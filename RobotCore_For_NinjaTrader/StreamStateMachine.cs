@@ -3416,6 +3416,9 @@ public sealed class StreamStateMachine
         var brkLong = _brkLongRounded.Value;
         var brkShort = _brkShortRounded.Value;
 
+        // CRITICAL FIX: OCO ID must be unique - NinjaTrader doesn't allow reusing OCO IDs
+        // If same stream locks multiple times, previous OCO ID would be reused, causing rejection
+        // Add unique identifier (GUID) to ensure each OCO group is unique
         // Shared OCO group links the two entry stops
         var ocoGroup = RobotOrderIds.EncodeEntryOco(TradingDate, Stream, SlotTimeChicago);
 

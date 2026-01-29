@@ -56,6 +56,9 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
   }
   
   const getStateBadgeColor = (state: string) => {
+    if (!state || state === '') {
+      return 'bg-gray-700 text-gray-400'
+    }
     switch (state) {
       case 'PRE_HYDRATION':
         return 'bg-gray-600 text-white'
@@ -157,9 +160,15 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   <td className="px-2 py-1">{stream.instrument || '-'}</td>
                   <td className="px-2 py-1">{stream.session || '-'}</td>
                   <td className="px-2 py-1">
-                    <span className={`px-2 py-0.5 rounded text-xs ${getStateBadgeColor(stream.state)}`}>
-                      {stream.state}
-                    </span>
+                    {stream.state ? (
+                      <span className={`px-2 py-0.5 rounded text-xs ${getStateBadgeColor(stream.state)}`}>
+                        {stream.state}
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-400">
+                        -
+                      </span>
+                    )}
                   </td>
                   <td className={`px-2 py-1 font-mono ${getTimeInStateColor(timeInState)}`}>
                     {formatDuration(timeInState)}

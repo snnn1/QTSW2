@@ -92,40 +92,29 @@ class EventProcessor:
             self._state_manager.update_engine_tick(timestamp_utc)
             # Clear ALL streams on engine start (new run) - they will be re-initialized
             # This prevents showing stale ARMED/RANGE_BUILDING states from previous runs
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            trading_date = self._state_manager.get_trading_date()
             if trading_date:
                 self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc, clear_all_for_date=True)
             else:
-                # If no trading_date in event, use today's date and clear all streams
-                from datetime import datetime
+                # If timetable not loaded yet, use computed fallback
+                from .timetable_poller import compute_timetable_trading_date
                 import pytz
                 chicago_tz = pytz.timezone("America/Chicago")
-                today_str = datetime.now(chicago_tz).strftime("%Y-%m-%d")
-                self._state_manager.cleanup_stale_streams(today_str, timestamp_utc, clear_all_for_date=True)
+                chicago_now = datetime.now(chicago_tz)
+                trading_date = compute_timetable_trading_date(chicago_now)
+                self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc, clear_all_for_date=True)
         
         elif event_type == "ENGINE_HEARTBEAT":
-            # Unconditional engine loop liveness signal from Tick()
-            # This represents engine loop (Tick()) execution, not bar processing
-            # Phase 4: Diagnostic logging for watchdog receipt
-            import asyncio
-            now_utc = datetime.now(timezone.utc)
-            delta_seconds = (now_utc - timestamp_utc).total_seconds()
-            try:
-                current_task = asyncio.current_task()
-                task_id = id(current_task) if current_task else None
-            except RuntimeError:
-                task_id = None
-            logger.debug(
-                f"ENGINE_HEARTBEAT received: event_type={event_type}, "
-                f"timestamp_utc={timestamp_utc.isoformat()}, now_utc={now_utc.isoformat()}, "
-                f"delta_seconds={delta_seconds:.2f}, thread={task_id}"
-            )
+            # DEPRECATED: ENGINE_HEARTBEAT removed from critical events (only works if AddOn/Strategy installed)
+            # Keep handler for backward compatibility with old events, but new events won't reach here
+            # Use ENGINE_TICK_CALLSITE (rate-limited) instead for reliable liveness monitoring
             self._state_manager.update_engine_tick(timestamp_utc)
         
         elif event_type == "ENGINE_TICK_HEARTBEAT":
             # PATTERN 1: Update engine tick timestamp AND track last bar time per instrument
             # Note: ENGINE_TICK_HEARTBEAT is bar-driven and tracks bar processing
-            # ENGINE_HEARTBEAT (above) is the authoritative Tick() liveness signal
+            # Use ENGINE_TICK_CALLSITE (rate-limited) for primary Tick() liveness signal
             self._state_manager.update_engine_tick(timestamp_utc)
             
             # Extract instrument and bar_time_utc from heartbeat payload
@@ -141,7 +130,7 @@ class EventProcessor:
         elif event_type == "ONBARUPDATE_CALLED":
             # OnBarUpdate is called constantly while engine is running (when bars arrive)
             # Use this as a reliable heartbeat indicator for engine liveness
-            # This is more frequent than ENGINE_HEARTBEAT and confirms NinjaTrader is calling OnBarUpdate
+            # Confirms NinjaTrader is calling OnBarUpdate (bar-dependent)
             self._state_manager.update_engine_tick(timestamp_utc)
             
             # Also track last bar time per instrument if available
@@ -151,9 +140,17 @@ class EventProcessor:
                 self._state_manager.update_last_bar(instrument, timestamp_utc)
         
         elif event_type == "ENGINE_TICK_CALLSITE":
-            # ENGINE_TICK_CALLSITE is emitted every time Tick() is called (very frequent)
-            # Use this as the primary heartbeat indicator since ENGINE_HEARTBEAT may not be emitted
+            # ENGINE_TICK_CALLSITE is emitted every time Tick() is called (very frequent, rate-limited in feed)
+            # This is the primary heartbeat indicator for engine liveness
+            # Rate-limited to every 5 seconds in event feed to reduce log volume
             # This ensures engine_alive stays true as long as Tick() is being called
+            # Diagnostic: Log when ENGINE_TICK_CALLSITE is processed (rate-limited)
+            if not hasattr(self, '_last_tick_process_log_utc'):
+                self._last_tick_process_log_utc = None
+            now = datetime.now(timezone.utc)
+            if self._last_tick_process_log_utc is None or (now - self._last_tick_process_log_utc).total_seconds() >= 30:
+                self._last_tick_process_log_utc = now
+                logger.info(f"ENGINE_TICK_CALLSITE processed: timestamp_utc={timestamp_utc.isoformat()}")
             self._state_manager.update_engine_tick(timestamp_utc)
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
@@ -195,8 +192,17 @@ class EventProcessor:
             self._state_manager.update_kill_switch(True)
         
         elif event_type == "STREAM_STATE_TRANSITION":
-            # Standardized fields are now always at top level (plan requirement #1)
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            # The timetable is the single source of truth for trading_date
+            trading_date = self._state_manager.get_trading_date()
+            if not trading_date:
+                # Fallback: If timetable not loaded yet, skip this event (will be processed on next poll)
+                logger.debug(
+                    f"STREAM_STATE_TRANSITION skipped: timetable trading_date not set yet "
+                    f"(event trading_date: {event.get('trading_date')}, stream: {event.get('stream')})"
+                )
+                return
+            
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
@@ -230,7 +236,7 @@ class EventProcessor:
                 canonical_stream = stream or ""
                 execution_instrument = instrument or ""
             
-            if trading_date and canonical_stream and new_state:
+            if canonical_stream and new_state:
                 # Parse state_entry_time_utc from event, but validate it's not too old
                 state_entry_time_utc = self._parse_timestamp(state_entry_time_utc_str) if state_entry_time_utc_str else timestamp_utc
                 
@@ -246,8 +252,8 @@ class EventProcessor:
                         state_entry_time_utc = timestamp_utc
                 
                 # Log state transition for debugging
-                logger.debug(
-                    f"Stream state transition: {canonical_stream} ({trading_date}) "
+                logger.info(
+                    f"✅ Stream state transition: {canonical_stream} ({trading_date}) "
                     f"{previous_state} -> {new_state} (execution_instrument={execution_instrument}, "
                     f"canonical_instrument={canonical_instrument}, session={session}, slot={slot_time_chicago})"
                 )
@@ -256,6 +262,13 @@ class EventProcessor:
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, new_state,
                     state_entry_time_utc=state_entry_time_utc
+                )
+                
+                # Diagnostic: Log stream count after update
+                stream_count = len(self._state_manager._stream_states)
+                logger.debug(
+                    f"Stream state updated: {canonical_stream} ({trading_date}) -> {new_state}. "
+                    f"Total streams in state manager: {stream_count}"
                 )
                 # Update instrument, session, slot_time_chicago, and range data if available
                 key = (trading_date, canonical_stream)
@@ -315,7 +328,11 @@ class EventProcessor:
         elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
             # MARKET_CLOSE_NO_TRADE is treated the same as STREAM_STAND_DOWN
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            trading_date = self._state_manager.get_trading_date()
+            if not trading_date:
+                logger.debug(f"{event_type} skipped: timetable trading_date not set yet")
+                return
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
@@ -339,7 +356,7 @@ class EventProcessor:
                 canonical_stream = stream or ""
                 execution_instrument = instrument or ""
             
-            if trading_date and canonical_stream:
+            if canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
                 # For MARKET_CLOSE_NO_TRADE, use commit_reason from data, or default to event_type
                 commit_reason = data.get("commit_reason") or data.get("reason") or event_type
@@ -355,7 +372,11 @@ class EventProcessor:
         
         elif event_type == "RANGE_INVALIDATED":
             # Standardized fields are now always at top level (plan requirement #1)
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            trading_date = self._state_manager.get_trading_date()
+            if not trading_date:
+                logger.debug(f"RANGE_INVALIDATED skipped: timetable trading_date not set yet")
+                return
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
@@ -379,7 +400,7 @@ class EventProcessor:
                 canonical_stream = stream or ""
                 execution_instrument = instrument or ""
             
-            if trading_date and canonical_stream:
+            if canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, "DONE", committed=True,
@@ -395,7 +416,11 @@ class EventProcessor:
         
         elif event_type == "RANGE_LOCKED":
             # Standardized fields are now always at top level (plan requirement #1)
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            trading_date = self._state_manager.get_trading_date()
+            if not trading_date:
+                logger.debug(f"RANGE_LOCKED skipped: timetable trading_date not set yet")
+                return
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
@@ -457,7 +482,7 @@ class EventProcessor:
                         logger.debug(f"Failed to parse extra_data string: {e}")
                         pass
             
-            if trading_date and canonical_stream:
+            if canonical_stream:
                 # PHASE 2: Use canonical stream ID for state management
                 # Pass event timestamp so state_entry_time_utc reflects when range was actually locked
                 self._state_manager.update_stream_state(
@@ -487,7 +512,11 @@ class EventProcessor:
         elif event_type == "RANGE_LOCK_SNAPSHOT":
             # Handle RANGE_LOCK_SNAPSHOT events as fallback/update source for range data
             # This ensures range data is captured even if RANGE_LOCKED event doesn't have all fields
-            trading_date = event.get("trading_date")
+            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
+            trading_date = self._state_manager.get_trading_date()
+            if not trading_date:
+                logger.debug(f"RANGE_LOCK_SNAPSHOT skipped: timetable trading_date not set yet")
+                return
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")
@@ -519,7 +548,7 @@ class EventProcessor:
             range_low = data.get("range_low")
             freeze_close = data.get("freeze_close")
             
-            if trading_date and canonical_stream:
+            if canonical_stream:
                 # Update existing stream state if it exists, or create new one
                 key = (trading_date, canonical_stream)
                 if key in self._state_manager._stream_states:
@@ -645,20 +674,14 @@ class EventProcessor:
                 self._state_manager.update_last_bar(instrument, timestamp_utc)
         
         elif event_type == "TIMETABLE_VALIDATED":
-            # Standardized fields are now always at top level (plan requirement #1)
-            # Keep existing TIMETABLE_VALIDATED handling for compatibility
-            # Do NOT override timetable_current-derived trading_date when timetable is available
-            # Only use event trading_date if StateManager trading_date is None (early startup)
-            trading_date = event.get("trading_date")
-            current_trading_date = self._state_manager.get_trading_date()
-            
-            # Only update trading_date from event if StateManager doesn't have one yet
-            # (timetable_current.json takes precedence when available)
-            if not current_trading_date and trading_date:
-                self._state_manager.update_timetable_state(True, trading_date)
-            else:
-                # Just mark as validated, but keep existing trading_date
-                self._state_manager.update_timetable_state(True, None)
+            # NOTE: Timetable validation is now based on timetable_current.json polling,
+            # not on TIMETABLE_VALIDATED events from the robot.
+            # This event is kept for compatibility but no longer updates timetable_validated.
+            # The timetable_validated status is set by update_timetable_streams() based on
+            # whether the timetable file was successfully loaded.
+            logger.debug(
+                f"TIMETABLE_VALIDATED event received (ignored - validation based on timetable_current.json polling)"
+            )
     
     def get_last_processed_seq(self, run_id: str) -> int:
         """Get last processed event_seq for a run_id."""

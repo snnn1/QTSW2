@@ -91,6 +91,11 @@ async def get_events(
         
         events = aggregator.get_events_since(run_id, since_seq)
         
+        # Debug: Check if ENGINE_TICK_CALLSITE events are in the response
+        tick_callsite_events = [e for e in events if e.get("event_type") == "ENGINE_TICK_CALLSITE"]
+        if tick_callsite_events:
+            logger.debug(f"API returning {len(tick_callsite_events)} ENGINE_TICK_CALLSITE event(s) to frontend")
+        
         # Get next_seq (highest event_seq in response, or since_seq if no events)
         next_seq = since_seq
         if events:
