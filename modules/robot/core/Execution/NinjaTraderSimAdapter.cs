@@ -375,6 +375,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             }
         }
         
+        // PHASE 2: Generate OCO group for protective orders (stop and target must be OCO paired)
+        // CRITICAL: Stop and target must be OCO so only one can fill
+        var protectiveOcoGroup = $"QTSW2:{intentId}_PROTECTIVE";
+        
         // PHASE 2: Submit protective stop with retry
         const int MAX_RETRIES = 3;
         const int RETRY_DELAY_MS = 100;
@@ -401,6 +405,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 intent.Direction,
                 intent.StopPrice.Value,
                 fillQuantity,
+                protectiveOcoGroup,
                 utcNow);
             
             if (stopResult.Success)
@@ -430,6 +435,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 intent.Direction,
                 intent.TargetPrice.Value,
                 fillQuantity,
+                protectiveOcoGroup,
                 utcNow);
             
             if (targetResult.Success)
@@ -653,6 +659,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         string direction,
         decimal stopPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -699,7 +706,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         try
         {
-            return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, utcNow);
+            return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
         }
         catch (Exception ex)
         {
@@ -723,6 +730,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         string direction,
         decimal targetPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -769,7 +777,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         try
         {
-            return SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, utcNow);
+            return SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, ocoGroup, utcNow);
         }
         catch (Exception ex)
         {

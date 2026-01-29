@@ -77,7 +77,12 @@ if feed_file.exists():
     
     print(f"\n  Diagnostic Events (Last 10):")
     for evt in diagnostic_events[-10:]:
-        print(f"    {evt['timestamp'][11:19]} | {evt['event_type']:<30} | Stream: {evt.get('stream', 'N/A'):<6} | Inst: {evt.get('instrument', 'N/A'):<4} | Exec: {evt.get('execution_instrument', 'N/A')}")
+        ts = evt.get('timestamp', '') or ''
+        ts_display = ts[11:19] if len(ts) > 19 else ts or 'N/A'
+        stream = evt.get('stream') or 'N/A'
+        instrument = evt.get('instrument') or 'N/A'
+        exec_inst = evt.get('execution_instrument') or 'N/A'
+        print(f"    {ts_display} | {evt.get('event_type', 'N/A'):<30} | Stream: {stream:<6} | Inst: {instrument:<4} | Exec: {exec_inst}")
 else:
     print("  Feed file not found")
 print()

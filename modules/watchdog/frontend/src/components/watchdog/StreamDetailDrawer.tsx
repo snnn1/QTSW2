@@ -35,7 +35,7 @@ export function StreamDetailDrawer({ stream, isOpen, onClose }: StreamDetailDraw
           <h3 className="text-lg font-semibold mb-2">Stream Summary</h3>
           <div className="space-y-1 text-sm">
             <div><span className="text-gray-400">Stream:</span> <span className="font-mono">{stream.stream}</span></div>
-            <div><span className="text-gray-400">Instrument:</span> {stream.instrument}</div>
+            <div><span className="text-gray-400">Instrument:</span> {stream.execution_instrument || stream.instrument}</div>
             <div><span className="text-gray-400">Session:</span> {stream.session}</div>
             <div><span className="text-gray-400">State:</span> {stream.state}</div>
             <div><span className="text-gray-400">Slot Time:</span> <span className="font-mono">{stream.slot_time_chicago}</span></div>

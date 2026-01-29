@@ -157,7 +157,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
                 >
                   <td className="px-2 py-1 font-mono">{stream.stream}</td>
-                  <td className="px-2 py-1">{stream.instrument || '-'}</td>
+                  <td className="px-2 py-1">{stream.execution_instrument || stream.instrument || '-'}</td>
                   <td className="px-2 py-1">{stream.session || '-'}</td>
                   <td className="px-2 py-1">
                     {stream.state ? (
@@ -246,10 +246,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                         issueList.push('⚠️ Range Invalidated')
                       }
                       
-                      // Long time in state (already handled by color coding, but can add to issues)
-                      if (timeInState > 600) { // >10 min
-                        issueList.push('⏱️ Stuck in state')
-                      }
+                      // Note: Removed "Stuck in state" indicator - time in state is already visible in "Time in State" column
                       
                       return issueList.length > 0 ? (
                         <span className="text-amber-500" title={issueList.join(', ')}>

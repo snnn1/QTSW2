@@ -8,6 +8,10 @@
 // - NinjaTraderBarRequest.cs (from modules/robot/ninjatrader/)
 // - Robot.Core.dll (or source files from modules/robot/core/)
 
+// CRITICAL: Define NINJATRADER for NinjaTrader's compiler
+// NinjaTrader compiles to tmp folder and may not respect .csproj DefineConstants
+#define NINJATRADER
+
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -231,10 +235,27 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // CRITICAL FIX: Request bars for ALL execution instruments from enabled streams
                 // This ensures micro futures (MYM, MCL) route to base instrument streams (YM, CL) via canonical mapping
-                // Pattern: Get all execution instruments → Request bars for each → Bars route via IsSameInstrument()
+                // Pattern: Get all execution instruments → Mark ALL as pending FIRST → Then queue BarsRequest for each
                 try
                 {
                     var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
+                    
+                    // CRITICAL: Mark ALL instruments as pending BEFORE queuing BarsRequest
+                    // This ensures streams wait even if they process ticks before BarsRequest completes
+                    // This prevents race condition where stream checks IsBarsRequestPending before it's marked
+                    foreach (var instrument in executionInstruments)
+                    {
+                        try
+                        {
+                            // Mark as pending immediately (synchronously) before queuing BarsRequest
+                            _engine.MarkBarsRequestPending(instrument, DateTimeOffset.UtcNow);
+                            Log($"BarsRequest marked as pending for {instrument} (before queuing)", LogLevel.Information);
+                        }
+                        catch (Exception markEx)
+                        {
+                            Log($"WARNING: Failed to mark BarsRequest pending for {instrument}: {markEx.Message}", LogLevel.Warning);
+                        }
+                    }
                     
                     if (executionInstruments.Count == 0)
                     {
@@ -256,6 +277,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else
                     {
                         Log($"Requesting historical bars for {executionInstruments.Count} execution instrument(s): {string.Join(", ", executionInstruments)}", LogLevel.Information);
+                        
+                        // NOTE: BarsRequest already marked as pending above (before checking count)
+                        // This ensures streams wait even if they process ticks before BarsRequest completes
                         
                         // HARDENING FIX 2: Make BarsRequest fire-and-forget to prevent blocking DataLoaded
                         // Start BarsRequest in background thread pool - don't wait for completion
@@ -284,6 +308,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 // Fire-and-forget BarsRequest - don't block DataLoaded initialization
                                 // Capture executionInstrument in local variable for closure
                                 var instrument = executionInstrument;
+                                
+                                // NOTE: BarsRequest already marked as pending above (before this loop)
+                                // This ensures streams wait even if they initialize before BarsRequest is queued
+                                
                                 ThreadPool.QueueUserWorkItem(_ =>
                                 {
                                     try
@@ -304,6 +332,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                                                 { "error_type", ex.GetType().Name },
                                                 { "note", "BarsRequest failed in background thread - strategy continues with live bars only" }
                                             });
+                                            
+                                            // Mark as completed (failed) so range lock can proceed
+                                            // This prevents indefinite blocking if BarsRequest fails
+                                            _engine.MarkBarsRequestCompleted(instrument, DateTimeOffset.UtcNow);
                                         }
                                     }
                                 });
@@ -391,6 +423,67 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "init_failed", _initFailed },
                         { "note", "Strategy successfully transitioned from DataLoaded to Realtime state" }
                     });
+                    
+                    // RESTART-AWARE: Check if any streams need BarsRequest for restart
+                    // This handles the case where streams restart mid-session and need historical bars
+                    try
+                    {
+                        var instrumentsNeedingBarsRequest = _engine.GetInstrumentsNeedingRestartBarsRequest();
+                        if (instrumentsNeedingBarsRequest.Count > 0)
+                        {
+                            Log($"RESTART_BARSREQUEST: Detected {instrumentsNeedingBarsRequest.Count} instrument(s) needing BarsRequest for restart", LogLevel.Information);
+                            
+                            foreach (var instrument in instrumentsNeedingBarsRequest)
+                            {
+                                // Check if this strategy's instrument matches
+                                var canonicalInstrument = Instrument?.MasterInstrument?.Name ?? "";
+                                if (string.Equals(instrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    Log($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart", LogLevel.Information);
+                                    
+                                    // Mark BarsRequest as pending BEFORE queuing (prevents premature range lock)
+                                    if (_engine != null)
+                                    {
+                                        _engine.MarkBarsRequestPending(instrument, DateTimeOffset.UtcNow);
+                                    }
+                                    
+                                    // Trigger BarsRequest in background thread (non-blocking)
+                                    var instrumentForClosure = instrument;
+                                    ThreadPool.QueueUserWorkItem(_ =>
+                                    {
+                                        try
+                                        {
+                                            RequestHistoricalBarsForPreHydration(instrumentForClosure);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Log($"WARNING: Restart BarsRequest failed for {instrumentForClosure}: {ex.Message}", LogLevel.Warning);
+                                            
+                                            if (_engine != null)
+                                            {
+                                                _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_RESTART_FAILED", new Dictionary<string, object>
+                                                {
+                                                    { "instrument", instrumentForClosure },
+                                                    { "error", ex.Message },
+                                                    { "error_type", ex.GetType().Name },
+                                                    { "note", "Restart BarsRequest failed - strategy continues with live bars only" }
+                                                });
+                                                
+                                                // Mark as completed (failed) so range lock can proceed
+                                                // This prevents indefinite blocking if BarsRequest fails
+                                                _engine.MarkBarsRequestCompleted(instrumentForClosure, DateTimeOffset.UtcNow);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log but don't fail - BarsRequest check is best-effort
+                        Log($"WARNING: Failed to check for restart BarsRequest: {ex.Message}", LogLevel.Warning);
+                    }
                 }
             }
             else if (State == State.Terminated)
@@ -554,13 +647,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var rangeStartChicagoTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
                 var nowChicagoDate = DateOnly.FromDateTime(nowChicago.DateTime);
                 
+                // RESTART-AWARE: On restart (after slot_time), request bars up to now
                 // Use the earlier of: slotTimeChicago or now (to avoid future bars)
-                // CRITICAL: Only use current time if we're on the trading date AND before slot_time
+                // CRITICAL: On restart after slot_time, request bars up to current time for visibility
                 // If we're on a different date (e.g., requesting tomorrow's bars), always use slot_time
-                // This prevents loading bars beyond the range window, which would change the input set
                 var endTimeChicago = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
-                    ? nowChicago.ToString("HH:mm")
-                    : slotTimeChicago;
+                    ? nowChicago.ToString("HH:mm")  // Before slot_time: request up to now
+                    : (nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime)
+                        ? nowChicago.ToString("HH:mm")  // RESTART: After slot_time, request up to now
+                        : slotTimeChicago;  // Future date: use slot_time
                 
                 // Check if we're starting before range_start_time (request would be invalid)
                 if (nowChicagoDate == tradingDate && nowChicago < rangeStartChicagoTime)
@@ -588,7 +683,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Log restart detection if restarting after slot time (on same trading date)
                 if (nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime)
                 {
-                    Log($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest limited to slot_time to prevent range input set changes", LogLevel.Information);
+                    Log($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest requesting bars up to current time ({nowChicago:HH:mm}) for visibility", LogLevel.Information);
                 }
                 
                 Log($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
@@ -890,17 +985,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // This will help us understand if NinjaTrader is calling OnBarUpdate() at all
                 if (_engine != null)
             {
-                var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                // Use execution instrument full name (e.g., "M2K 03-26") for bar tracking
+                // Canonical instrument (MasterInstrument.Name) remains for backward compatibility
+                var executionInstrumentFullName = Instrument?.FullName ?? "UNKNOWN";
+                var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN"; // Canonical for backward compatibility
                 var diagTimeUtc = DateTimeOffset.UtcNow;
-                var diagCanLog = !_lastOnBarUpdateLogUtc.TryGetValue(diagInstrument, out var diagPrevLogUtc) ||
+                var diagCanLog = !_lastOnBarUpdateLogUtc.TryGetValue(executionInstrumentFullName, out var diagPrevLogUtc) ||
                                (diagTimeUtc - diagPrevLogUtc).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
                 
                 if (diagCanLog)
                 {
-                    _lastOnBarUpdateLogUtc[diagInstrument] = diagTimeUtc;
+                    _lastOnBarUpdateLogUtc[executionInstrumentFullName] = diagTimeUtc;
                     _engine.LogEngineEvent(diagTimeUtc, "ONBARUPDATE_CALLED", new Dictionary<string, object>
                     {
-                        { "instrument", diagInstrument },
+                        { "instrument", diagInstrument }, // Canonical instrument (backward compatibility)
+                        { "execution_instrument_full_name", executionInstrumentFullName }, // Full contract name (e.g., "M2K 03-26")
                         { "engine_ready", _engineReady },
                         { "engine_null", _engine is null },
                         { "current_bar", CurrentBar },

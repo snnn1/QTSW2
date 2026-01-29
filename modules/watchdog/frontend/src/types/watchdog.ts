@@ -58,7 +58,8 @@ export interface StreamArmedStatus {
 
 export interface StreamState {
   stream: string;
-  instrument: string;
+  instrument: string;  // Canonical instrument (e.g., "RTY", "ES") - DO NOT CHANGE
+  execution_instrument?: string | null;  // Full contract name (e.g., "M2K 03-26", "MES 03-26")
   session: string;
   trading_date: string;
   state: StreamStateEnum | string;  // Allow empty string for streams without state yet

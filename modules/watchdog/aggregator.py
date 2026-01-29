@@ -858,7 +858,8 @@ class WatchdogAggregator:
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
-                            "instrument": getattr(watchdog_info, 'instrument', None) or instrument,
+                            "instrument": getattr(watchdog_info, 'instrument', None) or instrument,  # Canonical instrument (DO NOT CHANGE)
+                            "execution_instrument": getattr(watchdog_info, 'execution_instrument', None),  # Full contract name (e.g., "MES 03-26")
                             "session": getattr(watchdog_info, 'session', None) or session,
                             "state": getattr(watchdog_info, 'state', ''),
                             "committed": getattr(watchdog_info, 'committed', False),
@@ -885,7 +886,8 @@ class WatchdogAggregator:
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
-                            "instrument": instrument,
+                            "instrument": instrument,  # Canonical instrument (DO NOT CHANGE)
+                            "execution_instrument": None,  # Not available from timetable (will be set from events)
                             "session": session,
                             "state": "",  # No state yet
                             "committed": False,

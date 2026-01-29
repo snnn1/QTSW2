@@ -67,6 +67,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         string direction,
         decimal stopPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "PROTECTIVE_STOP_DRYRUN", new
@@ -86,6 +87,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         string direction,
         decimal targetPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "TARGET_ORDER_DRYRUN", new

@@ -22,89 +22,6 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class NinjaTraderSimAdapter
 {
-    /// <summary>
-    /// Helper method to resolve Instrument object from instrument string.
-    /// Attempts to resolve the execution instrument (e.g., "MES", "MNQ", "MYM") from NinjaTrader.
-    /// Falls back to strategy's instrument if resolution fails.
-    /// </summary>
-    private Instrument ResolveInstrument(string instrumentString, string intentId, DateTimeOffset utcNow)
-    {
-        Instrument? resolvedInstrument = null;
-        
-        // CRITICAL: Trim whitespace from instrument string to prevent "MGC " / "MES " errors
-        var trimmedInstrument = instrumentString?.Trim() ?? instrumentString;
-        
-        try
-        {
-            // Try to get Instrument from the string parameter (execution instrument)
-            resolvedInstrument = Instrument.GetInstrument(trimmedInstrument);
-            
-            if (resolvedInstrument == null)
-            {
-                // Fallback: If resolution fails, log warning and use strategy's instrument
-                // HARDENING FIX: Log as WARNING (not ERROR) since fallback exists and works
-                // This is expected behavior for micro futures (MYM, M2K, MNQ) - they fallback to strategy instrument
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
-                    "INSTRUMENT_RESOLUTION_FAILED", new
-                    {
-                        requested_instrument = trimmedInstrument,
-                        original_instrument = instrumentString,
-                        had_whitespace = instrumentString != trimmedInstrument,
-                        fallback_to_strategy_instrument = _ntInstrument != null ? (_ntInstrument as Instrument)?.MasterInstrument?.Name : "NULL",
-                        warning = "Could not resolve Instrument from string, using strategy instrument as fallback",
-                        note = "Instrument.GetInstrument() returned null. This is expected for micro futures - fallback to strategy instrument works.",
-                        severity = "WARNING" // Indicates this is expected, not an error
-                    }));
-                
-                // Fallback to strategy's instrument
-                resolvedInstrument = _ntInstrument as Instrument;
-            }
-            else
-            {
-                // Log successful resolution (especially if different from strategy instrument)
-                if (_ntInstrument != null)
-                {
-                    var strategyInstrument = (_ntInstrument as Instrument)?.MasterInstrument?.Name ?? "UNKNOWN";
-                    if (resolvedInstrument.MasterInstrument.Name != strategyInstrument)
-                    {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
-                            "INSTRUMENT_OVERRIDE", new
-                            {
-                                requested_instrument = trimmedInstrument,
-                                original_instrument = instrumentString,
-                                had_whitespace = instrumentString != trimmedInstrument,
-                                resolved_instrument = resolvedInstrument.MasterInstrument.Name,
-                                strategy_instrument = strategyInstrument,
-                                note = "Using execution instrument (different from strategy instrument)"
-                            }));
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            // If resolution fails, fallback to strategy's instrument
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
-                "INSTRUMENT_RESOLUTION_ERROR", new
-                {
-                    requested_instrument = trimmedInstrument,
-                    original_instrument = instrumentString,
-                    had_whitespace = instrumentString != trimmedInstrument,
-                    error = ex.Message,
-                    fallback_to_strategy_instrument = _ntInstrument != null ? (_ntInstrument as Instrument)?.MasterInstrument?.Name : "NULL",
-                    warning = "Exception resolving Instrument, using strategy instrument as fallback"
-                }));
-            
-            resolvedInstrument = _ntInstrument as Instrument;
-        }
-        
-        if (resolvedInstrument == null)
-        {
-            throw new InvalidOperationException($"Could not resolve Instrument for '{trimmedInstrument}' (original: '{instrumentString}') and strategy instrument is null");
-        }
-        
-        return resolvedInstrument;
-    }
 
     /// <summary>
     /// Helper method to safely get order tag/name using dynamic typing.
@@ -179,6 +96,53 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// Check if executionInstrument matches the strategy's NinjaTrader Instrument exactly.
+    /// Anchors on Instrument instance comparison, not string roots.
+    /// Must match same contract AND same month (e.g., "MNG" must match "MNG 03-26").
+    /// </summary>
+    private bool IsStrategyExecutionInstrument(string executionInstrument)
+    {
+        if (_ntInstrument == null)
+            return false;
+        
+        var strategyInstrument = _ntInstrument as Instrument;
+        if (strategyInstrument == null)
+            return false;
+        
+        // Anchor on Instrument instance: Try to resolve executionInstrument string to Instrument
+        var trimmedInstrument = executionInstrument?.Trim();
+        if (string.IsNullOrWhiteSpace(trimmedInstrument))
+            return false;
+        
+        try
+        {
+            // Resolve executionInstrument string to Instrument instance
+            var resolvedInstrument = Instrument.GetInstrument(trimmedInstrument);
+            
+            if (resolvedInstrument == null)
+            {
+                // If resolution fails, extract root from strategy's FullName and compare strings
+                // This handles cases where executionInstrument is just "MNG" but strategy has "MNG 03-26"
+                var strategyFullName = strategyInstrument.FullName ?? "";
+                var strategyRoot = strategyFullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                return string.Equals(strategyRoot, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
+            }
+            
+            // Compare Instrument instances directly (reference equality or FullName match)
+            // This ensures exact contract + month match
+            return ReferenceEquals(resolvedInstrument, strategyInstrument) || 
+                   string.Equals(resolvedInstrument.FullName, strategyInstrument.FullName, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // If resolution throws, fall back to string root comparison
+            var strategyFullName = strategyInstrument.FullName ?? "";
+            var strategyRoot = strategyFullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+            return string.Equals(strategyRoot, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    /// <summary>
     /// STEP 2: Submit entry order using real NT API.
     /// </summary>
     private OrderSubmissionResult SubmitEntryOrderReal(
@@ -203,79 +167,32 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        // CRITICAL FIX: Resolve Instrument from the execution instrument string parameter
-        // This allows orders to be placed on micros (MES, MNQ, MYM) even if strategy is subscribed to minis
-        Instrument? ntInstrument = null;
-        try
+        // Fix 1: Hard guard - check executionInstrument matches strategy's Instrument exactly
+        if (!IsStrategyExecutionInstrument(instrument))
         {
-            // CRITICAL: Trim whitespace from instrument string to prevent "MGC " / "MES " errors
-            var trimmedInstrument = instrument?.Trim() ?? instrument;
-            
-            // HARDENING FIX 4: Instrument resolution is single-shot - no contract month fallback
-            // Contract month fallback removed to prevent repeated resolution attempts and stalls
-            // If exact match fails, fallback to strategy instrument immediately
-            ntInstrument = Instrument.GetInstrument(trimmedInstrument);
-            
-            if (ntInstrument == null)
+            var error = $"Execution instrument '{instrument}' does not match strategy's Instrument. " +
+                       $"Strategy Instrument: {(_ntInstrument as Instrument)?.FullName ?? "NULL"}. " +
+                       $"Orders can only be placed on the strategy's enabled Instrument.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
             {
-                // Fallback: If resolution fails, log warning and use strategy's instrument
-                // HARDENING FIX: Log as WARNING (not ERROR) since fallback exists and works
-                // This is expected behavior for micro futures (MYM, M2K, MNQ) - they fallback to strategy instrument
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
-                    "INSTRUMENT_RESOLUTION_FAILED", new
-                    {
-                        requested_instrument = trimmedInstrument,
-                        original_instrument = instrument,
-                        had_whitespace = instrument != trimmedInstrument,
-                        fallback_to_strategy_instrument = _ntInstrument != null ? (_ntInstrument as Instrument)?.MasterInstrument?.Name : "NULL",
-                        warning = "Could not resolve Instrument from string, using strategy instrument as fallback",
-                        note = "Instrument.GetInstrument() returned null. This is expected for micro futures - fallback to strategy instrument works.",
-                        severity = "WARNING" // Indicates this is expected, not an error
-                    }));
-                
-                // Fallback to strategy's instrument
-                ntInstrument = _ntInstrument as Instrument;
-            }
-            else
-            {
-                // Log successful resolution (especially if different from strategy instrument)
-                if (_ntInstrument != null)
-                {
-                    var strategyInstrument = (_ntInstrument as Instrument)?.MasterInstrument?.Name ?? "UNKNOWN";
-                    if (ntInstrument.MasterInstrument.Name != strategyInstrument)
-                    {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, trimmedInstrument,
-                            "INSTRUMENT_OVERRIDE", new
-                            {
-                                requested_instrument = trimmedInstrument,
-                                original_instrument = instrument,
-                                had_whitespace = instrument != trimmedInstrument,
-                                resolved_instrument = ntInstrument.MasterInstrument.Name,
-                                strategy_instrument = strategyInstrument,
-                                note = "Using execution instrument (different from strategy instrument)"
-                            }));
-                    }
-                }
-            }
+                error,
+                requested_instrument = instrument,
+                strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
+                reason = "INSTRUMENT_MISMATCH"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
         }
-        catch (Exception ex)
-        {
-            // If resolution fails, fallback to strategy's instrument
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
-                "INSTRUMENT_RESOLUTION_ERROR", new
-                {
-                    requested_instrument = instrument,
-                    error = ex.Message,
-                    fallback_to_strategy_instrument = _ntInstrument != null ? (_ntInstrument as Instrument)?.MasterInstrument?.Name : "NULL",
-                    warning = "Exception resolving Instrument, using strategy instrument as fallback"
-                }));
-            
-            ntInstrument = _ntInstrument as Instrument;
-        }
-        
+
+        // Fix 3: Anchor on Instrument instance - use strategy's Instrument directly
+        var ntInstrument = _ntInstrument as Instrument;
         if (ntInstrument == null)
         {
-            var error = "NT instrument is null - cannot submit orders";
+            var error = "Strategy Instrument instance not available - cannot submit orders";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            {
+                error,
+                reason = "INSTRUMENT_INSTANCE_NULL"
+            }));
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
@@ -470,10 +387,10 @@ public sealed partial class NinjaTraderSimAdapter
                     return OrderSubmissionResult.FailureResult(error, utcNow);
                 }
                 
-                // Ensure quantity is int and > 0
+                // Fix 2: Quantity assertion (fail-fast) - throw immediately for invalid quantity
                 if (quantity <= 0)
                 {
-                    var error = $"Invalid quantity: {quantity} (must be int > 0)";
+                    var error = $"Order quantity unresolved: {quantity}";
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
                     {
                         error,
@@ -485,7 +402,7 @@ public sealed partial class NinjaTraderSimAdapter
                         intent_id = intentId,
                         account = "SIM"
                     }));
-                    return OrderSubmissionResult.FailureResult(error, utcNow);
+                    throw new InvalidOperationException(error);
                 }
                 
                 if (ntEntryPrice <= 0)
@@ -593,6 +510,9 @@ public sealed partial class NinjaTraderSimAdapter
                 
                 // Set order properties
                 dynamic dynOrderFinal = order;
+                // CRITICAL: For unmanaged orders with SetOrderQuantityBy=Strategy, explicitly set Quantity
+                // NinjaTrader may not set it correctly from CreateOrder parameters
+                dynOrderFinal.Quantity = quantity;
                 dynOrderFinal.TimeInForce = TimeInForce.Day;
                 SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
                 
@@ -1319,6 +1239,7 @@ public sealed partial class NinjaTraderSimAdapter
         string direction,
         decimal stopPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         if (_ntAccount == null || _ntInstrument == null)
@@ -1334,15 +1255,17 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        // Resolve Instrument from execution instrument string
-        Instrument ntInstrument;
-        try
+        // Fix 3: Anchor on Instrument instance - use strategy's Instrument directly
+        var ntInstrument = _ntInstrument as Instrument;
+        if (ntInstrument == null)
         {
-            ntInstrument = ResolveInstrument(instrument, intentId, utcNow);
-        }
-        catch (Exception ex)
-        {
-            return OrderSubmissionResult.FailureResult($"Failed to resolve instrument: {ex.Message}", utcNow);
+            var error = "Strategy Instrument instance not available - cannot submit protective stop order";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            {
+                error,
+                reason = "INSTRUMENT_INSTANCE_NULL"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
         try
@@ -1467,9 +1390,10 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Ensure quantity is int and > 0
+            // Fix 2: Quantity assertion (fail-fast) - throw immediately for invalid quantity
             if (quantity <= 0)
             {
-                var error = $"Invalid quantity: {quantity} (must be int > 0)";
+                var error = $"Order quantity unresolved: {quantity}";
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
                 {
                     error,
@@ -1481,7 +1405,7 @@ public sealed partial class NinjaTraderSimAdapter
                     intent_id = intentId,
                     account = "SIM"
                 }));
-                return OrderSubmissionResult.FailureResult(error, utcNow);
+                throw new InvalidOperationException(error);
             }
             
             if (stopPriceD <= 0)
@@ -1514,7 +1438,7 @@ public sealed partial class NinjaTraderSimAdapter
                     quantity,                               // Quantity
                     0.0,                                    // LimitPrice (0 for StopMarket)
                     stopPriceD,                             // StopPrice (use already computed variable)
-                    null,                                   // Oco (protective stops don't use OCO groups)
+                    ocoGroup,                               // Oco (OCO group for pairing with target order)
                     $"{intentId}_STOP",                     // OrderName
                     DateTime.MinValue,                      // Gtd
                     null                                    // CustomOrder
@@ -1641,6 +1565,7 @@ public sealed partial class NinjaTraderSimAdapter
         string direction,
         decimal targetPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         if (_ntAccount == null || _ntInstrument == null)
@@ -1656,15 +1581,17 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        // Resolve Instrument from execution instrument string
-        Instrument ntInstrument;
-        try
+        // Fix 3: Anchor on Instrument instance - use strategy's Instrument directly
+        var ntInstrument = _ntInstrument as Instrument;
+        if (ntInstrument == null)
         {
-            ntInstrument = ResolveInstrument(instrument, intentId, utcNow);
-        }
-        catch (Exception ex)
-        {
-            return OrderSubmissionResult.FailureResult($"Failed to resolve instrument: {ex.Message}", utcNow);
+            var error = "Strategy Instrument instance not available - cannot submit target order";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            {
+                error,
+                reason = "INSTRUMENT_INSTANCE_NULL"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
         try
@@ -1678,15 +1605,15 @@ public sealed partial class NinjaTraderSimAdapter
             if (existingTarget != null)
             {
                 var changed = false;
-                var targetPriceD = (double)targetPrice;
+                var existingTargetPriceD = (double)targetPrice;
                 if (existingTarget.Quantity != quantity)
                 {
                     existingTarget.Quantity = quantity;
                     changed = true;
                 }
-                if (Math.Abs(existingTarget.LimitPrice - targetPriceD) > 1e-10)
+                if (Math.Abs(existingTarget.LimitPrice - existingTargetPriceD) > 1e-10)
                 {
-                    existingTarget.LimitPrice = targetPriceD;
+                    existingTarget.LimitPrice = existingTargetPriceD;
                     changed = true;
                 }
 
@@ -1730,23 +1657,149 @@ public sealed partial class NinjaTraderSimAdapter
                 return OrderSubmissionResult.SuccessResult(existingTarget.OrderId, utcNow, utcNow);
             }
 
-            // Real NT API: Create target order
+            // Real NT API: Create target order using official NT8 CreateOrder factory method
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
-            dynamic dynAccountTarget = account;
+            var targetPriceD = (double)targetPrice;
+            
+            // Runtime safety checks BEFORE CreateOrder
+            if (!_ntContextSet)
+            {
+                var error = "NT context not set - cannot create protective Limit order";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+            
+            if (account == null)
+            {
+                var error = "Account is null - cannot create protective Limit order";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+            
+            if (ntInstrument == null)
+            {
+                var error = "Instrument is null - cannot create protective Limit order";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+            
+            // Ensure quantity is int and > 0
+            // Fix 2: Quantity assertion (fail-fast) - throw immediately for invalid quantity
+            if (quantity <= 0)
+            {
+                var error = $"Order quantity unresolved: {quantity}";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                throw new InvalidOperationException(error);
+            }
+            
+            if (targetPriceD <= 0)
+            {
+                var error = $"Invalid target price: {targetPriceD} (must be > 0)";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+            
             Order order;
             try
             {
-                order = dynAccountTarget.CreateOrder(ntInstrument, orderAction, OrderType.Limit, quantity, (double)targetPrice);
+                // Create order using official NT8 CreateOrder factory method (same signature as StopMarket)
+                order = account.CreateOrder(
+                    ntInstrument,                           // Instrument
+                    orderAction,                            // OrderAction
+                    OrderType.Limit,                        // OrderType
+                    OrderEntry.Manual,                      // OrderEntry
+                    TimeInForce.Day,                        // TimeInForce
+                    quantity,                               // Quantity
+                    targetPriceD,                           // LimitPrice
+                    0.0,                                    // StopPrice (0 for Limit orders)
+                    ocoGroup,                               // Oco (OCO group for pairing with stop order)
+                    $"{intentId}_TARGET",                   // OrderName
+                    DateTime.MinValue,                      // Gtd
+                    null                                    // CustomOrder
+                );
+                
+                // Log success before Submit
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_LIMIT", new
+                {
+                    order_name = $"{intentId}_TARGET",
+                    target_price = targetPriceD,
+                    quantity = quantity,
+                    order_action = orderAction.ToString(),
+                    instrument = instrument
+                }));
+                
+                // Set order tag
+                SetOrderTag(order, targetTag);
             }
-            catch
+            catch (Exception ex)
             {
-                // Fallback: 4-argument version, set price via dynamic property
-                order = dynAccountTarget.CreateOrder(ntInstrument, orderAction, OrderType.Limit, quantity);
-                dynamic dynOrder = order;
-                dynOrder.LimitPrice = (double)targetPrice;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+                {
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    order_type = "Limit",
+                    order_action = orderAction.ToString(),
+                    quantity = quantity,
+                    target_price = targetPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult($"Target order creation failed: {ex.Message}", utcNow);
             }
-            SetOrderTag(order, targetTag);
-            order.TimeInForce = TimeInForce.Day;
+
+            // Real NT API: Submit order
+            dynamic dynAccountTarget = account;
 
             // Real NT API: Submit order
             Order[] result;
@@ -2226,15 +2279,33 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        // Resolve Instrument from execution instrument string
-        Instrument ntInstrument;
-        try
+        // Fix 1: Hard guard - check executionInstrument matches strategy's Instrument exactly
+        if (!IsStrategyExecutionInstrument(instrument))
         {
-            ntInstrument = ResolveInstrument(instrument, intentId, utcNow);
+            var error = $"Execution instrument '{instrument}' does not match strategy's Instrument. " +
+                       $"Strategy Instrument: {(_ntInstrument as Instrument)?.FullName ?? "NULL"}. " +
+                       $"Orders can only be placed on the strategy's enabled Instrument.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            {
+                error,
+                requested_instrument = instrument,
+                strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
+                reason = "INSTRUMENT_MISMATCH"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
         }
-        catch (Exception ex)
+
+        // Fix 3: Anchor on Instrument instance - use strategy's Instrument directly
+        var ntInstrument = _ntInstrument as Instrument;
+        if (ntInstrument == null)
         {
-            return OrderSubmissionResult.FailureResult($"Failed to resolve instrument: {ex.Message}", utcNow);
+            var error = "Strategy Instrument instance not available - cannot submit orders";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            {
+                error,
+                reason = "INSTRUMENT_INSTANCE_NULL"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
         try
@@ -2270,16 +2341,31 @@ public sealed partial class NinjaTraderSimAdapter
             // Get Chart Trader quantity if accessible
             int? chartTraderQty = null;
 
-            // HARD BLOCK rules
+            // Fix 2: Quantity assertion (fail-fast) - throw immediately for invalid quantity
+            if (quantity <= 0)
+            {
+                var error = $"Order quantity unresolved: {quantity}";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
+                    "ENTRY_SUBMIT_PRECHECK", new
+                {
+                    intent_id = intentId,
+                    requested_quantity = quantity,
+                    expected_quantity = expectedQty,
+                    max_quantity = maxQty,
+                    cumulative_filled_qty = filledQty,
+                    remaining_allowed_qty = remainingAllowed,
+                    chart_trader_quantity = chartTraderQty,
+                    allowed = false,
+                    reason = error
+                }));
+                throw new InvalidOperationException(error);
+            }
+
+            // HARD BLOCK rules for other validation failures
             bool hardBlock = false;
             string? blockReason = null;
 
-            if (quantity <= 0)
-            {
-                hardBlock = true;
-                blockReason = $"Invalid quantity: {quantity}";
-            }
-            else if (filledQty > expectedQty)
+            if (filledQty > expectedQty)
             {
                 hardBlock = true;
                 blockReason = $"Already overfilled: filled={filledQty}, expected={expectedQty}";
@@ -2391,9 +2477,10 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Ensure quantity is int and > 0
+            // Fix 2: Quantity assertion (fail-fast) - throw immediately for invalid quantity
             if (quantity <= 0)
             {
-                var error = $"Invalid quantity: {quantity} (must be int > 0)";
+                var error = $"Order quantity unresolved: {quantity}";
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
                 {
                     error,
@@ -2405,7 +2492,7 @@ public sealed partial class NinjaTraderSimAdapter
                     intent_id = intentId,
                     account = "SIM"
                 }));
-                return OrderSubmissionResult.FailureResult(error, utcNow);
+                throw new InvalidOperationException(error);
             }
             
             var stopPriceD = (double)stopPrice;
@@ -2424,6 +2511,104 @@ public sealed partial class NinjaTraderSimAdapter
                     account = "SIM"
                 }));
                 return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+
+            // CRITICAL: Validate stop price relative to current market price
+            // For Sell Short Stop Market: stop must be BELOW current bid price
+            // For Buy Stop Market: stop must be ABOVE current ask price
+            try
+            {
+                dynamic dynInstrument = ntInstrument;
+                var marketData = dynInstrument.MarketData;
+                if (marketData != null)
+                {
+                    double? bid = null;
+                    double? ask = null;
+                    
+                    // Try GetBid()/GetAsk() methods first
+                    try
+                    {
+                        bid = (double?)marketData.GetBid(0);
+                        ask = (double?)marketData.GetAsk(0);
+                    }
+                    catch
+                    {
+                        // Fallback to Bid/Ask properties
+                        try
+                        {
+                            bid = (double?)marketData.Bid;
+                            ask = (double?)marketData.Ask;
+                        }
+                        catch
+                        {
+                            // Market data unavailable - skip validation
+                        }
+                    }
+                    
+                    if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
+                    {
+                        bool isValidStop = false;
+                        string validationError = "";
+                        double currentPrice = 0;
+                        
+                        if (orderAction == OrderAction.SellShort || orderAction == OrderAction.Sell)
+                        {
+                            // Short entry: stop must be BELOW current bid price
+                            currentPrice = bid.Value;
+                            isValidStop = stopPriceD < currentPrice;
+                            if (!isValidStop)
+                            {
+                                validationError = $"Sell Short Stop Market order rejected: stop price {stopPriceD:F3} must be BELOW current bid {currentPrice:F3}. " +
+                                                $"Current price has already fallen below breakout level {stopPriceD:F3}.";
+                            }
+                        }
+                        else if (orderAction == OrderAction.Buy)
+                        {
+                            // Long entry: stop must be ABOVE current ask price
+                            currentPrice = ask.Value;
+                            isValidStop = stopPriceD > currentPrice;
+                            if (!isValidStop)
+                            {
+                                validationError = $"Buy Stop Market order rejected: stop price {stopPriceD:F3} must be ABOVE current ask {currentPrice:F3}. " +
+                                                $"Current price has already risen above breakout level {stopPriceD:F3}.";
+                            }
+                        }
+                        
+                        if (!isValidStop)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_STOP_PRICE_INVALID", new
+                            {
+                                error = validationError,
+                                order_type = "StopMarket",
+                                order_action = orderAction.ToString(),
+                                quantity = quantity,
+                                stop_price = stopPriceD,
+                                current_bid = bid.Value,
+                                current_ask = ask.Value,
+                                current_price_used = currentPrice,
+                                instrument = instrument,
+                                intent_id = intentId,
+                                account = "SIM",
+                                note = "Stop price validation failed - order would be rejected by NinjaTrader"
+                            }));
+                            return OrderSubmissionResult.FailureResult(validationError, utcNow);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log warning but don't block order submission if we can't get current price
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_STOP_PRICE_VALIDATION_WARNING", new
+                {
+                    warning = $"Could not validate stop price against current market price: {ex.Message}",
+                    order_type = "StopMarket",
+                    order_action = orderAction.ToString(),
+                    stop_price = stopPriceD,
+                    instrument = instrument,
+                    intent_id = intentId,
+                    note = "Proceeding with order submission - NinjaTrader will validate"
+                }));
             }
             
             // Create order using official NT8 CreateOrder factory method
@@ -2447,6 +2632,24 @@ public sealed partial class NinjaTraderSimAdapter
                     DateTime.MinValue,                      // Gtd
                     null                                    // CustomOrder
                 );
+                
+                // CRITICAL: For unmanaged orders with SetOrderQuantityBy=Strategy, explicitly set Quantity
+                // NinjaTrader may not set it correctly from CreateOrder parameters
+                dynamic dynOrderForQuantityStop = order;
+                try
+                {
+                    dynOrderForQuantityStop.Quantity = quantity;
+                }
+                catch (Exception exQty)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_QUANTITY_SET_FAIL", new
+                    {
+                        error = exQty.Message,
+                        requested_quantity = quantity,
+                        order_type = "StopMarket",
+                        note = "Failed to set Quantity property - order may have incorrect quantity"
+                    }));
+                }
                 
                 // Log success before Submit
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_STOPMARKET", new

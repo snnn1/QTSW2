@@ -57,7 +57,11 @@ class WatchdogStateManager:
         self._execution_blocked_events: List[datetime] = []
         self._protective_failure_events: List[datetime] = []
         
-        # Data stall tracking: instrument -> last_bar_utc
+        # Data stall tracking: execution instrument full name -> last_bar_utc
+        # CRITICAL: Track by execution instrument contract (e.g., "MES 03-26"), not canonical (e.g., "ES")
+        # This ensures: MES stalled ≠ ES flowing, M2K stalled ≠ RTY flowing
+        self._last_bar_utc_by_execution_instrument: Dict[str, datetime] = {}
+        # Keep old dict for backward compatibility during transition (will be removed later)
         self._last_bar_utc_by_instrument: Dict[str, datetime] = {}
         
         # Timetable state
@@ -144,8 +148,20 @@ class WatchdogStateManager:
     
     def update_stream_state(self, trading_date: str, stream: str, state: str, 
                           committed: bool = False, commit_reason: Optional[str] = None,
-                          state_entry_time_utc: Optional[datetime] = None):
-        """Update stream state."""
+                          state_entry_time_utc: Optional[datetime] = None,
+                          execution_instrument: Optional[str] = None):
+        """
+        Update stream state.
+        
+        Args:
+            trading_date: Trading date string (YYYY-MM-DD)
+            stream: Stream ID
+            state: Stream state
+            committed: Whether stream is committed
+            commit_reason: Reason for commit (if committed)
+            state_entry_time_utc: UTC timestamp of state entry
+            execution_instrument: Execution instrument full name (e.g., "MES 03-26") - optional for backward compatibility
+        """
         key = (trading_date, stream)
         if key not in self._stream_states:
             self._stream_states[key] = StreamStateInfo(
@@ -154,7 +170,8 @@ class WatchdogStateManager:
                 state=state,
                 committed=committed,
                 commit_reason=commit_reason,
-                state_entry_time_utc=state_entry_time_utc or datetime.now(timezone.utc)
+                state_entry_time_utc=state_entry_time_utc or datetime.now(timezone.utc),
+                execution_instrument=execution_instrument
             )
         else:
             info = self._stream_states[key]
@@ -178,6 +195,9 @@ class WatchdogStateManager:
             info.committed = committed
             if commit_reason:
                 info.commit_reason = commit_reason
+            # Update execution_instrument if provided (backward compatible - only set if not None)
+            if execution_instrument is not None:
+                info.execution_instrument = execution_instrument
     
     def update_intent_exposure(self, intent_id: str, stream_id: str, instrument: str,
                               direction: str, entry_filled_qty: int = 0, exit_filled_qty: int = 0,
@@ -220,16 +240,37 @@ class WatchdogStateManager:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         self._protective_failure_events = [e for e in self._protective_failure_events if e > cutoff]
     
-    def update_last_bar(self, instrument: str, timestamp_utc: datetime):
-        """Update last bar timestamp for instrument."""
-        self._last_bar_utc_by_instrument[instrument] = timestamp_utc
+    def update_last_bar(self, execution_instrument_full_name: str, timestamp_utc: datetime):
+        """
+        Update last bar timestamp for execution instrument contract.
+        
+        Args:
+            execution_instrument_full_name: Full contract name (e.g., "MES 03-26", "M2K 03-26")
+            timestamp_utc: Bar timestamp in UTC
+        """
+        # Track by execution instrument full name (authoritative)
+        self._last_bar_utc_by_execution_instrument[execution_instrument_full_name] = timestamp_utc
+        # Also update old dict for backward compatibility (will be removed later)
+        # Extract root name for old dict (e.g., "MES 03-26" -> "MES")
+        root_name = execution_instrument_full_name.split()[0] if execution_instrument_full_name else execution_instrument_full_name
+        self._last_bar_utc_by_instrument[root_name] = timestamp_utc
     
-    def mark_data_loss(self, instrument: str, timestamp_utc: datetime):
-        """Mark instrument as having data loss."""
+    def mark_data_loss(self, execution_instrument_full_name: str, timestamp_utc: datetime):
+        """
+        Mark execution instrument contract as having data loss.
+        
+        Args:
+            execution_instrument_full_name: Full contract name (e.g., "MES 03-26")
+            timestamp_utc: Timestamp of data loss event
+        """
         # Clear last_bar_utc to indicate data loss
         # This will cause stall_detected to trigger if market is open
-        if instrument in self._last_bar_utc_by_instrument:
-            del self._last_bar_utc_by_instrument[instrument]
+        if execution_instrument_full_name in self._last_bar_utc_by_execution_instrument:
+            del self._last_bar_utc_by_execution_instrument[execution_instrument_full_name]
+        # Also clear from old dict for backward compatibility
+        root_name = execution_instrument_full_name.split()[0] if execution_instrument_full_name else execution_instrument_full_name
+        if root_name in self._last_bar_utc_by_instrument:
+            del self._last_bar_utc_by_instrument[root_name]
     
     def update_timetable_state(self, validated: bool, trading_date: Optional[str] = None):
         """Update timetable validation state."""
@@ -347,29 +388,43 @@ class WatchdogStateManager:
             )
             logger.info(f"Cleaned up {len(keys_to_remove)} stale stream(s) (current_trading_date: {current_trading_date}, clear_all: {clear_all_for_date})")
     
-    def bars_expected(self, instrument: str, market_open: bool) -> bool:
+    def bars_expected(self, execution_instrument_full_name: str, market_open: bool) -> bool:
         """
-        PATTERN 1: Determine if bars are expected for an instrument.
+        PATTERN 1: Determine if bars are expected for an execution instrument contract.
+        
+        NEW LOGIC: "Is there an enabled stream whose execution instrument matches X and whose state expects bars?"
+        
         Bars are expected if:
         - market_open == True, AND
-        - at least one stream for that instrument is in a bar-dependent state.
+        - at least one stream for that execution instrument is in a bar-dependent state.
         
         Bar-dependent states: PRE_HYDRATION, ARMED, RANGE_BUILDING, RANGE_LOCKED
         Excluded states: DONE, COMMITTED, NO_TRADE, INVALIDATED
+        
+        Args:
+            execution_instrument_full_name: Full contract name (e.g., "MES 03-26", "M2K 03-26")
+            market_open: Whether market is currently open
         """
         if not market_open:
             return False
         
-        # Check if any stream for this instrument is in a bar-dependent state
+        # Check if any stream for this execution instrument is in a bar-dependent state
         bar_dependent_states = {"PRE_HYDRATION", "ARMED", "RANGE_BUILDING", "RANGE_LOCKED"}
         excluded_states = {"DONE", "COMMITTED", "NO_TRADE", "INVALIDATED"}
         
         for (trading_date, stream), info in self._stream_states.items():
-            # Check if this stream is for the given instrument
-            # Note: info.instrument may be canonical instrument
-            if info.instrument == instrument or stream.upper().startswith(instrument.upper()):
-                if info.state in bar_dependent_states and not info.committed:
-                    return True
+            # Check if this stream's execution instrument matches the given execution instrument
+            # Match by full name if available, otherwise match by root name
+            stream_execution_instrument = getattr(info, 'execution_instrument', None)
+            if stream_execution_instrument:
+                # Match by full name (exact match)
+                if stream_execution_instrument == execution_instrument_full_name:
+                    if info.state in bar_dependent_states and not info.committed:
+                        return True
+                # Also match by root name (e.g., "MES 03-26" matches stream with "MES")
+                elif execution_instrument_full_name.startswith(stream_execution_instrument.split()[0] if ' ' in stream_execution_instrument else stream_execution_instrument):
+                    if info.state in bar_dependent_states and not info.committed:
+                        return True
         
         return False
     
@@ -538,14 +593,19 @@ class WatchdogStateManager:
             market_open = False
         
         # PATTERN 1: Compute engine_activity_state using bars_expected contract
-        # Determine which instruments have bars_expected
+        # Determine which execution instruments have bars_expected
         instruments_with_bars_expected = []
-        all_instruments = set(self._last_bar_utc_by_instrument.keys()) | set(
-            info.instrument for info in self._stream_states.values() if info.instrument
-        )
-        for instrument in all_instruments:
-            if self.bars_expected(instrument, market_open):
-                instruments_with_bars_expected.append(instrument)
+        # Use execution instrument full names from bar tracking
+        all_execution_instruments = set(self._last_bar_utc_by_execution_instrument.keys())
+        # Also include execution instruments from stream states
+        for info in self._stream_states.values():
+            execution_instrument = getattr(info, 'execution_instrument', None)
+            if execution_instrument:
+                all_execution_instruments.add(execution_instrument)
+        # Check bars_expected for each execution instrument
+        for execution_instrument_full_name in all_execution_instruments:
+            if self.bars_expected(execution_instrument_full_name, market_open):
+                instruments_with_bars_expected.append(execution_instrument_full_name)
         
         # PATTERN 1: Grace period for initial bar arrival
         # Only declare stalled if enough time has passed since engine start
@@ -615,44 +675,45 @@ class WatchdogStateManager:
                 )
         
         data_stall_detected = {}
-        # Only check for stalls on instruments that are expected to receive bars
+        # Only check for stalls on execution instruments that are expected to receive bars
         # This prevents false positives from instruments that received bars earlier
         # but are no longer expected to receive them (e.g., stream completed, market closed)
-        for instrument in instruments_with_bars_expected:
-            last_bar_utc = self._last_bar_utc_by_instrument.get(instrument)
+        # CRITICAL: Stall detection is per execution instrument contract (MES stalled ≠ ES flowing)
+        for execution_instrument_full_name in instruments_with_bars_expected:
+            last_bar_utc = self._last_bar_utc_by_execution_instrument.get(execution_instrument_full_name)
             if last_bar_utc:
                 elapsed = (now - last_bar_utc).total_seconds()
                 stall_detected = (
                     elapsed > DATA_STALL_THRESHOLD_SECONDS
                     and market_open
                 )
-                data_stall_detected[instrument] = {
-                    "instrument": instrument,
+                data_stall_detected[execution_instrument_full_name] = {
+                    "instrument": execution_instrument_full_name,  # Execution instrument full name
                     "last_bar_chicago": last_bar_utc.astimezone(CHICAGO_TZ).isoformat(),
                     "stall_detected": stall_detected,
                     "market_open": market_open
                 }
             else:
-                # Instrument expects bars but hasn't received any yet
+                # Execution instrument expects bars but hasn't received any yet
                 # Only mark as stalled if grace period has elapsed
                 if not grace_period_active:
-                    data_stall_detected[instrument] = {
-                        "instrument": instrument,
+                    data_stall_detected[execution_instrument_full_name] = {
+                        "instrument": execution_instrument_full_name,
                         "last_bar_chicago": None,
                         "stall_detected": market_open,  # Stall if market is open and no bars received
                         "market_open": market_open
                     }
         
         # PATTERN 1: Additional observability (recommended)
-        # Count instruments where bars_expected == True and worst last_bar_age
+        # Count execution instruments where bars_expected == True and worst last_bar_age
         bars_expected_count = len(instruments_with_bars_expected)
         
-        # Compute worst_last_bar_age_seconds for ALL instruments that have received bars
+        # Compute worst_last_bar_age_seconds for ALL execution instruments that have received bars
         # This helps detect data flow even when streams aren't in bar-dependent states yet
         worst_last_bar_age_seconds = None
-        if self._last_bar_utc_by_instrument:
-            # Check all instruments that have received bars (not just those with bars_expected)
-            for instrument, last_bar_utc in self._last_bar_utc_by_instrument.items():
+        if self._last_bar_utc_by_execution_instrument:
+            # Check all execution instruments that have received bars (not just those with bars_expected)
+            for execution_instrument_full_name, last_bar_utc in self._last_bar_utc_by_execution_instrument.items():
                 if last_bar_utc:
                     bar_age = (now - last_bar_utc).total_seconds()
                     if worst_last_bar_age_seconds is None or bar_age > worst_last_bar_age_seconds:
@@ -733,14 +794,16 @@ class StreamStateInfo:
     """Information about a stream's state."""
     def __init__(self, trading_date: str, stream: str, state: str,
                  committed: bool = False, commit_reason: Optional[str] = None,
-                 state_entry_time_utc: Optional[datetime] = None):
+                 state_entry_time_utc: Optional[datetime] = None,
+                 execution_instrument: Optional[str] = None):
         self.trading_date = trading_date
         self.stream = stream
         self.state = state
         self.committed = committed
         self.commit_reason = commit_reason
         self.state_entry_time_utc = state_entry_time_utc or datetime.now(timezone.utc)
-        self.instrument = ""  # Will be populated from events
+        self.instrument = ""  # Canonical instrument (DO NOT CHANGE - backward compatibility)
+        self.execution_instrument: Optional[str] = execution_instrument  # Full contract name (e.g., "MES 03-26")
         # Range and slot time fields (populated from events)
         self.session: Optional[str] = None
         self.slot_time_chicago: Optional[str] = None

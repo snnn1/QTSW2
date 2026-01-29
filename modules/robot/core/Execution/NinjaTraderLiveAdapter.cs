@@ -74,6 +74,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         string direction,
         decimal stopPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -95,6 +96,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         string direction,
         decimal targetPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new

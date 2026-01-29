@@ -59,6 +59,7 @@ public interface IExecutionAdapter
     /// <param name="direction">"Long" or "Short"</param>
     /// <param name="stopPrice">Stop loss price</param>
     /// <param name="quantity">Number of contracts</param>
+    /// <param name="ocoGroup">OCO group identifier (for pairing with target order). If null, no OCO pairing.</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Order submission result</returns>
     OrderSubmissionResult SubmitProtectiveStop(
@@ -67,6 +68,7 @@ public interface IExecutionAdapter
         string direction,
         decimal stopPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow);
 
     /// <summary>
@@ -77,6 +79,7 @@ public interface IExecutionAdapter
     /// <param name="direction">"Long" or "Short"</param>
     /// <param name="targetPrice">Target price</param>
     /// <param name="quantity">Number of contracts</param>
+    /// <param name="ocoGroup">OCO group identifier (for pairing with stop order). If null, no OCO pairing.</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Order submission result</returns>
     OrderSubmissionResult SubmitTargetOrder(
@@ -85,6 +88,7 @@ public interface IExecutionAdapter
         string direction,
         decimal targetPrice,
         int quantity,
+        string? ocoGroup,
         DateTimeOffset utcNow);
 
     /// <summary>

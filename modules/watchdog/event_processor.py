@@ -117,15 +117,20 @@ class EventProcessor:
             # Use ENGINE_TICK_CALLSITE (rate-limited) for primary Tick() liveness signal
             self._state_manager.update_engine_tick(timestamp_utc)
             
-            # Extract instrument and bar_time_utc from heartbeat payload
-            instrument = data.get("instrument") or event.get("instrument")
+            # Extract execution_instrument_full_name and bar_time_utc from heartbeat payload
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
+            instrument = data.get("instrument") or event.get("instrument")  # Fallback for backward compatibility
             bar_time_utc_str = data.get("bar_time_utc")
             
-            if instrument and bar_time_utc_str:
+            if bar_time_utc_str:
                 bar_time_utc = self._parse_timestamp(bar_time_utc_str)
                 if bar_time_utc:
-                    # Update per-instrument last bar time from heartbeat payload
-                    self._state_manager.update_last_bar(instrument, bar_time_utc)
+                    # Use execution_instrument_full_name if available, otherwise fall back to instrument
+                    if execution_instrument_full_name:
+                        self._state_manager.update_last_bar(execution_instrument_full_name, bar_time_utc)
+                    elif instrument:
+                        # Backward compatibility: fall back to instrument field
+                        self._state_manager.update_last_bar(instrument, bar_time_utc)
         
         elif event_type == "ONBARUPDATE_CALLED":
             # OnBarUpdate is called constantly while engine is running (when bars arrive)
@@ -133,11 +138,19 @@ class EventProcessor:
             # Confirms NinjaTrader is calling OnBarUpdate (bar-dependent)
             self._state_manager.update_engine_tick(timestamp_utc)
             
-            # Also track last bar time per instrument if available
-            instrument = data.get("instrument") or event.get("instrument")
-            if instrument:
+            # Track last bar time per execution instrument contract (authoritative)
+            # CRITICAL: Use execution_instrument_full_name for bar tracking (e.g., "MES 03-26")
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
+            if execution_instrument_full_name:
                 # Use event timestamp as bar time proxy (OnBarUpdate is called when bar arrives)
-                self._state_manager.update_last_bar(instrument, timestamp_utc)
+                self._state_manager.update_last_bar(execution_instrument_full_name, timestamp_utc)
+            else:
+                # Backward compatibility: fall back to instrument field if execution_instrument_full_name not present
+                # Old events may only have canonical instrument - handle gracefully
+                instrument = data.get("instrument") or event.get("instrument")
+                if instrument:
+                    # Use instrument as fallback (may be canonical in old events)
+                    self._state_manager.update_last_bar(instrument, timestamp_utc)
         
         elif event_type == "ENGINE_TICK_CALLSITE":
             # ENGINE_TICK_CALLSITE is emitted every time Tick() is called (very frequent, rate-limited in feed)
@@ -206,6 +219,7 @@ class EventProcessor:
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")  # Full contract name (e.g., "M2K 03-26")
             canonical_instrument_field = event.get("canonical_instrument")  # PHASE 3: Robot may emit both
             session = event.get("session")
             slot_time_chicago = event.get("slot_time_chicago") or data.get("slot_time_chicago")
@@ -259,9 +273,12 @@ class EventProcessor:
                 )
                 
                 # PHASE 2: Use canonical stream ID for state management
+                # CRITICAL - Backward Compatibility: Only pass execution_instrument_full_name if present
+                # Old events won't have this field - handle gracefully
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, new_state,
-                    state_entry_time_utc=state_entry_time_utc
+                    state_entry_time_utc=state_entry_time_utc,
+                    execution_instrument=execution_instrument_full_name  # May be None for old events
                 )
                 
                 # Diagnostic: Log stream count after update
@@ -276,6 +293,8 @@ class EventProcessor:
                     info = self._state_manager._stream_states[key]
                     if canonical_instrument:
                         info.instrument = canonical_instrument
+                    if execution_instrument_full_name:
+                        info.execution_instrument = execution_instrument_full_name
                     if session:
                         info.session = session
                     if slot_time_chicago:
@@ -349,6 +368,7 @@ class EventProcessor:
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")  # Full contract name
             canonical_instrument_field = event.get("canonical_instrument")  # PHASE 3: Robot may emit both
             
             # PHASE 3: Trust robot canonical fields if present, otherwise canonicalize
@@ -375,7 +395,8 @@ class EventProcessor:
                 commit_reason = data.get("commit_reason") or data.get("reason") or event_type
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, "DONE", committed=True,
-                    commit_reason=commit_reason
+                    commit_reason=commit_reason,
+                    execution_instrument=execution_instrument_full_name  # May be None for old events
                 )
                 # Update instrument info if available
                 if canonical_instrument:
@@ -393,6 +414,7 @@ class EventProcessor:
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")  # Full contract name
             canonical_instrument_field = event.get("canonical_instrument")  # PHASE 3: Robot may emit both
             
             # PHASE 3: Trust robot canonical fields if present, otherwise canonicalize
@@ -417,7 +439,8 @@ class EventProcessor:
                 # PHASE 2: Use canonical stream ID for state management
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, "DONE", committed=True,
-                    commit_reason="RANGE_INVALIDATED"
+                    commit_reason="RANGE_INVALIDATED",
+                    execution_instrument=execution_instrument_full_name  # May be None for old events
                 )
                 # Update instrument info and mark range as invalidated
                 key = (trading_date, canonical_stream)
@@ -437,6 +460,7 @@ class EventProcessor:
             stream = event.get("stream")
             instrument = event.get("instrument")
             execution_instrument = event.get("execution_instrument")  # PHASE 3: Robot may emit both
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")  # Full contract name
             canonical_instrument_field = event.get("canonical_instrument")  # PHASE 3: Robot may emit both
             session = event.get("session")
             slot_time_chicago = event.get("slot_time_chicago") or data.get("slot_time_chicago")
@@ -500,7 +524,8 @@ class EventProcessor:
                 # Pass event timestamp so state_entry_time_utc reflects when range was actually locked
                 self._state_manager.update_stream_state(
                     trading_date, canonical_stream, "RANGE_LOCKED",
-                    state_entry_time_utc=timestamp_utc
+                    state_entry_time_utc=timestamp_utc,
+                    execution_instrument=execution_instrument_full_name  # May be None for old events
                 )
                 # Update instrument, session, slot_time, and range values
                 key = (trading_date, canonical_stream)
@@ -508,6 +533,8 @@ class EventProcessor:
                     info = self._state_manager._stream_states[key]
                     if canonical_instrument:
                         info.instrument = canonical_instrument
+                    if execution_instrument_full_name:
+                        info.execution_instrument = execution_instrument_full_name
                     if session:
                         info.session = session
                     if slot_time_chicago:
@@ -672,18 +699,32 @@ class EventProcessor:
         
         elif event_type == "BAR_ACCEPTED":
             # Standardized fields are now always at top level (plan requirement #1)
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = event.get("instrument")
-            if instrument:
+            if execution_instrument_full_name:
+                self._state_manager.update_last_bar(execution_instrument_full_name, timestamp_utc)
+            elif instrument:
+                # Backward compatibility: fall back to instrument field
                 self._state_manager.update_last_bar(instrument, timestamp_utc)
         
         elif event_type == "DATA_LOSS_DETECTED":
+            # Use execution_instrument_full_name if available, otherwise fall back to instrument
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = event.get("instrument")
-            if instrument:
+            if execution_instrument_full_name:
+                self._state_manager.mark_data_loss(execution_instrument_full_name, timestamp_utc)
+            elif instrument:
+                # Backward compatibility: fall back to instrument field
                 self._state_manager.mark_data_loss(instrument, timestamp_utc)
         
         elif event_type == "DATA_STALL_RECOVERED":
+            # Use execution_instrument_full_name if available, otherwise fall back to instrument
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = event.get("instrument")
-            if instrument:
+            if execution_instrument_full_name:
+                self._state_manager.update_last_bar(execution_instrument_full_name, timestamp_utc)
+            elif instrument:
+                # Backward compatibility: fall back to instrument field
                 self._state_manager.update_last_bar(instrument, timestamp_utc)
         
         elif event_type == "TIMETABLE_VALIDATED":

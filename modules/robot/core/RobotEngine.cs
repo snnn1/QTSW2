@@ -94,6 +94,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, int> _barsSinceLastHeartbeatPerInstrument = new();
     private const int BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS = 60; // Emit at most once per 60 seconds per instrument
     
+    // BarsRequest completion tracking (per instrument)
+    // Tracks pending BarsRequest to prevent range lock before bars arrive
+    private readonly Dictionary<string, DateTimeOffset> _barsRequestPending = new Dictionary<string, DateTimeOffset>();
+    private readonly Dictionary<string, DateTimeOffset> _barsRequestCompleted = new Dictionary<string, DateTimeOffset>();
+    private const int BARSREQUEST_TIMEOUT_MINUTES = 5; // Timeout after 5 minutes if BarsRequest doesn't complete
+    
     // Engine heartbeat tracking for liveness monitoring
     private DateTimeOffset _lastTickUtc = DateTimeOffset.MinValue;
     
@@ -177,6 +183,90 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             return _recoveryState == ConnectionRecoveryState.CONNECTED_OK ||
                    _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE;
+        }
+    }
+    
+    /// <summary>
+    /// Mark BarsRequest as pending for an instrument.
+    /// Called when BarsRequest is initiated.
+    /// </summary>
+    public void MarkBarsRequestPending(string instrument, DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            var canonicalInstrument = GetCanonicalInstrument(instrument) ?? instrument;
+            _barsRequestPending[canonicalInstrument] = utcNow;
+            // Remove from completed if it was there (for restart scenarios)
+            _barsRequestCompleted.Remove(canonicalInstrument);
+            
+            LogEngineEvent(utcNow, "BARSREQUEST_PENDING_MARKED", new
+            {
+                instrument = instrument,
+                canonical_instrument = canonicalInstrument,
+                note = "BarsRequest marked as pending - range lock will wait for completion"
+            });
+        }
+    }
+    
+    /// <summary>
+    /// Mark BarsRequest as completed for an instrument.
+    /// Called when LoadPreHydrationBars receives bars.
+    /// </summary>
+    public void MarkBarsRequestCompleted(string instrument, DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            var canonicalInstrument = GetCanonicalInstrument(instrument) ?? instrument;
+            _barsRequestPending.Remove(canonicalInstrument);
+            _barsRequestCompleted[canonicalInstrument] = utcNow;
+            
+            LogEngineEvent(utcNow, "BARSREQUEST_COMPLETED_MARKED", new
+            {
+                instrument = instrument,
+                canonical_instrument = canonicalInstrument,
+                note = "BarsRequest marked as completed - range lock can proceed"
+            });
+        }
+    }
+    
+    /// <summary>
+    /// Check if BarsRequest is pending for an instrument.
+    /// Returns true if BarsRequest is pending and hasn't timed out.
+    /// </summary>
+    public bool IsBarsRequestPending(string instrument, DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            var canonicalInstrument = GetCanonicalInstrument(instrument) ?? instrument;
+            
+            if (!_barsRequestPending.TryGetValue(canonicalInstrument, out var pendingTime))
+            {
+                // No pending request - check if it was already completed
+                if (_barsRequestCompleted.ContainsKey(canonicalInstrument))
+                {
+                    return false; // Already completed
+                }
+                return false; // Never requested
+            }
+            
+            // Check for timeout
+            var elapsedMinutes = (utcNow - pendingTime).TotalMinutes;
+            if (elapsedMinutes >= BARSREQUEST_TIMEOUT_MINUTES)
+            {
+                // Timeout - remove from pending and log warning
+                _barsRequestPending.Remove(canonicalInstrument);
+                LogEngineEvent(utcNow, "BARSREQUEST_TIMEOUT", new
+                {
+                    instrument = instrument,
+                    canonical_instrument = canonicalInstrument,
+                    elapsed_minutes = elapsedMinutes,
+                    timeout_minutes = BARSREQUEST_TIMEOUT_MINUTES,
+                    note = "BarsRequest timed out - allowing range lock to proceed (may have insufficient bars)"
+                });
+                return false; // Timed out
+            }
+            
+            return true; // Still pending
         }
     }
     
@@ -395,13 +485,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 4: Load execution policy (startup-only, not reloadable)
                 try
                 {
-                    _executionPolicy = ExecutionPolicy.LoadFromFile(_executionPolicyPath);
+                    // Resolve absolute path for definitive logging
+                    var absolutePolicyPath = Path.IsPathRooted(_executionPolicyPath) 
+                        ? _executionPolicyPath 
+                        : Path.Combine(_root, _executionPolicyPath);
+                    absolutePolicyPath = Path.GetFullPath(absolutePolicyPath);
+                    
+                    _executionPolicy = ExecutionPolicy.LoadFromFile(absolutePolicyPath);
                     
                     // Compute file hash for audit trail
                     var policyFileHash = "";
                     try
                     {
-                        var policyBytes = File.ReadAllBytes(_executionPolicyPath);
+                        var policyBytes = File.ReadAllBytes(absolutePolicyPath);
                         using (var sha256 = System.Security.Cryptography.SHA256.Create())
                         {
                             var hashBytes = sha256.ComputeHash(policyBytes);
@@ -415,14 +511,83 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             new { error = ex.Message, note = "Failed to compute policy file hash (non-blocking)" }));
                     }
                     
+                    // Extract parsed values for diagnostic logging (raw JSON values, not derived)
+                    var parsedValues = new Dictionary<string, object>();
+                    foreach (var canonicalKvp in _executionPolicy.canonical_markets)
+                    {
+                        var canonicalMarket = canonicalKvp.Key;
+                        var marketPolicy = canonicalKvp.Value;
+                        var execInstruments = new Dictionary<string, object>();
+                        
+                        foreach (var execKvp in marketPolicy.execution_instruments)
+                        {
+                            var execInst = execKvp.Key;
+                            var instPolicy = execKvp.Value;
+                            execInstruments[execInst] = new
+                            {
+                                enabled = instPolicy.enabled,
+                                base_size = instPolicy.base_size,
+                                max_size = instPolicy.max_size
+                            };
+                        }
+                        parsedValues[canonicalMarket] = execInstruments;
+                    }
+                    
+                    // Log parsed values immediately after parsing (diagnostic)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_PARSED", state: "ENGINE",
+                        new
+                        {
+                            parsed_values = parsedValues,
+                            note = "Raw parsed JSON values immediately after deserialization"
+                        }));
+                    
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_LOADED", state: "ENGINE",
                         new
                         {
-                            file_path = _executionPolicyPath,
+                            file_path = absolutePolicyPath,
+                            file_path_relative = _executionPolicyPath,
                             file_hash = policyFileHash,
+                            file_size_bytes = new FileInfo(absolutePolicyPath).Length,
                             schema_id = _executionPolicy.schema,
                             note = "Execution policy loaded at startup; not reloadable"
                         }));
+                    
+                    // 🔒 INVARIANT ENFORCEMENT: Log execution instrument anchor and policy validation at startup
+                    // This provides proof of anchor and policy compliance for forensic clarity
+                    if (!string.IsNullOrWhiteSpace(_executionInstrument))
+                    {
+                        var anchoredInstrument = _executionInstrument.ToUpperInvariant();
+                        var anchoredCanonical = GetCanonicalInstrument(anchoredInstrument);
+                        var policyValidated = false;
+                        int? policyBaseSize = null;
+                        int? policyMaxSize = null;
+                        
+                        if (_executionPolicy != null)
+                        {
+                            var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(anchoredCanonical, anchoredInstrument);
+                            if (execInstPolicy != null && execInstPolicy.enabled)
+                            {
+                                policyValidated = true;
+                                policyBaseSize = execInstPolicy.base_size;
+                                policyMaxSize = execInstPolicy.max_size;
+                            }
+                        }
+                        
+                        var note = policyValidated
+                            ? $"Strategy anchored to execution instrument: {anchoredInstrument} (policy validated)"
+                            : $"Strategy anchored to execution instrument: {anchoredInstrument} (policy validation failed)";
+                        
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_INSTRUMENT_ANCHORED", state: "ENGINE",
+                            new
+                            {
+                                execution_instrument = anchoredInstrument,
+                                canonical_instrument = anchoredCanonical,
+                                policy_validated = policyValidated,
+                                policy_base_size = policyBaseSize,
+                                policy_max_size = policyMaxSize,
+                                note = note
+                            }));
+                    }
                 }
                 catch (FileNotFoundException ex)
                 {
@@ -1905,6 +2070,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Streams will start without historical bars
         }
 
+        // CRITICAL: Mark BarsRequest as completed BEFORE feeding bars
+        // This ensures streams can transition immediately when bars arrive
+        // If we mark after feeding, streams check IsBarsRequestPending() during feeding and still see pending
+        // Each OnBar() call triggers Tick() which calls HandlePreHydrationState(), so we need to mark completed first
+        MarkBarsRequestCompleted(instrument, utcNow);
+        
         // Feed filtered bars to matching streams
         var streamsFed = 0;
         foreach (var stream in _streams.Values)
@@ -1953,6 +2124,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 
                 // Feed bars directly to stream's buffer for pre-hydration
                 // Mark as historical bars (from BarsRequest)
+                // NOTE: BarsRequest already marked as completed above, so streams can transition immediately
                 foreach (var bar in filteredBars)
                 {
                     stream.OnBar(bar.TimestampUtc, bar.Open, bar.High, bar.Low, bar.Close, utcNow, isHistorical: true);
@@ -1960,7 +2132,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 streamsFed++;
             }
         }
-
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_LOADED", state: "ENGINE",
                 new
                 {
@@ -2607,24 +2779,47 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var session = directive.session ?? "";
             var slotTimeChicago = directive.slot_time ?? "";
             
+            // 🔒 INVARIANT: The strategy's enabled instrument in NinjaTrader is the primary execution anchor.
+            // Policy may only restrict or remap execution after anchoring to that instrument.
+            // - Anchor: Use _executionInstrument if it matches canonical market
+            // - Restrict: Policy validation in GetOrderQuantity() will fail if instrument is disabled
+            // - Remap: Not supported (NinjaTrader strategies are single-instrument)
+            //
+            // CRITICAL: Skip directives for instruments that don't match NinjaTrader's canonical market
+            // NinjaTrader strategies are single-instrument - we can only execute on the instrument configured in NinjaTrader
+            // This check happens FIRST before any processing to avoid unnecessary work
+            if (!string.IsNullOrWhiteSpace(_executionInstrument))
+            {
+                var ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                if (!string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Skip this directive - it's for a different canonical market than what NinjaTrader is configured for
+                    skippedCount++;
+                    var skipReason = "CANONICAL_MISMATCH";
+                    if (!skippedReasons.ContainsKey(skipReason))
+                        skippedReasons[skipReason] = 0;
+                    skippedReasons[skipReason]++;
+                    continue; // Skip to next directive
+                }
+            }
+            
+            // If we reach here, canonical matches - proceed with anchoring
             // CRITICAL: Use NinjaTrader instrument if it matches timetable instrument or its canonical equivalent
-            // If NinjaTrader has MNG and timetable says NG, use MNG for ExecutionInstrument
-            // If NinjaTrader has NG and timetable says NG, use NG for ExecutionInstrument
+            // This handles: NG (timetable) + MNG (NinjaTrader) -> use MNG
+            // And: NG (timetable) + NG (NinjaTrader) -> use NG
             // This allows the robot to use whatever instrument is actually enabled in NinjaTrader
             var executionInstrument = timetableInstrument;
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
                 var ntInstrument = _executionInstrument.ToUpperInvariant();
-                var ntCanonical = GetCanonicalInstrument(ntInstrument);
+                var ntCanonical = GetCanonicalInstrument(ntInstrument); // Already computed above, but keeping for clarity
                 
-                // If NinjaTrader instrument's canonical matches timetable's canonical, use NinjaTrader instrument
-                // This handles: NG (timetable) + MNG (NinjaTrader) -> use MNG
-                // And: NG (timetable) + NG (NinjaTrader) -> use NG
-                if (string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
-                {
-                    executionInstrument = ntInstrument;
-                }
+                // Canonical matches (we wouldn't be here otherwise), so use NinjaTrader instrument
+                executionInstrument = ntInstrument;
             }
+            
+            // Policy validation happens later in GetOrderQuantity() - if instrument is disabled, it will fail there
+            // This respects the anchor invariant: policy can only RESTRICT, not override the anchor
             
             // PHASE 2: Canonicalize stream ID - must use canonical instrument, not execution
             var streamId = directive.stream;
@@ -2851,7 +3046,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     executionAdapter: _executionAdapter, 
                     riskGate: _riskGate, 
                     executionJournal: _executionJournal, 
-                    loggingConfig: _loggingConfig);
+                    loggingConfig: _loggingConfig,
+                    engine: this); // Pass engine reference for BarsRequest status checks
                 
                 // PHASE 3: Post-creation assertion - verify stream properties match expectations
                 if (newSm.ExecutionInstrument != executionInstrument)
@@ -3774,6 +3970,59 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return null; // No micro future found for this base instrument
     }
 
+    /// <summary>
+    /// Check if BarsRequest should be called for restart for any streams.
+    /// Returns list of instruments that need BarsRequest due to restart.
+    /// Strategy should call this after Realtime state is reached and call RequestHistoricalBarsForPreHydration for each instrument.
+    /// </summary>
+    public List<string> GetInstrumentsNeedingRestartBarsRequest()
+    {
+        lock (_engineLock)
+        {
+            var instrumentsNeedingBarsRequest = new HashSet<string>();
+            var utcNow = DateTimeOffset.UtcNow;
+            
+            // Check all streams for restart state
+            // Streams in PRE_HYDRATION or ARMED state that are not committed may need BarsRequest
+            // This handles the case where streams restart mid-session and need historical bars
+            foreach (var stream in _streams.Values)
+            {
+                // Check if stream is in PRE_HYDRATION or ARMED state and not committed
+                // This indicates BarsRequest may be needed for restart
+                if ((stream.State == StreamState.PRE_HYDRATION || stream.State == StreamState.ARMED) &&
+                    !stream.Committed)
+                {
+                    var canonicalInstrument = stream.CanonicalInstrument;
+                    if (!string.IsNullOrEmpty(canonicalInstrument))
+                    {
+                        instrumentsNeedingBarsRequest.Add(canonicalInstrument);
+                        
+                        LogEngineEvent(utcNow, "RESTART_BARSREQUEST_DETECTED", new
+                        {
+                            instrument = canonicalInstrument,
+                            stream_id = stream.Stream,
+                            state = stream.State.ToString(),
+                            committed = stream.Committed,
+                            note = "Stream detected in PRE_HYDRATION/ARMED state - BarsRequest may be needed for restart"
+                        });
+                    }
+                }
+            }
+            
+            if (instrumentsNeedingBarsRequest.Count > 0)
+            {
+                LogEngineEvent(utcNow, "RESTART_BARSREQUEST_SUMMARY", new
+                {
+                    instruments_count = instrumentsNeedingBarsRequest.Count,
+                    instruments = instrumentsNeedingBarsRequest.ToList(),
+                    note = "Instruments detected that may need BarsRequest for restart"
+                });
+            }
+            
+            return instrumentsNeedingBarsRequest.ToList();
+        }
+    }
+    
     public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
     {
         lock (_engineLock)
