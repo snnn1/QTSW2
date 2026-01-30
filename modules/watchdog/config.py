@@ -26,6 +26,10 @@ UNPROTECTED_TIMEOUT_SECONDS = 10
 # ONBARUPDATE_CALLED and ENGINE_TICK_HEARTBEAT are rate-limited to 60 seconds
 # Set threshold to 90 seconds (1.5x rate limit) to avoid false positives
 DATA_STALL_THRESHOLD_SECONDS = 90  # Default, can be configurable per instrument
+# RECOVERY_TIMEOUT_SECONDS: Maximum time recovery can be in RECOVERY_RUNNING state
+# If DISCONNECT_RECOVERY_COMPLETE event is not received within this time, auto-clear recovery state
+# Set to 10 minutes - recovery should complete quickly, but allow time for slow reconnections
+RECOVERY_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # Update frequencies (seconds)
 ENGINE_ALIVE_UPDATE_FREQUENCY = 5

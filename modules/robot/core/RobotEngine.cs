@@ -85,14 +85,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly string _loggingConfigPath;
     private readonly string? _resolvedLogDirWarning;
 
-    // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
-    private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
-    private int BAR_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.enable_diagnostic_logs ? 1 : 5; // More frequent if diagnostics enabled
-    
-    // PATTERN 1: Bar-driven ENGINE_TICK_HEARTBEAT tracking (per instrument)
-    private readonly Dictionary<string, DateTimeOffset> _lastBarDrivenHeartbeatPerInstrument = new();
-    private readonly Dictionary<string, int> _barsSinceLastHeartbeatPerInstrument = new();
-    private const int BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS = 60; // Emit at most once per 60 seconds per instrument
     
     // BarsRequest completion tracking (per instrument)
     // Tracks pending BarsRequest to prevent range lock before bars arrive
@@ -1108,6 +1100,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             // HEARTBEAT: Emit unconditionally for process liveness (before any early returns)
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
+            
+            // WATCHDOG: Log ENGINE_TICK_CALLSITE for watchdog liveness monitoring
+            // This is the primary heartbeat indicator for engine liveness
+            // Rate-limited in event feed to every 5 seconds, but log every call here
+            // Watchdog uses this to detect engine stalls (threshold: 15 seconds)
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
+                new
+                {
+                    note = "Tick() called - watchdog liveness signal. Rate-limited in feed to every 5 seconds."
+                }));
+            
             // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
             _lastTickUtc = utcNow;
             _lastEngineTickUtc = utcNow; // Also update for broker sync gate
@@ -1115,8 +1118,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 3: Update health monitor with engine tick timestamp
             _healthMonitor?.UpdateEngineTick(utcNow);
 
-            // PATTERN 1: ENGINE_TICK_HEARTBEAT is now emitted from OnBar() after bar acceptance
-            // Tick() no longer emits heartbeats - heartbeat is bar-driven only
 
             // TRADING READINESS: Guards that prevent trading logic from running when engine is not ready
             // CRITICAL: Defensive checks - engine must be initialized for trading logic
@@ -1319,32 +1320,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Update last tick timestamp for broker synchronization check
         // Bar updates indicate connection health, so track them for recovery sync
         _lastTickUtc = utcNow;
-
-        // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
-        // Only logged if diagnostic logs are enabled
-        if (_loggingConfig.enable_diagnostic_logs)
-        {
-            var shouldLogHeartbeat = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastHeartbeat) ||
-                                    (utcNow - lastHeartbeat).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
-            
-            if (shouldLogHeartbeat)
-            {
-                _lastBarHeartbeatPerInstrument[instrument] = utcNow;
-                var barChicagoTimeHeartbeat = _time.ConvertUtcToChicago(barUtc);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
-                    new
-                    {
-                        instrument = instrument,
-                        raw_bar_time = barUtc.ToString("o"),
-                        raw_bar_time_kind = barUtc.DateTime.Kind.ToString(),
-                        utc_time = barUtc.ToString("o"),
-                        chicago_time = barChicagoTimeHeartbeat.ToString("o"),
-                        chicago_offset = barChicagoTimeHeartbeat.Offset.ToString(),
-                        close_price = close,
-                        note = "engine-level diagnostic"
-                    }));
-            }
-        }
 
         // Validate bar date against locked trading date from timetable
         var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
@@ -1650,9 +1625,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Log bar delivery summary periodically (rate-limited)
         LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
         
-        // PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance and processing
-        // This heartbeat represents "bars are being processed" and is the authoritative liveness signal
-        EmitBarDrivenHeartbeatIfNeeded(utcNow, instrument, barUtc, barChicagoTime);
+        } // Close lock (_engineLock)
     }
     
     /// <summary>
@@ -1722,6 +1695,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Rate-limiting for bar delivery logging (per stream)
     private readonly Dictionary<string, DateTimeOffset> _lastBarDeliveryLogUtc = new Dictionary<string, DateTimeOffset>();
     private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
+    
+    // Bar acceptance heartbeat tracking (rate-limited)
+    private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new Dictionary<string, DateTimeOffset>();
+    private const int BAR_HEARTBEAT_RATE_LIMIT_MINUTES = 5; // Log bar acceptance heartbeat every 5 minutes per instrument
     private const double BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES = 5.0;
     
     /// <summary>
@@ -1751,49 +1728,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }));
     }
     
-    /// <summary>
-    /// PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance.
-    /// This heartbeat represents "bars are being processed" and is the authoritative liveness signal.
-    /// Rate-limited to once per 60 seconds per instrument.
-    /// </summary>
-    private void EmitBarDrivenHeartbeatIfNeeded(DateTimeOffset utcNow, string instrument, DateTimeOffset barUtc, DateTimeOffset barChicagoTime)
-    {
-        // Check if heartbeat is due for this instrument
-        var lastHeartbeatUtc = _lastBarDrivenHeartbeatPerInstrument.TryGetValue(instrument, out var last) ? last : DateTimeOffset.MinValue;
-        var timeSinceLastHeartbeat = (utcNow - lastHeartbeatUtc).TotalSeconds;
-        var shouldEmit = lastHeartbeatUtc == DateTimeOffset.MinValue || timeSinceLastHeartbeat >= BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS;
-        
-        if (!shouldEmit)
-        {
-            // Increment bar counter even if not emitting heartbeat
-            if (!_barsSinceLastHeartbeatPerInstrument.ContainsKey(instrument))
-            {
-                _barsSinceLastHeartbeatPerInstrument[instrument] = 0;
-            }
-            _barsSinceLastHeartbeatPerInstrument[instrument]++;
-            return;
-        }
-        
-        // Emit heartbeat
-        var barsSinceLastHeartbeat = _barsSinceLastHeartbeatPerInstrument.TryGetValue(instrument, out var count) ? count : 0;
-        _lastBarDrivenHeartbeatPerInstrument[instrument] = utcNow;
-        _barsSinceLastHeartbeatPerInstrument[instrument] = 0; // Reset counter
-        
-        // CONTRACT: bar_time_utc represents the bar open time.
-        // NinjaTrader emits bars on close; this system normalizes all bars to open time for Analyzer parity and deterministic range logic.
-        // This assumes 1-minute bars and is guarded by an invariant.
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
-            new
-            {
-                instrument = instrument,
-                bar_time_utc = barUtc.ToString("o"),
-                bar_time_chicago = barChicagoTime.ToString("o"),
-                bars_since_last_heartbeat = barsSinceLastHeartbeat,
-                active_stream_count = _streams.Count,
-                recovery_state = _recoveryState.ToString(),
-                note = "bar-driven heartbeat (Pattern 1)"
-            }));
-    }
 
     /// <summary>
     /// Set session start time for an instrument (from TradingHours).
@@ -2316,7 +2250,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     
                     // Check: Stream ID should not contain execution instrument if different from canonical
                     if (executionInstrument != canonicalInstrument &&
-                        stream.Stream.Contains(executionInstrument, StringComparison.OrdinalIgnoreCase))
+                        stream.Stream.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         violations.Add($"Stream ID '{stream.Stream}' contains execution instrument '{executionInstrument}' (should be canonical '{canonicalInstrument}')");
                     }
@@ -2721,35 +2655,70 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // PHASE 4: Validate execution policy for unique execution instruments before stream creation (fail-closed)
         // Validation logic lives in GetOrderQuantity() - do not duplicate policy rules here
         // For each enabled directive:
-        //   1. Determine canonical market (already computed in loop below)
-        //   2. Call GetOrderQuantity(canonical, execution) - this validates policy
-        //   3. Aggregate exceptions and fail-closed once
-        var uniqueExecutionInstruments = incoming
+        //   1. Determine canonical market (timetable's instrument field is canonical)
+        //   2. Determine actual execution instrument (from _executionInstrument anchor or policy)
+        //   3. Call GetOrderQuantity(canonical, execution) - this validates policy
+        //   4. Aggregate exceptions and fail-closed once
+        var uniqueCanonicalInstruments = incoming
             .Select(d => (d.instrument ?? "").Trim())
             .Where(i => !string.IsNullOrWhiteSpace(i))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         var quantityValidationErrors = new List<string>();
-        foreach (var execInst in uniqueExecutionInstruments)
+        var uniqueExecutionInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var timetableInstrument in uniqueCanonicalInstruments)
         {
             try
             {
-                // Get canonical instrument for this execution instrument
-                var canonicalInst = GetCanonicalInstrument(execInst);
+                // Timetable's instrument field is canonical (ES, NQ, YM, etc.)
+                var canonicalInst = GetCanonicalInstrument(timetableInstrument);
+                
+                // Determine actual execution instrument that will be used:
+                // 1. If _executionInstrument is set and matches canonical market, use it
+                // 2. Otherwise, get the enabled execution instrument from policy
+                string executionInst;
+                if (!string.IsNullOrWhiteSpace(_executionInstrument))
+                {
+                    var ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                    if (string.Equals(ntCanonical, canonicalInst, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Use NinjaTrader's execution instrument (anchor)
+                        executionInst = _executionInstrument.ToUpperInvariant();
+                    }
+                    else
+                    {
+                        // Different canonical market - get enabled instrument from policy
+                        executionInst = _executionPolicy?.GetEnabledExecutionInstrument(canonicalInst) ?? timetableInstrument;
+                    }
+                }
+                else
+                {
+                    // No anchor - get enabled instrument from policy
+                    executionInst = _executionPolicy?.GetEnabledExecutionInstrument(canonicalInst) ?? timetableInstrument;
+                }
+                
+                if (string.IsNullOrWhiteSpace(executionInst))
+                {
+                    quantityValidationErrors.Add($"Execution instrument for canonical market '{canonicalInst}': No enabled execution instrument found in policy.");
+                    continue;
+                }
+                
+                // Track unique execution instruments for logging
+                uniqueExecutionInstruments.Add(executionInst);
                 
                 // PHASE 4: Call GetOrderQuantity - this validates policy (canonical market exists, instrument enabled, quantity valid)
                 // Do not manually re-encode policy rules here - validation logic must live in exactly one place
-                var qty = GetOrderQuantity(canonicalInst, execInst);
+                var qty = GetOrderQuantity(canonicalInst, executionInst);
                 // GetOrderQuantity already validates qty > 0, so no double-check needed
             }
             catch (ArgumentException ex)
             {
-                quantityValidationErrors.Add($"Execution instrument '{execInst}': {ex.Message}");
+                quantityValidationErrors.Add($"Canonical market '{timetableInstrument}': {ex.Message}");
             }
             catch (InvalidOperationException ex)
             {
-                quantityValidationErrors.Add($"Execution instrument '{execInst}': {ex.Message}");
+                quantityValidationErrors.Add($"Canonical market '{timetableInstrument}': {ex.Message}");
             }
         }
 
@@ -2761,7 +2730,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 new
                 {
                     errors = quantityValidationErrors,
-                    unique_execution_instruments = uniqueExecutionInstruments,
+                    unique_execution_instruments = uniqueExecutionInstruments.ToList(),
                     note = "Execution blocked due to execution policy validation failures"
                 }));
             throw new InvalidOperationException(errorMsg);
@@ -2827,9 +2796,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 // Map execution instrument in stream ID to canonical instrument
                 // e.g., "MES1" -> "ES1"
-                if (streamId.Contains(executionInstrument, StringComparison.OrdinalIgnoreCase))
+                if (streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    streamId = streamId.Replace(executionInstrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase);
+                    // Replace doesn't support StringComparison, so use manual replacement
+                    var index = streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase);
+                    if (index >= 0)
+                    {
+                        streamId = streamId.Substring(0, index) + canonicalInstrument + streamId.Substring(index + executionInstrument.Length);
+                    }
                 }
             }
             
@@ -2969,7 +2943,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (string.IsNullOrWhiteSpace(directive.slot_time))
                 {
                     // Fail closed: skip update if slot_time is null/empty
-                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, instrument, session, sm.SlotTimeChicago, null,
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, sm.SlotTimeChicago, null,
                         "STREAM_UPDATE_SKIPPED", "ENGINE", new 
                         { 
                             reason = "EMPTY_SLOT_TIME",
@@ -2984,7 +2958,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             else
             {
                 // PHASE 2: Fail-fast assertion - ensure stream ID is canonicalized
-                if (executionInstrument != canonicalInstrument && streamId.Contains(executionInstrument, StringComparison.OrdinalIgnoreCase))
+                if (executionInstrument != canonicalInstrument && streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     throw new InvalidOperationException(
                         $"PHASE 2 ASSERTION FAILED: Execution instrument '{executionInstrument}' leaked into logic stream ID '{streamId}'. " +
@@ -2996,7 +2970,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
                 
                 // PHASE 3: Fail-fast assertion - ensure stream ID is canonicalized before stream creation
-                if (executionInstrument != canonicalInstrument && streamId.Contains(executionInstrument, StringComparison.OrdinalIgnoreCase))
+                if (executionInstrument != canonicalInstrument && streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     throw new InvalidOperationException(
                         $"PHASE 3 ASSERTION FAILED: Execution instrument '{executionInstrument}' leaked into logic stream ID '{streamId}'. " +
@@ -3028,6 +3002,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var orderQuantity = GetOrderQuantity(canonicalInstrument, executionInstrument);
                 var (baseSize, maxSize) = GetOrderQuantityInfo(canonicalInstrument, executionInstrument);
                 
+                // CRITICAL FIX: Create modified directive with execution instrument instead of canonical
+                // The timetable directive.instrument is canonical (GC), but StreamStateMachine needs execution instrument (MGC)
+                // Create a copy of the directive with the correct execution instrument
+                var modifiedDirective = new TimetableStream
+                {
+                    stream = directive.stream,
+                    instrument = executionInstrument, // Use execution instrument (MGC), not canonical (GC)
+                    session = directive.session,
+                    slot_time = directive.slot_time,
+                    enabled = directive.enabled,
+                    block_reason = directive.block_reason,
+                    decision_time = directive.decision_time
+                };
+                
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
                 // PHASE 4: Pass order quantity (policy-controlled, Chart Trader ignored)
                 // Use named arguments after first optional parameter to avoid future breakage
@@ -3038,7 +3026,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     _journals, 
                     tradingDate, 
                     _lastTimetableHash, 
-                    directive, 
+                    modifiedDirective, // Use modified directive with execution instrument
                     _executionMode, 
                     orderQuantity, // baseSize (existing parameter)
                     maxSize, // NEW: maxSize parameter
@@ -3920,8 +3908,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 .ToList();
 
             // CRITICAL: Map base instruments to micro futures for BarsRequest
-            // If stream has ExecutionInstrument = YM, we need to request MYM bars
-            // If stream has ExecutionInstrument = CL, we need to request MCL bars
+            // ExecutionInstrument is already the execution instrument (e.g., MGC, MYM, MCL)
+            // If ExecutionInstrument is a base instrument (e.g., YM, CL), map to micro (MYM, MCL)
+            // Otherwise, use as-is (already micro or no mapping available)
             var barsRequestInstruments = new List<string>();
             foreach (var execInst in executionInstruments)
             {

@@ -590,3 +590,267 @@ if (!_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc 
 - Range computation (already locked)
 
 The stream is **immediately ready** to detect entries after restart, assuming restoration succeeds.
+
+## Breakout Detection on Restart
+
+### Does It Check If Breakout Already Occurred?
+
+**Short Answer:** It checks if an **entry was already detected/filled**, but **NOT** if price has already breached breakout levels.
+
+### Entry Detection Restoration
+
+**On Restart (Constructor, lines 389-399):**
+```csharp
+// Restore entry detection from execution journal (Option B)
+if (_executionJournal != null && !existing.EntryDetected)
+{
+    // Scan execution journal for any filled entry
+    _entryDetected = _executionJournal.HasEntryFillForStream(tradingDateStr, Stream);
+}
+else
+{
+    // Use journal value if available, otherwise default to false
+    _entryDetected = existing.EntryDetected;
+}
+```
+
+**What Gets Checked:**
+1. **Execution Journal** - Scans for filled entry orders (`EntryFilled == true`)
+2. **Stream Journal** - Uses `EntryDetected` flag if execution journal check skipped
+
+**What Does NOT Get Checked:**
+- ❌ **Price history** - Does NOT check if price already breached breakout levels
+- ❌ **Historical bars** - Does NOT replay bars to detect missed breakouts
+- ❌ **Current price** - Does NOT check current price against breakout levels on restart
+
+### Breakout Detection Logic
+
+**After Restart (HandleRangeLockedState, line 2880):**
+```csharp
+// Check for breakout after lock (before market close)
+if (!_entryDetected && barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && 
+    _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+{
+    CheckBreakoutEntry(barUtc, high, low, utcNow);
+}
+```
+
+**Key Point:** `CheckBreakoutEntry()` only runs if `!_entryDetected`. It checks the **current bar** against breakout levels, not historical bars.
+
+### Scenarios
+
+**Scenario A: Entry Already Filled Before Restart**
+- ✅ **Restored:** `_entryDetected = true` (from execution journal)
+- ✅ **Result:** No new entry detection, no duplicate orders
+- ✅ **Status:** Correct behavior
+
+**Scenario B: Breakout Occurred But Entry Not Filled**
+- ⚠️ **Restored:** `_entryDetected = false` (no fill in execution journal)
+- ⚠️ **Result:** Will detect breakout again on **next bar** if price still above/below breakout level
+- ⚠️ **Risk:** May try to enter again if breakout still valid
+
+**Scenario C: Breakout Occurred and Entry Filled**
+- ✅ **Restored:** `_entryDetected = true` (from execution journal fill)
+- ✅ **Result:** No duplicate detection
+- ✅ **Status:** Correct behavior
+
+**Scenario D: Breakout Occurred, Entry Submitted But Not Filled**
+- ⚠️ **Restored:** `_entryDetected = false` (no fill yet)
+- ⚠️ **Result:** Will detect breakout again on next bar
+- ⚠️ **Risk:** May submit duplicate entry order (idempotency check should prevent this)
+
+### Idempotency Protection
+
+**Entry Detection (RecordIntendedEntry, line 5089):**
+```csharp
+if (_entryDetected)
+{
+    // Log when breakout is detected but entry already exists
+    _log.Write(..., "BREAKOUT_DETECTED_ALREADY_ENTERED", ...);
+    return; // Already detected
+}
+```
+
+**Order Submission (RecordIntendedEntry, line 5182):**
+```csharp
+// Check idempotency: Has this intent already been submitted?
+if (_executionJournal != null && _executionJournal.IsIntentSubmitted(intentId, TradingDate, Stream))
+{
+    _log.Write(..., "EXECUTION_SKIPPED_DUPLICATE", ...);
+    return; // Already submitted
+}
+```
+
+**Stop Brackets (HandleRangeLockedState, line 2285):**
+```csharp
+bool alreadySubmitted = false;
+if (_executionJournal != null)
+{
+    alreadySubmitted = _executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
+                      _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream);
+}
+```
+
+### Potential Gap
+
+**Missing Check:** The system does NOT verify if price has already breached breakout levels before restart. It relies on:
+1. `_entryDetected` flag being set correctly
+2. Execution journal having correct fill records
+3. Idempotency checks preventing duplicate submissions
+
+**Edge Case:** If a breakout occurred but:
+- Entry was not detected (bug/crash)
+- Entry was detected but not submitted (crash)
+- Entry was submitted but not filled (crash)
+
+Then on restart, it will detect the breakout again on the next bar **if price is still above/below breakout level**. This could be correct (retry) or incorrect (missed opportunity) depending on timing.
+
+### Recommendations
+
+**Current Behavior is Acceptable Because:**
+1. **Execution journal** tracks fills reliably
+2. **Idempotency checks** prevent duplicate submissions
+3. **Breakout detection** is bar-by-bar (not historical replay)
+4. **If breakout still valid**, detecting it again is correct behavior
+
+**Potential Enhancement (Future):**
+- Check current price against breakout levels on restart
+- If price already breached and entry not detected, log warning
+- Consider replaying recent bars to detect missed breakouts (complex, may not be worth it)
+
+### Summary
+
+**Yes, it checks:**
+- ✅ If entry was already detected (`_entryDetected` flag)
+- ✅ If entry was already filled (execution journal)
+- ✅ If intent was already submitted (idempotency checks)
+
+**No, it does NOT check:**
+- ❌ If price has already breached breakout levels (before restart)
+- ❌ Historical bars to detect missed breakouts
+- ❌ Current price against breakout levels on restart
+
+**Relies on:**
+- Execution journal for fill tracking
+- Idempotency checks for duplicate prevention
+- Next bar's price for breakout detection
+
+## Scenario: Start at 11:10 After Breakout at 11:05
+
+### The Question
+
+**What happens if you start the strategy at 11:10, but the 11:00 range already broke out at 11:05?**
+
+### Step-by-Step What Happens
+
+**1. Stream Restoration (11:10)**
+- **Time:** 11:10 (startup)
+- **Action:** Range restored from hydration log
+- **State:** `RANGE_LOCKED` immediately
+- **Breakout Levels:** Restored (or computed if missing)
+- **Entry Detected:** Restored from execution journal (if entry was filled)
+
+**2. BarsRequest Loads Historical Bars**
+- **Time:** ~11:10 (after restoration)
+- **Bars Loaded:** From `range_start` to `now` (11:10)
+- **Includes:** Bars from 11:00-11:10 (including the breakout bar at 11:05)
+
+**3. Critical Issue: Bars Are SKIPPED**
+- **Code:** `RobotEngine.cs` line 2088-2090
+```csharp
+if (stream.State != StreamState.PRE_HYDRATION && 
+    stream.State != StreamState.ARMED && 
+    stream.State != StreamState.RANGE_BUILDING)
+{
+    // Bars skipped - stream already in RANGE_LOCKED
+    LogEvent(..., "PRE_HYDRATION_BARS_SKIPPED_STREAM_STATE", ...);
+}
+```
+- **Result:** Historical bars from 11:00-11:10 are **NOT fed** to the stream
+- **Reason:** Stream is already in `RANGE_LOCKED` state (not `PRE_HYDRATION`, `ARMED`, or `RANGE_BUILDING`)
+
+**4. Breakout Detection**
+- **Time:** On next **live** bar (11:11 or later)
+- **Check:** `CheckBreakoutEntry()` only checks the **current bar**
+- **Condition:** `barUtc >= SlotTimeUtc` (11:00) and `!_entryDetected`
+
+### What Gets Detected
+
+**Scenario A: Price Still Above/Below Breakout Level**
+- **11:10 bar:** Price still breached → **WILL detect breakout**
+- **11:11 bar:** Price still breached → **WILL detect breakout**
+- **Result:** Entry detected on next bar
+
+**Scenario B: Price Came Back Into Range**
+- **11:10 bar:** Price back in range → **WON'T detect breakout**
+- **11:11 bar:** Price back in range → **WON'T detect breakout**
+- **Result:** **MISSED BREAKOUT** - won't be detected
+
+**Scenario C: Entry Already Filled**
+- **Restored:** `_entryDetected = true` (from execution journal)
+- **Result:** No detection attempted (correct behavior)
+
+### The Gap
+
+**Problem:** Historical bars from BarsRequest are **skipped** when stream is in `RANGE_LOCKED` state.
+
+**Why:** The code assumes bars are only needed for pre-hydration. Once range is locked, it doesn't replay historical bars to detect missed breakouts.
+
+**Impact:**
+- ✅ **If price still breached:** Will detect on next bar (correct)
+- ❌ **If price came back:** Missed breakout won't be detected (gap)
+- ✅ **If entry already filled:** Correctly skips (correct)
+
+### Code Evidence
+
+**Bars Skipped When RANGE_LOCKED:**
+```csharp
+// RobotEngine.cs, LoadPreHydrationBars(), line 2088-2090
+if (stream.State != StreamState.PRE_HYDRATION && 
+    stream.State != StreamState.ARMED && 
+    stream.State != StreamState.RANGE_BUILDING)
+{
+    // Bars skipped - stream already progressed past pre-hydration
+    LogEvent(..., "PRE_HYDRATION_BARS_SKIPPED_STREAM_STATE", ...);
+}
+```
+
+**Breakout Detection Only Checks Current Bar:**
+```csharp
+// StreamStateMachine.cs, OnBar(), line 2880-2882
+if (!_entryDetected && barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && 
+    _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+{
+    CheckBreakoutEntry(barUtc, high, low, utcNow);  // Only checks THIS bar
+}
+```
+
+**CheckBreakoutEntry Logic:**
+```csharp
+// StreamStateMachine.cs, line 5067-5069
+bool longTrigger = high >= brkLong;   // Checks THIS bar's high
+bool shortTrigger = low <= brkShort;  // Checks THIS bar's low
+```
+
+### Summary
+
+**If you start at 11:10 after breakout at 11:05:**
+
+1. **Range is restored** ✅
+2. **BarsRequest loads bars** ✅ (11:00-11:10)
+3. **Bars are SKIPPED** ❌ (stream already RANGE_LOCKED)
+4. **Breakout detection** checks **next live bar only**
+5. **If price still breached:** Detects on next bar ✅
+6. **If price came back:** Missed breakout ❌
+
+**The system does NOT:**
+- Replay historical bars to detect missed breakouts
+- Check if price already breached before restart
+- Feed BarsRequest bars when stream is RANGE_LOCKED
+
+**The system DOES:**
+- Check if entry was already filled (execution journal)
+- Detect breakout on next bar if price still breached
+- Prevent duplicate orders (idempotency)
+
+**This is a known limitation** - the system prioritizes current state over historical replay for performance and simplicity reasons.

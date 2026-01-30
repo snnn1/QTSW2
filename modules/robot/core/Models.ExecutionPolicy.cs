@@ -135,6 +135,33 @@ public sealed class ExecutionPolicy
         var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
         return _canonicalMarkets.ContainsKey(canonicalUpper);
     }
+    
+    /// <summary>
+    /// Get the enabled execution instrument for a canonical market.
+    /// Policy requires exactly one enabled execution instrument per canonical market.
+    /// </summary>
+    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
+    /// <returns>Enabled execution instrument (e.g., "MES", "MNQ"), or null if not found</returns>
+    public string? GetEnabledExecutionInstrument(string canonicalInstrument)
+    {
+        var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
+        
+        if (!_canonicalMarkets.TryGetValue(canonicalUpper, out var marketPolicy))
+        {
+            return null;
+        }
+        
+        // Find the enabled execution instrument (policy guarantees exactly one)
+        foreach (var kvp in marketPolicy.execution_instruments)
+        {
+            if (kvp.Value.enabled)
+            {
+                return kvp.Key;
+            }
+        }
+        
+        return null; // No enabled instrument found (should not happen if policy is valid)
+    }
 }
 
 // Raw deserialization model (before normalization)

@@ -58,6 +58,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
+    
+    // Rate-limiting for INSTRUMENT_MISMATCH logging (operational hygiene)
+    // Prevents log flooding when instrument mismatch persists
+    private readonly Dictionary<string, DateTimeOffset> _lastInstrumentMismatchLogUtc = new();
+    private const int INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES = 60; // Log at most once per hour per instrument
+    
+    // Diagnostic: Track rate-limit diagnostic logs separately
+    private readonly Dictionary<string, DateTimeOffset> _lastInstrumentMismatchDiagLogUtc = new();
 
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
@@ -330,6 +338,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     private void HandleEntryFill(string intentId, Intent intent, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow)
     {
         // CRITICAL: Validate intent has all required fields for protective orders
+        // REAL RISK FIX: Treat missing intent fields the same as protective submission failure
+        // If we cannot prove the position is protected, flatten immediately (fail-closed)
         var missingFields = new List<string>();
         if (intent.Direction == null) missingFields.Add("Direction");
         if (intent.StopPrice == null) missingFields.Add("StopPrice");
@@ -337,10 +347,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         
         if (missingFields.Count > 0)
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
+            var failureReason = $"Intent incomplete - missing fields: {string.Join(", ", missingFields)}";
+            
+            // Log critical error
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "INTENT_INCOMPLETE_UNPROTECTED_POSITION",
                 new 
                 { 
-                    error = "Intent incomplete - cannot submit protective orders",
+                    error = failureReason,
                     intent_id = intentId,
                     missing_fields = missingFields,
                     direction = intent.Direction,
@@ -350,8 +363,45 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     fill_quantity = fillQuantity,
                     stream = intent.Stream,
                     instrument = intent.Instrument,
-                    note = "Entry order filled but protective orders cannot be placed due to incomplete intent data"
+                    action = "FLATTEN_IMMEDIATELY",
+                    note = "Entry order filled but intent incomplete - position unprotected. Flattening immediately (fail-closed behavior)."
                 }));
+            
+            // REAL RISK FIX: Flatten position immediately (same as protective order failure)
+            // Notify coordinator of protective failure
+            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
+            
+            // Flatten position immediately with retry logic
+            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
+            
+            // Stand down stream
+            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"INTENT_INCOMPLETE: {failureReason}");
+            
+            // Persist incident record
+            PersistProtectiveFailureIncident(intentId, intent, null, null, flattenResult, utcNow);
+            
+            // Raise high-priority alert
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                var title = $"CRITICAL: Intent Incomplete - Unprotected Position - {intent.Instrument}";
+                var message = $"Entry filled but intent incomplete (missing: {string.Join(", ", missingFields)}). Position flattened. Stream: {intent.Stream}, Intent: {intentId}.";
+                notificationService.EnqueueNotification($"INTENT_INCOMPLETE:{intentId}", title, message, priority: 2); // Emergency priority
+            }
+            
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "INTENT_INCOMPLETE_FLATTENED",
+                new
+                {
+                    intent_id = intentId,
+                    stream = intent.Stream,
+                    instrument = intent.Instrument,
+                    missing_fields = missingFields,
+                    flatten_success = flattenResult.Success,
+                    flatten_error = flattenResult.ErrorMessage,
+                    failure_reason = failureReason,
+                    note = "Position flattened and stream stood down due to incomplete intent (fail-closed behavior)"
+                }));
+            
             return;
         }
         
@@ -454,8 +504,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // Notify coordinator of protective failure
             _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
             
-            // Flatten position immediately (coordinator handles per-intent flattening)
-            var flattenResult = Flatten(intentId, intent.Instrument, utcNow);
+            // Flatten position immediately with retry logic (coordinator handles per-intent flattening)
+            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
             
             // Stand down stream (coordinator also calls this, but keep for backward compatibility)
             _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDER_FAILURE: {failureReason}");
@@ -870,6 +920,96 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
     }
 
+    /// <summary>
+    /// REAL RISK FIX: Flatten with retry logic (3 retries, short delay).
+    /// Flatten is the last line of defense - if it fails due to transient issues,
+    /// we must retry before giving up.
+    /// </summary>
+    private FlattenResult FlattenWithRetry(
+        string intentId,
+        string instrument,
+        DateTimeOffset utcNow)
+    {
+        const int MAX_RETRIES = 3;
+        const int RETRY_DELAY_MS = 200; // Short delay between retries
+        
+        FlattenResult? lastResult = null;
+        
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
+        {
+            if (attempt > 0)
+            {
+                // Short delay before retry
+                System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+            }
+            
+            lastResult = Flatten(intentId, instrument, utcNow);
+            
+            if (lastResult.Success)
+            {
+                if (attempt > 0)
+                {
+                    // Log successful retry
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_RETRY_SUCCEEDED",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = instrument,
+                            attempt = attempt + 1,
+                            total_attempts = MAX_RETRIES,
+                            note = "Flatten succeeded on retry"
+                        }));
+                }
+                return lastResult;
+            }
+            
+            // Log retry attempt
+            if (attempt < MAX_RETRIES - 1)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_RETRY_ATTEMPT",
+                    new
+                    {
+                        intent_id = intentId,
+                        instrument = instrument,
+                        attempt = attempt + 1,
+                        total_attempts = MAX_RETRIES,
+                        error = lastResult.ErrorMessage,
+                        note = "Flatten failed, retrying..."
+                    }));
+            }
+        }
+        
+        // All retries failed - scream loudly and stand down
+        var finalError = $"Flatten failed after {MAX_RETRIES} attempts: {lastResult?.ErrorMessage ?? "Unknown error"}";
+        
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAILED_ALL_RETRIES",
+            new
+            {
+                intent_id = intentId,
+                instrument = instrument,
+                total_attempts = MAX_RETRIES,
+                final_error = finalError,
+                note = "CRITICAL: Flatten failed after all retries - manual intervention required"
+            }));
+        
+        // Scream loudly: Send emergency notification
+        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+        if (notificationService != null)
+        {
+            var title = $"EMERGENCY: Flatten Failed After All Retries - {instrument}";
+            var message = $"CRITICAL: Flatten failed after {MAX_RETRIES} attempts. Error: {finalError}. Intent: {intentId}. Manual intervention required immediately.";
+            notificationService.EnqueueNotification($"FLATTEN_FAILED:{intentId}", title, message, priority: 2); // Emergency priority
+        }
+        
+        // Stand down stream if callback available
+        if (_intentMap.TryGetValue(intentId, out var intent))
+        {
+            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"FLATTEN_FAILED_ALL_RETRIES: {finalError}");
+        }
+        
+        return lastResult ?? FlattenResult.FailureResult(finalError, utcNow);
+    }
+
     public FlattenResult Flatten(
         string intentId,
         string instrument,
@@ -920,7 +1060,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAIL", new
             {
                 error = ex.Message,
-                account = "SIM"
+                account = "SIM",
+                exception_type = ex.GetType().Name
             }));
             
             return FlattenResult.FailureResult($"Flatten failed: {ex.Message}", utcNow);
@@ -1040,8 +1181,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     // Get intent to find stream
                     if (_intentMap.TryGetValue(intentId, out var intent))
                     {
-                        // Flatten position
-                        var flattenResult = Flatten(intentId, instrument, utcNow);
+                        // Flatten position with retry logic
+                        var flattenResult = FlattenWithRetry(intentId, instrument, utcNow);
                         
                         // Stand down stream
                         _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"UNPROTECTED_POSITION_TIMEOUT:{intentId}");
@@ -1084,10 +1225,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         // Cancel all remaining intent orders
         CancelIntentOrders(intentId, utcNow);
         
-        // Flatten intent exposure
+        // Flatten intent exposure with retry logic
         if (_intentMap.TryGetValue(intentId, out var intent))
         {
-            Flatten(intentId, intent.Instrument, utcNow);
+            FlattenWithRetry(intentId, intent.Instrument, utcNow);
         }
         
         // Emit emergency log
@@ -1236,23 +1377,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             return FlattenResult.FailureResult(error, utcNow);
         }
 
-        try
-        {
-            return FlattenIntentReal(intentId, instrument, utcNow);
-        }
-        catch (Exception ex)
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_ERROR", state: "ENGINE",
-                new
-                {
-                    intent_id = intentId,
-                    instrument = instrument,
-                    error = ex.Message,
-                    exception_type = ex.GetType().Name
-                }));
-            
-            return FlattenResult.FailureResult($"Flatten intent failed: {ex.Message}", utcNow);
-        }
+        // Use retry logic for FlattenIntent as well
+        return FlattenWithRetry(intentId, instrument, utcNow);
     }
 
     /// <summary>

@@ -1,100 +1,67 @@
 #!/usr/bin/env python3
-"""
-Check recent ENGINE log events
-"""
-
+"""Check recent ENGINE events after reset"""
 import json
-from pathlib import Path
+import glob
 from datetime import datetime, timezone
-import pytz
-
-CHICAGO_TZ = pytz.timezone("America/Chicago")
-ENGINE_LOG_FILE = Path("logs/robot/robot_ENGINE.jsonl")
-
-def parse_timestamp(ts_str):
-    """Parse ISO timestamp."""
-    if not ts_str:
-        return None
-    try:
-        ts_str = ts_str.replace('Z', '+00:00')
-        dt = datetime.fromisoformat(ts_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except:
-        return None
 
 def main():
     print("=" * 80)
-    print("RECENT ENGINE LOG EVENTS")
+    print("RECENT ENGINE EVENTS CHECK (After Reset)")
     print("=" * 80)
+    print()
     
-    if not ENGINE_LOG_FILE.exists():
-        print(f"[X] File not found: {ENGINE_LOG_FILE}")
-        return
-    
-    # Read all events
+    # Load recent events
     events = []
-    try:
-        with open(ENGINE_LOG_FILE, 'r', encoding='utf-8-sig') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except:
-                    continue
-    except Exception as e:
-        print(f"[X] Error reading file: {e}")
-        return
+    cutoff = datetime.now(timezone.utc).timestamp() - 600  # Last 10 minutes
     
-    print(f"Total events: {len(events)}")
+    for log_file in glob.glob('logs/robot/robot_ENGINE*.jsonl'):
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                        ts_utc = event.get('ts_utc', '')
+                        if ts_utc:
+                            try:
+                                event_time = datetime.fromisoformat(ts_utc.replace('Z', '+00:00'))
+                                if event_time.timestamp() >= cutoff:
+                                    events.append(event)
+                            except:
+                                pass
+                    except:
+                        continue
+        except Exception as e:
+            print(f"  Error reading {log_file}: {e}")
     
-    # Show most recent events
-    recent_events = sorted([e for e in events if e.get('ts_utc')], 
-                          key=lambda x: x.get('ts_utc', ''))[-20:]
+    # Sort by timestamp
+    events.sort(key=lambda x: x.get('ts_utc', ''), reverse=True)
     
-    print(f"\n[RECENT EVENTS] (last 20)")
-    for evt in reversed(recent_events):
-        ts_str = evt.get('ts_utc', '')
-        ts = parse_timestamp(ts_str)
-        if ts:
-            chicago_time = ts.astimezone(CHICAGO_TZ)
-            elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
-            
-            event_type = evt.get('event_type', '')
-            event = evt.get('event', '')
-            event_name = event or event_type or 'NO_TYPE'
-            
-            print(f"\n  {chicago_time.strftime('%H:%M:%S')} CT ({elapsed:.0f}s ago)")
-            print(f"    Event: {event_name}")
-            print(f"    Source: {evt.get('source', 'N/A')}")
-            print(f"    Stream: {evt.get('stream', 'N/A')}")
-            
-            # Check for errors
-            if 'ERROR' in event_name or 'ERROR' in str(evt.get('data', {})):
-                data = evt.get('data', {})
-                if isinstance(data, dict):
-                    error = data.get('error', data.get('message', ''))
-                    if error:
-                        print(f"    ERROR: {error}")
+    print(f"Total ENGINE events in last 10 minutes: {len(events)}")
+    print()
     
-    # Check for conversion errors
-    conversion_errors = [e for e in events if 'CONVERSION_ERROR' in str(e.get('event', '')) or 'CONVERSION_ERROR' in str(e.get('event_type', ''))]
-    print(f"\n[LOGGER CONVERSION ERRORS] Found {len(conversion_errors)}")
-    if conversion_errors:
-        for evt in conversion_errors[-5:]:
-            ts_str = evt.get('ts_utc', '')
-            ts = parse_timestamp(ts_str)
-            if ts:
-                chicago_time = ts.astimezone(CHICAGO_TZ)
-                print(f"  {chicago_time.strftime('%H:%M:%S')} CT - {evt.get('event', evt.get('event_type', ''))}")
-                data = evt.get('data', {})
-                if isinstance(data, dict):
-                    error = data.get('error', data.get('message', ''))
-                    if error:
-                        print(f"    Error: {error}")
+    # Check for ENGINE_TICK_CALLSITE
+    tick_callsite = [e for e in events if e.get('event') == 'ENGINE_TICK_CALLSITE']
+    print(f"ENGINE_TICK_CALLSITE events: {len(tick_callsite)}")
+    
+    # Show recent events
+    print("\nMost recent ENGINE events:")
+    for e in events[:30]:
+        ts = e.get('ts_utc', '')[:19] if e.get('ts_utc') else 'N/A'
+        event_name = e.get('event', 'N/A')
+        print(f"  {ts} | {event_name}")
+    
+    # Check event types
+    print("\nEvent type counts:")
+    event_counts = {}
+    for e in events:
+        event_name = e.get('event', 'UNKNOWN')
+        event_counts[event_name] = event_counts.get(event_name, 0) + 1
+    
+    for event_name, count in sorted(event_counts.items(), key=lambda x: x[1], reverse=True)[:15]:
+        print(f"  {event_name}: {count}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

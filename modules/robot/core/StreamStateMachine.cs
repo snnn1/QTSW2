@@ -140,6 +140,7 @@ public sealed class StreamStateMachine
     private DateTimeOffset? _lastSlotGateDiagnostic = null; // Rate-limiting for SLOT_GATE_DIAGNOSTIC
     private DateTimeOffset? _lastBarDiagnosticTime = null; // Rate-limiting for BAR_RECEIVED_DIAGNOSTIC
     private bool _lastSlotGateState = false; // Track previous gate state for change detection
+    private DateTimeOffset? _lastStuckRangeBuildingAlertUtc = null; // Rate-limiting for RANGE_BUILDING_STUCK_PAST_SLOT_TIME alert
     
     // Pre-hydration state
     private bool _preHydrationComplete = false; // Must be true before entering ARMED/RANGE_BUILDING
@@ -163,6 +164,8 @@ public sealed class StreamStateMachine
     private const int DATA_FEED_STALL_THRESHOLD_MINUTES = 3; // Warn if no bars for 3+ minutes
     private DateTimeOffset? _lastBarTimestampUtc = null; // Detect out-of-order bars
     private bool _slotEndSummaryLogged = false; // Ensure exactly one summary per slot
+    private DateTimeOffset? _lastTickTraceUtc = null; // Rate-limiting for tick trace logging
+    private DateTimeOffset? _lastTickCalledUtc = null; // Rate-limiting for tick call logging
     
     // Logging rate limiting
     private bool _rangeComputeStartLogged = false; // Ensure RANGE_COMPUTE_START only logged once per slot
@@ -172,8 +175,6 @@ public sealed class StreamStateMachine
     private DateTimeOffset? _lastStuckStateCheckUtc = null; // Rate-limit stuck state checks (once per 5 minutes max)
     private DateTimeOffset? _lastLiveBarAgeWarningUtc = null; // Rate-limit BAR_PARTIAL_WARNING_LIVE_FEED (once per stream per 5 minutes)
     private DateTimeOffset? _lastBarBufferedStateIndependentUtc = null; // Rate-limit BAR_BUFFERED_STATE_INDEPENDENT (once per stream per 5 minutes)
-    private DateTimeOffset? _lastTickTraceUtc = null; // Rate-limit TICK_TRACE (once per stream per 5 minutes)
-    private DateTimeOffset? _lastTickCalledUtc = null; // Rate-limit TICK_CALLED (once per stream per 1 minute)
     private DateTimeOffset? _lastPreHydrationHandlerTraceUtc = null; // Rate-limit PRE_HYDRATION_HANDLER_TRACE (once per stream per 5 minutes)
     private DateTimeOffset? _lastArmedWaitingForBarsLogUtc = null; // Rate-limit ARMED_WAITING_FOR_BARS (once per stream per 5 minutes)
     
@@ -771,118 +772,6 @@ public sealed class StreamStateMachine
     public void Tick(DateTimeOffset utcNow)
     {
         // DIAGNOSTIC: Unconditional log to verify Tick() is being called at all
-        // This will help identify if Tick() is not being called or if there's a code path issue
-        // Use RobotEvents.Base() format but handle null _time gracefully
-        try
-        {
-            if (_log != null && _time != null)
-            {
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate ?? "", Stream ?? "", Instrument ?? "", Session ?? "", SlotTimeChicago ?? "", SlotTimeUtc,
-                    "TICK_METHOD_ENTERED", State.ToString(),
-                    new
-                    {
-                        stream_id = Stream ?? "UNKNOWN",
-                        current_state = State.ToString(),
-                        utc_now = utcNow.ToString("o"),
-                        note = "Unconditional diagnostic: Tick() method was entered"
-                    }));
-            }
-            else if (_log != null)
-            {
-                // Fallback: _time is null, use minimal format
-                var fallbackEvent = new Dictionary<string, object>
-                {
-                    ["event"] = "TICK_METHOD_ENTERED",
-                    ["stream"] = Stream ?? "UNKNOWN",
-                    ["trading_date"] = TradingDate ?? "",
-                    ["instrument"] = Instrument ?? "",
-                    ["session"] = Session ?? "",
-                    ["state"] = State.ToString(),
-                    ["ts_utc"] = utcNow.ToString("o"),
-                    ["data"] = new Dictionary<string, object>
-                    {
-                        ["payload"] = new Dictionary<string, object>
-                        {
-                            ["stream_id"] = Stream ?? "UNKNOWN",
-                            ["current_state"] = State.ToString(),
-                            ["time_null"] = true,
-                            ["note"] = "Unconditional diagnostic: Tick() entered but _time is null"
-                        }
-                    }
-                };
-                _log.Write(fallbackEvent);
-            }
-        }
-        catch (Exception ex)
-        {
-            // Try to log the error itself
-            try
-            {
-                if (_log != null)
-                {
-                    var errorEvent = new Dictionary<string, object>
-                    {
-                        ["event"] = "TICK_METHOD_ENTERED_ERROR",
-                        ["stream"] = Stream ?? "UNKNOWN",
-                        ["ts_utc"] = utcNow.ToString("o"),
-                        ["error"] = ex.Message,
-                        ["note"] = "Tick() entered but logging failed"
-                    };
-                    _log.Write(errorEvent);
-                }
-            }
-            catch (Exception innerEx)
-            {
-                LogCriticalError("TICK_METHOD_ENTERED_ERROR_FALLBACK_FAILED", innerEx, utcNow, new
-                {
-                    original_error = ex.Message,
-                    note = "Failed to log TICK_METHOD_ENTERED_ERROR fallback"
-                });
-            }
-        }
-
-        // DIAGNOSTIC: Rate-limited log (every 1 minute) to verify Tick() is being called
-        // This will help identify if Tick() is not being called at all
-        var shouldLogTickCalled = !_lastTickCalledUtc.HasValue || 
-            (utcNow - _lastTickCalledUtc.Value).TotalMinutes >= 1.0;
-        
-        if (shouldLogTickCalled && _log != null && _time != null)
-        {
-            try
-            {
-                _lastTickCalledUtc = utcNow;
-                var nowChicago = _time.ConvertUtcToChicago(utcNow).ToString("o");
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "TICK_CALLED", State.ToString(),
-                    new
-                    {
-                        stream_id = Stream,
-                        current_state = State.ToString(),
-                        now_chicago = nowChicago,
-                        execution_mode = _executionMode.ToString(),
-                        note = "Diagnostic: Tick() method was called (rate-limited to 1 min)"
-                    }));
-            }
-            catch (Exception ex)
-            {
-                // Log error but don't throw - we want to see if Tick() is being called even if logging fails
-                try
-                {
-                    if (_log != null)
-                    {
-                        _log.Write(RobotEvents.Base(_time ?? new TimeService("America/Chicago"), utcNow, TradingDate ?? "", Stream ?? "", Instrument ?? "", Session ?? "", SlotTimeChicago ?? "", SlotTimeUtc,
-                            "TICK_CALLED_ERROR", State.ToString(),
-                            new
-                            {
-                                stream_id = Stream ?? "N/A",
-                                error = ex.Message,
-                                note = "Diagnostic: Tick() called but logging failed"
-                            }));
-                    }
-                }
-                catch { }
-            }
-        }
 
         if (_journal.Committed)
         {
@@ -891,26 +780,66 @@ public sealed class StreamStateMachine
             return;
         }
 
-        // DIAGNOSTIC: Rate-limited TRACE log to confirm Tick() is executing per stream
-        // Log once per stream per 5 minutes
-        // CRITICAL: Always log (not gated by enable_diagnostic_logs) - needed for debugging stuck streams
-        var shouldLogTickTrace = !_lastTickTraceUtc.HasValue || 
-            (utcNow - _lastTickTraceUtc.Value).TotalMinutes >= 5.0;
-        
-        if (shouldLogTickTrace)
+
+        // OPTIONAL SAFETY ASSERTION: Detect stuck RANGE_BUILDING states
+        // If state == RANGE_BUILDING and now > slot_time + X minutes → log critical
+        // This guardrail would have caught the original bug automatically
+        if (State == StreamState.RANGE_BUILDING && SlotTimeUtc != DateTimeOffset.MinValue)
         {
-            _lastTickTraceUtc = utcNow;
-            var nowChicago = _time.ConvertUtcToChicago(utcNow);
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "TICK_TRACE", State.ToString(),
-                new
+            var minutesPastSlotTime = (utcNow - SlotTimeUtc).TotalMinutes;
+            const double STUCK_RANGE_BUILDING_THRESHOLD_MINUTES = 10.0; // Alert if stuck > 10 minutes past slot time
+            
+            // DIAGNOSTIC: Log safety assertion check (verifies assertion is running)
+            // Rate-limited to once per 15 minutes to confirm assertion is active without spam
+            var shouldLogAssertionCheck = !_lastStuckRangeBuildingAlertUtc.HasValue ||
+                                         (utcNow - _lastStuckRangeBuildingAlertUtc.Value).TotalMinutes >= 15.0;
+            
+            if (shouldLogAssertionCheck && minutesPastSlotTime <= STUCK_RANGE_BUILDING_THRESHOLD_MINUTES)
+            {
+                // Log that assertion is checking but threshold not exceeded (diagnostic confirmation)
+                var nowChicago = _time.ConvertUtcToChicago(utcNow);
+                var slotTimeChicago = _time.ConvertUtcToChicago(SlotTimeUtc);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RANGE_BUILDING_SAFETY_ASSERTION_CHECK", State.ToString(),
+                    new
+                    {
+                        minutes_past_slot_time = Math.Round(minutesPastSlotTime, 1),
+                        threshold_minutes = STUCK_RANGE_BUILDING_THRESHOLD_MINUTES,
+                        slot_time_chicago = slotTimeChicago.ToString("o"),
+                        current_time_chicago = nowChicago.ToString("o"),
+                        status = "OK",
+                        note = $"DIAGNOSTIC: Safety assertion is checking. Stream is {Math.Round(minutesPastSlotTime, 1)} minutes past slot time (threshold: {STUCK_RANGE_BUILDING_THRESHOLD_MINUTES} min). Assertion is active and monitoring."
+                    }));
+            }
+            
+            if (minutesPastSlotTime > STUCK_RANGE_BUILDING_THRESHOLD_MINUTES)
+            {
+                // Rate-limit this critical alert to once per 5 minutes
+                var shouldLogStuck = !_lastStuckRangeBuildingAlertUtc.HasValue ||
+                                    (utcNow - _lastStuckRangeBuildingAlertUtc.Value).TotalMinutes >= 5.0;
+                
+                if (shouldLogStuck)
                 {
-                    stream_id = Stream,
-                    current_state = State.ToString(),
-                    now_chicago = nowChicago.ToString("o"),
-                    execution_mode = _executionMode.ToString(),
-                    note = "Diagnostic: Confirms Tick() is executing for this stream"
-                }));
+                    _lastStuckRangeBuildingAlertUtc = utcNow;
+                    var nowChicago = _time.ConvertUtcToChicago(utcNow);
+                    var slotTimeChicago = _time.ConvertUtcToChicago(SlotTimeUtc);
+                    
+                    LogHealth("CRITICAL", "RANGE_BUILDING_STUCK_PAST_SLOT_TIME", 
+                        $"Stream stuck in RANGE_BUILDING state for {minutesPastSlotTime:F1} minutes past slot time. " +
+                        $"Slot time: {slotTimeChicago:HH:mm:ss} CT, Current: {nowChicago:HH:mm:ss} CT. " +
+                        $"This may indicate Tick() is not running or range lock check is failing.",
+                        new
+                        {
+                            minutes_past_slot_time = Math.Round(minutesPastSlotTime, 1),
+                            slot_time_chicago = slotTimeChicago.ToString("o"),
+                            current_time_chicago = nowChicago.ToString("o"),
+                            slot_time_utc = SlotTimeUtc.ToString("o"),
+                            current_time_utc = utcNow.ToString("o"),
+                            threshold_minutes = STUCK_RANGE_BUILDING_THRESHOLD_MINUTES,
+                            note = "Safety assertion: Would have caught original bug where Tick() stopped running"
+                        });
+                }
+            }
         }
 
         switch (State)
@@ -1735,10 +1664,10 @@ public sealed class StreamStateMachine
                     try
                     {
                         var chicagoNow = _time.ConvertUtcToChicago(utcNow);
-                        var barCount = GetBarBufferCount();
+                        var preHydrationBarCount = GetBarBufferCount();
                         var preHydrationData = new Dictionary<string, object>
                         {
-                            ["bar_count"] = barCount,
+                            ["bar_count"] = preHydrationBarCount,
                             ["execution_mode"] = _executionMode.ToString(),
                             ["transition_reason"] = "PRE_HYDRATION_COMPLETE_SIM"
                         };
@@ -1948,10 +1877,10 @@ public sealed class StreamStateMachine
                 try
                 {
                     var chicagoNow = _time.ConvertUtcToChicago(utcNow);
-                    var barCount = GetBarBufferCount();
+                    var preHydrationBarCount = GetBarBufferCount();
                     var preHydrationData = new Dictionary<string, object>
                     {
-                        ["bar_count"] = barCount,
+                        ["bar_count"] = preHydrationBarCount,
                         ["execution_mode"] = _executionMode.ToString(),
                         ["transition_reason"] = shouldForceTransition ? "PRE_HYDRATION_FORCED_TIMEOUT" : "PRE_HYDRATION_COMPLETE",
                         ["historical_bar_count"] = historicalBarCount,
@@ -2451,7 +2380,7 @@ public sealed class StreamStateMachine
             if (shouldLogBar)
             {
                 _lastBarDiagnosticTime = utcNow;
-                var inRange = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
+                var inRange = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "BAR_RECEIVED_DIAGNOSTIC", State.ToString(),
                     new
@@ -2501,15 +2430,16 @@ public sealed class StreamStateMachine
         _lastBarReceivedUtc = utcNow;
         _lastBarTimestampUtc = barUtc;
         
-        // Buffer bars that fall within [range_start, slot_time) using Chicago time comparison
+        // Buffer bars that fall within [range_start, slot_time] using Chicago time comparison
         // Bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)
         // Range window is defined in Chicago time to match trading session semantics
         // State-independent buffering: Always buffer bars within range window regardless of state
+        // CRITICAL FIX: Include slot_time bar (<= instead of <) so range lock check runs when slot_time bar arrives
         
         // DIAGNOSTIC: Proof log for 1-minute boundary investigation
         // Log every bar admission decision with raw timestamp, Chicago time, comparison result, and source
         var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
-        var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime;
+        var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "BAR_ADMISSION_PROOF", State.ToString(),
             new
@@ -2524,13 +2454,13 @@ public sealed class StreamStateMachine
                 slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
                 comparison_result = comparisonResult,
                 comparison_detail = comparisonResult 
-                    ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago < slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
-                    : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss}))",
+                    ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago <= slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
+                    : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss})]",
                 bar_source = barSourceStr,
                 note = "Diagnostic proof log - bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)"
             }));
         
-        if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime < SlotTimeChicagoTime)
+        if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime)
         {
                 // DEFENSIVE: Validate bar data before buffering
                 string? validationError = null;

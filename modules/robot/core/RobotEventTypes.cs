@@ -70,10 +70,6 @@ public static class RobotEventTypes
         ["ENGINE_TICK_INVALID_STATE"] = "ERROR",
         ["ENGINE_TICK_STALL_DETECTED"] = "ERROR",
         ["ENGINE_TICK_STALL_RECOVERED"] = "INFO",
-        ["ENGINE_HEARTBEAT"] = "INFO", // CRITICAL: Must be INFO level for Watchdog liveness monitoring
-        ["ENGINE_TICK_HEARTBEAT"] = "DEBUG",
-        ["ENGINE_TICK_HEARTBEAT_AUDIT"] = "DEBUG",
-        ["ENGINE_BAR_HEARTBEAT"] = "DEBUG",
         
         // Timer diagnostics
         ["TIMER_LIFECYCLE_STATE_TRANSITION"] = "INFO",
@@ -325,10 +321,6 @@ public static class RobotEventTypes
         ["BE_MODIFY_DRYRUN"] = "DEBUG",
         
         // Tick/stream state
-        ["TICK_METHOD_ENTERED"] = "DEBUG",
-        ["TICK_METHOD_ENTERED_ERROR"] = "ERROR",
-        ["TICK_CALLED"] = "DEBUG",
-        ["TICK_TRACE"] = "DEBUG",
         ["UPDATE_APPLIED"] = "DEBUG",
         
         // Session
@@ -355,8 +347,7 @@ public static class RobotEventTypes
     {
         // Engine lifecycle
         "ENGINE_START", "ENGINE_STOP", "ENGINE_STAND_DOWN", "ENGINE_TICK_INVALID_STATE",
-        "ENGINE_TICK_STALL_DETECTED", "ENGINE_TICK_STALL_RECOVERED", "ENGINE_HEARTBEAT",
-        "ENGINE_TICK_HEARTBEAT", "ENGINE_TICK_HEARTBEAT_AUDIT", "ENGINE_BAR_HEARTBEAT",
+        "ENGINE_TICK_STALL_DETECTED", "ENGINE_TICK_STALL_RECOVERED",
         "TIMER_LIFECYCLE_STATE_TRANSITION", "TIMER_LIFECYCLE_START_ATTEMPT", "TIMER_LIFECYCLE_START_SKIPPED", "TIMER_LIFECYCLE_STARTED", "TIMER_LIFECYCLE_ERROR",
         "TIMER_GATE_EARLY_RETURN", "TIMER_META_HEARTBEAT", "TIMER_CALLBACK_EXCEPTION",
         
@@ -483,7 +474,6 @@ public static class RobotEventTypes
         "TARGET_ORDER_DRYRUN", "BE_MODIFY_DRYRUN",
         
         // Tick/stream state
-        "TICK_METHOD_ENTERED", "TICK_METHOD_ENTERED_ERROR", "TICK_CALLED", "TICK_TRACE",
         "UPDATE_APPLIED",
         
         // Session

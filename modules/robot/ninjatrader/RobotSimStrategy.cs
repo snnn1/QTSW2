@@ -14,6 +14,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -30,14 +31,30 @@ namespace NinjaTrader.NinjaScript.Strategies
     /// <summary>
     /// Robot SIM Strategy: Hosts RobotEngine in NinjaTrader SIM account.
     /// Provides NT context (Account, Instrument, Order/Execution events) to NinjaTraderSimAdapter.
+    /// 
+    /// INVARIANT: One execution instrument → one strategy instance per account.
+    /// Multiple strategy instances on the same (account, executionInstrument) are invalid and will cause
+    /// order tracking failures. This is enforced by duplicate instance detection during initialization.
     /// </summary>
     public class RobotSimStrategy : Strategy
     {
+        // FUTURE HARDENING: Track active instances to prevent duplicate deployments
+        // Key: (accountName, executionInstrumentFullName) - must be unique per account
+        private static readonly HashSet<(string account, string instrument)> _activeInstances = new();
+        private static readonly object _activeInstancesLock = new object();
+        
+        // Instance identifier for forensics (logged once at startup)
+        private readonly string _instanceId;
+        
         private RobotEngine? _engine;
         private NinjaTraderSimAdapter? _adapter;
         private bool _simAccountVerified = false;
         private bool _engineReady = false; // Single latch: true once engine is fully initialized and ready
         private bool _initFailed = false; // HARDENING FIX 3: Fail-closed flag - if true, strategy will not function
+        
+        // Track filtered callbacks for misconfiguration detection
+        private int _filteredOrderUpdateCount = 0;
+        private int _filteredExecutionUpdateCount = 0;
         
         // Rate-limiting for timezone detection logging (per instrument)
         private readonly Dictionary<string, DateTimeOffset> _lastTimezoneDetectionLogUtc = new Dictionary<string, DateTimeOffset>();
@@ -57,10 +74,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly Dictionary<string, DateTimeOffset> _lastOnBarUpdateLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int ON_BAR_UPDATE_RATE_LIMIT_MINUTES = 1; // Log at most once per minute per instrument
         
+        
         // Rate-limiting for BarsRequest skipped warnings (per instrument)
         private readonly Dictionary<string, DateTimeOffset> _lastBarsRequestSkippedLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BARSREQUEST_SKIPPED_RATE_LIMIT_MINUTES = 5; // Log at most once per 5 minutes per instrument
 
+        public RobotSimStrategy()
+        {
+            // Generate unique instance ID for forensics
+            _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
+        }
+        
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -116,6 +140,58 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                     _simAccountVerified = true;
                     Log($"SIM account verified: {Account.Name}", LogLevel.Information);
+                    
+                    // FUTURE HARDENING: Check for duplicate instance deployment
+                    // INVARIANT: (account, executionInstrument) must be unique
+                    // If violated → CRITICAL + stand down
+                    var executionInstrumentFullName = Instrument?.FullName ?? "UNKNOWN";
+                    // Note: accountName already declared above (line 128), reuse it
+                    var instanceKey = (accountName, executionInstrumentFullName);
+                    
+                    lock (_activeInstancesLock)
+                    {
+                        if (_activeInstances.Contains(instanceKey))
+                        {
+                            // CRITICAL: Duplicate instance detected - fail closed
+                            var errorMsg = $"CRITICAL: Duplicate strategy instance detected. " +
+                                         $"Another instance is already running on account '{accountName}' " +
+                                         $"with execution instrument '{executionInstrumentFullName}'. " +
+                                         $"INVARIANT VIOLATION: One execution instrument → one strategy instance per account. " +
+                                         $"Standing down to prevent order tracking failures.";
+                            
+                            Log(errorMsg, LogLevel.Error);
+                            _initFailed = true;
+                            
+                            // Log to engine if available (may not be initialized yet)
+                            try
+                            {
+                                var tempProjectRoot = ProjectRootResolver.ResolveProjectRoot();
+                                var tempLog = new RobotLogger(tempProjectRoot, Path.Combine(tempProjectRoot, "logs", "robot"), Instrument?.MasterInstrument?.Name ?? "UNKNOWN", null);
+                                tempLog.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "DUPLICATE_INSTANCE_DETECTED", state: "ENGINE",
+                                    new
+                                    {
+                                        error = errorMsg,
+                                        account = accountName,
+                                        execution_instrument = executionInstrumentFullName,
+                                        instance_id = _instanceId,
+                                        action = "STAND_DOWN",
+                                        invariant = "One execution instrument → one strategy instance per account"
+                                    }));
+                            }
+                            catch
+                            {
+                                // If logging fails, at least we've logged to NT console
+                            }
+                            
+                            return; // Abort initialization
+                        }
+                        
+                        // Register this instance
+                        _activeInstances.Add(instanceKey);
+                    }
+                    
+                    // FUTURE HARDENING: Log instance ID once at startup for forensics
+                    Log($"Strategy instance initialized: InstanceId={_instanceId}, Account={accountName}, ExecutionInstrument={executionInstrumentFullName}", LogLevel.Information);
 
                     // Diagnostic: Log NINJATRADER compilation status
 #if NINJATRADER
@@ -489,6 +565,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Terminated)
             {
                 _engine?.Stop();
+                
+                // FUTURE HARDENING: Unregister instance on termination
+                if (Account != null && Instrument != null)
+                {
+                    var executionInstrumentFullName = Instrument.FullName ?? "UNKNOWN";
+                    var accountName = Account.Name ?? "UNKNOWN";
+                    var instanceKey = (accountName, executionInstrumentFullName);
+                    
+                    lock (_activeInstancesLock)
+                    {
+                        _activeInstances.Remove(instanceKey);
+                    }
+                    
+                    // Log filtered callback counts if any occurred (useful signal for misconfiguration)
+                    if (_filteredOrderUpdateCount > 0 || _filteredExecutionUpdateCount > 0)
+                    {
+                        Log($"Instance terminated: InstanceId={_instanceId}, FilteredOrderUpdates={_filteredOrderUpdateCount}, FilteredExecutionUpdates={_filteredExecutionUpdateCount}", LogLevel.Information);
+                    }
+                }
             }
         }
 
@@ -1274,6 +1369,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var tickPrice = (decimal)e.Price;
                 var utcNow = DateTimeOffset.UtcNow;
                 
+                // CRITICAL FIX: Drive Tick() from tick flow to ensure continuous execution
+                // This ensures range lock checks and time-based logic run even when bars aren't closing
+                // Tick() is idempotent and safe to call frequently
+                // 
+                // INVARIANT: Tick() must run even when bars are not closing.
+                // Tick() must NEVER depend on OnBarUpdate liveness.
+                // This prevents regression if someone removes OnBarUpdate Tick() call.
+                
+                _engine.Tick(utcNow);
+                
                 // Check break-even triggers using tick price
                 CheckBreakEvenTriggersTickBased(tickPrice, utcNow);
             }
@@ -1463,6 +1568,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 if (_engine is null) return;
                 
+                // CRITICAL FIX: Filter orders by instrument to prevent cross-instance order tracking failures
+                // When multiple strategy instances run on the same account, all instances receive OrderUpdate
+                // callbacks for ALL orders. Each instance should only process orders for its own instrument.
+                // This prevents "EXECUTION_UPDATE_UNKNOWN_ORDER" errors when Instance B receives updates
+                // for orders submitted by Instance A.
+                if (e.Order?.Instrument != Instrument)
+                {
+                    // FUTURE HARDENING: Warn (not error) if filtered callback occurs
+                    // Useful signal if someone misconfigures charts (e.g., same instrument, multiple instances)
+                    _filteredOrderUpdateCount++;
+                    if (_filteredOrderUpdateCount == 1 || _filteredOrderUpdateCount % 10 == 0)
+                    {
+                        // Log first occurrence and every 10th occurrence (rate-limited)
+                        Log($"WARNING: OrderUpdate filtered - order instrument '{e.Order?.Instrument?.FullName ?? "NULL"}' " +
+                            $"does not match strategy instrument '{Instrument?.FullName ?? "NULL"}'. " +
+                            $"This may indicate misconfiguration (multiple instances on same instrument). " +
+                            $"Filtered count: {_filteredOrderUpdateCount}, InstanceId={_instanceId}", LogLevel.Warning);
+                    }
+                    return;
+                }
+                
                 // Update broker sync gate timestamp (before forwarding to adapter)
                 var utcNow = DateTimeOffset.UtcNow;
                 _engine.OnBrokerOrderUpdateObserved(utcNow);
@@ -1511,6 +1637,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 if (_engine is null) return;
+                
+                // CRITICAL FIX: Filter executions by instrument to prevent cross-instance order tracking failures
+                // When multiple strategy instances run on the same account, all instances receive ExecutionUpdate
+                // callbacks for ALL executions. Each instance should only process executions for its own instrument.
+                // This prevents fill handling errors when Instance B receives executions for orders submitted by Instance A.
+                if (e.Execution?.Order?.Instrument != Instrument)
+                {
+                    // FUTURE HARDENING: Warn (not error) if filtered callback occurs
+                    // Useful signal if someone misconfigures charts (e.g., same instrument, multiple instances)
+                    _filteredExecutionUpdateCount++;
+                    if (_filteredExecutionUpdateCount == 1 || _filteredExecutionUpdateCount % 10 == 0)
+                    {
+                        // Log first occurrence and every 10th occurrence (rate-limited)
+                        Log($"WARNING: ExecutionUpdate filtered - execution order instrument '{e.Execution?.Order?.Instrument?.FullName ?? "NULL"}' " +
+                            $"does not match strategy instrument '{Instrument?.FullName ?? "NULL"}'. " +
+                            $"This may indicate misconfiguration (multiple instances on same instrument). " +
+                            $"Filtered count: {_filteredExecutionUpdateCount}, InstanceId={_instanceId}", LogLevel.Warning);
+                    }
+                    return;
+                }
                 
                 // Update broker sync gate timestamp (before forwarding to adapter)
                 var utcNow = DateTimeOffset.UtcNow;

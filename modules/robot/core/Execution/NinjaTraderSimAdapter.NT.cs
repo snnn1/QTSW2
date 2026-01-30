@@ -22,6 +22,8 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class NinjaTraderSimAdapter
 {
+    // Note: Rate-limiting fields (_lastInstrumentMismatchLogUtc, INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES, 
+    // _lastInstrumentMismatchDiagLogUtc) are defined in the base class file (NinjaTraderSimAdapter.cs)
 
     /// <summary>
     /// Helper method to safely get order tag/name using dynamic typing.
@@ -56,9 +58,10 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
-    /// Check if executionInstrument matches the strategy's NinjaTrader Instrument exactly.
-    /// Anchors on Instrument instance comparison, not string roots.
-    /// Must match same contract AND same month (e.g., "MNG" must match "MNG 03-26").
+    /// Check if executionInstrument matches the strategy's NinjaTrader Instrument.
+    /// Handles both root-only names (e.g., "MGC") and full contract names (e.g., "MGC 04-26").
+    /// If executionInstrument is root-only, compares to strategy instrument root.
+    /// If executionInstrument includes contract month, requires exact match.
     /// </summary>
     private bool IsStrategyExecutionInstrument(string executionInstrument)
     {
@@ -69,36 +72,42 @@ public sealed partial class NinjaTraderSimAdapter
         if (strategyInstrument == null)
             return false;
         
-        // Anchor on Instrument instance: Try to resolve executionInstrument string to Instrument
         var trimmedInstrument = executionInstrument?.Trim();
         if (string.IsNullOrWhiteSpace(trimmedInstrument))
             return false;
         
+        var strategyFullName = strategyInstrument.FullName ?? "";
+        var strategyRoot = strategyFullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        
+        // CRITICAL FIX: Check if executionInstrument is root-only (no space = no contract month)
+        // If it's root-only, compare to strategy instrument root
+        var executionParts = trimmedInstrument.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        var isRootOnly = executionParts.Length == 1;
+        
+        if (isRootOnly)
+        {
+            // Root-only comparison: "MGC" matches "MGC 04-26"
+            return string.Equals(strategyRoot, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
+        }
+        
+        // Full contract name provided: require exact match
         try
         {
-            // Resolve executionInstrument string to Instrument instance
             var resolvedInstrument = Instrument.GetInstrument(trimmedInstrument);
-            
             if (resolvedInstrument == null)
             {
-                // If resolution fails, extract root from strategy's FullName and compare strings
-                // This handles cases where executionInstrument is just "MNG" but strategy has "MNG 03-26"
-                var strategyFullName = strategyInstrument.FullName ?? "";
-                var strategyRoot = strategyFullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-                return string.Equals(strategyRoot, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
+                // Resolution failed - compare strings directly
+                return string.Equals(strategyFullName, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
             }
             
-            // Compare Instrument instances directly (reference equality or FullName match)
-            // This ensures exact contract + month match
+            // Compare Instrument instances (reference equality or FullName match)
             return ReferenceEquals(resolvedInstrument, strategyInstrument) || 
-                   string.Equals(resolvedInstrument.FullName, strategyInstrument.FullName, StringComparison.OrdinalIgnoreCase);
+                   string.Equals(resolvedInstrument.FullName, strategyFullName, StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
-            // If resolution throws, fall back to string root comparison
-            var strategyFullName = strategyInstrument.FullName ?? "";
-            var strategyRoot = strategyFullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
-            return string.Equals(strategyRoot, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
+            // If resolution throws, fall back to string comparison
+            return string.Equals(strategyFullName, trimmedInstrument, StringComparison.OrdinalIgnoreCase);
         }
     }
 
@@ -173,13 +182,26 @@ public sealed partial class NinjaTraderSimAdapter
             var error = $"Execution instrument '{instrument}' does not match strategy's Instrument. " +
                        $"Strategy Instrument: {(_ntInstrument as Instrument)?.FullName ?? "NULL"}. " +
                        $"Orders can only be placed on the strategy's enabled Instrument.";
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            
+            // OPERATIONAL HYGIENE: Rate-limit INSTRUMENT_MISMATCH logging to prevent log flooding
+            // Log once per hour per instrument to avoid masking other signals
+            var shouldLog = !_lastInstrumentMismatchLogUtc.TryGetValue(instrument, out var lastLogUtc) ||
+                           (utcNow - lastLogUtc).TotalMinutes >= INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES;
+            
+            if (shouldLog)
             {
-                error,
-                requested_instrument = instrument,
-                strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
-                reason = "INSTRUMENT_MISMATCH"
-            }));
+                _lastInstrumentMismatchLogUtc[instrument] = utcNow;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+                {
+                    error,
+                    requested_instrument = instrument,
+                    strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
+                    reason = "INSTRUMENT_MISMATCH",
+                    rate_limited = true,
+                    note = $"INSTRUMENT_MISMATCH logging rate-limited to once per {INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES} minute(s) per instrument to prevent log flooding"
+                }));
+            }
+            
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
@@ -2356,13 +2378,49 @@ public sealed partial class NinjaTraderSimAdapter
             var error = $"Execution instrument '{instrument}' does not match strategy's Instrument. " +
                        $"Strategy Instrument: {(_ntInstrument as Instrument)?.FullName ?? "NULL"}. " +
                        $"Orders can only be placed on the strategy's enabled Instrument.";
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+            
+            // OPERATIONAL HYGIENE: Rate-limit INSTRUMENT_MISMATCH logging to prevent log flooding
+            // Log once per hour per instrument to avoid masking other signals
+            var shouldLog = !_lastInstrumentMismatchLogUtc.TryGetValue(instrument, out var lastLogUtc) ||
+                           (utcNow - lastLogUtc).TotalMinutes >= INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES;
+            
+            if (shouldLog)
             {
-                error,
-                requested_instrument = instrument,
-                strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
-                reason = "INSTRUMENT_MISMATCH"
-            }));
+                _lastInstrumentMismatchLogUtc[instrument] = utcNow;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_BLOCKED", new
+                {
+                    error,
+                    requested_instrument = instrument,
+                    strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
+                    reason = "INSTRUMENT_MISMATCH",
+                    rate_limited = true,
+                    note = $"INSTRUMENT_MISMATCH logging rate-limited to once per {INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES} minute(s) per instrument to prevent log flooding"
+                }));
+            }
+            else
+            {
+                // DIAGNOSTIC: Log when rate-limiting is active (verifies rate-limiting fix is working)
+                // Log this diagnostic once per 10 minutes to confirm rate-limiting without flooding
+                var shouldLogDiag = !_lastInstrumentMismatchDiagLogUtc.TryGetValue(instrument, out var lastDiagLogUtc) ||
+                                   (utcNow - lastDiagLogUtc).TotalMinutes >= 10.0;
+                
+                if (shouldLogDiag)
+                {
+                    _lastInstrumentMismatchDiagLogUtc[instrument] = utcNow;
+                    var minutesSinceLastLog = lastLogUtc != DateTimeOffset.MinValue ? (utcNow - lastLogUtc).TotalMinutes : 0;
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "INSTRUMENT_MISMATCH_RATE_LIMITED", new
+                    {
+                        requested_instrument = instrument,
+                        strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
+                        reason = "INSTRUMENT_MISMATCH",
+                        rate_limiting_active = true,
+                        minutes_since_last_log = Math.Round(minutesSinceLastLog, 1),
+                        rate_limit_minutes = INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES,
+                        note = $"DIAGNOSTIC: INSTRUMENT_MISMATCH rate-limiting is working. Last log was {Math.Round(minutesSinceLastLog, 1)} minutes ago. This block is suppressed."
+                    }));
+                }
+            }
+            
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 

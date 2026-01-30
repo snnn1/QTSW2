@@ -40,8 +40,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string _executionPolicyPath = ""; // PHASE 4: Execution policy file path
     private ExecutionPolicy? _executionPolicy; // PHASE 4: Loaded execution policy
     
-    // PHASE 3.1: Execution instrument from constructor (MES, ES, MNG, NG, etc.)
-    private readonly string? _executionInstrument;
+    // PHASE 3.1: Single-executor guard for canonical markets
+    private CanonicalMarketLock? _canonicalMarketLock;
+    private readonly string? _executionInstrument; // Execution instrument from constructor (MES, ES, etc.)
 
     private string? _lastTimetableHash;
     private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
@@ -84,14 +85,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly string _loggingConfigPath;
     private readonly string? _resolvedLogDirWarning;
 
-    // ENGINE-level bar ingress diagnostic (rate-limiting per instrument)
-    private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new();
-    private int BAR_HEARTBEAT_RATE_LIMIT_MINUTES => _loggingConfig.enable_diagnostic_logs ? 1 : 5; // More frequent if diagnostics enabled
-    
-    // PATTERN 1: Bar-driven ENGINE_TICK_HEARTBEAT tracking (per instrument)
-    private readonly Dictionary<string, DateTimeOffset> _lastBarDrivenHeartbeatPerInstrument = new();
-    private readonly Dictionary<string, int> _barsSinceLastHeartbeatPerInstrument = new();
-    private const int BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS = 60; // Emit at most once per 60 seconds per instrument
     
     // BarsRequest completion tracking (per instrument)
     // Tracks pending BarsRequest to prevent range lock before bars arrive
@@ -104,6 +97,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Gap violation summary tracking (rate-limited)
     private DateTimeOffset? _lastGapViolationSummaryUtc = null;
+    
+    // PHASE 3.1: Identity invariants status tracking (rate-limited)
+    private DateTimeOffset? _lastIdentityInvariantsCheckUtc = null;
+    private const int IDENTITY_INVARIANTS_CHECK_INTERVAL_SECONDS = 60; // Check every 60 seconds
+    private bool _lastIdentityInvariantsPass = true; // Track last status for on-change emission
     
     // Bar rejection tracking for summary events
     private readonly Dictionary<string, BarRejectionStats> _barRejectionStats = new Dictionary<string, BarRejectionStats>();
@@ -289,6 +287,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _executionMode = executionMode;
         _executionInstrument = instrument; // PHASE 3.1: Store execution instrument for canonical lock
         
+        // Log the instrument passed from NinjaTrader (for debugging)
+        if (!string.IsNullOrWhiteSpace(instrument))
+        {
+            // Note: Can't use LogEvent here because logger isn't initialized yet
+            // This will be logged later in Start() after logger is ready
+        }
+        
         // Load logging configuration
         _loggingConfig = LoggingConfig.LoadFromFile(projectRoot);
         _loggingConfigPath = Path.Combine(projectRoot, "configs", "robot", "logging.json");
@@ -367,19 +372,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Start()
     {
-        // DEFENSIVE: Guarantee run_id is always set before any operations
-        if (string.IsNullOrEmpty(_runId))
-        {
-            _runId = Guid.NewGuid().ToString("N");
-            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RUN_ID_AUTO_GENERATED", state: "ENGINE",
-                new
-                {
-                    run_id = _runId,
-                    note = "run_id was missing and auto-generated at Start() - this should not happen under normal operation"
-                }));
-        }
-        
         // CRITICAL: Set run_id before any Start-path logs
+        _runId = Guid.NewGuid().ToString("N");
         _log.SetRunId(_runId);
 
         var utcNow = DateTimeOffset.UtcNow;
@@ -479,83 +473,76 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _time = new TimeService(_spec.timezone);
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_LOADED", state: "ENGINE",
                     new { spec_name = _spec.spec_name, spec_revision = _spec.spec_revision, timezone = _spec.timezone }));
-            }
-            catch (Exception ex)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE",
-                    new { error = ex.Message }));
-                throw;
-            }
-
-            // PHASE 4: Load execution policy (startup-only, not reloadable)
-            try
-            {
-                // Resolve absolute path for definitive logging
-                var absolutePolicyPath = Path.IsPathRooted(_executionPolicyPath) 
-                    ? _executionPolicyPath 
-                    : Path.Combine(_root, _executionPolicyPath);
-                absolutePolicyPath = Path.GetFullPath(absolutePolicyPath);
                 
-                _executionPolicy = ExecutionPolicy.LoadFromFile(absolutePolicyPath);
-                
-                // Compute file hash for audit trail
-                var policyFileHash = "";
+                // PHASE 4: Load execution policy (startup-only, not reloadable)
                 try
                 {
-                    var policyBytes = File.ReadAllBytes(absolutePolicyPath);
-                    using (var sha256 = System.Security.Cryptography.SHA256.Create())
-                    {
-                        var hashBytes = sha256.ComputeHash(policyBytes);
-                        policyFileHash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Log but don't fail - hash is for audit only
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_HASH_ERROR", state: "ENGINE",
-                        new { error = ex.Message, note = "Failed to compute policy file hash (non-blocking)" }));
-                }
-                
-                // Extract parsed values for diagnostic logging (raw JSON values, not derived)
-                var parsedValues = new Dictionary<string, object>();
-                foreach (var canonicalKvp in _executionPolicy.canonical_markets)
-                {
-                    var canonicalMarket = canonicalKvp.Key;
-                    var marketPolicy = canonicalKvp.Value;
-                    var execInstruments = new Dictionary<string, object>();
+                    // Resolve absolute path for definitive logging
+                    var absolutePolicyPath = Path.IsPathRooted(_executionPolicyPath) 
+                        ? _executionPolicyPath 
+                        : Path.Combine(_root, _executionPolicyPath);
+                    absolutePolicyPath = Path.GetFullPath(absolutePolicyPath);
                     
-                    foreach (var execKvp in marketPolicy.execution_instruments)
+                    _executionPolicy = ExecutionPolicy.LoadFromFile(absolutePolicyPath);
+                    
+                    // Compute file hash for audit trail
+                    var policyFileHash = "";
+                    try
                     {
-                        var execInst = execKvp.Key;
-                        var instPolicy = execKvp.Value;
-                        execInstruments[execInst] = new
+                        var policyBytes = File.ReadAllBytes(absolutePolicyPath);
+                        using (var sha256 = System.Security.Cryptography.SHA256.Create())
                         {
-                            enabled = instPolicy.enabled,
-                            base_size = instPolicy.base_size,
-                            max_size = instPolicy.max_size
-                        };
+                            var hashBytes = sha256.ComputeHash(policyBytes);
+                            policyFileHash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+                        }
                     }
-                    parsedValues[canonicalMarket] = execInstruments;
-                }
-                
-                // Log parsed values immediately after parsing (diagnostic)
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_PARSED", state: "ENGINE",
-                    new
+                    catch (Exception ex)
                     {
-                        parsed_values = parsedValues,
-                        note = "Raw parsed JSON values immediately after deserialization"
-                    }));
-                
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_LOADED", state: "ENGINE",
-                    new
+                        // Log but don't fail - hash is for audit only
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_HASH_ERROR", state: "ENGINE",
+                            new { error = ex.Message, note = "Failed to compute policy file hash (non-blocking)" }));
+                    }
+                    
+                    // Extract parsed values for diagnostic logging (raw JSON values, not derived)
+                    var parsedValues = new Dictionary<string, object>();
+                    foreach (var canonicalKvp in _executionPolicy.canonical_markets)
                     {
-                        file_path = absolutePolicyPath,
-                        file_path_relative = _executionPolicyPath,
-                        file_hash = policyFileHash,
-                        file_size_bytes = new FileInfo(absolutePolicyPath).Length,
-                        schema_id = _executionPolicy.schema,
-                        note = "Execution policy loaded at startup; not reloadable"
-                    }));
+                        var canonicalMarket = canonicalKvp.Key;
+                        var marketPolicy = canonicalKvp.Value;
+                        var execInstruments = new Dictionary<string, object>();
+                        
+                        foreach (var execKvp in marketPolicy.execution_instruments)
+                        {
+                            var execInst = execKvp.Key;
+                            var instPolicy = execKvp.Value;
+                            execInstruments[execInst] = new
+                            {
+                                enabled = instPolicy.enabled,
+                                base_size = instPolicy.base_size,
+                                max_size = instPolicy.max_size
+                            };
+                        }
+                        parsedValues[canonicalMarket] = execInstruments;
+                    }
+                    
+                    // Log parsed values immediately after parsing (diagnostic)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_PARSED", state: "ENGINE",
+                        new
+                        {
+                            parsed_values = parsedValues,
+                            note = "Raw parsed JSON values immediately after deserialization"
+                        }));
+                    
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_LOADED", state: "ENGINE",
+                        new
+                        {
+                            file_path = absolutePolicyPath,
+                            file_path_relative = _executionPolicyPath,
+                            file_hash = policyFileHash,
+                            file_size_bytes = new FileInfo(absolutePolicyPath).Length,
+                            schema_id = _executionPolicy.schema,
+                            note = "Execution policy loaded at startup; not reloadable"
+                        }));
                     
                     // 🔒 INVARIANT ENFORCEMENT: Log execution instrument anchor and policy validation at startup
                     // This provides proof of anchor and policy compliance for forensic clarity
@@ -593,20 +580,112 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                                 note = note
                             }));
                     }
-            }
-            catch (FileNotFoundException ex)
-            {
-                var errorMsg = $"PHASE 4: Execution policy file not found: {_executionPolicyPath}. Execution blocked.";
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_NOT_FOUND", state: "ENGINE",
-                    new { error = ex.Message, file_path = _executionPolicyPath, note = errorMsg }));
-                throw new InvalidOperationException(errorMsg, ex);
+                }
+                catch (FileNotFoundException ex)
+                {
+                    var errorMsg = $"PHASE 4: Execution policy file not found: {_executionPolicyPath}. Execution blocked.";
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy file is required. Execution blocked."
+                        }));
+                    throw new InvalidOperationException(errorMsg, ex);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Policy validation failed
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy validation failed. Execution blocked."
+                        }));
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var errorMsg = $"PHASE 4: Failed to load execution policy: {ex.Message}";
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            file_path = _executionPolicyPath,
+                            note = "Execution policy load/parse failed. Execution blocked."
+                        }));
+                    throw new InvalidOperationException(errorMsg, ex);
+                }
+                
+                // PHASE 4: Policy validation occurs in ApplyTimetable based on actual enabled directives
+                // No single-instrument assumption validation here - enforcement happens where streams are created
+                
+                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging
+                // This ensures observability consistency: lock acquisition happens before policy activation logs
+                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
+                {
+                    var canonicalInstrument = GetCanonicalInstrument(_executionInstrument);
+                    _canonicalMarketLock = new CanonicalMarketLock(_root, canonicalInstrument, _runId, _log);
+                    
+                    if (!_canonicalMarketLock.TryAcquire(utcNow))
+                    {
+                        // Lock acquisition failed - another instance is active
+                        var errorMsg = $"PHASE 3.1: Another robot instance is already executing canonical market '{canonicalInstrument}'. " +
+                                     $"This instance (execution instrument: {_executionInstrument}) will not start to prevent duplicate execution.";
+                        
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANONICAL_MARKET_ALREADY_ACTIVE", state: "ENGINE",
+                            new
+                            {
+                                canonical_instrument = canonicalInstrument,
+                                execution_instrument = _executionInstrument,
+                                run_id = _runId,
+                                note = errorMsg
+                            }));
+                        
+                        // Trigger high-priority alert
+                        if (_healthMonitor != null)
+                        {
+                            var notificationService = _healthMonitor.GetNotificationService();
+                            if (notificationService != null)
+                            {
+                                notificationService.EnqueueNotification(
+                                    "CANONICAL_MARKET_ALREADY_ACTIVE",
+                                    "CRITICAL: Duplicate Executor Blocked",
+                                    errorMsg,
+                                    priority: 2); // Emergency priority
+                            }
+                        }
+                        
+                        throw new InvalidOperationException(errorMsg);
+                    }
+                    
+                    // PHASE 4: Emit policy activation log AFTER lock acquisition (observability consistency)
+                    if (_executionPolicy != null)
+                    {
+                        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
+                        if (execInstPolicy != null && execInstPolicy.enabled)
+                        {
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
+                                new
+                                {
+                                    canonical_instrument = canonicalInstrument,
+                                    execution_instrument = _executionInstrument,
+                                    resolved_order_quantity = execInstPolicy.base_size,
+                                    base_size = execInstPolicy.base_size,
+                                    max_size = execInstPolicy.max_size,
+                                    note = "Policy loaded at startup; not reloadable"
+                                }));
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
-                var errorMsg = $"PHASE 4: Failed to load execution policy from {_executionPolicyPath}. Execution blocked.";
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_LOAD_FAILED", state: "ENGINE",
-                    new { error = ex.Message, exception_type = ex.GetType().Name, file_path = _executionPolicyPath, note = errorMsg }));
-                throw new InvalidOperationException(errorMsg, ex);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SPEC_INVALID", state: "ENGINE",
+                    new { error = ex.Message }));
+                throw;
             }
 
             // Initialize execution components now that spec is loaded
@@ -855,6 +934,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         warning = "Strategy started after range window — range may be incomplete or unavailable",
                         stream_id = stream.Stream,
                         instrument = stream.Instrument,
+                        execution_instrument = stream.ExecutionInstrument,
+                        canonical_instrument = stream.CanonicalInstrument,
                         session = stream.Session,
                         now_utc = utcNow.ToString("o"),
                         now_chicago = nowChicago.ToString("o"),
@@ -892,6 +973,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var enabledStreams = _streams.Values.Where(s => !s.Committed).ToList();
         var enabledInstruments = enabledStreams.Select(s => s.Instrument).Distinct().ToList();
         
+        // PHASE 4: Build quantity mapping for enabled streams (from policy)
+        // Note: Single-argument GetOrderQuantity() is acceptable here (banner/logging only, not stream creation)
+        var quantityMapping = enabledStreams
+            .GroupBy(s => s.ExecutionInstrument)
+            .Select(g => new
+            {
+                execution_instrument = g.Key,
+                quantity = GetOrderQuantity(g.Key), // Single-arg overload OK for logging
+                stream_count = g.Count()
+            })
+            .ToList();
+        
         var bannerData = new Dictionary<string, object?>
         {
             ["execution_mode"] = _executionMode.ToString(),
@@ -905,16 +998,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             ["spec_name"] = _spec?.spec_name ?? "NOT_LOADED",
             ["spec_revision"] = _spec?.spec_revision ?? "NOT_LOADED",
             ["kill_switch_enabled"] = _killSwitch != null && _killSwitch.IsEnabled(),
-            ["health_monitor_enabled"] = _healthMonitor != null
+            ["health_monitor_enabled"] = _healthMonitor != null,
+            // PHASE 4: Order quantity control (from policy file)
+            ["order_quantity_mapping"] = quantityMapping,
+            ["order_quantity_source"] = "EXECUTION_POLICY_FILE",
+            ["chart_trader_quantity_ignored"] = true
         };
         
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
             eventType: "OPERATOR_BANNER", state: "ENGINE", bannerData));
+        
+        // PHASE 4: Explicit log stating Chart Trader quantity is ignored (policy-controlled)
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+            eventType: "EXECUTION_QUANTITY_CONTROL", state: "ENGINE",
+            new
+            {
+                order_quantity_source = "EXECUTION_POLICY_FILE",
+                chart_trader_quantity_ignored = true,
+                execution_instrument_quantity_mapping = quantityMapping,
+                note = "Execution quantity is controlled by execution policy file; Chart Trader quantity is ignored. All orders use instrument-specific quantities from policy."
+            }));
     }
 
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
+        
+        // PHASE 3.1: Release canonical market lock on shutdown
+        _canonicalMarketLock?.Release(utcNow);
+        
         string? summaryPathToWrite = null;
         string? summaryJson = null;
 
@@ -961,6 +1073,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Tick(DateTimeOffset utcNow)
     {
+        // PHASE 3.1: Periodic identity invariants check (rate-limited)
+        CheckIdentityInvariantsIfNeeded(utcNow);
+        
         // Check for test notification trigger file (outside lock for performance)
         var triggerFile = Path.Combine(_root, "data", "test_notification_trigger.txt");
         if (File.Exists(triggerFile))
@@ -985,6 +1100,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             // HEARTBEAT: Emit unconditionally for process liveness (before any early returns)
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
+            
+            // WATCHDOG: Log ENGINE_TICK_CALLSITE for watchdog liveness monitoring
+            // This is the primary heartbeat indicator for engine liveness
+            // Rate-limited in event feed to every 5 seconds, but log every call here
+            // Watchdog uses this to detect engine stalls (threshold: 15 seconds)
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
+                new
+                {
+                    note = "Tick() called - watchdog liveness signal. Rate-limited in feed to every 5 seconds."
+                }));
+            
             // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
             _lastTickUtc = utcNow;
             _lastEngineTickUtc = utcNow; // Also update for broker sync gate
@@ -992,8 +1118,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 3: Update health monitor with engine tick timestamp
             _healthMonitor?.UpdateEngineTick(utcNow);
 
-            // PATTERN 1: ENGINE_TICK_HEARTBEAT is now emitted from OnBar() after bar acceptance
-            // Tick() no longer emits heartbeats - heartbeat is bar-driven only
 
             // TRADING READINESS: Guards that prevent trading logic from running when engine is not ready
             // CRITICAL: Defensive checks - engine must be initialized for trading logic
@@ -1196,32 +1320,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Update last tick timestamp for broker synchronization check
         // Bar updates indicate connection health, so track them for recovery sync
         _lastTickUtc = utcNow;
-
-        // ENGINE_BAR_HEARTBEAT: Diagnostic to prove bar ingress from NinjaTrader
-        // Only logged if diagnostic logs are enabled
-        if (_loggingConfig.enable_diagnostic_logs)
-        {
-            var shouldLogHeartbeat = !_lastBarHeartbeatPerInstrument.TryGetValue(instrument, out var lastHeartbeat) ||
-                                    (utcNow - lastHeartbeat).TotalMinutes >= BAR_HEARTBEAT_RATE_LIMIT_MINUTES;
-            
-            if (shouldLogHeartbeat)
-            {
-                _lastBarHeartbeatPerInstrument[instrument] = utcNow;
-                var barChicagoTimeHeartbeat = _time.ConvertUtcToChicago(barUtc);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_BAR_HEARTBEAT", state: "ENGINE",
-                    new
-                    {
-                        instrument = instrument,
-                        raw_bar_time = barUtc.ToString("o"),
-                        raw_bar_time_kind = barUtc.DateTime.Kind.ToString(),
-                        utc_time = barUtc.ToString("o"),
-                        chicago_time = barChicagoTimeHeartbeat.ToString("o"),
-                        chicago_offset = barChicagoTimeHeartbeat.Offset.ToString(),
-                        close_price = close,
-                        note = "engine-level diagnostic"
-                    }));
-            }
-        }
 
         // Validate bar date against locked trading date from timetable
         var barChicagoTime = _time.ConvertUtcToChicago(barUtc);
@@ -1462,12 +1560,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
-        // Pass bar data to streams of matching instrument
+        // PHASE 3: Assert bar instrument is execution (from NT)
+        // Note: Bar routing uses canonical matching, but input must be execution instrument
+        // This assertion ensures we're not accidentally passing canonical instrument to OnBar
+        
+        // 🔴 Diagnostic Point #2: Bar routing summary (canonical mapping verification)
+        var rawInstrument = instrument;
+        var canonicalInstrument = _spec != null ? GetCanonicalInstrument(instrument) : instrument;
         var streamsReceivingBar = new List<string>();
         var streamsFilteredOut = new List<string>();
+        var streamsChecked = 0;
         
         foreach (var s in _streams.Values)
         {
+            streamsChecked++;
+            // PHASE 3: IsSameInstrument receives execution instrument, compares canonical internally
             if (s.IsSameInstrument(instrument))
             {
                 streamsReceivingBar.Add($"{s.Session}_{s.SlotTimeChicago}");
@@ -1500,13 +1607,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
+        // 🔴 Diagnostic Point #2: Log bar routing summary (every bar, diagnostic-only)
+        if (_loggingConfig.enable_diagnostic_logs)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
+                new
+                {
+                    raw_instrument = rawInstrument,
+                    canonical_instrument = canonicalInstrument,
+                    streams_checked = streamsChecked,
+                    streams_matched = streamsReceivingBar.Count,
+                    streams_receiving_bar = streamsReceivingBar,
+                    note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
+                }));
+        }
+        
         // Log bar delivery summary periodically (rate-limited)
         LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
         
-        // PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance and processing
-        // This heartbeat represents "bars are being processed" and is the authoritative liveness signal
-        EmitBarDrivenHeartbeatIfNeeded(utcNow, instrument, barUtc, barChicagoTime);
-        }
+        } // Close lock (_engineLock)
     }
     
     /// <summary>
@@ -1578,6 +1697,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
     private const double BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES = 5.0;
     
+    // Bar acceptance heartbeat tracking (rate-limited)
+    private readonly Dictionary<string, DateTimeOffset> _lastBarHeartbeatPerInstrument = new Dictionary<string, DateTimeOffset>();
+    private const int BAR_HEARTBEAT_RATE_LIMIT_MINUTES = 5; // Log bar acceptance heartbeat every 5 minutes per instrument
+    
     /// <summary>
     /// Log bar delivery summary if interval has elapsed (rate-limited to every 5 minutes).
     /// </summary>
@@ -1605,49 +1728,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }));
     }
     
-    /// <summary>
-    /// PATTERN 1: Emit bar-driven ENGINE_TICK_HEARTBEAT after bar acceptance.
-    /// This heartbeat represents "bars are being processed" and is the authoritative liveness signal.
-    /// Rate-limited to once per 60 seconds per instrument.
-    /// </summary>
-    private void EmitBarDrivenHeartbeatIfNeeded(DateTimeOffset utcNow, string instrument, DateTimeOffset barUtc, DateTimeOffset barChicagoTime)
-    {
-        // Check if heartbeat is due for this instrument
-        var lastHeartbeatUtc = _lastBarDrivenHeartbeatPerInstrument.TryGetValue(instrument, out var last) ? last : DateTimeOffset.MinValue;
-        var timeSinceLastHeartbeat = (utcNow - lastHeartbeatUtc).TotalSeconds;
-        var shouldEmit = lastHeartbeatUtc == DateTimeOffset.MinValue || timeSinceLastHeartbeat >= BAR_DRIVEN_HEARTBEAT_RATE_LIMIT_SECONDS;
-        
-        if (!shouldEmit)
-        {
-            // Increment bar counter even if not emitting heartbeat
-            if (!_barsSinceLastHeartbeatPerInstrument.ContainsKey(instrument))
-            {
-                _barsSinceLastHeartbeatPerInstrument[instrument] = 0;
-            }
-            _barsSinceLastHeartbeatPerInstrument[instrument]++;
-            return;
-        }
-        
-        // Emit heartbeat
-        var barsSinceLastHeartbeat = _barsSinceLastHeartbeatPerInstrument.TryGetValue(instrument, out var count) ? count : 0;
-        _lastBarDrivenHeartbeatPerInstrument[instrument] = utcNow;
-        _barsSinceLastHeartbeatPerInstrument[instrument] = 0; // Reset counter
-        
-        // CONTRACT: bar_time_utc represents the bar open time.
-        // NinjaTrader emits bars on close; this system normalizes all bars to open time for Analyzer parity and deterministic range logic.
-        // This assumes 1-minute bars and is guarded by an invariant.
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_HEARTBEAT", state: "ENGINE",
-            new
-            {
-                instrument = instrument,
-                bar_time_utc = barUtc.ToString("o"),
-                bar_time_chicago = barChicagoTime.ToString("o"),
-                bars_since_last_heartbeat = barsSinceLastHeartbeat,
-                active_stream_count = _streams.Count,
-                recovery_state = _recoveryState.ToString(),
-                note = "bar-driven heartbeat (Pattern 1)"
-            }));
-    }
 
     /// <summary>
     /// Set session start time for an instrument (from TradingHours).
@@ -1681,178 +1761,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     /// <param name="instrument">Instrument name</param>
     /// <returns>Session start time in HH:MM format</returns>
-    /// <summary>
-    /// PHASE 3: Get canonical instrument for a given execution instrument.
-    /// Maps micro futures (MES, MNQ, MYM, etc.) to their base instruments (ES, NQ, YM, etc.).
-    /// Returns execution instrument unchanged if not a micro or if spec is unavailable.
-    /// </summary>
-    private string GetCanonicalInstrument(string executionInstrument)
-    {
-        if (_spec != null &&
-            _spec.TryGetInstrument(executionInstrument, out var inst) &&
-            inst.is_micro &&
-            !string.IsNullOrWhiteSpace(inst.base_instrument))
-        {
-            return inst.base_instrument.ToUpperInvariant(); // MYM → YM
-        }
-
-        return executionInstrument.ToUpperInvariant(); // YM → YM
-    }
-
-    /// <summary>
-    /// PHASE 4: Get order quantity for execution instrument from execution policy (canonical + execution overload).
-    /// PRIMARY PATH: Use this overload for stream creation to avoid GetCanonicalInstrument divergence risk.
-    /// </summary>
-    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
-    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
-    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
-    /// <exception cref="ArgumentException">If instrument is null or empty</exception>
-    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
-    public int GetOrderQuantity(string canonicalInstrument, string executionInstrument)
-    {
-        if (string.IsNullOrWhiteSpace(canonicalInstrument))
-        {
-            throw new ArgumentException("Canonical instrument cannot be null or empty", nameof(canonicalInstrument));
-        }
-        if (string.IsNullOrWhiteSpace(executionInstrument))
-        {
-            throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
-        }
-        
-        if (_executionPolicy == null)
-        {
-            throw new InvalidOperationException("PHASE 4: Execution policy not loaded. Cannot resolve order quantity.");
-        }
-        
-        var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
-        var execUpper = executionInstrument.Trim().ToUpperInvariant();
-        
-        // Get execution instrument policy
-        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalUpper, execUpper);
-        if (execInstPolicy == null)
-        {
-            throw new InvalidOperationException(
-                $"PHASE 4: Execution instrument '{executionInstrument}' not found in execution policy for canonical market '{canonicalInstrument}'. " +
-                $"Execution blocked.");
-        }
-        
-        if (!execInstPolicy.enabled)
-        {
-            throw new InvalidOperationException(
-                $"PHASE 4: Execution instrument '{executionInstrument}' is disabled in execution policy for canonical market '{canonicalInstrument}'. " +
-                $"Execution blocked.");
-        }
-        
-        // Return base_size (policy-controlled quantity)
-        var quantity = execInstPolicy.base_size;
-        
-        if (quantity <= 0)
-        {
-            throw new InvalidOperationException(
-                $"PHASE 4: Invalid quantity {quantity} for execution instrument '{executionInstrument}' in policy. " +
-                $"Quantity must be positive.");
-        }
-        
-        return quantity;
-    }
-
-    /// <summary>
-    /// PHASE 4: Get order quantity for execution instrument from execution policy (single-argument overload).
-    /// SECONDARY PATH: Use only for banner/logging, never for stream creation.
-    /// Relies on GetCanonicalInstrument() which could diverge from directive's canonical identity.
-    /// </summary>
-    /// <param name="executionInstrument">Execution instrument (e.g., "MES", "ES", "NQ")</param>
-    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
-    /// <exception cref="ArgumentException">If instrument is null or empty</exception>
-    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
-    public int GetOrderQuantity(string executionInstrument)
-    {
-        if (string.IsNullOrWhiteSpace(executionInstrument))
-        {
-            throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
-        }
-        
-        // GetCanonicalInstrument is pure and safe, but use canonical+execution overload for stream creation
-        var canonicalInstrument = GetCanonicalInstrument(executionInstrument);
-        return GetOrderQuantity(canonicalInstrument, executionInstrument);
-    }
-    
-    /// <summary>
-    /// Get order quantity info (baseSize, maxSize) from execution policy.
-    /// </summary>
-    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
-    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
-    /// <returns>Tuple of (baseSize, maxSize) from policy</returns>
-    /// <exception cref="InvalidOperationException">If policy not loaded, instrument not found, not enabled, or sizes invalid</exception>
-    public (int baseSize, int maxSize) GetOrderQuantityInfo(string canonicalInstrument, string executionInstrument)
-    {
-        if (_executionPolicy == null)
-        {
-            throw new InvalidOperationException("Execution policy not loaded");
-        }
-        
-        var policy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, executionInstrument);
-        if (policy == null)
-        {
-            throw new InvalidOperationException(
-                $"Execution instrument {executionInstrument} not found in policy for {canonicalInstrument}");
-        }
-        
-        if (!policy.enabled)
-        {
-            throw new InvalidOperationException(
-                $"Execution instrument {executionInstrument} not enabled for {canonicalInstrument}");
-        }
-        
-        if (policy.base_size <= 0 || policy.max_size <= 0)
-        {
-            throw new InvalidOperationException(
-                $"Invalid policy sizes: baseSize={policy.base_size}, maxSize={policy.max_size}");
-        }
-        
-        if (policy.base_size > policy.max_size)
-        {
-            throw new InvalidOperationException(
-                $"Policy violation: baseSize ({policy.base_size}) > maxSize ({policy.max_size})");
-        }
-        
-        return (policy.base_size, policy.max_size);
-    }
-
-    /// <summary>
-    /// Get the enabled execution instrument for a canonical market from the execution policy.
-    /// Returns the first enabled execution instrument found.
-    /// 
-    /// NOTE: This method is kept for diagnostic purposes only. It is NOT used for execution instrument selection
-    /// as that would violate the anchor invariant. The strategy's NinjaTrader instrument is the primary anchor,
-    /// and policy can only restrict (fail) if that instrument is disabled.
-    /// </summary>
-    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
-    /// <returns>Enabled execution instrument name, or null if none found</returns>
-    private string? GetEnabledExecutionInstrument(string canonicalInstrument)
-    {
-        if (_executionPolicy == null)
-        {
-            return null;
-        }
-        
-        var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
-        if (!_executionPolicy.canonical_markets.TryGetValue(canonicalUpper, out var marketPolicy))
-        {
-            return null;
-        }
-        
-        foreach (var kvp in marketPolicy.execution_instruments)
-        {
-            if (kvp.Value.enabled)
-            {
-                return kvp.Key; // Return the first enabled execution instrument
-            }
-        }
-        
-        return null;
-    }
-    
     private string GetSessionStartTime(string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument))
@@ -2158,7 +2066,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 streamsFed++;
             }
         }
-
+            
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_LOADED", state: "ENGINE",
                 new
                 {
@@ -2215,10 +2123,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         ApplyTimetable(_lastTimetable, utcNow);
 
         // Log stream creation with detailed stream information
+        // PHASE 1: Include both execution and canonical instruments for observability
         var streamDetails = _streams.Values.Select(s => new
         {
             stream_id = s.Stream,
             instrument = s.Instrument,
+            execution_instrument = s.ExecutionInstrument,
+            canonical_instrument = s.CanonicalInstrument,
             session = s.Session,
             slot_time = s.SlotTimeChicago,
             committed = s.Committed,
@@ -2256,8 +2167,271 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
 
+        // PHASE 3: Emit canonicalization self-test diagnostic
+        EmitCanonicalizationSelfTest(utcNow);
+
         // Check startup timing now that streams exist
         CheckStartupTiming(utcNow);
+    }
+    
+    /// <summary>
+    /// PHASE 3: Emit canonicalization self-test diagnostic event.
+    /// Provides observability for identity mapping verification.
+    /// </summary>
+    private void EmitCanonicalizationSelfTest(DateTimeOffset utcNow)
+    {
+        if (_spec is null || _time is null || !_activeTradingDate.HasValue)
+            return;
+        
+        var canonicalStreamIds = _streams.Values
+            .Select(s => s.Stream)
+            .OrderBy(s => s)
+            .ToList();
+        
+        var instrumentMappings = _streams.Values
+            .GroupBy(s => s.ExecutionInstrument)
+            .Select(g => new
+            {
+                execution_instrument = g.Key,
+                canonical_instrument = g.First().CanonicalInstrument,
+                stream_count = g.Count(),
+                streams = g.Select(s => s.Stream).OrderBy(s => s).ToList()
+            })
+            .OrderBy(m => m.execution_instrument)
+            .ToList();
+        
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "CANONICALIZATION_SELF_TEST", state: "ENGINE",
+            new
+            {
+                trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                total_streams = _streams.Count,
+                canonical_stream_ids = canonicalStreamIds,
+                instrument_mappings = instrumentMappings,
+                note = "PHASE 3: Canonicalization self-test - verifies execution/canonical identity mapping"
+            }));
+    }
+
+    /// <summary>
+    /// PHASE 3.1: Check identity invariants periodically and emit status event.
+    /// Rate-limited to once per 60 seconds and on-change.
+    /// </summary>
+    private void CheckIdentityInvariantsIfNeeded(DateTimeOffset utcNow)
+    {
+        // Rate limit: check every 60 seconds or on-change
+        var shouldCheck = !_lastIdentityInvariantsCheckUtc.HasValue ||
+                         (utcNow - _lastIdentityInvariantsCheckUtc.Value).TotalSeconds >= IDENTITY_INVARIANTS_CHECK_INTERVAL_SECONDS;
+        
+        if (!shouldCheck && _lastIdentityInvariantsPass)
+            return; // Too soon and last check passed - skip
+        
+        lock (_engineLock)
+        {
+            // Re-check time inside lock (may have changed)
+            if (_lastIdentityInvariantsCheckUtc.HasValue &&
+                (utcNow - _lastIdentityInvariantsCheckUtc.Value).TotalSeconds < IDENTITY_INVARIANTS_CHECK_INTERVAL_SECONDS &&
+                _lastIdentityInvariantsPass)
+            {
+                return; // Still too soon and passing
+            }
+            
+            var violations = new List<string>();
+            var canonicalInstrument = "";
+            var executionInstrument = _executionInstrument ?? "";
+            var streamIds = new List<string>();
+            
+            // Check 1: All stream IDs are canonical (no execution instrument in stream ID)
+            if (_spec != null && !string.IsNullOrWhiteSpace(executionInstrument))
+            {
+                canonicalInstrument = GetCanonicalInstrument(executionInstrument);
+                
+                foreach (var stream in _streams.Values)
+                {
+                    streamIds.Add(stream.Stream);
+                    
+                    // Check: Stream ID should not contain execution instrument if different from canonical
+                    if (executionInstrument != canonicalInstrument &&
+                        stream.Stream.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        violations.Add($"Stream ID '{stream.Stream}' contains execution instrument '{executionInstrument}' (should be canonical '{canonicalInstrument}')");
+                    }
+                    
+                    // Check: Stream.Instrument should equal CanonicalInstrument
+                    if (stream.Instrument != stream.CanonicalInstrument)
+                    {
+                        violations.Add($"Stream '{stream.Stream}': Instrument property '{stream.Instrument}' does not match CanonicalInstrument '{stream.CanonicalInstrument}'");
+                    }
+                    
+                    // Check: ExecutionInstrument is present
+                    if (string.IsNullOrWhiteSpace(stream.ExecutionInstrument))
+                    {
+                        violations.Add($"Stream '{stream.Stream}': ExecutionInstrument is null or empty");
+                    }
+                }
+            }
+            
+            var pass = violations.Count == 0;
+            var shouldEmit = !_lastIdentityInvariantsCheckUtc.HasValue || // First check
+                            pass != _lastIdentityInvariantsPass; // Status changed
+            
+            if (shouldEmit)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "IDENTITY_INVARIANTS_STATUS", state: "ENGINE",
+                    new
+                    {
+                        pass = pass,
+                        violations = violations,
+                        canonical_instrument = canonicalInstrument,
+                        execution_instrument = executionInstrument,
+                        stream_ids = streamIds.OrderBy(s => s).ToList(),
+                        checked_at_utc = utcNow.ToString("o"),
+                        note = pass 
+                            ? "All identity invariants passed - canonical and execution identities are consistent"
+                            : $"Identity violations detected: {string.Join("; ", violations)}"
+                    }));
+                
+                _lastIdentityInvariantsPass = pass;
+            }
+            
+            _lastIdentityInvariantsCheckUtc = utcNow;
+        }
+    }
+    
+    /// <summary>
+    /// PHASE 1: Get canonical instrument for a given execution instrument.
+    /// Maps micro futures (MES, MNQ, etc.) to their base instruments (ES, NQ, etc.).
+    /// Returns execution instrument unchanged if not a micro or if spec is unavailable.
+    /// </summary>
+    private string GetCanonicalInstrument(string executionInstrument)
+    {
+        if (_spec != null &&
+            _spec.TryGetInstrument(executionInstrument, out var inst) &&
+            inst.is_micro &&
+            !string.IsNullOrWhiteSpace(inst.base_instrument))
+        {
+            return inst.base_instrument.ToUpperInvariant(); // MES → ES
+        }
+
+        return executionInstrument.ToUpperInvariant(); // ES → ES
+    }
+
+    /// <summary>
+    /// PHASE 4: Get order quantity for execution instrument from execution policy (canonical + execution overload).
+    /// PRIMARY PATH: Use this overload for stream creation to avoid GetCanonicalInstrument divergence risk.
+    /// </summary>
+    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
+    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
+    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
+    /// <exception cref="ArgumentException">If instrument is null or empty</exception>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
+    public int GetOrderQuantity(string canonicalInstrument, string executionInstrument)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalInstrument))
+        {
+            throw new ArgumentException("Canonical instrument cannot be null or empty", nameof(canonicalInstrument));
+        }
+        if (string.IsNullOrWhiteSpace(executionInstrument))
+        {
+            throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
+        }
+        
+        if (_executionPolicy == null)
+        {
+            throw new InvalidOperationException("PHASE 4: Execution policy not loaded. Cannot resolve order quantity.");
+        }
+        
+        var canonicalUpper = canonicalInstrument.Trim().ToUpperInvariant();
+        var execUpper = executionInstrument.Trim().ToUpperInvariant();
+        
+        // Get execution instrument policy
+        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalUpper, execUpper);
+        if (execInstPolicy == null)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Execution instrument '{executionInstrument}' not found in execution policy for canonical market '{canonicalInstrument}'. " +
+                $"Execution blocked.");
+        }
+        
+        if (!execInstPolicy.enabled)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Execution instrument '{executionInstrument}' is disabled in execution policy for canonical market '{canonicalInstrument}'. " +
+                $"Execution blocked.");
+        }
+        
+        // Return base_size (policy-controlled quantity)
+        var quantity = execInstPolicy.base_size;
+        
+        if (quantity <= 0)
+        {
+            throw new InvalidOperationException(
+                $"PHASE 4: Invalid quantity {quantity} for execution instrument '{executionInstrument}' in policy. " +
+                $"Quantity must be positive.");
+        }
+        
+        return quantity;
+    }
+
+    /// <summary>
+    /// PHASE 4: Get order quantity for execution instrument from execution policy (single-argument overload).
+    /// SECONDARY PATH: Use only for banner/logging, never for stream creation.
+    /// Relies on GetCanonicalInstrument() which could diverge from directive's canonical identity.
+    /// </summary>
+    /// <param name="executionInstrument">Execution instrument (e.g., "MES", "ES", "NQ")</param>
+    /// <returns>Order quantity for the instrument (base_size from policy)</returns>
+    /// <exception cref="ArgumentException">If instrument is null or empty</exception>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument unknown, or quantity invalid</exception>
+    public int GetOrderQuantity(string executionInstrument)
+    {
+        if (string.IsNullOrWhiteSpace(executionInstrument))
+        {
+            throw new ArgumentException("Execution instrument cannot be null or empty", nameof(executionInstrument));
+        }
+        
+        // GetCanonicalInstrument is pure and safe, but use canonical+execution overload for stream creation
+        var canonicalInstrument = GetCanonicalInstrument(executionInstrument);
+        return GetOrderQuantity(canonicalInstrument, executionInstrument);
+    }
+    
+    /// <summary>
+    /// Get order quantity info (baseSize, maxSize) from execution policy.
+    /// </summary>
+    /// <param name="canonicalInstrument">Canonical instrument (e.g., "ES", "NQ")</param>
+    /// <param name="executionInstrument">Execution instrument (e.g., "ES", "MES")</param>
+    /// <returns>Tuple of (baseSize, maxSize) from policy</returns>
+    /// <exception cref="InvalidOperationException">If policy not loaded, instrument not found, not enabled, or sizes invalid</exception>
+    public (int baseSize, int maxSize) GetOrderQuantityInfo(string canonicalInstrument, string executionInstrument)
+    {
+        if (_executionPolicy == null)
+        {
+            throw new InvalidOperationException("Execution policy not loaded");
+        }
+        
+        var policy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, executionInstrument);
+        if (policy == null)
+        {
+            throw new InvalidOperationException(
+                $"Execution instrument {executionInstrument} not found in policy for {canonicalInstrument}");
+        }
+        
+        if (!policy.enabled)
+        {
+            throw new InvalidOperationException(
+                $"Execution instrument {executionInstrument} not enabled for {canonicalInstrument}");
+        }
+        
+        if (policy.base_size <= 0 || policy.max_size <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Invalid policy sizes: baseSize={policy.base_size}, maxSize={policy.max_size}");
+        }
+        
+        if (policy.base_size > policy.max_size)
+        {
+            throw new InvalidOperationException(
+                $"Policy violation: baseSize ({policy.base_size}) > maxSize ({policy.max_size})");
+        }
+        
+        return (policy.base_size, policy.max_size);
     }
 
     private (FilePollResult Poll, TimetableContract? Timetable, Exception? ParseException) PollAndParseTimetable(DateTimeOffset utcNow)
@@ -2478,6 +2652,90 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var streamIdOccurrences = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
+        // PHASE 4: Validate execution policy for unique execution instruments before stream creation (fail-closed)
+        // Validation logic lives in GetOrderQuantity() - do not duplicate policy rules here
+        // For each enabled directive:
+        //   1. Determine canonical market (timetable's instrument field is canonical)
+        //   2. Determine actual execution instrument (from _executionInstrument anchor or policy)
+        //   3. Call GetOrderQuantity(canonical, execution) - this validates policy
+        //   4. Aggregate exceptions and fail-closed once
+        var uniqueCanonicalInstruments = incoming
+            .Select(d => (d.instrument ?? "").Trim())
+            .Where(i => !string.IsNullOrWhiteSpace(i))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var quantityValidationErrors = new List<string>();
+        var uniqueExecutionInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var timetableInstrument in uniqueCanonicalInstruments)
+        {
+            try
+            {
+                // Timetable's instrument field is canonical (ES, NQ, YM, etc.)
+                var canonicalInst = GetCanonicalInstrument(timetableInstrument);
+                
+                // Determine actual execution instrument that will be used:
+                // 1. If _executionInstrument is set and matches canonical market, use it
+                // 2. Otherwise, get the enabled execution instrument from policy
+                string executionInst;
+                if (!string.IsNullOrWhiteSpace(_executionInstrument))
+                {
+                    var ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                    if (string.Equals(ntCanonical, canonicalInst, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Use NinjaTrader's execution instrument (anchor)
+                        executionInst = _executionInstrument.ToUpperInvariant();
+                    }
+                    else
+                    {
+                        // Different canonical market - get enabled instrument from policy
+                        executionInst = _executionPolicy?.GetEnabledExecutionInstrument(canonicalInst) ?? timetableInstrument;
+                    }
+                }
+                else
+                {
+                    // No anchor - get enabled instrument from policy
+                    executionInst = _executionPolicy?.GetEnabledExecutionInstrument(canonicalInst) ?? timetableInstrument;
+                }
+                
+                if (string.IsNullOrWhiteSpace(executionInst))
+                {
+                    quantityValidationErrors.Add($"Execution instrument for canonical market '{canonicalInst}': No enabled execution instrument found in policy.");
+                    continue;
+                }
+                
+                // Track unique execution instruments for logging
+                uniqueExecutionInstruments.Add(executionInst);
+                
+                // PHASE 4: Call GetOrderQuantity - this validates policy (canonical market exists, instrument enabled, quantity valid)
+                // Do not manually re-encode policy rules here - validation logic must live in exactly one place
+                var qty = GetOrderQuantity(canonicalInst, executionInst);
+                // GetOrderQuantity already validates qty > 0, so no double-check needed
+            }
+            catch (ArgumentException ex)
+            {
+                quantityValidationErrors.Add($"Canonical market '{timetableInstrument}': {ex.Message}");
+            }
+            catch (InvalidOperationException ex)
+            {
+                quantityValidationErrors.Add($"Canonical market '{timetableInstrument}': {ex.Message}");
+            }
+        }
+
+        if (quantityValidationErrors.Count > 0)
+        {
+            var errorMsg = $"PHASE 4: Execution policy validation failed:\n{string.Join("\n", quantityValidationErrors)}";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, 
+                eventType: "EXECUTION_POLICY_VALIDATION_FAILED", state: "ENGINE",
+                new
+                {
+                    errors = quantityValidationErrors,
+                    unique_execution_instruments = uniqueExecutionInstruments.ToList(),
+                    note = "Execution blocked due to execution policy validation failures"
+                }));
+            throw new InvalidOperationException(errorMsg);
+        }
+        
         // Log timetable parsing stats
         int acceptedCount = 0;
         int skippedCount = 0;
@@ -2499,12 +2757,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // CRITICAL: Skip directives for instruments that don't match NinjaTrader's canonical market
             // NinjaTrader strategies are single-instrument - we can only execute on the instrument configured in NinjaTrader
             // This check happens FIRST before any processing to avoid unnecessary work
-            string? ntCanonical = null;
-            string? ntInstrument = null;
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
-                ntInstrument = _executionInstrument.ToUpperInvariant();
-                ntCanonical = GetCanonicalInstrument(ntInstrument);
+                var ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
                 if (!string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
                 {
                     // Skip this directive - it's for a different canonical market than what NinjaTrader is configured for
@@ -2523,23 +2778,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // And: NG (timetable) + NG (NinjaTrader) -> use NG
             // This allows the robot to use whatever instrument is actually enabled in NinjaTrader
             var executionInstrument = timetableInstrument;
-            bool anchorApplied = false;
-            string? anchorEventType = null;
-            string? anchorNote = null;
-            
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
+                var ntInstrument = _executionInstrument.ToUpperInvariant();
+                var ntCanonical = GetCanonicalInstrument(ntInstrument); // Already computed above, but keeping for clarity
+                
                 // Canonical matches (we wouldn't be here otherwise), so use NinjaTrader instrument
-                // ntInstrument and ntCanonical already computed above
-                executionInstrument = ntInstrument!;
-                anchorApplied = true;
-                anchorEventType = "EXECUTION_INSTRUMENT_ANCHOR_APPLIED";
-                anchorNote = $"Anchor applied: timetable '{timetableInstrument}' → NinjaTrader '{ntInstrument}' (canonical match: {canonicalInstrument})";
-            }
-            else
-            {
-                anchorEventType = "EXECUTION_INSTRUMENT_NO_ANCHOR";
-                anchorNote = $"No NinjaTrader instrument available for anchoring. Using timetable instrument '{timetableInstrument}'.";
+                executionInstrument = ntInstrument;
             }
             
             // Policy validation happens later in GetOrderQuantity() - if instrument is disabled, it will fail there
@@ -2551,13 +2796,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 // Map execution instrument in stream ID to canonical instrument
                 // e.g., "MES1" -> "ES1"
-                // Use case-insensitive comparison
-                var streamIdUpper = streamId.ToUpperInvariant();
-                var execInstUpper = executionInstrument.ToUpperInvariant();
-                if (streamIdUpper.Contains(execInstUpper))
+                if (streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    // Replace with case-insensitive matching - find the index and replace
-                    var index = streamIdUpper.IndexOf(execInstUpper);
+                    // Replace doesn't support StringComparison, so use manual replacement
+                    var index = streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase);
                     if (index >= 0)
                     {
                         streamId = streamId.Substring(0, index) + canonicalInstrument + streamId.Substring(index + executionInstrument.Length);
@@ -2589,38 +2831,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             var tradingDateStr = tradingDate.ToString("yyyy-MM-dd"); // Use parameter, not _activeTradingDate
             
-            // Diagnostic log: Anchor status (after all variables are declared)
-            if (!string.IsNullOrWhiteSpace(anchorEventType))
-            {
-                var anchorData = new Dictionary<string, object>
-                {
-                    { "timetable_instrument", timetableInstrument },
-                    { "execution_instrument", executionInstrument },
-                    { "canonical_instrument", canonicalInstrument },
-                    { "note", anchorNote ?? "" }
-                };
-                
-                if (anchorApplied)
-                {
-                    anchorData["ninjatrader_instrument"] = ntInstrument ?? "";
-                    anchorData["anchored_execution_instrument"] = executionInstrument;
-                }
-                else if (!string.IsNullOrWhiteSpace(ntInstrument))
-                {
-                    anchorData["timetable_canonical"] = canonicalInstrument;
-                    anchorData["ninjatrader_instrument"] = ntInstrument;
-                    anchorData["ninjatrader_canonical"] = ntCanonical ?? "";
-                }
-                
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc ?? DateTimeOffset.UtcNow,
-                    anchorEventType, "ENGINE", anchorData));
-            }
-            
             // Log execution instrument override if it occurred (after slotTimeUtc is computed)
             if (!string.IsNullOrWhiteSpace(_executionInstrument) && 
                 !string.Equals(executionInstrument, timetableInstrument, StringComparison.OrdinalIgnoreCase))
             {
-                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc ?? DateTimeOffset.UtcNow,
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc ?? DateTimeOffset.UtcNow,
                     "EXECUTION_INSTRUMENT_OVERRIDE", "ENGINE",
                     new
                     {
@@ -2641,7 +2856,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (!skippedReasons.TryGetValue("MISSING_FIELDS", out var count)) count = 0;
                 skippedReasons["MISSING_FIELDS"] = count + 1;
                 LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "MISSING_FIELDS", stream_id = streamId, instrument = executionInstrument, session = session, slot_time = slotTimeChicago }));
+                    "STREAM_SKIPPED", "ENGINE", new 
+                    { 
+                        reason = "MISSING_FIELDS", 
+                        stream_id = streamId, 
+                        execution_instrument = executionInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        session = session, 
+                        slot_time = slotTimeChicago 
+                    }));
                 continue;
             }
 
@@ -2651,7 +2874,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (!skippedReasons.TryGetValue("UNKNOWN_SESSION", out var count2)) count2 = 0;
                 skippedReasons["UNKNOWN_SESSION"] = count2 + 1;
                 LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_SESSION", stream_id = streamId, session = session }));
+                    "STREAM_SKIPPED", "ENGINE", new 
+                    { 
+                        reason = "UNKNOWN_SESSION", 
+                        stream_id = streamId, 
+                        execution_instrument = executionInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        session = session 
+                    }));
                 continue;
             }
 
@@ -2663,17 +2893,32 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (!skippedReasons.TryGetValue("INVALID_SLOT_TIME", out var count3)) count3 = 0;
                 skippedReasons["INVALID_SLOT_TIME"] = count3 + 1;
                 LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "INVALID_SLOT_TIME", stream_id = streamId, slot_time = slotTimeChicago, allowed_times = allowed }));
+                    "STREAM_SKIPPED", "ENGINE", new 
+                    { 
+                        reason = "INVALID_SLOT_TIME", 
+                        stream_id = streamId, 
+                        execution_instrument = executionInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        slot_time = slotTimeChicago, 
+                        allowed_times = allowed 
+                    }));
                 continue;
             }
 
+            // PHASE 2: Timetable validation uses canonical instrument (logic identity)
             if (!_spec.TryGetInstrument(canonicalInstrument, out _))
             {
                 skippedCount++;
                 if (!skippedReasons.TryGetValue("UNKNOWN_INSTRUMENT", out var count4)) count4 = 0;
                 skippedReasons["UNKNOWN_INSTRUMENT"] = count4 + 1;
                 LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                    "STREAM_SKIPPED", "ENGINE", new { reason = "UNKNOWN_INSTRUMENT", stream_id = streamId, instrument = canonicalInstrument }));
+                    "STREAM_SKIPPED", "ENGINE", new 
+                    { 
+                        reason = "UNKNOWN_INSTRUMENT", 
+                        stream_id = streamId, 
+                        execution_instrument = executionInstrument,
+                        canonical_instrument = canonicalInstrument
+                    }));
                 continue;
             }
 
@@ -2685,7 +2930,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (sm.Committed)
                 {
                     LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                        "UPDATE_IGNORED_COMMITTED", "ENGINE", new { reason = "STREAM_COMMITTED" }));
+                        "UPDATE_IGNORED_COMMITTED", "ENGINE", new 
+                        { 
+                            reason = "STREAM_COMMITTED",
+                            execution_instrument = executionInstrument,
+                            canonical_instrument = canonicalInstrument
+                        }));
                     continue;
                 }
 
@@ -2707,20 +2957,36 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
             else
             {
+                // PHASE 2: Fail-fast assertion - ensure stream ID is canonicalized
+                if (executionInstrument != canonicalInstrument && streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 2 ASSERTION FAILED: Execution instrument '{executionInstrument}' leaked into logic stream ID '{streamId}'. " +
+                        $"Expected canonical stream ID using '{canonicalInstrument}'. " +
+                        $"This indicates incomplete canonicalization."
+                    );
+                }
+                
                 // PHASE 3: New stream - pass DateOnly directly (authoritative), convert to string only for logging/journal
                 
-                // CRITICAL: Create modified directive with executionInstrument override
-                // This ensures StreamStateMachine uses the NinjaTrader instrument (e.g., MNG) instead of timetable instrument (e.g., NG)
-                var modifiedDirective = new TimetableStream
+                // PHASE 3: Fail-fast assertion - ensure stream ID is canonicalized before stream creation
+                if (executionInstrument != canonicalInstrument && streamId.IndexOf(executionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    stream = directive.stream,
-                    instrument = executionInstrument, // Use computed executionInstrument (may be MNG if NinjaTrader has MNG)
-                    session = directive.session,
-                    slot_time = directive.slot_time,
-                    enabled = directive.enabled,
-                    block_reason = directive.block_reason,
-                    decision_time = directive.decision_time
-                };
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Execution instrument '{executionInstrument}' leaked into logic stream ID '{streamId}'. " +
+                        $"Expected canonical stream ID using '{canonicalInstrument}'. " +
+                        $"This indicates incomplete canonicalization in ApplyTimetable."
+                    );
+                }
+                
+                // PHASE 3: Assert canonical stream ID matches canonical instrument
+                if (!streamId.StartsWith(canonicalInstrument, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream ID '{streamId}' does not start with canonical instrument '{canonicalInstrument}'. " +
+                        $"Stream IDs must use canonical instrument prefix (e.g., ES1, not MES1)."
+                    );
+                }
                 
                 // PHASE 4: Resolve order quantity from policy (canonical + execution)
                 // Use canonical+execution overload to avoid GetCanonicalInstrument divergence risk
@@ -2736,9 +3002,94 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var orderQuantity = GetOrderQuantity(canonicalInstrument, executionInstrument);
                 var (baseSize, maxSize) = GetOrderQuantityInfo(canonicalInstrument, executionInstrument);
                 
+                // CRITICAL FIX: Create modified directive with execution instrument instead of canonical
+                // The timetable directive.instrument is canonical (GC), but StreamStateMachine needs execution instrument (MGC)
+                // Create a copy of the directive with the correct execution instrument
+                var modifiedDirective = new TimetableStream
+                {
+                    stream = directive.stream,
+                    instrument = executionInstrument, // Use execution instrument (MGC), not canonical (GC)
+                    session = directive.session,
+                    slot_time = directive.slot_time,
+                    enabled = directive.enabled,
+                    block_reason = directive.block_reason,
+                    decision_time = directive.decision_time
+                };
+                
                 // PHASE 3: Pass DateOnly to constructor (will be converted to string internally for journal)
                 // PHASE 4: Pass order quantity (policy-controlled, Chart Trader ignored)
-                var newSm = new StreamStateMachine(_time, _spec, _log, _journals, tradingDate, _lastTimetableHash, modifiedDirective, _executionMode, orderQuantity, maxSize, _root, _executionAdapter, _riskGate, _executionJournal, loggingConfig: _loggingConfig, engine: this);
+                // Use named arguments after first optional parameter to avoid future breakage
+                var newSm = new StreamStateMachine(
+                    _time, 
+                    _spec, 
+                    _log, 
+                    _journals, 
+                    tradingDate, 
+                    _lastTimetableHash, 
+                    modifiedDirective, // Use modified directive with execution instrument
+                    _executionMode, 
+                    orderQuantity, // baseSize (existing parameter)
+                    maxSize, // NEW: maxSize parameter
+                    _root, // Project root for range event persistence
+                    executionAdapter: _executionAdapter, 
+                    riskGate: _riskGate, 
+                    executionJournal: _executionJournal, 
+                    loggingConfig: _loggingConfig,
+                    engine: this); // Pass engine reference for BarsRequest status checks
+                
+                // PHASE 3: Post-creation assertion - verify stream properties match expectations
+                if (newSm.ExecutionInstrument != executionInstrument)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream ExecutionInstrument '{newSm.ExecutionInstrument}' does not match expected '{executionInstrument}'."
+                    );
+                }
+                if (newSm.CanonicalInstrument != canonicalInstrument)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream CanonicalInstrument '{newSm.CanonicalInstrument}' does not match expected '{canonicalInstrument}'."
+                    );
+                }
+                if (newSm.Stream != streamId)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream ID '{newSm.Stream}' does not match canonicalized stream ID '{streamId}'."
+                    );
+                }
+                if (newSm.Instrument != canonicalInstrument)
+                {
+                    throw new InvalidOperationException(
+                        $"PHASE 3 ASSERTION FAILED: Stream Instrument property '{newSm.Instrument}' is not canonical '{canonicalInstrument}'. " +
+                        $"Instrument property must represent logic identity (canonical)."
+                    );
+                }
+                
+                // PHASE 2: Verify stream ID matches canonical instrument
+                if (newSm.ExecutionInstrument != newSm.CanonicalInstrument && 
+                    !string.Equals(newSm.Stream, streamId, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Stream ID should already be canonicalized above, but double-check
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "STREAM_ID_CANONICALIZATION_WARNING", "ENGINE", new 
+                        { 
+                            stream_id_from_timetable = directive.stream,
+                            canonicalized_stream_id = streamId,
+                            execution_instrument = newSm.ExecutionInstrument,
+                            canonical_instrument = newSm.CanonicalInstrument,
+                            note = "Stream ID was canonicalized from timetable"
+                        }));
+                }
+                
+                // PHASE 2: Log stream creation with both instruments for observability
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_CREATED", "ENGINE", new 
+                    { 
+                        stream_id = streamId,
+                        execution_instrument = newSm.ExecutionInstrument,
+                        canonical_instrument = newSm.CanonicalInstrument,
+                        session = session,
+                        slot_time = slotTimeChicago
+                    }));
                 
                 // PHASE 4: Set alert callback for high-priority alerts only (RANGE_INVALIDATED)
                 // Non-critical alerts (gaps, pre-hydration, state transitions) are logged only, not notified
@@ -2772,20 +3123,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     });
                 }
                 
-                // PHASE 3: Post-creation assertion - verify stream ExecutionInstrument matches expected
-                if (newSm.ExecutionInstrument != executionInstrument)
-                {
-                    throw new InvalidOperationException(
-                        $"PHASE 3 ASSERTION FAILED: Stream ExecutionInstrument '{newSm.ExecutionInstrument}' does not match expected '{executionInstrument}'."
-                    );
-                }
-                
                 _streams[streamId] = newSm;
 
                 if (newSm.Committed)
                 {
                     LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
-                        "STREAM_SKIPPED", "ENGINE", new { reason = "ALREADY_COMMITTED_JOURNAL" }));
+                        "STREAM_SKIPPED", "ENGINE", new 
+                        { 
+                            reason = "ALREADY_COMMITTED_JOURNAL",
+                            execution_instrument = newSm.ExecutionInstrument,
+                            canonical_instrument = newSm.CanonicalInstrument
+                        }));
                     continue;
                 }
 
@@ -3560,8 +3908,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 .ToList();
 
             // CRITICAL: Map base instruments to micro futures for BarsRequest
-            // If stream has ExecutionInstrument = YM, we need to request MYM bars
-            // If stream has ExecutionInstrument = CL, we need to request MCL bars
+            // ExecutionInstrument is already the execution instrument (e.g., MGC, MYM, MCL)
+            // If ExecutionInstrument is a base instrument (e.g., YM, CL), map to micro (MYM, MCL)
+            // Otherwise, use as-is (already micro or no mapping available)
             var barsRequestInstruments = new List<string>();
             foreach (var execInst in executionInstruments)
             {

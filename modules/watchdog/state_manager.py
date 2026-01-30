@@ -18,6 +18,7 @@ from .config import (
     STUCK_STREAM_THRESHOLD_SECONDS,
     UNPROTECTED_TIMEOUT_SECONDS,
     DATA_STALL_THRESHOLD_SECONDS,
+    RECOVERY_TIMEOUT_SECONDS,
 )
 from .market_session import is_market_open
 
@@ -40,6 +41,7 @@ class WatchdogStateManager:
         # Engine state
         self._last_engine_tick_utc: Optional[datetime] = None
         self._recovery_state: str = "CONNECTED_OK"
+        self._recovery_started_utc: Optional[datetime] = None  # Track when recovery started for timeout
         self._kill_switch_active: bool = False
         self._connection_status: str = "Connected"
         self._last_connection_event_utc: Optional[datetime] = None
@@ -113,7 +115,16 @@ class WatchdogStateManager:
             "DISCONNECT_RECOVERY_COMPLETE": "RECOVERY_COMPLETE",
             "DISCONNECT_RECOVERY_ABORTED": "DISCONNECT_FAIL_CLOSED",
         }
-        self._recovery_state = state_mapping.get(state, state)
+        new_state = state_mapping.get(state, state)
+        
+        # Track when recovery started for timeout detection
+        if new_state == "RECOVERY_RUNNING":
+            self._recovery_started_utc = timestamp_utc
+        elif new_state in ("RECOVERY_COMPLETE", "CONNECTED_OK", "DISCONNECT_FAIL_CLOSED"):
+            # Recovery completed or reset - clear start time
+            self._recovery_started_utc = None
+        
+        self._recovery_state = new_state
     
     def update_kill_switch(self, active: bool):
         """Update kill switch status."""
@@ -731,6 +742,32 @@ class WatchdogStateManager:
         elif engine_activity_state == "ENGINE_ACTIVE_PROCESSING":
             frontend_engine_state = "ACTIVE"
         
+        # CRITICAL FIX: Auto-clear recovery state if stuck in RECOVERY_RUNNING for too long
+        # This prevents watchdog from being stuck in "RECOVERY IN PROGRESS" indefinitely
+        # if DISCONNECT_RECOVERY_COMPLETE event is never received
+        recovery_state = self._recovery_state
+        if recovery_state == "RECOVERY_RUNNING" and self._recovery_started_utc:
+            recovery_duration = (now - self._recovery_started_utc).total_seconds()
+            if recovery_duration > RECOVERY_TIMEOUT_SECONDS:
+                logger.warning(
+                    f"RECOVERY_STATE_TIMEOUT: Recovery has been running for {recovery_duration:.0f}s "
+                    f"(started: {self._recovery_started_utc.isoformat()}), "
+                    f"but DISCONNECT_RECOVERY_COMPLETE event was never received. "
+                    f"Auto-clearing recovery state to CONNECTED_OK."
+                )
+                # Auto-transition to CONNECTED_OK if engine is alive and receiving ticks
+                # Otherwise, assume recovery completed but event was missed
+                if engine_alive:
+                    recovery_state = "CONNECTED_OK"
+                    self._recovery_state = "CONNECTED_OK"
+                    self._recovery_started_utc = None
+                else:
+                    # Engine not alive - recovery may have failed, but clear the stuck state anyway
+                    # This prevents indefinite "RECOVERY IN PROGRESS" when engine is actually stalled
+                    recovery_state = "CONNECTED_OK"
+                    self._recovery_state = "CONNECTED_OK"
+                    self._recovery_started_utc = None
+        
         return {
             "engine_alive": engine_alive,
             "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values
@@ -739,7 +776,7 @@ class WatchdogStateManager:
                 if self._last_engine_tick_utc else None
             ),
             "engine_tick_stall_detected": not engine_alive,
-            "recovery_state": self._recovery_state,
+            "recovery_state": recovery_state,  # Use computed recovery_state (may be auto-cleared)
             "kill_switch_active": self._kill_switch_active,
             "connection_status": self._connection_status,
             "last_connection_event_chicago": (
