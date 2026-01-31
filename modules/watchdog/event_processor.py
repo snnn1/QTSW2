@@ -727,6 +727,44 @@ class EventProcessor:
                 # Backward compatibility: fall back to instrument field
                 self._state_manager.update_last_bar(instrument, timestamp_utc)
         
+        elif event_type == "DUPLICATE_INSTANCE_DETECTED":
+            # Extract duplicate instance detection information
+            account = data.get("account", "")
+            execution_instrument = data.get("execution_instrument", "")
+            instance_id = data.get("instance_id", "")
+            error_msg = data.get("error", "")
+            
+            logger.warning(
+                f"DUPLICATE_INSTANCE_DETECTED: account={account}, execution_instrument={execution_instrument}, "
+                f"instance_id={instance_id}, error={error_msg[:100] if error_msg else 'N/A'}"
+            )
+            
+            self._state_manager.record_duplicate_instance(
+                account=account,
+                execution_instrument=execution_instrument,
+                instance_id=instance_id,
+                timestamp_utc=timestamp_utc,
+                error_message=error_msg
+            )
+        
+        elif event_type == "EXECUTION_POLICY_VALIDATION_FAILED":
+            # Extract execution policy validation failure information
+            errors = data.get("errors", [])
+            unique_execution_instruments = data.get("unique_execution_instruments", [])
+            note = data.get("note", "")
+            
+            logger.warning(
+                f"EXECUTION_POLICY_VALIDATION_FAILED: {len(errors)} error(s), "
+                f"execution_instruments={unique_execution_instruments}, note={note[:100] if note else 'N/A'}"
+            )
+            
+            self._state_manager.record_execution_policy_failure(
+                errors=errors,
+                execution_instruments=unique_execution_instruments,
+                timestamp_utc=timestamp_utc,
+                note=note
+            )
+        
         elif event_type == "TIMETABLE_VALIDATED":
             # NOTE: Timetable validation is now based on timetable_current.json polling,
             # not on TIMETABLE_VALIDATED events from the robot.

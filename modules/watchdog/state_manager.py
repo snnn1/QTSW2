@@ -84,6 +84,14 @@ class WatchdogStateManager:
         self._last_identity_invariants_event_chicago: Optional[datetime] = None
         self._last_identity_violations: List[str] = []
         
+        # Duplicate instance detection tracking
+        # Key: (account, execution_instrument) -> DuplicateInstanceInfo
+        self._duplicate_instances: Dict[tuple, 'DuplicateInstanceInfo'] = {}
+        
+        # Execution policy validation failures (keep last 10 failures)
+        self._execution_policy_failures: List['ExecutionPolicyFailureInfo'] = []
+        self._max_execution_policy_failures = 10  # Keep last 10 failures
+        
     def update_engine_tick(self, timestamp_utc: datetime):
         """
         Update engine tick timestamp from ENGINE_TICK_CALLSITE event.
@@ -250,6 +258,70 @@ class WatchdogStateManager:
         # Keep only last 1 hour
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         self._protective_failure_events = [e for e in self._protective_failure_events if e > cutoff]
+    
+    def record_duplicate_instance(
+        self,
+        account: str,
+        execution_instrument: str,
+        instance_id: str,
+        timestamp_utc: datetime,
+        error_message: str
+    ):
+        """
+        Record duplicate instance detection.
+        
+        Args:
+            account: Account name where duplicate was detected
+            execution_instrument: Execution instrument full name (e.g., "MES 03-26")
+            instance_id: Instance ID of the duplicate instance
+            timestamp_utc: UTC timestamp when duplicate was detected
+            error_message: Error message describing the duplicate
+        """
+        key = (account, execution_instrument)
+        self._duplicate_instances[key] = DuplicateInstanceInfo(
+            account=account,
+            execution_instrument=execution_instrument,
+            instance_id=instance_id,
+            detected_at_utc=timestamp_utc,
+            error_message=error_message
+        )
+        logger.warning(
+            f"Duplicate instance recorded: account={account}, execution_instrument={execution_instrument}, "
+            f"instance_id={instance_id}, detected_at={timestamp_utc.isoformat()}"
+        )
+    
+    def record_execution_policy_failure(
+        self,
+        errors: List[str],
+        execution_instruments: List[str],
+        timestamp_utc: datetime,
+        note: str
+    ):
+        """
+        Record execution policy validation failure.
+        
+        Args:
+            errors: List of error messages from validation
+            execution_instruments: List of execution instruments involved in the failure
+            timestamp_utc: UTC timestamp when failure occurred
+            note: Additional note about the failure
+        """
+        failure_info = ExecutionPolicyFailureInfo(
+            errors=errors.copy(),
+            execution_instruments=execution_instruments.copy(),
+            failed_at_utc=timestamp_utc,
+            note=note
+        )
+        
+        # Add to list and keep only last N failures
+        self._execution_policy_failures.append(failure_info)
+        if len(self._execution_policy_failures) > self._max_execution_policy_failures:
+            self._execution_policy_failures.pop(0)  # Remove oldest
+        
+        logger.warning(
+            f"Execution policy validation failure recorded: {len(errors)} error(s), "
+            f"execution_instruments={execution_instruments}, failed_at={timestamp_utc.isoformat()}"
+        )
     
     def update_last_bar(self, execution_instrument_full_name: str, timestamp_utc: datetime):
         """
@@ -797,7 +869,30 @@ class WatchdogStateManager:
                 self._last_identity_invariants_event_chicago.isoformat()
                 if self._last_identity_invariants_event_chicago else None
             ),
-            "last_identity_violations": self._last_identity_violations.copy()
+            "last_identity_violations": self._last_identity_violations.copy(),
+            # Duplicate instance detection
+            "duplicate_instances_detected": [
+                {
+                    "account": info.account,
+                    "execution_instrument": info.execution_instrument,
+                    "instance_id": info.instance_id,
+                    "detected_at_chicago": info.detected_at_utc.astimezone(CHICAGO_TZ).isoformat(),
+                    "error_message": info.error_message
+                }
+                for info in self._duplicate_instances.values()
+            ],
+            "duplicate_instances_count": len(self._duplicate_instances),
+            # Execution policy validation failures
+            "execution_policy_failures": [
+                {
+                    "errors": failure.errors.copy(),
+                    "execution_instruments": failure.execution_instruments.copy(),
+                    "failed_at_chicago": failure.failed_at_utc.astimezone(CHICAGO_TZ).isoformat(),
+                    "note": failure.note
+                }
+                for failure in self._execution_policy_failures
+            ],
+            "execution_policy_failures_count": len(self._execution_policy_failures)
         }
     
     def compute_unprotected_positions(self) -> List[Dict]:
@@ -864,6 +959,27 @@ class IntentExposureInfo:
         self.exit_filled_qty = exit_filled_qty
         self.state = state
         self.entry_filled_at_utc = entry_filled_at_utc
+
+
+class DuplicateInstanceInfo:
+    """Information about a detected duplicate instance."""
+    def __init__(self, account: str, execution_instrument: str, instance_id: str,
+                 detected_at_utc: datetime, error_message: str):
+        self.account = account
+        self.execution_instrument = execution_instrument
+        self.instance_id = instance_id
+        self.detected_at_utc = detected_at_utc
+        self.error_message = error_message
+
+
+class ExecutionPolicyFailureInfo:
+    """Information about an execution policy validation failure."""
+    def __init__(self, errors: List[str], execution_instruments: List[str],
+                 failed_at_utc: datetime, note: str):
+        self.errors = errors
+        self.execution_instruments = execution_instruments
+        self.failed_at_utc = failed_at_utc
+        self.note = note
 
 
 class CursorManager:

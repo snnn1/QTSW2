@@ -162,26 +162,43 @@ namespace NinjaTrader.NinjaScript.Strategies
                             Log(errorMsg, LogLevel.Error);
                             _initFailed = true;
                             
-                            // Log to engine if available (may not be initialized yet)
-                            try
+                            // Log to engine and report critical if engine exists
+                            if (_engine != null)
                             {
-                                var tempProjectRoot = ProjectRootResolver.ResolveProjectRoot();
-                                var tempLog = new RobotLogger(tempProjectRoot, Path.Combine(tempProjectRoot, "logs", "robot"), Instrument?.MasterInstrument?.Name ?? "UNKNOWN", null);
-                                tempLog.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "DUPLICATE_INSTANCE_DETECTED", state: "ENGINE",
-                                    new
+                                try
+                                {
+                                    // Use engine's logging (not temporary logger)
+                                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DUPLICATE_INSTANCE_DETECTED", new Dictionary<string, object>
                                     {
-                                        error = errorMsg,
-                                        account = accountName,
-                                        execution_instrument = executionInstrumentFullName,
-                                        instance_id = _instanceId,
-                                        action = "STAND_DOWN",
-                                        invariant = "One execution instrument → one strategy instance per account"
-                                    }));
+                                        ["error"] = errorMsg,
+                                        ["account"] = accountName,
+                                        ["execution_instrument"] = executionInstrumentFullName,
+                                        ["instance_id"] = _instanceId,
+                                        ["action"] = "STAND_DOWN",
+                                        ["invariant"] = "One execution instrument → one strategy instance per account"
+                                    });
+                                    
+                                    // Report to HealthMonitor for push notification
+                                    var healthMonitor = _engine.GetHealthMonitor();
+                                    if (healthMonitor != null)
+                                    {
+                                        var payload = new Dictionary<string, object>
+                                        {
+                                            ["account"] = accountName,
+                                            ["execution_instrument"] = executionInstrumentFullName,
+                                            ["instance_id"] = _instanceId,
+                                            ["error"] = errorMsg,
+                                            ["action"] = "STAND_DOWN"
+                                        };
+                                        healthMonitor.ReportCritical("DUPLICATE_INSTANCE_DETECTED", payload);
+                                    }
+                                }
+                                catch
+                                {
+                                    // If engine logging fails, at least we've logged to NT console
+                                }
                             }
-                            catch
-                            {
-                                // If logging fails, at least we've logged to NT console
-                            }
+                            // If engine is null, console log is sufficient (early failure path)
                             
                             return; // Abort initialization
                         }

@@ -77,6 +77,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
+    
+    // Guard against multiple execution policy failure notifications per startup
+    private bool _executionPolicyFailureReported = false;
 
     // Logging configuration
     private readonly LoggingConfig _loggingConfig;
@@ -370,6 +373,64 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _executionSummary = new ExecutionSummary();
     }
 
+    /// <summary>
+    /// Report execution policy validation failure to HealthMonitor.
+    /// Centralized to ensure one notification per validation pass.
+    /// Uses boolean latch to prevent multiple calls even if validation is retried/re-entered.
+    /// </summary>
+    private void ReportExecutionPolicyFailure(
+        string summary,
+        List<string>? details = null,
+        Dictionary<string, object>? context = null)
+    {
+        // Guard: Only report once per engine startup
+        if (_executionPolicyFailureReported)
+            return;
+        
+        if (_healthMonitor == null)
+            return;
+        
+        // Set latch BEFORE building payload (fail-safe: if payload building fails, we still won't retry)
+        _executionPolicyFailureReported = true;
+        
+        var payload = new Dictionary<string, object>
+        {
+            ["summary"] = summary,
+            ["file_path"] = _executionPolicyPath
+        };
+        
+        if (details != null && details.Count > 0)
+            payload["details"] = details;
+        
+        if (context != null)
+        {
+            foreach (var kvp in context)
+                payload[kvp.Key] = kvp.Value;
+        }
+        
+        // Optional: Add execution policy hash for deduplication
+        if (_executionPolicy != null)
+        {
+            try
+            {
+                var policyJson = JsonUtil.Serialize(_executionPolicy);
+                using (var sha256 = System.Security.Cryptography.SHA256.Create())
+                {
+                    var policyBytes = System.Text.Encoding.UTF8.GetBytes(policyJson);
+                    var hashBytes = sha256.ComputeHash(policyBytes);
+                    var policyHash = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+                    payload["execution_policy_hash"] = policyHash;
+                }
+            }
+            catch
+            {
+                // Hash computation failure shouldn't block notification
+            }
+        }
+        
+        _healthMonitor.ReportCritical("EXECUTION_POLICY_VALIDATION_FAILED", payload);
+    }
+
     public void Start()
     {
         // CRITICAL: Set run_id before any Start-path logs
@@ -591,6 +652,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             file_path = _executionPolicyPath,
                             note = "Execution policy file is required. Execution blocked."
                         }));
+                    
+                    // Centralized notification
+                    ReportExecutionPolicyFailure(
+                        summary: "Execution policy file not found",
+                        details: new List<string> { ex.Message },
+                        context: new Dictionary<string, object> { ["exception_type"] = ex.GetType().Name }
+                    );
+                    
                     throw new InvalidOperationException(errorMsg, ex);
                 }
                 catch (InvalidOperationException ex)
@@ -603,6 +672,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             file_path = _executionPolicyPath,
                             note = "Execution policy validation failed. Execution blocked."
                         }));
+                    
+                    // Centralized notification
+                    ReportExecutionPolicyFailure(
+                        summary: "Execution policy validation failed",
+                        details: new List<string> { ex.Message }
+                    );
+                    
                     throw;
                 }
                 catch (Exception ex)
@@ -616,6 +692,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             file_path = _executionPolicyPath,
                             note = "Execution policy load/parse failed. Execution blocked."
                         }));
+                    
+                    // Centralized notification
+                    ReportExecutionPolicyFailure(
+                        summary: "Execution policy load/parse failed",
+                        details: new List<string> { ex.Message },
+                        context: new Dictionary<string, object> { ["exception_type"] = ex.GetType().Name }
+                    );
+                    
                     throw new InvalidOperationException(errorMsg, ex);
                 }
                 
@@ -2733,6 +2817,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     unique_execution_instruments = uniqueExecutionInstruments.ToList(),
                     note = "Execution blocked due to execution policy validation failures"
                 }));
+            
+            // Centralized notification (single call for all quantity validation errors)
+            ReportExecutionPolicyFailure(
+                summary: "Execution policy quantity validation failed",
+                details: quantityValidationErrors,
+                context: new Dictionary<string, object>
+                {
+                    ["unique_execution_instruments"] = uniqueExecutionInstruments.ToList()
+                }
+            );
+            
             throw new InvalidOperationException(errorMsg);
         }
         

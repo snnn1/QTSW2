@@ -100,6 +100,9 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Critical Events
     "CRITICAL_EVENT_REPORTED",
     "EXECUTION_GATE_INVARIANT_VIOLATION",
+    # Deployment and Configuration
+    "DUPLICATE_INSTANCE_DETECTED",  # Critical for detecting invalid deployments
+    "EXECUTION_POLICY_VALIDATION_FAILED",  # Important for execution monitoring
     # Additional events needed for state tracking
     "RANGE_LOCKED",
     "RANGE_LOCK_SNAPSHOT",  # Contains range data for RANGE_LOCKED streams
@@ -110,4 +113,6 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "ONBARUPDATE_CALLED",
     "ONBARUPDATE_DIAGNOSTIC",
     "BAR_ROUTING_DIAGNOSTIC",
+    # Bar acceptance tracking
+    "BAR_ACCEPTED",  # Bar acceptance events (rate-limited in engine)
 }

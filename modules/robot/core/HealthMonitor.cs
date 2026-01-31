@@ -59,7 +59,9 @@ public sealed class HealthMonitor
     private static readonly HashSet<string> ALLOWED_CRITICAL_EVENT_TYPES = new(StringComparer.OrdinalIgnoreCase)
     {
         "EXECUTION_GATE_INVARIANT_VIOLATION",
-        "DISCONNECT_FAIL_CLOSED_ENTERED"
+        "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "DUPLICATE_INSTANCE_DETECTED",
+        "EXECUTION_POLICY_VALIDATION_FAILED"
     };
     
     // Background evaluation thread for data loss detection
@@ -619,6 +621,75 @@ public sealed class HealthMonitor
             if (payload.TryGetValue("active_stream_count", out var streamCount) && streamCount != null)
                 parts.Add($"Active Streams: {streamCount}");
             parts.Add("All execution blocked - requires operator intervention");
+        }
+        else if (eventType == "DUPLICATE_INSTANCE_DETECTED")
+        {
+            parts.Add("CRITICAL | INVARIANT: Duplicate Strategy Instance Detected");
+            if (payload.TryGetValue("account", out var account) && account != null)
+                parts.Add($"Account: {account}");
+            if (payload.TryGetValue("execution_instrument", out var inst) && inst != null)
+                parts.Add($"Instrument: {inst}");
+            if (payload.TryGetValue("instance_id", out var instanceId) && instanceId != null)
+                parts.Add($"Instance ID: {instanceId}");
+            if (payload.TryGetValue("error", out var error) && error != null)
+                parts.Add($"Error: {error}");
+            parts.Add("Action: Strategy standing down - requires operator intervention");
+        }
+        else if (eventType == "EXECUTION_POLICY_VALIDATION_FAILED")
+        {
+            parts.Add("CRITICAL | EXECUTION HALT: Execution Policy Validation Failed");
+            
+            // Normalized payload reading: prefer summary/details/context convention
+            // Fall back to error/errors for backward compatibility
+            
+            // Summary (canonical)
+            if (payload.TryGetValue("summary", out var summary) && summary != null)
+            {
+                parts.Add(summary.ToString());
+            }
+            
+            // Details (canonical - preferred over errors/error)
+            if (payload.TryGetValue("details", out var details) && details != null)
+            {
+                if (details is List<string> detailsList)
+                    parts.Add($"Details: {string.Join("; ", detailsList)}");
+                else
+                    parts.Add($"Details: {details}");
+            }
+            // Fallback: errors (backward compatibility)
+            else if (payload.TryGetValue("errors", out var errors) && errors != null)
+            {
+                if (errors is List<string> errorList)
+                    parts.Add($"Errors: {string.Join("; ", errorList)}");
+                else
+                    parts.Add($"Error: {errors}");
+            }
+            // Fallback: error (backward compatibility)
+            else if (payload.TryGetValue("error", out var error) && error != null)
+            {
+                parts.Add($"Error: {error}");
+            }
+            
+            // Context fields (canonical)
+            if (payload.TryGetValue("context", out var context) && context is Dictionary<string, object> contextDict)
+            {
+                if (contextDict.TryGetValue("unique_execution_instruments", out var instruments) && instruments != null)
+                {
+                    if (instruments is List<string> instList)
+                        parts.Add($"Affected Instruments: {string.Join(", ", instList)}");
+                }
+            }
+            // Fallback: direct field access (backward compatibility)
+            else if (payload.TryGetValue("unique_execution_instruments", out var instrumentsDirect) && instrumentsDirect != null)
+            {
+                if (instrumentsDirect is List<string> instList)
+                    parts.Add($"Affected Instruments: {string.Join(", ", instList)}");
+            }
+            
+            if (payload.TryGetValue("file_path", out var filePath) && filePath != null)
+                parts.Add($"Policy File: {filePath}");
+            
+            parts.Add("Execution blocked - requires operator intervention");
         }
         else
         {
