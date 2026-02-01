@@ -45,7 +45,7 @@
       },
       "Robot.Core/1.0.0": {
         "type": "project",
-        "framework": ".NETFramework,Version=v4.8",
+        "framework": ".NETCoreApp,Version=v8.0",
         "dependencies": {
           "System.Text.Json": "8.0.0"
         },

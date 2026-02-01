@@ -36,7 +36,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 var projectRoot = QTSW2.Robot.Core.ProjectRootResolver.ResolveProjectRoot();
                 // Default to DRYRUN mode for Step-3; can be made configurable via strategy parameters
-                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.DRYRUN);
+                // Pass MasterInstrument.Name for explicit canonical matching (null if Instrument not available)
+                var masterInstrumentName = Instrument?.MasterInstrument?.Name;
+                _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.DRYRUN, masterInstrumentName: masterInstrumentName);
                 
                 // PHASE 1: Set account info for startup banner
                 var accountName = Account?.Name ?? "UNKNOWN";

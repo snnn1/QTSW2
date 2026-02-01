@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
 using NinjaTrader.Cbi;
@@ -1010,6 +1011,190 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// Intent context structure for resolved intent information.
+    /// </summary>
+    private struct IntentContext
+    {
+        public string TradingDate;
+        public string Stream;
+        public string Direction;
+        public decimal ContractMultiplier;
+        public string ExecutionInstrument;
+        public string CanonicalInstrument;
+        public string Tag;
+        public string IntentId;
+    }
+    
+    /// <summary>
+    /// Resolve intent context or fail-closed.
+    /// Returns true if context resolved successfully, false if orphan fill detected.
+    /// </summary>
+    private bool ResolveIntentContextOrFailClosed(
+        string intentId, 
+        string encodedTag, 
+        string orderType, 
+        string instrument, 
+        decimal fillPrice, 
+        int fillQuantity, 
+        DateTimeOffset utcNow, 
+        out IntentContext context)
+    {
+        context = default;
+        
+        if (!_intentMap.TryGetValue(intentId, out var intent))
+        {
+            LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
+                utcNow, reason: "INTENT_NOT_FOUND");
+            
+            // Stand down stream if known, otherwise block instrument
+            // Try to get stream from orderInfo if available, but likely unknown
+            _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:INTENT_NOT_FOUND:{intentId}");
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    tag = encodedTag,
+                    order_type = orderType,
+                    instrument = instrument,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    reason = "INTENT_NOT_FOUND",
+                    action_taken = "EXECUTION_BLOCKED",
+                    note = "Intent not found in _intentMap - orphan fill logged, execution blocked"
+                }));
+            
+            return false;
+        }
+        
+        var tradingDate = intent.TradingDate ?? "";
+        var stream = intent.Stream ?? "";
+        var direction = intent.Direction ?? "";
+        
+        // Validate required fields
+        if (string.IsNullOrWhiteSpace(tradingDate))
+        {
+            LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
+                utcNow, stream, "MISSING_TRADING_DATE");
+            _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_TRADING_DATE:{intentId}");
+            return false;
+        }
+        
+        if (string.IsNullOrWhiteSpace(stream))
+        {
+            LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
+                utcNow, reason: "MISSING_STREAM");
+            _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:MISSING_STREAM:{intentId}");
+            return false;
+        }
+        
+        if (string.IsNullOrWhiteSpace(direction))
+        {
+            LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
+                utcNow, stream, "MISSING_DIRECTION");
+            _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_DIRECTION:{intentId}");
+            return false;
+        }
+        
+        // Derive contract multiplier
+        decimal? contractMultiplier = null;
+        if (_ntInstrument is Instrument ntInst)
+        {
+            contractMultiplier = (decimal)ntInst.MasterInstrument.PointValue;
+        }
+        
+        if (!contractMultiplier.HasValue)
+        {
+            LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
+                utcNow, stream, "MISSING_MULTIPLIER");
+            _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_MULTIPLIER:{intentId}");
+            return false;
+        }
+        
+        context = new IntentContext
+        {
+            TradingDate = tradingDate,
+            Stream = stream,
+            Direction = direction,
+            ContractMultiplier = contractMultiplier.Value,
+            ExecutionInstrument = intent.Instrument ?? "",
+            CanonicalInstrument = intent.Instrument ?? "", // TODO: derive canonical if different from execution
+            Tag = encodedTag,
+            IntentId = intentId
+        };
+        
+        return true;
+    }
+    
+    /// <summary>
+    /// Log orphan fill to JSONL file.
+    /// </summary>
+    private void LogOrphanFill(
+        string intentId, 
+        string tag, 
+        string orderType, 
+        string instrument,
+        decimal fillPrice, 
+        int fillQuantity, 
+        DateTimeOffset utcNow, 
+        string? stream = null,
+        string reason = "UNKNOWN")
+    {
+        try
+        {
+            var orphanDir = Path.Combine(_projectRoot, "data", "execution_incidents", "orphan_fills");
+            Directory.CreateDirectory(orphanDir);
+            var orphanFile = Path.Combine(orphanDir, $"orphan_fills_{utcNow:yyyy-MM-dd}.jsonl");
+            
+            var orphanRecord = new
+            {
+                event_type = "ORPHAN_FILL",
+                timestamp_utc = utcNow.ToString("o"),
+                intent_id = intentId,
+                tag = tag,
+                order_type = orderType,
+                instrument = instrument,
+                fill_price = fillPrice,
+                fill_quantity = fillQuantity,
+                stream = stream ?? "UNKNOWN",
+                reason = reason,
+                action_taken = "EXECUTION_BLOCKED"
+            };
+            
+            var json = QTSW2.Robot.Core.JsonUtil.Serialize(orphanRecord);
+            File.AppendAllText(orphanFile, json + "\n");
+            
+            // Also log as CRITICAL event
+            _log.Write(RobotEvents.EngineBase(utcNow, stream ?? "", "ORPHAN_FILL_CRITICAL", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    tag = tag,
+                    order_type = orderType,
+                    instrument = instrument,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    stream = stream ?? "UNKNOWN",
+                    reason = reason,
+                    orphan_file = orphanFile,
+                    action_taken = "EXECUTION_BLOCKED"
+                }));
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't fail execution (orphan logging failure shouldn't block)
+            _log.Write(RobotEvents.EngineBase(utcNow, stream ?? "", "ORPHAN_FILL_LOG_ERROR", "ENGINE",
+                new
+                {
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    intent_id = intentId,
+                    note = "Failed to write orphan fill log - continuing"
+                }));
+        }
+    }
+
+    /// <summary>
     /// STEP 3: Handle real NT ExecutionUpdate event.
     /// Called from public HandleExecutionUpdate() method.
     /// </summary>
@@ -1106,49 +1291,62 @@ public sealed partial class NinjaTraderSimAdapter
             });
         }
         
-        // Get contract multiplier for slippage calculation
-        decimal? contractMultiplier = null;
-        if (_ntInstrument is Instrument ntInst)
+        // CRITICAL: Resolve intent context before any journal call
+        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, 
+            fillPrice, fillQuantity, utcNow, out var context))
         {
-            contractMultiplier = (decimal)ntInst.MasterInstrument.PointValue;
+            // Context resolution failed - orphan fill logged and execution blocked
+            // Do NOT call journal with empty strings
+            return; // Fail-closed
         }
-
-        // Update ExecutionJournal: PARTIAL_FILL or FILLED (use cumulative quantity for safety)
-        if (filledTotal < orderInfo.Quantity)
+        
+        // Explicit Entry vs Exit Classification
+        if (orderInfo.IsEntryOrder == true)
         {
-            // Partial fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_PARTIAL_FILL",
-                new
-                {
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    filled_total = filledTotal,
-                    order_quantity = orderInfo.Quantity,
-                    broker_order_id = order.OrderId,
-                    order_type = orderInfo.OrderType
-                }));
-        }
-        else
-        {
-            // Full fill
-            _executionJournal.RecordFill(intentId, "", "", fillPrice, filledTotal, utcNow, contractMultiplier);
-            orderInfo.State = "FILLED";
-
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
-                new
-                {
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    filled_total = filledTotal,
-                    broker_order_id = order.OrderId,
-                    order_type = orderInfo.OrderType
-                }));
-        }
-
-        // STEP 4: Register entry fill with coordinator
-        if (orderInfo.IsEntryOrder)
-        {
+            // Entry fill
+            _executionJournal.RecordEntryFill(
+                context.IntentId, 
+                context.TradingDate, 
+                context.Stream,
+                fillPrice, 
+                fillQuantity,  // DELTA ONLY - not filledTotal
+                utcNow, 
+                context.ContractMultiplier, 
+                context.Direction,
+                context.ExecutionInstrument, 
+                context.CanonicalInstrument);
+            
+            // Log fill event
+            if (filledTotal < orderInfo.Quantity)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_PARTIAL_FILL",
+                    new
+                    {
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        filled_total = filledTotal,
+                        order_quantity = orderInfo.Quantity,
+                        broker_order_id = order.OrderId,
+                        order_type = orderInfo.OrderType,
+                        stream = context.Stream
+                    }));
+            }
+            else
+            {
+                orderInfo.State = "FILLED";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
+                    new
+                    {
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        filled_total = filledTotal,
+                        broker_order_id = order.OrderId,
+                        order_type = orderInfo.OrderType,
+                        stream = context.Stream
+                    }));
+            }
+            
+            // Register entry fill with coordinator
             if (_intentMap.TryGetValue(intentId, out var entryIntent))
             {
                 // Register exposure with coordinator
@@ -1159,22 +1357,21 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else
             {
-                // CRITICAL: Intent not found - protective orders cannot be placed
-                // EMERGENCY FIX: Flatten position immediately to prevent unprotected exposure
-                // Note: Cannot get stream from OrderInfo (it doesn't have Stream property) - use empty string
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                // This should not happen - ResolveIntentContextOrFailClosed already checked
+                // But handle defensively
+                _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_ERROR", "ENGINE",
                     new 
                     { 
-                        error = "Intent not found in _intentMap - cannot submit protective orders",
+                        error = "Intent not found in _intentMap after context resolution - defensive check",
                         intent_id = intentId,
                         fill_price = fillPrice,
                         fill_quantity = filledTotal,
                         order_type = orderInfo.OrderType,
                         broker_order_id = order.OrderId,
                         instrument = orderInfo.Instrument,
-                        stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                        stream = context.Stream,
                         action_taken = "FLATTENING_POSITION",
-                        note = "Entry order filled but intent was not registered - flattening position immediately to prevent unprotected exposure"
+                        note = "Entry order filled but intent lost after context resolution - flattening position"
                     }));
                 
                 // Emergency flatten to prevent unprotected position
@@ -1182,12 +1379,12 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
                     
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_NOT_FOUND_FLATTENED", state: "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
                         new
                         {
                             intent_id = intentId,
                             instrument = orderInfo.Instrument,
-                            stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                            stream = context.Stream,
                             fill_price = fillPrice,
                             fill_quantity = filledTotal,
                             flatten_success = flattenResult.Success,
@@ -1195,27 +1392,27 @@ public sealed partial class NinjaTraderSimAdapter
                             note = "Position flattened due to missing intent - protective orders could not be placed"
                         }));
                     
-                    // Stand down stream to prevent further trading (use empty string since stream not available)
-                    _standDownStreamCallback?.Invoke("", utcNow, $"INTENT_NOT_FOUND:{intentId}");
+                    // Stand down stream
+                    _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
                     
                     // Raise high-priority alert
                     var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                     if (notificationService != null)
                     {
                         var title = $"CRITICAL: Intent Not Found - {orderInfo.Instrument}";
-                        var message = $"Entry order filled but intent was not registered. Position flattened. Stream: UNKNOWN, Intent: {intentId}";
+                        var message = $"Entry order filled but intent was not registered. Position flattened. Stream: {context.Stream}, Intent: {intentId}";
                         notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2); // Emergency priority
                     }
                 }
                 catch (Exception ex)
                 {
                     // Log flatten failure but don't throw - we've already logged the error
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_NOT_FOUND_FLATTEN_FAILED", state: "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_FAILED", "ENGINE",
                         new
                         {
                             intent_id = intentId,
                             instrument = orderInfo.Instrument,
-                            stream = "", // OrderInfo doesn't have Stream property - intent not available to get it
+                            stream = context.Stream,
                             error = ex.Message,
                             exception_type = ex.GetType().Name,
                             note = "Failed to flatten position after intent not found - manual intervention may be required"
@@ -1225,8 +1422,51 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET")
         {
-            // Exit fill: register with coordinator
+            // Exit fill
+            _executionJournal.RecordExitFill(
+                context.IntentId, 
+                context.TradingDate, 
+                context.Stream,
+                fillPrice, 
+                fillQuantity,  // DELTA ONLY - not filledTotal
+                orderInfo.OrderType, 
+                utcNow);
+            
+            // Log exit fill event
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_EXIT_FILL",
+                new
+                {
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    filled_total = filledTotal,
+                    broker_order_id = order.OrderId,
+                    exit_order_type = orderInfo.OrderType,
+                    stream = context.Stream
+                }));
+            
+            // Register exit fill with coordinator
             _coordinator?.OnExitFill(intentId, filledTotal, utcNow);
+        }
+        else
+        {
+            // Unknown exit type - orphan it
+            LogOrphanFill(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, fillPrice, fillQuantity,
+                utcNow, context.Stream, "UNKNOWN_EXIT_TYPE");
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_UNKNOWN_EXIT_TYPE", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    order_type = orderInfo.OrderType,
+                    instrument = orderInfo.Instrument,
+                    stream = context.Stream,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    action_taken = "EXECUTION_BLOCKED",
+                    note = "Unknown exit order type - orphan fill logged, execution blocked"
+                }));
+            
+            return; // Fail-closed
         }
     }
 

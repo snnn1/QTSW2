@@ -153,6 +153,23 @@ export const calculateDOMProfit = (data, contractMultiplier = 1) => {
 }
 
 /**
+ * Calculate profit by Day of Year (DOY) by stream
+ * 
+ * @deprecated Use backend DOY breakdown instead. This function is kept only as a fallback
+ * for cases where backend data is unavailable. DOY calculation is backend-only.
+ */
+export const calculateDOYProfit = (data, contractMultiplier = 1) => {
+  // Fallback calculation - not canonical
+  // This function should rarely/never be called since DOY uses backend API exclusively
+  console.warn('calculateDOYProfit: Using fallback calculation. Backend DOY breakdown should be used instead.')
+  
+  // For now, return empty object - backend is the source of truth
+  // If fallback is truly needed, day of year calculation would need to be implemented
+  // but it's better to ensure backend data is always available
+  return {}
+}
+
+/**
  * Calculate profit by Day of Week (DOW) by stream
  */
 export const calculateDailyProfit = (data, contractMultiplier = 1) => {

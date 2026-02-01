@@ -5,6 +5,45 @@ using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
+/// <summary>
+/// Terminal state classification for streams.
+/// Provides explicit classification of how a stream ended.
+/// </summary>
+public enum StreamTerminalState
+{
+    /// <summary>
+    /// No trade occurred - no breakout detected before market close or other no-trade condition.
+    /// </summary>
+    NO_TRADE,
+    
+    /// <summary>
+    /// Trade completed successfully (STOP or TARGET filled).
+    /// </summary>
+    TRADE_COMPLETED,
+    
+    /// <summary>
+    /// Stream was skipped at timetable parse (canonical mismatch, disabled, etc.).
+    /// Note: This state is set when stream is never created, not persisted in StreamJournal.
+    /// </summary>
+    SKIPPED_CONFIG,
+    
+    /// <summary>
+    /// Runtime failure (stand down, corruption, protective failure, etc.).
+    /// </summary>
+    FAILED_RUNTIME,
+    
+    /// <summary>
+    /// Suspended due to insufficient data.
+    /// </summary>
+    SUSPENDED_DATA,
+    
+    /// <summary>
+    /// Zero bars loaded during hydration (CSV missing, BarsRequest failed, or timeout with 0 bars).
+    /// Distinct from NO_TRADE (no breakout) - represents data unavailability, not market conditions.
+    /// </summary>
+    ZERO_BAR_HYDRATION
+}
+
 public sealed class JournalStore
 {
     private readonly string _journalDir;
@@ -108,6 +147,12 @@ public sealed class StreamJournal
     public bool Committed { get; set; }
 
     public string? CommitReason { get; set; } // ENTRY_FILLED | NO_TRADE_MARKET_CLOSE | FORCED_FLATTEN
+
+    /// <summary>
+    /// Formal terminal state classification.
+    /// Set on commit to provide explicit classification of how stream ended.
+    /// </summary>
+    public StreamTerminalState? TerminalState { get; set; }
 
     public string LastState { get; set; } = "";
 

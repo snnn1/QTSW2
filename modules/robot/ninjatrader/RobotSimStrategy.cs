@@ -262,7 +262,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     
                     // Use strategy's instrument directly - no resolution needed at this stage
                     // Instrument resolution will happen later when orders are submitted (in Realtime state)
-                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName);
+                    // CRITICAL: Pass both execution instrument (e.g., "MGC") and MasterInstrument.Name (e.g., "GC")
+                    // for explicit canonical matching per authoritative rule
+                    var masterInstrumentName = Instrument.MasterInstrument.Name; // e.g., "GC" for "MGC 03-26"
+                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName, masterInstrumentName: masterInstrumentName);
                 
                 // PHASE 1: Set account info for startup banner
                 // Reuse accountName variable declared above

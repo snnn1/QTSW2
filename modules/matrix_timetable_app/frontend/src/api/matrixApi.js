@@ -145,17 +145,25 @@ export async function getProfitBreakdown({
   breakdownType,
   streamFilters = {},
   useFiltered = false,
-  contractMultiplier = 1.0
+  contractMultiplier = 1.0,
+  streamInclude = null
 }) {
+  const requestBody = {
+    breakdown_type: breakdownType,
+    stream_filters: streamFilters,
+    use_filtered: useFiltered,
+    contract_multiplier: contractMultiplier
+  }
+  
+  // Add stream_include if provided
+  if (streamInclude && Array.isArray(streamInclude) && streamInclude.length > 0) {
+    requestBody.stream_include = streamInclude
+  }
+  
   const response = await fetch(`${API_BASE}/matrix/breakdown`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      breakdown_type: breakdownType,
-      stream_filters: streamFilters,
-      use_filtered: useFiltered,
-      contract_multiplier: contractMultiplier
-    })
+    body: JSON.stringify(requestBody)
   })
 
   if (!response.ok) {

@@ -144,6 +144,7 @@ public sealed class StreamStateMachine
     
     // Pre-hydration state
     private bool _preHydrationComplete = false; // Must be true before entering ARMED/RANGE_BUILDING
+    private bool _hadZeroBarHydration = false; // Track if hydration resulted in zero bars (for terminal state classification)
     
     // Gap tolerance tracking (all times in Chicago, bar OPEN times)
     private double _largestSingleGapMinutes = 0.0; // Largest single gap seen
@@ -436,23 +437,9 @@ public sealed class StreamStateMachine
                     }
                 }
                 
-                // Journal can be fallback only (not the authority)
-                // If hydration log restoration failed, fall back to journal LastState check
-                if (!_rangeLocked && existing.LastState == "RANGE_LOCKED")
-                {
-                    // Fallback: Journal indicates locked but hydration/ranges log missing
-                    // This shouldn't happen, but handle gracefully
-                    LogHealth("WARN", "RANGE_LOCKED_RESTORE_FALLBACK", 
-                        "Restoring range lock from journal (hydration/ranges log not found)",
-                        new
-                        {
-                            trading_date = tradingDateStr,
-                            stream_id = Stream,
-                            note = "Hydration/ranges log should be canonical - investigate why it's missing. Journal is fallback only."
-                        });
-                    // Note: Cannot fully restore without hydration log data, so mark as needing recomputation
-                    // Range will be recomputed on next tick
-                }
+                // ARCHITECTURAL DOCTRINE: Hydration logs are canonical. Journal is advisory only.
+                // If hydration log restoration failed, range must be recomputed (explicit failure, not hidden fallback).
+                // Removed journal fallback to enforce single canonical source of truth.
             }
         }
         
@@ -1414,6 +1401,11 @@ public sealed class StreamStateMachine
                     // Log forced transition if hard timeout triggered
                     if (shouldForceTransition)
                     {
+                        // Mark zero-bar hydration if hard timeout forced transition with 0 bars
+                        if (barCount == 0)
+                        {
+                            _hadZeroBarHydration = true;
+                        }
                         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                             "PRE_HYDRATION_FORCED_TRANSITION", State.ToString(),
                             new
@@ -1431,6 +1423,7 @@ public sealed class StreamStateMachine
                     // Log timeout if transitioning without bars (but not forced)
                     else if (barCount == 0 && nowChicago >= RangeStartChicagoTime)
                     {
+                        _hadZeroBarHydration = true; // Mark zero-bar hydration (hard timeout with 0 bars)
                         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
                             SlotTimeChicago, SlotTimeUtc,
                             "PRE_HYDRATION_TIMEOUT_NO_BARS", "PRE_HYDRATION",
@@ -3610,6 +3603,7 @@ public sealed class StreamStateMachine
                         now_chicago = nowChicago.ToString("o"),
                         range_start_chicago = RangeStartChicagoTime.ToString("o")
                     });
+                _hadZeroBarHydration = true; // Mark zero-bar hydration
                 _preHydrationComplete = true;
                 return;
             }
@@ -3634,6 +3628,7 @@ public sealed class StreamStateMachine
                             hydration_start_chicago = hydrationStart.ToString("o"),
                             hydration_end_chicago = hydrationEnd.ToString("o")
                         });
+                    _hadZeroBarHydration = true; // Mark zero-bar hydration
                     _preHydrationComplete = true;
                     return;
                 }
@@ -3716,6 +3711,7 @@ public sealed class StreamStateMachine
                         now_chicago = nowChicago.ToString("o"),
                         range_start_chicago = RangeStartChicagoTime.ToString("o")
                     });
+                _hadZeroBarHydration = true; // Mark zero-bar hydration
             }
             else
             {
@@ -4870,13 +4866,17 @@ public sealed class StreamStateMachine
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journal.TimetableHashAtCommit = _timetableHash;
 
+        // Determine terminal state based on commit reason and trade completion
+        _journal.TerminalState = DetermineTerminalState(commitReason, utcNow);
+
         _journals.Save(_journal);
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "JOURNAL_WRITTEN", StreamState.DONE.ToString(),
             new 
             { 
                 committed = true, 
-                commit_reason = commitReason, 
+                commit_reason = commitReason,
+                terminal_state = _journal.TerminalState?.ToString() ?? "NULL",
                 timetable_hash_at_commit = _timetableHash,
                 execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
                 canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
@@ -4890,9 +4890,64 @@ public sealed class StreamStateMachine
             { 
                 committed = true, 
                 commit_reason = commitReason,
+                terminal_state = _journal.TerminalState?.ToString() ?? "NULL",
                 execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
                 canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
             }));
+    }
+
+    /// <summary>
+    /// Determine terminal state based on commit reason and trade completion status.
+    /// </summary>
+    private StreamTerminalState DetermineTerminalState(string commitReason, DateTimeOffset utcNow)
+    {
+        // Check if trade was completed (from execution journal)
+        bool tradeCompleted = false;
+        if (_executionJournal != null)
+        {
+            tradeCompleted = _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
+        }
+
+        // Classify based on commit reason and trade completion
+        if (tradeCompleted)
+        {
+            return StreamTerminalState.TRADE_COMPLETED;
+        }
+
+        // Check for zero-bar hydration (distinct from generic NO_TRADE)
+        // Zero-bar hydration occurs when CSV missing, BarsRequest failed, or hard timeout with 0 bars
+        if (_hadZeroBarHydration && 
+            (commitReason.Contains("NO_TRADE") || 
+             commitReason == "NO_TRADE_MARKET_CLOSE" ||
+             commitReason.Contains("PRE_HYDRATION") ||
+             commitReason.Contains("TIMEOUT")))
+        {
+            return StreamTerminalState.ZERO_BAR_HYDRATION;
+        }
+
+        // Classify based on commit reason
+        if (commitReason == "STREAM_STAND_DOWN" || 
+            commitReason.Contains("FAILED") || 
+            commitReason.Contains("ERROR") ||
+            commitReason.Contains("CORRUPTION"))
+        {
+            return StreamTerminalState.FAILED_RUNTIME;
+        }
+
+        if (commitReason == "NO_TRADE_MARKET_CLOSE" || 
+            commitReason == "NO_TRADE_LATE_START_MISSED_BREAKOUT" ||
+            commitReason.Contains("NO_TRADE"))
+        {
+            return StreamTerminalState.NO_TRADE;
+        }
+
+        if (State == StreamState.SUSPENDED_DATA_INSUFFICIENT)
+        {
+            return StreamTerminalState.SUSPENDED_DATA;
+        }
+
+        // Default: NO_TRADE if no other classification applies
+        return StreamTerminalState.NO_TRADE;
     }
     
     /// <summary>

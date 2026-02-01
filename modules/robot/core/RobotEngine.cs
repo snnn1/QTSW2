@@ -43,6 +43,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // PHASE 3.1: Single-executor guard for canonical markets
     private CanonicalMarketLock? _canonicalMarketLock;
     private readonly string? _executionInstrument; // Execution instrument from constructor (MES, ES, etc.)
+    private readonly string? _masterInstrumentName; // MasterInstrument.Name from NinjaTrader (for explicit canonical matching)
 
     private string? _lastTimetableHash;
     private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
@@ -284,11 +285,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     string IExecutionRecoveryGuard.GetRecoveryStateReason() => RecoveryState.ToString();
 
-    public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, bool useAsyncLogging = true)
+    public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, string? masterInstrumentName = null, bool useAsyncLogging = true)
     {
         _root = projectRoot;
         _executionMode = executionMode;
         _executionInstrument = instrument; // PHASE 3.1: Store execution instrument for canonical lock
+        _masterInstrumentName = masterInstrumentName; // Store MasterInstrument.Name for explicit canonical matching
         
         // Log the instrument passed from NinjaTrader (for debugging)
         if (!string.IsNullOrWhiteSpace(instrument))
@@ -2845,24 +2847,53 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             
             // 🔒 INVARIANT: The strategy's enabled instrument in NinjaTrader is the primary execution anchor.
             // Policy may only restrict or remap execution after anchoring to that instrument.
-            // - Anchor: Use _executionInstrument if it matches canonical market
+            // - Anchor: Use _executionInstrument if MasterInstrument.Name matches canonical market
             // - Restrict: Policy validation in GetOrderQuantity() will fail if instrument is disabled
             // - Remap: Not supported (NinjaTrader strategies are single-instrument)
             //
-            // CRITICAL: Skip directives for instruments that don't match NinjaTrader's canonical market
-            // NinjaTrader strategies are single-instrument - we can only execute on the instrument configured in NinjaTrader
+            // CRITICAL RULE: If a strategy is enabled on a specific contract in NinjaTrader, that contract MUST be traded,
+            // provided its MasterInstrument matches a timetable canonical instrument.
             // This check happens FIRST before any processing to avoid unnecessary work
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
-                var ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                // Use MasterInstrument.Name directly for explicit canonical matching (as per authoritative rule)
+                string? ntCanonical = null;
+                if (!string.IsNullOrWhiteSpace(_masterInstrumentName))
+                {
+                    // Explicit: Use MasterInstrument.Name directly (e.g., "GC" for "MGC 03-26")
+                    ntCanonical = _masterInstrumentName.ToUpperInvariant();
+                }
+                else
+                {
+                    // Fallback: Derive canonical from execution instrument (for backwards compatibility)
+                    ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                }
+                
                 if (!string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Skip this directive - it's for a different canonical market than what NinjaTrader is configured for
+                    // Skip this directive - MasterInstrument does not match timetable canonical instrument
                     skippedCount++;
                     var skipReason = "CANONICAL_MISMATCH";
                     if (!skippedReasons.ContainsKey(skipReason))
                         skippedReasons[skipReason] = 0;
                     skippedReasons[skipReason]++;
+                    
+                    // FAIL LOUDLY: Log per-stream skip with detailed context
+                    var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+                    var slotTimeUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "STREAM_SKIPPED", "ENGINE", new 
+                        { 
+                            reason = "CANONICAL_MISMATCH", 
+                            stream_id = directive.stream, 
+                            timetable_canonical = canonicalInstrument,
+                            ninjatrader_master_instrument = ntCanonical ?? "NULL",
+                            ninjatrader_execution_instrument = _executionInstrument ?? "NULL",
+                            session = session, 
+                            slot_time = slotTimeChicago,
+                            note = "MasterInstrument does not match timetable canonical instrument - directive skipped per authoritative rule"
+                        }));
+                    
                     continue; // Skip to next directive
                 }
             }

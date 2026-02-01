@@ -41,8 +41,8 @@ export default function ProfitTable({ data, periodType }) {
   }
   
   // Get sorted periods
-  // For DOM (Day of Month), sort numerically; for month/year, sort descending (newest first); otherwise sort as strings
-  const sortedPeriods = periodType === 'dom' 
+  // For DOM (Day of Month) and DOY (Day of Year), sort numerically; for month/year, sort descending (newest first); otherwise sort as strings
+  const sortedPeriods = periodType === 'dom' || periodType === 'doy'
     ? Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b))
     : periodType === 'month'
     ? Object.keys(data).sort((a, b) => {
@@ -71,7 +71,7 @@ export default function ProfitTable({ data, periodType }) {
         <thead>
           <tr className="bg-gray-800">
             <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
-              {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'month' ? 'Month' : 'Year'}
+              {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'doy' ? 'Day of Year' : periodType === 'month' ? 'Month' : 'Year'}
             </th>
             {sortedStreams.map(stream => (
               <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
@@ -102,6 +102,8 @@ export default function ProfitTable({ data, periodType }) {
                     ? period // Already the day of week name (Monday, Tuesday, etc.)
                     : periodType === 'dom'
                     ? `${period}${getOrdinalSuffix(period)}` // e.g., "1st", "2nd", "3rd"
+                    : periodType === 'doy'
+                    ? `Day ${period}`
                     : periodType === 'month'
                     ? (() => {
                         // Period should be in format "YYYY-MM" (e.g., "2024-01")

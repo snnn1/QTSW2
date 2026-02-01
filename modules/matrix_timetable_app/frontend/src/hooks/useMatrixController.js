@@ -316,7 +316,7 @@ export function useMatrixController({
   useEffect(() => {
     try {
       // Breakdown tabs don't use data table filtering
-      const breakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year', 'timetable']
+      const breakdownTabs = ['time', 'day', 'dom', 'doy', 'date', 'month', 'year', 'timetable']
       if (breakdownTabs.includes(deferredActiveTab)) {
         return
       }

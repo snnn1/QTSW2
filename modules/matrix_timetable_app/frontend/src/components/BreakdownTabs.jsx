@@ -1,5 +1,8 @@
 import ProfitTable from './ProfitTable'
 
+/**
+ * BreakdownTabs Component
+ */
 export default function BreakdownTabs({
   activeTab,
   masterLoading,
@@ -8,11 +11,13 @@ export default function BreakdownTabs({
   timeProfitAfter,
   dayProfitAfter,
   domProfitAfter,
+  doyProfitAfter,
   monthProfitAfter,
   yearProfitAfter,
   timeProfitBefore,
   dayProfitBefore,
   domProfitBefore,
+  doyProfitBefore,
   monthProfitBefore,
   yearProfitBefore
 }) {
@@ -21,6 +26,7 @@ export default function BreakdownTabs({
       case 'time': return 'Time'
       case 'day': return 'Day of Week (DOW)'
       case 'dom': return 'Day of Month'
+      case 'doy': return 'Day of Year'
       case 'month': return 'Month'
       case 'year': return 'Year'
       default: return ''
@@ -32,6 +38,7 @@ export default function BreakdownTabs({
       case 'time': return timeProfitAfter
       case 'day': return dayProfitAfter
       case 'dom': return domProfitAfter
+      case 'doy': return doyProfitAfter
       case 'month': return monthProfitAfter
       case 'year': return yearProfitAfter
       default: return {}
@@ -43,6 +50,7 @@ export default function BreakdownTabs({
       case 'time': return timeProfitBefore
       case 'day': return dayProfitBefore
       case 'dom': return domProfitBefore
+      case 'doy': return doyProfitBefore
       case 'month': return monthProfitBefore
       case 'year': return yearProfitBefore
       default: return {}

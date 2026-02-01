@@ -132,6 +132,11 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
         
     Returns:
         DataFrame with filters applied (final_allowed and filter_reasons updated)
+    
+    Note:
+        WOY filtering is NOT supported - WOY is analysis-only diagnostic tool.
+        StreamFilterConfig does NOT include exclude_weeks_of_year field.
+        WOY breakdowns are for regime discovery, not execution tuning.
     """
     # Handle empty DataFrame explicitly
     if df.empty:

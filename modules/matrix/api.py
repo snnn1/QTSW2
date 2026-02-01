@@ -45,7 +45,7 @@ class MatrixBuildRequest(BaseModel):
 
 
 class BreakdownRequest(BaseModel):
-    breakdown_type: str  # "day", "dom", "time", "date", "month", "year"
+    breakdown_type: str  # "day", "dom", "doy", "doy_by_year", "time", "date", "month", "year"
     stream_filters: Optional[Dict[str, StreamFilterConfig]] = None
     use_filtered: bool = False  # If True, apply filters; if False, use all data
     contract_multiplier: float = 1.0
@@ -676,6 +676,18 @@ async def calculate_profit_breakdown(request: BreakdownRequest):
     """
     try:
         import pandas as pd
+        
+        # DOY breakdown is analysis-only. Day-based filters are not supported and will be ignored.
+        if request.breakdown_type == 'doy':
+            # DOY is analysis-only - no day-based filters allowed
+            # This is defensive - StreamFilterConfig doesn't have exclude_days_of_year
+            # But log if someone tries to add it in the future
+            for stream_id, filter_config in (request.stream_filters or {}).items():
+                if hasattr(filter_config, 'exclude_days_of_year'):
+                    logger.warning(
+                        f"DOY breakdown requested but day-based filters detected for {stream_id}. "
+                        f"DOY is analysis-only - day filters will be ignored."
+                    )
         
         # Find latest matrix file (same logic as /data endpoint)
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"

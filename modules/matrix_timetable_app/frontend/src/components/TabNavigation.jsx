@@ -67,6 +67,16 @@ export default function TabNavigation({ activeTab, setActiveTab }) {
         DOM
       </button>
       <button
+        onClick={() => setActiveTab('doy')}
+        className={`px-4 py-2 font-medium whitespace-nowrap ${
+          activeTab === 'doy'
+            ? 'border-b-2 border-blue-500 text-blue-400'
+            : 'text-gray-400 hover:text-gray-300'
+        }`}
+      >
+        DOY
+      </button>
+      <button
         onClick={() => setActiveTab('month')}
         className={`px-4 py-2 font-medium whitespace-nowrap ${
           activeTab === 'month'

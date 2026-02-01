@@ -12,6 +12,7 @@ import {
   calculateTimeProfit,
   calculateDailyProfit,
   calculateDOMProfit,
+  calculateDOYProfit,
   calculateDateProfit,
   calculateMonthlyProfit,
   calculateYearlyProfit
@@ -490,8 +491,8 @@ function AppContent() {
   // Fetch backend stats for individual streams (full dataset)
   // CRITICAL: Always fetch backend stats for individual streams to ensure stats cover ALL data
   useEffect(() => {
-    // Breakdown tabs that are NOT streams: timetable, master, time, day, dom, date, month, year, stats
-    const breakdownTabs = ['timetable', 'master', 'time', 'day', 'dom', 'date', 'month', 'year', 'stats']
+    // Breakdown tabs that are NOT streams: timetable, master, time, day, dom, doy, date, month, year, stats
+    const breakdownTabs = ['timetable', 'master', 'time', 'day', 'dom', 'doy', 'date', 'month', 'year', 'stats']
     
     // Only fetch for individual stream tabs (not breakdown tabs)
     if (deferredActiveTab && !breakdownTabs.includes(deferredActiveTab)) {
@@ -635,6 +636,9 @@ function AppContent() {
   
   const calculateDOMProfitLocal = (data = masterData) => 
     calculateDOMProfit(data, masterContractMultiplier)
+  
+  const calculateDOYProfitLocal = (data = masterData) => 
+    calculateDOYProfit(data, masterContractMultiplier)
   
   const calculateDailyProfitLocal = (data = masterData) => 
     calculateDailyProfit(data, masterContractMultiplier)
@@ -2523,7 +2527,7 @@ function AppContent() {
   }
   
   // Render profit breakdown tables
-  const renderProfitTable = (data, periodType, limitDays = null) => {
+  const renderProfitTable = (data, periodType, limitDays = null, yearConsistencyData = null) => {
     // Wrap in try-catch to prevent white screen on errors
     try {
     // Ensure data is always an object (never undefined or null)
@@ -2564,8 +2568,8 @@ function AppContent() {
     const sortedStreams = Array.from(allStreams).sort()
     
     // Get sorted periods
-    // For DOM (Day of Month), sort numerically; for month/year/date/day, sort with latest first; otherwise sort as strings
-    const sortedPeriods = periodType === 'dom' 
+    // For DOM (Day of Month) and DOY (Day of Year), sort numerically; for month/year/date/day, sort with latest first; otherwise sort as strings
+    const sortedPeriods = periodType === 'dom' || periodType === 'doy'
       ? Object.keys(data).sort((a, b) => parseInt(a) - parseInt(b))
       : periodType === 'month'
       ? Object.keys(data).sort((a, b) => {
@@ -2574,12 +2578,6 @@ function AppContent() {
       : periodType === 'date'
       ? Object.keys(data).sort((a, b) => {
           return b.localeCompare(a) // Latest first (YYYY-MM-DD format)
-        })
-      : periodType === 'day'
-      ? Object.keys(data).sort((a, b) => {
-          // Sort day of week in order: Monday, Tuesday, Wednesday, Thursday, Friday
-          const dowOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-          return dowOrder.indexOf(a) - dowOrder.indexOf(b)
         })
       : periodType === 'year'
       ? Object.keys(data).sort((a, b) => {
@@ -2612,7 +2610,7 @@ function AppContent() {
             <thead>
               <tr className="bg-gray-800">
                 <th className="p-3 border border-gray-700 text-left font-semibold bg-gray-800">
-                  {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'month' ? 'Month' : 'Year'}
+                  {periodType === 'time' ? 'Time' : periodType === 'day' ? 'DOW' : periodType === 'dom' ? 'Day of Month' : periodType === 'doy' ? 'Day of Year' : periodType === 'month' ? 'Month' : 'Year'}
                 </th>
                 {sortedStreams.map(stream => (
                   <th key={stream} className="p-3 border border-gray-700 text-right font-semibold bg-gray-800">
@@ -2633,15 +2631,12 @@ function AppContent() {
                 return (
                   <tr key={period} className="hover:bg-gray-900">
                     <td className="p-3 border border-gray-700 font-medium">
-                    {periodType === 'time'
-                      ? period
-                      : periodType === 'day'
-                      ? period // Day of week name (Monday, Tuesday, etc.)
-                      : periodType === 'dom'
-                        ? `${period}${getOrdinalSuffix(period)}`
-                        : periodType === 'month'
-                        ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' })
-                        : period}
+                      {periodType === 'time' ? period :
+                       periodType === 'day' ? period :
+                       periodType === 'dom' ? `${period}${getOrdinalSuffix(period)}` :
+                       periodType === 'doy' ? `Day ${period}` :
+                       periodType === 'month' ? new Date(period + '-01').toLocaleDateString('en-US', { year: 'numeric', month: 'long' }) :
+                       period}
                     </td>
                     {sortedStreams.map(stream => {
                       const profit = (periodData && periodData[stream]) || 0
@@ -2836,11 +2831,11 @@ function AppContent() {
   // Track previous breakdown tab to clear old breakdown types when switching
   const prevBreakdownTabRef = useRef(null)
   
-  // Calculate profit breakdowns - use backend for full-dataset breakdowns (DOW/DOM/TIME/YEAR), worker for filtered view (date/month)
+  // Calculate profit breakdowns - use backend for full-dataset breakdowns (DOW/DOM/DOY/TIME/YEAR), worker for filtered view (date/month)
   // Use activeTab (not deferredActiveTab) for breakdowns since they're less performance-critical
   // and we want them to trigger immediately when user clicks a breakdown tab
   useEffect(() => {
-    const activeBreakdownTabs = ['time', 'day', 'dom', 'date', 'month', 'year']
+    const activeBreakdownTabs = ['time', 'day', 'dom', 'doy', 'date', 'month', 'year']
     
     // Only calculate if we're on a breakdown tab
     if (!activeBreakdownTabs.includes(activeTab)) {
@@ -2853,7 +2848,7 @@ function AppContent() {
     
     // For DOW, DOM, TIME, YEAR, and MONTH tabs, fetch from backend (full dataset, canonical)
     // For other tabs (date), use worker (filtered view is fine)
-    if (activeTab === 'day' || activeTab === 'dom' || activeTab === 'time' || activeTab === 'year' || activeTab === 'month') {
+    if (activeTab === 'day' || activeTab === 'dom' || activeTab === 'doy' || activeTab === 'time' || activeTab === 'year' || activeTab === 'month') {
       // Fetch full-dataset breakdowns from backend
       const fetchBreakdownFromBackend = async (useFiltered) => {
         try {
@@ -2862,6 +2857,8 @@ function AppContent() {
             breakdownType = 'dow'
           } else if (activeTab === 'dom') {
             breakdownType = 'dom'
+          } else if (activeTab === 'doy') {
+            breakdownType = 'doy'
           } else if (activeTab === 'time') {
             breakdownType = 'time'
           } else if (activeTab === 'year') {
@@ -2884,7 +2881,21 @@ function AppContent() {
             streamInclude: streamIncludeParam
           })
           
+          
+          console.log(`[Breakdown] Received response for ${breakdownType}:`, {
+            hasData: !!data,
+            hasBreakdown: !!(data && data.breakdown),
+            breakdownKeys: data && data.breakdown ? Object.keys(data.breakdown).length : 0,
+            sampleKeys: data && data.breakdown ? Object.keys(data.breakdown).slice(0, 5) : []
+          })
+          
           if (data && data.breakdown) {
+            // Check if breakdown has any data
+            const breakdownKeys = Object.keys(data.breakdown)
+            if (breakdownKeys.length === 0) {
+              console.warn(`[Breakdown] Empty breakdown received for ${activeTab} (${useFiltered ? 'after' : 'before'})`)
+            }
+            
             const suffix = useFiltered ? 'after' : 'before'
             // Verify breakdown format - should be {time: {stream: profit}} for time tab
             if (activeTab === 'time') {
@@ -2914,10 +2925,21 @@ function AppContent() {
             }))
             console.log(`[Breakdown] Updated ${activeTab}_${suffix} breakdown from backend (${Object.keys(data.breakdown).length} entries)`)
           } else {
-            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`, data)
+            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`, {
+              data,
+              hasData: !!data,
+              hasBreakdown: !!(data && data.breakdown),
+              responseKeys: data ? Object.keys(data) : []
+            })
           }
         } catch (error) {
           console.error(`Failed to fetch ${activeTab} breakdown from backend:`, error)
+          console.error(`Error details:`, {
+            message: error.message,
+            stack: error.stack,
+            breakdownType,
+            useFiltered
+          })
         }
       }
       
@@ -2979,6 +3001,30 @@ function AppContent() {
     if (!workerReady) return calculateDOMProfitLocal(memoizedMasterFilteredData)
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
+  
+  const memoizedDOYProfitBefore = useMemo(() => {
+    const data = profitBreakdowns['doy_before']
+    if (data) {
+      console.log(`[DOY] Using doy_before data: ${Object.keys(data).length} days`)
+      return data
+    }
+    // DOY uses backend API (full dataset) - don't fall back to worker data
+    // Return empty object to wait for backend data
+    console.log(`[DOY] No doy_before data yet, waiting for backend...`)
+    return {}
+  }, [profitBreakdowns])
+  
+  const memoizedDOYProfitAfter = useMemo(() => {
+    const data = profitBreakdowns['doy_after']
+    if (data) {
+      console.log(`[DOY] Using doy_after data: ${Object.keys(data).length} days`)
+      return data
+    }
+    // DOY uses backend API (full dataset) - don't fall back to worker data
+    // Return empty object to wait for backend data
+    console.log(`[DOY] No doy_after data yet, waiting for backend...`)
+    return {}
+  }, [profitBreakdowns])
   
   const memoizedMonthProfitBefore = useMemo(() => {
     // Month breakdown is canonical - fetched from backend (full dataset)
@@ -3330,6 +3376,18 @@ function AppContent() {
           </button>
           <button
             onClick={() => {
+              handleTabChange('doy');
+            }}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'woy'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            DOY
+          </button>
+          <button
+            onClick={() => {
               handleTabChange('date');
             }}
             className={`px-4 py-2 font-medium whitespace-nowrap ${
@@ -3520,11 +3578,11 @@ function AppContent() {
               )}
             </div>
           </div>
-        ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'date' || activeTab === 'month' || activeTab === 'year' ? (
+        ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'doy' || activeTab === 'date' || activeTab === 'month' || activeTab === 'year' ? (
           <div className="space-y-6">
             <div className="bg-gray-900 rounded-lg p-6">
               <h2 className="text-xl font-semibold mb-6">
-                Profit by {activeTab === 'time' ? 'Time' : activeTab === 'day' ? 'Day of Week (DOW)' : activeTab === 'dom' ? 'Day of Month' : activeTab === 'date' ? 'Day' : activeTab === 'month' ? 'Month' : 'Year'} - All Streams
+                Profit by {activeTab === 'time' ? 'Time' : activeTab === 'day' ? 'Day of Week (DOW)' : activeTab === 'dom' ? 'Day of Month' : activeTab === 'doy' ? 'Day of Year' : activeTab === 'date' ? 'Day' : activeTab === 'month' ? 'Month' : 'Year'} - All Streams
               </h2>
               {masterLoading ? (
                 <div className="text-center py-8">Loading data...</div>
@@ -3540,6 +3598,7 @@ function AppContent() {
                 </div>
               ) : (
                 <>
+                  
                   {/* After Filters */}
                   <div className="mb-8">
                     <div className="flex items-center justify-between mb-4">
@@ -3558,13 +3617,15 @@ function AppContent() {
                         const data = activeTab === 'time' ? memoizedTimeProfitAfter :
                           activeTab === 'day' ? memoizedDayProfitAfter :
                           activeTab === 'dom' ? memoizedDOMProfitAfter :
+                          activeTab === 'doy' ? memoizedDOYProfitAfter :
                           activeTab === 'date' ? memoizedDateProfitAfter :
                           activeTab === 'month' ? memoizedMonthProfitAfter :
                           memoizedYearProfitAfter
                         return data || {}
                       })(),
                       activeTab,
-                      activeTab === 'date' && !showAllDays ? 200 : null
+                      activeTab === 'date' && !showAllDays ? 200 : null,
+                      null
                     )}
                   </div>
                   
@@ -3586,13 +3647,15 @@ function AppContent() {
                         const data = activeTab === 'time' ? memoizedTimeProfitBefore :
                           activeTab === 'day' ? memoizedDayProfitBefore :
                           activeTab === 'dom' ? memoizedDOMProfitBefore :
+                          activeTab === 'doy' ? memoizedDOYProfitBefore :
                           activeTab === 'date' ? memoizedDateProfitBefore :
                           activeTab === 'month' ? memoizedMonthProfitBefore :
                           memoizedYearProfitBefore
                         return data || {}
                       })(),
                       activeTab,
-                      activeTab === 'date' && !showAllDays ? 200 : null
+                      activeTab === 'date' && !showAllDays ? 200 : null,
+                      null
                     )}
                   </div>
                 </>
