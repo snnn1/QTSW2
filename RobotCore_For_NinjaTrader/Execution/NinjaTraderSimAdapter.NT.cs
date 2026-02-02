@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
 using NinjaTrader.Cbi;
@@ -1289,7 +1290,7 @@ public sealed partial class NinjaTraderSimAdapter
         
         // CRITICAL: Resolve intent context before any journal call
         if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, 
-            fillPrice, fillQuantity, utcNow, out var context))
+            fillPrice, fillQuantity, utcNow, out IntentContext context))
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings

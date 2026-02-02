@@ -141,16 +141,18 @@ class EventProcessor:
             # Track last bar time per execution instrument contract (authoritative)
             # CRITICAL: Use execution_instrument_full_name for bar tracking (e.g., "MES 03-26")
             execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
+            instrument = event.get("instrument") or data.get("instrument")
             if execution_instrument_full_name:
                 # Use event timestamp as bar time proxy (OnBarUpdate is called when bar arrives)
                 self._state_manager.update_last_bar(execution_instrument_full_name, timestamp_utc)
-            else:
+                logger.debug(f"ONBARUPDATE_CALLED: Updated last_bar for {execution_instrument_full_name} at {timestamp_utc.isoformat()}")
+            elif instrument:
                 # Backward compatibility: fall back to instrument field if execution_instrument_full_name not present
                 # Old events may only have canonical instrument - handle gracefully
-                instrument = data.get("instrument") or event.get("instrument")
-                if instrument:
-                    # Use instrument as fallback (may be canonical in old events)
-                    self._state_manager.update_last_bar(instrument, timestamp_utc)
+                self._state_manager.update_last_bar(instrument, timestamp_utc)
+                logger.debug(f"ONBARUPDATE_CALLED: Updated last_bar for {instrument} (fallback) at {timestamp_utc.isoformat()}")
+            else:
+                logger.warning(f"ONBARUPDATE_CALLED: No instrument found in event {event.get('event_seq')}")
         
         elif event_type == "ENGINE_TICK_CALLSITE":
             # ENGINE_TICK_CALLSITE is emitted every time Tick() is called (very frequent, rate-limited in feed)
@@ -168,12 +170,89 @@ class EventProcessor:
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status
-            pass_value = data.get("pass", False)
+            # CRITICAL: Extract from payload string if not in data dict (C# anonymous object serialization)
+            pass_value = data.get("pass")
             violations = data.get("violations", [])
             canonical_instrument = data.get("canonical_instrument", "")
             execution_instrument = data.get("execution_instrument", "")
             stream_ids = data.get("stream_ids", [])
             checked_at_utc_str = data.get("checked_at_utc", "")
+            
+            # If fields are missing, try to extract from payload string
+            if pass_value is None and "payload" in data:
+                payload_str = data.get("payload", "")
+                if isinstance(payload_str, str):
+                    try:
+                        # Extract pass value from payload: "pass = True" or "pass = False" or "pass = [REDACTED]"
+                        # If redacted, check the note field for "passed" or "failed"
+                        pass_match = re.search(r'pass\s*=\s*([^,\s}]+)', payload_str)
+                        if pass_match:
+                            pass_str = pass_match.group(1).strip()
+                            # Handle boolean values
+                            if pass_str.lower() in ('true', 'true', '1'):
+                                pass_value = True
+                            elif pass_str.lower() in ('false', 'false', '0'):
+                                pass_value = False
+                            elif '[redacted]' in pass_str.lower() or '[REDACTED]' in pass_str:
+                                # Value is redacted - check note for hint
+                                # Note field comes after checked_at_utc, extract everything after "note ="
+                                note_match = re.search(r'note\s*=\s*([^}]+)', payload_str, re.IGNORECASE)
+                                if note_match:
+                                    note = note_match.group(1).strip().lower()
+                                    logger.info(f"Extracted note from identity payload: {note[:150]}")
+                                    # Check for positive indicators first
+                                    if 'passed' in note or 'consistent' in note or 'all identity invariants passed' in note:
+                                        pass_value = True
+                                        logger.info(f"Identity check PASSED based on note: '{note[:100]}'")
+                                    elif 'failed' in note or 'violation' in note or 'inconsistent' in note:
+                                        pass_value = False
+                                        logger.info(f"Identity check FAILED based on note: '{note[:100]}'")
+                                    else:
+                                        # If note is unclear but contains "passed" anywhere, assume pass
+                                        if 'passed' in note.lower():
+                                            pass_value = True
+                                            logger.info(f"Identity check PASSED (fallback) based on note containing 'passed': '{note[:100]}'")
+                                        else:
+                                            pass_value = None  # Unknown
+                                            logger.warning(f"Identity note unclear, cannot determine pass/fail: '{note[:100]}'")
+                                else:
+                                    logger.warning("No note field found in identity payload - cannot determine pass/fail")
+                                    pass_value = None
+                            else:
+                                logger.warning(f"Unknown pass_str format: '{pass_str}' - cannot determine pass/fail")
+                                pass_value = None
+                        
+                        # Extract violations if present
+                        if not violations:
+                            # Check if violations list is mentioned (may be empty)
+                            violations_match = re.search(r'violations\s*=\s*([^,}]+)', payload_str)
+                            # If violations list is not empty, we'd need more complex parsing
+                            # For now, leave as empty list if not explicitly found
+                        
+                        # Extract canonical_instrument
+                        if not canonical_instrument:
+                            canon_match = re.search(r'canonical_instrument\s*=\s*([^,}]+)', payload_str)
+                            if canon_match:
+                                canonical_instrument = canon_match.group(1).strip()
+                        
+                        # Extract execution_instrument
+                        if not execution_instrument:
+                            exec_match = re.search(r'execution_instrument\s*=\s*([^,}]+)', payload_str)
+                            if exec_match:
+                                execution_instrument = exec_match.group(1).strip()
+                        
+                        # Extract checked_at_utc
+                        if not checked_at_utc_str:
+                            checked_match = re.search(r'checked_at_utc\s*=\s*([^,}]+)', payload_str)
+                            if checked_match:
+                                checked_at_utc_str = checked_match.group(1).strip()
+                    except Exception as e:
+                        logger.error(f"Failed to parse identity payload: {e}", exc_info=True)
+                        # Don't set pass_value here - let it fall through to default
+            
+            # Default pass_value to False if still None
+            if pass_value is None:
+                pass_value = False
             
             checked_at_utc = self._parse_timestamp(checked_at_utc_str) if checked_at_utc_str else timestamp_utc
             
@@ -197,7 +276,8 @@ class EventProcessor:
                            "DISCONNECT_RECOVERY_COMPLETE", "DISCONNECT_RECOVERY_ABORTED"):
             self._state_manager.update_recovery_state(event_type, timestamp_utc)
         
-        elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED"):
+        elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION"):
+            # CONNECTION_RECOVERED_NOTIFICATION is also a recovery signal
             connection_status = "ConnectionLost" if "LOST" in event_type else "Connected"
             self._state_manager.update_connection_status(connection_status, timestamp_utc)
         
@@ -699,13 +779,64 @@ class EventProcessor:
         
         elif event_type == "BAR_ACCEPTED":
             # Standardized fields are now always at top level (plan requirement #1)
-            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
-            instrument = event.get("instrument")
-            if execution_instrument_full_name:
-                self._state_manager.update_last_bar(execution_instrument_full_name, timestamp_utc)
-            elif instrument:
-                # Backward compatibility: fall back to instrument field
-                self._state_manager.update_last_bar(instrument, timestamp_utc)
+            # Try multiple sources: data dict first (most reliable), then top-level event, then instrument fields
+            execution_instrument_full_name = (
+                data.get("execution_instrument_full_name") or 
+                event.get("execution_instrument_full_name") or
+                data.get("instrument") or
+                event.get("instrument")
+            )
+            
+            if execution_instrument_full_name and execution_instrument_full_name.strip():
+                self._state_manager.update_last_bar(execution_instrument_full_name.strip(), timestamp_utc)
+                logger.debug(f"BAR_ACCEPTED: Updated last_bar for {execution_instrument_full_name} at {timestamp_utc.isoformat()}")
+            else:
+                # Last resort: try to extract from payload if present
+                payload = data.get("payload", "")
+                if isinstance(payload, str) and "instrument" in payload:
+                    try:
+                        match = re.search(r'instrument\s*=\s*([^,}]+)', payload)
+                        if match:
+                            extracted_instrument = match.group(1).strip()
+                            self._state_manager.update_last_bar(extracted_instrument, timestamp_utc)
+                            logger.debug(f"BAR_ACCEPTED: Extracted and updated last_bar for {extracted_instrument} from payload at {timestamp_utc.isoformat()}")
+                        else:
+                            logger.warning(f"BAR_ACCEPTED: No instrument found in event {event.get('event_seq')}, payload={payload[:100]}")
+                    except Exception as e:
+                        logger.warning(f"BAR_ACCEPTED: Failed to extract instrument from payload for event {event.get('event_seq')}: {e}")
+                else:
+                    logger.warning(f"BAR_ACCEPTED: No instrument found in event {event.get('event_seq')}, data keys: {list(data.keys())}")
+        
+        elif event_type == "BAR_RECEIVED_NO_STREAMS":
+            # Track bar arrival even when no streams exist (for data stall detection)
+            # This ensures watchdog can detect data stalls even before streams are created
+            # Try multiple sources: data dict first (most reliable), then top-level event, then instrument fields
+            execution_instrument_full_name = (
+                data.get("execution_instrument_full_name") or 
+                event.get("execution_instrument_full_name") or
+                data.get("instrument") or
+                event.get("instrument")
+            )
+            
+            if execution_instrument_full_name and execution_instrument_full_name.strip():
+                self._state_manager.update_last_bar(execution_instrument_full_name.strip(), timestamp_utc)
+                logger.debug(f"BAR_RECEIVED_NO_STREAMS: Updated last_bar for {execution_instrument_full_name} at {timestamp_utc.isoformat()}")
+            else:
+                # Last resort: try to extract from payload if present
+                payload = data.get("payload", "")
+                if isinstance(payload, str) and "instrument" in payload:
+                    try:
+                        match = re.search(r'instrument\s*=\s*([^,}]+)', payload)
+                        if match:
+                            extracted_instrument = match.group(1).strip()
+                            self._state_manager.update_last_bar(extracted_instrument, timestamp_utc)
+                            logger.debug(f"BAR_RECEIVED_NO_STREAMS: Extracted and updated last_bar for {extracted_instrument} from payload at {timestamp_utc.isoformat()}")
+                        else:
+                            logger.warning(f"BAR_RECEIVED_NO_STREAMS: No instrument found in event {event.get('event_seq')}, payload={payload[:100]}")
+                    except Exception as e:
+                        logger.warning(f"BAR_RECEIVED_NO_STREAMS: Failed to extract instrument from payload for event {event.get('event_seq')}: {e}")
+                else:
+                    logger.warning(f"BAR_RECEIVED_NO_STREAMS: No instrument found in event {event.get('event_seq')}, data keys: {list(data.keys())}")
         
         elif event_type == "DATA_LOSS_DETECTED":
             # Use execution_instrument_full_name if available, otherwise fall back to instrument

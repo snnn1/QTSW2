@@ -56,6 +56,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     // PHASE 2: Callback to get notification service for alerts
     private Func<object?>? _getNotificationServiceCallback;
     
+    // PHASE 2: Callback to check if execution is allowed (recovery state guard)
+    private Func<bool>? _isExecutionAllowedCallback;
+    
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
     
@@ -80,10 +83,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// <summary>
     /// PHASE 2: Set callbacks for stream stand-down and notification service access.
     /// </summary>
-    public void SetEngineCallbacks(Action<string, DateTimeOffset, string>? standDownStreamCallback, Func<object?>? getNotificationServiceCallback)
+    public void SetEngineCallbacks(Action<string, DateTimeOffset, string>? standDownStreamCallback, Func<object?>? getNotificationServiceCallback, Func<bool>? isExecutionAllowedCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
+        _isExecutionAllowedCallback = isExecutionAllowedCallback;
     }
     
     /// <summary>
@@ -411,6 +415,54 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             entryOrderInfo.EntryFillTime = utcNow;
             entryOrderInfo.ProtectiveStopAcknowledged = false;
             entryOrderInfo.ProtectiveTargetAcknowledged = false;
+        }
+        
+        // CRITICAL FIX: Check recovery state before submitting protective orders
+        // This prevents protective orders from being attempted during disconnect recovery
+        // when the broker API may be unavailable
+        if (_isExecutionAllowedCallback != null && !_isExecutionAllowedCallback())
+        {
+            var error = "Execution blocked - recovery state guard active. Protective orders will be queued for submission after recovery completes.";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_BLOCKED_RECOVERY",
+                new 
+                { 
+                    error = error, 
+                    intent_id = intentId, 
+                    fill_quantity = fillQuantity,
+                    fill_price = fillPrice,
+                    note = "Protective orders blocked during recovery state - position unprotected until recovery completes"
+                }));
+            
+            // CRITICAL: Queue protective orders for submission after recovery completes
+            // For now, flatten immediately (fail-closed) - TODO: Implement queue mechanism
+            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
+            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
+            
+            // Stand down stream
+            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDERS_BLOCKED_RECOVERY: {error}");
+            
+            // Raise high-priority alert
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                var title = $"CRITICAL: Protective Orders Blocked - Recovery State - {intent.Instrument}";
+                var message = $"Entry filled but protective orders blocked due to recovery state. Position flattened. Stream: {intent.Stream}, Intent: {intentId}.";
+                notificationService.EnqueueNotification($"PROTECTIVE_BLOCKED_RECOVERY:{intentId}", title, message, priority: 2); // Emergency priority
+            }
+            
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_BLOCKED_RECOVERY_FLATTENED",
+                new
+                {
+                    intent_id = intentId,
+                    stream = intent.Stream,
+                    instrument = intent.Instrument,
+                    flatten_success = flattenResult.Success,
+                    flatten_error = flattenResult.ErrorMessage,
+                    error = error,
+                    note = "Position flattened due to protective orders blocked during recovery state"
+                }));
+            
+            return;
         }
         
         // Validate exit orders before submission

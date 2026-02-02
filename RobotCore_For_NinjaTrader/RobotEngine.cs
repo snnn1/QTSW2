@@ -1538,6 +1538,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 new
                 {
                     instrument = instrument,
+                    execution_instrument_full_name = instrument, // Full contract name from NinjaTrader (e.g., "MES 03-26")
                     bar_timestamp_utc = barUtc.ToString("o"),
                     bar_timestamp_chicago = barChicagoTime.ToString("o"),
                     bar_trading_date = barChicagoDate.ToString("yyyy-MM-dd"),
@@ -1556,6 +1557,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 new
                 {
                     instrument = instrument,
+                    execution_instrument_full_name = instrument, // Full contract name from NinjaTrader (e.g., "MES 03-26")
                     bar_timestamp_utc = barUtc.ToString("o"),
                     note = "Bar received but streams not yet created - this should not happen"
                 }));
@@ -3356,6 +3358,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Forward connection status update to health monitor and handle recovery state transitions.
     /// </summary>
+    /// <summary>
+    /// Handle connection status update from NinjaTrader.
+    /// 
+    /// State transitions:
+    /// - CONNECTED_OK → DISCONNECT_FAIL_CLOSED: On first disconnect
+    /// - DISCONNECT_FAIL_CLOSED → RECONNECTED_RECOVERY_PENDING: On reconnect
+    /// - RECONNECTED_RECOVERY_PENDING → RECOVERY_COMPLETE: After broker sync completes
+    /// - RECOVERY_COMPLETE → CONNECTED_OK: Normal operation restored
+    /// 
+    /// Execution behavior during disconnect states:
+    /// During DISCONNECT_FAIL_CLOSED and RECONNECTED_RECOVERY_PENDING, all non-emergency execution is blocked.
+    /// Emergency risk-reduction actions (flattening open positions) may still be attempted.
+    /// 
+    /// Blocked operations (go through RiskGate → IExecutionRecoveryGuard):
+    /// - Entry orders
+    /// - Protective orders (initial stop/target)
+    /// - Order modifications (including BE stop moves)
+    /// 
+    /// Permitted operations (bypass RiskGate):
+    /// - Emergency flatten operations (call adapter's Flatten() directly)
+    /// </summary>
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
     {
         lock (_engineLock)
@@ -3364,7 +3387,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var wasConnected = _lastConnectionStatus == ConnectionStatus.Connected;
             var isConnected = status == ConnectionStatus.Connected;
 
-            // Forward to health monitor first
+            // Update trading date in health monitor on every call (prevents regression to empty string, handles day rollover)
+            _healthMonitor?.SetTradingDate(TradingDateString);
+            
+            // Forward to health monitor
             _healthMonitor?.OnConnectionStatusUpdate(status, connectionName, utcNow);
 
             // Handle recovery state transitions

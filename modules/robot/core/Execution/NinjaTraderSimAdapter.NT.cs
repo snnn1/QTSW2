@@ -992,15 +992,106 @@ public sealed partial class NinjaTraderSimAdapter
             
             _executionJournal.RecordRejection(intentId, "", "", $"ORDER_REJECTED: {fullErrorMsg}", utcNow);
             orderInfo.State = "REJECTED";
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
-                new 
-                { 
-                    broker_order_id = order.OrderId, 
-                    error = fullErrorMsg,
-                    error_code = errorCode,
-                    comment = comment,
-                    error_details = errorDetails
-                }));
+            
+            // CRITICAL FIX: If protective order is rejected, trigger fail-closed pathway
+            // Order submission success != order acceptance - broker can reject orders after submission
+            bool isProtectiveOrder = orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET";
+            if (isProtectiveOrder)
+            {
+                // Protective order rejected - position is unprotected
+                // Trigger same fail-closed pathway as submission failure
+                var failureReason = $"Protective {orderInfo.OrderType} order rejected by broker: {fullErrorMsg}";
+                
+                // Get intent to find stream
+                string? stream = null;
+                if (_intentMap.TryGetValue(intentId, out var intent))
+                {
+                    stream = intent.Stream;
+                    
+                    // Notify coordinator of protective failure
+                    _coordinator?.OnProtectiveFailure(intentId, stream, utcNow);
+                    
+                    // Flatten position immediately with retry logic
+                    var flattenResult = FlattenWithRetry(intentId, orderInfo.Instrument, utcNow);
+                    
+                    // Stand down stream
+                    _standDownStreamCallback?.Invoke(stream, utcNow, $"PROTECTIVE_ORDER_REJECTED: {failureReason}");
+                    
+                    // Persist incident record
+                    PersistProtectiveFailureIncident(intentId, intent,
+                        OrderSubmissionResult.FailureResult(fullErrorMsg, utcNow), // Stop/Target result
+                        null, // Other leg (only one leg rejected)
+                        flattenResult, utcNow);
+                    
+                    // Raise high-priority alert
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Protective Order Rejected - {orderInfo.Instrument}";
+                        var message = $"Protective {orderInfo.OrderType} order rejected by broker. Position flattened. Stream: {stream}, Intent: {intentId}. Error: {fullErrorMsg}";
+                        notificationService.EnqueueNotification($"PROTECTIVE_REJECTED:{intentId}", title, message, priority: 2); // Emergency priority
+                    }
+                    
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_FLATTENED",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = stream,
+                            instrument = orderInfo.Instrument,
+                            order_type = orderInfo.OrderType,
+                            broker_order_id = order.OrderId,
+                            error = fullErrorMsg,
+                            error_code = errorCode,
+                            comment = comment,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            failure_reason = failureReason,
+                            note = "Position flattened due to protective order rejection by broker (fail-closed behavior)"
+                        }));
+                }
+                else
+                {
+                    // Intent not found - log error but still log rejection
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_INTENT_NOT_FOUND",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = orderInfo.Instrument,
+                            order_type = orderInfo.OrderType,
+                            broker_order_id = order.OrderId,
+                            error = fullErrorMsg,
+                            note = "Protective order rejected but intent not found - cannot flatten (orphan rejection)"
+                        }));
+                    
+                    // Still log the rejection
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
+                        new 
+                        { 
+                            broker_order_id = order.OrderId, 
+                            error = fullErrorMsg,
+                            error_code = errorCode,
+                            comment = comment,
+                            error_details = errorDetails,
+                            order_type = orderInfo.OrderType,
+                            note = "Protective order rejected but intent not found - manual intervention may be required"
+                        }));
+                }
+            }
+            else
+            {
+                // Non-protective order rejected - log only
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
+                    new 
+                    { 
+                        broker_order_id = order.OrderId, 
+                        error = fullErrorMsg,
+                        error_code = errorCode,
+                        comment = comment,
+                        error_details = errorDetails,
+                        order_type = orderInfo.OrderType,
+                        note = "Non-protective order rejected - no flatten required"
+                    }));
+            }
         }
         else if (orderState == OrderState.Cancelled)
         {

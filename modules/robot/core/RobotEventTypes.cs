@@ -252,6 +252,7 @@ public static class RobotEventTypes
         ["CONNECTION_LOST"] = "ERROR",
         ["CONNECTION_LOST_SUSTAINED"] = "ERROR",
         ["CONNECTION_RECOVERED"] = "INFO",
+        ["CONNECTION_RECOVERED_NOTIFICATION"] = "INFO",
         ["DATA_LOSS_DETECTED"] = "ERROR",
         ["DATA_STALL_RECOVERED"] = "INFO",
         
@@ -437,7 +438,7 @@ public static class RobotEventTypes
         "RECOVERY_STREAM_ORDERS_RECONCILED",
         
         // Health monitoring
-        "CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED",
+        "CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION",
         "DATA_LOSS_DETECTED", "DATA_STALL_RECOVERED",
         
         // Notifications

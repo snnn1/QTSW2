@@ -6,6 +6,15 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Risk gate: fail-closed checks before ANY order submission.
 /// All gates must pass for execution to proceed.
+/// 
+/// RiskGate enforces execution blocking during recovery states.
+/// Emergency flatten operations are explicitly exempt and may bypass the gate.
+/// 
+/// During DISCONNECT_FAIL_CLOSED and RECONNECTED_RECOVERY_PENDING:
+/// - Entry orders go through CheckGates() → blocked (via IExecutionRecoveryGuard)
+/// - Protective orders go through CheckGates() → blocked
+/// - Order modifications go through CheckGates() → blocked
+/// - Flatten operations call adapter's Flatten() directly → permitted (bypasses RiskGate)
 /// </summary>
 public sealed class RiskGate
 {

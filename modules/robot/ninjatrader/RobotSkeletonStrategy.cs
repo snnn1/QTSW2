@@ -235,16 +235,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (_engine is null) return;
             
-            // Forward connection status to health monitor using helper method and accessor
+            // Forward connection status to health monitor using strongly-typed extension method
             var connectionName = connectionStatusUpdate.Connection?.Options?.Name ?? "Unknown";
             // ConnectionStatusEventArgs - pass the Connection.Status directly (NinjaTrader API)
             // The Connection property has a Status property of type NinjaTrader.Cbi.ConnectionStatus
             var connection = connectionStatusUpdate.Connection;
             var ntStatus = connection?.Status;
-            // Fully qualify ConnectionStatus to avoid ambiguity between QTSW2.Robot.Core.ConnectionStatus and NinjaTrader.Cbi.ConnectionStatus
+            // Use strongly-typed extension method (no reflection needed in strategy project)
+            // Null status fallback to ConnectionError
             var healthMonitorStatus = ntStatus != null ? ntStatus.ToHealthMonitorStatus() : QTSW2.Robot.Core.ConnectionStatus.ConnectionError;
             
-            // Use RobotEngine's OnConnectionStatusUpdate method (replaces reflection)
+            // Use RobotEngine's OnConnectionStatusUpdate method
             _engine.OnConnectionStatusUpdate(healthMonitorStatus, connectionName);
         }
     }

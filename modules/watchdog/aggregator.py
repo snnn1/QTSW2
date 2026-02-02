@@ -46,6 +46,88 @@ class WatchdogAggregator:
         cursor = self._cursor_manager.load_cursor()
         logger.info(f"Loaded cursor state: {cursor}")
         
+        # Initialize state from recent events on startup
+        # This ensures all state is set immediately before processing begins
+        # CRITICAL: Always rebuild state on startup to ensure it's current
+        logger.info("Initializing watchdog state from recent events on startup")
+        
+        # Always rebuild connection status on startup
+        logger.info("Rebuilding connection status from recent events")
+        self._rebuild_connection_status_from_recent_events()
+        
+        # Always initialize engine tick from recent ticks on startup
+        logger.info("Initializing engine tick from recent events")
+        try:
+            recent_ticks = self._read_recent_ticks_from_end(max_events=1)
+            if recent_ticks:
+                most_recent_tick = recent_ticks[-1]
+                self._event_processor.process_event(most_recent_tick)
+                logger.info(f"Initialized engine tick from recent events: {most_recent_tick.get('timestamp_utc', '')[:19]}")
+            else:
+                logger.warning("No recent ticks found for initialization")
+        except Exception as e:
+            logger.warning(f"Failed to initialize engine tick on startup: {e}", exc_info=True)
+        
+        # Always initialize bar tracking from recent bars on startup
+        logger.info("Initializing bar tracking from recent events")
+        try:
+            recent_bars = self._read_recent_bar_events_from_end(max_events=50)  # Read more bars to ensure we get recent ones
+            bars_processed = 0
+            for bar_event in recent_bars:
+                try:
+                    self._event_processor.process_event(bar_event)
+                    bars_processed += 1
+                except Exception as e:
+                    logger.debug(f"Failed to process bar event during startup init: {e}")
+            if bars_processed > 0:
+                logger.info(f"Initialized bar tracking from {bars_processed} recent bar events on startup")
+            else:
+                logger.info("No recent bars found for initialization")
+        except Exception as e:
+            logger.warning(f"Failed to initialize bar tracking on startup: {e}", exc_info=True)
+        
+        # Always initialize identity status from recent identity events on startup
+        logger.info("Initializing identity status from recent events")
+        try:
+            # Read recent events and find identity events
+            from .config import FRONTEND_FEED_FILE
+            import json
+            if FRONTEND_FEED_FILE.exists():
+                with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+                    all_lines = f.readlines()
+                    recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+                
+                latest_identity_event = None
+                latest_timestamp = None
+                
+                for line in recent_lines:
+                    if line.strip():
+                        try:
+                            event = json.loads(line.strip())
+                            if event.get('event_type') == 'IDENTITY_INVARIANTS_STATUS':
+                                ts_str = event.get('timestamp_utc', '')
+                                if ts_str:
+                                    try:
+                                        from datetime import datetime, timezone
+                                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                                        if ts.tzinfo is None:
+                                            ts = ts.replace(tzinfo=timezone.utc)
+                                        if latest_timestamp is None or ts > latest_timestamp:
+                                            latest_identity_event = event
+                                            latest_timestamp = ts
+                                    except:
+                                        pass
+                        except:
+                            continue
+                
+                if latest_identity_event:
+                    self._event_processor.process_event(latest_identity_event)
+                    logger.info(f"Initialized identity status from recent event at {latest_timestamp.isoformat()[:19] if latest_timestamp else 'unknown'}")
+                else:
+                    logger.info("No identity events found for initialization")
+        except Exception as e:
+            logger.warning(f"Failed to initialize identity status on startup: {e}", exc_info=True)
+        
         # Start background task for processing events
         asyncio.create_task(self._process_events_loop())
         
@@ -276,6 +358,20 @@ class WatchdogAggregator:
                 logger.info("State manager is empty - rebuilding stream states from most recent events")
                 self._rebuild_stream_states_from_recent_events()
             
+            # Check if connection status needs initialization - rebuild from recent events
+            # This handles initialization or state loss scenarios
+            # Note: connection_status defaults to "Connected" but may be Unknown if state_manager was reset
+            # We rebuild if status is Unknown OR if we've never seen a connection event
+            if (self._state_manager._connection_status == "Unknown" or 
+                self._state_manager._last_connection_event_utc is None):
+                logger.info(
+                    f"Connection status needs initialization "
+                    f"(status={self._state_manager._connection_status}, "
+                    f"last_event={self._state_manager._last_connection_event_utc}) - "
+                    f"rebuilding from recent events"
+                )
+                self._rebuild_connection_status_from_recent_events()
+            
             # CRITICAL: Always check for the most recent ENGINE_TICK_CALLSITE event from the end of file
             # This ensures we catch ticks even if cursor is ahead or events are out of order
             # We only need the most recent one to update liveness timestamp
@@ -319,10 +415,45 @@ class WatchdogAggregator:
                             f"⚠️ No ENGINE_TICK_CALLSITE events found in feed file. "
                             f"Current tick age: {tick_age:.1f}s, threshold: {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s"
                         )
+                    else:
+                        # No ticks ever received - log this as a warning
+                        logger.warning(
+                            f"⚠️ No ENGINE_TICK_CALLSITE events found in feed file and no previous ticks. "
+                            f"This may indicate events aren't being processed or feed file is empty."
+                        )
             except Exception as e:
                 logger.error(f"Error reading ticks from end of file: {e}", exc_info=True)
             
+            # CRITICAL: Also check for recent bar events from the end of file
+            # This ensures bar tracking stays current even if cursor is ahead
+            try:
+                recent_bars = self._read_recent_bar_events_from_end(max_events=10)
+                if recent_bars:
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    bars_processed = 0
+                    for bar_event in recent_bars:
+                        try:
+                            # Process bar event to update bar tracking
+                            self._event_processor.process_event(bar_event)
+                            bars_processed += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to process bar event from end-of-file: {e}", exc_info=True)
+                    
+                    if bars_processed > 0:
+                        logger.info(f"✅ Processed {bars_processed} recent bar event(s) from end-of-file for bar tracking")
+                    else:
+                        logger.warning(f"⚠️ Found {len(recent_bars)} bar events but failed to process them")
+                else:
+                    # Check if we have any bars tracked at all
+                    if not self._state_manager._last_bar_utc_by_execution_instrument:
+                        logger.debug("No bar events found in feed and no bars tracked yet")
+            except Exception as e:
+                logger.error(f"Error reading bar events from end of file: {e}", exc_info=True)
+            
             # Normal incremental processing - read new events since cursor
+            # CRITICAL: This now reads from end of file (last 5000 lines) to catch all recent events
+            # including new run_ids that aren't in cursor yet
             events = self._read_feed_events_since(cursor)
             
             # Process each event
@@ -350,16 +481,61 @@ class WatchdogAggregator:
                 event_types = [e.get("event_type", "UNKNOWN") for e in events[:5]]
                 logger.debug(f"Processed {len(events)} events (no ENGINE_TICK_CALLSITE): {event_types}")
             
-            # Update cursor
+            # Update cursor for all run_ids that had events
             if events:
-                last_run_id = events[-1].get("run_id")
-                last_seq = events[-1].get("event_seq", 0)
-                if last_run_id:
-                    cursor[last_run_id] = last_seq
+                # Group events by run_id and update cursor for each
+                run_ids_seen = {}
+                for event in events:
+                    run_id = event.get("run_id")
+                    event_seq = event.get("event_seq", 0)
+                    if run_id:
+                        # Keep the highest seq for each run_id
+                        if run_id not in run_ids_seen or event_seq > run_ids_seen[run_id]:
+                            run_ids_seen[run_id] = event_seq
+                
+                # Update cursor for all run_ids
+                for run_id, last_seq in run_ids_seen.items():
+                    cursor[run_id] = last_seq
+                
+                if run_ids_seen:
                     self._cursor_manager.save_cursor(cursor)
+                    logger.debug(f"Updated cursor for {len(run_ids_seen)} run_id(s): {list(run_ids_seen.keys())[:3]}...")
         
         except Exception as e:
             logger.error(f"Error processing feed events: {e}", exc_info=True)
+    
+    def _read_recent_bar_events_from_end(self, max_events: int = 10) -> List[Dict]:
+        """Read recent bar events from the end of frontend_feed.jsonl."""
+        import json
+        
+        bar_events = []
+        if not FRONTEND_FEED_FILE.exists():
+            return bar_events
+        
+        try:
+            # CRITICAL FIX: Use same simple approach as _read_feed_events_since
+            # Read file normally and take last N lines - more reliable than backwards reading
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+                all_lines = f.readlines()
+                # Read last 5000 lines to ensure we catch bar events (bars may be less frequent)
+                lines_to_read = 5000
+                lines = all_lines[-lines_to_read:] if len(all_lines) > lines_to_read else all_lines
+            
+            # Process lines in reverse (newest first)
+            for line in reversed(lines):
+                if len(bar_events) >= max_events:
+                    break
+                try:
+                    event = json.loads(line.strip())
+                    event_type = event.get("event_type", "")
+                    if event_type in ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED"):
+                        bar_events.append(event)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            logger.debug(f"Error reading bar events from end of file: {e}", exc_info=True)
+        
+        return bar_events
     
     def _read_recent_ticks_from_end(self, max_events: int = 10) -> List[Dict]:
         """
@@ -460,39 +636,26 @@ class WatchdogAggregator:
             return events
         
         try:
-            # Use byte-offset tracking for incremental reading (similar to event_feed.py)
-            # Store last read position per run_id to avoid re-reading entire file
-            if not hasattr(self, '_feed_file_positions'):
-                self._feed_file_positions: Dict[str, int] = {}  # run_id -> byte position
+            # CRITICAL FIX: Always read from the end of file for recent events
+            # The old byte-position tracking was causing issues where we'd read from old positions
+            # and miss new run_ids. Instead, read the last N lines to catch recent events.
+            # This ensures we always process the most recent events regardless of cursor position.
             
-            # For each run_id in cursor, read from last known position
-            # If run_id not in positions, start from beginning
-            run_ids_to_track = set(cursor.keys())
+            # Read last 5000 lines to ensure we catch all recent events
+            # This is efficient and ensures we don't miss new run_ids
+            MAX_LINES_TO_READ = 5000
             
-            # Also track any new run_ids we encounter
-            # Use utf-8-sig to handle UTF-8 BOM markers
-            # Use binary mode to track positions accurately
-            with open(FRONTEND_FEED_FILE, 'rb') as f:
-                # If we have positions, seek to the minimum position (earliest unread)
-                if self._feed_file_positions:
-                    min_pos = min(self._feed_file_positions.values())
-                    f.seek(min_pos)
-                else:
-                    # First time: read from beginning
-                    f.seek(0)
-                
-                # Read new lines since last position
+            # CRITICAL FIX: Read file normally from end, but use a simpler approach
+            # Read the entire file and take last N lines - this is more reliable than backwards reading
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+                all_lines = f.readlines()
+                # Take last N lines
+                lines = all_lines[-MAX_LINES_TO_READ:] if len(all_lines) > MAX_LINES_TO_READ else all_lines
+            
+                # Process lines
                 parse_errors = 0
-                for line_bytes in f:
-                    # Track position before processing line
-                    line_start_pos = f.tell() - len(line_bytes)
-                    
-                    try:
-                        line = line_bytes.decode('utf-8-sig').strip()
-                    except UnicodeDecodeError:
-                        parse_errors += 1
-                        continue
-                    
+                for line_str in lines:
+                    line = line_str.strip()
                     if not line:
                         continue
                     
@@ -507,18 +670,28 @@ class WatchdogAggregator:
                         
                         # Check if we should include this event
                         last_seq = cursor.get(run_id, 0)
-                        if event_seq > last_seq:
-                            events.append(event)
-                            # Track this run_id
-                            run_ids_to_track.add(run_id)
-                        elif event_type == "ENGINE_TICK_CALLSITE":
-                            # Debug: Log when ENGINE_TICK_CALLSITE events are skipped due to cursor
-                            logger.debug(
-                                f"ENGINE_TICK_CALLSITE skipped by cursor: event_seq={event_seq} <= cursor[{run_id}]={last_seq}"
-                            )
+                        # Always include bar events and tick events for state tracking (even if cursor is ahead)
+                        # This ensures bar tracking and engine liveness stay current
+                        is_bar_event = event_type in ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED")
+                        is_tick_event = event_type == "ENGINE_TICK_CALLSITE"
                         
-                        # Update position for this run_id (position after this line)
-                        self._feed_file_positions[run_id] = f.tell()
+                        # CRITICAL: Always include tick/bar events for state tracking
+                        # Also include events that are newer than cursor position
+                        should_include = False
+                        if is_bar_event or is_tick_event:
+                            # Always process tick/bar events for state tracking
+                            should_include = True
+                            if event_seq <= last_seq:
+                                logger.debug(
+                                    f"{event_type} included despite cursor: event_seq={event_seq} <= cursor[{run_id}]={last_seq} "
+                                    f"(bar/tick events always processed for state tracking)"
+                                )
+                        elif event_seq > last_seq:
+                            # Include events newer than cursor
+                            should_include = True
+                        
+                        if should_include:
+                            events.append(event)
                     
                     except json.JSONDecodeError:
                         # Silently skip malformed JSON lines
@@ -528,9 +701,13 @@ class WatchdogAggregator:
                 # Log parse errors only once per read, not per line
                 if parse_errors > 0:
                     logger.debug(f"Skipped {parse_errors} malformed JSON lines in feed file")
+                
+                # Sort events by timestamp to ensure chronological processing
+                # This is critical when reading from end of file - events may be out of order
+                events.sort(key=lambda e: e.get('timestamp_utc', ''))
         
         except Exception as e:
-            logger.error(f"Error reading feed file: {e}")
+            logger.error(f"Error reading feed file: {e}", exc_info=True)
         
         return events
     
@@ -606,6 +783,88 @@ class WatchdogAggregator:
         
         except Exception as e:
             logger.error(f"Error rebuilding stream states from recent events: {e}", exc_info=True)
+    
+    def _rebuild_connection_status_from_recent_events(self):
+        """
+        Rebuild connection status by finding the most recent connection event.
+        This initializes connection status when state_manager starts or connection status is Unknown.
+        """
+        import json
+        from datetime import datetime, timezone
+        
+        if not FRONTEND_FEED_FILE.exists():
+            logger.warning("Feed file does not exist, cannot rebuild connection status")
+            return
+        
+        try:
+            # Track the most recent connection event
+            # Connection event types: CONNECTION_LOST, CONNECTION_LOST_SUSTAINED, CONNECTION_RECOVERED, CONNECTION_RECOVERED_NOTIFICATION
+            latest_connection_event = None
+            latest_timestamp = None
+            
+            # Read recent events (last 5000 lines should be enough to find current connection status)
+            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+                # Read last N lines
+                all_lines = f.readlines()
+                recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+                
+                for line in recent_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    try:
+                        event = json.loads(line)
+                        event_type = event.get("event_type")
+                        
+                        # Only process connection events
+                        if event_type not in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", 
+                                             "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION"):
+                            continue
+                        
+                        timestamp_str = event.get("timestamp_utc")
+                        if not timestamp_str:
+                            continue
+                        
+                        # Parse timestamp for comparison
+                        try:
+                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                            if timestamp.tzinfo is None:
+                                timestamp = timestamp.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            continue
+                        
+                        # Keep the most recent connection event
+                        if latest_timestamp is None or timestamp > latest_timestamp:
+                            latest_connection_event = event
+                            latest_timestamp = timestamp
+                    
+                    except json.JSONDecodeError:
+                        continue
+            
+            # Process the most recent connection event to rebuild connection status
+            if latest_connection_event:
+                logger.info(
+                    f"Found most recent connection event: {latest_connection_event.get('event_type')} "
+                    f"at {latest_timestamp.isoformat() if latest_timestamp else 'unknown'}"
+                )
+                # Process this event to rebuild the connection status
+                self._event_processor.process_event(latest_connection_event)
+                logger.info(
+                    f"Rebuilt connection status from recent event: "
+                    f"status={self._state_manager._connection_status}, "
+                    f"last_event_utc={self._state_manager._last_connection_event_utc.isoformat() if self._state_manager._last_connection_event_utc else None}"
+                )
+            else:
+                logger.info("No connection events found in recent feed - connection status remains Unknown")
+                # Default to Connected if no connection events found (assume connected state)
+                # This is safer than Unknown for monitoring purposes
+                if self._state_manager._connection_status == "Unknown":
+                    self._state_manager._connection_status = "Connected"
+                    logger.info("Set connection status to Connected (default - no connection events found)")
+        
+        except Exception as e:
+            logger.error(f"Error rebuilding connection status from recent events: {e}", exc_info=True)
     
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
         """
@@ -994,6 +1253,7 @@ class WatchdogAggregator:
             "CONNECTION_LOST",
             "CONNECTION_LOST_SUSTAINED",
             "CONNECTION_RECOVERED",
+            "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification after sustained disconnect
             "ENGINE_TICK_STALL_DETECTED",
             "ENGINE_TICK_STALL_RECOVERED",
             "STREAM_STATE_TRANSITION",
@@ -1058,6 +1318,7 @@ class WatchdogAggregator:
         
         warning_types = {
             "CONNECTION_LOST_SUSTAINED",
+            "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification (informational)
             "RISK_GATE_CHANGED",
             "TRADING_ALLOWED_CHANGED",
         }

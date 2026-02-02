@@ -22,6 +22,7 @@ from modules.watchdog.config import (
     EXECUTION_JOURNALS_DIR,
     EXECUTION_SUMMARIES_DIR,
     ROBOT_JOURNAL_DIR,
+    FRONTEND_FEED_FILE,
 )
 from modules.watchdog.websocket_tracker import get_tracker
 
@@ -268,6 +269,67 @@ async def get_execution_summary(
         logger.error(f"Error reading summary file {summary_file}: {e}")
         raise HTTPException(status_code=500, detail=f"Error reading summary: {e}")
 
+
+@router.post("/reprocess-identity")
+async def reprocess_identity():
+    """
+    Manually trigger reprocessing of the latest identity event.
+    Useful for applying new extraction logic to existing events.
+    """
+    if aggregator_instance is None:
+        raise HTTPException(status_code=503, detail="Watchdog aggregator not initialized")
+    
+    try:
+        import json
+        from datetime import datetime, timezone
+        
+        if not FRONTEND_FEED_FILE.exists():
+            return {"success": False, "error": "Frontend feed file not found"}
+        
+        # Read recent events and find latest identity event
+        with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
+            all_lines = f.readlines()
+            recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+        
+        latest_identity_event = None
+        latest_timestamp = None
+        
+        for line in recent_lines:
+            if line.strip():
+                try:
+                    event = json.loads(line.strip())
+                    if event.get('event_type') == 'IDENTITY_INVARIANTS_STATUS':
+                        ts_str = event.get('timestamp_utc', '')
+                        if ts_str:
+                            try:
+                                ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                if latest_timestamp is None or ts > latest_timestamp:
+                                    latest_identity_event = event
+                                    latest_timestamp = ts
+                            except:
+                                pass
+                except:
+                    continue
+        
+        if latest_identity_event:
+            # Reprocess the event
+            aggregator_instance._event_processor.process_event(latest_identity_event)
+            
+            # Get updated status
+            status = aggregator_instance._state_manager.compute_watchdog_status()
+            
+            return {
+                "success": True,
+                "event_timestamp": latest_timestamp.isoformat()[:19] if latest_timestamp else None,
+                "pass_value": status.get("last_identity_invariants_pass"),
+                "violations": status.get("last_identity_violations", [])
+            }
+        else:
+            return {"success": False, "error": "No identity events found"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to reprocess identity: {str(e)}")
 
 @router.get("/stream-pnl")
 async def get_stream_pnl(

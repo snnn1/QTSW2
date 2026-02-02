@@ -35,6 +35,9 @@ class EventFeedGenerator:
         # Rate limiting for very frequent events (per run_id)
         self._last_engine_tick_callsite_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
         self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5  # Only write ENGINE_TICK_CALLSITE every 5 seconds
+        # Rate limiting for BAR_RECEIVED_NO_STREAMS (very frequent, only write every 60 seconds)
+        self._last_bar_received_no_streams_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
+        self._BAR_RECEIVED_NO_STREAMS_RATE_LIMIT_SECONDS = 60  # Only write BAR_RECEIVED_NO_STREAMS every 60 seconds
         
     def _convert_utc_to_chicago(self, utc_timestamp_str: str) -> str:
         """Convert UTC timestamp string to Chicago timezone."""
@@ -105,6 +108,15 @@ class EventFeedGenerator:
         if not self._is_live_critical_event(event_type):
             return None
         
+        # Filter out initialization STREAM_STATE_TRANSITION events (UNKNOWN -> *)
+        # These are noise - we only care about runtime state transitions
+        if event_type == "STREAM_STATE_TRANSITION":
+            data = event.get("data", {})
+            old_state = data.get("old_state", "")
+            # Skip initialization transitions (UNKNOWN -> anything)
+            if old_state == "UNKNOWN" or old_state == "":
+                return None
+        
         run_id = self._extract_run_id(event)
         if not run_id:
             logger.debug(f"Event missing run_id: {event_type}, skipping")
@@ -143,6 +155,34 @@ class EventFeedGenerator:
                     # If timestamp parsing fails, allow event through (better to log than miss)
                     logger.debug(f"Failed to parse timestamp for rate limiting: {e}")
         
+        # Rate limit BAR_RECEIVED_NO_STREAMS events (very frequent, only write every 60 seconds)
+        # This event fires every time a bar is received before streams are created, which can be very frequent
+        # Rate limiting reduces feed file size and processing overhead while still tracking bar arrival
+        if event_type == "BAR_RECEIVED_NO_STREAMS":
+            timestamp_utc = self._extract_timestamp_utc(event)
+            if timestamp_utc:
+                try:
+                    event_time = datetime.fromisoformat(timestamp_utc.replace('Z', '+00:00'))
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+                    
+                    last_written = self._last_bar_received_no_streams_time.get(run_id)
+                    if last_written:
+                        elapsed = (event_time - last_written).total_seconds()
+                        if elapsed < self._BAR_RECEIVED_NO_STREAMS_RATE_LIMIT_SECONDS:
+                            # Rate limited - skip this event
+                            logger.debug(
+                                f"BAR_RECEIVED_NO_STREAMS rate-limited: run_id={run_id}, "
+                                f"elapsed={elapsed:.1f}s < {self._BAR_RECEIVED_NO_STREAMS_RATE_LIMIT_SECONDS}s"
+                            )
+                            return None
+                    
+                    # Update last written time
+                    self._last_bar_received_no_streams_time[run_id] = event_time
+                except Exception as e:
+                    # If timestamp parsing fails, allow event through (better to log than miss)
+                    logger.debug(f"Failed to parse timestamp for BAR_RECEIVED_NO_STREAMS rate limiting: {e}")
+        
         # Increment event_seq for this run_id (starts at 1, increments by 1)
         if run_id not in self._event_seq_by_run_id:
             self._event_seq_by_run_id[run_id] = 0  # Will be incremented to 1
@@ -176,6 +216,46 @@ class EventFeedGenerator:
         data = event.get("data", {})
         if not isinstance(data, dict):
             data = {}
+        
+        # Extract execution_instrument_full_name from payload string for bar events
+        # RobotEvents.EngineBase serializes anonymous objects as payload strings
+        # Format: "{ instrument = MES, execution_instrument_full_name = MES 03-26, ... }"
+        # OR: "{ instrument = MCL, bar_timestamp_utc = ..., note = ... }" (no execution_instrument_full_name)
+        if event_type in ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED"):
+            # Check if we need to extract from payload
+            # Extract if field is missing, None, or empty string
+            needs_extraction = (
+                not data.get("execution_instrument_full_name") and 
+                "payload" in data and 
+                isinstance(data.get("payload"), str)
+            )
+            
+            if needs_extraction:
+                payload_str = data.get("payload")
+                try:
+                    import re
+                    # First try to extract execution_instrument_full_name from payload string
+                    # Format: "execution_instrument_full_name = MES 03-26" or "execution_instrument_full_name = MES"
+                    match = re.search(r'execution_instrument_full_name\s*=\s*([^,}]+)', payload_str)
+                    if match:
+                        execution_instrument_full_name = match.group(1).strip()
+                        data["execution_instrument_full_name"] = execution_instrument_full_name
+                        logger.debug(f"Extracted execution_instrument_full_name='{execution_instrument_full_name}' from payload for {event_type}")
+                    
+                    # Also extract instrument if not already present or empty
+                    if not data.get("instrument"):
+                        inst_match = re.search(r'instrument\s*=\s*([^,}]+)', payload_str)
+                        if inst_match:
+                            data["instrument"] = inst_match.group(1).strip()
+                            logger.debug(f"Extracted instrument='{data['instrument']}' from payload for {event_type}")
+                    
+                    # CRITICAL: If execution_instrument_full_name is still missing but instrument was extracted,
+                    # use instrument as fallback for execution_instrument_full_name
+                    if not data.get("execution_instrument_full_name") and data.get("instrument"):
+                        data["execution_instrument_full_name"] = data["instrument"]
+                        logger.debug(f"Using instrument='{data['instrument']}' as execution_instrument_full_name fallback for {event_type}")
+                except Exception as e:
+                    logger.warning(f"Failed to parse payload for {event_type}: {e}", exc_info=True)
         
         # For RANGE_LOCKED and RANGE_LOCK_SNAPSHOT events, extract range data from data dict
         # and ensure it's available at top level for event processor
@@ -211,6 +291,10 @@ class EventFeedGenerator:
                     except Exception:
                         pass  # Keep original extra_data if parsing fails
         
+        # Extract execution_instrument_full_name from data dict for top-level access
+        # Use instrument as fallback if execution_instrument_full_name is not available
+        execution_instrument_full_name = data.get("execution_instrument_full_name") or data.get("instrument")
+        
         # Build frontend feed event
         feed_event = {
             "event_seq": event_seq,
@@ -226,6 +310,7 @@ class EventFeedGenerator:
             "slot_time_utc": slot_time_utc,
             "execution_instrument": execution_instrument,
             "canonical_instrument": canonical_instrument,
+            "execution_instrument_full_name": execution_instrument_full_name,  # Top-level for easy access
             "data": data,
         }
         

@@ -163,7 +163,7 @@ class WatchdogStateManager:
         except Exception as e:
             logger.warning(f"Failed to convert identity invariants timestamp to Chicago: {e}")
             self._last_identity_invariants_event_chicago = None
-        self._last_connection_event_utc = timestamp_utc
+        # Note: Do NOT update _last_connection_event_utc here - identity invariants are not connection events
     
     def update_stream_state(self, trading_date: str, stream: str, state: str, 
                           committed: bool = False, commit_reason: Optional[str] = None,
@@ -332,7 +332,24 @@ class WatchdogStateManager:
             timestamp_utc: Bar timestamp in UTC
         """
         # Track by execution instrument full name (authoritative)
+        prev_timestamp = self._last_bar_utc_by_execution_instrument.get(execution_instrument_full_name)
         self._last_bar_utc_by_execution_instrument[execution_instrument_full_name] = timestamp_utc
+        
+        # Log update for debugging (rate-limited to avoid spam)
+        if not hasattr(self, '_last_bar_update_log'):
+            self._last_bar_update_log = {}
+        
+        now = datetime.now(timezone.utc)
+        log_key = execution_instrument_full_name
+        last_log_time = self._last_bar_update_log.get(log_key)
+        
+        if not last_log_time or (now - last_log_time).total_seconds() >= 60:
+            logger.debug(
+                f"update_last_bar: {execution_instrument_full_name} -> {timestamp_utc.isoformat()}"
+                f"{f' (prev: {prev_timestamp.isoformat()})' if prev_timestamp else ' (new)'}"
+            )
+            self._last_bar_update_log[log_key] = now
+        
         # Also update old dict for backward compatibility (will be removed later)
         # Extract root name for old dict (e.g., "MES 03-26" -> "MES")
         root_name = execution_instrument_full_name.split()[0] if execution_instrument_full_name else execution_instrument_full_name
@@ -492,10 +509,19 @@ class WatchdogStateManager:
             return False
         
         # Check if any stream for this execution instrument is in a bar-dependent state
+        # CRITICAL: Also check if the stream is enabled on the timetable
         bar_dependent_states = {"PRE_HYDRATION", "ARMED", "RANGE_BUILDING", "RANGE_LOCKED"}
         excluded_states = {"DONE", "COMMITTED", "NO_TRADE", "INVALIDATED"}
         
         for (trading_date, stream), info in self._stream_states.items():
+            # Check if stream is enabled on timetable (if timetable available)
+            stream_id = f"{trading_date}_{stream}"
+            if self._enabled_streams is not None:
+                # Timetable available - only check enabled streams
+                if stream_id not in self._enabled_streams:
+                    continue  # Stream not enabled, skip it
+            # If timetable unavailable (_enabled_streams is None), check all streams (conservative)
+            
             # Check if this stream's execution instrument matches the given execution instrument
             # Match by full name if available, otherwise match by root name
             stream_execution_instrument = getattr(info, 'execution_instrument', None)
@@ -705,56 +731,52 @@ class WatchdogStateManager:
         
         # Compute engine_activity_state based on bars_expected and last bar times
         # Map to frontend-expected states: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED'
-        if not market_open:
-            # Market closed - no bars expected, engine is idle
+        # PRIMARY INDICATOR: Use engine tick liveness (ENGINE_TICK_CALLSITE) as the main signal
+        # Ticks fire very frequently (every Tick() call) and are rate-limited in feed to every 5 seconds
+        # This is more reliable than bar events which are rate-limited to 60 seconds
+        
+        engine_tick_age = None
+        if self._last_engine_tick_utc:
+            engine_tick_age = (now - self._last_engine_tick_utc).total_seconds()
+        
+        # PRIORITY 1: Check if ticks are arriving (most reliable indicator)
+        if engine_tick_age is not None and engine_tick_age <= ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+            # Ticks are arriving - engine is ACTIVE regardless of market status or bar expectations
+            # This ensures that if you see ticks in the UI, the status shows ACTIVE
+            engine_activity_state = "ACTIVE"
+            logger.debug(
+                f"ENGINE_ACTIVE: Ticks arriving (tick_age={engine_tick_age:.1f}s < {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s)"
+            )
+        elif engine_tick_age is not None and engine_tick_age > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+            # Engine ticks stopped - this is a real stall
+            engine_activity_state = "STALLED"
+            logger.warning(
+                f"ENGINE_STALL_DETECTED_TICKS_STOPPED: tick_age_seconds={engine_tick_age:.1f}, "
+                f"threshold={ENGINE_TICK_STALL_THRESHOLD_SECONDS}, "
+                f"last_tick_utc={self._last_engine_tick_utc.isoformat() if self._last_engine_tick_utc else None}, "
+                f"now={now.isoformat()}"
+            )
+        elif not market_open:
+            # No ticks received and market closed - engine is idle
             engine_activity_state = "IDLE_MARKET_CLOSED"
         elif not instruments_with_bars_expected:
-            # Market open but no streams require bars (waiting for range windows)
+            # No ticks received, market open but no streams require bars (waiting for range windows)
             # This is IDLE, not STALLED - streams will activate when their windows arrive
             engine_activity_state = "IDLE_MARKET_CLOSED"  # Use same state as market closed for UI consistency
-        else:
-            # Market open and at least one instrument requires bars
-            # PRIMARY INDICATOR: Use engine tick liveness (ENGINE_TICK_CALLSITE) instead of bar events
-            # Ticks fire very frequently (every Tick() call) and are rate-limited in feed to every 5 seconds
-            # This is more reliable than bar events which are rate-limited to 60 seconds
-            engine_tick_age = None
-            if self._last_engine_tick_utc:
-                engine_tick_age = (now - self._last_engine_tick_utc).total_seconds()
-            
-            # Check if engine ticks have stopped (primary stall indicator)
-            if engine_tick_age is None:
-                # No ticks received yet - only stall if grace period elapsed
-                if not grace_period_active:
-                    engine_activity_state = "STALLED"
-                    logger.warning(
-                        f"ENGINE_STALL_DETECTED_NO_TICKS: grace_period_elapsed=True, "
-                        f"engine_running_time={engine_running_time:.1f}s, "
-                        f"_last_engine_tick_utc={self._last_engine_tick_utc}"
-                    )
-                else:
-                    engine_activity_state = "ACTIVE"  # Grace period active, engine starting up
-                    logger.debug(
-                        f"ENGINE_ACTIVE_GRACE_PERIOD: No ticks yet but grace period active "
-                        f"(running_time={engine_running_time:.1f}s < {GRACE_PERIOD_SECONDS}s)"
-                    )
-            elif engine_tick_age > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
-                # Engine ticks stopped - this is a real stall
+        elif engine_tick_age is None:
+            # No ticks received yet - only stall if grace period elapsed
+            if not grace_period_active:
                 engine_activity_state = "STALLED"
                 logger.warning(
-                    f"ENGINE_STALL_DETECTED_TICKS_STOPPED: tick_age_seconds={engine_tick_age:.1f}, "
-                    f"threshold={ENGINE_TICK_STALL_THRESHOLD_SECONDS}, "
-                    f"last_tick_utc={self._last_engine_tick_utc.isoformat() if self._last_engine_tick_utc else None}, "
-                    f"now={now.isoformat()}"
+                    f"ENGINE_STALL_DETECTED_NO_TICKS: grace_period_elapsed=True, "
+                    f"engine_running_time={engine_running_time:.1f}s, "
+                    f"_last_engine_tick_utc={self._last_engine_tick_utc}"
                 )
             else:
-                # Ticks are arriving - engine is active
-                # Note: We don't check bar arrival times here because:
-                # 1. Ticks are more frequent and reliable (fire every Tick() call)
-                # 2. Bar events are rate-limited to 60 seconds, causing false positives
-                # 3. If ticks are arriving, data is flowing - bars will arrive eventually
-                engine_activity_state = "ACTIVE"
+                engine_activity_state = "ACTIVE"  # Grace period active, engine starting up
                 logger.debug(
-                    f"ENGINE_ACTIVE: Ticks arriving (tick_age={engine_tick_age:.1f}s < {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s)"
+                    f"ENGINE_ACTIVE_GRACE_PERIOD: No ticks yet but grace period active "
+                    f"(running_time={engine_running_time:.1f}s < {GRACE_PERIOD_SECONDS}s)"
                 )
         
         data_stall_detected = {}
@@ -762,6 +784,7 @@ class WatchdogStateManager:
         # This prevents false positives from instruments that received bars earlier
         # but are no longer expected to receive them (e.g., stream completed, market closed)
         # CRITICAL: Stall detection is per execution instrument contract (MES stalled ≠ ES flowing)
+        # Check instruments that are expecting bars
         for execution_instrument_full_name in instruments_with_bars_expected:
             last_bar_utc = self._last_bar_utc_by_execution_instrument.get(execution_instrument_full_name)
             if last_bar_utc:
@@ -787,12 +810,9 @@ class WatchdogStateManager:
                         "market_open": market_open
                     }
         
-        # PATTERN 1: Additional observability (recommended)
-        # Count execution instruments where bars_expected == True and worst last_bar_age
-        bars_expected_count = len(instruments_with_bars_expected)
-        
         # Compute worst_last_bar_age_seconds for ALL execution instruments that have received bars
         # This helps detect data flow even when streams aren't in bar-dependent states yet
+        # Do this BEFORE checking for stalls so we can use it in the stall detection logic
         worst_last_bar_age_seconds = None
         if self._last_bar_utc_by_execution_instrument:
             # Check all execution instruments that have received bars (not just those with bars_expected)
@@ -801,6 +821,58 @@ class WatchdogStateManager:
                     bar_age = (now - last_bar_utc).total_seconds()
                     if worst_last_bar_age_seconds is None or bar_age > worst_last_bar_age_seconds:
                         worst_last_bar_age_seconds = bar_age
+        
+        # Also check instruments that have received bars but aren't currently expecting them
+        # This catches stalls when streams aren't in bar-dependent states yet
+        # CRITICAL: Only check instruments that are currently enabled/active
+        # Don't flag instruments that:
+        # 1. Received bars hours/days ago but are no longer active
+        # 2. Are not enabled on the timetable (e.g., NG not enabled)
+        # Use a "recent activity" threshold (e.g., 1 hour) AND check if instrument has enabled streams
+        RECENT_ACTIVITY_THRESHOLD_SECONDS = 3600  # 1 hour - if no bars in last hour, instrument is inactive
+        if market_open and worst_last_bar_age_seconds is not None:
+            if worst_last_bar_age_seconds > DATA_STALL_THRESHOLD_SECONDS:
+                # Find instruments with old bars that aren't already in data_stall_detected
+                # BUT only if:
+                # 1. They've received bars recently (within RECENT_ACTIVITY_THRESHOLD)
+                # 2. They have enabled streams on the timetable (or timetable unavailable)
+                for execution_instrument_full_name, last_bar_utc in self._last_bar_utc_by_execution_instrument.items():
+                    if execution_instrument_full_name not in data_stall_detected and last_bar_utc:
+                        bar_age = (now - last_bar_utc).total_seconds()
+                        # Only flag as stalled if:
+                        # 1. Bar age exceeds stall threshold (> 90s)
+                        # 2. Instrument was active recently (< 1 hour ago)
+                        # 3. Instrument has enabled streams (check if any stream for this instrument is enabled)
+                        if bar_age > DATA_STALL_THRESHOLD_SECONDS and bar_age < RECENT_ACTIVITY_THRESHOLD_SECONDS:
+                            # Check if this instrument has any enabled streams
+                            has_enabled_streams = False
+                            if self._enabled_streams is None:
+                                # Timetable unavailable - assume enabled (conservative)
+                                has_enabled_streams = True
+                            else:
+                                # Check if any stream for this execution instrument is enabled
+                                for (trading_date, stream), info in self._stream_states.items():
+                                    stream_execution_instrument = getattr(info, 'execution_instrument', None)
+                                    if stream_execution_instrument and stream_execution_instrument == execution_instrument_full_name:
+                                        stream_id = f"{trading_date}_{stream}"
+                                        if stream_id in self._enabled_streams:
+                                            has_enabled_streams = True
+                                            break
+                            
+                            # Only flag as stalled if instrument has enabled streams
+                            if has_enabled_streams:
+                                data_stall_detected[execution_instrument_full_name] = {
+                                    "instrument": execution_instrument_full_name,
+                                    "last_bar_chicago": last_bar_utc.astimezone(CHICAGO_TZ).isoformat(),
+                                    "stall_detected": True,
+                                    "market_open": market_open
+                                }
+        
+        # PATTERN 1: Additional observability (recommended)
+        # Count execution instruments where bars_expected == True and worst last_bar_age
+        bars_expected_count = len(instruments_with_bars_expected)
+        
+        # worst_last_bar_age_seconds already computed above
         
         # PATTERN 1: Map internal states to frontend-expected states
         # Frontend expects: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED'

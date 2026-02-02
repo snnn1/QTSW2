@@ -71,6 +71,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "CONNECTION_LOST",
     "CONNECTION_LOST_SUSTAINED",
     "CONNECTION_RECOVERED",
+    "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification after sustained disconnect
     # Kill Switch
     "KILL_SWITCH_ACTIVE",
     # Stream State
@@ -115,4 +116,5 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "BAR_ROUTING_DIAGNOSTIC",
     # Bar acceptance tracking
     "BAR_ACCEPTED",  # Bar acceptance events (rate-limited in engine)
+    "BAR_RECEIVED_NO_STREAMS",  # Bar received before streams created (for data stall detection)
 }
