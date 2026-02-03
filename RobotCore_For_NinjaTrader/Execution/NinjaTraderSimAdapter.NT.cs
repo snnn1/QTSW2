@@ -113,6 +113,19 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// Helper method to get Intent info for journal logging.
+    /// Returns tradingDate, stream, and intent prices from _intentMap if available.
+    /// </summary>
+    private (string tradingDate, string stream, decimal? entryPrice, decimal? stopPrice, decimal? targetPrice, string? direction, string? ocoGroup) GetIntentInfo(string intentId)
+    {
+        if (_intentMap.TryGetValue(intentId, out var intent))
+        {
+            return (intent.TradingDate, intent.Stream, intent.EntryPrice, intent.StopPrice, intent.TargetPrice, intent.Direction, null);
+        }
+        return ("", "", null, null, null, null, null);
+    }
+
+    /// <summary>
     /// STEP 1: Verify SIM account using real NT API.
     /// </summary>
     private void VerifySimAccountReal()
@@ -736,7 +749,9 @@ public sealed partial class NinjaTraderSimAdapter
                         error = "Order rejected";
                     }
                 }
-                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_SUBMIT_FAILED: {error}", utcNow);
+                var (tradingDate9, stream9, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate9, stream9, $"ENTRY_SUBMIT_FAILED: {error}", utcNow, 
+                    orderType: "ENTRY", rejectedPrice: entryPrice, rejectedQuantity: quantity);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
                 {
                     error,
@@ -747,7 +762,13 @@ public sealed partial class NinjaTraderSimAdapter
             }
 
             // Journal: ENTRY_SUBMITTED (store expected entry price for slippage calculation)
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY", order.OrderId, acknowledgedAt, entryPrice);
+            var (tradingDate, stream, intentEntryPrice, intentStopPrice, intentTargetPrice, intentDirection, _) = GetIntentInfo(intentId);
+            var finalEntryPrice = intentEntryPrice ?? entryPrice;
+            var finalDirection = intentDirection ?? direction;
+            
+            _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY", order.OrderId, acknowledgedAt, 
+                expectedEntryPrice: entryPrice, entryPrice: finalEntryPrice, stopPrice: intentStopPrice, 
+                targetPrice: intentTargetPrice, direction: finalDirection, ocoGroup: null);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -778,7 +799,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
         catch (Exception ex)
         {
-            _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_SUBMIT_FAILED: {ex.Message}", utcNow);
+            var (tradingDate10, stream10, _, _, _, _, _) = GetIntentInfo(intentId);
+            _executionJournal.RecordRejection(intentId, tradingDate10, stream10, $"ENTRY_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "ENTRY", rejectedPrice: entryPrice, rejectedQuantity: quantity);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
                 error = ex.Message,
@@ -990,17 +1013,110 @@ public sealed partial class NinjaTraderSimAdapter
             if (!string.IsNullOrEmpty(errorCode)) fullErrorMsg += $" (ErrorCode: {errorCode})";
             if (!string.IsNullOrEmpty(comment)) fullErrorMsg += $" (Comment: {comment})";
             
-            _executionJournal.RecordRejection(intentId, "", "", $"ORDER_REJECTED: {fullErrorMsg}", utcNow);
+            var (tradingDate11, stream11, _, _, _, _, _) = GetIntentInfo(intentId);
+            _executionJournal.RecordRejection(intentId, tradingDate11, stream11, $"ORDER_REJECTED: {fullErrorMsg}", utcNow, 
+                orderType: orderInfo.OrderType, rejectedPrice: orderInfo.Price, rejectedQuantity: orderInfo.Quantity);
             orderInfo.State = "REJECTED";
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
-                new 
-                { 
-                    broker_order_id = order.OrderId, 
-                    error = fullErrorMsg,
-                    error_code = errorCode,
-                    comment = comment,
-                    error_details = errorDetails
-                }));
+            
+            // CRITICAL FIX: If protective order is rejected, trigger fail-closed pathway
+            // Order submission success != order acceptance - broker can reject orders after submission
+            bool isProtectiveOrder = orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET";
+            if (isProtectiveOrder)
+            {
+                // Protective order rejected - position is unprotected
+                // Trigger same fail-closed pathway as submission failure
+                var failureReason = $"Protective {orderInfo.OrderType} order rejected by broker: {fullErrorMsg}";
+                
+                // Get intent to find stream
+                string? stream = null;
+                if (_intentMap.TryGetValue(intentId, out var intent))
+                {
+                    stream = intent.Stream;
+                    
+                    // Notify coordinator of protective failure
+                    _coordinator?.OnProtectiveFailure(intentId, stream, utcNow);
+                    
+                    // Flatten position immediately with retry logic
+                    var flattenResult = FlattenWithRetry(intentId, orderInfo.Instrument, utcNow);
+                    
+                    // Stand down stream
+                    _standDownStreamCallback?.Invoke(stream, utcNow, $"PROTECTIVE_ORDER_REJECTED: {failureReason}");
+                    
+                    // Persist incident record
+                    PersistProtectiveFailureIncident(intentId, intent,
+                        OrderSubmissionResult.FailureResult(fullErrorMsg, utcNow), // Stop/Target result
+                        null, // Other leg (only one leg rejected)
+                        flattenResult, utcNow);
+                    
+                    // Raise high-priority alert
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Protective Order Rejected - {orderInfo.Instrument}";
+                        var message = $"Protective {orderInfo.OrderType} order rejected by broker. Position flattened. Stream: {stream}, Intent: {intentId}. Error: {fullErrorMsg}";
+                        notificationService.EnqueueNotification($"PROTECTIVE_REJECTED:{intentId}", title, message, priority: 2); // Emergency priority
+                    }
+                    
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_FLATTENED",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = stream,
+                            instrument = orderInfo.Instrument,
+                            order_type = orderInfo.OrderType,
+                            broker_order_id = order.OrderId,
+                            error = fullErrorMsg,
+                            error_code = errorCode,
+                            comment = comment,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            failure_reason = failureReason,
+                            note = "Position flattened due to protective order rejection by broker (fail-closed behavior)"
+                        }));
+                }
+                else
+                {
+                    // Intent not found - log error but still log rejection
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_INTENT_NOT_FOUND",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = orderInfo.Instrument,
+                            order_type = orderInfo.OrderType,
+                            broker_order_id = order.OrderId,
+                            error = fullErrorMsg,
+                            note = "Protective order rejected but intent not found - cannot flatten (orphan rejection)"
+                        }));
+                    
+                    // Still log the rejection
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
+                        new 
+                        { 
+                            broker_order_id = order.OrderId, 
+                            error = fullErrorMsg,
+                            error_code = errorCode,
+                            comment = comment,
+                            error_details = errorDetails,
+                            order_type = orderInfo.OrderType,
+                            note = "Protective order rejected but intent not found - manual intervention may be required"
+                        }));
+                }
+            }
+            else
+            {
+                // Non-protective order rejected - log only
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
+                    new 
+                    { 
+                        broker_order_id = order.OrderId, 
+                        error = fullErrorMsg,
+                        error_code = errorCode,
+                        comment = comment,
+                        error_details = errorDetails,
+                        order_type = orderInfo.OrderType,
+                        note = "Non-protective order rejected - no flatten required"
+                    }));
+            }
         }
         else if (orderState == OrderState.Cancelled)
         {
@@ -1010,6 +1126,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    /// <summary>
+    /// Intent context structure for resolved intent information.
+    /// </summary>
     private struct IntentContext
     {
         public string TradingDate;
@@ -1206,27 +1325,25 @@ public sealed partial class NinjaTraderSimAdapter
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
         
+        var fillPrice = (decimal)execution.Price;
+        var fillQuantity = execution.Quantity;
+        
         // CRITICAL: Log when orders are ignored due to missing/invalid tags
         if (string.IsNullOrEmpty(intentId))
         {
-            var ignoredFillPrice = (decimal)execution.Price;
-            var ignoredFillQuantity = execution.Quantity;
             _log.Write(RobotEvents.ExecutionBase(utcNow, "", "", "EXECUTION_UPDATE_IGNORED_NO_TAG",
                 new 
                 { 
                     error = "Execution update ignored - order tag missing or invalid",
                     broker_order_id = order.OrderId,
                     order_tag = encodedTag ?? "NULL",
-                    fill_price = ignoredFillPrice,
-                    fill_quantity = ignoredFillQuantity,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
                     instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
                     note = "Order may not be robot-managed or tag was not set correctly"
                 }));
             return; // strict: non-robot orders ignored
         }
-
-        var fillPrice = (decimal)execution.Price;
-        var fillQuantity = execution.Quantity;
 
         if (!_orderMap.TryGetValue(intentId, out var orderInfo))
         {
@@ -1289,8 +1406,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
         
         // CRITICAL: Resolve intent context before any journal call
+        IntentContext context;
         if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, 
-            fillPrice, fillQuantity, utcNow, out IntentContext context))
+            fillPrice, fillQuantity, utcNow, out context))
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings
@@ -1354,10 +1472,9 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else
             {
-                // CRITICAL: Intent not found - protective orders cannot be placed
-                // EMERGENCY FIX: Flatten position immediately to prevent unprotected exposure
-                // Note: Cannot get stream from OrderInfo (it doesn't have Stream property) - use empty string
-                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_ERROR", "ENGINE",
+                // This should not happen - ResolveIntentContextOrFailClosed already checked
+                // But handle defensively
+                _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_ERROR", "ENGINE",
                     new 
                     { 
                         error = "Intent not found in _intentMap after context resolution - defensive check",
@@ -1377,7 +1494,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
                     
-                        _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
+                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
                         new
                         {
                             intent_id = intentId,
@@ -1461,8 +1578,10 @@ public sealed partial class NinjaTraderSimAdapter
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
                     action_taken = "EXECUTION_BLOCKED",
-                    note = "Unknown exit order type - orphan fill logged"
+                    note = "Unknown exit order type - orphan fill logged, execution blocked"
                 }));
+            
+            return; // Fail-closed
         }
     }
 
@@ -1517,20 +1636,31 @@ public sealed partial class NinjaTraderSimAdapter
 
             if (existingStop != null)
             {
-                var changed = false;
-                if (existingStop.Quantity != quantity)
-                {
-                    existingStop.Quantity = quantity;
-                    changed = true;
-                }
-                if (Math.Abs(existingStop.StopPrice - stopPriceD) > 1e-10)
-                {
-                    existingStop.StopPrice = stopPriceD;
-                    changed = true;
-                }
+                var quantityChanged = existingStop.Quantity != quantity;
+                var priceChanged = Math.Abs(existingStop.StopPrice - stopPriceD) > 1e-10;
+                var changed = quantityChanged || priceChanged;
 
-                if (changed)
+                // GC FIX: If quantity changed, cancel and recreate (NinjaTrader may not allow quantity changes)
+                if (quantityChanged)
                 {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "PROTECTIVE_ORDER_QUANTITY_CHANGE", new
+                    {
+                        old_quantity = existingStop.Quantity,
+                        new_quantity = quantity,
+                        order_type = "PROTECTIVE_STOP",
+                        broker_order_id = existingStop.OrderId,
+                        note = "Quantity changed - canceling and recreating protective orders (NinjaTrader may not allow quantity changes on working orders)"
+                    }));
+                    
+                    // Cancel existing protective orders (both stop and target since they're OCO paired)
+                    CancelProtectiveOrdersForIntent(intentId, utcNow);
+                    
+                    // Fall through to create new order below
+                    existingStop = null;
+                }
+                else if (priceChanged)
+                {
+                    // Only price changed - try to update (quantity unchanged)
                     dynamic dynAccountChange = account;
                     Order[]? changeRes = null;
                     try
@@ -1562,29 +1692,46 @@ public sealed partial class NinjaTraderSimAdapter
                         }
                         catch (Exception fallbackEx)
                         {
-                            // Both attempts failed - reject change
-                            var errorMsg = $"Stop order change failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
-                            _executionJournal.RecordRejection(intentId, "", "", $"STOP_CHANGE_FAILED: {errorMsg}", utcNow);
-                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
+                            // GC FIX: When order change fails (especially quantity changes), cancel and recreate
+                            // NinjaTrader may not allow quantity changes on working orders, so we need to cancel and recreate
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAILED_CANCEL_RECREATE", new
                             {
-                                error = errorMsg,
-                                first_error = ex.Message,
+                                error = ex.Message,
                                 fallback_error = fallbackEx.Message,
                                 order_type = "PROTECTIVE_STOP",
                                 broker_order_id = existingStop.OrderId,
-                                account = "SIM",
-                                exception_type = ex.GetType().Name,
-                                fallback_exception_type = fallbackEx.GetType().Name
+                                old_quantity = existingStop.Quantity,
+                                new_quantity = quantity,
+                                note = "Order change failed - will cancel and recreate with correct quantity"
                             }));
-                            return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+                            
+                            // Cancel existing stop order (and its OCO pair target if exists)
+                            CancelProtectiveOrdersForIntent(intentId, utcNow);
+                            
+                            // Fall through to create new order below
+                            existingStop = null; // Clear so we create new order
                         }
                     }
                     if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
                     {
+                        // GC FIX: When order change is rejected, cancel and recreate
                         dynamic dynChangeRes = changeRes?[0];
-                        var err = (string?)dynChangeRes?.ErrorMessage ?? (string?)dynChangeRes?.Error ?? "Stop order change rejected";
-                        _executionJournal.RecordRejection(intentId, "", "", $"STOP_CHANGE_FAILED: {err}", utcNow);
-                        return OrderSubmissionResult.FailureResult(err, utcNow);
+                        var err = (string?)dynChangeRes?.Error ?? "Stop order change rejected";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_REJECTED_CANCEL_RECREATE", new
+                        {
+                            error = err,
+                            order_type = "PROTECTIVE_STOP",
+                            broker_order_id = existingStop.OrderId,
+                            old_quantity = existingStop.Quantity,
+                            new_quantity = quantity,
+                            note = "Order change rejected - will cancel and recreate with correct quantity"
+                        }));
+                        
+                        // Cancel existing stop order (and its OCO pair target if exists)
+                        CancelProtectiveOrdersForIntent(intentId, utcNow);
+                        
+                        // Fall through to create new order below
+                        existingStop = null; // Clear so we create new order
                     }
                 }
 
@@ -1605,6 +1752,14 @@ public sealed partial class NinjaTraderSimAdapter
             // Real NT API: Create stop order using official NT8 CreateOrder factory method
             var orderAction = direction == "Long" ? OrderAction.Sell : OrderAction.BuyToCover;
             // stopPriceD is already computed above before idempotency check
+            
+            // Get ocoGroup from intent if not provided (use separate variable to avoid parameter shadowing)
+            string? ocoGroupToUse = ocoGroup;
+            if (ocoGroupToUse == null)
+            {
+                var (_, _, _, _, _, _, intentOcoGroup) = GetIntentInfo(intentId);
+                ocoGroupToUse = intentOcoGroup;
+            }
             
             // Runtime safety checks BEFORE CreateOrder
             if (!_ntContextSet)
@@ -1706,7 +1861,7 @@ public sealed partial class NinjaTraderSimAdapter
                     quantity,                               // Quantity
                     0.0,                                    // LimitPrice (0 for StopMarket)
                     stopPriceD,                             // StopPrice (use already computed variable)
-                    ocoGroup,                               // Oco (OCO group for pairing with target order)
+                    ocoGroupToUse,                          // Oco (OCO group for pairing with target order)
                     $"{intentId}_STOP",                     // OrderName
                     DateTime.MinValue,                      // Gtd
                     null                                    // CustomOrder
@@ -1764,7 +1919,9 @@ public sealed partial class NinjaTraderSimAdapter
                     intent_id = intentId,
                     account = "SIM"
                 }));
-                _executionJournal.RecordRejection(intentId, "", "", $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow);
+                var (tradingDate1, stream1, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate1, stream1, $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                    orderType: "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
                 return OrderSubmissionResult.FailureResult($"Failed to submit StopMarket order: {ex.Message}", utcNow);
             }
             
@@ -1798,12 +1955,22 @@ public sealed partial class NinjaTraderSimAdapter
                     intent_id = intentId,
                     account = "SIM"
                 }));
-                _executionJournal.RecordRejection(intentId, "", "", $"STOP_SUBMIT_FAILED: {error}", utcNow);
+                var (tradingDate2, stream2, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate2, stream2, $"STOP_SUBMIT_FAILED: {error}", utcNow, 
+                    orderType: "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
                 return OrderSubmissionResult.FailureResult(error, utcNow);
             }
 
             // Journal: STOP_SUBMITTED
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "STOP", order.OrderId, utcNow);
+            var (tradingDate3, stream3, _, intentStopPrice, intentTargetPrice, _, intentOcoGroupFromJournal) = GetIntentInfo(intentId);
+            // Use intentOcoGroup if ocoGroupToUse is still null
+            if (ocoGroupToUse == null)
+            {
+                ocoGroupToUse = intentOcoGroupFromJournal;
+            }
+            _executionJournal.RecordSubmission(intentId, tradingDate3, stream3, instrument, "STOP", order.OrderId, utcNow, 
+                expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice ?? stopPrice, 
+                targetPrice: intentTargetPrice, direction: direction, ocoGroup: ocoGroupToUse);
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -1819,7 +1986,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
         catch (Exception ex)
         {
-            _executionJournal.RecordRejection(intentId, "", "", $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow);
+            var (tradingDate14, stream14, _, _, _, _, _) = GetIntentInfo(intentId);
+            _executionJournal.RecordRejection(intentId, tradingDate14, stream14, $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
             return OrderSubmissionResult.FailureResult($"Stop order submission failed: {ex.Message}", utcNow);
         }
     }
@@ -1872,21 +2041,32 @@ public sealed partial class NinjaTraderSimAdapter
 
             if (existingTarget != null)
             {
-                var changed = false;
                 var existingTargetPriceD = (double)targetPrice;
-                if (existingTarget.Quantity != quantity)
-                {
-                    existingTarget.Quantity = quantity;
-                    changed = true;
-                }
-                if (Math.Abs(existingTarget.LimitPrice - existingTargetPriceD) > 1e-10)
-                {
-                    existingTarget.LimitPrice = existingTargetPriceD;
-                    changed = true;
-                }
+                var quantityChanged = existingTarget.Quantity != quantity;
+                var priceChanged = Math.Abs(existingTarget.LimitPrice - existingTargetPriceD) > 1e-10;
+                var changed = quantityChanged || priceChanged;
 
-                if (changed)
+                // GC FIX: If quantity changed, cancel and recreate (NinjaTrader may not allow quantity changes)
+                if (quantityChanged)
                 {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "PROTECTIVE_ORDER_QUANTITY_CHANGE", new
+                    {
+                        old_quantity = existingTarget.Quantity,
+                        new_quantity = quantity,
+                        order_type = "PROTECTIVE_TARGET",
+                        broker_order_id = existingTarget.OrderId,
+                        note = "Quantity changed - canceling and recreating protective orders (NinjaTrader may not allow quantity changes on working orders)"
+                    }));
+                    
+                    // Cancel existing protective orders (both stop and target since they're OCO paired)
+                    CancelProtectiveOrdersForIntent(intentId, utcNow);
+                    
+                    // Fall through to create new order below
+                    existingTarget = null;
+                }
+                else if (priceChanged)
+                {
+                    // Only price changed - try to update (quantity unchanged)
                     dynamic dynAccountChangeTarget = account;
                     Order[]? changeRes = null;
                     try
@@ -1918,29 +2098,45 @@ public sealed partial class NinjaTraderSimAdapter
                         }
                         catch (Exception fallbackEx)
                         {
-                            // Both attempts failed - reject change
-                            var errorMsg = $"Target order change failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
-                            _executionJournal.RecordRejection(intentId, "", "", $"TARGET_CHANGE_FAILED: {errorMsg}", utcNow);
-                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
+                            // GC FIX: When order change fails, cancel and recreate
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAILED_CANCEL_RECREATE", new
                             {
-                                error = errorMsg,
-                                first_error = ex.Message,
+                                error = ex.Message,
                                 fallback_error = fallbackEx.Message,
                                 order_type = "PROTECTIVE_TARGET",
                                 broker_order_id = existingTarget.OrderId,
-                                account = "SIM",
-                                exception_type = ex.GetType().Name,
-                                fallback_exception_type = fallbackEx.GetType().Name
+                                old_quantity = existingTarget.Quantity,
+                                new_quantity = quantity,
+                                note = "Order change failed - will cancel and recreate with correct quantity"
                             }));
-                            return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+                            
+                            // Cancel existing target order (and its OCO pair stop if exists)
+                            CancelProtectiveOrdersForIntent(intentId, utcNow);
+                            
+                            // Fall through to create new order below
+                            existingTarget = null; // Clear so we create new order
                         }
                     }
                     if (changeRes == null || changeRes.Length == 0 || changeRes[0].OrderState == OrderState.Rejected)
                     {
+                        // GC FIX: When order change is rejected, cancel and recreate
                         dynamic dynChangeRes = changeRes?[0];
-                        var err = (string?)dynChangeRes?.ErrorMessage ?? (string?)dynChangeRes?.Error ?? "Target order change rejected";
-                        _executionJournal.RecordRejection(intentId, "", "", $"TARGET_CHANGE_FAILED: {err}", utcNow);
-                        return OrderSubmissionResult.FailureResult(err, utcNow);
+                        var err = (string?)dynChangeRes?.Error ?? "Target order change rejected";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_REJECTED_CANCEL_RECREATE", new
+                        {
+                            error = err,
+                            order_type = "PROTECTIVE_TARGET",
+                            broker_order_id = existingTarget.OrderId,
+                            old_quantity = existingTarget.Quantity,
+                            new_quantity = quantity,
+                            note = "Order change rejected - will cancel and recreate with correct quantity"
+                        }));
+                        
+                        // Cancel existing target order (and its OCO pair stop if exists)
+                        CancelProtectiveOrdersForIntent(intentId, utcNow);
+                        
+                        // Fall through to create new order below
+                        existingTarget = null; // Clear so we create new order
                     }
                 }
 
@@ -2099,8 +2295,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
 
             // Real NT API: Submit order
-            dynamic dynAccountTarget = account;
             Order[] result;
+            dynamic dynAccountTarget = account;
             try
             {
                 object? submitResult = dynAccountTarget.Submit(new[] { order });
@@ -2121,14 +2317,33 @@ public sealed partial class NinjaTraderSimAdapter
             
             if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
             {
-                dynamic dynResult = result?[0];
-                var error = (string?)dynResult?.ErrorMessage ?? (string?)dynResult?.Error ?? "Target order rejected";
-                _executionJournal.RecordRejection(intentId, "", "", $"TARGET_SUBMIT_FAILED: {error}", utcNow);
+                // GC FIX: Safely extract error message - Order object doesn't have ErrorMessage property
+                string error = "Target order rejected";
+                if (result != null && result.Length > 0)
+                {
+                    try
+                    {
+                        dynamic dynResult = result[0];
+                        error = (string?)dynResult?.Error ?? "Target order rejected";
+                    }
+                    catch
+                    {
+                        // Fallback if dynamic access fails
+                        error = "Target order rejected";
+                    }
+                }
+                
+                var (tradingDate4, stream4, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate4, stream4, $"TARGET_SUBMIT_FAILED: {error}", utcNow, 
+                    orderType: "TARGET", rejectedPrice: targetPrice, rejectedQuantity: quantity);
                 return OrderSubmissionResult.FailureResult(error, utcNow);
             }
 
             // Journal: TARGET_SUBMITTED
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "TARGET", order.OrderId, utcNow);
+            var (tradingDate5, stream5, _, intentStopPrice2, intentTargetPrice2, _, ocoGroup2) = GetIntentInfo(intentId);
+            _executionJournal.RecordSubmission(intentId, tradingDate5, stream5, instrument, "TARGET", order.OrderId, utcNow, 
+                expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice2, 
+                targetPrice: intentTargetPrice2 ?? targetPrice, direction: direction, ocoGroup: ocoGroup2);
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -2144,7 +2359,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
         catch (Exception ex)
         {
-            _executionJournal.RecordRejection(intentId, "", "", $"TARGET_SUBMIT_FAILED: {ex.Message}", utcNow);
+            var (tradingDate6, stream6, _, _, _, _, _) = GetIntentInfo(intentId);
+            _executionJournal.RecordRejection(intentId, tradingDate6, stream6, $"TARGET_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "TARGET", rejectedPrice: targetPrice, rejectedQuantity: quantity);
             return OrderSubmissionResult.FailureResult($"Target order submission failed: {ex.Message}", utcNow);
         }
     }
@@ -2242,7 +2459,43 @@ public sealed partial class NinjaTraderSimAdapter
                 return OrderModificationResult.FailureResult(error, utcNow);
             }
 
-            _executionJournal.RecordBEModification(intentId, "", "", beStopPrice, utcNow);
+            // Get Intent and previous stop price for BE modification context
+            var (tradingDate8, stream8, intentEntryPrice2, intentStopPrice3, intentTargetPrice3, _, _) = GetIntentInfo(intentId);
+            decimal? previousStopPrice = null;
+            decimal? beTriggerPrice = null;
+            
+            // Get previous stop price from journal entry
+            var journalPath = System.IO.Path.Combine(_projectRoot, "data", "execution_journals", $"{tradingDate8}_{stream8}_{intentId}.json");
+            if (System.IO.File.Exists(journalPath))
+            {
+                try
+                {
+                    var journalJson = System.IO.File.ReadAllText(journalPath);
+                    var journalEntry = QTSW2.Robot.Core.JsonUtil.Deserialize<ExecutionJournalEntry>(journalJson);
+                    if (journalEntry != null && journalEntry.StopPrice.HasValue)
+                    {
+                        previousStopPrice = journalEntry.StopPrice.Value;
+                    }
+                    if (journalEntry != null && journalEntry.BEStopPrice.HasValue)
+                    {
+                        // If BE was already modified, use the previous BE stop price
+                        previousStopPrice = journalEntry.BEStopPrice.Value;
+                    }
+                }
+                catch
+                {
+                    // Ignore errors reading journal
+                }
+            }
+            
+            // Get BE trigger price from Intent
+            if (_intentMap.TryGetValue(intentId, out var beIntent))
+            {
+                beTriggerPrice = beIntent.BeTrigger;
+            }
+            
+            _executionJournal.RecordBEModification(intentId, tradingDate8, stream8, beStopPrice, utcNow, 
+                previousStopPrice: previousStopPrice, beTriggerPrice: beTriggerPrice, entryPrice: intentEntryPrice2);
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_SUCCESS", new
             {
@@ -2337,6 +2590,74 @@ public sealed partial class NinjaTraderSimAdapter
             Positions = positions,
             WorkingOrders = workingOrders
         };
+    }
+    
+    /// <summary>
+    /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
+    /// This is used when updating existing protective orders fails - we cancel and recreate them.
+    /// </summary>
+    private void CancelProtectiveOrdersForIntent(string intentId, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null)
+        {
+            return;
+        }
+        
+        var account = _ntAccount as Account;
+        if (account == null)
+        {
+            return;
+        }
+        
+        var ordersToCancel = new List<Order>();
+        
+        try
+        {
+            // Find protective orders (stop and target) for this intent
+            var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+            var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+            
+            foreach (var order in account.Orders)
+            {
+                if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                {
+                    continue;
+                }
+                
+                var tag = GetOrderTag(order) ?? "";
+                
+                // Match stop or target tag
+                if (tag == stopTag || tag == targetTag)
+                {
+                    ordersToCancel.Add(order);
+                }
+            }
+            
+            if (ordersToCancel.Count > 0)
+            {
+                // Real NT API: Cancel orders
+                account.Cancel(ordersToCancel.ToArray());
+                
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
+                {
+                    intent_id = intentId,
+                    cancelled_count = ordersToCancel.Count,
+                    cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
+                    cancelled_tags = ordersToCancel.Select(o => GetOrderTag(o)).ToList(),
+                    note = "Cancelled protective orders to recreate with correct quantity (quantity change requires cancel/recreate)"
+                }));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCEL_ERROR", new
+            {
+                intent_id = intentId,
+                error = ex.Message,
+                exception_type = ex.GetType().Name,
+                note = "Failed to cancel protective orders - may cause duplicate order issues"
+            }));
+        }
     }
     
     /// <summary>
@@ -2493,12 +2814,16 @@ public sealed partial class NinjaTraderSimAdapter
                 }
             }
             
+            // GC FIX: Check if position is null before accessing Quantity
+            var positionQty = position?.Quantity ?? 0;
+            
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
                 new
                 {
                     intent_id = intentId,
                     instrument = instrument,
-                    position_qty = position.Quantity,
+                    position_qty = positionQty,
+                    position_available = position != null,
                     note = "Flattened instrument position (broker API limitation - per-intent not supported)"
                 }));
             
@@ -2886,7 +3211,9 @@ public sealed partial class NinjaTraderSimAdapter
             if (priceValidationFailed)
             {
                 // HARD BLOCK: Stop price too far from market (fail-closed)
-                _executionJournal.RecordRejection(intentId, "", "", $"STOP_PRICE_VALIDATION_FAILED: {priceValidationReason}", utcNow);
+                var (tradingDate20, stream20, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate20, stream20, $"STOP_PRICE_VALIDATION_FAILED: {priceValidationReason}", utcNow, 
+                    orderType: "STOP", rejectedPrice: stopPrice, rejectedQuantity: null);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
                     "STOP_PRICE_VALIDATION_FAILED", new
                 {
@@ -2993,82 +3320,9 @@ public sealed partial class NinjaTraderSimAdapter
             // CRITICAL: Validate stop price relative to current market price
             // For Sell Short Stop Market: stop must be BELOW current price
             // For Buy Stop Market: stop must be ABOVE current price
-            // Note: LastPrice is not directly available on MasterInstrument in NinjaTrader API
-            // This validation is optional - NinjaTrader will reject invalid orders anyway
-            try
-            {
-                // Try to get current price through dynamic access (may not be available)
-                double currentPrice = 0.0;
-                try
-                {
-                    dynamic dynInstrument = ntInstrument.MasterInstrument;
-                    currentPrice = (double)(dynInstrument?.LastPrice ?? 0.0);
-                }
-                catch
-                {
-                    // LastPrice not available - skip validation, let NinjaTrader handle it
-                    currentPrice = 0.0;
-                }
-                
-                if (currentPrice > 0)
-                {
-                    bool isValidStop = false;
-                    string validationError = "";
-                    
-                    if (orderAction == OrderAction.SellShort || orderAction == OrderAction.Sell)
-                    {
-                        // Short entry: stop must be BELOW current price
-                        isValidStop = stopPriceD < currentPrice;
-                        if (!isValidStop)
-                        {
-                            validationError = $"Sell Short Stop Market order rejected: stop price {stopPriceD} must be BELOW current price {currentPrice}. " +
-                                            $"Current price has already fallen below breakout level.";
-                        }
-                    }
-                    else if (orderAction == OrderAction.Buy)
-                    {
-                        // Long entry: stop must be ABOVE current price
-                        isValidStop = stopPriceD > currentPrice;
-                        if (!isValidStop)
-                        {
-                            validationError = $"Buy Stop Market order rejected: stop price {stopPriceD} must be ABOVE current price {currentPrice}. " +
-                                            $"Current price has already risen above breakout level.";
-                        }
-                    }
-                    
-                    if (!isValidStop)
-                    {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_STOP_PRICE_INVALID", new
-                        {
-                            error = validationError,
-                            order_type = "StopMarket",
-                            order_action = orderAction.ToString(),
-                            quantity = quantity,
-                            stop_price = stopPriceD,
-                            current_price = currentPrice,
-                            instrument = instrument,
-                            intent_id = intentId,
-                            account = "SIM",
-                            note = "Stop price validation failed - order would be rejected by NinjaTrader"
-                        }));
-                        return OrderSubmissionResult.FailureResult(validationError, utcNow);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                // Log warning but don't block order submission if we can't get current price
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_STOP_PRICE_VALIDATION_WARNING", new
-                {
-                    warning = $"Could not validate stop price against current market price: {ex.Message}",
-                    order_type = "StopMarket",
-                    order_action = orderAction.ToString(),
-                    stop_price = stopPriceD,
-                    instrument = instrument,
-                    intent_id = intentId,
-                    note = "Proceeding with order submission - NinjaTrader will validate"
-                }));
-            }
+            // Note: Instrument.LastPrice is not available in NT API, skipping price validation
+            // Stop price validation is handled by NinjaTrader broker
+            // Price validation removed - NinjaTrader broker will validate stop prices and reject invalid orders
             
             // Create order using official NT8 CreateOrder factory method
             Order order = null!;
@@ -3243,7 +3497,9 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     // Both attempts failed - reject order
                     var errorMsg = $"Entry stop order submission failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
-                    _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {errorMsg}", utcNow);
+                    var (tradingDate17, stream17, _, _, _, _, _) = GetIntentInfo(intentId);
+                    _executionJournal.RecordRejection(intentId, tradingDate17, stream17, $"ENTRY_STOP_SUBMIT_FAILED: {errorMsg}", utcNow, 
+                        orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
                     {
                         error = errorMsg,
@@ -3279,7 +3535,9 @@ public sealed partial class NinjaTraderSimAdapter
                         error = "Order rejected";
                     }
                 }
-                _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow);
+                var (tradingDate18, stream18, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, tradingDate18, stream18, $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow, 
+                    orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
                 {
                     error,
@@ -3290,7 +3548,10 @@ public sealed partial class NinjaTraderSimAdapter
                 return OrderSubmissionResult.FailureResult(error, utcNow);
             }
 
-            _executionJournal.RecordSubmission(intentId, "", "", instrument, "ENTRY_STOP", order.OrderId, acknowledgedAt);
+            var (tradingDate19, stream19, intentEntryPrice3, intentStopPrice4, intentTargetPrice4, intentDirection2, ocoGroup3) = GetIntentInfo(intentId);
+            _executionJournal.RecordSubmission(intentId, tradingDate19, stream19, instrument, "ENTRY_STOP", order.OrderId, acknowledgedAt, 
+                expectedEntryPrice: null, entryPrice: intentEntryPrice3, stopPrice: intentStopPrice4 ?? stopPrice, 
+                targetPrice: intentTargetPrice4, direction: intentDirection2 ?? direction, ocoGroup: ocoGroup3 ?? ocoGroup);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {

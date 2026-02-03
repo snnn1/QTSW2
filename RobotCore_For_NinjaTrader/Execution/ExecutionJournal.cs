@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -140,7 +141,12 @@ public sealed class ExecutionJournal
         string orderType,
         string? brokerOrderId,
         DateTimeOffset utcNow,
-        decimal? expectedEntryPrice = null)
+        decimal? expectedEntryPrice = null,
+        decimal? entryPrice = null,
+        decimal? stopPrice = null,
+        decimal? targetPrice = null,
+        string? direction = null,
+        string? ocoGroup = null)
     {
         lock (_lock)
         {
@@ -193,11 +199,25 @@ public sealed class ExecutionJournal
                 };
             }
 
+            // Ensure TradingDate and Stream are set (may be empty strings from old call sites)
+            if (string.IsNullOrWhiteSpace(entry.TradingDate) && !string.IsNullOrWhiteSpace(tradingDate))
+            {
+                entry.TradingDate = tradingDate;
+            }
+            if (string.IsNullOrWhiteSpace(entry.Stream) && !string.IsNullOrWhiteSpace(stream))
+            {
+                entry.Stream = stream;
+            }
+            if (string.IsNullOrWhiteSpace(entry.Instrument) && !string.IsNullOrWhiteSpace(instrument))
+            {
+                entry.Instrument = instrument;
+            }
+
             entry.EntrySubmitted = true;
             entry.EntrySubmittedAt = utcNow.ToString("o");
             entry.BrokerOrderId = brokerOrderId;
 
-            if (orderType == "ENTRY")
+            if (orderType == "ENTRY" || orderType == "ENTRY_STOP")
             {
                 entry.EntryOrderType = orderType;
                 // Store expected entry price for slippage calculation
@@ -205,6 +225,28 @@ public sealed class ExecutionJournal
                 {
                     entry.ExpectedEntryPrice = expectedEntryPrice.Value;
                 }
+            }
+
+            // Store intent prices (only if not already set to preserve existing values)
+            if (entryPrice.HasValue && !entry.EntryPrice.HasValue)
+            {
+                entry.EntryPrice = entryPrice.Value;
+            }
+            if (stopPrice.HasValue && !entry.StopPrice.HasValue)
+            {
+                entry.StopPrice = stopPrice.Value;
+            }
+            if (targetPrice.HasValue && !entry.TargetPrice.HasValue)
+            {
+                entry.TargetPrice = targetPrice.Value;
+            }
+            if (!string.IsNullOrWhiteSpace(direction) && string.IsNullOrWhiteSpace(entry.Direction))
+            {
+                entry.Direction = direction;
+            }
+            if (!string.IsNullOrWhiteSpace(ocoGroup) && string.IsNullOrWhiteSpace(entry.OcoGroup))
+            {
+                entry.OcoGroup = ocoGroup;
             }
 
             _cache[key] = entry;
@@ -485,6 +527,10 @@ public sealed class ExecutionJournal
                 entry.ContractMultiplier = contractMultiplier;
             }
             
+            // Store intent prices if not already set (preserve existing values)
+            // These may have been set by RecordSubmission, but if not, preserve null
+            // Note: Intent prices should ideally be set at submission time, but we don't block here
+            
             // Legacy fields for backwards compatibility
             entry.EntryFilled = true;
             if (string.IsNullOrEmpty(entry.EntryFilledAt))
@@ -546,7 +592,8 @@ public sealed class ExecutionJournal
         decimal exitFillPrice,
         int exitFillQuantity,  // DELTA ONLY - this fill's quantity
         string exitOrderType,  // "STOP", "TARGET", "EMERGENCY", "MANUAL"
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        string? slotInstanceKey = null)  // Optional: slot_instance_key for health sink granularity
     {
         lock (_lock)
         {
@@ -752,6 +799,17 @@ public sealed class ExecutionJournal
             }
             else if (entry.ExitFilledQuantityTotal == entry.EntryFilledQuantityTotal)
             {
+                // CRITICAL: Guard against duplicate TRADE_COMPLETED emission
+                // If trade already completed, skip emission (idempotency)
+                if (entry.TradeCompleted)
+                {
+                    // Trade already completed - skip duplicate emission
+                    // This prevents duplicate events after restart/replay
+                    _cache[key] = entry;
+                    SaveJournal(journalPath, entry);
+                    return;
+                }
+                
                 // Complete - compute P&L
                 var direction = entry.Direction;
                 var contractMultiplier = entry.ContractMultiplier.Value;
@@ -822,24 +880,81 @@ public sealed class ExecutionJournal
                     entry.CompletionReason = exitOrderType;
                 }
                 
-                // Log trade completion
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TRADE_COMPLETED", "ENGINE",
-                    new
+                // Log trade completion with enhanced fields
+                var tradeData = new Dictionary<string, object?>
+                {
+                    ["intent_id"] = intentId,
+                    ["stream"] = stream,
+                    ["instrument"] = entry.Instrument,
+                    ["direction"] = direction,
+                    ["entry_avg_price"] = entryAvg,
+                    ["exit_avg_price"] = exitAvg,
+                    ["entry_qty"] = entry.EntryFilledQuantityTotal,
+                    ["exit_qty"] = entry.ExitFilledQuantityTotal,
+                    ["realized_pnl_points"] = points,
+                    ["realized_pnl_gross"] = grossDollars,
+                    ["realized_pnl_net"] = netDollars,
+                    ["completion_reason"] = entry.CompletionReason,
+                    ["exit_reason"] = entry.CompletionReason, // Alias for consistency
+                    ["contract_multiplier"] = contractMultiplier
+                };
+                
+                // Add entry/exit times if available
+                if (!string.IsNullOrWhiteSpace(entry.EntryFilledAt))
+                {
+                    tradeData["entry_time_utc"] = entry.EntryFilledAt;
+                    if (DateTimeOffset.TryParse(entry.EntryFilledAt, out var entryTime))
                     {
-                        intent_id = intentId,
-                        stream = stream,
-                        instrument = entry.Instrument,
-                        direction = direction,
-                        entry_avg_price = entryAvg,
-                        exit_avg_price = exitAvg,
-                        entry_qty = entry.EntryFilledQuantityTotal,
-                        exit_qty = entry.ExitFilledQuantityTotal,
-                        realized_pnl_points = points,
-                        realized_pnl_gross = grossDollars,
-                        realized_pnl_net = netDollars,
-                        completion_reason = entry.CompletionReason,
-                        contract_multiplier = contractMultiplier
-                    }));
+                        tradeData["entry_time_chicago"] = TimeService.ConvertUtcToChicagoStatic(entryTime).ToString("o");
+                    }
+                }
+                
+                // Use ExitFilledAtUtc (the field name in ExecutionJournalEntry)
+                var exitTimeStr = entry.ExitFilledAtUtc;
+                if (!string.IsNullOrWhiteSpace(exitTimeStr))
+                {
+                    tradeData["exit_time_utc"] = exitTimeStr;
+                    if (DateTimeOffset.TryParse(exitTimeStr, out var exitTime))
+                    {
+                        tradeData["exit_time_chicago"] = TimeService.ConvertUtcToChicagoStatic(exitTime).ToString("o");
+                    }
+                }
+                
+                // Add commission and fees if available
+                if (entry.Commission.HasValue)
+                {
+                    tradeData["commission"] = entry.Commission.Value;
+                }
+                
+                if (entry.Fees.HasValue)
+                {
+                    tradeData["fees"] = entry.Fees.Value;
+                }
+                
+                // Calculate time in trade if both times available
+                var entryTimeStr = entry.EntryFilledAt;
+                if (!string.IsNullOrWhiteSpace(entryTimeStr) && !string.IsNullOrWhiteSpace(exitTimeStr))
+                {
+                    if (DateTimeOffset.TryParse(entryTimeStr, out var entryTimeParsed) &&
+                        DateTimeOffset.TryParse(exitTimeStr, out var exitTimeParsed))
+                    {
+                        var timeInTrade = exitTimeParsed - entryTimeParsed;
+                        tradeData["time_in_trade_minutes"] = (int)timeInTrade.TotalMinutes;
+                        tradeData["time_in_trade_seconds"] = (int)timeInTrade.TotalSeconds;
+                    }
+                }
+                
+                // Include slot_instance_key if provided (for health sink path granularity)
+                if (!string.IsNullOrWhiteSpace(slotInstanceKey))
+                {
+                    tradeData["slot_instance_key"] = slotInstanceKey;
+                }
+                
+                // Use RobotEvents.Base instead of EngineBase for proper stream context
+                // RobotEvents.Base signature: (TimeService?, DateTimeOffset, string?, string?, string?, string?, string?, DateTimeOffset?, string, string, Dictionary<string, object?>?)
+                // Note: TimeService is required, but ExecutionJournal doesn't have access to it. Use a temporary instance.
+                var tempTime = new TimeService("America/Chicago");
+                _log.Write(RobotEvents.Base(tempTime, utcNow, tradingDate, stream, entry.Instrument ?? "", null, null, null, "TRADE_COMPLETED", "Trade completed", tradeData));
             }
             else
             {
@@ -875,7 +990,10 @@ public sealed class ExecutionJournal
         string tradingDate,
         string stream,
         string reason,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        string? orderType = null,
+        decimal? rejectedPrice = null,
+        int? rejectedQuantity = null)
     {
         lock (_lock)
         {
@@ -937,7 +1055,10 @@ public sealed class ExecutionJournal
         string tradingDate,
         string stream,
         decimal beStopPrice,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        decimal? previousStopPrice = null,
+        decimal? beTriggerPrice = null,
+        decimal? entryPrice = null)
     {
         lock (_lock)
         {
@@ -982,9 +1103,33 @@ public sealed class ExecutionJournal
                 }
             }
 
+            // Ensure TradingDate and Stream are set
+            if (string.IsNullOrWhiteSpace(entry.TradingDate) && !string.IsNullOrWhiteSpace(tradingDate))
+            {
+                entry.TradingDate = tradingDate;
+            }
+            if (string.IsNullOrWhiteSpace(entry.Stream) && !string.IsNullOrWhiteSpace(stream))
+            {
+                entry.Stream = stream;
+            }
+
             entry.BEModified = true;
             entry.BEModifiedAt = utcNow.ToString("o");
             entry.BEStopPrice = beStopPrice;
+            
+            // Store BE modification context (only if not already set)
+            if (previousStopPrice.HasValue && !entry.PreviousStopPrice.HasValue)
+            {
+                entry.PreviousStopPrice = previousStopPrice.Value;
+            }
+            if (beTriggerPrice.HasValue && !entry.BETriggerPrice.HasValue)
+            {
+                entry.BETriggerPrice = beTriggerPrice.Value;
+            }
+            if (entryPrice.HasValue && !entry.EntryPrice.HasValue)
+            {
+                entry.EntryPrice = entryPrice.Value;
+            }
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
@@ -1197,6 +1342,10 @@ public class ExecutionJournalEntry
 
     public decimal? BEStopPrice { get; set; }
     
+    // BE modification context
+    public decimal? PreviousStopPrice { get; set; } // Stop price before BE modification
+    public decimal? BETriggerPrice { get; set; } // BE trigger price (65% of target)
+    
     // Minimal extension for recovery: deterministic rebuild fields
     public string? Direction { get; set; }
     
@@ -1208,6 +1357,11 @@ public class ExecutionJournalEntry
     
     public string? OcoGroup { get; set; }
     
+    // Rejection context
+    public string? RejectionOrderType { get; set; } // Order type that was rejected (ENTRY, STOP, TARGET)
+    public decimal? RejectedPrice { get; set; } // Price that was rejected
+    public int? RejectedQuantity { get; set; } // Quantity that was rejected
+    
     // Slippage and cost tracking
     public decimal? ExpectedEntryPrice { get; set; } // Price we intended to fill at
     public decimal? ActualFillPrice { get; set; } // Price we actually filled at (same as FillPrice, kept for clarity)
@@ -1217,8 +1371,12 @@ public class ExecutionJournalEntry
     public decimal? Fees { get; set; } // Exchange fees (if available)
     public decimal? TotalCost { get; set; } // SlippageDollars + Commission + Fees
     
-    // Contract multiplier (required for P&L calculation)
-    public decimal? ContractMultiplier { get; set; }
+    // Core identity (for journal-alone determinism)
+    // NOTE: TradingDate and Stream may be nullable for backwards compatibility,
+    // but persistence MUST reject empty/whitespace values
+    // TradingDate and Stream already exist above - ensure they are populated
+    
+    public decimal? ContractMultiplier { get; set; } // Contract multiplier (required for P&L calculation)
     
     // Entry fill tracking (cumulative, weighted average)
     public int EntryFilledQuantityTotal { get; set; } // Cumulative total entry quantity

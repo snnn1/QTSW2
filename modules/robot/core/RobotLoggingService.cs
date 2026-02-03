@@ -37,6 +37,9 @@ public sealed class RobotLoggingService : IDisposable
     private readonly string _logDirectory;
     private readonly Dictionary<string, StreamWriter> _writers = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _writersLock = new();
+    private readonly Dictionary<string, StreamWriter> _healthWriters = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _healthWritersLock = new();
+    private readonly string _healthDirectory;
     private CancellationTokenSource _cancellationTokenSource = new();
     private Task? _backgroundWorker;
     private bool _disposed = false;
@@ -70,6 +73,12 @@ public sealed class RobotLoggingService : IDisposable
     
     // Daily rotation tracking
     private DateTime _lastRotationDateUtc = DateTime.MinValue;
+    
+    // Rate limiting: track last emission time and counts per event type
+    private readonly Dictionary<string, DateTimeOffset> _lastEventEmission = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _eventCountsPerMinute = new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset _lastRateLimitResetUtc = DateTimeOffset.UtcNow;
+    private readonly object _rateLimitLock = new();
 
     private sealed class DailySummaryAggregator
     {
@@ -287,6 +296,8 @@ public sealed class RobotLoggingService : IDisposable
     {
         _logDirectory = customLogDir ?? Path.Combine(projectRoot, "logs", "robot");
         Directory.CreateDirectory(_logDirectory);
+        _healthDirectory = Path.Combine(projectRoot, "logs", "health");
+        Directory.CreateDirectory(_healthDirectory);
         _instanceCounter++;
         
         // Load logging configuration
@@ -302,6 +313,14 @@ public sealed class RobotLoggingService : IDisposable
         // Archive old logs on startup
         ArchiveOldLogs();
     }
+    
+    // Selected INFO events that should go to health sink
+    private static readonly HashSet<string> HEALTH_SINK_INFO_EVENTS = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "TRADE_COMPLETED",
+        "CRITICAL_EVENT_REPORTED"  // Critical events timeline for forensic analysis
+        // Note: ENGINE_HEARTBEAT not included as it doesn't exist in current event registry
+    };
 
     /// <summary>
     /// Non-blocking enqueue. Never throws from OnBarUpdate.
@@ -309,6 +328,29 @@ public sealed class RobotLoggingService : IDisposable
     public void Log(RobotLogEvent evt)
     {
         if (_disposed) return;
+
+        // CRITICAL: ERROR and CRITICAL events always bypass all filtering
+        bool isErrorOrCritical = string.Equals(evt.level, "ERROR", StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(evt.level, "CRITICAL", StringComparison.OrdinalIgnoreCase);
+        
+        if (!isErrorOrCritical)
+        {
+            // Diagnostics filtering: drop DEBUG events if diagnostics disabled
+            if (!_config.diagnostics_enabled && string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            
+            // Rate limiting: apply only to DEBUG and INFO levels
+            if (string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!CheckRateLimit(evt))
+                {
+                    return; // Rate limit exceeded, drop event
+                }
+            }
+        }
 
         // Log level filtering: drop events below minimum level
         if (!ShouldLog(evt.level))
@@ -343,6 +385,57 @@ public sealed class RobotLoggingService : IDisposable
         }
 
         _queue.Enqueue(evt);
+    }
+    
+    /// <summary>
+    /// Check rate limit for event. Returns true if event should be logged, false if rate limit exceeded.
+    /// Rate limits apply ONLY to DEBUG and INFO levels. ERROR and CRITICAL always bypass.
+    /// </summary>
+    private bool CheckRateLimit(RobotLogEvent evt)
+    {
+        if (_config.event_rate_limits == null || _config.event_rate_limits.Count == 0)
+        {
+            return true; // No rate limits configured
+        }
+        
+        var eventType = evt.@event ?? "";
+        if (string.IsNullOrWhiteSpace(eventType))
+        {
+            return true; // No event type, can't rate limit
+        }
+        
+        if (!_config.event_rate_limits.TryGetValue(eventType, out int maxPerMinute))
+        {
+            return true; // No rate limit for this event type
+        }
+        
+        var now = DateTimeOffset.UtcNow;
+        
+        lock (_rateLimitLock)
+        {
+            // Reset counters every minute
+            if ((now - _lastRateLimitResetUtc).TotalMinutes >= 1.0)
+            {
+                _eventCountsPerMinute.Clear();
+                _lastRateLimitResetUtc = now;
+            }
+            
+            // Get current count for this event type
+            if (!_eventCountsPerMinute.TryGetValue(eventType, out int currentCount))
+            {
+                currentCount = 0;
+            }
+            
+            // Check if rate limit exceeded
+            if (currentCount >= maxPerMinute)
+            {
+                return false; // Rate limit exceeded
+            }
+            
+            // Increment count
+            _eventCountsPerMinute[eventType] = currentCount + 1;
+            return true;
+        }
     }
 
     /// <summary>
@@ -448,6 +541,24 @@ public sealed class RobotLoggingService : IDisposable
             }
             _writers.Clear();
         }
+        
+        // Close all health writers
+        lock (_healthWritersLock)
+        {
+            foreach (var writer in _healthWriters.Values)
+            {
+                try
+                {
+                    writer.Flush();
+                    writer.Dispose();
+                }
+                catch
+                {
+                    // Ignore errors during shutdown
+                }
+            }
+            _healthWriters.Clear();
+        }
 
         _backgroundWorker = null;
     }
@@ -532,6 +643,18 @@ public sealed class RobotLoggingService : IDisposable
         {
             WriteBatchToFile(kvp.Key, kvp.Value);
         }
+        
+        // Write to health sink if enabled (events >= WARN + selected INFO)
+        if (_config.enable_health_sink)
+        {
+            foreach (var evt in batch)
+            {
+                if (ShouldWriteToHealthSink(evt))
+                {
+                    WriteToHealthSink(evt);
+                }
+            }
+        }
 
         // Periodically emit a human-friendly daily summary (best-effort).
         MaybeWriteDailySummary(force);
@@ -574,6 +697,132 @@ public sealed class RobotLoggingService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Check if event should be written to health sink.
+    /// Health sink includes: events >= WARN OR selected INFO events (TRADE_COMPLETED).
+    /// </summary>
+    private bool ShouldWriteToHealthSink(RobotLogEvent evt)
+    {
+        // Always include WARN, ERROR, CRITICAL
+        if (string.Equals(evt.level, "WARN", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(evt.level, "ERROR", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(evt.level, "CRITICAL", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        
+        // Include selected INFO events
+        if (string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(evt.@event) &&
+            HEALTH_SINK_INFO_EVENTS.Contains(evt.@event))
+        {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Write event to health sink with slot_instance_key granularity.
+    /// Path: logs/health/<trading_date>_<instrument>_<stream>_<slot_instance_key>.jsonl
+    /// Falls back to logs/health/<trading_date>_<instrument>_<stream>.jsonl if slot_instance_key is null.
+    /// </summary>
+    private void WriteToHealthSink(RobotLogEvent evt)
+    {
+        StreamWriter? writer = null;
+        try
+        {
+            // Extract fields for health sink path
+            var tradingDate = evt.trading_date ?? "";
+            var instrument = string.IsNullOrWhiteSpace(evt.instrument) ? "ENGINE" : evt.instrument;
+            var stream = evt.stream ?? "";
+            var slotInstanceKey = ExtractSlotInstanceKey(evt);
+            
+            // Build health sink key (used for writer lookup)
+            var healthKey = string.IsNullOrWhiteSpace(slotInstanceKey)
+                ? $"{tradingDate}_{instrument}_{stream}"
+                : $"{tradingDate}_{instrument}_{stream}_{slotInstanceKey}";
+            
+            lock (_healthWritersLock)
+            {
+                if (!_healthWriters.TryGetValue(healthKey, out writer))
+                {
+                    var sanitizedKey = SanitizeFileName(healthKey);
+                    var filePath = Path.Combine(_healthDirectory, $"{sanitizedKey}.jsonl");
+                    var fileStream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                    writer = new StreamWriter(fileStream, Encoding.UTF8) { AutoFlush = false };
+                    _healthWriters[healthKey] = writer;
+                }
+            }
+            
+            var json = JsonUtil.Serialize(evt);
+            writer.WriteLine(json);
+            writer.Flush();
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't fail - health sink is supplementary
+            LogErrorToFile($"Health sink write failure: {ex.Message}");
+            
+            // Remove broken writer
+            if (writer != null)
+            {
+                try
+                {
+                    lock (_healthWritersLock)
+                    {
+                        // Find and remove the broken writer
+                        var keyToRemove = "";
+                        foreach (var kvp in _healthWriters)
+                        {
+                            if (kvp.Value == writer)
+                            {
+                                keyToRemove = kvp.Key;
+                                break;
+                            }
+                        }
+                        if (!string.IsNullOrEmpty(keyToRemove))
+                        {
+                            _healthWriters.Remove(keyToRemove);
+                            writer.Dispose();
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore cleanup errors
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Extract slot_instance_key from event data if present.
+    /// </summary>
+    private string? ExtractSlotInstanceKey(RobotLogEvent evt)
+    {
+        if (evt.data == null) return null;
+        
+        // Try to extract from data dictionary
+        if (evt.data is Dictionary<string, object?> dataDict)
+        {
+            if (dataDict.TryGetValue("slot_instance_key", out var slotKey) && slotKey is string slotKeyStr)
+            {
+                return slotKeyStr;
+            }
+            // Also check nested payload
+            if (dataDict.TryGetValue("payload", out var payload) && payload is Dictionary<string, object?> payloadDict)
+            {
+                if (payloadDict.TryGetValue("slot_instance_key", out var nestedSlotKey) && nestedSlotKey is string nestedSlotKeyStr)
+                {
+                    return nestedSlotKeyStr;
+                }
+            }
+        }
+        
+        return null;
+    }
+    
     private void WriteBatchToFile(string instrument, List<RobotLogEvent> batch)
     {
         StreamWriter? writer = null;

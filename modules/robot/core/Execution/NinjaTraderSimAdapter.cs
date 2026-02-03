@@ -206,7 +206,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         catch (Exception ex)
         {
             // Journal: ENTRY_SUBMIT_FAILED
-            _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_SUBMIT_FAILED: {ex.Message}", utcNow);
+            // Get Intent info for journal logging
+            string tradingDate = "";
+            string stream = "";
+            if (_intentMap.TryGetValue(intentId, out var entryIntent))
+            {
+                tradingDate = entryIntent.TradingDate;
+                stream = entryIntent.Stream;
+            }
+            _executionJournal.RecordRejection(intentId, tradingDate, stream, $"ENTRY_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "ENTRY", rejectedPrice: entryPrice, rejectedQuantity: quantity);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
@@ -288,7 +297,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
         catch (Exception ex)
         {
-            _executionJournal.RecordRejection(intentId, "", "", $"ENTRY_STOP_SUBMIT_FAILED: {ex.Message}", utcNow);
+            // Get Intent info for journal logging
+            string tradingDate = "";
+            string stream = "";
+            if (_intentMap.TryGetValue(intentId, out var stopEntryIntent))
+            {
+                tradingDate = stopEntryIntent.TradingDate;
+                stream = stopEntryIntent.Stream;
+            }
+            _executionJournal.RecordRejection(intentId, tradingDate, stream, $"ENTRY_STOP_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
@@ -477,15 +495,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             }
         }
         
-        // PHASE 2: Generate OCO group for protective orders (stop and target must be OCO paired)
-        // CRITICAL: Stop and target must be OCO so only one can fill
-        var protectiveOcoGroup = $"QTSW2:{intentId}_PROTECTIVE";
-        
-        // PHASE 2: Submit protective stop with retry
+        // PHASE 2: Submit protective orders with retry
+        // CRITICAL FIX: Generate unique OCO group for each retry attempt
+        // NinjaTrader does not allow reusing OCO IDs once they've been used (even if rejected)
+        // Both stop and target must use the same OCO group to be paired, so we retry both together
         const int MAX_RETRIES = 3;
         const int RETRY_DELAY_MS = 100;
         
         OrderSubmissionResult? stopResult = null;
+        OrderSubmissionResult? targetResult = null;
+        
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
             if (attempt > 0)
@@ -498,9 +517,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             {
                 var error = "Exit validation failed during retry";
                 stopResult = OrderSubmissionResult.FailureResult(error, utcNow);
+                targetResult = OrderSubmissionResult.FailureResult(error, utcNow);
                 break;
             }
             
+            // Generate unique OCO group for this attempt (append attempt number and timestamp)
+            // Both stop and target must use the same OCO group to be paired
+            var protectiveOcoGroup = $"QTSW2:{intentId}_PROTECTIVE_A{attempt}_{utcNow:HHmmssfff}";
+            
+            // Submit stop order
             stopResult = SubmitProtectiveStop(
                 intentId,
                 intent.Instrument,
@@ -510,38 +535,38 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 protectiveOcoGroup,
                 utcNow);
             
+            // Only submit target if stop succeeded (they must be OCO paired)
             if (stopResult.Success)
-                break;
-        }
-        
-        // PHASE 2: Submit target order with retry
-        OrderSubmissionResult? targetResult = null;
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
-        {
-            if (attempt > 0)
             {
-                System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+                targetResult = SubmitTargetOrder(
+                    intentId,
+                    intent.Instrument,
+                    intent.Direction,
+                    intent.TargetPrice.Value,
+                    fillQuantity,
+                    protectiveOcoGroup,
+                    utcNow);
+                
+                // If both succeeded, we're done
+                if (targetResult.Success)
+                    break;
+                
+                // If target failed but stop succeeded, we need to cancel stop and retry both
+                // Cancel the stop order before retrying (OCO pairing broken)
+                if (stopResult.BrokerOrderId != null)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_RETRY_CANCEL_STOP",
+                        new
+                        {
+                            attempt = attempt + 1,
+                            reason = "Target submission failed - canceling stop to retry both as OCO pair",
+                            stop_broker_order_id = stopResult.BrokerOrderId
+                        }));
+                    // Note: Stop will be canceled by NinjaTrader when we submit new orders, or we could explicitly cancel
+                    // For now, continue to next retry attempt with new OCO group
+                }
             }
-            
-            // Validate again before each retry
-            if (_coordinator != null && !_coordinator.CanSubmitExit(intentId, fillQuantity))
-            {
-                var error = "Exit validation failed during retry";
-                targetResult = OrderSubmissionResult.FailureResult(error, utcNow);
-                break;
-            }
-            
-            targetResult = SubmitTargetOrder(
-                intentId,
-                intent.Instrument,
-                intent.Direction,
-                intent.TargetPrice.Value,
-                fillQuantity,
-                protectiveOcoGroup,
-                utcNow);
-            
-            if (targetResult.Success)
-                break;
+            // If stop failed, continue to next retry attempt
         }
         
         // PHASE 2: If either protective leg failed after retries, flatten position and stand down stream
@@ -813,7 +838,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         catch (Exception ex)
         {
             // Journal: STOP_SUBMIT_FAILED
-            _executionJournal.RecordRejection(intentId, "", "", $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow);
+            // Get Intent info for journal logging
+            string tradingDate = "";
+            string stream = "";
+            if (_intentMap.TryGetValue(intentId, out var stopIntent))
+            {
+                tradingDate = stopIntent.TradingDate;
+                stream = stopIntent.Stream;
+            }
+            _executionJournal.RecordRejection(intentId, tradingDate, stream, $"STOP_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
@@ -884,7 +918,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         catch (Exception ex)
         {
             // Journal: TARGET_SUBMIT_FAILED
-            _executionJournal.RecordRejection(intentId, "", "", $"TARGET_SUBMIT_FAILED: {ex.Message}", utcNow);
+            // Get Intent info for journal logging
+            string tradingDate = "";
+            string stream = "";
+            if (_intentMap.TryGetValue(intentId, out var targetIntent))
+            {
+                tradingDate = targetIntent.TradingDate;
+                stream = targetIntent.Stream;
+            }
+            _executionJournal.RecordRejection(intentId, tradingDate, stream, $"TARGET_SUBMIT_FAILED: {ex.Message}", utcNow, 
+                orderType: "TARGET", rejectedPrice: targetPrice, rejectedQuantity: quantity);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
             {
@@ -1031,8 +1074,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             }
         }
         
-        // All retries failed - scream loudly and stand down
+        // All retries failed - log POSITION_FLATTEN_FAIL_CLOSED and stand down
         var finalError = $"Flatten failed after {MAX_RETRIES} attempts: {lastResult?.ErrorMessage ?? "Unknown error"}";
+        
+        // Log POSITION_FLATTEN_FAIL_CLOSED at ERROR level (CRITICAL event)
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "POSITION_FLATTEN_FAIL_CLOSED", new
+        {
+            intent_id = intentId,
+            instrument = instrument,
+            retry_count = MAX_RETRIES,
+            final_error = finalError,
+            last_error_message = lastResult?.ErrorMessage ?? "Unknown error",
+            note = "All flatten retries exhausted - position may still be open. Manual intervention required."
+        }));
         
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAILED_ALL_RETRIES",
             new

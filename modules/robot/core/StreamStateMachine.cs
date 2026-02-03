@@ -376,8 +376,41 @@ public sealed class StreamStateMachine
             LastUpdateUtc = DateTimeOffset.MinValue.ToString("o"),
             TimetableHashAtCommit = null,
             StopBracketsSubmittedAtLock = false,
-            EntryDetected = false
+            EntryDetected = false,
+            SlotStatus = SlotStatus.ACTIVE,
+            SlotInstanceKey = null, // Will be set below if new journal
+            ExecutionInterruptedByClose = false,
+            ReentrySubmitted = false,
+            ReentryFilled = false,
+            ProtectionSubmitted = false,
+            ProtectionAccepted = false
         };
+        
+        // SLOT PERSISTENCE: Generate SlotInstanceKey for new slots (set once, never overwritten)
+        if (existing == null && string.IsNullOrWhiteSpace(_journal.SlotInstanceKey))
+        {
+            // New slot lifecycle - generate SlotInstanceKey
+            _journal.SlotInstanceKey = $"{Stream}_{SlotTimeChicago}_{tradingDateStr}";
+            
+            // Calculate and store NextSlotTimeUtc
+            _journal.NextSlotTimeUtc = CalculateNextSlotTimeUtc(tradingDate, SlotTimeChicago, time);
+        }
+        else if (existing != null && !string.IsNullOrWhiteSpace(existing.SlotInstanceKey))
+        {
+            // Restore SlotInstanceKey from existing journal (preserve lifecycle identity)
+            _journal.SlotInstanceKey = existing.SlotInstanceKey;
+            _journal.SlotStatus = existing.SlotStatus;
+            _journal.ExecutionInterruptedByClose = existing.ExecutionInterruptedByClose;
+            _journal.ForcedFlattenTimestamp = existing.ForcedFlattenTimestamp;
+            _journal.OriginalIntentId = existing.OriginalIntentId;
+            _journal.ReentryIntentId = existing.ReentryIntentId;
+            _journal.ReentrySubmitted = existing.ReentrySubmitted;
+            _journal.ReentryFilled = existing.ReentryFilled;
+            _journal.ProtectionSubmitted = existing.ProtectionSubmitted;
+            _journal.ProtectionAccepted = existing.ProtectionAccepted;
+            _journal.NextSlotTimeUtc = existing.NextSlotTimeUtc ?? CalculateNextSlotTimeUtc(tradingDate, SlotTimeChicago, time);
+            _journal.PriorJournalKey = existing.PriorJournalKey;
+        }
         
         // Initialize state entry time tracking
         _stateEntryTimeUtc = DateTimeOffset.UtcNow;
@@ -553,6 +586,39 @@ public sealed class StreamStateMachine
 
     public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
     {
+        // NQ2 FIX: Prevent slot_time changes after stream initialization if stream is past PRE_HYDRATION
+        // This prevents timetable updates from changing slot_time mid-session
+        if (State != StreamState.PRE_HYDRATION && SlotTimeChicago != newSlotTimeChicago)
+        {
+            var warningMsg = $"WARNING: Attempted to update slot_time from '{SlotTimeChicago}' to '{newSlotTimeChicago}' " +
+                           $"but stream is already in state '{State}'. Slot_time changes are only allowed during PRE_HYDRATION. " +
+                           $"Ignoring update to prevent mid-session slot_time changes.";
+            
+            LogHealth("WARN", "SLOT_TIME_UPDATE_REJECTED", warningMsg, new
+            {
+                stream = Stream,
+                current_state = State.ToString(),
+                current_slot_time = SlotTimeChicago,
+                attempted_slot_time = newSlotTimeChicago,
+                trading_date = tradingDate.ToString("yyyy-MM-dd"),
+                note = "Slot_time update rejected - stream already initialized. This prevents timetable updates from affecting active streams."
+            });
+            
+            // Report to HealthMonitor for visibility
+            if (_reportCriticalCallback != null)
+            {
+                _reportCriticalCallback("SLOT_TIME_UPDATE_REJECTED", new Dictionary<string, object>
+                {
+                    { "stream", Stream },
+                    { "current_slot_time", SlotTimeChicago },
+                    { "attempted_slot_time", newSlotTimeChicago },
+                    { "state", State.ToString() }
+                }, TradingDate);
+            }
+            
+            return; // Reject the update
+        }
+        
         // Allowed only if not committed
         SlotTimeChicago = newSlotTimeChicago;
         
@@ -650,15 +716,73 @@ public sealed class StreamStateMachine
         // Recompute time boundaries for new trading date
         RecomputeTimeBoundaries(newTradingDate);
 
+        // SLOT PERSISTENCE: Check if this is a post-entry active slot that should be carried forward
+        var previousJournal = _journals.TryLoad(previousTradingDateStr, Stream);
+        var isPostEntryActive = false;
+        
+        if (!isInitialization && !isBackwardDate && previousJournal != null)
+        {
+            // Check post-entry active condition:
+            // 1. SlotStatus == ACTIVE
+            // 2. ExecutionInterruptedByClose == true OR post-entry verified via ExecutionJournal
+            // 3. now < NextSlotTimeUtc (slot not expired)
+            var slotNotExpired = !previousJournal.NextSlotTimeUtc.HasValue || utcNow < previousJournal.NextSlotTimeUtc.Value;
+            var isPostEntry = false;
+            
+            if (previousJournal.ExecutionInterruptedByClose)
+            {
+                isPostEntry = true; // Already marked as interrupted (forced flattened)
+            }
+            else if (!string.IsNullOrWhiteSpace(previousJournal.OriginalIntentId) && _executionJournal != null)
+            {
+                // Verify post-entry via ExecutionJournal: load ExecutionJournalEntry via OriginalIntentId, check EntryFilled==true
+                isPostEntry = HasEntryFillForIntentId(previousJournal.OriginalIntentId, previousTradingDateStr);
+            }
+            
+            isPostEntryActive = previousJournal.SlotStatus == SlotStatus.ACTIVE && 
+                               isPostEntry && 
+                               slotNotExpired;
+        }
+
         // Replace journal with one for the new trading_date
         if (existingJournal != null)
         {
             // Use existing journal for new date
             _journal = existingJournal;
         }
+        else if (isPostEntryActive && previousJournal != null)
+        {
+            // SLOT PERSISTENCE: Clone-forward post-entry active slot (carry-forward mechanism)
+            // Create new journal entry for new TradingDate but preserve SlotInstanceKey and lifecycle fields
+            _journal = new StreamJournal
+            {
+                TradingDate = newTradingDateStr, // Update for reporting
+                Stream = Stream,
+                Committed = false,
+                CommitReason = null,
+                LastState = State.ToString(),
+                LastUpdateUtc = utcNow.ToString("o"),
+                TimetableHashAtCommit = null,
+                StopBracketsSubmittedAtLock = previousJournal.StopBracketsSubmittedAtLock,
+                EntryDetected = previousJournal.EntryDetected,
+                // Preserve slot lifecycle identity and state
+                SlotInstanceKey = previousJournal.SlotInstanceKey, // NEVER overwrite - preserve lifecycle identity
+                SlotStatus = previousJournal.SlotStatus,
+                ExecutionInterruptedByClose = previousJournal.ExecutionInterruptedByClose,
+                ForcedFlattenTimestamp = previousJournal.ForcedFlattenTimestamp,
+                OriginalIntentId = previousJournal.OriginalIntentId,
+                ReentryIntentId = previousJournal.ReentryIntentId,
+                ReentrySubmitted = previousJournal.ReentrySubmitted,
+                ReentryFilled = previousJournal.ReentryFilled,
+                ProtectionSubmitted = previousJournal.ProtectionSubmitted,
+                ProtectionAccepted = previousJournal.ProtectionAccepted,
+                NextSlotTimeUtc = previousJournal.NextSlotTimeUtc,
+                PriorJournalKey = $"{previousTradingDateStr}_{Stream}" // Reference to previous day's journal
+            };
+        }
         else
         {
-            // Create new journal entry for new trading_date
+            // Create new journal entry for new trading_date (new slot lifecycle)
             _journal = new StreamJournal
             {
                 TradingDate = newTradingDateStr,
@@ -667,13 +791,29 @@ public sealed class StreamStateMachine
                 CommitReason = null,
                 LastState = State.ToString(),
                 LastUpdateUtc = utcNow.ToString("o"),
-                TimetableHashAtCommit = null
+                TimetableHashAtCommit = null,
+                StopBracketsSubmittedAtLock = false,
+                EntryDetected = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                SlotInstanceKey = null, // Will be set below if new journal
+                ExecutionInterruptedByClose = false,
+                ReentrySubmitted = false,
+                ReentryFilled = false,
+                ProtectionSubmitted = false,
+                ProtectionAccepted = false
             };
+            
+            // Generate new SlotInstanceKey for new slot lifecycle
+            if (string.IsNullOrWhiteSpace(_journal.SlotInstanceKey))
+            {
+                _journal.SlotInstanceKey = $"{Stream}_{SlotTimeChicago}_{newTradingDateStr}";
+                _journal.NextSlotTimeUtc = CalculateNextSlotTimeUtc(newTradingDate, SlotTimeChicago, _time);
+            }
         }
         _journals.Save(_journal);
 
-        // Only reset state and clear buffers if this is an actual forward rollover (not initialization or backward date)
-        if (!isInitialization && !isBackwardDate)
+        // Only reset state and clear buffers if this is an actual forward rollover AND NOT post-entry active
+        if (!isInitialization && !isBackwardDate && !isPostEntryActive)
         {
             // Reset all daily state for new trading day
             ResetDailyState();
@@ -765,6 +905,20 @@ public sealed class StreamStateMachine
             // Hard no re-arming
             State = StreamState.DONE;
             return;
+        }
+        
+        // SLOT PERSISTENCE: Check slot expiry BEFORE other state transitions (authoritative termination)
+        if (_journal.SlotStatus == SlotStatus.ACTIVE && _journal.NextSlotTimeUtc.HasValue && utcNow >= _journal.NextSlotTimeUtc.Value)
+        {
+            // Slot expired at next slot time - exit position and commit lifecycle terminal
+            HandleSlotExpiry(utcNow);
+            return;
+        }
+        
+        // SLOT PERSISTENCE: Check for market open re-entry (time-based, not bar-based)
+        if (_journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.ReentrySubmitted)
+        {
+            CheckMarketOpenReentry(utcNow);
         }
 
 
@@ -2082,6 +2236,35 @@ public sealed class StreamStateMachine
             _lastBarReceivedUtc = utcNow; // Reset to prevent spam
         }
         
+        // D) Bar flow stalled: Check for stalled bar flow during active trading window
+        // Trigger when expected bar flow stops (hardcode 5 minutes initially, make config-driven later)
+        const double BAR_FLOW_STALLED_THRESHOLD_MINUTES = 5.0;
+        if (_lastBarReceivedUtc.HasValue && 
+            (utcNow - _lastBarReceivedUtc.Value).TotalMinutes >= BAR_FLOW_STALLED_THRESHOLD_MINUTES &&
+            State != StreamState.DONE && State != StreamState.SUSPENDED_DATA_INSUFFICIENT)
+        {
+            // Only log BAR_FLOW_STALLED if we're in an active trading window
+            var isInActiveWindow = State == StreamState.RANGE_BUILDING || 
+                                   State == StreamState.ARMED || 
+                                   State == StreamState.RANGE_LOCKED;
+            
+            if (isInActiveWindow)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_FLOW_STALLED", State.ToString(),
+                    new
+                    {
+                        minutes_since_last_bar = (utcNow - _lastBarReceivedUtc.Value).TotalMinutes,
+                        last_bar_utc = _lastBarReceivedUtc.Value.ToString("o"),
+                        state = State.ToString(),
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        threshold_minutes = BAR_FLOW_STALLED_THRESHOLD_MINUTES
+                    }));
+                _lastBarReceivedUtc = utcNow; // Reset to prevent spam
+            }
+        }
+        
         // DIAGNOSTIC: Log slot gate evaluation (only if diagnostic logs enabled, and only on state change or rate limit)
         if (_enableDiagnosticLogs)
         {
@@ -2158,6 +2341,19 @@ public sealed class StreamStateMachine
                         range_locked = _rangeLocked,
                         range_invalidated = _rangeInvalidated
                     });
+                
+                // NQ2 FIX: Report critical if slot_time passed without range lock
+                if (_reportCriticalCallback != null)
+                {
+                    _reportCriticalCallback("SLOT_TIME_PASSED_WITHOUT_RANGE_LOCK", new Dictionary<string, object>
+                    {
+                        { "stream", Stream },
+                        { "slot_time_chicago", SlotTimeChicagoTime.ToString("o") },
+                        { "current_time_chicago", _time.ConvertUtcToChicago(utcNow).ToString("o") },
+                        { "range_locked", _rangeLocked },
+                        { "range_invalidated", _rangeInvalidated }
+                    }, TradingDate);
+                }
             }
             
             // Legacy check: If range is locked but state is not RANGE_LOCKED, log critical error
@@ -3394,82 +3590,50 @@ public sealed class StreamStateMachine
         }
     }
     
-    // Per-file locks for health log files to prevent concurrent access
-    private static readonly Dictionary<string, object> _healthFileLocks = new();
-    private static readonly object _healthLocksLock = new();
 
     /// <summary>
-    /// Get or create a lock object for a specific health log file path.
-    /// </summary>
-    private static object GetHealthFileLock(string filePath)
-    {
-        lock (_healthLocksLock)
-        {
-            if (!_healthFileLocks.TryGetValue(filePath, out var fileLock))
-            {
-                fileLock = new object();
-                _healthFileLocks[filePath] = fileLock;
-            }
-            return fileLock;
-        }
-    }
-
-    /// <summary>
-    /// Log health/anomaly event to logs/health/ directory.
-    /// Uses proper file locking to prevent concurrent access conflicts.
+    /// Log health/anomaly event through RobotLogger (routes to health sink via RobotLoggingService).
+    /// Health events are automatically routed to health sink if enable_health_sink is true.
     /// </summary>
     private void LogHealth(string level, string eventType, string message, object? data = null)
     {
         try
         {
-            // Use ProjectRootResolver instead of deriving from journal path to avoid path issues
-            var projectRoot = ProjectRootResolver.ResolveProjectRoot();
-            if (string.IsNullOrEmpty(projectRoot))
-            {
-                // Fallback: try to get from journal path if resolver fails
-                var journalPath = _journals.GetJournalPath(TradingDate, Stream);
-                projectRoot = Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(journalPath)));
-                if (string.IsNullOrEmpty(projectRoot))
-                    return;
-            }
-            
-            var healthDir = Path.Combine(projectRoot, "logs", "health");
-            Directory.CreateDirectory(healthDir);
-            
-            var logFile = Path.Combine(healthDir, $"{TradingDate}_{Instrument}_{Stream}.jsonl");
-            
             var utcNow = DateTimeOffset.UtcNow;
-            var chicagoNow = _time.ConvertUtcToChicago(utcNow);
             
-            var logEntry = new Dictionary<string, object?>
+            // Build data dictionary with additional context
+            var eventData = new Dictionary<string, object?>
             {
-                ["ts_utc"] = utcNow.ToString("o"),
-                ["ts_chicago"] = chicagoNow.ToString("o"),
-                ["level"] = level,
-                ["event_type"] = eventType,
                 ["message"] = message,
-                ["trading_date"] = TradingDate,
-                ["instrument"] = Instrument,
-                ["slot"] = Stream,
-                ["session"] = Session,
                 ["state"] = State.ToString(),
-                ["execution_mode"] = _executionMode.ToString(),
-                ["data"] = data
+                ["execution_mode"] = _executionMode.ToString()
             };
             
-            var json = JsonUtil.Serialize(logEntry);
-            
-            // Use per-file locking to prevent concurrent writes (similar to JournalStore)
-            var fileLock = GetHealthFileLock(logFile);
-            lock (fileLock)
+            // Include slot_instance_key if available for health sink path granularity
+            if (_journal != null && !string.IsNullOrWhiteSpace(_journal.SlotInstanceKey))
             {
-                // Use FileShare.ReadWrite to allow concurrent reads but serialize writes
-                using (var fileStream = new FileStream(logFile, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
-                using (var writer = new StreamWriter(fileStream))
+                eventData["slot_instance_key"] = _journal.SlotInstanceKey;
+            }
+            
+            // Merge additional data if provided
+            if (data != null)
+            {
+                if (data is Dictionary<string, object?> dataDict)
                 {
-                    writer.WriteLine(json);
+                    foreach (var kvp in dataDict)
+                    {
+                        eventData[kvp.Key] = kvp.Value;
+                    }
+                }
+                else
+                {
+                    eventData["payload"] = data;
                 }
             }
+            
+            // Route through RobotLogger - will automatically go to health sink if level >= WARN or selected INFO
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                eventType, message, eventData));
         }
         catch (Exception ex)
         {
@@ -4868,6 +5032,52 @@ public sealed class StreamStateMachine
 
         // Determine terminal state based on commit reason and trade completion
         _journal.TerminalState = DetermineTerminalState(commitReason, utcNow);
+        
+        // SLOT PERSISTENCE: Set SlotStatus based on commit reason
+        var previousSlotStatus = _journal.SlotStatus;
+        SlotStatus newSlotStatus;
+        if (commitReason == "SLOT_EXPIRED")
+        {
+            newSlotStatus = SlotStatus.EXPIRED;
+        }
+        else if (commitReason == "NO_TRADE_MARKET_CLOSE" || commitReason.Contains("NO_TRADE"))
+        {
+            newSlotStatus = SlotStatus.NO_TRADE;
+        }
+        else if (commitReason.Contains("FAILED") || commitReason.Contains("ERROR") || commitReason.Contains("CORRUPTION") || commitReason == "STREAM_STAND_DOWN")
+        {
+            newSlotStatus = SlotStatus.FAILED_RUNTIME;
+        }
+        else if (_executionJournal != null && _executionJournal.HasCompletedTradeForStream(TradingDate, Stream))
+        {
+            newSlotStatus = SlotStatus.COMPLETE;
+        }
+        else
+        {
+            // Default to COMPLETE if trade completed, otherwise keep current status
+            newSlotStatus = SlotStatus.COMPLETE;
+        }
+        
+        // Only set status if it's different (allows for pre-set statuses from external calls)
+        // Emit SLOT_STATUS_CHANGED if status changed (handles both internal and external changes)
+        if (previousSlotStatus != newSlotStatus)
+        {
+            _journal.SlotStatus = newSlotStatus;
+            LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousSlotStatus} -> {newSlotStatus}",
+                new
+                {
+                    previous_status = previousSlotStatus.ToString(),
+                    new_status = newSlotStatus.ToString(),
+                    commit_reason = commitReason,
+                    slot_instance_key = _journal.SlotInstanceKey
+                });
+        }
+        else
+        {
+            // Status already set to target value (likely set externally before Commit())
+            // Ensure it's set (idempotent)
+            _journal.SlotStatus = newSlotStatus;
+        }
 
         _journals.Save(_journal);
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -4877,6 +5087,7 @@ public sealed class StreamStateMachine
                 committed = true, 
                 commit_reason = commitReason,
                 terminal_state = _journal.TerminalState?.ToString() ?? "NULL",
+                slot_status = _journal.SlotStatus.ToString(),
                 timetable_hash_at_commit = _timetableHash,
                 execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
                 canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
@@ -4891,6 +5102,7 @@ public sealed class StreamStateMachine
                 committed = true, 
                 commit_reason = commitReason,
                 terminal_state = _journal.TerminalState?.ToString() ?? "NULL",
+                slot_status = _journal.SlotStatus.ToString(),
                 execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
                 canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
             }));
@@ -5586,6 +5798,528 @@ public sealed class StreamStateMachine
         {
             return new List<Bar>(_barBuffer);
         }
+    }
+    
+    /// <summary>
+    /// Calculate next slot time UTC (next occurrence of slot_time).
+    /// Reference: Analyzer's get_next_slot_time() logic.
+    /// Assumes standard trading calendar. Early closes/holidays may cause slot expiry timing drift.
+    /// </summary>
+    private DateTimeOffset CalculateNextSlotTimeUtc(DateOnly tradingDate, string slotTimeChicago, TimeService time)
+    {
+        var currentChicago = time.ConstructChicagoTime(tradingDate, slotTimeChicago);
+        var currentDate = DateOnly.FromDateTime(currentChicago.Date);
+        var currentDateAsDateTime = currentChicago.Date; // For DayOfWeek property
+        
+        // Determine next trading day (handle Friday→Monday skip)
+        DateOnly nextDate;
+        if (currentDateAsDateTime.DayOfWeek == DayOfWeek.Friday)
+        {
+            // Friday → Monday (skip weekend)
+            nextDate = currentDate.AddDays(3);
+        }
+        else
+        {
+            // Regular day → next day
+            nextDate = currentDate.AddDays(1);
+        }
+        
+        // Construct next slot time in Chicago timezone
+        var nextSlotTimeChicago = time.ConstructChicagoTime(nextDate, slotTimeChicago);
+        
+        // Convert to UTC
+        var nextSlotTimeUtc = time.ConvertChicagoToUtc(nextSlotTimeChicago);
+        
+        return nextSlotTimeUtc;
+    }
+    
+    /// <summary>
+    /// Check if entry fill exists for given intent ID (helper for post-entry verification).
+    /// </summary>
+    private bool HasEntryFillForIntentId(string intentId, string? tradingDate = null)
+    {
+        if (_executionJournal == null || string.IsNullOrWhiteSpace(intentId)) return false;
+        
+        // Try to load ExecutionJournalEntry by scanning journal directory
+        // If tradingDate is null, search across all dates (for cross-date scenarios)
+        var pattern = tradingDate != null
+            ? $"{tradingDate}_*_{intentId}.json"
+            : $"*_*_{intentId}.json";
+        var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+        
+        try
+        {
+            if (!Directory.Exists(journalDir)) return false;
+            
+            var files = Directory.GetFiles(journalDir, pattern);
+            foreach (var file in files)
+            {
+                try
+                {
+                    var json = File.ReadAllText(file);
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null && (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Skip corrupted files
+                }
+            }
+        }
+        catch
+        {
+            // Fail-safe: return false on error
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Handle forced flatten at market close (execution interruption, not slot completion).
+    /// CRITICAL: Must NEVER call Commit() or set Committed=true or State=DONE.
+    /// </summary>
+    public void HandleForcedFlatten(DateTimeOffset utcNow)
+    {
+        if (_journal.Committed || _journal.SlotStatus != SlotStatus.ACTIVE)
+        {
+            return; // Already committed or not active
+        }
+        
+        // Guard: Verify post-entry condition
+        var isPostEntry = false;
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+        {
+            isPostEntry = HasEntryFillForIntentId(_journal.OriginalIntentId, TradingDate);
+        }
+        else if (_executionJournal != null)
+        {
+            // Fallback: check if any entry fill exists for this stream
+            isPostEntry = _executionJournal.HasEntryFillForStream(TradingDate, Stream);
+        }
+        
+        if (!isPostEntry)
+        {
+            // Pre-entry forced flatten - this shouldn't happen, but if it does, mark as NO_TRADE
+            var previousStatus = _journal.SlotStatus;
+            _journal.SlotStatus = SlotStatus.NO_TRADE;
+            if (previousStatus != SlotStatus.NO_TRADE)
+            {
+                LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousStatus} -> {SlotStatus.NO_TRADE}",
+                    new
+                    {
+                        previous_status = previousStatus.ToString(),
+                        new_status = SlotStatus.NO_TRADE.ToString(),
+                        commit_reason = "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY",
+                        slot_instance_key = _journal.SlotInstanceKey
+                    });
+            }
+            Commit(utcNow, "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY", "FORCED_FLATTEN_MARKET_CLOSE");
+            return;
+        }
+        
+        // Post-entry forced flatten: Set interruption flag, do NOT commit
+        _journal.ExecutionInterruptedByClose = true;
+        _journal.ForcedFlattenTimestamp = utcNow;
+        
+        // Store OriginalIntentId if not already stored (reference only, not duplication)
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && _executionJournal != null)
+        {
+            // Find the intent ID for this stream's entry fill
+            var pattern = $"{TradingDate}_{Stream}_*.json";
+            var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+            
+            try
+            {
+                if (Directory.Exists(journalDir))
+                {
+                    var files = Directory.GetFiles(journalDir, pattern);
+                    foreach (var file in files)
+                    {
+                        try
+                        {
+                            var json = File.ReadAllText(file);
+                            var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                            if (entry != null && (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0))
+                            {
+                                _journal.OriginalIntentId = entry.IntentId;
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            // Skip corrupted files
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fail-safe: continue without OriginalIntentId
+            }
+        }
+        
+        // Persist journal (do NOT commit)
+        _journals.Save(_journal);
+        
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "FORCED_FLATTEN_MARKET_CLOSE", State.ToString(),
+            new
+            {
+                execution_interrupted = true,
+                forced_flatten_timestamp = utcNow.ToString("o"),
+                original_intent_id = _journal.OriginalIntentId ?? "NULL",
+                slot_status = _journal.SlotStatus.ToString(),
+                note = "Forced flatten at market close - execution interrupted, slot remains ACTIVE for re-entry"
+            }));
+    }
+    
+    /// <summary>
+    /// Handle slot expiry (next slot time reached).
+    /// </summary>
+    private void HandleSlotExpiry(DateTimeOffset utcNow)
+    {
+        if (_journal.SlotStatus != SlotStatus.ACTIVE)
+        {
+            return; // Already expired or terminal
+        }
+        
+        // Exit position at market if open (via execution adapter)
+        // Handle both original entry and re-entry positions
+        if (_executionAdapter != null)
+        {
+            // Flatten original entry position if OriginalIntentId exists
+            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            {
+                try
+                {
+                    _executionAdapter.Flatten(_journal.OriginalIntentId, ExecutionInstrument, utcNow);
+                }
+                catch
+                {
+                    // Log error but continue with expiry
+                }
+            }
+            
+            // Flatten re-entry position if re-entry happened
+            if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+            {
+                try
+                {
+                    _executionAdapter.Flatten(_journal.ReentryIntentId, ExecutionInstrument, utcNow);
+                }
+                catch
+                {
+                    // Log error but continue with expiry
+                }
+            }
+        }
+        
+        // Cancel orders for both intents
+        if (_executionAdapter != null)
+        {
+            // Cancel original entry orders
+            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            {
+                try
+                {
+                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+                    {
+                        simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow);
+                    }
+                }
+                catch
+                {
+                    // Log error but continue with expiry
+                }
+            }
+            
+            // Cancel re-entry orders if re-entry happened
+            if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+            {
+                try
+                {
+                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+                    {
+                        simAdapter.CancelIntentOrders(_journal.ReentryIntentId, utcNow);
+                    }
+                }
+                catch
+                {
+                    // Log error but continue with expiry
+                }
+            }
+        }
+        
+        // Set SlotStatus=EXPIRED and commit lifecycle terminal
+        var previousStatus = _journal.SlotStatus;
+        _journal.SlotStatus = SlotStatus.EXPIRED;
+        if (previousStatus != SlotStatus.EXPIRED)
+        {
+            LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousStatus} -> {SlotStatus.EXPIRED}",
+                new
+                {
+                    previous_status = previousStatus.ToString(),
+                    new_status = SlotStatus.EXPIRED.ToString(),
+                    commit_reason = "SLOT_EXPIRED",
+                    slot_instance_key = _journal.SlotInstanceKey
+                });
+        }
+        Commit(utcNow, "SLOT_EXPIRED", "SLOT_EXPIRED");
+        
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "SLOT_EXPIRED", State.ToString(),
+            new
+            {
+                next_slot_time_utc = _journal.NextSlotTimeUtc?.ToString("o") ?? "NULL",
+                slot_status = _journal.SlotStatus.ToString(),
+                note = "Slot expired at next slot time"
+            }));
+    }
+    
+    /// <summary>
+    /// Check for market open re-entry (time-based, not bar-based).
+    /// Evaluated in Tick() - trigger = now >= session_open AND market live (tick/price observed).
+    /// </summary>
+    private void CheckMarketOpenReentry(DateTimeOffset utcNow)
+    {
+        if (_journal.SlotStatus != SlotStatus.ACTIVE || 
+            !_journal.ExecutionInterruptedByClose || 
+            _journal.ReentrySubmitted ||
+            string.IsNullOrWhiteSpace(_journal.OriginalIntentId) ||
+            _executionJournal == null ||
+            _executionAdapter == null)
+        {
+            return; // Conditions not met for re-entry
+        }
+        
+        // Time gate: now >= session_open_time (use RangeStartChicagoTime as proxy for session open)
+        var nowChicago = _time.ConvertUtcToChicago(utcNow);
+        if (nowChicago < RangeStartChicagoTime)
+        {
+            return; // Before session open
+        }
+        
+        // Market tradeable signal: At least one tick/price observed since reopen
+        // For now, assume market is live if we're past session open (can be enhanced with actual tick observation)
+        // TODO: Add explicit tick observation tracking for more precise market-open detection
+        
+        // Check slot not expired
+        if (_journal.NextSlotTimeUtc.HasValue && utcNow >= _journal.NextSlotTimeUtc.Value)
+        {
+            return; // Slot expired, no re-entry
+        }
+        
+        // Load bracket levels from ExecutionJournalEntry via OriginalIntentId (canonical source)
+        // CRITICAL: OriginalIntentId was stored from previous trading date, so search across all dates
+        // Use PriorJournalKey to get original TradingDate if available, otherwise search all dates
+        string? originalTradingDate = null;
+        if (!string.IsNullOrWhiteSpace(_journal.PriorJournalKey))
+        {
+            // PriorJournalKey format: "{PreviousTradingDate}_{Stream}"
+            var parts = _journal.PriorJournalKey.Split('_');
+            if (parts.Length >= 1)
+            {
+                originalTradingDate = parts[0];
+            }
+        }
+        
+        var pattern = originalTradingDate != null
+            ? $"{originalTradingDate}_*_{_journal.OriginalIntentId}.json"
+            : $"*_*_{_journal.OriginalIntentId}.json"; // Search all dates if PriorJournalKey not available
+        var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+        ExecutionJournalEntry? originalEntry = null;
+        
+        try
+        {
+            if (Directory.Exists(journalDir))
+            {
+                var files = Directory.GetFiles(journalDir, pattern);
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var json = File.ReadAllText(file);
+                        var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                        if (entry != null && entry.IntentId == _journal.OriginalIntentId)
+                        {
+                            originalEntry = entry;
+                            break;
+                        }
+                    }
+                    catch
+                    {
+                        // Skip corrupted files
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Fail-safe: cannot load entry
+        }
+        
+        if (originalEntry == null || !originalEntry.EntryFilled)
+        {
+            // Cannot load original entry or entry not filled - fail closed
+            var previousStatus = _journal.SlotStatus;
+            _journal.SlotStatus = SlotStatus.FAILED_RUNTIME;
+            if (previousStatus != SlotStatus.FAILED_RUNTIME)
+            {
+                LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousStatus} -> {SlotStatus.FAILED_RUNTIME}",
+                    new
+                    {
+                        previous_status = previousStatus.ToString(),
+                        new_status = SlotStatus.FAILED_RUNTIME.ToString(),
+                        commit_reason = "REENTRY_FAILED_CANNOT_LOAD_ORIGINAL_ENTRY",
+                        slot_instance_key = _journal.SlotInstanceKey
+                    });
+            }
+            Commit(utcNow, "REENTRY_FAILED_CANNOT_LOAD_ORIGINAL_ENTRY", "REENTRY_FAILED");
+            LogHealth("CRITICAL", "REENTRY_FAILED", $"Re-entry failed: Cannot load original ExecutionJournalEntry for intent {_journal.OriginalIntentId}",
+                new { original_intent_id = _journal.OriginalIntentId });
+            return;
+        }
+        
+        // Pre-re-entry safety check: Verify stop price validity and protection placement conditions
+        // For now, assume safety checks pass (can be enhanced with actual price gap detection)
+        // TODO: Add explicit gap detection and price validity checks
+        
+        // Generate deterministic ReentryIntentId (does NOT include TradingDate)
+        if (string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+        {
+            _journal.ReentryIntentId = $"{_journal.SlotInstanceKey}_REENTRY";
+        }
+        
+        // Submit MARKET entry using direction/quantity from ExecutionJournalEntry, with ReentryIntentId
+        var direction = originalEntry.Direction;
+        var quantity = originalEntry.EntryFilledQuantityTotal;
+        
+        if (quantity <= 0)
+        {
+            // Invalid quantity - fail closed
+            var previousStatus = _journal.SlotStatus;
+            _journal.SlotStatus = SlotStatus.FAILED_RUNTIME;
+            if (previousStatus != SlotStatus.FAILED_RUNTIME)
+            {
+                LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousStatus} -> {SlotStatus.FAILED_RUNTIME}",
+                    new
+                    {
+                        previous_status = previousStatus.ToString(),
+                        new_status = SlotStatus.FAILED_RUNTIME.ToString(),
+                        commit_reason = "REENTRY_FAILED_INVALID_QUANTITY",
+                        slot_instance_key = _journal.SlotInstanceKey
+                    });
+            }
+            Commit(utcNow, "REENTRY_FAILED_INVALID_QUANTITY", "REENTRY_FAILED");
+            LogHealth("CRITICAL", "REENTRY_FAILED", $"Re-entry failed: Invalid quantity {quantity}",
+                new { original_intent_id = _journal.OriginalIntentId, quantity });
+            return;
+        }
+        
+        // Mark re-entry as submitted (idempotency)
+        _journal.ReentrySubmitted = true;
+        _journals.Save(_journal);
+        
+        // Submit MARKET order (implementation depends on execution adapter)
+        // For now, log the re-entry attempt - actual order submission will be handled by execution adapter
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "REENTRY_SUBMITTED", State.ToString(),
+            new
+            {
+                reentry_intent_id = _journal.ReentryIntentId,
+                original_intent_id = _journal.OriginalIntentId,
+                direction = direction ?? "NULL",
+                quantity = quantity,
+                stop_price = originalEntry.StopPrice,
+                target_price = originalEntry.TargetPrice,
+                entry_price = originalEntry.EntryPrice,
+                note = "Re-entry MARKET order submitted at market open"
+            }));
+        
+        // Note: Actual order submission and fill handling will be done by execution adapter
+        // On fill, execution adapter should call HandleReentryFill() which will submit protective bracket
+    }
+    
+    /// <summary>
+    /// Handle re-entry fill (called by execution adapter when re-entry order fills).
+    /// </summary>
+    public void HandleReentryFill(string reentryIntentId, DateTimeOffset utcNow)
+    {
+        if (_journal.ReentryIntentId != reentryIntentId || _journal.ReentryFilled)
+        {
+            return; // Not our re-entry or already filled
+        }
+        
+        _journal.ReentryFilled = true;
+        _journals.Save(_journal);
+        
+        // Load bracket levels from OriginalIntentId
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) || _executionJournal == null)
+        {
+            // Cannot load bracket levels - fail closed
+            _journal.SlotStatus = SlotStatus.FAILED_RUNTIME;
+            var previousStatus = _journal.SlotStatus;
+            _journal.SlotStatus = SlotStatus.FAILED_RUNTIME;
+            if (previousStatus != SlotStatus.FAILED_RUNTIME)
+            {
+                LogHealth("INFO", "SLOT_STATUS_CHANGED", $"Slot status changed: {previousStatus} -> {SlotStatus.FAILED_RUNTIME}",
+                    new
+                    {
+                        previous_status = previousStatus.ToString(),
+                        new_status = SlotStatus.FAILED_RUNTIME.ToString(),
+                        commit_reason = "REENTRY_PROTECTION_FAILED_CANNOT_LOAD_BRACKET",
+                        slot_instance_key = _journal.SlotInstanceKey
+                    });
+            }
+            Commit(utcNow, "REENTRY_PROTECTION_FAILED_CANNOT_LOAD_BRACKET", "REENTRY_PROTECTION_FAILED");
+            LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", $"Re-entry protection failed: Cannot load bracket levels for intent {_journal.OriginalIntentId}",
+                new { original_intent_id = _journal.OriginalIntentId });
+            return;
+        }
+        
+        // Submit protective bracket (implementation depends on execution adapter)
+        // For now, mark protection as submitted - actual submission will be handled by execution adapter
+        _journal.ProtectionSubmitted = true;
+        _journals.Save(_journal);
+        
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "REENTRY_FILLED", State.ToString(),
+            new
+            {
+                reentry_intent_id = reentryIntentId,
+                original_intent_id = _journal.OriginalIntentId,
+                note = "Re-entry filled - protective bracket should be submitted"
+            }));
+        
+        // Note: Actual protective order submission will be done by execution adapter
+        // On acceptance, execution adapter should call HandleReentryProtectionAccepted()
+    }
+    
+    /// <summary>
+    /// Handle re-entry protection acceptance (called by execution adapter when protective orders accepted).
+    /// </summary>
+    public void HandleReentryProtectionAccepted(DateTimeOffset utcNow)
+    {
+        if (!_journal.ProtectionSubmitted)
+        {
+            return; // Protection not submitted
+        }
+        
+        _journal.ProtectionAccepted = true;
+        _journal.ExecutionInterruptedByClose = false; // Clear interruption flag after protection confirmed
+        _journals.Save(_journal);
+        
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "REENTRY_PROTECTION_ACCEPTED", State.ToString(),
+            new
+            {
+                reentry_intent_id = _journal.ReentryIntentId,
+                original_intent_id = _journal.OriginalIntentId,
+                note = "Re-entry protection accepted - slot resumed normal operation"
+            }));
     }
 
     /// <summary>

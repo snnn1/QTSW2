@@ -55,6 +55,27 @@ public sealed class LoggingConfig
     /// Set to 0 to disable automatic cleanup.
     /// </summary>
     public int archive_cleanup_days { get; set; } = 30;
+    
+    /// <summary>
+    /// Enable diagnostics logging (default: false).
+    /// When false, DEBUG events are dropped immediately.
+    /// ERROR and CRITICAL events always bypass this flag.
+    /// </summary>
+    public bool diagnostics_enabled { get; set; } = false;
+    
+    /// <summary>
+    /// Event rate limits: max occurrences per minute per event type.
+    /// Example: { "BAR_ACCEPTED": 60, "SLOT_GATE_DIAGNOSTIC": 1 }
+    /// Rate limits apply ONLY to DEBUG and INFO levels.
+    /// ERROR and CRITICAL events always bypass rate limits.
+    /// </summary>
+    public Dictionary<string, int>? event_rate_limits { get; set; }
+    
+    /// <summary>
+    /// Enable health sink (default: true).
+    /// When enabled, events >= WARN + selected INFO events are written to logs/health/ directory.
+    /// </summary>
+    public bool enable_health_sink { get; set; } = true;
 
     public static LoggingConfig LoadFromFile(string projectRoot)
     {

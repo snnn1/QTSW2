@@ -84,7 +84,9 @@ public sealed class HealthMonitor
     private static readonly HashSet<string> ALLOWED_CRITICAL_EVENT_TYPES = new(StringComparer.OrdinalIgnoreCase)
     {
         "EXECUTION_GATE_INVARIANT_VIOLATION",
-        "DISCONNECT_FAIL_CLOSED_ENTERED"
+        "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "SLOT_FAILED_RUNTIME",
+        "REENTRY_PROTECTION_FAILED"
     };
     
     // Background evaluation thread for data loss detection
@@ -116,6 +118,21 @@ public sealed class HealthMonitor
         if (config.pushover_enabled && !string.IsNullOrWhiteSpace(config.pushover_user_key) && !string.IsNullOrWhiteSpace(config.pushover_app_token))
         {
             _notificationService = NotificationService.GetOrCreate(projectRoot, config);
+            
+            // Set failure callback to emit ERROR events for notification failures
+            _notificationService.SetFailureCallback((notificationKey, errorMessage, exception) =>
+            {
+                var utcNow = DateTimeOffset.UtcNow;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "NOTIFICATION_SEND_FAILED", state: "ENGINE",
+                    new
+                    {
+                        notification_key = notificationKey,
+                        error_message = errorMessage,
+                        exception_type = exception?.GetType().Name,
+                        exception_message = exception?.Message,
+                        note = "Pushover notification send failed - check notification_errors.log for details"
+                    }));
+            });
         }
     }
 
@@ -291,7 +308,11 @@ public sealed class HealthMonitor
                                         note = "Connection loss notification sent regardless of stream state (critical infrastructure issue)"
                                     }));
                                 
-                                SendNotification("CONNECTION_LOST", title, message, priority: 2, skipPerKeyRateLimit: true); // Emergency priority, respects per-event-type limiter
+                                // NOTE: CONNECTION_LOST notifications intentionally bypass the emergency rate limiter.
+                                // Each sustained disconnect is treated as a distinct operational incident and must notify immediately.
+                                // Deduplication is handled per incident ID (via _sharedConnectionLostNotifiedByIncident) to prevent
+                                // duplicate notifications when multiple strategy instances detect the same disconnect.
+                                SendNotification("CONNECTION_LOST", title, message, priority: 2, skipPerKeyRateLimit: true); // Intentional: incident-based notification, bypasses rate limiter
                             }
                         }
                     }
@@ -919,6 +940,15 @@ public sealed class HealthMonitor
     /// Get notification service for external use (e.g., engine startup alerts).
     /// </summary>
     public NotificationService? GetNotificationService() => _notificationService;
+    
+    /// <summary>
+    /// Get notification service metrics (queue depth, success/failure counts, watchdog restarts).
+    /// Returns null if notification service is not available.
+    /// </summary>
+    public NotificationService.NotificationMetrics? GetNotificationMetrics()
+    {
+        return _notificationService?.GetMetrics();
+    }
     
     /// <summary>
     /// Send a test notification to verify Pushover is working.

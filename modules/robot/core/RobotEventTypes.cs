@@ -122,7 +122,7 @@ public static class RobotEventTypes
         ["STREAM_SKIPPED"] = "INFO",
         
         // Bars
-        ["BAR_ACCEPTED"] = "INFO",
+        ["BAR_ACCEPTED"] = "DEBUG",
         ["BAR_DATE_MISMATCH"] = "WARN",
         ["BAR_PARTIAL_REJECTED"] = "WARN",
         ["BAR_RECEIVED_BEFORE_DATE_LOCKED"] = "WARN",
@@ -136,6 +136,7 @@ public static class RobotEventTypes
         ["BAR_TIME_INTERPRETATION_MISMATCH"] = "WARN",
         ["BAR_TIME_INTERPRETATION_LOCKED"] = "INFO",
         ["BAR_TIME_DETECTION_STARTING"] = "DEBUG",
+        ["BAR_FLOW_STALLED"] = "WARN",
         
         // BarsRequest
         ["BARSREQUEST_REQUESTED"] = "INFO",
@@ -194,6 +195,10 @@ public static class RobotEventTypes
         ["EXECUTION_SUMMARY_WRITTEN"] = "INFO",
         ["EXECUTION_GATE_INVARIANT_VIOLATION"] = "ERROR",
         ["BREAKOUT_DETECTED_ALREADY_ENTERED"] = "WARN",
+        ["TRADE_COMPLETED"] = "INFO",
+        ["ENTRY_BLOCKED_RISK"] = "WARN",
+        ["RISK_CHECK_EVALUATED"] = "DEBUG",
+        ["POSITION_FLATTEN_FAIL_CLOSED"] = "ERROR",
         
         // Orders
         ["ORDER_SUBMITTED"] = "INFO",
@@ -267,11 +272,22 @@ public static class RobotEventTypes
         ["TEST_NOTIFICATION_TRIGGER_ERROR"] = "ERROR",
         
         // Journal
-        ["JOURNAL_WRITTEN"] = "INFO",
+        ["JOURNAL_WRITTEN"] = "DEBUG",
         ["EXECUTION_JOURNAL_ERROR"] = "ERROR",
         ["EXECUTION_JOURNAL_READ_ERROR"] = "ERROR",
         ["EXECUTION_JOURNAL_CORRUPTION"] = "ERROR",
         ["EXECUTION_SLIPPAGE_DETECTED"] = "INFO",
+        
+        // Slot persistence
+        ["FORCED_FLATTEN_MARKET_CLOSE"] = "WARN",
+        ["REENTRY_SUBMITTED"] = "INFO",
+        ["REENTRY_FILLED"] = "INFO",
+        ["REENTRY_PROTECTION_ACCEPTED"] = "INFO",
+        ["REENTRY_FAILED"] = "ERROR",
+        ["REENTRY_PROTECTION_FAILED"] = "ERROR",
+        ["SLOT_EXPIRED"] = "INFO",
+        ["SLOT_STATUS_CHANGED"] = "INFO",
+        ["SLOT_FAILED_RUNTIME"] = "ERROR",
         
         // Intent exposure coordinator
         ["INTENT_EXPOSURE_REGISTERED"] = "INFO",
@@ -299,6 +315,9 @@ public static class RobotEventTypes
         ["LOG_CONVERSION_ERROR"] = "ERROR",
         ["LOGGER_CONVERSION_ERROR"] = "ERROR",
         ["LOGGING_INVARIANT_VIOLATION"] = "ERROR",
+        
+        // Notification failures
+        ["NOTIFICATION_SEND_FAILED"] = "ERROR",
         
         // Account snapshots
         ["ACCOUNT_SNAPSHOT_DRYRUN"] = "DEBUG",
@@ -379,6 +398,7 @@ public static class RobotEventTypes
         "BAR_REJECTION_RATE_HIGH", "BAR_REJECTION_SUMMARY", "BAR_DELIVERY_SUMMARY",
         "BAR_DELIVERY_TO_STREAM", "BAR_TIME_INTERPRETATION_MISMATCH",
         "BAR_TIME_INTERPRETATION_LOCKED", "BAR_TIME_DETECTION_STARTING",
+        "BAR_FLOW_STALLED",
         
         // BarsRequest
         "BARSREQUEST_REQUESTED", "BARSREQUEST_EXECUTED", "BARSREQUEST_FAILED",
@@ -409,7 +429,8 @@ public static class RobotEventTypes
         "EXECUTION_MODE_SET", "EXECUTION_BLOCKED", "EXECUTION_ERROR", "EXECUTION_FILLED",
         "EXECUTION_PARTIAL_FILL", "EXECUTION_SKIPPED_DUPLICATE", "EXECUTION_UPDATE_UNKNOWN_ORDER",
         "EXECUTION_UPDATE_MOCK", "EXECUTION_SUMMARY_WRITTEN", "EXECUTION_GATE_INVARIANT_VIOLATION",
-        "BREAKOUT_DETECTED_ALREADY_ENTERED",
+        "BREAKOUT_DETECTED_ALREADY_ENTERED", "TRADE_COMPLETED",
+        "ENTRY_BLOCKED_RISK", "RISK_CHECK_EVALUATED", "POSITION_FLATTEN_FAIL_CLOSED",
         
         // Orders
         "ORDER_SUBMITTED", "ORDER_SUBMIT_SUCCESS", "ORDER_SUBMIT_FAIL", "ORDER_SUBMIT_ATTEMPT",
@@ -449,6 +470,11 @@ public static class RobotEventTypes
         // Journal
         "JOURNAL_WRITTEN", "EXECUTION_JOURNAL_ERROR", "EXECUTION_JOURNAL_READ_ERROR", "EXECUTION_JOURNAL_CORRUPTION", "EXECUTION_SLIPPAGE_DETECTED",
         
+        // Slot persistence
+        "FORCED_FLATTEN_MARKET_CLOSE", "REENTRY_SUBMITTED", "REENTRY_FILLED",
+        "REENTRY_PROTECTION_ACCEPTED", "REENTRY_FAILED", "REENTRY_PROTECTION_FAILED",
+        "SLOT_EXPIRED", "SLOT_STATUS_CHANGED", "SLOT_FAILED_RUNTIME",
+        
         // Intent exposure coordinator
         "INTENT_EXPOSURE_REGISTERED", "INTENT_EXPOSURE_CLOSED", "INTENT_EXIT_FILL", "INTENT_EXIT_FILL_NO_EXPOSURE",
         "INTENT_EXIT_VALIDATION_FAILED", "INTENT_PROTECTIVE_FAILURE", "INTENT_PROTECTIVE_FAILURE_FALLBACK",
@@ -460,6 +486,9 @@ public static class RobotEventTypes
         "LOG_BACKPRESSURE_DROP", "LOG_WORKER_LOOP_ERROR", "LOG_WRITE_FAILURE",
         "LOG_HEALTH_ERROR", "LOG_CONVERSION_ERROR", "LOGGER_CONVERSION_ERROR",
         "LOGGING_INVARIANT_VIOLATION",
+        
+        // Notification failures
+        "NOTIFICATION_SEND_FAILED",
         
         // Account snapshots
         "ACCOUNT_SNAPSHOT_DRYRUN", "ACCOUNT_SNAPSHOT_ERROR", "ACCOUNT_SNAPSHOT_LIVE_ERROR",

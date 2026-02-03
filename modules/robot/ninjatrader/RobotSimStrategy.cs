@@ -336,6 +336,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
                     
+                    // NQ2 FIX: Enhanced logging for BarsRequest initiation
+                    Log($"BARSREQUEST_INIT: Attempting to request bars. Execution instruments count: {executionInstruments.Count}", LogLevel.Information);
+                    
+                    if (_engine != null)
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BARSREQUEST_INIT", new Dictionary<string, object>
+                        {
+                            { "execution_instruments_count", executionInstruments.Count },
+                            { "execution_instruments", executionInstruments },
+                            { "note", "BarsRequest initiation - checking for enabled streams" }
+                        });
+                    }
+                    
                     // CRITICAL: Mark ALL instruments as pending BEFORE queuing BarsRequest
                     // This ensures streams wait even if they process ticks before BarsRequest completes
                     // This prevents race condition where stream checks IsBarsRequestPending before it's marked
@@ -369,6 +382,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "reason", "No execution instruments found" },
                             { "note", "Skipping BarsRequest - no enabled streams. Engine will continue without pre-hydration bars." }
                         });
+                        
+                        // NQ2 FIX: Report critical if BarsRequest is skipped
+                        var healthMonitor = _engine?.GetHealthMonitor();
+                        if (healthMonitor != null)
+                        {
+                            healthMonitor.ReportCritical("BARSREQUEST_SKIPPED_NO_INSTRUMENTS", new Dictionary<string, object>
+                            {
+                                { "reason", "No execution instruments found" },
+                                { "note", "BarsRequest was skipped - streams may not have historical bars" }
+                            });
+                        }
                     }
                     else
                     {
@@ -398,6 +422,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         { "reason", "Streams not ready" },
                                         { "note", "Skipping BarsRequest - no enabled streams for this instrument." }
                                     });
+                                    
+                                    // NQ2 FIX: Report critical if BarsRequest is skipped due to streams not ready
+                                    var healthMonitor = _engine?.GetHealthMonitor();
+                                    if (healthMonitor != null)
+                                    {
+                                        healthMonitor.ReportCritical("BARSREQUEST_SKIPPED_STREAMS_NOT_READY", new Dictionary<string, object>
+                                        {
+                                            { "instrument", executionInstrument },
+                                            { "reason", "Streams not ready" },
+                                            { "note", "BarsRequest skipped - streams may not receive historical bars" }
+                                        });
+                                    }
+                                    
                                     continue;
                                 }
                                 

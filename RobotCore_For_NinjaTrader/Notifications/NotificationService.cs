@@ -30,6 +30,14 @@ public sealed class NotificationService : IDisposable
     private int _workerRestartCount = 0;
     private readonly object _livenessLock = new();
     
+    // Metrics tracking
+    private long _notificationsSentSuccessfully = 0;
+    private long _notificationsFailed = 0;
+    private readonly object _metricsLock = new();
+    
+    // Optional callback for failure events (allows external ERROR event logging)
+    private Action<string, string, Exception?>? _onFailureCallback;
+    
     // Configuration constants
     private const int MAX_QUEUE_SIZE = 1000;
     private const int WORKER_SLEEP_MS = 100;
@@ -66,6 +74,47 @@ public sealed class NotificationService : IDisposable
             
             return instance;
         }
+    }
+    
+    /// <summary>
+    /// Set callback for notification failures (allows external ERROR event logging).
+    /// Callback signature: (notificationKey, errorMessage, exception)
+    /// </summary>
+    public void SetFailureCallback(Action<string, string, Exception?>? callback)
+    {
+        _onFailureCallback = callback;
+    }
+    
+    /// <summary>
+    /// Get notification service metrics.
+    /// </summary>
+    public NotificationMetrics GetMetrics()
+    {
+        lock (_metricsLock)
+        {
+            return new NotificationMetrics
+            {
+                QueueDepth = _queue.Count,
+                NotificationsSentSuccessfully = _notificationsSentSuccessfully,
+                NotificationsFailed = _notificationsFailed,
+                WorkerRestartCount = _workerRestartCount,
+                WorkerStartedAt = _workerStartedAt,
+                LastDequeuedAt = _lastDequeuedAt != DateTimeOffset.MinValue ? _lastDequeuedAt : (DateTimeOffset?)null
+            };
+        }
+    }
+    
+    /// <summary>
+    /// Notification service metrics.
+    /// </summary>
+    public class NotificationMetrics
+    {
+        public int QueueDepth { get; set; }
+        public long NotificationsSentSuccessfully { get; set; }
+        public long NotificationsFailed { get; set; }
+        public int WorkerRestartCount { get; set; }
+        public DateTimeOffset WorkerStartedAt { get; set; }
+        public DateTimeOffset? LastDequeuedAt { get; set; }
     }
     
     /// <summary>
@@ -229,8 +278,11 @@ public sealed class NotificationService : IDisposable
                         // Create new cancellation token source
                         _cancellationTokenSource = new CancellationTokenSource();
                         
-                        // Increment restart count
+                    // Increment restart count (metrics)
+                    lock (_livenessLock)
+                    {
                         _workerRestartCount++;
+                    }
                         
                         // Reset timestamps
                         _workerStartedAt = DateTimeOffset.UtcNow;
@@ -432,6 +484,12 @@ public sealed class NotificationService : IDisposable
                         
                         if (result.Success)
                         {
+                            // Update metrics
+                            lock (_metricsLock)
+                            {
+                                _notificationsSentSuccessfully++;
+                            }
+                            
                             // Log success (INFO level)
                             WriteNotificationLog("INFO", 
                                 $"Pushover notification sent successfully: " +
@@ -443,7 +501,13 @@ public sealed class NotificationService : IDisposable
                         }
                         else
                         {
-                            // Log failure (ERROR level) with full diagnostic details
+                            // Update metrics
+                            lock (_metricsLock)
+                            {
+                                _notificationsFailed++;
+                            }
+                            
+                            // Build error message
                             var errorParts = new System.Text.StringBuilder();
                             errorParts.Append($"Pushover notification failed: ");
                             errorParts.Append($"Key={request.Key}, ");
@@ -462,12 +526,23 @@ public sealed class NotificationService : IDisposable
                                 errorParts.Append($", ResponseBody={sanitizedBody}");
                             }
                             
-                            if (result.Exception != null)
-                            {
-                                errorParts.Append($", Exception={FormatExceptionChain(result.Exception)}");
-                            }
+                            var errorMessage = errorParts.ToString();
                             
-                            WriteNotificationLog("ERROR", errorParts.ToString());
+                            // Log failure (ERROR level) with full diagnostic details
+                            WriteNotificationLog("ERROR", errorMessage);
+                            
+                            // Invoke failure callback for ERROR event emission (if set)
+                            if (_onFailureCallback != null)
+                            {
+                                try
+                                {
+                                    _onFailureCallback(request.Key, errorMessage, result.Exception);
+                                }
+                                catch
+                                {
+                                    // Don't let callback failures crash the worker
+                                }
+                            }
                         }
                         
                         // Continue processing queue regardless of success/failure

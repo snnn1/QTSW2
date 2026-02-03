@@ -10,28 +10,7 @@ public static class NinjaTraderExtensions
 {
     /// <summary>
     /// Convert NinjaTrader ConnectionStatus to HealthMonitor ConnectionStatus.
-    /// Uses strongly-typed NinjaTrader.Cbi.ConnectionStatus (no reflection needed).
     /// </summary>
-    /// <param name="ntStatus">NinjaTrader connection status</param>
-    /// <returns>Internal ConnectionStatus enum</returns>
-    public static ConnectionStatus ToHealthMonitorStatus(this NinjaTrader.Cbi.ConnectionStatus ntStatus)
-    {
-        // Map NinjaTrader connection status to internal enum
-        // Default branch maps unknown to ConnectionError (safe fallback)
-        return ntStatus switch
-        {
-            NinjaTrader.Cbi.ConnectionStatus.Connected => ConnectionStatus.Connected,
-            NinjaTrader.Cbi.ConnectionStatus.ConnectionLost => ConnectionStatus.ConnectionLost,
-            NinjaTrader.Cbi.ConnectionStatus.Disconnected => ConnectionStatus.Disconnected,
-            _ => ConnectionStatus.ConnectionError // Default: unknown status → ConnectionError
-        };
-    }
-    
-    /// <summary>
-    /// Convert NinjaTrader ConnectionStatus to HealthMonitor ConnectionStatus (backward compatibility overload).
-    /// Uses reflection for object parameter (for backward compatibility with old code).
-    /// </summary>
-    [Obsolete("Use strongly-typed overload: ToHealthMonitorStatus(NinjaTrader.Cbi.ConnectionStatus)")]
     public static ConnectionStatus ToHealthMonitorStatus(this object ntConnectionStatus)
     {
         // Use reflection to access NinjaTrader.Cbi.ConnectionStatus enum values

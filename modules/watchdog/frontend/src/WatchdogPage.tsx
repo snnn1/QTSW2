@@ -110,15 +110,15 @@ export function WatchdogPage() {
       // This handles the case where streams are in PRE_HYDRATION but bars are arriving
       if (status.worst_last_bar_age_seconds !== null && status.worst_last_bar_age_seconds !== undefined) {
         // Bars are being received - show FLOWING if recent (< 2 minutes), otherwise show based on threshold
-        // Use DATA_STALL_THRESHOLD (90s) as the threshold for showing STALLED vs FLOWING
-        const DATA_STALL_THRESHOLD = 90 // Match backend threshold
+        // Use DATA_STALL_THRESHOLD (120s) as the threshold for showing STALLED vs FLOWING
+        const DATA_STALL_THRESHOLD = 120 // Match backend threshold (increased from 90s to prevent flickering)
         if (status.worst_last_bar_age_seconds < DATA_STALL_THRESHOLD) {
           return 'FLOWING'
-        } else if (status.worst_last_bar_age_seconds < 120) {
-          // Between 90-120 seconds: still recent enough to show FLOWING
+        } else if (status.worst_last_bar_age_seconds < 150) {
+          // Between 120-150 seconds: add small buffer to prevent flickering
           return 'FLOWING'
         } else {
-          // Over 2 minutes: show as stalled if market is open
+          // Over 2.5 minutes: show as stalled if market is open
           return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
         }
       }

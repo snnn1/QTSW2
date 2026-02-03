@@ -44,6 +44,37 @@ public enum StreamTerminalState
     ZERO_BAR_HYDRATION
 }
 
+/// <summary>
+/// Slot lifecycle status - tracks slot state independent of execution state.
+/// </summary>
+public enum SlotStatus
+{
+    /// <summary>
+    /// Slot is logically active (pre or post-entry).
+    /// </summary>
+    ACTIVE,
+    
+    /// <summary>
+    /// Slot completed (stop/target hit).
+    /// </summary>
+    COMPLETE,
+    
+    /// <summary>
+    /// Slot expired (next slot time reached).
+    /// </summary>
+    EXPIRED,
+    
+    /// <summary>
+    /// No entry by market close (pre-entry only).
+    /// </summary>
+    NO_TRADE,
+    
+    /// <summary>
+    /// Runtime failure (protection rejection, re-entry failure, etc.).
+    /// </summary>
+    FAILED_RUNTIME
+}
+
 public sealed class JournalStore
 {
     private readonly string _journalDir;
@@ -146,7 +177,7 @@ public sealed class StreamJournal
 
     public bool Committed { get; set; }
 
-    public string? CommitReason { get; set; } // ENTRY_FILLED | NO_TRADE_MARKET_CLOSE | FORCED_FLATTEN
+    public string? CommitReason { get; set; } // ENTRY_FILLED | NO_TRADE_MARKET_CLOSE | FORCED_FLATTEN | SLOT_EXPIRED
 
     /// <summary>
     /// Formal terminal state classification.
@@ -165,5 +196,60 @@ public sealed class StreamJournal
     
     // RESTART RECOVERY: Persist entry detection state (backup to execution journal)
     public bool EntryDetected { get; set; } = false;
+    
+    // SLOT PERSISTENCE: Slot lifecycle identity and status
+    /// <summary>
+    /// Stable across date rollover; defines lifecycle identity.
+    /// Format: "{Stream}_{SlotTimeChicago}_{StartTradingDate}"
+    /// Set once at slot start, NEVER overwritten.
+    /// </summary>
+    public string? SlotInstanceKey { get; set; }
+    
+    /// <summary>
+    /// Slot lifecycle status - tracks slot state independent of execution state.
+    /// </summary>
+    public SlotStatus SlotStatus { get; set; } = SlotStatus.ACTIVE;
+    
+    /// <summary>
+    /// True if forced flattened at market close (execution interruption, not slot completion).
+    /// </summary>
+    public bool ExecutionInterruptedByClose { get; set; }
+    
+    /// <summary>
+    /// When forced flatten occurred (optional).
+    /// </summary>
+    public DateTimeOffset? ForcedFlattenTimestamp { get; set; }
+    
+    /// <summary>
+    /// Reference to locate canonical ExecutionJournalEntry (contains bracket levels).
+    /// Used ONLY to read bracket levels, NOT for re-entry order submission.
+    /// </summary>
+    public string? OriginalIntentId { get; set; }
+    
+    /// <summary>
+    /// Deterministic, stable across restart.
+    /// Derive from: "{SlotInstanceKey}_REENTRY" or hash-based derivation.
+    /// Does NOT include TradingDate.
+    /// Used for re-entry order submission idempotency (distinct from OriginalIntentId).
+    /// </summary>
+    public string? ReentryIntentId { get; set; }
+    
+    // Re-entry idempotency markers
+    public bool ReentrySubmitted { get; set; }
+    public bool ReentryFilled { get; set; }
+    public bool ProtectionSubmitted { get; set; }
+    public bool ProtectionAccepted { get; set; }
+    
+    /// <summary>
+    /// Next occurrence of slot_time for expiry (optional, can be recomputed deterministically from SlotInstanceKey).
+    /// </summary>
+    public DateTimeOffset? NextSlotTimeUtc { get; set; }
+    
+    /// <summary>
+    /// Reference to previous day's journal for carry-forward mechanism.
+    /// Format: "{PreviousTradingDate}_{Stream}"
+    /// Used when cloning-forward post-entry active slots across date rollover.
+    /// </summary>
+    public string? PriorJournalKey { get; set; }
 }
 

@@ -2181,8 +2181,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         if (_spec is null || _time is null || !_activeTradingDate.HasValue)
         {
+            // CRITICAL FIX: Enhanced diagnostic logging
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAMS_CREATION_SKIPPED", state: "ENGINE",
-                new { reason = "Missing spec, time, or trading date" }));
+                new
+                {
+                    reason = "MISSING_REQUIREMENTS",
+                    spec_is_null = _spec is null,
+                    time_is_null = _time is null,
+                    trading_date_has_value = _activeTradingDate.HasValue,
+                    trading_date = _activeTradingDate.HasValue ? _activeTradingDate.Value.ToString("yyyy-MM-dd") : null,
+                    note = "Cannot create streams - missing spec, time service, or trading date"
+                }));
             return;
         }
 
@@ -2195,8 +2204,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Validate timetable structure
         if (_lastTimetable == null)
         {
+            // CRITICAL FIX: Enhanced diagnostic logging
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "STREAMS_CREATION_FAILED", state: "ENGINE",
-                new { reason = "No timetable loaded" }));
+                new
+                {
+                    reason = "NO_TIMETABLE_LOADED",
+                    trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                    timetable_path = _timetablePath,
+                    last_timetable_hash = _lastTimetableHash,
+                    note = "Cannot create streams - timetable not loaded. Check if ReloadTimetableIfChanged() completed successfully."
+                }));
             return;
         }
 
@@ -2686,12 +2703,41 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         // Store timetable for later application
         _lastTimetable = timetable;
-
-        // If trading date is already locked and streams exist, apply timetable changes immediately
-        // This handles timetable updates after initial stream creation
-        if (_activeTradingDate.HasValue && _streams.Count > 0)
+        
+        // CRITICAL FIX: If trading date is locked but streams don't exist yet, create them now
+        // This ensures streams are created immediately after timetable is loaded and trading date is locked
+        if (_activeTradingDate.HasValue && _streams.Count == 0)
         {
+            // CRITICAL FIX: Log before calling to ensure we can trace execution
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAMS_CREATION_ATTEMPT", state: "ENGINE",
+                new
+                {
+                    trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                    streams_count = _streams.Count,
+                    spec_is_null = _spec is null,
+                    time_is_null = _time is null,
+                    last_timetable_is_null = _lastTimetable is null,
+                    note = "Attempting to create streams after timetable loaded"
+                }));
+            EnsureStreamsCreated(utcNow);
+        }
+        else if (_activeTradingDate.HasValue && _streams.Count > 0)
+        {
+            // If trading date is already locked and streams exist, apply timetable changes immediately
+            // This handles timetable updates after initial stream creation
             ApplyTimetable(timetable, utcNow);
+        }
+        else
+        {
+            // CRITICAL FIX: Log why stream creation is not being attempted
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAMS_CREATION_NOT_ATTEMPTED", state: "ENGINE",
+                new
+                {
+                    trading_date_has_value = _activeTradingDate.HasValue,
+                    trading_date = _activeTradingDate.HasValue ? _activeTradingDate.Value.ToString("yyyy-MM-dd") : null,
+                    streams_count = _streams.Count,
+                    note = "Stream creation not attempted - check conditions"
+                }));
         }
         // Otherwise, timetable will be applied when EnsureStreamsCreated() is called after trading date is locked
         
@@ -2859,12 +2905,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // This check happens FIRST before any processing to avoid unnecessary work
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
-                // Use MasterInstrument.Name directly for explicit canonical matching (as per authoritative rule)
+                // Use MasterInstrument.Name for explicit canonical matching (as per authoritative rule)
+                // CRITICAL FIX: Must canonicalize MasterInstrument.Name (e.g., M2K -> NQ, MGC -> GC) before comparison
                 string? ntCanonical = null;
                 if (!string.IsNullOrWhiteSpace(_masterInstrumentName))
                 {
-                    // Explicit: Use MasterInstrument.Name directly (e.g., "GC" for "MGC 03-26")
-                    ntCanonical = _masterInstrumentName.ToUpperInvariant();
+                    // Explicit: Canonicalize MasterInstrument.Name (e.g., "M2K" -> "NQ", "MGC" -> "GC")
+                    ntCanonical = GetCanonicalInstrument(_masterInstrumentName.ToUpperInvariant());
                 }
                 else
                 {

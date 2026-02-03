@@ -92,6 +92,13 @@ class WatchdogStateManager:
         self._execution_policy_failures: List['ExecutionPolicyFailureInfo'] = []
         self._max_execution_policy_failures = 10  # Keep last 10 failures
         
+        # Status smoothing/debouncing to prevent flickering
+        # Track last N status computations to smooth out temporary threshold violations
+        self._engine_status_history: List[tuple] = []  # List of (timestamp, status) tuples
+        self._data_status_history: List[tuple] = []   # List of (timestamp, status) tuples
+        self._status_history_size = 3  # Keep last 3 status computations (15 seconds at 5s polling)
+        self._status_change_threshold = 2  # Require 2 consecutive polls with same status before changing
+        
     def update_engine_tick(self, timestamp_utc: datetime):
         """
         Update engine tick timestamp from ENGINE_TICK_CALLSITE event.
@@ -331,6 +338,22 @@ class WatchdogStateManager:
             execution_instrument_full_name: Full contract name (e.g., "MES 03-26", "M2K 03-26")
             timestamp_utc: Bar timestamp in UTC
         """
+        # CRITICAL FIX: Clean up old root-name entries that don't match current format
+        # Old entries like "M2K" should be removed when we receive "M2K 03-26"
+        root_name = execution_instrument_full_name.split()[0] if execution_instrument_full_name else execution_instrument_full_name
+        if root_name and root_name != execution_instrument_full_name:
+            # If we're updating a full contract name, remove any old root-name entry
+            if root_name in self._last_bar_utc_by_execution_instrument:
+                old_entry = self._last_bar_utc_by_execution_instrument[root_name]
+                # Only remove if it's significantly older (more than 10 minutes)
+                # This prevents removing valid entries during transition
+                age_seconds = (timestamp_utc - old_entry).total_seconds() if old_entry else 0
+                if abs(age_seconds) > 600:  # 10 minutes difference
+                    logger.debug(
+                        f"Cleaning up old root-name entry: {root_name} (replaced by {execution_instrument_full_name})"
+                    )
+                    del self._last_bar_utc_by_execution_instrument[root_name]
+        
         # Track by execution instrument full name (authoritative)
         prev_timestamp = self._last_bar_utc_by_execution_instrument.get(execution_instrument_full_name)
         self._last_bar_utc_by_execution_instrument[execution_instrument_full_name] = timestamp_utc
@@ -352,7 +375,6 @@ class WatchdogStateManager:
         
         # Also update old dict for backward compatibility (will be removed later)
         # Extract root name for old dict (e.g., "MES 03-26" -> "MES")
-        root_name = execution_instrument_full_name.split()[0] if execution_instrument_full_name else execution_instrument_full_name
         self._last_bar_utc_by_instrument[root_name] = timestamp_utc
     
     def mark_data_loss(self, execution_instrument_full_name: str, timestamp_utc: datetime):
@@ -711,8 +733,33 @@ class WatchdogStateManager:
             execution_instrument = getattr(info, 'execution_instrument', None)
             if execution_instrument:
                 all_execution_instruments.add(execution_instrument)
-        # Check bars_expected for each execution instrument
-        for execution_instrument_full_name in all_execution_instruments:
+        
+        # CRITICAL FIX: Filter out root-name entries (e.g., "M2K") that don't have contract suffix
+        # These are old entries from before the contract name format change
+        # Only keep entries that look like full contract names (contain space and date)
+        filtered_instruments = set()
+        for inst in all_execution_instruments:
+            # Full contract names have format like "MES 03-26" (space + date)
+            # Root names are just "MES" (no space)
+            if ' ' in inst and len(inst.split()) >= 2:
+                # Looks like full contract name - keep it
+                filtered_instruments.add(inst)
+            elif inst not in self._last_bar_utc_by_execution_instrument:
+                # Root name but not in tracking dict - skip it
+                continue
+            else:
+                # Root name in tracking dict - check if it's old (more than 10 minutes)
+                last_bar = self._last_bar_utc_by_execution_instrument.get(inst)
+                if last_bar:
+                    age = (now - last_bar).total_seconds()
+                    if age > 600:  # More than 10 minutes old - likely stale
+                        logger.debug(f"Filtering out old root-name entry: {inst} (age: {age:.1f}s)")
+                        continue
+                # Recent root-name entry - keep it (might be valid during transition)
+                filtered_instruments.add(inst)
+        
+        # Check bars_expected for each execution instrument (using filtered set)
+        for execution_instrument_full_name in filtered_instruments:
             if self.bars_expected(execution_instrument_full_name, market_open):
                 instruments_with_bars_expected.append(execution_instrument_full_name)
         
@@ -836,11 +883,38 @@ class WatchdogStateManager:
                 # BUT only if:
                 # 1. They've received bars recently (within RECENT_ACTIVITY_THRESHOLD)
                 # 2. They have enabled streams on the timetable (or timetable unavailable)
+                # CRITICAL FIX: Filter out old root-name entries (e.g., "M2K" without contract suffix)
+                # These are stale entries from before the contract name format change
                 for execution_instrument_full_name, last_bar_utc in self._last_bar_utc_by_execution_instrument.items():
+                    # Skip root-name entries that don't have contract suffix (old format)
+                    # Full contract names have format like "MES 03-26" (space + date)
+                    if ' ' not in execution_instrument_full_name or len(execution_instrument_full_name.split()) < 2:
+                        # Root name without contract - check if it's old and should be ignored
+                        bar_age = (now - last_bar_utc).total_seconds() if last_bar_utc else 0
+                        if bar_age > 600:  # More than 10 minutes old - likely stale, skip it
+                            logger.debug(
+                                f"Skipping old root-name entry in stall detection: {execution_instrument_full_name} "
+                                f"(age: {bar_age:.1f}s)"
+                            )
+                            continue
+                        # Recent root-name entry - might be valid during transition, but prefer full contract names
+                        # Check if there's a corresponding full contract name entry
+                        root_name = execution_instrument_full_name
+                        has_full_contract_entry = any(
+                            inst.startswith(root_name + ' ') 
+                            for inst in self._last_bar_utc_by_execution_instrument.keys()
+                        )
+                        if has_full_contract_entry:
+                            # Full contract name exists - skip root name entry
+                            logger.debug(
+                                f"Skipping root-name entry in favor of full contract name: {execution_instrument_full_name}"
+                            )
+                            continue
+                    
                     if execution_instrument_full_name not in data_stall_detected and last_bar_utc:
                         bar_age = (now - last_bar_utc).total_seconds()
                         # Only flag as stalled if:
-                        # 1. Bar age exceeds stall threshold (> 90s)
+                        # 1. Bar age exceeds stall threshold (> 120s)
                         # 2. Instrument was active recently (< 1 hour ago)
                         # 3. Instrument has enabled streams (check if any stream for this instrument is enabled)
                         if bar_age > DATA_STALL_THRESHOLD_SECONDS and bar_age < RECENT_ACTIVITY_THRESHOLD_SECONDS:
@@ -912,9 +986,97 @@ class WatchdogStateManager:
                     self._recovery_state = "CONNECTED_OK"
                     self._recovery_started_utc = None
         
+        # CRITICAL FIX: Auto-clear DISCONNECT_FAIL_CLOSED state if engine is alive and receiving ticks
+        # This handles the case where disconnect happened but engine recovered without sending recovery events
+        # If engine is receiving ticks consistently, connection has been restored
+        if recovery_state == "DISCONNECT_FAIL_CLOSED" and engine_alive:
+            # Engine is alive (receiving ticks within threshold) - connection is restored
+            # Auto-clear fail-closed state since engine is operational
+            logger.info(
+                f"RECOVERY_STATE_AUTO_CLEAR: Engine is alive and receiving ticks "
+                f"(tick_age={(now - self._last_engine_tick_utc).total_seconds():.1f}s < {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s). "
+                f"Auto-clearing DISCONNECT_FAIL_CLOSED state to CONNECTED_OK."
+            )
+            recovery_state = "CONNECTED_OK"
+            self._recovery_state = "CONNECTED_OK"
+            self._recovery_started_utc = None
+        
+        # CRITICAL FIX: Auto-clear ConnectionLost status if engine is alive and receiving ticks
+        # This handles the case where connection was lost but recovered without sending CONNECTION_RECOVERED event
+        # If engine is receiving ticks consistently, connection has been restored
+        if self._connection_status == "ConnectionLost" and engine_alive:
+            # Engine is alive (receiving ticks within threshold) - connection is restored
+            # Check if connection event is old enough to warrant auto-clear (prevent immediate re-trigger)
+            MIN_STABLE_CONNECTION_SECONDS = 60  # 1 minute - allow brief recovery period
+            should_auto_clear = False
+            
+            if self._last_connection_event_utc:
+                connection_event_age = (now - self._last_connection_event_utc).total_seconds()
+                if connection_event_age > MIN_STABLE_CONNECTION_SECONDS:
+                    should_auto_clear = True
+            else:
+                # No connection event timestamp - auto-clear if engine is alive
+                should_auto_clear = True
+            
+            if should_auto_clear:
+                logger.info(
+                    f"CONNECTION_STATUS_AUTO_CLEAR: Engine is alive and receiving ticks "
+                    f"(tick_age={(now - self._last_engine_tick_utc).total_seconds():.1f}s < {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s). "
+                    f"Auto-clearing ConnectionLost status to Connected."
+                )
+                self._connection_status = "Connected"
+                # Update last connection event time to prevent immediate re-trigger
+                self._last_connection_event_utc = now
+        
+        # Apply smoothing to data stall detection
+        # Compute data status: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE'
+        data_status = "FLOWING"
+        if data_stall_detected:
+            critical_stall = any(d.get('stall_detected', False) and d.get('market_open', False) 
+                                for d in data_stall_detected.values())
+            if critical_stall:
+                data_status = "STALLED"
+            elif any(d.get('stall_detected', False) for d in data_stall_detected.values()):
+                data_status = "ACCEPTABLE_SILENCE"  # Market closed or acceptable pause
+        
+        # Apply smoothing/debouncing to data status
+        self._data_status_history.append((now, data_status))
+        if len(self._data_status_history) > self._status_history_size:
+            self._data_status_history.pop(0)
+        
+        # Check if status has been consistent for threshold polls
+        if len(self._data_status_history) >= self._status_change_threshold:
+            recent_states = [state for _, state in self._data_status_history[-self._status_change_threshold:]]
+            if len(set(recent_states)) == 1:
+                # Status has been consistent - use it
+                smoothed_data_status = recent_states[0]
+            else:
+                # Status is inconsistent - use most recent but keep previous if available
+                if len(self._data_status_history) > self._status_change_threshold:
+                    prev_stable = self._data_status_history[-self._status_change_threshold - 1][1]
+                    smoothed_data_status = prev_stable
+                else:
+                    smoothed_data_status = data_status
+        else:
+            smoothed_data_status = data_status
+        
+        # Filter data_stall_detected based on smoothed status
+        # Only suppress stalls if smoothed status indicates they're temporary flickering
+        smoothed_data_stall_detected = data_stall_detected
+        if smoothed_data_status == "FLOWING" and data_status == "STALLED":
+            # Temporary stall detected but smoothed status is FLOWING - likely flickering
+            # Only suppress if this is a single-poll violation (not persistent)
+            if len(self._data_status_history) >= 2:
+                # Check if previous status was also FLOWING (indicates temporary violation)
+                prev_status = self._data_status_history[-2][1]
+                if prev_status == "FLOWING":
+                    # Previous was FLOWING, current is STALLED, smoothed is FLOWING = flickering
+                    smoothed_data_stall_detected = {}
+                # If previous was STALLED, this might be real - keep stalls
+        
         return {
             "engine_alive": engine_alive,
-            "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values
+            "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values (smoothed)
             "last_engine_tick_chicago": (
                 self._last_engine_tick_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_engine_tick_utc else None
@@ -930,7 +1092,7 @@ class WatchdogStateManager:
             "stuck_streams": stuck_streams,
             "execution_blocked_count": len(self._execution_blocked_events),
             "protective_failures_count": len(self._protective_failure_events),
-            "data_stall_detected": data_stall_detected,
+            "data_stall_detected": smoothed_data_stall_detected,  # Smoothed to prevent flickering
             "market_open": market_open,  # Always included, even if error occurred
             # PATTERN 1: Bars expected observability
             "bars_expected_count": bars_expected_count,

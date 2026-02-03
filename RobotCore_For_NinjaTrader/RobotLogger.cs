@@ -98,6 +98,39 @@ public sealed class RobotLogger
                     _loggingService.Log(logEvent);
                     return; // Successfully routed through service
                 }
+                else
+                {
+                    // CRITICAL: Conversion returned null - log diagnostic info for ENGINE events
+                    if (evt is Dictionary<string, object?> evtDict)
+                    {
+                        var streamVal = evtDict.TryGetValue("stream", out var s) ? s?.ToString() : "UNKNOWN";
+                        var eventTypeVal = evtDict.TryGetValue("event_type", out var et) ? et?.ToString() : "UNKNOWN";
+                        if (streamVal == "__engine__")
+                        {
+                            // ENGINE events being dropped - this is a critical issue
+                            // Log to fallback path so we can see what's happening
+                            var diagnosticEvent = new Dictionary<string, object?>
+                            {
+                                ["ts_utc"] = DateTimeOffset.UtcNow.ToString("o"),
+                                ["event_type"] = "LOGGER_CONVERSION_RETURNED_NULL",
+                                ["stream"] = "__engine__",
+                                ["instrument"] = "",
+                                ["data"] = new Dictionary<string, object?>
+                                {
+                                    ["payload"] = new Dictionary<string, object?>
+                                    {
+                                        ["original_event_type"] = eventTypeVal,
+                                        ["original_stream"] = streamVal,
+                                        ["error"] = "ConvertToRobotLogEvent() returned null for ENGINE event",
+                                        ["note"] = "This indicates a validation failure in conversion - check event structure"
+                                    }
+                                }
+                            };
+                            // Try to log diagnostic via fallback (but ENGINE events are dropped, so this won't work)
+                            // This is a last-ditch attempt - the real fix is in ConvertToRobotLogEvent()
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {

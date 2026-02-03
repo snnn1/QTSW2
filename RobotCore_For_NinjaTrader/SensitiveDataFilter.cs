@@ -135,7 +135,6 @@ public static class SensitiveDataFilter
     /// </summary>
     private static bool IsSensitiveKey(string key)
     {
-        if (string.IsNullOrEmpty(key)) return false;
         var lower = key.ToLowerInvariant();
         return lower.Contains("password") ||
                lower.Contains("pwd") ||
