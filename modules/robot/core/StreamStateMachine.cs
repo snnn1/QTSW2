@@ -5566,11 +5566,41 @@ public sealed class StreamStateMachine
 
     private void ComputeAndLogProtectiveOrders(DateTimeOffset utcNow)
     {
-        if (_intendedDirection == null || !_intendedEntryPrice.HasValue || !RangeHigh.HasValue || !RangeLow.HasValue)
+        if (_intendedDirection == null || !_intendedEntryPrice.HasValue)
             return;
 
         var direction = _intendedDirection;
         var entryPrice = _intendedEntryPrice.Value;
+        
+        // CRITICAL FIX: BE trigger can be computed without range (only needs entry price and base target)
+        // Always compute BE trigger even if range isn't available
+        var beTriggerPts = _baseTarget * 0.65m; // 65% of target
+        var beTriggerPrice = direction == "Long" ? entryPrice + beTriggerPts : entryPrice - beTriggerPts;
+        var beStopPrice = direction == "Long" ? entryPrice - _tickSize : entryPrice + _tickSize;
+        
+        // Store BE trigger immediately (required for break-even detection)
+        _intendedBeTrigger = beTriggerPrice;
+
+        // Stop and target require range - only compute if range is available
+        if (!RangeHigh.HasValue || !RangeLow.HasValue)
+        {
+            // Range not available - log warning but still set BE trigger (critical for break-even detection)
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "PROTECTIVE_ORDERS_PARTIAL_COMPUTE", State.ToString(),
+                new
+                {
+                    direction = direction,
+                    entry_price = entryPrice,
+                    be_trigger_price = beTriggerPrice,
+                    be_stop_price = beStopPrice,
+                    range_high_available = RangeHigh.HasValue,
+                    range_low_available = RangeLow.HasValue,
+                    warning = "Range not available - BE trigger computed but stop/target prices not set",
+                    note = "BE trigger is set for break-even detection. Stop and target will be computed when range is available or from lock snapshot."
+                }));
+            return; // Exit early - stop/target can't be computed without range
+        }
+
         var rangeSize = RangeHigh.Value - RangeLow.Value;
 
         // Compute target
@@ -5581,15 +5611,9 @@ public sealed class StreamStateMachine
         var slPoints = Math.Min(rangeSize, maxSlPoints);
         var stopPrice = direction == "Long" ? entryPrice - slPoints : entryPrice + slPoints;
 
-        // Compute BE trigger
-        var beTriggerPts = _baseTarget * 0.65m; // 65% of target
-        var beTriggerPrice = direction == "Long" ? entryPrice + beTriggerPts : entryPrice - beTriggerPts;
-        var beStopPrice = direction == "Long" ? entryPrice - _tickSize : entryPrice + _tickSize;
-
         // Store computed values for execution
         _intendedStopPrice = stopPrice;
         _intendedTargetPrice = targetPrice;
-        _intendedBeTrigger = beTriggerPrice;
 
         // Log protective orders (always log for DRYRUN parity)
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,

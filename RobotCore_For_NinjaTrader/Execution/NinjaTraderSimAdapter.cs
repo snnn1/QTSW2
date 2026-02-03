@@ -717,10 +717,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 entry_price = intent.EntryPrice,
                 stop_price = intent.StopPrice,
                 target_price = intent.TargetPrice,
+                be_trigger = intent.BeTrigger,  // CRITICAL: Log BE trigger to verify it's set
                 has_direction = intent.Direction != null,
                 has_stop_price = intent.StopPrice != null,
                 has_target_price = intent.TargetPrice != null,
-                note = "Intent registered - required for protective order placement on fill"
+                has_be_trigger = intent.BeTrigger != null,  // CRITICAL: Log whether BE trigger is set
+                note = "Intent registered - required for protective order placement on fill. BE trigger must be set for break-even detection."
             }));
     }
     
@@ -1366,9 +1368,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// Get active intents that need break-even monitoring.
     /// Returns intents with filled entries that haven't had BE triggered yet.
     /// </summary>
-    public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, string direction)> GetActiveIntentsForBEMonitoring()
+    public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring()
     {
-        var activeIntents = new List<(string, Intent, decimal, decimal, string)>();
+        var activeIntents = new List<(string, Intent, decimal, decimal, decimal?, string)>();
         
         foreach (var kvp in _orderMap)
         {
@@ -1392,7 +1394,25 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             if (_executionJournal.IsBEModified(intentId, intent.TradingDate ?? "", intent.Stream ?? ""))
                 continue;
             
-            activeIntents.Add((intentId, intent, intent.BeTrigger.Value, intent.EntryPrice.Value, intent.Direction));
+            // Get actual fill price from execution journal for logging/debugging purposes
+            // NOTE: BE stop uses breakout level (entryPrice), not actual fill price
+            // The breakout level is the strategic entry point, slippage shouldn't affect BE stop placement
+            decimal? actualFillPrice = null;
+            try
+            {
+                var journalEntry = _executionJournal.GetEntry(intentId, intent.TradingDate ?? "", intent.Stream ?? "");
+                if (journalEntry != null && journalEntry.FillPrice.HasValue)
+                {
+                    actualFillPrice = journalEntry.FillPrice.Value;
+                }
+            }
+            catch
+            {
+                // If journal lookup fails, continue without fill price (not critical for BE stop calculation)
+            }
+            
+            // entryPrice is the breakout level (brkLong/brkShort for stop orders, limit price for limit orders)
+            activeIntents.Add((intentId, intent, intent.BeTrigger.Value, intent.EntryPrice.Value, actualFillPrice, intent.Direction));
         }
         
         return activeIntents;

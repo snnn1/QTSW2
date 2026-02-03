@@ -3679,6 +3679,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Check if broker is synchronized (connection stable and quiet window passed).
     /// Accepts bar updates OR order/execution updates as proof of connection health.
+    /// 
+    /// FIX: Bar updates are frequent during active trading/historical loading, so they don't
+    /// require a quiet window. Only order/execution updates require a quiet window to ensure
+    /// the broker has finished sending all updates. This prevents the sync gate from being
+    /// blocked indefinitely when bars are coming in frequently.
     /// </summary>
     private bool IsBrokerSynchronized(DateTimeOffset utcNow)
     {
@@ -3694,41 +3699,47 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return false;
         }
         
-        // Accept bar updates OR order/execution updates as proof of connection health
-        // Bar updates indicate the data feed is working, which is sufficient for SIM mode
-        // or when there are no open positions/orders
+        // Check for bar updates after reconnect (proves connection is alive)
         var hasBarUpdateAfterReconnect = _lastTickUtc != DateTimeOffset.MinValue && _lastTickUtc >= _reconnectUtc.Value;
+        
+        // Check for order/execution updates after reconnect
         var hasOrderUpdateAfterReconnect = _lastOrderUpdateUtc.HasValue && _lastOrderUpdateUtc.Value >= _reconnectUtc.Value;
         var hasExecutionUpdateAfterReconnect = _lastExecutionUpdateUtc.HasValue && _lastExecutionUpdateUtc.Value >= _reconnectUtc.Value;
         
+        // Need at least one type of update to prove connection health
         if (!hasBarUpdateAfterReconnect && !hasOrderUpdateAfterReconnect && !hasExecutionUpdateAfterReconnect)
         {
             return false;
         }
         
-        // Require quiet window: at least 5 seconds since last update
-        // Use the most recent update (bar, order, or execution) for quiet window calculation
-        var lastUpdateUtc = DateTimeOffset.MinValue;
-        if (hasBarUpdateAfterReconnect && _lastTickUtc > lastUpdateUtc)
+        // If we have order/execution updates, require quiet window (broker may still be sending updates)
+        // Bar updates alone don't require quiet window since they're expected to be frequent
+        if (hasOrderUpdateAfterReconnect || hasExecutionUpdateAfterReconnect)
         {
-            lastUpdateUtc = _lastTickUtc;
-        }
-        if (_lastOrderUpdateUtc.HasValue && _lastOrderUpdateUtc.Value > lastUpdateUtc)
-        {
-            lastUpdateUtc = _lastOrderUpdateUtc.Value;
-        }
-        if (_lastExecutionUpdateUtc.HasValue && _lastExecutionUpdateUtc.Value > lastUpdateUtc)
-        {
-            lastUpdateUtc = _lastExecutionUpdateUtc.Value;
+            // Use the most recent order/execution update for quiet window calculation
+            var lastOrderExecutionUpdateUtc = DateTimeOffset.MinValue;
+            if (_lastOrderUpdateUtc.HasValue && _lastOrderUpdateUtc.Value > lastOrderExecutionUpdateUtc)
+            {
+                lastOrderExecutionUpdateUtc = _lastOrderUpdateUtc.Value;
+            }
+            if (_lastExecutionUpdateUtc.HasValue && _lastExecutionUpdateUtc.Value > lastOrderExecutionUpdateUtc)
+            {
+                lastOrderExecutionUpdateUtc = _lastExecutionUpdateUtc.Value;
+            }
+            
+            if (lastOrderExecutionUpdateUtc == DateTimeOffset.MinValue)
+            {
+                return false;
+            }
+            
+            // Require quiet window: at least 5 seconds since last order/execution update
+            var quietWindowSeconds = (utcNow - lastOrderExecutionUpdateUtc).TotalSeconds;
+            return quietWindowSeconds >= 5.0;
         }
         
-        if (lastUpdateUtc == DateTimeOffset.MinValue)
-        {
-            return false;
-        }
-        
-        var quietWindowSeconds = (utcNow - lastUpdateUtc).TotalSeconds;
-        return quietWindowSeconds >= 5.0;
+        // If we only have bar updates (no order/execution updates), bar updates alone are sufficient
+        // No quiet window required - bars are expected to be frequent during active trading
+        return hasBarUpdateAfterReconnect;
     }
     
     /// <summary>

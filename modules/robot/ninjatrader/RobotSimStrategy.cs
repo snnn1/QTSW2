@@ -1485,7 +1485,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Get active intents that need BE monitoring
                 var activeIntents = _adapter.GetActiveIntentsForBEMonitoring();
                 
-                foreach (var (intentId, intent, beTriggerPrice, entryPrice, direction) in activeIntents)
+                foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
                 {
                 // Check if BE trigger has been reached using tick price
                 bool beTriggerReached = false;
@@ -1503,7 +1503,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 if (beTriggerReached)
                 {
-                    // Calculate break-even stop price (entry ± 1 tick)
+                    // CRITICAL FIX: Use breakout level (entryPrice) for BE stop, not actual fill price
+                    // "1 tick before breakout point" means 1 tick before the breakout level (entryPrice)
+                    // The breakout level is the strategic entry point, slippage shouldn't affect BE stop placement
+                    // For stop-market orders: entryPrice = breakout level (brkLong/brkShort)
+                    // For limit orders: entryPrice = limit price
+                    decimal breakoutLevel = entryPrice;
+                    
+                    // Calculate break-even stop price (breakout level ± 1 tick)
                     // CRITICAL FIX: Use strategy's instrument tick size directly - don't call Instrument.GetInstrument()
                     // Instrument.GetInstrument() can block/hang if instrument doesn't exist (e.g., M2K)
                     // Strategy's Instrument is already loaded and available - use it as source of truth
@@ -1521,9 +1528,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // Use default fallback if tick size access fails
                     }
                     
+                    // CRITICAL FIX: BE stop should be 1 tick before breakout point (breakout level, not fill price)
+                    // For long: breakoutLevel - tickSize (1 tick below breakout level)
+                    // For short: breakoutLevel + tickSize (1 tick above breakout level)
                     decimal beStopPrice = direction == "Long" 
-                        ? entryPrice - tickSize  // 1 tick below entry for long
-                        : entryPrice + tickSize; // 1 tick above entry for short
+                        ? breakoutLevel - tickSize  // 1 tick below breakout level for long
+                        : breakoutLevel + tickSize; // 1 tick above breakout level for short
                     
                     // Modify stop order to break-even
                     // CRITICAL FIX: Add retry awareness for race condition (stop order may not be in account.Orders yet)
@@ -1540,13 +1550,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "instrument", intent.Instrument ?? "" },
                                 { "stream", intent.Stream ?? "" },
                                 { "direction", direction },
-                                { "entry_price", entryPrice },
+                                { "breakout_level", breakoutLevel },
+                                { "actual_fill_price", actualFillPrice },
                                 { "be_trigger_price", beTriggerPrice },
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
                                 { "tick_price", tickPrice },
                                 { "detection_method", "TICK_BASED" },
-                                { "note", "Break-even trigger reached (tick-based detection) - stop order modified to break-even" }
+                                { "note", "Break-even trigger reached (tick-based detection) - stop order modified to break-even using breakout level (1 tick before breakout point)" }
                             });
                         }
                     }
@@ -1567,6 +1578,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "instrument", intent.Instrument ?? "" },
                                 { "stream", intent.Stream ?? "" },
                                 { "direction", direction },
+                                { "breakout_level", breakoutLevel },
+                                { "actual_fill_price", actualFillPrice },
                                 { "be_trigger_price", beTriggerPrice },
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },

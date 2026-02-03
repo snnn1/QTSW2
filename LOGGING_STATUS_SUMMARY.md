@@ -1,61 +1,111 @@
-# Logging Status Summary - January 29, 2026
+# Logging Status Summary
 
-## Critical Issue: Restart Recovery Not Working
+## Logging Fixes Implemented Today
 
-### Problem
-**Restart recovery is failing** - streams are re-locking ranges instead of restoring them from logs.
+### 1. BE Trigger Logging in INTENT_REGISTERED Events ✅
 
-### Evidence
-1. **No restoration logs found**: No `RANGE_LOCKED_RESTORED_FROM_HYDRATION` or `RANGE_LOCKED_RESTORED_FROM_RANGES` events
-2. **Duplicate RANGE_LOCKED events**: Each restart creates new events instead of restoring
-   - GC2: 2 events (16:31:06, 16:44:31)
-   - RTY2: 2 events (16:31:06, 16:44:31)
-   - NG2: 2 events (16:31:08, 16:44:34)
-3. **Full lifecycle executed**: Streams go through PRE_HYDRATION → ARMED → RANGE_BUILDING → RANGE_LOCKED instead of restoring directly
+**Location**: `modules/robot/core/Execution/NinjaTraderSimAdapter.cs` (RegisterIntent method)
 
-### Root Cause Analysis
+**Added Fields**:
+- `be_trigger`: The BE trigger price value from the intent
+- `has_be_trigger`: Boolean indicating whether BE trigger is set (not null)
 
-**Timing Issue:**
-- Restoration is called in constructor at 16:31:02
-- At that time, hydration log might not have events from BEFORE restart
-- Ranges log DOES have events (from 15:30, 15:44), but restoration might not be finding them
+**Purpose**: 
+- Verify that BE triggers are being set correctly when intents are registered
+- Diagnose why BE detection might not be working (if `has_be_trigger: false`)
 
-**Possible Causes:**
-1. `RestoreRangeLockedFromHydrationLog()` not finding events (deserialization failing?)
-2. Restoration happening but then normal flow continues anyway
-3. Events exist but restoration logic has a bug
+**Code**:
+```csharp
+_log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, intent.Instrument, "INTENT_REGISTERED",
+    new
+    {
+        // ... existing fields ...
+        be_trigger = intent.BeTrigger,
+        has_be_trigger = intent.BeTrigger != null,
+        note = "Intent registered - required for protective order placement on fill. BE trigger must be set for break-even detection."
+    }));
+```
 
-### What's Working
+### 2. Enhanced BE Trigger Event Logging ✅
 
-✅ **Range lock implementation**: New code prevents duplicates going forward (once locked, stays locked)
-✅ **No critical errors**: No RANGE_LOCK_TRANSITION_FAILED, DUPLICATE_RANGE_LOCKED errors
-✅ **Breakout computation**: All events have `breakout_levels_missing: false`
-✅ **Idempotency**: RangeLockedEventPersister prevents duplicate writes (but restoration bypasses this)
+**Location**: `modules/robot/ninjatrader/RobotSimStrategy.cs` (CheckBreakEvenTriggersTickBased)
 
-### What's Broken
+**Added Fields to BE_TRIGGER_REACHED**:
+- `breakout_level`: The breakout level (entryPrice) used for BE stop calculation
+- `actual_fill_price`: The actual fill price from journal (for diagnostics)
 
-❌ **Restart recovery**: Not restoring from logs
-❌ **Duplicate prevention on restart**: Creating new locks instead of restoring
-❌ **Efficiency**: Unnecessary range recomputation on restart
+**Purpose**:
+- Verify BE stop is calculated correctly using breakout level
+- Compare breakout level vs actual fill price to understand slippage
 
-### Next Steps
+**Code**:
+```csharp
+_log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, instrument, "BE_TRIGGER_REACHED",
+    new
+    {
+        // ... existing fields ...
+        breakout_level = entryPrice,
+        actual_fill_price = actualFillPrice,
+        be_stop_price = beStopPrice,
+        // ...
+    }));
+```
 
-1. **Add diagnostic logging** to `RestoreRangeLockedFromHydrationLog()`:
-   - Log when method is called
-   - Log if files exist
-   - Log how many events found
-   - Log if restoration succeeded or failed
+### 3. GetActiveIntentsForBEMonitoring Enhancement ✅
 
-2. **Check deserialization**: Verify HydrationEvent and RangeLockedEvent deserialize correctly
+**Location**: `modules/robot/core/Execution/NinjaTraderSimAdapter.cs`
 
-3. **Add guard**: Prevent normal flow from continuing if `_rangeLocked == true` after restoration
+**Change**: Return signature now includes `actualFillPrice` for logging/diagnostics
 
-4. **Test restoration**: Manually verify restoration works with existing log files
+**Purpose**: Allows BE detection logic to log both breakout level and actual fill price
 
-## Summary
+### 4. ExecutionJournal.GetEntry Method ✅
 
-**Status**: ⚠️ **Restart recovery is broken** - needs immediate fix
+**Location**: `modules/robot/core/Execution/ExecutionJournal.cs`
 
-**Impact**: Medium - ranges are being recomputed unnecessarily, but values appear correct
+**Added**: Public method to retrieve journal entries for BE monitoring
 
-**Priority**: High - should be fixed before next restart to prevent duplicate events
+**Purpose**: Enables retrieval of actual fill price for logging/diagnostics
+
+## Current Status
+
+### ✅ Code Changes Complete
+All logging enhancements have been implemented in the source code.
+
+### ⚠️ Deployment Status
+**Current**: Old logging format still active (DLL needs restart)
+
+**Evidence**: Recent INTENT_REGISTERED events (last 6 hours) do NOT contain `has_be_trigger` field
+
+**Required Action**: 
+1. Rebuild DLL (if not already done)
+2. Restart NinjaTrader to load updated DLL
+
+## Verification
+
+To verify logging is working after restart:
+
+```python
+# Check for INTENT_REGISTERED events with BE trigger field
+python check_recent_logging.py
+```
+
+Expected after restart:
+- `Events with BE trigger field: X/X` (all events should have the field)
+- `[OK] NEW LOGGING FORMAT ACTIVE`
+
+## What We Fixed Today
+
+1. ✅ **BE Trigger Logging**: Added `be_trigger` and `has_be_trigger` to INTENT_REGISTERED events
+2. ✅ **BE Stop Calculation**: Fixed to use breakout level instead of fill price
+3. ✅ **BE Event Logging**: Enhanced BE_TRIGGER_REACHED events with breakout_level and actual_fill_price
+4. ✅ **Position Tracking**: Fixed MNQ position accumulation bug (fillQuantity vs filledTotal)
+5. ✅ **Flatten Operations**: Added null checks to prevent NullReferenceException
+6. ✅ **ExecutionJournal**: Added GetEntry method for BE monitoring
+
+## Next Steps
+
+1. **Restart NinjaTrader** to load updated DLL with new logging
+2. **Monitor logs** for INTENT_REGISTERED events with `has_be_trigger` field
+3. **Verify BE detection** is working with enhanced logging
+4. **Check BE stop placement** matches breakout level (not fill price)

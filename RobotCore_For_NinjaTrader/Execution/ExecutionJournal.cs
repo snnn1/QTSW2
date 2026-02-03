@@ -1282,6 +1282,46 @@ public sealed class ExecutionJournal
         }
     }
 
+    /// <summary>
+    /// Get execution journal entry for an intent.
+    /// Returns null if entry doesn't exist.
+    /// </summary>
+    public ExecutionJournalEntry? GetEntry(string intentId, string tradingDate, string stream)
+    {
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            
+            // Check cache first
+            if (_cache.TryGetValue(key, out var cachedEntry))
+            {
+                return cachedEntry;
+            }
+            
+            // Check disk
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+            if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                    {
+                        _cache[key] = entry;
+                        return entry;
+                    }
+                }
+                catch
+                {
+                    // If read fails, return null
+                }
+            }
+            
+            return null;
+        }
+    }
+    
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 

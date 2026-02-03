@@ -1464,11 +1464,14 @@ public sealed partial class NinjaTraderSimAdapter
             // Register entry fill with coordinator
             if (_intentMap.TryGetValue(intentId, out var entryIntent))
             {
-                // Register exposure with coordinator
-                _coordinator?.OnEntryFill(intentId, filledTotal, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+                // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
+                // OnEntryFill does: exposure.EntryFilledQty += qty, so passing cumulative totals causes double-counting
+                _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
                 
-                // Ensure we protect the currently filled quantity (no market-close gating)
-                HandleEntryFill(intentId, entryIntent, fillPrice, filledTotal, utcNow);
+                // CRITICAL FIX: Pass fillQuantity (delta) not filledTotal (cumulative) to HandleEntryFill
+                // HandleEntryFill submits protective orders for the NEW fill quantity only
+                // Passing filledTotal causes exponential position growth as protective orders are resubmitted with cumulative totals
+                HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, utcNow);
             }
             else
             {
@@ -1559,8 +1562,9 @@ public sealed partial class NinjaTraderSimAdapter
                     stream = context.Stream
                 }));
             
-            // Register exit fill with coordinator
-            _coordinator?.OnExitFill(intentId, filledTotal, utcNow);
+            // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
+            // OnExitFill does: exposure.ExitFilledQty += qty, so passing cumulative totals causes double-counting
+            _coordinator?.OnExitFill(intentId, fillQuantity, utcNow);
         }
         else
         {
@@ -2762,19 +2766,48 @@ public sealed partial class NinjaTraderSimAdapter
         
         try
         {
+            // CRITICAL FIX: Add null checks to prevent NullReferenceException
             // Get position for this instrument - use dynamic to handle different API signatures
             dynamic dynAccountFlatten = account;
             Position? position = null;
+            string? instrumentName = null;
+            
+            // Safely get instrument name
             try
             {
-                position = dynAccountFlatten.GetPosition(ntInstrument);
+                if (ntInstrument?.MasterInstrument != null)
+                {
+                    instrumentName = ntInstrument.MasterInstrument.Name;
+                }
+                else if (ntInstrument != null)
+                {
+                    // Fallback if MasterInstrument is null
+                    instrumentName = ntInstrument.ToString();
+                }
+            }
+            catch
+            {
+                // If we can't get instrument name, use instrument symbol from parameter
+                instrumentName = instrument;
+            }
+            
+            // Try to get position
+            try
+            {
+                if (ntInstrument != null)
+                {
+                    position = dynAccountFlatten.GetPosition(ntInstrument);
+                }
             }
             catch
             {
                 // Try alternative signature - GetPosition might take instrument name string
                 try
                 {
-                    position = dynAccountFlatten.GetPosition(ntInstrument.MasterInstrument.Name);
+                    if (!string.IsNullOrEmpty(instrumentName))
+                    {
+                        position = dynAccountFlatten.GetPosition(instrumentName);
+                    }
                 }
                 catch
                 {
@@ -2795,23 +2828,48 @@ public sealed partial class NinjaTraderSimAdapter
             // 2. If other intents exist, they would need to be re-entered (rare path)
             // 3. This is an emergency fallback scenario
             
+            // CRITICAL FIX: Add null checks before flattening
+            bool flattenSucceeded = false;
+            
             // Flatten - use dynamic to handle different API signatures
-            try
+            if (ntInstrument != null)
             {
-                dynAccountFlatten.Flatten(ntInstrument);
-            }
-            catch
-            {
-                // Try alternative signature - Flatten might take ICollection<Instrument>
                 try
                 {
-                    dynAccountFlatten.Flatten(new[] { ntInstrument });
+                    dynAccountFlatten.Flatten(ntInstrument);
+                    flattenSucceeded = true;
                 }
                 catch
                 {
-                    // Try with instrument name string
-                    dynAccountFlatten.Flatten(ntInstrument.MasterInstrument.Name);
+                    // Try alternative signature - Flatten might take ICollection<Instrument>
+                    try
+                    {
+                        dynAccountFlatten.Flatten(new[] { ntInstrument });
+                        flattenSucceeded = true;
+                    }
+                    catch
+                    {
+                        // Try with instrument name string
+                        if (!string.IsNullOrEmpty(instrumentName))
+                        {
+                            try
+                            {
+                                dynAccountFlatten.Flatten(instrumentName);
+                                flattenSucceeded = true;
+                            }
+                            catch
+                            {
+                                // All flatten attempts failed
+                            }
+                        }
+                    }
                 }
+            }
+            
+            if (!flattenSucceeded)
+            {
+                var error = $"Flatten failed: ntInstrument is null or all flatten attempts failed. Instrument: {instrument}, InstrumentName: {instrumentName ?? "N/A"}";
+                return FlattenResult.FailureResult(error, utcNow);
             }
             
             // GC FIX: Check if position is null before accessing Quantity
