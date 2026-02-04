@@ -1,220 +1,179 @@
 #!/usr/bin/env python3
-"""
-Check data stall status - verify if bars are arriving and if streams expect them.
-"""
+# -*- coding: utf-8 -*-
+"""Check data stall status from watchdog"""
 import json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-import pytz
 
-def parse_timestamp(ts_str: str):
-    if not ts_str:
-        return None
+print("=" * 100)
+print("DATA STALL DIAGNOSTICS")
+print("=" * 100)
+print()
+
+# Check watchdog state file
+state_file = Path("automation/logs/orchestrator_state.json")
+if not state_file.exists():
+    print(f"[ERROR] Watchdog state file not found: {state_file}")
+    exit(1)
+
+try:
+    with open(state_file, 'r') as f:
+        state = json.load(f)
+except Exception as e:
+    print(f"[ERROR] Failed to read state file: {e}")
+    exit(1)
+
+# Check data stall status
+data_stall_detected = state.get('data_stall_detected', {})
+worst_last_bar_age_seconds = state.get('worst_last_bar_age_seconds')
+market_open = state.get('market_open', False)
+data_status = state.get('data_status', 'UNKNOWN')
+
+print(f"Market Open: {market_open}")
+print(f"Data Status: {data_status}")
+print(f"Worst Last Bar Age: {worst_last_bar_age_seconds:.1f} seconds" if worst_last_bar_age_seconds else "Worst Last Bar Age: No bars received")
+print()
+
+if data_stall_detected:
+    print(f"[WARNING] DATA STALL DETECTED for {len(data_stall_detected)} instrument(s):")
+    print("-" * 100)
+    
+    now = datetime.now(timezone.utc)
+    
+    for instrument, info in data_stall_detected.items():
+        stall_detected = info.get('stall_detected', False)
+        last_bar_chicago = info.get('last_bar_chicago')
+        market_open_flag = info.get('market_open', False)
+        
+        print(f"  Instrument: {instrument}")
+        print(f"    Stall Detected: {stall_detected}")
+        print(f"    Market Open: {market_open_flag}")
+        
+        if last_bar_chicago:
+            try:
+                last_bar_utc = datetime.fromisoformat(last_bar_chicago.replace('Z', '+00:00'))
+                if last_bar_utc.tzinfo is None:
+                    last_bar_utc = last_bar_utc.replace(tzinfo=timezone.utc)
+                age_seconds = (now - last_bar_utc).total_seconds()
+                print(f"    Last Bar: {last_bar_chicago}")
+                print(f"    Age: {age_seconds:.1f} seconds ({age_seconds/60:.1f} minutes)")
+            except:
+                print(f"    Last Bar: {last_bar_chicago}")
+        else:
+            print(f"    Last Bar: None (no bars received yet)")
+        print()
+else:
+    print("[OK] No data stalls detected")
+    print()
+
+# Check recent bar events from robot logs
+print("Recent Bar Events (last 5 minutes):")
+print("-" * 100)
+
+recent = datetime.now(timezone.utc) - timedelta(minutes=5)
+bar_events = []
+
+for log_file in Path("logs/robot").glob("*.jsonl"):
     try:
-        if 'T' in ts_str:
-            if ts_str.endswith('Z'):
-                ts_str = ts_str[:-1] + '+00:00'
-            elif '+' not in ts_str:
-                ts_str = ts_str + '+00:00'
-            dt = datetime.fromisoformat(ts_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
+        with open(log_file, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                try:
+                    e = json.loads(line.strip())
+                    ts_str = e.get('ts_utc', '')
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        if ts >= recent:
+                            event_type = e.get('event', '')
+                            if any(k in event_type.upper() for k in ['BAR', 'ONBARUPDATE']):
+                                bar_events.append(e)
+                except:
+                    pass
     except:
         pass
-    return None
 
-def main():
-    log_dir = Path("logs/robot")
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
-    chicago_tz = pytz.timezone('America/Chicago')
+if bar_events:
+    # Sort by timestamp
+    bar_events.sort(key=lambda e: e.get('ts_utc', ''), reverse=True)
     
-    print("="*80)
-    print("DATA STALL ANALYSIS")
-    print("="*80)
+    print(f"Found {len(bar_events)} bar events in last 5 minutes:")
+    print()
     
-    # Load events
-    events = []
-    for log_file in sorted(log_dir.glob("robot_*.jsonl"), reverse=True)[:3]:
-        try:
-            with open(log_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            e = json.loads(line)
-                            ts = parse_timestamp(e.get('ts_utc', ''))
-                            if ts and ts >= cutoff:
-                                events.append(e)
-                        except:
-                            pass
-        except:
-            pass
-    
-    events.sort(key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-    
-    print(f"\nLoaded {len(events):,} events from last 30 minutes\n")
-    
-    # 1. Check bar events
-    print("="*80)
-    print("1. BAR EVENTS")
-    print("="*80)
-    
-    bar_received = [e for e in events if e.get('event') == 'BAR_RECEIVED_NO_STREAMS']
-    bar_accepted = [e for e in events if e.get('event') == 'BAR_ACCEPTED']
-    bar_rejected = [e for e in events if 'BAR' in e.get('event', '') and 'REJECT' in e.get('event', '')]
-    data_stall = [e for e in events if e.get('event') == 'DATA_STALL_RECOVERED']
-    data_loss = [e for e in events if e.get('event') == 'DATA_LOSS_DETECTED']
-    
-    print(f"  BAR_RECEIVED_NO_STREAMS: {len(bar_received)}")
-    print(f"  BAR_ACCEPTED: {len(bar_accepted)}")
-    print(f"  BAR_REJECTED: {len(bar_rejected)}")
-    print(f"  DATA_STALL_RECOVERED: {len(data_stall)}")
-    print(f"  DATA_LOSS_DETECTED: {len(data_loss)}")
-    
-    # Check latest bar received
-    if bar_received:
-        latest = max(bar_received, key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-        ts = parse_timestamp(latest.get('ts_utc', ''))
-        if ts:
-            ts_chicago = ts.astimezone(chicago_tz)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            instrument = latest.get('instrument', 'N/A')
-            print(f"\n  Latest BAR_RECEIVED_NO_STREAMS:")
-            print(f"    Time: {ts_chicago.strftime('%H:%M:%S')} CT ({age:.0f}s ago)")
-            print(f"    Instrument: {instrument}")
-            if age > 300:  # 5 minutes
-                print(f"    [WARN] No bars received for {age:.0f}s - possible data stall")
-            else:
-                print(f"    [OK] Bars arriving normally")
-    
-    # Check latest bar accepted
-    if bar_accepted:
-        latest = max(bar_accepted, key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-        ts = parse_timestamp(latest.get('ts_utc', ''))
-        if ts:
-            ts_chicago = ts.astimezone(chicago_tz)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            instrument = latest.get('instrument', 'N/A')
-            print(f"\n  Latest BAR_ACCEPTED:")
-            print(f"    Time: {ts_chicago.strftime('%H:%M:%S')} CT ({age:.0f}s ago)")
-            print(f"    Instrument: {instrument}")
-    
-    # 2. Check stream states
-    print("\n" + "="*80)
-    print("2. STREAM STATES")
-    print("="*80)
-    
-    stream_transitions = [e for e in events if e.get('event') == 'STREAM_STATE_TRANSITION']
-    streams_by_state = {}
-    
-    for e in stream_transitions:
+    # Group by instrument
+    by_instrument = {}
+    for e in bar_events[:20]:  # Show last 20
         data = e.get('data', {})
-        new_state = data.get('new_state', 'UNKNOWN')
-        stream = e.get('stream', 'UNKNOWN')
-        if new_state not in streams_by_state:
-            streams_by_state[new_state] = []
-        if stream not in streams_by_state[new_state]:
-            streams_by_state[new_state].append(stream)
+        instrument = data.get('instrument') or data.get('execution_instrument') or 'UNKNOWN'
+        if instrument not in by_instrument:
+            by_instrument[instrument] = []
+        by_instrument[instrument].append(e)
     
-    print(f"  Stream state transitions: {len(stream_transitions)}")
-    print(f"\n  Streams by state:")
-    bar_dependent_states = ['PRE_HYDRATION', 'ARMED', 'RANGE_BUILDING', 'RANGE_LOCKED']
-    for state in sorted(streams_by_state.keys()):
-        count = len(streams_by_state[state])
-        is_bar_dependent = state in bar_dependent_states
-        marker = "[EXPECTS BARS]" if is_bar_dependent else ""
-        print(f"    {state:20} {count:3} streams {marker}")
-    
-    # Check if any streams are in bar-dependent states
-    streams_expecting_bars = sum(len(streams_by_state.get(state, [])) for state in bar_dependent_states)
-    print(f"\n  Streams expecting bars: {streams_expecting_bars}")
-    
-    # 3. Check instruments receiving bars
-    print("\n" + "="*80)
-    print("3. INSTRUMENTS RECEIVING BARS")
-    print("="*80)
-    
-    instruments = {}
-    for e in bar_received[-100:]:  # Last 100
-        inst = e.get('instrument', 'UNKNOWN')
-        ts = parse_timestamp(e.get('ts_utc', ''))
-        if inst:
-            if inst not in instruments:
-                instruments[inst] = []
-            if ts:
-                instruments[inst].append(ts)
-    
-    print(f"  Instruments receiving bars (last 100 events):")
-    for inst in sorted(instruments.keys()):
-        timestamps = instruments[inst]
-        if timestamps:
-            latest = max(timestamps)
-            age = (datetime.now(timezone.utc) - latest).total_seconds()
-            ts_chicago = latest.astimezone(chicago_tz)
-            print(f"    {inst:15} Latest: {ts_chicago.strftime('%H:%M:%S')} CT ({age:.0f}s ago) | {len(timestamps)} events")
-    
-    # 4. Check data stall detection
-    print("\n" + "="*80)
-    print("4. DATA STALL DETECTION")
-    print("="*80)
-    
-    if data_stall:
-        latest = max(data_stall, key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-        ts = parse_timestamp(latest.get('ts_utc', ''))
-        if ts:
-            ts_chicago = ts.astimezone(chicago_tz)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            print(f"  Latest DATA_STALL_RECOVERED: {ts_chicago.strftime('%H:%M:%S')} CT ({age:.0f}s ago)")
-            print(f"  [INFO] Data stalls were detected but have recovered")
-    
-    if data_loss:
-        latest = max(data_loss, key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-        ts = parse_timestamp(latest.get('ts_utc', ''))
-        if ts:
-            ts_chicago = ts.astimezone(chicago_tz)
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            data = latest.get('data', {})
-            note = data.get('note', '')[:80] if data.get('note') else ''
-            print(f"  Latest DATA_LOSS_DETECTED: {ts_chicago.strftime('%H:%M:%S')} CT ({age:.0f}s ago)")
-            print(f"  Note: {note}")
-    
-    # 5. Summary
-    print("\n" + "="*80)
-    print("5. DATA STALL SUMMARY")
-    print("="*80)
-    
-    # Determine if data is actually stalled
-    is_stalled = False
-    reasons = []
-    
-    if bar_received:
-        latest_bar = max(bar_received, key=lambda x: parse_timestamp(x.get('ts_utc', '')) or datetime.min.replace(tzinfo=timezone.utc))
-        ts_bar = parse_timestamp(latest_bar.get('ts_utc', ''))
-        if ts_bar:
-            age_bar = (datetime.now(timezone.utc) - ts_bar).total_seconds()
-            if age_bar > 300:  # 5 minutes
-                is_stalled = True
-                reasons.append(f"No bars received for {age_bar:.0f}s")
-    
-    if streams_expecting_bars > 0:
-        if not bar_received or (bar_received and parse_timestamp(bar_received[-1].get('ts_utc', '')) and 
-                                (datetime.now(timezone.utc) - parse_timestamp(bar_received[-1].get('ts_utc', ''))).total_seconds() > 300):
-            is_stalled = True
-            reasons.append(f"{streams_expecting_bars} stream(s) expecting bars but none received")
-    
-    if is_stalled:
-        print("\n  [WARN] DATA STALL DETECTED")
-        for reason in reasons:
-            print(f"    - {reason}")
-    else:
-        print("\n  [OK] Data is flowing normally")
-        if streams_expecting_bars == 0:
-            print(f"    Note: No streams are currently expecting bars (ranges haven't formed yet)")
-        else:
-            print(f"    Note: {streams_expecting_bars} stream(s) expecting bars, bars arriving normally")
-    
-    print("="*80)
+    for instrument, events in sorted(by_instrument.items()):
+        print(f"  {instrument}: {len(events)} events")
+        for e in events[:3]:  # Show last 3 per instrument
+            ts = e.get('ts_utc', '')[:19]
+            event_type = e.get('event', '')
+            print(f"    [{ts}] {event_type}")
+else:
+    print("No bar events found in last 5 minutes")
+    print("This could indicate:")
+    print("  - Market is closed")
+    print("  - Robot is not receiving data")
+    print("  - Robot is not running")
+    print()
 
-if __name__ == "__main__":
-    main()
+# Check engine tick events
+print("Engine Activity (last 5 minutes):")
+print("-" * 100)
+
+tick_events = []
+for log_file in Path("logs/robot").glob("*.jsonl"):
+    try:
+        with open(log_file, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                try:
+                    e = json.loads(line.strip())
+                    ts_str = e.get('ts_utc', '')
+                    if ts_str:
+                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        if ts >= recent:
+                            event_type = e.get('event', '')
+                            if 'ENGINE_TICK' in event_type.upper():
+                                tick_events.append(e)
+                except:
+                    pass
+    except:
+        pass
+
+if tick_events:
+    tick_events.sort(key=lambda e: e.get('ts_utc', ''), reverse=True)
+    print(f"Found {len(tick_events)} engine tick events in last 5 minutes")
+    print(f"Most recent: {tick_events[0].get('ts_utc', '')[:19]}")
+else:
+    print("[WARNING] No engine tick events in last 5 minutes")
+    print("This could indicate the robot is not running or not processing ticks")
+    print()
+
+print("=" * 100)
+print("RECOMMENDATIONS")
+print("=" * 100)
+print()
+
+if data_stall_detected:
+    print("1. Check NinjaTrader connection:")
+    print("   - Is NinjaTrader connected to data feed?")
+    print("   - Check connection status in NinjaTrader")
+    print()
+    print("2. Check if market is open:")
+    print("   - Market hours: 8:00 AM - 4:00 PM Chicago time")
+    print("   - Data stalls are only flagged when market is open")
+    print()
+    print("3. Check robot logs for errors:")
+    print("   - Look for connection errors")
+    print("   - Look for data feed errors")
+    print()
+    print("4. Restart NinjaTrader if needed:")
+    print("   - Sometimes data feed needs reconnection")
+    print()
+else:
+    print("[OK] No action needed - data is flowing normally")
+    print()

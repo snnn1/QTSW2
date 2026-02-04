@@ -1,60 +1,108 @@
-# DATA STALLED Alert Explanation
+# DATA STALLED Explanation
 
-## Current Situation
+## What is "DATA STALLED"?
 
-**Alert:** DATA STALLED  
-**Status:** 4 instruments detected as stalled (MNQ 03-26, MGC 04-26, MYM 03-26, MES 03-26)
+The watchdog monitors data feed health by tracking when bars are received from NinjaTrader. If bars stop arriving for more than **120 seconds** while the market is open, it flags this as a **DATA STALL**.
 
-## Analysis
+## How Data Stall Detection Works
 
-### Watchdog Detection
-- **Bars Expected Count:** 9 streams expecting bars
-- **Streams in PRE_HYDRATION:** 5 streams waiting for bars
-- **Last Bar Received:** ~10 minutes ago (627 seconds)
-- **Threshold:** 90 seconds (DATA_STALL_THRESHOLD_SECONDS)
-- **Market Open:** True (according to watchdog)
+### Threshold
+- **DATA_STALL_THRESHOLD_SECONDS = 120 seconds** (2 minutes)
+- If no bars received for > 120 seconds AND market is open → **STALLED**
+- If market is closed → **ACCEPTABLE_SILENCE** (not a problem)
 
-### Actual Status
-- **No bar events** found in robot logs in last 15 minutes
-- **Current time:** Sunday 17:27 CT
-- **Market status:** CME futures markets are **typically closed on Sunday**
+### Detection Logic
+1. **Per Execution Instrument**: Each contract (e.g., "MES 03-26", "MNQ 03-26") is tracked separately
+2. **Bar Events**: Robot sends `ONBARUPDATE_CALLED` events (rate-limited to every 60 seconds)
+3. **Stall Detection**: If last bar was > 120 seconds ago → flagged as stalled
 
-## Root Cause
+## Why You Might See "DATA STALLED"
 
-**The market is likely CLOSED, but the watchdog thinks it's OPEN.**
+### Common Causes:
 
-The watchdog's `is_market_open()` function may not be correctly detecting that:
-1. It's Sunday (markets are closed)
-2. Even if it's after 17:00 CT, Sunday is not a trading day
+1. **Market is Closed**
+   - If market closed recently, bars stop arriving
+   - This is **normal** and should show "ACCEPTABLE_SILENCE" not "STALLED"
+   - Check: Is it after 4:00 PM Chicago time?
 
-## Why This Happens
+2. **NinjaTrader Data Feed Disconnected**
+   - Data provider connection lost
+   - NinjaTrader not connected to broker/data feed
+   - **Action**: Check NinjaTrader connection status
 
-1. **Streams are in PRE_HYDRATION** - They're waiting for bars to start
-2. **No bars arriving** - Market is closed, so no new bars
-3. **Watchdog detects stall** - Bars expected but none received for > 90 seconds
-4. **False positive** - Market is actually closed, so this is expected behavior
+3. **Robot Not Running**
+   - Robot strategy not active in NinjaTrader
+   - **Action**: Check if strategy is running in NinjaTrader
 
-## Solution
+4. **No Active Streams**
+   - No streams expecting bars (all completed or not started)
+   - **Action**: Check if streams are in bar-dependent states (ARMED, RANGE_BUILDING, etc.)
 
-### Immediate
-This is a **FALSE POSITIVE** alert. The market is closed, so no bars should be arriving.
+5. **Stale State**
+   - Watchdog UI showing old state
+   - **Action**: Refresh the watchdog page
 
-### Long-term Fix
-The watchdog's `is_market_open()` function should:
-1. Check if it's Sunday (markets closed)
-2. Verify actual market hours for the current day
-3. Only flag data stalls when market is actually open
+## Current Status Check
 
-## Verification
+Based on diagnostic:
+- **Market Open**: `None` (unknown)
+- **Worst Last Bar Age**: `None` (no bars tracked)
+- **Data Stall Detected**: 0 instruments
+- **Engine Activity**: Active (25,002 tick events in last 5 minutes)
 
-To verify market status:
-- Check if it's Sunday (markets closed)
-- Check CME market hours for current day
-- Verify if bars are actually expected (streams in bar-dependent states)
+**This suggests:**
+- Robot is running and processing ticks
+- But watchdog state may be stale or not initialized
+- No actual stalls detected in backend state
+
+## How to Fix
+
+### If Market is Closed:
+- **Normal behavior** - wait for market to open
+- Should show "ACCEPTABLE_SILENCE" not "STALLED"
+
+### If Market is Open:
+1. **Check NinjaTrader Connection**:
+   - Open NinjaTrader
+   - Check connection status (green = connected)
+   - Verify data feed is active
+
+2. **Check Robot Strategy**:
+   - Is strategy running?
+   - Check for errors in NinjaTrader output window
+
+3. **Check Robot Logs**:
+   - Look for `ONBARUPDATE_CALLED` events
+   - Look for connection errors
+   - Check if bars are being received
+
+4. **Restart Watchdog** (if needed):
+   - Restart watchdog backend
+   - Refresh watchdog UI
+
+5. **Restart NinjaTrader** (if needed):
+   - Sometimes data feed needs reconnection
+   - Restart NinjaTrader to reconnect
+
+## Diagnostic Commands
+
+```bash
+# Check data stall status
+python check_data_stall.py
+
+# Check recent bar events
+python check_latest_logs.py
+
+# Check watchdog state
+python -c "import json; print(json.dumps(json.load(open('automation/logs/orchestrator_state.json')), indent=2))"
+```
 
 ## Summary
 
-**Status:** FALSE POSITIVE  
-**Reason:** Market is closed (Sunday), but watchdog thinks it's open  
-**Action:** No action needed - this is expected when market is closed  
-**Fix Needed:** Improve `is_market_open()` to correctly detect Sunday/market closures
+"DATA STALLED" means bars haven't been received for > 2 minutes while market is open. Check:
+1. Is market actually open?
+2. Is NinjaTrader connected?
+3. Is robot strategy running?
+4. Are bars being received (check logs)?
+
+If all checks pass but still showing stalled, it may be a stale UI state - refresh the watchdog page.
