@@ -357,8 +357,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// <summary>
     /// PHASE 2: Handle entry fill and submit protective orders with retry and failure recovery.
     /// </summary>
-    private void HandleEntryFill(string intentId, Intent intent, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow)
+    private void HandleEntryFill(string intentId, Intent intent, decimal fillPrice, int fillQuantity, int totalFilledQuantity, DateTimeOffset utcNow)
     {
+        // CRITICAL FIX: totalFilledQuantity is the cumulative filled quantity (passed from caller)
+        // For incremental fills, protective orders must cover the ENTIRE position, not just the new fill
+        // This prevents position accumulation bugs where protective orders only cover the delta
+        
         // CRITICAL: Validate intent has all required fields for protective orders
         // REAL RISK FIX: Treat missing intent fields the same as protective submission failure
         // If we cannot prove the position is protected, flatten immediately (fail-closed)
@@ -383,46 +387,26 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     target_price = intent.TargetPrice,
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
+                    total_filled_quantity = totalFilledQuantity,
                     stream = intent.Stream,
                     instrument = intent.Instrument,
                     action = "FLATTEN_IMMEDIATELY",
                     note = "Entry order filled but intent incomplete - position unprotected. Flattening immediately (fail-closed behavior)."
                 }));
             
-            // REAL RISK FIX: Flatten position immediately (same as protective order failure)
-            // Notify coordinator of protective failure
-            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
-            
-            // Flatten position immediately with retry logic
-            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
-            
-            // Stand down stream
-            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"INTENT_INCOMPLETE: {failureReason}");
-            
-            // Persist incident record
-            PersistProtectiveFailureIncident(intentId, intent, null, null, flattenResult, utcNow);
-            
-            // Raise high-priority alert
-            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-            if (notificationService != null)
-            {
-                var title = $"CRITICAL: Intent Incomplete - Unprotected Position - {intent.Instrument}";
-                var message = $"Entry filled but intent incomplete (missing: {string.Join(", ", missingFields)}). Position flattened. Stream: {intent.Stream}, Intent: {intentId}.";
-                notificationService.EnqueueNotification($"INTENT_INCOMPLETE:{intentId}", title, message, priority: 2); // Emergency priority
-            }
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "INTENT_INCOMPLETE_FLATTENED",
-                new
-                {
-                    intent_id = intentId,
-                    stream = intent.Stream,
-                    instrument = intent.Instrument,
-                    missing_fields = missingFields,
-                    flatten_success = flattenResult.Success,
-                    flatten_error = flattenResult.ErrorMessage,
-                    failure_reason = failureReason,
-                    note = "Position flattened and stream stood down due to incomplete intent (fail-closed behavior)"
-                }));
+            // SIMPLIFICATION: Use centralized fail-closed pattern
+            FailClosed(
+                intentId,
+                intent,
+                failureReason,
+                "INTENT_INCOMPLETE_FLATTENED",
+                $"INTENT_INCOMPLETE:{intentId}",
+                $"CRITICAL: Intent Incomplete - Unprotected Position - {intent.Instrument}",
+                $"Entry filled but intent incomplete (missing: {string.Join(", ", missingFields)}). Position flattened. Stream: {intent.Stream}, Intent: {intentId}.",
+                null, // stopResult
+                null, // targetResult
+                new { missing_fields = missingFields }, // additionalData
+                utcNow);
             
             return;
         }
@@ -447,50 +431,45 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     error = error, 
                     intent_id = intentId, 
                     fill_quantity = fillQuantity,
+                    total_filled_quantity = totalFilledQuantity,
                     fill_price = fillPrice,
                     note = "Protective orders blocked during recovery state - position unprotected until recovery completes"
                 }));
             
+            // SIMPLIFICATION: Use centralized fail-closed pattern
             // CRITICAL: Queue protective orders for submission after recovery completes
             // For now, flatten immediately (fail-closed) - TODO: Implement queue mechanism
-            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
-            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
-            
-            // Stand down stream
-            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDERS_BLOCKED_RECOVERY: {error}");
-            
-            // Raise high-priority alert
-            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-            if (notificationService != null)
-            {
-                var title = $"CRITICAL: Protective Orders Blocked - Recovery State - {intent.Instrument}";
-                var message = $"Entry filled but protective orders blocked due to recovery state. Position flattened. Stream: {intent.Stream}, Intent: {intentId}.";
-                notificationService.EnqueueNotification($"PROTECTIVE_BLOCKED_RECOVERY:{intentId}", title, message, priority: 2); // Emergency priority
-            }
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_BLOCKED_RECOVERY_FLATTENED",
-                new
-                {
-                    intent_id = intentId,
-                    stream = intent.Stream,
-                    instrument = intent.Instrument,
-                    flatten_success = flattenResult.Success,
-                    flatten_error = flattenResult.ErrorMessage,
-                    error = error,
-                    note = "Position flattened due to protective orders blocked during recovery state"
-                }));
+            FailClosed(
+                intentId,
+                intent,
+                error,
+                "PROTECTIVE_ORDERS_BLOCKED_RECOVERY_FLATTENED",
+                $"PROTECTIVE_BLOCKED_RECOVERY:{intentId}",
+                $"CRITICAL: Protective Orders Blocked - Recovery State - {intent.Instrument}",
+                $"Entry filled but protective orders blocked due to recovery state. Position flattened. Stream: {intent.Stream}, Intent: {intentId}.",
+                null, // stopResult
+                null, // targetResult
+                new { error }, // additionalData
+                utcNow);
             
             return;
         }
         
         // Validate exit orders before submission
+        // CRITICAL FIX: Use totalFilledQuantity (cumulative) for validation
+        // Protective orders must cover the ENTIRE position, not just the new fill
         if (_coordinator != null)
         {
-            if (!_coordinator.CanSubmitExit(intentId, fillQuantity))
+            if (!_coordinator.CanSubmitExit(intentId, totalFilledQuantity))
             {
                 var error = "Exit validation failed - cannot submit protective orders";
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "EXECUTION_ERROR",
-                    new { error = error, intent_id = intentId, fill_quantity = fillQuantity }));
+                    new { 
+                        error = error, 
+                        intent_id = intentId, 
+                        fill_quantity = fillQuantity,
+                        total_filled_quantity = totalFilledQuantity
+                    }));
                 return;
             }
         }
@@ -513,7 +492,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             }
             
             // Validate again before each retry
-            if (_coordinator != null && !_coordinator.CanSubmitExit(intentId, fillQuantity))
+            // CRITICAL FIX: Use totalFilledQuantity (cumulative) for validation and protective orders
+            // Protective orders must cover the ENTIRE position, not just the new fill
+            if (_coordinator != null && !_coordinator.CanSubmitExit(intentId, totalFilledQuantity))
             {
                 var error = "Exit validation failed during retry";
                 stopResult = OrderSubmissionResult.FailureResult(error, utcNow);
@@ -521,17 +502,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 break;
             }
             
+            // SIMPLIFICATION: Use centralized OCO group generation
             // Generate unique OCO group for this attempt (append attempt number and timestamp)
             // Both stop and target must use the same OCO group to be paired
-            var protectiveOcoGroup = $"QTSW2:{intentId}_PROTECTIVE_A{attempt}_{utcNow:HHmmssfff}";
+            var protectiveOcoGroup = GenerateProtectiveOcoGroup(intentId, attempt, utcNow);
             
             // Submit stop order
+            // CRITICAL FIX: Use totalFilledQuantity (cumulative) for protective orders
+            // This ensures protective orders cover the ENTIRE position for incremental fills
             stopResult = SubmitProtectiveStop(
                 intentId,
                 intent.Instrument,
                 intent.Direction,
                 intent.StopPrice.Value,
-                fillQuantity,
+                totalFilledQuantity,  // CRITICAL: Use total, not delta
                 protectiveOcoGroup,
                 utcNow);
             
@@ -543,7 +527,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     intent.Instrument,
                     intent.Direction,
                     intent.TargetPrice.Value,
-                    fillQuantity,
+                    totalFilledQuantity,  // CRITICAL: Use total, not delta
                     protectiveOcoGroup,
                     utcNow);
                 
@@ -578,43 +562,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             
             var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: {string.Join(", ", failedLegs)}";
             
-            // Notify coordinator of protective failure
-            _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
-            
-            // Flatten position immediately with retry logic (coordinator handles per-intent flattening)
-            var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
-            
-            // Stand down stream (coordinator also calls this, but keep for backward compatibility)
-            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"PROTECTIVE_ORDER_FAILURE: {failureReason}");
-            
-            // Persist incident record
-            PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, flattenResult, utcNow);
-            
-            // Raise high-priority alert
-            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-            if (notificationService != null)
-            {
-                var title = $"CRITICAL: Protective Order Failure - {intent.Instrument}";
-                var message = $"Entry filled but protective orders failed. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. Failures: {failureReason}";
-                notificationService.EnqueueNotification($"PROTECTIVE_FAILURE:{intentId}", title, message, priority: 2); // Emergency priority
-            }
-            
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_FAILED_FLATTENED",
-                new
-                {
-                    intent_id = intentId,
-                    stream = intent.Stream,
-                    instrument = intent.Instrument,
-                    stop_success = stopResult.Success,
-                    stop_error = stopResult.ErrorMessage,
-                    target_success = targetResult.Success,
-                    target_error = targetResult.ErrorMessage,
-                    flatten_success = flattenResult.Success,
-                    flatten_error = flattenResult.ErrorMessage,
-                    failure_reason = failureReason,
-                    retry_count = MAX_RETRIES,
-                    note = "Position flattened and stream stood down due to protective order failure"
-                }));
+            // SIMPLIFICATION: Use centralized fail-closed pattern
+            FailClosed(
+                intentId,
+                intent,
+                failureReason,
+                "PROTECTIVE_ORDERS_FAILED_FLATTENED",
+                $"PROTECTIVE_FAILURE:{intentId}",
+                $"CRITICAL: Protective Order Failure - {intent.Instrument}",
+                $"Entry filled but protective orders failed. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. Failures: {failureReason}",
+                stopResult,
+                targetResult,
+                new { retry_count = MAX_RETRIES }, // additionalData
+                utcNow);
             
             return;
         }
@@ -627,7 +587,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 target_order_id = targetResult.BrokerOrderId,
                 stop_price = intent.StopPrice,
                 target_price = intent.TargetPrice,
-                quantity = fillQuantity
+                fill_quantity = fillQuantity,  // Delta for this fill
+                total_filled_quantity = totalFilledQuantity,  // Cumulative total for protective orders
+                note = "Protective orders submitted for total filled quantity (covers entire position for incremental fills)"
             }));
         
         // Check for unprotected positions after protective order submission
@@ -643,9 +605,91 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             order_type = "ENTRY_OR_ENTRY_STOP",
             stop_price = intent.StopPrice,
             target_price = intent.TargetPrice,
-            protected_quantity = fillQuantity,
-            note = "Protective stop + target successfully placed/ensured for filled quantity"
+            fill_quantity = fillQuantity,  // Delta for this fill
+            protected_quantity = totalFilledQuantity,  // Cumulative total protected
+            note = "Protective stop + target successfully placed/ensured for total filled quantity (covers entire position for incremental fills)"
         }));
+    }
+    
+    /// <summary>
+    /// SIMPLIFICATION: Generate unique OCO group for protective orders.
+    /// NinjaTrader does not allow reusing OCO IDs once they've been used (even if rejected),
+    /// so we generate a unique group per retry attempt.
+    /// </summary>
+    private string GenerateProtectiveOcoGroup(string intentId, int attempt, DateTimeOffset utcNow)
+    {
+        return $"QTSW2:{intentId}_PROTECTIVE_A{attempt}_{utcNow:HHmmssfff}";
+    }
+    
+    /// <summary>
+    /// SIMPLIFICATION: Fail-closed pattern - flatten position, stand down stream, alert, and persist incident.
+    /// Centralizes the fail-closed behavior used in multiple places (intent incomplete, recovery blocked, protective failure, unprotected timeout).
+    /// </summary>
+    private void FailClosed(
+        string intentId,
+        Intent intent,
+        string failureReason,
+        string eventType,
+        string notificationKey,
+        string notificationTitle,
+        string notificationMessage,
+        OrderSubmissionResult? stopResult,
+        OrderSubmissionResult? targetResult,
+        object? additionalData,
+        DateTimeOffset utcNow)
+    {
+        // Notify coordinator of protective failure
+        _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
+        
+        // Flatten position immediately with retry logic
+        var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
+        
+        // Stand down stream
+        _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"{eventType}: {failureReason}");
+        
+        // Persist incident record
+        PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, flattenResult, utcNow);
+        
+        // Raise high-priority alert
+        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+        if (notificationService != null)
+        {
+            notificationService.EnqueueNotification(notificationKey, notificationTitle, notificationMessage, priority: 2); // Emergency priority
+        }
+        
+        // Log final flattened event
+        var logData = new Dictionary<string, object>
+        {
+            { "intent_id", intentId },
+            { "stream", intent.Stream },
+            { "instrument", intent.Instrument },
+            { "flatten_success", flattenResult.Success },
+            { "flatten_error", flattenResult.ErrorMessage },
+            { "failure_reason", failureReason },
+            { "note", "Position flattened and stream stood down (fail-closed behavior)" }
+        };
+        
+        if (stopResult != null)
+        {
+            logData["stop_success"] = stopResult.Success;
+            logData["stop_error"] = stopResult.ErrorMessage;
+        }
+        if (targetResult != null)
+        {
+            logData["target_success"] = targetResult.Success;
+            logData["target_error"] = targetResult.ErrorMessage;
+        }
+        if (additionalData != null)
+        {
+            // Merge additional data into log
+            var props = additionalData.GetType().GetProperties();
+            foreach (var prop in props)
+            {
+                logData[prop.Name] = prop.GetValue(additionalData);
+            }
+        }
+        
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, eventType, logData));
     }
     
     /// <summary>
@@ -1289,20 +1333,26 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                     // Get intent to find stream
                     if (_intentMap.TryGetValue(intentId, out var intent))
                     {
-                        // Flatten position with retry logic
-                        var flattenResult = FlattenWithRetry(intentId, instrument, utcNow);
-                        
-                        // Stand down stream
-                        _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"UNPROTECTED_POSITION_TIMEOUT:{intentId}");
-                        
-                        // Raise high-priority alert
-                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                        if (notificationService != null)
-                        {
-                            var title = $"CRITICAL: Unprotected Position Timeout - {instrument}";
-                            var message = $"Entry filled but protective orders not acknowledged within {UNPROTECTED_POSITION_TIMEOUT_SECONDS} seconds. Position flattened. Stream: {intent.Stream}, Intent: {intentId}";
-                            notificationService.EnqueueNotification($"UNPROTECTED_TIMEOUT:{intentId}", title, message, priority: 2); // Emergency priority
-                        }
+                        // SIMPLIFICATION: Use centralized fail-closed pattern
+                        var failureReason = $"Unprotected position timeout ({UNPROTECTED_POSITION_TIMEOUT_SECONDS}s) - protective orders not acknowledged";
+                        FailClosed(
+                            intentId,
+                            intent,
+                            failureReason,
+                            "UNPROTECTED_POSITION_TIMEOUT_FLATTENED",
+                            $"UNPROTECTED_TIMEOUT:{intentId}",
+                            $"CRITICAL: Unprotected Position Timeout - {instrument}",
+                            $"Entry filled but protective orders not acknowledged within {UNPROTECTED_POSITION_TIMEOUT_SECONDS} seconds. Position flattened. Stream: {intent.Stream}, Intent: {intentId}",
+                            null, // stopResult
+                            null, // targetResult
+                            new 
+                            { 
+                                elapsed_seconds = elapsed,
+                                protective_stop_acknowledged = orderInfo.ProtectiveStopAcknowledged,
+                                protective_target_acknowledged = orderInfo.ProtectiveTargetAcknowledged,
+                                timeout_seconds = UNPROTECTED_POSITION_TIMEOUT_SECONDS
+                            }, // additionalData
+                            utcNow);
                     }
                 }
             }

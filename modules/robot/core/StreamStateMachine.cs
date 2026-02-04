@@ -191,11 +191,17 @@ public sealed class StreamStateMachine
     private decimal? _lastCloseBeforeLock;
 
     // Dry-run entry tracking
+    // SEMANTIC CHANGE: _entryDetected is now an observation flag (post-fact), not a decision flag (pre-submission)
+    // After removing immediate entry path, _entryDetected is only set:
+    // - On restart (from journal/execution journal)
+    // - In LogNoTradeMarketClose() (mark as processed)
+    // It is NOT set pre-submission - execution journal is authoritative for fill state
+    // All _entryDetected checks are kept for defense-in-depth and restart recovery support
     private bool _entryDetected;
     private string? _intendedDirection; // "Long", "Short", or null
     private decimal? _intendedEntryPrice;
     private DateTimeOffset? _intendedEntryTimeUtc;
-    private string? _triggerReason; // "IMMEDIATE_AT_LOCK", "BREAKOUT", "NO_TRADE_MARKET_CLOSE"
+    private string? _triggerReason; // "ENTRY_STOP_BRACKET_LONG", "ENTRY_STOP_BRACKET_SHORT", "NO_TRADE_MARKET_CLOSE"
     private decimal? _brkLongRaw;
     private decimal? _brkShortRaw;
     private decimal? _brkLongRounded;
@@ -2396,8 +2402,8 @@ public sealed class StreamStateMachine
             _brkLongRounded.HasValue && _brkShortRounded.HasValue)
         {
             // Check if intents were already submitted (idempotency check)
-            var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "STOP_BRACKETS_AT_LOCK");
-            var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "STOP_BRACKETS_AT_LOCK");
+            var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+            var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
             
             bool alreadySubmitted = false;
             if (_executionJournal != null)
@@ -2995,11 +3001,16 @@ public sealed class StreamStateMachine
                 }
             }
 
-            // Check for breakout after lock (before market close) - FIXED: Now works for all execution modes
-            if (!_entryDetected && barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
-            {
-                CheckBreakoutEntry(barUtc, high, low, utcNow);
-            }
+            // SIMPLIFICATION: Removed CheckBreakoutEntry() - stop brackets handle breakouts automatically
+            // Stop brackets (OCO-linked Long + Short) are submitted at lock and fill automatically when price hits breakout level
+            // This eliminates race conditions and simplifies execution to 2 paths: immediate entry OR stop brackets
+            // Breakout detection on bars is no longer needed - stop brackets handle it
+            // 
+            // OLD CODE (removed):
+            // if (!_entryDetected && barUtc >= SlotTimeUtc && barUtc < MarketCloseUtc && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            // {
+            //     CheckBreakoutEntry(barUtc, high, low, utcNow);
+            // }
         }
     }
 
@@ -3202,73 +3213,13 @@ public sealed class StreamStateMachine
                 note = "Entered SubmitStopEntryBracketsAtLock - checking preconditions"
             }));
 
-        // Idempotency: only once per stream per day
-        if (_stopBracketsSubmittedAtLock)
+        // SIMPLIFICATION: Use consolidated precondition check
+        var canSubmitResult = CanSubmitStopBrackets(utcNow);
+        if (!canSubmitResult.CanSubmit)
         {
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new { reason = "IDEMPOTENCY", _stopBracketsSubmittedAtLock = true }));
-            return;
-        }
-
-        // Preconditions
-        if (_journal.Committed || State == StreamState.DONE)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new { reason = "JOURNAL_COMMITTED_OR_DONE", journal_committed = _journal?.Committed ?? false, state = State.ToString() }));
-            return;
-        }
-        if (_rangeInvalidated)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new { reason = "RANGE_INVALIDATED", _rangeInvalidated = true }));
-            return;
-        }
-        // Trading gate: Block entries if breakout levels are missing
-        if (_breakoutLevelsMissing)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new { reason = "BREAKOUT_LEVELS_MISSING", _breakoutLevelsMissing = true, note = "Stream gated from entry until breakout levels are computed" }));
-            return;
-        }
-        if (_executionAdapter == null || _executionJournal == null || _riskGate == null)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new 
-                { 
-                    reason = "NULL_DEPENDENCIES",
-                    execution_adapter_null = _executionAdapter == null,
-                    execution_journal_null = _executionJournal == null,
-                    risk_gate_null = _riskGate == null
-                }));
-            return;
-        }
-        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new 
-                { 
-                    reason = "BREAKOUT_LEVELS_MISSING",
-                    brk_long_has_value = _brkLongRounded.HasValue,
-                    brk_short_has_value = _brkShortRounded.HasValue
-                }));
-            return;
-        }
-        if (!RangeHigh.HasValue || !RangeLow.HasValue)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
-                new 
-                { 
-                    reason = "RANGE_VALUES_MISSING",
-                    range_high_has_value = RangeHigh.HasValue,
-                    range_low_has_value = RangeLow.HasValue
-                }));
+                new { reason = canSubmitResult.Reason, details = canSubmitResult.Details }));
             return;
         }
 
@@ -3372,7 +3323,7 @@ public sealed class StreamStateMachine
             targetPrice: longTarget,
             beTrigger: longBeTrigger,
             entryTimeUtc: utcNow,
-            triggerReason: "STOP_BRACKETS_AT_LOCK");
+            triggerReason: "ENTRY_STOP_BRACKET_LONG");
 
         var shortIntent = new Intent(
             TradingDate,
@@ -3386,7 +3337,7 @@ public sealed class StreamStateMachine
             targetPrice: shortTarget,
             beTrigger: shortBeTrigger,
             entryTimeUtc: utcNow,
-            triggerReason: "STOP_BRACKETS_AT_LOCK");
+            triggerReason: "ENTRY_STOP_BRACKET_SHORT");
 
         var longIntentId = longIntent.ComputeIntentId();
         var shortIntentId = shortIntent.ComputeIntentId();
@@ -4511,14 +4462,16 @@ public sealed class StreamStateMachine
             // 2. LogSlotEndSummary
             LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
             
-            // 3. CheckImmediateEntryAtLock (gate on breakout levels)
-            if (FreezeClose.HasValue && RangeHigh.HasValue && RangeLow.HasValue && !_breakoutLevelsMissing)
-            {
-                CheckImmediateEntryAtLock(utcNow);
-            }
-            
-            // 4. SubmitStopEntryBracketsAtLock (gate on breakout levels)
-            if (!_entryDetected && utcNow < MarketCloseUtc && !_breakoutLevelsMissing)
+            // SIMPLIFICATION: Removed immediate entry path - always use stop brackets
+            // Stop brackets handle all entry scenarios:
+            // - If price already beyond breakout → stop fills immediately (marketable stop behavior)
+            // - If price not at breakout → stop waits for breakout
+            // This eliminates race conditions and simplifies execution to single entry mechanism
+            //
+            // Gate: Ensure breakout levels exist (canonical prerequisite for stop bracket submission)
+            // Note: SubmitStopEntryBracketsAtLock() has internal gates on _brkLongRounded/_brkShortRounded (line 3255)
+            //       and _breakoutLevelsMissing (line 3235), so this gate is redundant but kept for clarity
+            if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
                 SubmitStopEntryBracketsAtLock(utcNow);
             }
@@ -5025,7 +4978,12 @@ public sealed class StreamStateMachine
 
         _journal.Committed = true;
         _journal.CommitReason = commitReason;
-        _journal.EntryDetected = _entryDetected; // Ensure persisted on commit
+        // CRITICAL FIX: Make execution journal authoritative for EntryDetected at commit
+        // After removing RecordIntendedEntry(), _entryDetected may be false even after fill
+        // Execution journal is ground truth for fills (already used by restart recovery)
+        _journal.EntryDetected = 
+            (_executionJournal?.HasEntryFillForStream(TradingDate, Stream) == true) 
+            || _entryDetected;
         _journal.LastState = StreamState.DONE.ToString();
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journal.TimetableHashAtCommit = _timetableHash;
@@ -5216,334 +5174,29 @@ public sealed class StreamStateMachine
         }
     }
 
-    private void CheckImmediateEntryAtLock(DateTimeOffset utcNow)
-    {
-        if (!FreezeClose.HasValue || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
-            return;
 
-        var freezeClose = FreezeClose.Value;
-        var brkLong = _brkLongRounded.Value;
-        var brkShort = _brkShortRounded.Value;
+    // SIMPLIFICATION: CheckBreakoutEntry() and CheckImmediateEntryAtLock() methods removed
+    // Stop brackets (submitted at lock) handle ALL entry scenarios automatically:
+    // - If price already beyond breakout → stop fills immediately (marketable stop behavior)
+    // - If price not at breakout → stop waits for breakout
+    // This eliminates race conditions and reduces complexity from 2 paths to 1:
+    // 1. Stop brackets at lock (handle all scenarios - immediate fills and future breakouts)
+    //
+    // Benefits:
+    // - Eliminates race conditions between stop brackets and breakout detection
+    // - Simpler state management (no need to check if stop brackets exist)
+    // - Single mechanism for breakout entries (stop brackets)
+    // - Reduced complexity: 3 entry paths → 2 entry paths
+    //
+    // OLD CODE (removed):
+    // private void CheckBreakoutEntry(DateTimeOffset barUtc, decimal high, decimal low, DateTimeOffset utcNow)
+    // {
+    //     // This method was removed - stop brackets handle breakouts automatically
+    // }
 
-        // Analyzer logic: immediate_long = freeze_close >= brk_long, immediate_short = freeze_close <= brk_short
-        bool immediateLong = freezeClose >= brkLong;
-        bool immediateShort = freezeClose <= brkShort;
-
-        if (immediateLong && immediateShort)
-        {
-            // Both conditions met - choose closer breakout (Analyzer's _handle_dual_immediate_entry)
-            var longDistance = Math.Abs(freezeClose - brkLong);
-            var shortDistance = Math.Abs(freezeClose - brkShort);
-            if (longDistance <= shortDistance)
-            {
-                RecordIntendedEntry("Long", brkLong, SlotTimeUtc, "IMMEDIATE_AT_LOCK", utcNow);
-            }
-            else
-            {
-                RecordIntendedEntry("Short", brkShort, SlotTimeUtc, "IMMEDIATE_AT_LOCK", utcNow);
-            }
-        }
-        else if (immediateLong)
-        {
-            RecordIntendedEntry("Long", brkLong, SlotTimeUtc, "IMMEDIATE_AT_LOCK", utcNow);
-        }
-        else if (immediateShort)
-        {
-            RecordIntendedEntry("Short", brkShort, SlotTimeUtc, "IMMEDIATE_AT_LOCK", utcNow);
-        }
-    }
-
-    private void CheckBreakoutEntry(DateTimeOffset barUtc, decimal high, decimal low, DateTimeOffset utcNow)
-    {
-        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
-            return;
-
-        var brkLong = _brkLongRounded.Value;
-        var brkShort = _brkShortRounded.Value;
-
-        // Analyzer logic: long triggers when bar.high >= brk_long, short triggers when bar.low <= brk_short
-        bool longTrigger = high >= brkLong;
-        bool shortTrigger = low <= brkShort;
-
-        if (longTrigger && shortTrigger)
-        {
-            // Both trigger - choose first by timestamp (should be same bar, so choose deterministically)
-            // Analyzer chooses first by timestamp, but if same bar, we choose long (documented)
-            RecordIntendedEntry("Long", brkLong, barUtc, "BREAKOUT", utcNow);
-        }
-        else if (longTrigger)
-        {
-            RecordIntendedEntry("Long", brkLong, barUtc, "BREAKOUT", utcNow);
-        }
-        else if (shortTrigger)
-        {
-            RecordIntendedEntry("Short", brkShort, barUtc, "BREAKOUT", utcNow);
-        }
-    }
-
-    private void RecordIntendedEntry(string direction, decimal entryPrice, DateTimeOffset entryTimeUtc, string triggerReason, DateTimeOffset utcNow)
-    {
-        if (_entryDetected)
-        {
-            // CRITICAL FIX: Log when breakout is detected but entry already exists
-            // This helps debug why breakouts aren't triggering entries (e.g., if immediate entry at lock prevents later breakout entries)
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "BREAKOUT_DETECTED_ALREADY_ENTERED", State.ToString(),
-                new
-                {
-                    detected_direction = direction,
-                    detected_entry_price = entryPrice,
-                    detected_entry_time_utc = entryTimeUtc.ToString("o"),
-                    detected_entry_time_chicago = _time.ConvertUtcToChicago(entryTimeUtc).ToString("o"),
-                    detected_trigger_reason = triggerReason,
-                    existing_entry_direction = _intendedDirection,
-                    existing_entry_price = _intendedEntryPrice,
-                    existing_entry_time_utc = _intendedEntryTimeUtc?.ToString("o") ?? "",
-                    existing_entry_time_chicago = _intendedEntryTimeUtc.HasValue ? _time.ConvertUtcToChicago(_intendedEntryTimeUtc.Value).ToString("o") : "",
-                    existing_trigger_reason = _triggerReason,
-                    note = "Breakout detected but entry already exists - this breakout was ignored"
-                }));
-            return; // Already detected
-        }
-
-        _entryDetected = true;
-        _intendedDirection = direction;
-        _intendedEntryPrice = entryPrice;
-        _intendedEntryTimeUtc = entryTimeUtc;
-        _triggerReason = triggerReason;
-
-        // PERSIST: Save entry detection to journal
-        _journal.EntryDetected = true;
-        _journals.Save(_journal);
-
-        // Compute protective orders (stop/target/BE trigger)
-        ComputeAndLogProtectiveOrders(utcNow);
-
-        // Log intended entry (always log for DRYRUN parity)
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "DRYRUN_INTENDED_ENTRY", State.ToString(),
-            new
-            {
-                intended_trade = true,
-                direction = direction,
-                entry_time_utc = entryTimeUtc.ToString("o"),
-                entry_time_chicago = _time.ConvertUtcToChicago(entryTimeUtc).ToString("o"),
-                entry_price = entryPrice,
-                trigger_reason = triggerReason
-            }));
-
-        // Build intent and execute (execution mode only determines adapter, not behavior)
-        // Note: Execution adapter will validate null values - no need to check here
-
-        // PHASE 3: Assert Instrument property is canonical (logic identity)
-        if (Instrument != CanonicalInstrument)
-        {
-            throw new InvalidOperationException(
-                $"PHASE 3 ASSERTION FAILED: Stream Instrument property '{Instrument}' does not match CanonicalInstrument '{CanonicalInstrument}'. " +
-                $"Instrument property must represent logic identity (canonical)."
-            );
-        }
-        
-        // PHASE 3: Assert Stream ID is canonical (does not contain execution instrument)
-        if (ExecutionInstrument != CanonicalInstrument && Stream.IndexOf(ExecutionInstrument, StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            throw new InvalidOperationException(
-                $"PHASE 3 ASSERTION FAILED: Execution instrument '{ExecutionInstrument}' found in Stream ID '{Stream}'. " +
-                $"Stream ID must use canonical instrument '{CanonicalInstrument}'."
-            );
-        }
-        
-        // Build canonical intent (uses canonical Instrument for logic identity)
-        var intent = new Intent(
-            TradingDate,
-            Stream,
-            Instrument,  // PHASE 3: Intent ID uses canonical instrument (logic identity)
-            Session,
-            SlotTimeChicago,
-            direction,
-            entryPrice,
-            _intendedStopPrice,
-            _intendedTargetPrice,
-            _intendedBeTrigger,
-            entryTimeUtc,
-            triggerReason);
-
-        var intentId = intent.ComputeIntentId();
-        
-        // Emit expectation declaration
-        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, ExecutionInstrument, 
-            "INTENT_EXECUTION_EXPECTATION_DECLARED", new
-        {
-            intent_id = intentId,
-            canonical_instrument = CanonicalInstrument,
-            execution_instrument = ExecutionInstrument,
-            policy_base_size = _orderQuantity,
-            policy_max_size = _maxQuantity,
-            source = "EXECUTION_POLICY_FILE"
-        }));
-        
-        // Register policy expectation with adapter
-        if (_executionAdapter is NinjaTraderSimAdapter simAdapterForPolicy)
-        {
-            simAdapterForPolicy.RegisterIntentPolicy(intentId, _orderQuantity, _maxQuantity, 
-                CanonicalInstrument, ExecutionInstrument, "EXECUTION_POLICY_FILE");
-        }
-
-        // Check idempotency: Has this intent already been submitted?
-        if (_executionJournal != null && _executionJournal.IsIntentSubmitted(intentId, TradingDate, Stream))
-        {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "EXECUTION_SKIPPED_DUPLICATE",
-                new
-                {
-                    reason = "INTENT_ALREADY_SUBMITTED",
-                    trading_date = TradingDate,
-                    stream = Stream,
-                    direction,
-                    entry_price = entryPrice
-                }));
-            return;
-        }
-
-        // Risk gate check
-        if (_riskGate == null)
-        {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "EXECUTION_BLOCKED",
-                new { reason = "RISK_GATE_NOT_INITIALIZED" }));
-            return;
-        }
-
-        var streamArmed = !_journal.Committed && State != StreamState.DONE;
-        var (allowed, reason, failedGates) = _riskGate.CheckGates(
-            _executionMode,
-            TradingDate,
-            Stream,
-            Instrument,
-            Session,
-            SlotTimeChicago,
-            timetableValidated: true, // Timetable is validated at engine level
-            streamArmed: streamArmed,
-            utcNow);
-
-        if (!allowed)
-        {
-            _riskGate.LogBlocked(intentId, Instrument, Stream, Session, SlotTimeChicago, TradingDate, 
-                reason ?? "UNKNOWN", failedGates, streamArmed, true, utcNow);
-            return;
-        }
-
-        // All checks passed - log execution allowed (permanent state-transition log)
-        // PHASE 3: Include both canonical and execution identities in event payload
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "EXECUTION_ALLOWED", State.ToString(),
-            new
-            {
-                intent_id = intentId,
-                direction = direction,
-                entry_price = entryPrice,
-                trigger_reason = triggerReason,
-                execution_instrument = ExecutionInstrument,  // PHASE 3: Include execution identity
-                canonical_instrument = CanonicalInstrument,   // PHASE 3: Include canonical identity
-                note = "All gates passed, submitting entry order"
-            }));
-
-        // All checks passed - submit entry order
-        if (_executionAdapter == null)
-        {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "EXECUTION_BLOCKED",
-                new { reason = "EXECUTION_ADAPTER_NOT_INITIALIZED" }));
-            return;
-        }
-
-        // Submit entry order (quantity = code-controlled, Chart Trader ignored)
-        // Use StopMarket for breakout entries, Limit for immediate entries
-        var entryOrderType = triggerReason == "BREAKOUT" ? "STOP_MARKET" : "LIMIT";
-        // PHASE 3: Assert ExecutionInstrument is set before order placement
-        if (string.IsNullOrWhiteSpace(ExecutionInstrument))
-        {
-            throw new InvalidOperationException(
-                "PHASE 3 ASSERTION FAILED: ExecutionInstrument is null or empty. Cannot place orders without execution instrument."
-            );
-        }
-        
-        // PHASE 3: Assert ExecutionInstrument differs from canonical (for micro futures)
-        // This ensures we're not accidentally using canonical instrument for orders
-        if (ExecutionInstrument == CanonicalInstrument && ExecutionInstrument != "ES" && ExecutionInstrument != "NQ" && ExecutionInstrument != "YM" && ExecutionInstrument != "CL" && ExecutionInstrument != "NG" && ExecutionInstrument != "GC" && ExecutionInstrument != "RTY")
-        {
-            // Allow same for regular futures (ES, NQ, etc.), but warn if unexpected
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "EXECUTION_INSTRUMENT_SAME_AS_CANONICAL", State.ToString(),
-                new
-                {
-                    execution_instrument = ExecutionInstrument,
-                    canonical_instrument = CanonicalInstrument,
-                    note = "Execution and canonical instruments are the same (expected for regular futures)"
-                }));
-        }
-        
-        // CRITICAL: Register intent BEFORE order submission so protective orders can be placed on fill
-        // This MUST happen before SubmitEntryOrder() is called, not after
-        // Register intent with adapter for fill callback handling
-        // Use type check and cast instead of reflection (RegisterIntent is internal)
-        if (_executionAdapter is NinjaTraderSimAdapter simAdapterForIntent)
-        {
-            simAdapterForIntent.RegisterIntent(intent);
-        }
-        else
-        {
-            // CRITICAL ERROR: Execution adapter is not NinjaTraderSimAdapter - intent cannot be registered
-            // This will cause protective orders to fail on fill
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "EXECUTION_ERROR",
-                new
-                {
-                    error = "Execution adapter is not NinjaTraderSimAdapter - RegisterIntent() cannot be called",
-                    execution_adapter_type = _executionAdapter?.GetType().Name ?? "NULL",
-                    intent_id = intentId,
-                    note = "CRITICAL: Protective orders will NOT be placed on fill because intent is not registered"
-                }));
-        }
-        
-        // PHASE 2: Use ExecutionInstrument for order placement (not canonical Instrument)
-        // PHASE 3.2: Use code-controlled order quantity (Chart Trader quantity ignored)
-        var entryResult = _executionAdapter.SubmitEntryOrder(
-            intentId,
-            ExecutionInstrument,
-            direction,
-            entryPrice,
-            _orderQuantity, // PHASE 3.2: Code-controlled quantity, not Chart Trader
-            entryOrderType,
-            utcNow);
-
-        // Record submission in journal
-        if (_executionJournal != null)
-        {
-            if (entryResult.Success)
-            {
-                // PHASE 2: Journal uses ExecutionInstrument for execution tracking
-                _executionJournal.RecordSubmission(intentId, TradingDate, Stream, ExecutionInstrument, "ENTRY", entryResult.BrokerOrderId, utcNow, entryPrice);
-            }
-            else
-            {
-                _executionJournal.RecordRejection(intentId, TradingDate, Stream, entryResult.ErrorMessage ?? "UNKNOWN_ERROR", utcNow);
-            }
-        }
-        
-        // If entry submitted successfully, log success
-        // Protective orders will be submitted automatically on entry fill (STEP 4)
-        if (entryResult.Success)
-        {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, Instrument, "ENTRY_SUBMITTED",
-                new
-                {
-                    broker_order_id = entryResult.BrokerOrderId,
-                    direction,
-                    entry_price = entryPrice,
-                    stop_price = _intendedStopPrice,
-                    target_price = _intendedTargetPrice,
-                    intent_registered = _executionAdapter is NinjaTraderSimAdapter,
-                    note = "Protective orders will be submitted after entry fill confirmation"
-                }));
-        }
-    }
+    // REMOVED: RecordIntendedEntry() method - became dead code after removing CheckImmediateEntryAtLock()
+    // Stop brackets create Intent objects directly and don't use this method
+    // This method handled single-entry logic (pre-submission), but stop brackets work differently (submit both orders at once)
 
     private void LogNoTradeMarketClose(DateTimeOffset utcNow)
     {

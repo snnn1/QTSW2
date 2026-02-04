@@ -190,6 +190,47 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        // EXECUTION AUDIT FIX 1: Prevent multiple entry orders for same intent
+        // CRITICAL: Check if entry order already exists for this intent
+        if (_orderMap.TryGetValue(intentId, out var existingOrder))
+        {
+            // Check if existing order is an entry order and still active
+            if (existingOrder.IsEntryOrder && 
+                (existingOrder.State == "SUBMITTED" || 
+                 existingOrder.State == "ACCEPTED" || 
+                 existingOrder.State == "WORKING"))
+            {
+                var error = $"Entry order already exists for intent {intentId}. " +
+                           $"Existing order state: {existingOrder.State}, " +
+                           $"Broker Order ID: {existingOrder.OrderId}";
+                
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_ORDER_DUPLICATE_BLOCKED", new
+                {
+                    intent_id = intentId,
+                    existing_order_id = existingOrder.OrderId,
+                    existing_order_state = existingOrder.State,
+                    error = error,
+                    note = "Multiple entry orders prevented - only one entry order allowed per intent"
+                }));
+                
+                return OrderSubmissionResult.FailureResult(error, utcNow);
+            }
+            
+            // If existing order is filled, allow new entry (shouldn't happen but handle gracefully)
+            if (existingOrder.State == "FILLED")
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_ORDER_ALREADY_FILLED", new
+                {
+                    intent_id = intentId,
+                    existing_order_id = existingOrder.OrderId,
+                    warning = "Entry order already filled - new entry order submission blocked",
+                    note = "This should not happen - entry orders should only be submitted once per intent"
+                }));
+                
+                return OrderSubmissionResult.FailureResult("Entry order already filled for this intent", utcNow);
+            }
+        }
+
         // Fix 1: Hard guard - check executionInstrument matches strategy's Instrument exactly
         if (!IsStrategyExecutionInstrument(instrument))
         {
@@ -650,20 +691,89 @@ public sealed partial class NinjaTraderSimAdapter
             SetOrderTag(order, encodedTag); // Robot-owned envelope
             order.TimeInForce = TimeInForce.Day;
             
-            // CRITICAL: Verify tag was set correctly
+            // EXECUTION AUDIT FIX 2: Make tag verification failure fatal with retry logic
+            // CRITICAL: Verify tag was set correctly - fail-closed if verification fails
             var verifyTag = GetOrderTag(order);
             if (verifyTag != encodedTag)
             {
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_FAILED",
+                var error = $"Order tag verification failed - tag may not be set correctly. " +
+                           $"Expected: {encodedTag}, Actual: {verifyTag ?? "NULL"}";
+                
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_FAILED_CRITICAL",
                     new
                     {
                         intent_id = intentId,
                         expected_tag = encodedTag,
                         actual_tag = verifyTag ?? "NULL",
                         broker_order_id = order.OrderId,
-                        error = "Order tag verification failed - tag may not be set correctly",
-                        note = "This may cause fills to be ignored if tag cannot be decoded"
+                        error = error,
+                        action = "RETRYING_ORDER_CREATION",
+                        note = "CRITICAL: Tag verification failed - retrying order creation with explicit tag setting"
                     }));
+                
+                // CRITICAL FIX: Retry order creation with explicit tag setting
+                // Try setting tag again before giving up
+                try
+                {
+                    SetOrderTag(order, encodedTag);
+                    verifyTag = GetOrderTag(order);
+                    
+                    if (verifyTag != encodedTag)
+                    {
+                        // Still failed after retry - fail-closed
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_FAILED_FATAL",
+                            new
+                            {
+                                intent_id = intentId,
+                                expected_tag = encodedTag,
+                                actual_tag = verifyTag ?? "NULL",
+                                broker_order_id = order.OrderId,
+                                error = "Tag verification failed after retry - order creation aborted",
+                                action = "ORDER_CREATION_ABORTED",
+                                note = "CRITICAL: Cannot guarantee fill tracking - aborting order creation (fail-closed)"
+                            }));
+                        
+                        // Remove from order map if already added
+                        _orderMap.TryRemove(intentId, out _);
+                        
+                        return OrderSubmissionResult.FailureResult(
+                            $"Order tag verification failed after retry: {error}. Order creation aborted (fail-closed).", 
+                            utcNow);
+                    }
+                    else
+                    {
+                        // Retry succeeded - log success
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_RETRY_SUCCEEDED",
+                            new
+                            {
+                                intent_id = intentId,
+                                tag = encodedTag,
+                                broker_order_id = order.OrderId,
+                                note = "Tag verification retry succeeded - order creation continuing"
+                            }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Retry failed with exception - fail-closed
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_TAG_SET_RETRY_EXCEPTION",
+                        new
+                        {
+                            intent_id = intentId,
+                            expected_tag = encodedTag,
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            action = "ORDER_CREATION_ABORTED",
+                            note = "CRITICAL: Tag retry threw exception - aborting order creation (fail-closed)"
+                        }));
+                    
+                    // Remove from order map if already added
+                    _orderMap.TryRemove(intentId, out _);
+                    
+                    return OrderSubmissionResult.FailureResult(
+                        $"Order tag verification retry failed: {ex.Message}. Order creation aborted (fail-closed).", 
+                        utcNow);
+                }
             }
 
             // Store order info for callback correlation
@@ -1166,19 +1276,79 @@ public sealed partial class NinjaTraderSimAdapter
             // Try to get stream from orderInfo if available, but likely unknown
             _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:INTENT_NOT_FOUND:{intentId}");
             
-            _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
-                new
+            // CRITICAL FIX: Flatten position immediately (fail-closed)
+            // Entry fill happened but intent not found - position exists but is unprotected
+            // Must flatten to prevent unprotected position accumulation
+            try
+            {
+                var flattenResult = Flatten(intentId, instrument, utcNow);
+                
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        tag = encodedTag,
+                        order_type = orderType,
+                        instrument = instrument,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        reason = "INTENT_NOT_FOUND",
+                        action_taken = "EXECUTION_BLOCKED_AND_FLATTENED",
+                        flatten_success = flattenResult.Success,
+                        flatten_error = flattenResult.ErrorMessage,
+                        note = "Intent not found in _intentMap - orphan fill logged, position flattened (fail-closed)"
+                    }));
+                
+                // Raise high-priority alert if flatten succeeded
+                if (flattenResult.Success)
                 {
-                    intent_id = intentId,
-                    tag = encodedTag,
-                    order_type = orderType,
-                    instrument = instrument,
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    reason = "INTENT_NOT_FOUND",
-                    action_taken = "EXECUTION_BLOCKED",
-                    note = "Intent not found in _intentMap - orphan fill logged, execution blocked"
-                }));
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Intent Not Found - Position Flattened - {instrument}";
+                        var message = $"Entry fill occurred but intent not found in map. Position flattened automatically. Intent: {intentId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2); // Emergency priority
+                    }
+                }
+                else
+                {
+                    // Flatten failed - critical alert
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Intent Not Found - Flatten FAILED - {instrument}";
+                        var message = $"Entry fill occurred but intent not found. Flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_FLATTEN_EXCEPTION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        tag = encodedTag,
+                        order_type = orderType,
+                        instrument = instrument,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        reason = "INTENT_NOT_FOUND",
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        action_taken = "EXECUTION_BLOCKED_FLATTEN_EXCEPTION",
+                        note = "CRITICAL: Intent not found and flatten operation threw exception - MANUAL INTERVENTION REQUIRED"
+                    }));
+                
+                // Critical alert for flatten exception
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    var title = $"CRITICAL: Intent Not Found - Flatten EXCEPTION - {instrument}";
+                    var message = $"Entry fill occurred but intent not found. Flatten operation threw exception - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Exception: {ex.Message}";
+                    notificationService.EnqueueNotification($"INTENT_NOT_FOUND_FLATTEN_EXCEPTION:{intentId}", title, message, priority: 3); // Highest priority
+                }
+            }
             
             return false;
         }
@@ -1328,44 +1498,262 @@ public sealed partial class NinjaTraderSimAdapter
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
         
-        // CRITICAL: Log when orders are ignored due to missing/invalid tags
+        // CRITICAL FIX: Fail-closed behavior for untracked fills
+        // If a fill can't be tracked, the position still exists in NinjaTrader but is unprotected
+        // We MUST flatten immediately to prevent unprotected position accumulation
         if (string.IsNullOrEmpty(intentId))
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, "", "", "EXECUTION_UPDATE_IGNORED_NO_TAG",
+            var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "EXECUTION_UPDATE_UNTrackED_FILL_CRITICAL",
                 new 
                 { 
-                    error = "Execution update ignored - order tag missing or invalid",
+                    error = "Execution update (fill) received for order with missing/invalid tag - position may exist but is untracked",
                     broker_order_id = order.OrderId,
                     order_tag = encodedTag ?? "NULL",
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
-                    instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
-                    note = "Order may not be robot-managed or tag was not set correctly"
+                    instrument = instrument,
+                    action = "FLATTEN_IMMEDIATELY",
+                    note = "CRITICAL: Fill happened but can't be tracked. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
                 }));
-            return; // strict: non-robot orders ignored
+            
+            // CRITICAL: Flatten position immediately (fail-closed)
+            // The fill happened in NinjaTrader, so we must flatten to prevent unprotected position
+            // Since we don't have intent_id, we'll flatten the entire instrument position
+            try
+            {
+                // Use a dummy intent_id to flatten instrument position
+                // FlattenIntentReal flattens the entire instrument anyway, so this works
+                var flattenResult = Flatten("UNKNOWN_UNTrackED_FILL", instrument, utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "UNTrackED_FILL_FLATTENED",
+                    new
+                    {
+                        broker_order_id = order.OrderId,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        flatten_success = flattenResult.Success,
+                        flatten_error = flattenResult.ErrorMessage,
+                        note = "Position flattened due to untracked fill (fail-closed behavior)"
+                    }));
+                
+                // Alert if flatten succeeded (info) or failed (critical)
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    if (flattenResult.Success)
+                    {
+                        var title = $"Untracked Fill - Position Flattened - {instrument}";
+                        var message = $"Untracked fill occurred (missing/invalid tag) and position was flattened automatically. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
+                        notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTENED:{order.OrderId}", title, message, priority: 1); // Info priority
+                    }
+                    else
+                    {
+                        var title = $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}";
+                        var message = $"Untracked fill occurred but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
+                        notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTEN_FAILED:{order.OrderId}", title, message, priority: 3); // Highest priority
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_FAILED",
+                    new
+                    {
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        broker_order_id = order.OrderId,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        note = "CRITICAL: Failed to flatten untracked fill position - manual intervention required"
+                    }));
+                
+                // Critical alert for flatten failure
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    var title = $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}";
+                    var message = $"Untracked fill occurred (missing/invalid tag) but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
+                    notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTEN_FAILED:{order.OrderId}", title, message, priority: 3); // Highest priority
+                }
+            }
+            
+            return; // Fail-closed: don't process untracked fill
         }
 
+        // CRITICAL FIX: Handle race condition where fill arrives before order is fully added to _orderMap
+        // This can happen when order state is "Initialized" - order is being submitted but fill arrives immediately
         if (!_orderMap.TryGetValue(intentId, out var orderInfo))
         {
-            // CRITICAL FIX: Handle execution updates (fills) for untracked orders gracefully
-            // This can happen if:
-            // 1. Order was rejected before being tracked but still got filled
-            // 2. Order tracking failed but execution update arrived
-            // 3. Multiple execution updates for same order (race condition)
-            // Log as INFO (not WARN) since this is often expected for rejected orders that still fill
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
-                new 
-                { 
-                    error = "Order not found in tracking map", 
-                    broker_order_id = order.OrderId, 
-                    tag = encodedTag,
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
-                    note = "Execution update (fill) received for untracked order - may indicate order was rejected before tracking or tracking race condition",
-                    severity = "INFO" // Not an error - often expected for rejected orders that still fill
-                }));
-            return;
+            var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var orderState = order.OrderState;
+            
+            // RACE CONDITION FIX: If order is in Initialized state, wait briefly and retry
+            // Order is added to _orderMap BEFORE submission (line 706), but there might be a threading visibility issue
+            // or the fill is arriving from a different order instance
+            if (orderState == OrderState.Initialized)
+            {
+                // EXECUTION AUDIT FIX 3: Increased retry delay from 50ms to 100ms for better race condition resolution
+                // Brief wait for order to be added to map (max 3 retries, 100ms each)
+                const int MAX_RETRIES = 3;
+                const int RETRY_DELAY_MS = 100; // Increased from 50ms to improve race condition resolution
+                
+                bool found = false;
+                for (int retry = 0; retry < MAX_RETRIES; retry++)
+                {
+                    if (retry > 0)
+                    {
+                        System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+                    }
+                    
+                    if (_orderMap.TryGetValue(intentId, out orderInfo))
+                    {
+                        found = true;
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_RACE_CONDITION_RESOLVED",
+                            new 
+                            { 
+                                broker_order_id = order.OrderId, 
+                                tag = encodedTag,
+                                intent_id = intentId,
+                                fill_price = fillPrice,
+                                fill_quantity = fillQuantity,
+                                retry_count = retry + 1,
+                                order_state = orderState.ToString(),
+                                note = "Fill arrived before order was visible in map - retry succeeded (race condition resolved)"
+                            }));
+                        break; // Found it - continue processing below
+                    }
+                }
+                
+                if (!found)
+                {
+                    // Still not found after retries - flatten (fail-closed)
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
+                        new 
+                        { 
+                            error = "Execution update (fill) received for untracked order - order not found in map after retries",
+                            broker_order_id = order.OrderId, 
+                            tag = encodedTag,
+                            intent_id = intentId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            instrument = instrument,
+                            order_state = orderState.ToString(),
+                            retry_count = MAX_RETRIES,
+                            action = "FLATTEN_IMMEDIATELY",
+                            note = "CRITICAL: Fill happened but order not in tracking map after retries. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
+                        }));
+                    
+                    try
+                    {
+                        var flattenResult = Flatten(intentId, instrument, utcNow);
+                        
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
+                            new
+                            {
+                                broker_order_id = order.OrderId,
+                                intent_id = intentId,
+                                fill_price = fillPrice,
+                                fill_quantity = fillQuantity,
+                                flatten_success = flattenResult.Success,
+                                flatten_error = flattenResult.ErrorMessage,
+                                note = "Position flattened due to untracked order fill (fail-closed behavior)"
+                            }));
+                        
+                        // Alert if flatten succeeded (info) or failed (critical)
+                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                        if (notificationService != null)
+                        {
+                            if (flattenResult.Success)
+                            {
+                                var title = $"Unknown Order Fill - Position Flattened - {instrument}";
+                                var message = $"Fill occurred for order not found in tracking map and position was flattened automatically. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
+                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTENED:{intentId}", title, message, priority: 1); // Info priority
+                            }
+                            else
+                            {
+                                var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
+                                var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
+                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
+                            new
+                            {
+                                error = ex.Message,
+                                exception_type = ex.GetType().Name,
+                                broker_order_id = order.OrderId,
+                                intent_id = intentId,
+                                note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
+                            }));
+                    }
+                    
+                    return; // Fail-closed: don't process untracked fill
+                }
+            }
+            else
+            {
+                // Order not in Initialized state - immediate flatten (fail-closed)
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
+                    new 
+                    { 
+                        error = "Execution update (fill) received for untracked order - position may exist but is untracked",
+                        broker_order_id = order.OrderId, 
+                        tag = encodedTag,
+                        intent_id = intentId,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        instrument = instrument,
+                        order_state = orderState.ToString(),
+                        action = "FLATTEN_IMMEDIATELY",
+                        note = "CRITICAL: Fill happened but order not in tracking map. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
+                    }));
+                
+                try
+                {
+                    var flattenResult = Flatten(intentId, instrument, utcNow);
+                    
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
+                        new
+                        {
+                            broker_order_id = order.OrderId,
+                            intent_id = intentId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            note = "Position flattened due to untracked order fill (fail-closed behavior)"
+                        }));
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            broker_order_id = order.OrderId,
+                            intent_id = intentId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
+                        }));
+                    
+                    // Critical alert for flatten failure
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
+                        var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
+                        notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
+                    }
+                }
+                
+                return; // Fail-closed: don't process untracked fill
+            }
         }
 
         // Track cumulative fills for partial-fill safety
@@ -1468,10 +1856,11 @@ public sealed partial class NinjaTraderSimAdapter
                 // OnEntryFill does: exposure.EntryFilledQty += qty, so passing cumulative totals causes double-counting
                 _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
                 
-                // CRITICAL FIX: Pass fillQuantity (delta) not filledTotal (cumulative) to HandleEntryFill
-                // HandleEntryFill submits protective orders for the NEW fill quantity only
-                // Passing filledTotal causes exponential position growth as protective orders are resubmitted with cumulative totals
-                HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, utcNow);
+                // CRITICAL FIX: Pass filledTotal (cumulative) to HandleEntryFill for protective orders
+                // HandleEntryFill needs TOTAL filled quantity to submit protective orders that cover the ENTIRE position
+                // For incremental fills, protective orders must be updated to cover cumulative position, not just delta
+                // filledTotal is already updated: orderInfo.FilledQuantity += fillQuantity (line 1372)
+                HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
             }
             else
             {
