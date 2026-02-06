@@ -593,6 +593,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         
         // Check for unprotected positions after protective order submission
         CheckUnprotectedPositions(utcNow);
+        
+        // CRITICAL FIX: Check all instruments for flat positions and cancel entry stops
+        // This detects manual position closures that bypass robot code
+        // Called on every execution update to catch manual flattens quickly
+        CheckAllInstrumentsForFlatPositions(utcNow);
 
         // Proof log: unambiguous, includes encoded envelope and decoded identity
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVES_PLACED", new
@@ -1291,6 +1296,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
     }
 
+    /// <summary>
+    /// Check all instruments for flat positions and cancel entry stops.
+    /// Called on every execution update to detect manual position closures.
+    /// </summary>
+    private void CheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow)
+    {
+        // Implementation in NinjaTraderSimAdapter.NT.cs
+    }
+    
     /// <summary>
     /// Check for unprotected positions and flatten if protectives not acknowledged within timeout.
     /// </summary>

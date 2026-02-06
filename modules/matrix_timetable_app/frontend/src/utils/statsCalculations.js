@@ -285,10 +285,11 @@ export const calculateStats = (filteredData, streamId, contractMultiplier = 1) =
   const annualizedVolatility = stdDevDollars * Math.sqrt(tradingDaysPerYear)
   const sharpeRatio = annualizedVolatility > 0 ? annualizedReturn / annualizedVolatility : 0
   
-  // Sortino Ratio
+  // Sortino Ratio (standard definition: variance around zero)
   const downsideReturnsDollars = dailyReturnsDollars.filter(r => r < 0)
-  const downsideVarianceDollars = downsideReturnsDollars.length > 1
-    ? downsideReturnsDollars.reduce((sum, r) => sum + Math.pow(r, 2), 0) / (downsideReturnsDollars.length - 1)
+  // Calculate downside deviation around zero (standard Sortino definition)
+  const downsideVarianceDollars = downsideReturnsDollars.length > 0
+    ? downsideReturnsDollars.reduce((sum, r) => sum + Math.pow(r, 2), 0) / downsideReturnsDollars.length
     : 0
   const downsideDevDollars = Math.sqrt(downsideVarianceDollars)
   const annualizedDownsideVolatility = downsideDevDollars * Math.sqrt(tradingDaysPerYear)

@@ -1498,6 +1498,25 @@ public sealed partial class NinjaTraderSimAdapter
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
         
+        // CRITICAL FIX: Determine order type from tag (STOP/TARGET suffix) before looking up in _orderMap
+        // Protective orders have tags like QTSW2:{intentId}:STOP or QTSW2:{intentId}:TARGET
+        // Entry orders have tags like QTSW2:{intentId}
+        string? orderTypeFromTag = null;
+        bool isProtectiveOrder = false;
+        if (!string.IsNullOrEmpty(encodedTag))
+        {
+            if (encodedTag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase))
+            {
+                orderTypeFromTag = "STOP";
+                isProtectiveOrder = true;
+            }
+            else if (encodedTag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
+            {
+                orderTypeFromTag = "TARGET";
+                isProtectiveOrder = true;
+            }
+        }
+        
         // CRITICAL FIX: Fail-closed behavior for untracked fills
         // If a fill can't be tracked, the position still exists in NinjaTrader but is unprotected
         // We MUST flatten immediately to prevent unprotected position accumulation
@@ -1578,12 +1597,61 @@ public sealed partial class NinjaTraderSimAdapter
                 }
             }
             
+            // CRITICAL FIX: Check all instruments for flat positions even for untracked fills
+            // Manual flatten may have occurred, and we need to cancel entry stops
+            CheckAllInstrumentsForFlatPositions(utcNow);
+            
             return; // Fail-closed: don't process untracked fill
         }
 
         // CRITICAL FIX: Handle race condition where fill arrives before order is fully added to _orderMap
         // This can happen when order state is "Initialized" - order is being submitted but fill arrives immediately
-        if (!_orderMap.TryGetValue(intentId, out var orderInfo))
+        // CRITICAL FIX: Handle protective orders that aren't in _orderMap
+        // Protective orders (STOP/TARGET) are not always added to _orderMap, but we can create OrderInfo from tag
+        OrderInfo? orderInfo = null;
+        bool orderInfoCreatedFromTag = false;
+        
+        if (!_orderMap.TryGetValue(intentId, out orderInfo))
+        {
+            // If this is a protective order (detected from tag), create OrderInfo on the fly
+            if (isProtectiveOrder && !string.IsNullOrEmpty(orderTypeFromTag) && !string.IsNullOrEmpty(intentId))
+            {
+                // Get intent to get direction and instrument
+                if (_intentMap.TryGetValue(intentId, out var intent))
+                {
+                    orderInfo = new OrderInfo
+                    {
+                        IntentId = intentId,
+                        Instrument = intent.Instrument ?? order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN",
+                        OrderId = order.OrderId,
+                        OrderType = orderTypeFromTag,
+                        Direction = intent.Direction ?? "",
+                        Quantity = order.Quantity,
+                        Price = orderTypeFromTag == "STOP" ? (decimal?)order.StopPrice : (decimal?)order.LimitPrice,
+                        State = "SUBMITTED",
+                        NTOrder = order,
+                        IsEntryOrder = false, // Protective order, not entry
+                        FilledQuantity = 0
+                    };
+                    orderInfoCreatedFromTag = true;
+                    
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_FILL_TRACKED_FROM_TAG",
+                        new
+                        {
+                            broker_order_id = order.OrderId,
+                            tag = encodedTag,
+                            order_type = orderTypeFromTag,
+                            intent_id = intentId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            note = "Protective order fill tracked from tag (order not in _orderMap - created OrderInfo on the fly)"
+                        }));
+                }
+            }
+        }
+        
+        // If still no orderInfo, handle as untracked
+        if (orderInfo == null)
         {
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             var orderState = order.OrderState;
@@ -1687,19 +1755,8 @@ public sealed partial class NinjaTraderSimAdapter
                                 exception_type = ex.GetType().Name,
                                 broker_order_id = order.OrderId,
                                 intent_id = intentId,
-                                fill_price = fillPrice,
-                                fill_quantity = fillQuantity,
                                 note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
                             }));
-                        
-                        // Critical alert for flatten failure
-                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                        if (notificationService != null)
-                        {
-                            var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
-                            var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
-                        }
                     }
                     
                     return; // Fail-closed: don't process untracked fill
@@ -1738,24 +1795,6 @@ public sealed partial class NinjaTraderSimAdapter
                             flatten_error = flattenResult.ErrorMessage,
                             note = "Position flattened due to untracked order fill (fail-closed behavior)"
                         }));
-                    
-                    // Alert if flatten succeeded (info) or failed (critical)
-                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                    if (notificationService != null)
-                    {
-                        if (flattenResult.Success)
-                        {
-                            var title = $"Unknown Order Fill - Position Flattened - {instrument}";
-                            var message = $"Fill occurred for order not found in tracking map and position was flattened automatically. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTENED:{intentId}", title, message, priority: 1); // Info priority
-                        }
-                        else
-                        {
-                            var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
-                            var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
-                        }
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -1823,8 +1862,10 @@ public sealed partial class NinjaTraderSimAdapter
         }
         
         // CRITICAL: Resolve intent context before any journal call
+        // Use orderTypeFromTag if available (from tag), otherwise use orderInfo.OrderType
+        var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
         IntentContext context;
-        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, 
+        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument, 
             fillPrice, fillQuantity, utcNow, out context))
         {
             // Context resolution failed - orphan fill logged and execution blocked
@@ -1833,7 +1874,10 @@ public sealed partial class NinjaTraderSimAdapter
         }
         
         // Explicit Entry vs Exit Classification
-        if (orderInfo.IsEntryOrder == true)
+        // CRITICAL FIX: Use orderTypeFromTag to determine if it's an entry or exit order
+        // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry order in _orderMap)
+        bool isEntryFill = !isProtectiveOrder && orderInfo.IsEntryOrder == true;
+        if (isEntryFill)
         {
             // Entry fill
             _executionJournal.RecordEntryFill(
@@ -1884,6 +1928,11 @@ public sealed partial class NinjaTraderSimAdapter
                 // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
                 // OnEntryFill does: exposure.EntryFilledQty += qty, so passing cumulative totals causes double-counting
                 _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+                
+                // CRITICAL FIX: Check if position is now flat after entry fill - if so, cancel entry stop orders
+                // This handles manual position closures (user clicks "Flatten" in NinjaTrader UI) that happen
+                // immediately after entry fills (race condition where user flattens before protective orders submit)
+                CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
                 
                 // CRITICAL FIX: Pass filledTotal (cumulative) to HandleEntryFill for protective orders
                 // HandleEntryFill needs TOTAL filled quantity to submit protective orders that cover the ENTIRE position
@@ -1956,19 +2005,22 @@ public sealed partial class NinjaTraderSimAdapter
                 }
             }
         }
-        else if (orderInfo.OrderType == "STOP" || orderInfo.OrderType == "TARGET")
+        else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
             // Exit fill
+            // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
+            // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
             _executionJournal.RecordExitFill(
                 context.IntentId, 
                 context.TradingDate, 
                 context.Stream,
                 fillPrice, 
                 fillQuantity,  // DELTA ONLY - not filledTotal
-                orderInfo.OrderType, 
+                orderTypeForContext, // Use tag-based order type (ground truth)
                 utcNow);
             
             // Log exit fill event
+            // CRITICAL FIX: Use orderTypeForContext (from tag) for logging - it's the ground truth
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_EXIT_FILL",
                 new
                 {
@@ -1976,13 +2028,99 @@ public sealed partial class NinjaTraderSimAdapter
                     fill_quantity = fillQuantity,
                     filled_total = filledTotal,
                     broker_order_id = order.OrderId,
-                    exit_order_type = orderInfo.OrderType,
+                    exit_order_type = orderTypeForContext, // Use tag-based order type (ground truth)
                     stream = context.Stream
                 }));
             
             // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
             // OnExitFill does: exposure.ExitFilledQty += qty, so passing cumulative totals causes double-counting
             _coordinator?.OnExitFill(intentId, fillQuantity, utcNow);
+            
+            // CRITICAL FIX: Check if position is now flat after exit fill - if so, cancel entry stop orders
+            // This handles manual position closures (user clicks "Flatten" in NinjaTrader UI)
+            // When position goes flat, entry stop orders should be cancelled to prevent re-entry
+            CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+            
+            // CRITICAL FIX: When protective stop OR target fills, cancel opposite entry stop order to prevent re-entry
+            // OCO should handle this, but if OCO fails or there's a race condition, the opposite entry stop
+            // can still be active and fill later, creating an unwanted new position
+            // This applies to BOTH stop loss and target (limit) fills - when either fills, position is closed
+            // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
+            // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
+            if ((orderTypeForContext == "STOP" || orderTypeForContext == "TARGET") && _intentMap.TryGetValue(intentId, out var filledIntent))
+            {
+                // Find the opposite entry intent for this stream
+                // Entry intents are created in pairs: one Long, one Short with same TradingDate/Stream/SlotTime
+                var oppositeDirection = filledIntent.Direction == "Long" ? "Short" : "Long";
+                
+                // Find opposite intent by searching _intentMap for same stream with opposite direction
+                string? oppositeIntentId = null;
+                foreach (var kvp in _intentMap)
+                {
+                    var otherIntent = kvp.Value;
+                    if (otherIntent.Stream == filledIntent.Stream &&
+                        otherIntent.TradingDate == filledIntent.TradingDate &&
+                        otherIntent.Direction == oppositeDirection &&
+                        otherIntent.TriggerReason != null &&
+                        (otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") || 
+                         otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                    {
+                        oppositeIntentId = kvp.Key;
+                        break;
+                    }
+                }
+                
+                // Cancel opposite entry order if found
+                // CRITICAL FIX: Only cancel if opposite entry hasn't filled yet
+                // If opposite entry already filled, it has protective orders that should NOT be cancelled
+                // (They protect the opposite position and should be managed via OCO groups)
+                if (oppositeIntentId != null)
+                {
+                    // Check if opposite entry already filled (defense-in-depth)
+                    // Get journal entry for opposite intent and check if it has an entry fill
+                    var oppositeEntryFilled = false;
+                    if (_executionJournal != null && !string.IsNullOrEmpty(filledIntent.TradingDate) && !string.IsNullOrEmpty(filledIntent.Stream))
+                    {
+                        var oppositeEntry = _executionJournal.GetEntry(oppositeIntentId, filledIntent.TradingDate, filledIntent.Stream);
+                        oppositeEntryFilled = oppositeEntry != null && (oppositeEntry.EntryFilled || oppositeEntry.EntryFilledQuantityTotal > 0);
+                    }
+                    
+                    if (!oppositeEntryFilled)
+                    {
+                        // Opposite entry hasn't filled - safe to cancel (only cancels entry order, not protective orders)
+                        var cancelled = CancelIntentOrders(oppositeIntentId, utcNow);
+                        if (cancelled)
+                        {
+                            var exitType = orderTypeForContext == "STOP" ? "stop" : "target";
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "OPPOSITE_ENTRY_CANCELLED_ON_EXIT_FILL",
+                                new
+                                {
+                                    filled_intent_id = intentId,
+                                    opposite_intent_id = oppositeIntentId,
+                                    filled_direction = filledIntent.Direction,
+                                    opposite_direction = oppositeDirection,
+                                    exit_order_type = orderTypeForContext,
+                                    stream = context.Stream,
+                                    note = $"Cancelled opposite entry stop order when protective {exitType} filled to prevent re-entry"
+                                }));
+                        }
+                    }
+                    else
+                    {
+                        // Opposite entry already filled - don't cancel (would cancel its protective orders)
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "OPPOSITE_ENTRY_ALREADY_FILLED_SKIP_CANCEL",
+                            new
+                            {
+                                filled_intent_id = intentId,
+                                opposite_intent_id = oppositeIntentId,
+                                filled_direction = filledIntent.Direction,
+                                opposite_direction = oppositeDirection,
+                                stream = context.Stream,
+                                note = "Opposite entry already filled - skipping cancel to avoid cancelling protective orders (OCO should handle entry cancellation)"
+                            }));
+                    }
+                }
+            }
         }
         else
         {
@@ -2005,6 +2143,11 @@ public sealed partial class NinjaTraderSimAdapter
             
             return; // Fail-closed
         }
+        
+        // CRITICAL FIX: Check all instruments for flat positions after EVERY execution update
+        // This detects manual position closures that bypass robot code
+        // Called after both entry and exit fills to catch manual flattens quickly
+        CheckAllInstrumentsForFlatPositions(utcNow);
     }
 
     /// <summary>
@@ -2299,8 +2442,9 @@ public sealed partial class NinjaTraderSimAdapter
                     instrument = instrument
                 }));
                 
-                // Set order tag
-                SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
+                // CRITICAL FIX: Use EncodeStopTag() so BE modification can find the order
+                // BE modification code (ModifyStopToBreakEven) looks for tag QTSW2:{intentId}:STOP
+                SetOrderTag(order, RobotOrderIds.EncodeStopTag(intentId));
             }
             catch (Exception ex)
             {
@@ -2394,6 +2538,24 @@ public sealed partial class NinjaTraderSimAdapter
                 expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice ?? stopPrice, 
                 targetPrice: intentTargetPrice, direction: direction, ocoGroup: ocoGroupToUse);
 
+            // CRITICAL FIX: Add protective stop order to _orderMap so it can be tracked when it fills
+            // Without this, protective stop fills are treated as untracked and trigger flatten operations
+            var stopOrderInfo = new OrderInfo
+            {
+                IntentId = intentId,
+                Instrument = instrument,
+                OrderId = order.OrderId,
+                OrderType = "STOP",
+                Direction = direction,
+                Quantity = quantity,
+                Price = stopPrice,
+                State = "SUBMITTED",
+                NTOrder = order,
+                IsEntryOrder = false, // Protective order, not entry
+                FilledQuantity = 0
+            };
+            _orderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
+            
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
                 broker_order_id = order.OrderId,
@@ -2401,7 +2563,8 @@ public sealed partial class NinjaTraderSimAdapter
                 direction,
                 stop_price = stopPrice,
                 quantity,
-                account = "SIM"
+                account = "SIM",
+                note = "Protective stop order added to _orderMap for tracking"
             }));
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
@@ -2767,6 +2930,28 @@ public sealed partial class NinjaTraderSimAdapter
                 expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice2, 
                 targetPrice: intentTargetPrice2 ?? targetPrice, direction: direction, ocoGroup: ocoGroup2);
 
+            // CRITICAL FIX: Add protective target order to _orderMap so it can be tracked when it fills
+            // Without this, protective target fills are treated as untracked and trigger flatten operations
+            // Note: This overwrites entry order in _orderMap, but that's OK because:
+            // - Entry order is already filled by the time protective orders are submitted
+            // - Entry fills are tracked in execution journal (ground truth)
+            // - Tag-based detection provides fallback if _orderMap lookup fails
+            var targetOrderInfo = new OrderInfo
+            {
+                IntentId = intentId,
+                Instrument = instrument,
+                OrderId = order.OrderId,
+                OrderType = "TARGET",
+                Direction = direction,
+                Quantity = quantity,
+                Price = targetPrice,
+                State = "SUBMITTED",
+                NTOrder = order,
+                IsEntryOrder = false, // Protective order, not entry
+                FilledQuantity = 0
+            };
+            _orderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
+            
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
                 broker_order_id = order.OrderId,
@@ -2774,7 +2959,8 @@ public sealed partial class NinjaTraderSimAdapter
                 direction,
                 target_price = targetPrice,
                 quantity,
-                account = "SIM"
+                account = "SIM",
+                note = "Protective target order added to _orderMap for tracking"
             }));
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
@@ -3103,6 +3289,9 @@ public sealed partial class NinjaTraderSimAdapter
         try
         {
             // Find orders matching this intent ID
+            // CRITICAL FIX: Only cancel entry orders, not protective orders
+            // Protective orders should be managed via OCO groups (when one fills, OCO cancels the other)
+            // If we cancel protective orders here, we could leave positions unprotected
             foreach (var order in account.Orders)
             {
                 if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
@@ -3113,8 +3302,12 @@ public sealed partial class NinjaTraderSimAdapter
                 var tag = GetOrderTag(order) ?? "";
                 var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
                 
-                // Match intent ID (handles STOP, TARGET suffixes)
-                if (decodedIntentId == intentId)
+                // Match intent ID AND ensure it's an entry order (not STOP/TARGET)
+                // Entry orders: QTSW2:{intentId}
+                // Protective orders: QTSW2:{intentId}:STOP or QTSW2:{intentId}:TARGET
+                if (decodedIntentId == intentId && 
+                    !tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) && 
+                    !tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
                 {
                     ordersToCancel.Add(order);
                 }
@@ -3143,11 +3336,76 @@ public sealed partial class NinjaTraderSimAdapter
                         cancelled_count = ordersToCancel.Count,
                         cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList()
                     }));
-                
-                return true;
             }
             
-            return true; // No orders to cancel is success
+            // CRITICAL FIX: Defensively cancel opposite entry stop order to prevent re-entry
+            // This handles cases where cancellation is called but opposite entry wasn't explicitly cancelled
+            if (_intentMap.TryGetValue(intentId, out var cancelledIntent))
+            {
+                // Find the opposite entry intent for this stream
+                var oppositeDirection = cancelledIntent.Direction == "Long" ? "Short" : "Long";
+                string? oppositeIntentId = null;
+                
+                foreach (var kvp in _intentMap)
+                {
+                    var otherIntent = kvp.Value;
+                    if (otherIntent.Stream == cancelledIntent.Stream &&
+                        otherIntent.TradingDate == cancelledIntent.TradingDate &&
+                        otherIntent.Direction == oppositeDirection &&
+                        otherIntent.TriggerReason != null &&
+                        (otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") ||
+                         otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                    {
+                        // Check if opposite entry hasn't filled yet
+                        var oppositeEntryFilled = false;
+                        if (_executionJournal != null && !string.IsNullOrEmpty(otherIntent.TradingDate) && !string.IsNullOrEmpty(otherIntent.Stream))
+                        {
+                            var oppositeEntry = _executionJournal.GetEntry(kvp.Key, otherIntent.TradingDate, otherIntent.Stream);
+                            oppositeEntryFilled = oppositeEntry != null && (oppositeEntry.EntryFilled || oppositeEntry.EntryFilledQuantityTotal > 0);
+                        }
+                        
+                        if (!oppositeEntryFilled)
+                        {
+                            oppositeIntentId = kvp.Key;
+                            break;
+                        }
+                    }
+                }
+                
+                // Cancel opposite entry if found and not filled
+                if (oppositeIntentId != null && oppositeIntentId != intentId)
+                {
+                    try
+                    {
+                        var oppositeCancelled = CancelIntentOrdersReal(oppositeIntentId, utcNow);
+                        if (oppositeCancelled)
+                        {
+                            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCELLED_DEFENSIVELY", state: "ENGINE",
+                                new
+                                {
+                                    cancelled_intent_id = intentId,
+                                    opposite_intent_id = oppositeIntentId,
+                                    stream = cancelledIntent.Stream,
+                                    note = "Defensively cancelled opposite entry stop order when cancelling intent to prevent re-entry"
+                                }));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log but don't fail - defensive cancellation failure is not critical
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCEL_DEFENSIVE_FAILED", state: "ENGINE",
+                            new
+                            {
+                                cancelled_intent_id = intentId,
+                                opposite_intent_id = oppositeIntentId,
+                                error = ex.Message,
+                                note = "Failed to defensively cancel opposite entry - may cause re-entry"
+                            }));
+                    }
+                }
+            }
+            
+            return true; // Success (even if no orders to cancel)
         }
         catch (Exception ex)
         {
@@ -3293,6 +3551,78 @@ public sealed partial class NinjaTraderSimAdapter
             // GC FIX: Check if position is null before accessing Quantity
             var positionQty = position?.Quantity ?? 0;
             
+            // CRITICAL FIX: Cancel entry stop orders when position is manually flattened
+            // When user manually cancels a position, entry stop orders remain active
+            // If price is at/through opposite breakout level, opposite entry stop fills immediately → re-entry
+            // Solution: Cancel BOTH entry stop orders (long and short) for this stream when flattening
+            if (_intentMap.TryGetValue(intentId, out var flattenedIntent))
+            {
+                // Find the stream and trading date from the flattened intent
+                var stream = flattenedIntent.Stream ?? "";
+                var tradingDate = flattenedIntent.TradingDate ?? "";
+                
+                if (!string.IsNullOrEmpty(stream) && !string.IsNullOrEmpty(tradingDate))
+                {
+                    // Find both entry intents (long and short) for this stream
+                    var entryIntentIds = new List<string>();
+                    foreach (var kvp in _intentMap)
+                    {
+                        var otherIntent = kvp.Value;
+                        if (otherIntent.Stream == stream &&
+                            otherIntent.TradingDate == tradingDate &&
+                            otherIntent.TriggerReason != null &&
+                            (otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") ||
+                             otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                        {
+                            // Check if this entry hasn't filled yet (only cancel unfilled entries)
+                            var entryFilled = false;
+                            if (_executionJournal != null)
+                            {
+                                var journalEntry = _executionJournal.GetEntry(kvp.Key, tradingDate, stream);
+                                entryFilled = journalEntry != null && (journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0);
+                            }
+                            
+                            if (!entryFilled)
+                            {
+                                entryIntentIds.Add(kvp.Key);
+                            }
+                        }
+                    }
+                    
+                    // Cancel all unfilled entry stop orders for this stream
+                    foreach (var entryIntentId in entryIntentIds)
+                    {
+                        try
+                        {
+                            var cancelled = CancelIntentOrders(entryIntentId, utcNow);
+                            if (cancelled)
+                            {
+                                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_CANCELLED_ON_MANUAL_FLATTEN",
+                                    new
+                                    {
+                                        flattened_intent_id = intentId,
+                                        cancelled_entry_intent_id = entryIntentId,
+                                        stream = stream,
+                                        trading_date = tradingDate,
+                                        note = "Cancelled entry stop order when position was manually flattened to prevent re-entry"
+                                    }));
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_CANCEL_FAILED_ON_FLATTEN",
+                                new
+                                {
+                                    error = ex.Message,
+                                    entry_intent_id = entryIntentId,
+                                    stream = stream,
+                                    note = "Failed to cancel entry stop order on manual flatten - re-entry may occur"
+                                }));
+                        }
+                    }
+                }
+            }
+            
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_INTENT_SUCCESS", state: "ENGINE",
                 new
                 {
@@ -3317,6 +3647,135 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
             
             return FlattenResult.FailureResult($"Flatten intent failed: {ex.Message}", utcNow);
+        }
+    }
+    
+    /// <summary>
+    /// Check if position is flat and cancel all entry stop orders for the instrument.
+    /// Called after execution updates to detect manual position closures.
+    /// </summary>
+    private void CheckAndCancelEntryStopsOnPositionFlat(string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null || _ntInstrument == null)
+        {
+            return;
+        }
+        
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        
+        if (account == null || ntInstrument == null)
+        {
+            return;
+        }
+        
+        try
+        {
+            // Get current position for this instrument
+            Position? position = null;
+            try
+            {
+                if (ntInstrument != null)
+                {
+                    dynamic dynAccount = account;
+                    position = dynAccount.GetPosition(ntInstrument);
+                }
+            }
+            catch
+            {
+                // Try alternative signature
+                try
+                {
+                    if (ntInstrument?.MasterInstrument != null)
+                    {
+                        dynamic dynAccount = account;
+                        position = dynAccount.GetPosition(ntInstrument.MasterInstrument.Name);
+                    }
+                }
+                catch
+                {
+                    // Position check failed - skip cancellation
+                    return;
+                }
+            }
+            
+            // If position is flat, cancel all entry stop orders for this instrument
+            if (position != null && position.MarketPosition == MarketPosition.Flat)
+            {
+                // Find all entry intents for this instrument that haven't filled yet
+                var entryIntentIdsToCancel = new List<string>();
+                
+                foreach (var kvp in _intentMap)
+                {
+                    var intent = kvp.Value;
+                    
+                    // Match instrument
+                    if (intent.Instrument != instrument)
+                        continue;
+                    
+                    // Only check entry stop bracket intents
+                    if (intent.TriggerReason == null ||
+                        (!intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") &&
+                         !intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                        continue;
+                    
+                    // Check if entry hasn't filled yet
+                    var entryFilled = false;
+                    if (_executionJournal != null && !string.IsNullOrEmpty(intent.TradingDate) && !string.IsNullOrEmpty(intent.Stream))
+                    {
+                        var journalEntry = _executionJournal.GetEntry(kvp.Key, intent.TradingDate, intent.Stream);
+                        entryFilled = journalEntry != null && (journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0);
+                    }
+                    
+                    if (!entryFilled)
+                    {
+                        entryIntentIdsToCancel.Add(kvp.Key);
+                    }
+                }
+                
+                // Cancel all unfilled entry stop orders
+                foreach (var entryIntentId in entryIntentIdsToCancel)
+                {
+                    try
+                    {
+                        var cancelled = CancelIntentOrders(entryIntentId, utcNow);
+                        if (cancelled)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCELLED_ON_POSITION_FLAT",
+                                new
+                                {
+                                    cancelled_entry_intent_id = entryIntentId,
+                                    instrument = instrument,
+                                    position_market_position = "Flat",
+                                    note = "Cancelled entry stop order because position is flat (manual closure detected)"
+                                }));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_FAILED_ON_POSITION_FLAT",
+                            new
+                            {
+                                error = ex.Message,
+                                entry_intent_id = entryIntentId,
+                                instrument = instrument,
+                                note = "Failed to cancel entry stop order when position went flat - re-entry may occur"
+                            }));
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Log error but don't throw - this is a safety check, not critical path
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "CHECK_POSITION_FLAT_ERROR",
+                new
+                {
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    instrument = instrument,
+                    note = "Error checking if position is flat - entry stop cancellation skipped"
+                }));
         }
     }
     

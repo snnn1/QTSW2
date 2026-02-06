@@ -3187,6 +3187,52 @@ public sealed class StreamStateMachine
     }
 
     /// <summary>
+    /// Consolidated precondition check for stop bracket submission.
+    /// Returns a tuple indicating whether submission can proceed and the reason if not.
+    /// </summary>
+    private (bool CanSubmit, string Reason, object? Details) CanSubmitStopBrackets(DateTimeOffset utcNow)
+    {
+        // Idempotency: only once per stream per day
+        if (_stopBracketsSubmittedAtLock) 
+        { 
+            return (false, "IDEMPOTENCY", new { _stopBracketsSubmittedAtLock = true }); 
+        }
+        
+        // Preconditions
+        if (_journal.Committed || State == StreamState.DONE) 
+        { 
+            return (false, "JOURNAL_COMMITTED_OR_DONE", new { journal_committed = _journal?.Committed ?? false, state = State.ToString() }); 
+        }
+        
+        if (_rangeInvalidated) 
+        { 
+            return (false, "RANGE_INVALIDATED", new { _rangeInvalidated = true }); 
+        }
+        
+        if (_breakoutLevelsMissing) 
+        { 
+            return (false, "BREAKOUT_LEVELS_MISSING", new { _breakoutLevelsMissing = true, note = "Stream gated from entry until breakout levels are computed" }); 
+        }
+        
+        if (_executionAdapter == null || _executionJournal == null || _riskGate == null) 
+        { 
+            return (false, "NULL_DEPENDENCIES", new { execution_adapter_null = _executionAdapter == null, execution_journal_null = _executionJournal == null, risk_gate_null = _riskGate == null }); 
+        }
+        
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) 
+        { 
+            return (false, "BREAKOUT_LEVELS_MISSING", new { brk_long_has_value = _brkLongRounded.HasValue, brk_short_has_value = _brkShortRounded.HasValue }); 
+        }
+        
+        if (!RangeHigh.HasValue || !RangeLow.HasValue) 
+        { 
+            return (false, "RANGE_VALUES_MISSING", new { range_high_has_value = RangeHigh.HasValue, range_low_has_value = RangeLow.HasValue }); 
+        }
+        
+        return (true, "OK", null);
+    }
+
+    /// <summary>
     /// Submit paired stop-market entry orders (long + short) immediately after RANGE_LOCKED.
     /// These are linked via OCO so only one side can fill.
     /// </summary>

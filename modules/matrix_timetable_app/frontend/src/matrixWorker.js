@@ -782,10 +782,11 @@ function _calculateDailyMetrics(
   const annualizedVolatility = stdDailyReturn * Math.sqrt(tradingDaysPerYear)
   const sharpeRatio = annualizedVolatility > 0 ? annualizedReturn / annualizedVolatility : 0.0
 
-  // Sortino: only downside volatility
+  // Sortino: only downside volatility (standard definition: variance around zero)
   const downsideReturns = dailyPnL.filter(r => r < 0)
-  const downsideVariance = downsideReturns.length > 1
-    ? downsideReturns.reduce((sum, r) => sum + Math.pow(r - meanDailyReturn, 2), 0) / (downsideReturns.length - 1)
+  // Calculate downside deviation around zero (standard Sortino definition)
+  const downsideVariance = downsideReturns.length > 0
+    ? downsideReturns.reduce((sum, r) => sum + Math.pow(r, 2), 0) / downsideReturns.length
     : 0
   const downsideStd = Math.sqrt(downsideVariance)
   const annualizedDownsideVol = downsideStd * Math.sqrt(tradingDaysPerYear)

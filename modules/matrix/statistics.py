@@ -924,9 +924,11 @@ def _calculate_risk_daily_metrics(
     annualized_volatility = std_daily_return * np.sqrt(trading_days_per_year)
     sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility > 0 else 0.0
     
-    # Sortino: only downside volatility
+    # Sortino: only downside volatility (standard definition: variance around zero)
     downside_returns = daily_returns[daily_returns < 0]
-    downside_std = float(np.std(downside_returns)) if len(downside_returns) > 1 else 0.0
+    # Calculate downside deviation around zero (standard Sortino definition)
+    downside_variance = float(np.mean(downside_returns ** 2)) if len(downside_returns) > 0 else 0.0
+    downside_std = float(np.sqrt(downside_variance))
     annualized_downside_vol = downside_std * np.sqrt(trading_days_per_year)
     sortino_ratio = annualized_return / annualized_downside_vol if annualized_downside_vol > 0 else 0.0
     
