@@ -1430,49 +1430,55 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// <summary>
     /// Get active intents that need break-even monitoring.
     /// Returns intents with filled entries that haven't had BE triggered yet.
+    /// 
+    /// CRITICAL FIX: Check execution journal instead of _orderMap because protective orders
+    /// overwrite entry orders in _orderMap (entry order is replaced with stop/target orders).
+    /// Execution journal is the source of truth for entry fill status.
     /// </summary>
     public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring()
     {
         var activeIntents = new List<(string, Intent, decimal, decimal, decimal?, string)>();
         
-        foreach (var kvp in _orderMap)
+        // CRITICAL FIX: Iterate over _intentMap instead of _orderMap
+        // _orderMap gets overwritten by protective orders (stop/target), so entry orders are lost
+        // Execution journal is the authoritative source for entry fill status
+        foreach (var kvp in _intentMap)
         {
             var intentId = kvp.Key;
-            var orderInfo = kvp.Value;
+            var intent = kvp.Value;
             
-            // Only check entry orders that are filled
-            if (!orderInfo.IsEntryOrder || orderInfo.State != "FILLED" || !orderInfo.EntryFillTime.HasValue)
-                continue;
-            
-            // Check if intent exists and has BE trigger price
-            if (!_intentMap.TryGetValue(intentId, out var intent))
-                continue;
-            
+            // Check if intent has required fields for BE monitoring
             if (intent.BeTrigger == null || intent.EntryPrice == null || intent.Direction == null)
                 continue;
             
+            // Check if entry has been filled using execution journal (source of truth)
+            // Execution journal tracks entry fills regardless of _orderMap state
+            var tradingDate = intent.TradingDate ?? "";
+            var stream = intent.Stream ?? "";
+            
+            ExecutionJournalEntry? journalEntry = null;
+            try
+            {
+                journalEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+            }
+            catch
+            {
+                // If journal lookup fails, skip this intent
+                continue;
+            }
+            
+            // Only check intents with filled entries
+            if (journalEntry == null || !journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal <= 0)
+                continue;
+            
             // Check if BE has already been triggered (idempotency check)
-            // Note: We need trading date and stream from intent to check journal
-            // For now, use empty strings - IsBEModified will check disk if not in cache
-            if (_executionJournal.IsBEModified(intentId, intent.TradingDate ?? "", intent.Stream ?? ""))
+            if (_executionJournal.IsBEModified(intentId, tradingDate, stream))
                 continue;
             
             // Get actual fill price from execution journal for logging/debugging purposes
             // NOTE: BE stop uses breakout level (entryPrice), not actual fill price
             // The breakout level is the strategic entry point, slippage shouldn't affect BE stop placement
-            decimal? actualFillPrice = null;
-            try
-            {
-                var journalEntry = _executionJournal.GetEntry(intentId, intent.TradingDate ?? "", intent.Stream ?? "");
-                if (journalEntry != null && journalEntry.FillPrice.HasValue)
-                {
-                    actualFillPrice = journalEntry.FillPrice.Value;
-                }
-            }
-            catch
-            {
-                // If journal lookup fails, continue without fill price (not critical for BE stop calculation)
-            }
+            decimal? actualFillPrice = journalEntry.FillPrice;
             
             // entryPrice is the breakout level (brkLong/brkShort for stop orders, limit price for limit orders)
             activeIntents.Add((intentId, intent, intent.BeTrigger.Value, intent.EntryPrice.Value, actualFillPrice, intent.Direction));

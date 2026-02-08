@@ -1,1 +1,0 @@
-{"run_id": "test-run-12345", "stage": "scheduler", "event": "start", "timestamp": "2025-12-20T01:43:57.758862+00:00", "msg": "Test scheduler event from test script", "data": {"manual": false, "test": true}}
