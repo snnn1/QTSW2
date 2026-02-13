@@ -17,7 +17,7 @@ QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 # Import watchdog aggregator
 import sys
 sys.path.insert(0, str(QTSW2_ROOT))
-from modules.watchdog.aggregator import WatchdogAggregator
+from modules.watchdog.aggregator import WatchdogAggregator, _read_last_lines
 from modules.watchdog.config import (
     EXECUTION_JOURNALS_DIR,
     EXECUTION_SUMMARIES_DIR,
@@ -80,17 +80,18 @@ async def get_events(
     try:
         aggregator = get_aggregator()
         
-        # If run_id not provided, get current run_id
-        if not run_id:
-            run_id = aggregator.get_current_run_id()
-            if not run_id:
-                return {
-                    "run_id": None,
-                    "events": [],
-                    "next_seq": 0
-                }
+        # Always get run_id from BOTTOM of feed (most recent event)
+        # Never use client's run_id - it may be stale, causing us to filter out newest events
+        current_run_id = aggregator.get_current_run_id()
+        if not current_run_id:
+            return {
+                "run_id": None,
+                "events": [],
+                "next_seq": 0
+            }
         
-        events = aggregator.get_events_since(run_id, since_seq)
+        # Always query by current_run_id - events at bottom of file are from current run
+        events = aggregator.get_events_since(current_run_id, since_seq)
         
         # Debug: Check if ENGINE_TICK_CALLSITE events are in the response
         tick_callsite_events = [e for e in events if e.get("event_type") == "ENGINE_TICK_CALLSITE"]
@@ -102,8 +103,9 @@ async def get_events(
         if events:
             next_seq = max(e.get("event_seq", 0) for e in events)
         
+        # Always return current_run_id so frontend can detect stale run and reset
         return {
-            "run_id": run_id,
+            "run_id": current_run_id,
             "events": events,
             "next_seq": next_seq
         }
@@ -286,10 +288,8 @@ async def reprocess_identity():
         if not FRONTEND_FEED_FILE.exists():
             return {"success": False, "error": "Frontend feed file not found"}
         
-        # Read recent events and find latest identity event
-        with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-            all_lines = f.readlines()
-            recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+        # Read recent events (tail-only, no full file load)
+        recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
         
         latest_identity_event = None
         latest_timestamp = None

@@ -21,6 +21,45 @@ logger = logging.getLogger(__name__)
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 
+def _read_last_lines(path, n: int, encoding: str = "utf-8-sig") -> List[str]:
+    """
+    Read the last N lines from a file without loading the entire file.
+    Uses reverse chunked read - O(tail size) not O(file size).
+    """
+    if not path.exists():
+        return []
+    lines = []
+    chunk_size = 65536  # 64KB
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            pos = size
+            buffer = b""
+            while pos > 0 and len(lines) < n:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                buffer = chunk + buffer
+                while b"\n" in buffer and len(lines) < n:
+                    last_nl = buffer.rfind(b"\n")
+                    if last_nl == -1:
+                        break
+                    line = buffer[last_nl + 1 :].decode(encoding, errors="replace").strip()
+                    buffer = buffer[:last_nl]
+                    if line:
+                        lines.append(line)
+            if buffer.strip() and len(lines) < n:
+                line = buffer.decode(encoding, errors="replace").strip()
+                if line:
+                    lines.append(line)
+        lines.reverse()
+    except Exception as e:
+        logger.warning(f"Error reading last {n} lines from {path}: {e}")
+    return lines
+
+
 class WatchdogAggregator:
     """Main aggregator service."""
     
@@ -93,9 +132,7 @@ class WatchdogAggregator:
             from .config import FRONTEND_FEED_FILE
             import json
             if FRONTEND_FEED_FILE.exists():
-                with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                    all_lines = f.readlines()
-                    recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
+                recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
                 
                 latest_identity_event = None
                 latest_timestamp = None
@@ -505,7 +542,8 @@ class WatchdogAggregator:
             logger.error(f"Error processing feed events: {e}", exc_info=True)
     
     def _read_recent_bar_events_from_end(self, max_events: int = 10) -> List[Dict]:
-        """Read recent bar events from the end of frontend_feed.jsonl."""
+        """Read recent bar events from the end of frontend_feed.jsonl.
+        Uses tail-only read (no full file load) for performance."""
         import json
         
         bar_events = []
@@ -513,15 +551,7 @@ class WatchdogAggregator:
             return bar_events
         
         try:
-            # CRITICAL FIX: Use same simple approach as _read_feed_events_since
-            # Read file normally and take last N lines - more reliable than backwards reading
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                all_lines = f.readlines()
-                # Read last 5000 lines to ensure we catch bar events (bars may be less frequent)
-                lines_to_read = 5000
-                lines = all_lines[-lines_to_read:] if len(all_lines) > lines_to_read else all_lines
-            
-            # Process lines in reverse (newest first)
+            lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
             for line in reversed(lines):
                 if len(bar_events) >= max_events:
                     break
@@ -628,7 +658,8 @@ class WatchdogAggregator:
         return ticks
     
     def _read_feed_events_since(self, cursor: Dict[str, int]) -> List[Dict]:
-        """Read events from frontend_feed.jsonl since cursor position."""
+        """Read events from frontend_feed.jsonl since cursor position.
+        Uses tail-only read (no full file load) for performance."""
         import json
         
         events = []
@@ -637,76 +668,33 @@ class WatchdogAggregator:
             return events
         
         try:
-            # CRITICAL FIX: Always read from the end of file for recent events
-            # The old byte-position tracking was causing issues where we'd read from old positions
-            # and miss new run_ids. Instead, read the last N lines to catch recent events.
-            # This ensures we always process the most recent events regardless of cursor position.
-            
-            # Read last 5000 lines to ensure we catch all recent events
-            # This is efficient and ensures we don't miss new run_ids
             MAX_LINES_TO_READ = 5000
+            lines = _read_last_lines(FRONTEND_FEED_FILE, MAX_LINES_TO_READ)
             
-            # CRITICAL FIX: Read file normally from end, but use a simpler approach
-            # Read the entire file and take last N lines - this is more reliable than backwards reading
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                all_lines = f.readlines()
-                # Take last N lines
-                lines = all_lines[-MAX_LINES_TO_READ:] if len(all_lines) > MAX_LINES_TO_READ else all_lines
-            
-                # Process lines
-                parse_errors = 0
-                for line_str in lines:
-                    line = line_str.strip()
-                    if not line:
+            parse_errors = 0
+            for line_str in lines:
+                line = line_str.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    run_id = event.get("run_id")
+                    event_seq = event.get("event_seq", 0)
+                    event_type = event.get("event_type", "")
+                    if not run_id:
                         continue
-                    
-                    try:
-                        event = json.loads(line)
-                        run_id = event.get("run_id")
-                        event_seq = event.get("event_seq", 0)
-                        event_type = event.get("event_type", "")
-                        
-                        if not run_id:
-                            continue
-                        
-                        # Check if we should include this event
-                        last_seq = cursor.get(run_id, 0)
-                        # Always include bar events and tick events for state tracking (even if cursor is ahead)
-                        # This ensures bar tracking and engine liveness stay current
-                        is_bar_event = event_type in ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED")
-                        is_tick_event = event_type == "ENGINE_TICK_CALLSITE"
-                        
-                        # CRITICAL: Always include tick/bar events for state tracking
-                        # Also include events that are newer than cursor position
-                        should_include = False
-                        if is_bar_event or is_tick_event:
-                            # Always process tick/bar events for state tracking
-                            should_include = True
-                            if event_seq <= last_seq:
-                                logger.debug(
-                                    f"{event_type} included despite cursor: event_seq={event_seq} <= cursor[{run_id}]={last_seq} "
-                                    f"(bar/tick events always processed for state tracking)"
-                                )
-                        elif event_seq > last_seq:
-                            # Include events newer than cursor
-                            should_include = True
-                        
-                        if should_include:
-                            events.append(event)
-                    
-                    except json.JSONDecodeError:
-                        # Silently skip malformed JSON lines
-                        parse_errors += 1
-                        continue
-                
-                # Log parse errors only once per read, not per line
-                if parse_errors > 0:
-                    logger.debug(f"Skipped {parse_errors} malformed JSON lines in feed file")
-                
-                # Sort events by timestamp to ensure chronological processing
-                # This is critical when reading from end of file - events may be out of order
-                events.sort(key=lambda e: e.get('timestamp_utc', ''))
-        
+                    last_seq = cursor.get(run_id, 0)
+                    is_bar_event = event_type in ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED")
+                    is_tick_event = event_type == "ENGINE_TICK_CALLSITE"
+                    should_include = (is_bar_event or is_tick_event) or (event_seq > last_seq)
+                    if should_include:
+                        events.append(event)
+                except json.JSONDecodeError:
+                    parse_errors += 1
+                    continue
+            if parse_errors > 0:
+                logger.debug(f"Skipped {parse_errors} malformed JSON lines in feed file")
+            events.sort(key=lambda e: e.get('timestamp_utc', ''))
         except Exception as e:
             logger.error(f"Error reading feed file: {e}", exc_info=True)
         
@@ -729,47 +717,32 @@ class WatchdogAggregator:
             # Key: (trading_date, stream), Value: (event, timestamp)
             latest_states: Dict[tuple, tuple] = {}
             
-            # Read recent events (last 5000 lines should be enough to find current states)
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                # Read last N lines
-                all_lines = f.readlines()
-                recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
-                
-                for line in recent_lines:
-                    line = line.strip()
-                    if not line:
+            # Tail-only read: avoid loading entire file
+            recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+            for line in recent_lines:
+                line = line.strip() if isinstance(line, str) else str(line)
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    event_type = event.get("event_type")
+                    if event_type != "STREAM_STATE_TRANSITION":
                         continue
-                    
+                    trading_date = event.get("trading_date")
+                    stream = event.get("stream")
+                    timestamp_str = event.get("timestamp_utc")
+                    if not trading_date or not stream or not timestamp_str:
+                        continue
                     try:
-                        event = json.loads(line)
-                        event_type = event.get("event_type")
-                        
-                        # Only process STREAM_STATE_TRANSITION events
-                        if event_type != "STREAM_STATE_TRANSITION":
-                            continue
-                        
-                        trading_date = event.get("trading_date")
-                        stream = event.get("stream")
-                        timestamp_str = event.get("timestamp_utc")
-                        
-                        if not trading_date or not stream or not timestamp_str:
-                            continue
-                        
-                        # Parse timestamp for comparison
-                        try:
-                            from datetime import datetime
-                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                        except Exception:
-                            continue
-                        
-                        key = (trading_date, stream)
-                        
-                        # Keep the most recent state for this stream
-                        if key not in latest_states or timestamp > latest_states[key][1]:
-                            latest_states[key] = (event, timestamp)
-                    
-                    except json.JSONDecodeError:
+                        from datetime import datetime
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    except Exception:
                         continue
+                    key = (trading_date, stream)
+                    if key not in latest_states or timestamp > latest_states[key][1]:
+                        latest_states[key] = (event, timestamp)
+                except json.JSONDecodeError:
+                    continue
             
             # Process the most recent state for each stream
             if latest_states:
@@ -803,45 +776,32 @@ class WatchdogAggregator:
             latest_connection_event = None
             latest_timestamp = None
             
-            # Read recent events (last 5000 lines should be enough to find current connection status)
-            with open(FRONTEND_FEED_FILE, 'r', encoding='utf-8-sig') as f:
-                # Read last N lines
-                all_lines = f.readlines()
-                recent_lines = all_lines[-5000:] if len(all_lines) > 5000 else all_lines
-                
-                for line in recent_lines:
-                    line = line.strip()
-                    if not line:
+            # Tail-only read: avoid loading entire file
+            recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+            for line in recent_lines:
+                line = line.strip() if isinstance(line, str) else str(line)
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    event_type = event.get("event_type")
+                    if event_type not in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED",
+                                         "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION"):
                         continue
-                    
+                    timestamp_str = event.get("timestamp_utc")
+                    if not timestamp_str:
+                        continue
                     try:
-                        event = json.loads(line)
-                        event_type = event.get("event_type")
-                        
-                        # Only process connection events
-                        if event_type not in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", 
-                                             "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION"):
-                            continue
-                        
-                        timestamp_str = event.get("timestamp_utc")
-                        if not timestamp_str:
-                            continue
-                        
-                        # Parse timestamp for comparison
-                        try:
-                            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                            if timestamp.tzinfo is None:
-                                timestamp = timestamp.replace(tzinfo=timezone.utc)
-                        except Exception:
-                            continue
-                        
-                        # Keep the most recent connection event
-                        if latest_timestamp is None or timestamp > latest_timestamp:
-                            latest_connection_event = event
-                            latest_timestamp = timestamp
-                    
-                    except json.JSONDecodeError:
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        if timestamp.tzinfo is None:
+                            timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    except Exception:
                         continue
+                    if latest_timestamp is None or timestamp > latest_timestamp:
+                        latest_connection_event = event
+                        latest_timestamp = timestamp
+                except json.JSONDecodeError:
+                    continue
             
             # Process the most recent connection event to rebuild connection status
             if latest_connection_event:
@@ -869,67 +829,40 @@ class WatchdogAggregator:
     
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
         """
-        Get events since event_seq for a run_id.
+        Get most recent events for Live Events feed.
         
-        Optimized: Reads forward but stops early when possible.
-        For very large files, consider using cursor-based incremental reading.
+        CRITICAL: Return the most recent 200 events by timestamp, NO run_id filter.
+        Filtering by run_id caused 15+ min stale display - multiple runs interleave,
+        and we'd sometimes pick a run with sparse/old events in the tail.
+        Frontend dedupes by run_id:event_seq, so we can return mixed runs safely.
+        
+        Size optimization: Read only last 1000 lines (~700KB) instead of 5000 (~3.4MB)
+        on a 50MB+ file - reduces I/O and parse time for faster response.
         """
         import json
         
         events = []
-        
         if not FRONTEND_FEED_FILE.exists():
             return events
         
         try:
-            # Use binary mode to avoid tell() issues
-            with open(FRONTEND_FEED_FILE, 'rb') as f:
-                # Track if we've seen events for this run_id to optimize early stopping
-                seen_run_id_events = False
-                consecutive_non_matching = 0
-                max_consecutive_skip = 1000  # Stop if we see 1000 non-matching events in a row
-                
-                for line_bytes in f:
-                    try:
-                        line = line_bytes.decode('utf-8-sig').strip()
-                    except UnicodeDecodeError:
-                        continue
-                    
-                    if not line:
-                        continue
-                    
-                    try:
-                        event = json.loads(line)
-                        event_run_id = event.get("run_id")
-                        event_seq = event.get("event_seq", 0)
-                        
-                        if event_run_id == run_id:
-                            seen_run_id_events = True
-                            consecutive_non_matching = 0
-                            if event_seq > since_seq:
-                                events.append(event)
-                            elif event_seq <= since_seq and seen_run_id_events:
-                                # We've found matching run_id but seq is <= since_seq
-                                # If we've already collected events, we can stop (events are sequential)
-                                if events:
-                                    break
-                        else:
-                            # Not matching run_id
-                            if seen_run_id_events:
-                                # We've seen events for this run_id, but now seeing different run_id
-                                # This could mean we've moved to a different run_id section
-                                consecutive_non_matching += 1
-                                if consecutive_non_matching > max_consecutive_skip:
-                                    # Likely moved past this run_id's events, stop
-                                    break
-                    
-                    except json.JSONDecodeError:
-                        # Silently skip malformed JSON lines
-                        continue
-        
+            # Read last 1000 lines only - enough for 200 events, much faster on large files
+            lines = _read_last_lines(FRONTEND_FEED_FILE, 1000)
+            all_events = []
+            for line_str in lines:
+                if not line_str.strip():
+                    continue
+                try:
+                    event = json.loads(line_str)
+                    all_events.append(event)
+                except json.JSONDecodeError:
+                    continue
+            # Sort by timestamp - most recent last
+            all_events.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
+            # Take the most recent 200 (matches frontend MAX_EVENTS)
+            events = all_events[-200:] if len(all_events) > 200 else all_events
         except Exception as e:
             logger.error(f"Error reading feed file: {e}", exc_info=True)
-        
         return events
     
     def get_watchdog_status(self) -> Dict:
@@ -1001,15 +934,34 @@ class WatchdogAggregator:
             }
     
     def get_current_run_id(self) -> Optional[str]:
-        """Get current engine run_id."""
-        run_id = self._event_feed.get_current_run_id()
+        """
+        Get current engine run_id - the run_id from the most recent event in the feed.
+        Previously returned run_id with highest event_seq (wrong: event_seq is per-run,
+        so an old long-running session could win over a newer one, causing Live Events
+        to show 30+ min stale data).
+        """
+        run_id = self._get_run_id_from_most_recent_feed_event()
         if not run_id:
-            # Try to get from cursor
+            run_id = self._event_feed.get_current_run_id()
+        if not run_id:
             cursor = self._cursor_manager.load_cursor()
             if cursor:
-                # Return run_id with highest seq (most recent)
                 run_id = max(cursor.items(), key=lambda x: x[1])[0] if cursor else None
         return run_id
+
+    def _get_run_id_from_most_recent_feed_event(self) -> Optional[str]:
+        """Get run_id from the last event in frontend_feed.jsonl (most recent by time)."""
+        import json
+        if not FRONTEND_FEED_FILE.exists():
+            return None
+        try:
+            lines = _read_last_lines(FRONTEND_FEED_FILE, 1)
+            if lines:
+                event = json.loads(lines[-1])
+                return event.get("run_id")
+        except Exception as e:
+            logger.debug(f"Could not get run_id from feed tail: {e}")
+        return None
     
     def get_stream_states(self) -> Dict:
         """
@@ -1235,6 +1187,25 @@ class WatchdogAggregator:
             
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
+        
+        # Sort streams by slot_time_chicago descending (latest first)
+        def _slot_sort_key(s):
+            st = s.get("slot_time_chicago") or ""
+            if not st:
+                return (0, 0)
+            # Extract HH:MM from "HH:MM" or "YYYY-MM-DDTHH:MM:SS" format
+            if "T" in st:
+                try:
+                    idx = st.index("T")
+                    st = st[idx + 1 : idx + 6]  # "HH:MM"
+                except Exception:
+                    pass
+            parts = st.split(":")
+            h = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+            m = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            return (h, m)
+        streams.sort(key=_slot_sort_key, reverse=True)
+        
         return {
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
             "streams": streams,

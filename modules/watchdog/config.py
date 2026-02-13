@@ -14,12 +14,16 @@ EXECUTION_JOURNALS_DIR = QTSW2_ROOT / "data" / "execution_journals"
 EXECUTION_SUMMARIES_DIR = QTSW2_ROOT / "data" / "execution_summaries"
 FRONTEND_FEED_FILE = ROBOT_LOGS_DIR / "frontend_feed.jsonl"
 FRONTEND_CURSOR_FILE = QTSW2_ROOT / "data" / "frontend_cursor.json"
+# Persisted read positions for robot log files (survives watchdog restarts)
+ROBOT_LOG_READ_POSITIONS_FILE = QTSW2_ROOT / "data" / "robot_log_read_positions.json"
 
 # Thresholds (from specification)
 # ENGINE_TICK_STALL_THRESHOLD_SECONDS: Threshold for detecting engine tick stalls
 # ENGINE_TICK_CALLSITE is rate-limited in feed to every 5 seconds
-# Set to 15 seconds (3x rate limit) to detect stalls quickly while avoiding false positives
-ENGINE_TICK_STALL_THRESHOLD_SECONDS = 15
+# Use 60s - we now use processing time for liveness, so only stall when we truly stop receiving ticks
+ENGINE_TICK_STALL_THRESHOLD_SECONDS = 60
+# Hysteresis: require extra seconds before declaring dead (prevents flickering)
+ENGINE_TICK_STALL_HYSTERESIS_SECONDS = 15
 STUCK_STREAM_THRESHOLD_SECONDS = 300
 UNPROTECTED_TIMEOUT_SECONDS = 10
 # DATA_STALL_THRESHOLD_SECONDS must be > rate limit of bar tracking events

@@ -15,6 +15,7 @@ import pytz
 from .config import (
     FRONTEND_CURSOR_FILE,
     ENGINE_TICK_STALL_THRESHOLD_SECONDS,
+    ENGINE_TICK_STALL_HYSTERESIS_SECONDS,
     STUCK_STREAM_THRESHOLD_SECONDS,
     UNPROTECTED_TIMEOUT_SECONDS,
     DATA_STALL_THRESHOLD_SECONDS,
@@ -40,6 +41,7 @@ class WatchdogStateManager:
     def __init__(self):
         # Engine state
         self._last_engine_tick_utc: Optional[datetime] = None
+        self._last_engine_alive_value: bool = True  # Hysteresis: prevents flickering
         self._recovery_state: str = "CONNECTED_OK"
         self._recovery_started_utc: Optional[datetime] = None  # Track when recovery started for timeout
         self._kill_switch_active: bool = False
@@ -104,17 +106,20 @@ class WatchdogStateManager:
         Update engine tick timestamp from ENGINE_TICK_CALLSITE event.
         This represents engine loop (Tick()) execution - primary liveness indicator.
         ENGINE_TICK_CALLSITE fires every Tick() call (rate-limited in feed to every 5 seconds).
+        
+        SIMPLE FIX: Always use processing time (now). We're actively receiving ticks = engine is alive.
+        Event timestamps can be stale when pipeline lags, causing false STALLED flickering.
         """
+        now = datetime.now(timezone.utc)
         prev_tick = self._last_engine_tick_utc
-        self._last_engine_tick_utc = timestamp_utc
+        self._last_engine_tick_utc = now
         
         # Diagnostic: Log when ticks are received (rate-limited to avoid spam)
         if not hasattr(self, '_last_tick_update_log_utc'):
             self._last_tick_update_log_utc = None
-        now = datetime.now(timezone.utc)
         if self._last_tick_update_log_utc is None or (now - self._last_tick_update_log_utc).total_seconds() >= 30:
             self._last_tick_update_log_utc = now
-            elapsed_since_prev = (timestamp_utc - prev_tick).total_seconds() if prev_tick else None
+            elapsed_since_prev = (self._last_engine_tick_utc - prev_tick).total_seconds() if prev_tick else None
             elapsed_str = f"{elapsed_since_prev:.1f}s" if elapsed_since_prev is not None else "first_tick"
             logger.debug(
                 f"ENGINE_TICK_UPDATED: timestamp_utc={timestamp_utc.isoformat()}, "
@@ -560,13 +565,25 @@ class WatchdogStateManager:
         return False
     
     def compute_engine_alive(self) -> bool:
-        """Compute engine_alive derived field."""
+        """Compute engine_alive derived field with hysteresis to prevent flickering."""
         if self._last_engine_tick_utc is None:
+            self._last_engine_alive_value = False
             return False
         
         now = datetime.now(timezone.utc)
         elapsed = (now - self._last_engine_tick_utc).total_seconds()
-        engine_alive = elapsed < ENGINE_TICK_STALL_THRESHOLD_SECONDS
+        
+        # Hysteresis: when alive, require extra staleness before declaring dead
+        # When dead, use normal threshold to recover quickly
+        if self._last_engine_alive_value:
+            # Currently alive: need threshold + hysteresis seconds of no ticks to go dead
+            stall_threshold = ENGINE_TICK_STALL_THRESHOLD_SECONDS + ENGINE_TICK_STALL_HYSTERESIS_SECONDS
+            engine_alive = elapsed < stall_threshold
+        else:
+            # Currently dead: need tick within threshold to recover
+            engine_alive = elapsed < ENGINE_TICK_STALL_THRESHOLD_SECONDS
+        
+        self._last_engine_alive_value = engine_alive
         
         # Phase 4: Diagnostic logging (rate-limited to every ~30 seconds)
         if not hasattr(self, '_last_engine_alive_log_utc'):
@@ -787,19 +804,24 @@ class WatchdogStateManager:
             engine_tick_age = (now - self._last_engine_tick_utc).total_seconds()
         
         # PRIORITY 1: Check if ticks are arriving (most reliable indicator)
-        if engine_tick_age is not None and engine_tick_age <= ENGINE_TICK_STALL_THRESHOLD_SECONDS:
-            # Ticks are arriving - engine is ACTIVE regardless of market status or bar expectations
-            # This ensures that if you see ticks in the UI, the status shows ACTIVE
+        # Use same hysteresis as compute_engine_alive to prevent flickering
+        stall_threshold = (
+            ENGINE_TICK_STALL_THRESHOLD_SECONDS + ENGINE_TICK_STALL_HYSTERESIS_SECONDS
+            if self._last_engine_alive_value
+            else ENGINE_TICK_STALL_THRESHOLD_SECONDS
+        )
+        if engine_tick_age is not None and engine_tick_age <= stall_threshold:
+            # Ticks are arriving (or within hysteresis grace) - engine is ACTIVE
             engine_activity_state = "ACTIVE"
             logger.debug(
-                f"ENGINE_ACTIVE: Ticks arriving (tick_age={engine_tick_age:.1f}s < {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s)"
+                f"ENGINE_ACTIVE: Ticks arriving (tick_age={engine_tick_age:.1f}s <= {stall_threshold}s)"
             )
-        elif engine_tick_age is not None and engine_tick_age > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+        elif engine_tick_age is not None and engine_tick_age > stall_threshold:
             # Engine ticks stopped - this is a real stall
             engine_activity_state = "STALLED"
             logger.warning(
                 f"ENGINE_STALL_DETECTED_TICKS_STOPPED: tick_age_seconds={engine_tick_age:.1f}, "
-                f"threshold={ENGINE_TICK_STALL_THRESHOLD_SECONDS}, "
+                f"threshold={stall_threshold}, "
                 f"last_tick_utc={self._last_engine_tick_utc.isoformat() if self._last_engine_tick_utc else None}, "
                 f"now={now.isoformat()}"
             )

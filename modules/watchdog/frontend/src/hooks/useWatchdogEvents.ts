@@ -6,7 +6,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { fetchWatchdogEvents } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
-import { sortEventsBySeq, deduplicateEvents, filterRepetitiveEvents } from '../utils/eventUtils'
+import { sortEventsByTimestamp, deduplicateEvents, filterRepetitiveEvents } from '../utils/eventUtils'
 import type { WatchdogEvent } from '../types/watchdog'
 
 interface Cursor {
@@ -40,14 +40,10 @@ export function useWatchdogEvents() {
     }
     
     if (data) {
-      // Update run_id if changed
+      // Backend now returns mixed runs (most recent 500 by timestamp) - don't reset on run_id change
+      // Just merge new events; dedupe by run_id:event_seq handles mixed runs
       if (data.run_id && data.run_id !== cursor.runId) {
-        // New run_id detected - reset cursor and clear events
-        setCursor({ runId: data.run_id, lastEventSeq: 0 })
-        processedEventsRef.current.clear()
-        setEvents([])
-        setLoading(false)
-        return
+        setCursor(prev => ({ ...prev, runId: data.run_id }))
       }
       
       // Deduplicate new events
@@ -72,26 +68,23 @@ export function useWatchdogEvents() {
         setEvents(prev => {
           // Quick check: if no previous events and we have new ones, just return sorted new events
           if (prev.length === 0) {
-            const sorted = sortEventsBySeq(unseenEvents)
+            const sorted = sortEventsByTimestamp(unseenEvents)
             return sorted.slice(-MAX_EVENTS)
           }
           
-          // Check if we're just appending (events are already in order)
-          const prevLastSeq = prev.length > 0 ? prev[prev.length - 1].event_seq : -1
-          const newFirstSeq = unseenEvents[0]?.event_seq ?? -1
+          // Check if we're just appending (new events have timestamps after last)
+          const prevLastTs = prev.length > 0 ? (prev[prev.length - 1].timestamp_utc || prev[prev.length - 1].timestamp_chicago || '') : ''
+          const newFirstTs = unseenEvents[0]?.timestamp_utc || unseenEvents[0]?.timestamp_chicago || ''
           
-          // If new events come after the last event, we can just append without full sort
-          if (newFirstSeq > prevLastSeq && prev.length + unseenEvents.length <= MAX_EVENTS) {
-            // Events are already in order, just append
+          // If new events come after the last event (by timestamp) and we have room, just append
+          if (newFirstTs > prevLastTs && prev.length + unseenEvents.length <= MAX_EVENTS) {
             return [...prev, ...unseenEvents]
           }
           
-          // Otherwise, combine and sort
+          // Otherwise, combine and sort by timestamp
           const combined = [...prev, ...unseenEvents]
-          const sorted = sortEventsBySeq(combined)
-          const final = sorted.slice(-MAX_EVENTS)
-          
-          return final
+          const sorted = sortEventsByTimestamp(combined)
+          return sorted.slice(-MAX_EVENTS)
         })
         
         // Update cursor
@@ -123,41 +116,13 @@ export function useWatchdogEvents() {
     poll()
   }, [])
   
-  // Check for ENGINE_START events to reset cursor
-  useEffect(() => {
-    const engineStartEvent = events.find(e => e.event_type === 'ENGINE_START')
-    if (engineStartEvent && engineStartEvent.run_id !== cursor.runId) {
-      // Reset cursor for new run_id
-      setCursor({ runId: engineStartEvent.run_id, lastEventSeq: 0 })
-      processedEventsRef.current.clear()
-      setEvents([])
-    }
-  }, [events, cursor.runId])
-  
-  // Memoize sorted events - only sort if events array reference changed
-  // The custom memo comparison in LiveEventFeed will handle content comparison
+  // Memoize sorted events - sort by timestamp (event_seq resets on watchdog restart,
+  // so old events can have higher seq than new ones, causing stale display)
   const sortedEvents = useMemo(() => {
     if (events.length === 0) {
       return []
     }
-    
-    // Events should already be sorted, but ensure they are
-    // Check if already sorted (most common case)
-    let isSorted = true
-    for (let i = 1; i < events.length; i++) {
-      if (events[i - 1].event_seq > events[i].event_seq) {
-        isSorted = false
-        break
-      }
-    }
-    
-    // If already sorted, return the same array reference (prevents unnecessary re-renders)
-    if (isSorted) {
-      return events
-    }
-    
-    // Otherwise sort (should be rare)
-    return sortEventsBySeq(events)
+    return sortEventsByTimestamp(events)
   }, [events])
   
   return {

@@ -27,7 +27,11 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutM
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
   
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal })
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      cache: 'no-store', // Prevent stale Live Events from cache
+    })
     clearTimeout(timeoutId)
     return response
   } catch (error) {
