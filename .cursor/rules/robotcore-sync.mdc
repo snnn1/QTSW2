@@ -1,0 +1,36 @@
+---
+description: Always sync robot/NinjaTrader changes to RobotCore_For_NinjaTrader
+globs: modules/robot/**/*.cs, RobotCore_For_NinjaTrader/**/*.cs
+alwaysApply: false
+---
+
+# RobotCore Sync Rule
+
+When editing robot or NinjaTrader-related files, **always sync changes to RobotCore_For_NinjaTrader** in the project root.
+
+## Sync Mapping
+
+| Source | Sync To |
+|-------|---------|
+| `modules/robot/ninjatrader/RobotSimStrategy.cs` | `RobotCore_For_NinjaTrader/Strategies/RobotSimStrategy.cs` |
+| `modules/robot/ninjatrader/RobotSimStrategy.cs` | `%OneDrive%\Documents\NinjaTrader 8\bin\Custom\Strategies\RobotSimStrategy.cs` |
+
+**Do NOT sync RobotSimStrategy to AddOns/RobotCore_For_NinjaTrader** - NinjaTrader compiles AddOns, so that would create duplicate class definitions. Strategy lives only in Custom/Strategies/.
+| `modules/robot/core/*` (RobotEngine, StreamStateMachine, Execution/*, etc.) | `RobotCore_For_NinjaTrader/*` (matching paths) |
+
+## When Making Edits
+
+1. **RobotSimStrategy**: Edit `modules/robot/ninjatrader/RobotSimStrategy.cs`, then sync to both:
+   - `RobotCore_For_NinjaTrader/Strategies/RobotSimStrategy.cs`
+   - `OneDrive\Documents\NinjaTrader 8\bin\Custom\Strategies\RobotSimStrategy.cs`
+
+2. **Engine/Core files** (RobotEngine, StreamStateMachine, NinjaTraderSimAdapter, etc.): Edit in `modules/robot/core/` and sync to `RobotCore_For_NinjaTrader/` (or edit in RobotCore_For_NinjaTrader and sync to modules/robot/core/).
+
+3. **NinjaTraderBarRequest**: Lives in `modules/robot/ninjatrader/`; copy to NinjaTrader Custom folder as needed.
+
+## Why
+
+RobotCore_For_NinjaTrader is the primary NinjaTrader DLL build. Keeping it in sync ensures:
+- One place to see the full robot codebase
+- Build and deploy from `RobotCore_For_NinjaTrader`
+- No drift between modules and the NT project

@@ -452,22 +452,22 @@ class EventFeedGenerator:
         if processed_count > 0:
             logger.debug(f"Processed {processed_count} new events")
         
-        # Diagnostic: Check if ENGINE_TICK_CALLSITE events are in the raw logs
-        tick_callsite_in_raw = False
+        # Diagnostic: Check if tick/heartbeat events are in the raw logs
+        tick_or_alive_in_raw = False
         for event in all_events:
             event_type = self._extract_event_type(event)
-            if event_type == "ENGINE_TICK_CALLSITE":
-                tick_callsite_in_raw = True
+            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
+                tick_or_alive_in_raw = True
                 break
         
-        if tick_callsite_in_raw:
-            logger.debug("ENGINE_TICK_CALLSITE events found in raw robot logs")
+        if tick_or_alive_in_raw:
+            logger.debug("ENGINE_TICK_CALLSITE or ENGINE_ALIVE events found in raw robot logs")
         else:
-            # Only warn if we processed events but no ENGINE_TICK_CALLSITE
+            # Only warn if we processed events but no liveness signal
             if processed_count > 0:
                 logger.warning(
-                    f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE found. "
-                    f"This may indicate the robot is not emitting ENGINE_TICK_CALLSITE events."
+                    f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE or ENGINE_ALIVE found. "
+                    f"This may indicate the robot is not emitting liveness events."
                 )
         
         return processed_count

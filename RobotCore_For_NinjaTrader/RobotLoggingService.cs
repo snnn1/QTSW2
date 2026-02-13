@@ -60,6 +60,7 @@ public sealed class RobotLoggingService : IDisposable
     private DateTime _lastErrorLogTime = DateTime.MinValue;
     private long _droppedDebugCount = 0; // Changed to long for Interlocked operations
     private long _droppedInfoCount = 0;  // Changed to long for Interlocked operations
+    private long _droppedDebugVolumeCapCount = 0; // DEBUG events dropped due to per-minute cap
     private int _writeFailureCount = 0;
     private DateTime _lastBackpressureEventUtc = DateTime.MinValue;
     private DateTime _lastWorkerErrorEventUtc = DateTime.MinValue;
@@ -79,6 +80,10 @@ public sealed class RobotLoggingService : IDisposable
     private readonly Dictionary<string, int> _eventCountsPerMinute = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastRateLimitResetUtc = DateTimeOffset.UtcNow;
     private readonly object _rateLimitLock = new();
+    private DateTime _lastPipelineMetricUtc = DateTime.MinValue;
+    private const int PIPELINE_METRIC_INTERVAL_SECONDS = 60; // 1 minute - lightweight, good operational visibility
+    private int _debugCountThisMinute = 0;
+    private DateTimeOffset _lastDebugCapResetUtc = DateTimeOffset.UtcNow;
 
     private sealed class DailySummaryAggregator
     {
@@ -105,12 +110,14 @@ public sealed class RobotLoggingService : IDisposable
         private RobotLogEvent? _latestRangeLocked;
         private RobotLogEvent? _latestPushover;
         private RobotLogEvent? _latestLoggingPipelineError;
+        private string? _latestStreamStatusSummary;
 
         public void Observe(RobotLogEvent evt)
         {
             TotalEvents++;
 
-            if (string.Equals(evt.level, "ERROR", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(evt.level, "ERROR", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(evt.level, "CRITICAL", StringComparison.OrdinalIgnoreCase))
             {
                 Errors++;
                 _latestError = evt;
@@ -172,6 +179,33 @@ public sealed class RobotLoggingService : IDisposable
                 PushoverEvents++;
                 _latestPushover = evt;
             }
+
+            if (string.Equals(name, "STREAM_STATUS_SUMMARY", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "STREAM_STATE_SNAPSHOT", StringComparison.OrdinalIgnoreCase))
+            {
+                _latestStreamStatusSummary = FormatStreamStatusFromEvent(evt);
+            }
+        }
+
+        private static string? FormatStreamStatusFromEvent(RobotLogEvent evt)
+        {
+            if (evt.data == null || !evt.data.TryGetValue("streams", out var streamsObj)) return null;
+            if (streamsObj is not System.Collections.IEnumerable streamsEnumerable) return null;
+
+            var sb = new StringBuilder();
+            foreach (var item in streamsEnumerable)
+            {
+                if (item is Dictionary<string, object?> d)
+                {
+                    var streamId = d.TryGetValue("stream_id", out var s) ? s?.ToString() ?? "?" : "?";
+                    var state = d.TryGetValue("state", out var st) ? st?.ToString() ?? "?" : "?";
+                    var barCount = d.TryGetValue("bar_count", out var bc) ? bc?.ToString() ?? "0" : "0";
+                    var waitingFor = d.TryGetValue("waiting_for", out var wf) ? wf?.ToString() : null;
+                    var part = waitingFor != null ? $"{streamId}: {state} (bars={barCount}, waiting_for={waitingFor})" : $"{streamId}: {state} (bars={barCount})";
+                    sb.AppendLine($"- {part}");
+                }
+            }
+            return sb.Length > 0 ? sb.ToString().TrimEnd() : null;
         }
 
         private static string Compact(string? s, int maxLen = 160)
@@ -234,6 +268,13 @@ public sealed class RobotLoggingService : IDisposable
             sb.AppendLine("## Notifications");
             sb.AppendLine($"- pushover_events: {PushoverEvents}");
             sb.AppendLine($"- latest_pushover: {Fmt(_latestPushover)}");
+
+            if (!string.IsNullOrWhiteSpace(_latestStreamStatusSummary))
+            {
+                sb.AppendLine();
+                sb.AppendLine("## Streams (latest snapshot)");
+                sb.AppendLine(_latestStreamStatusSummary);
+            }
 
             sb.AppendLine();
             sb.AppendLine("## Notes");
@@ -336,9 +377,20 @@ public sealed class RobotLoggingService : IDisposable
         if (!isErrorOrCritical)
         {
             // Diagnostics filtering: drop DEBUG events if diagnostics disabled
-            if (!_config.diagnostics_enabled && string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase))
+            if (!_config.DiagnosticsEnabled && string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase))
             {
                 return;
+            }
+            
+            // DEBUG volume cap: when diagnostics enabled, limit DEBUG per minute to avoid starving INFO
+            if (_config.DiagnosticsEnabled && _config.debug_volume_cap_per_minute > 0 &&
+                string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!CheckDebugVolumeCap())
+                {
+                    Interlocked.Increment(ref _droppedDebugVolumeCapCount);
+                    return;
+                }
             }
             
             // Rate limiting: apply only to DEBUG and INFO levels
@@ -387,6 +439,28 @@ public sealed class RobotLoggingService : IDisposable
         _queue.Enqueue(evt);
     }
     
+    /// <summary>
+    /// Check DEBUG volume cap (per-minute). Returns true if event should be logged, false if cap exceeded.
+    /// </summary>
+    private bool CheckDebugVolumeCap()
+    {
+        var cap = _config.debug_volume_cap_per_minute;
+        if (cap <= 0) return true;
+        
+        var now = DateTimeOffset.UtcNow;
+        lock (_rateLimitLock)
+        {
+            if ((now - _lastDebugCapResetUtc).TotalMinutes >= 1.0)
+            {
+                _debugCountThisMinute = 0;
+                _lastDebugCapResetUtc = now;
+            }
+            if (_debugCountThisMinute >= cap) return false;
+            _debugCountThisMinute++;
+            return true;
+        }
+    }
+
     /// <summary>
     /// Check rate limit for event. Returns true if event should be logged, false if rate limit exceeded.
     /// Rate limits apply ONLY to DEBUG and INFO levels. ERROR and CRITICAL always bypass.
@@ -446,9 +520,10 @@ public sealed class RobotLoggingService : IDisposable
         return _minLogLevel switch
         {
             "DEBUG" => true, // DEBUG level logs everything
-            "INFO" => level == "INFO" || level == "WARN" || level == "ERROR",
-            "WARN" => level == "WARN" || level == "ERROR",
-            "ERROR" => level == "ERROR", // ERROR level only logs errors
+            "INFO" => level == "INFO" || level == "WARN" || level == "ERROR" || level == "CRITICAL",
+            "WARN" => level == "WARN" || level == "ERROR" || level == "CRITICAL",
+            "ERROR" => level == "ERROR" || level == "CRITICAL",
+            "CRITICAL" => level == "CRITICAL",
             _ => true // Default: log everything if level is unknown
         };
     }
@@ -594,6 +669,13 @@ public sealed class RobotLoggingService : IDisposable
                 {
                     FlushBatch(force: false);
                     lastFlush = now;
+                }
+
+                // Periodic LOG_PIPELINE_METRIC every minute
+                if ((now - _lastPipelineMetricUtc).TotalSeconds >= PIPELINE_METRIC_INTERVAL_SECONDS)
+                {
+                    _lastPipelineMetricUtc = now;
+                    EmitPipelineMetric(queueSize);
                 }
 
                 // Sleep briefly to avoid tight loop
@@ -1025,6 +1107,42 @@ public sealed class RobotLoggingService : IDisposable
             sanitized = sanitized.Replace(c, '_');
         }
         return sanitized.ToUpperInvariant();
+    }
+
+    /// <summary>
+    /// Emit periodic pipeline metric event (queue depth, drops, etc.) to ENGINE log.
+    /// </summary>
+    private void EmitPipelineMetric(int queueDepth)
+    {
+        try
+        {
+            var droppedDebug = Interlocked.Read(ref _droppedDebugCount);
+            var droppedInfo = Interlocked.Read(ref _droppedInfoCount);
+            var droppedDebugCap = Interlocked.Read(ref _droppedDebugVolumeCapCount);
+            var metricEvent = new RobotLogEvent(
+                DateTimeOffset.UtcNow,
+                "INFO",
+                "RobotLoggingService",
+                "ENGINE",
+                "LOG_PIPELINE_METRIC",
+                "Log pipeline metrics",
+                runId: "LOGGING_SERVICE",
+                data: new Dictionary<string, object?>
+                {
+                    ["queue_depth"] = queueDepth,
+                    ["max_queue_size"] = MAX_QUEUE_SIZE,
+                    ["dropped_debug"] = droppedDebug,
+                    ["dropped_info"] = droppedInfo,
+                    ["dropped_debug_volume_cap"] = droppedDebugCap,
+                    ["write_failure_count"] = _writeFailureCount
+                }
+            );
+            _queue.Enqueue(metricEvent); // Safe: metric is INFO, queue likely has space
+        }
+        catch
+        {
+            // Silently fail - metrics are best-effort
+        }
     }
 
     /// <summary>

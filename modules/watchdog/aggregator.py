@@ -461,7 +461,7 @@ class WatchdogAggregator:
             latest_tick_timestamp = None
             for event in events:
                 event_type = event.get("event_type", "")
-                if event_type == "ENGINE_TICK_CALLSITE":
+                if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
                     tick_events_count += 1
                     timestamp_utc = event.get("timestamp_utc")
                     if timestamp_utc:
@@ -470,16 +470,16 @@ class WatchdogAggregator:
                 # Add important events to ring buffer for WebSocket streaming
                 self._add_to_ring_buffer_if_important(event)
             
-            # Diagnostic: Log when ENGINE_TICK_CALLSITE events are read from feed
+            # Diagnostic: Log when tick/heartbeat events are read from feed
             if tick_events_count > 0:
                 logger.info(
-                    f"Processed {tick_events_count} ENGINE_TICK_CALLSITE event(s) from feed. "
+                    f"Processed {tick_events_count} tick/heartbeat event(s) from feed. "
                     f"Latest tick timestamp: {latest_tick_timestamp}"
                 )
             elif len(events) > 0:
                 # No tick events in this batch - log what we did get
                 event_types = [e.get("event_type", "UNKNOWN") for e in events[:5]]
-                logger.debug(f"Processed {len(events)} events (no ENGINE_TICK_CALLSITE): {event_types}")
+                logger.debug(f"Processed {len(events)} events (no tick/heartbeat): {event_types}")
             
             # Update cursor for all run_ids that had events
             if events:
@@ -539,8 +539,8 @@ class WatchdogAggregator:
     
     def _read_recent_ticks_from_end(self, max_events: int = 10) -> List[Dict]:
         """
-        Read the most recent ENGINE_TICK_CALLSITE events from the end of the feed file.
-        This ensures we always have the latest tick timestamp for liveness, regardless of cursor position.
+        Read the most recent ENGINE_TICK_CALLSITE or ENGINE_ALIVE events from the end of the feed file.
+        ENGINE_ALIVE is used as fallback when ENGINE_TICK_CALLSITE is not emitted (e.g. older DLL).
         """
         import json
         
@@ -587,7 +587,8 @@ class WatchdogAggregator:
                                 continue
                             
                             event = json.loads(line)
-                            if event.get("event_type") == "ENGINE_TICK_CALLSITE":
+                            event_type = event.get("event_type")
+                            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
                                 ticks.append(event)
                                 if len(ticks) >= max_events:
                                     break
@@ -601,7 +602,7 @@ class WatchdogAggregator:
                         line = buffer.decode('utf-8-sig').strip()
                         if line:
                             event = json.loads(line)
-                            if event.get("event_type") == "ENGINE_TICK_CALLSITE":
+                            if event.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
                                 ticks.append(event)
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         logger.debug(f"Skipping malformed JSON in buffer: {e}")
@@ -614,7 +615,7 @@ class WatchdogAggregator:
             if ticks:
                 latest_tick = ticks[-1]
                 logger.info(
-                    f"Found {len(ticks)} ENGINE_TICK_CALLSITE event(s) from end of file. "
+                    f"Found {len(ticks)} tick/heartbeat event(s) from end of file. "
                     f"Latest: timestamp={latest_tick.get('timestamp_utc')}, "
                     f"event_seq={latest_tick.get('event_seq')}, run_id={latest_tick.get('run_id')}"
                 )
@@ -1270,6 +1271,7 @@ class WatchdogAggregator:
         excluded_types = {
             "ENGINE_TICK_HEARTBEAT",  # Too frequent
             "ENGINE_TICK_CALLSITE",  # Diagnostic event, used for backend liveness only
+            "ENGINE_ALIVE",  # Strategy heartbeat, used for backend liveness only
         }
         
         # Check if event is important

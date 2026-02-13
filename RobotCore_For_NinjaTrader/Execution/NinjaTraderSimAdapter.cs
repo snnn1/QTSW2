@@ -1014,7 +1014,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         try
         {
             // STEP 5: Check journal to prevent duplicate BE modifications
-            if (_executionJournal.IsBEModified(intentId, "", ""))
+            // CRITICAL: Use tradingDate and stream from intent - empty strings never match journal keys
+            var tradingDate = "";
+            var stream = "";
+            if (_intentMap.TryGetValue(intentId, out var intentForBe))
+            {
+                tradingDate = intentForBe.TradingDate ?? "";
+                stream = intentForBe.Stream ?? "";
+            }
+            if (_executionJournal.IsBEModified(intentId, tradingDate, stream))
             {
                 var error = "BE modification already attempted for this intent";
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_SKIPPED", new

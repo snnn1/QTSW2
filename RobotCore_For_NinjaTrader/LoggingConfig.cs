@@ -17,6 +17,19 @@ public sealed class LoggingConfig
     public int max_file_size_mb { get; set; } = 50;
     public int max_rotated_files { get; set; } = 5;
     public string min_log_level { get; set; } = "INFO";
+    
+    /// <summary>
+    /// Log profile: "PRODUCTION" (default) or "DIAGNOSTIC".
+    /// When PRODUCTION: DEBUG events dropped, stream/bar diagnostics disabled.
+    /// When DIAGNOSTIC: DEBUG events permitted, stream status snapshots, bar diagnostics, risk gate logs.
+    /// If not set, falls back to enable_diagnostic_logs || diagnostics_enabled for backward compatibility.
+    /// </summary>
+    public string? log_profile { get; set; }
+    
+    /// <summary>
+    /// [DEPRECATED] Use log_profile = "DIAGNOSTIC" instead.
+    /// Kept for backward compatibility; ignored when log_profile is set.
+    /// </summary>
     public bool enable_diagnostic_logs { get; set; } = false;
     public DiagnosticRateLimits? diagnostic_rate_limits { get; set; }
     public int archive_days { get; set; } = 7;
@@ -58,11 +71,16 @@ public sealed class LoggingConfig
     public int archive_cleanup_days { get; set; } = 30;
     
     /// <summary>
-    /// Enable diagnostics logging (default: false).
-    /// When false, DEBUG events are dropped immediately.
-    /// ERROR and CRITICAL events always bypass this flag.
+    /// [DEPRECATED] Use log_profile = "DIAGNOSTIC" instead.
+    /// Kept for backward compatibility; ignored when log_profile is set.
     /// </summary>
     public bool diagnostics_enabled { get; set; } = false;
+    
+    /// <summary>
+    /// Maximum DEBUG events per minute when diagnostics enabled (default: 600).
+    /// Prevents DEBUG volume from starving INFO. 0 = no cap.
+    /// </summary>
+    public int debug_volume_cap_per_minute { get; set; } = 600;
     
     /// <summary>
     /// Event rate limits: max occurrences per minute per event type.
@@ -77,6 +95,15 @@ public sealed class LoggingConfig
     /// When enabled, events >= WARN + selected INFO events are written to logs/health/ directory.
     /// </summary>
     public bool enable_health_sink { get; set; } = true;
+
+    /// <summary>
+    /// True when diagnostics are enabled (stream/bar diagnostics, DEBUG events, risk gate logs).
+    /// Uses log_profile if set; otherwise enable_diagnostic_logs || diagnostics_enabled.
+    /// </summary>
+    public bool DiagnosticsEnabled =>
+        !string.IsNullOrWhiteSpace(log_profile)
+            ? string.Equals(log_profile.Trim(), "DIAGNOSTIC", StringComparison.OrdinalIgnoreCase)
+            : (enable_diagnostic_logs || diagnostics_enabled);
 
     public static LoggingConfig LoadFromFile(string projectRoot)
     {

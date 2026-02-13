@@ -31,6 +31,9 @@ public static class RobotEventTypes
         
         // Fallback: use heuristics for unknown events
         var upper = eventType.ToUpperInvariant();
+        if (upper.Contains("CRITICAL") || upper.Contains("KILL_SWITCH") || upper.Contains("FLATTEN_FAILED_ALL") ||
+            upper.Contains("DUPLICATE_INSTANCE") || upper.Contains("FLATTEN_FAILED"))
+            return "CRITICAL";
         if (upper.Contains("ERROR") || upper.Contains("FAIL") || upper.Contains("INVALID") || upper.Contains("VIOLATION"))
             return "ERROR";
         if (upper.Contains("WARN") || upper.Contains("BLOCKED"))
@@ -198,7 +201,7 @@ public static class RobotEventTypes
         ["TRADE_COMPLETED"] = "INFO",
         ["ENTRY_BLOCKED_RISK"] = "WARN",
         ["RISK_CHECK_EVALUATED"] = "DEBUG",
-        ["POSITION_FLATTEN_FAIL_CLOSED"] = "ERROR",
+        ["POSITION_FLATTEN_FAIL_CLOSED"] = "CRITICAL",
         
         // Orders
         ["ORDER_SUBMITTED"] = "INFO",
@@ -227,13 +230,14 @@ public static class RobotEventTypes
         
         // Kill switch
         ["KILL_SWITCH_INITIALIZED"] = "INFO",
-        ["KILL_SWITCH_ACTIVE"] = "ERROR",
-        ["KILL_SWITCH_ERROR_FAIL_CLOSED"] = "ERROR",
+        ["KILL_SWITCH_ACTIVE"] = "CRITICAL",
+        ["KILL_SWITCH_ERROR_FAIL_CLOSED"] = "CRITICAL",
         
         // Flatten
         ["FLATTEN_ATTEMPT"] = "INFO",
         ["FLATTEN_SUCCESS"] = "INFO",
         ["FLATTEN_FAIL"] = "ERROR",
+        ["FLATTEN_FAILED_ALL_RETRIES"] = "CRITICAL",
         ["FLATTEN_DRYRUN"] = "DEBUG",
         
         // Recovery
@@ -309,12 +313,14 @@ public static class RobotEventTypes
         
         // Logging service
         ["LOG_BACKPRESSURE_DROP"] = "ERROR",
+        ["LOG_PIPELINE_METRIC"] = "INFO",
         ["LOG_WORKER_LOOP_ERROR"] = "ERROR",
         ["LOG_WRITE_FAILURE"] = "ERROR",
         ["LOG_HEALTH_ERROR"] = "ERROR",
         ["LOG_CONVERSION_ERROR"] = "ERROR",
         ["LOGGER_CONVERSION_ERROR"] = "ERROR",
         ["LOGGING_INVARIANT_VIOLATION"] = "ERROR",
+        ["UNREGISTERED_EVENT_TYPE"] = "WARN",
         
         // Notification failures
         ["NOTIFICATION_SEND_FAILED"] = "ERROR",
@@ -339,6 +345,7 @@ public static class RobotEventTypes
         ["PROTECTIVE_STOP_DRYRUN"] = "DEBUG",
         ["TARGET_ORDER_DRYRUN"] = "DEBUG",
         ["BE_MODIFY_DRYRUN"] = "DEBUG",
+        ["BE_PATH_ACTIVE"] = "INFO",
         
         // Tick/stream state
         ["UPDATE_APPLIED"] = "DEBUG",
@@ -360,6 +367,13 @@ public static class RobotEventTypes
         
         // Incident persistence
         ["INCIDENT_PERSIST_ERROR"] = "ERROR",
+        
+        // Critical execution failures (highest severity)
+        ["DUPLICATE_INSTANCE_DETECTED"] = "CRITICAL",
+        ["INTENT_POLICY_MISSING_AT_ORDER_CREATE"] = "CRITICAL",
+        ["INTENT_NOT_FOUND_FLATTEN_FAILED"] = "CRITICAL",
+        ["UNKNOWN_ORDER_FILL_FLATTEN_FAILED"] = "CRITICAL",
+        ["UNTRACKED_FILL_FLATTEN_FAILED"] = "CRITICAL",
     };
     
     // All registered event types (for validation)
@@ -446,7 +460,7 @@ public static class RobotEventTypes
         "KILL_SWITCH_INITIALIZED", "KILL_SWITCH_ACTIVE", "KILL_SWITCH_ERROR_FAIL_CLOSED",
         
         // Flatten
-        "FLATTEN_ATTEMPT", "FLATTEN_SUCCESS", "FLATTEN_FAIL", "FLATTEN_DRYRUN",
+        "FLATTEN_ATTEMPT", "FLATTEN_SUCCESS", "FLATTEN_FAIL", "FLATTEN_FAILED_ALL_RETRIES", "FLATTEN_DRYRUN",
         
         // Recovery
         "DISCONNECT_FAIL_CLOSED_ENTERED", "DISCONNECT_RECOVERY_STARTED",
@@ -481,11 +495,14 @@ public static class RobotEventTypes
         "BROKER_EXPOSURE_MISMATCH", "BROKER_EXPOSURE_RECALC_ERROR",
         "CANCEL_INTENT_ORDERS_BLOCKED", "CANCEL_INTENT_ORDERS_MOCK", "CANCEL_INTENT_ORDERS_SUCCESS", "CANCEL_INTENT_ORDERS_ERROR",
         "FLATTEN_INTENT_ATTEMPT", "FLATTEN_INTENT_SUCCESS", "FLATTEN_INTENT_ERROR",
+        "DUPLICATE_INSTANCE_DETECTED", "INTENT_POLICY_MISSING_AT_ORDER_CREATE",
+        "INTENT_NOT_FOUND_FLATTEN_FAILED", "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
+        "UNTRACKED_FILL_FLATTEN_FAILED",
         
         // Logging service
-        "LOG_BACKPRESSURE_DROP", "LOG_WORKER_LOOP_ERROR", "LOG_WRITE_FAILURE",
+        "LOG_BACKPRESSURE_DROP", "LOG_PIPELINE_METRIC", "LOG_WORKER_LOOP_ERROR", "LOG_WRITE_FAILURE",
         "LOG_HEALTH_ERROR", "LOG_CONVERSION_ERROR", "LOGGER_CONVERSION_ERROR",
-        "LOGGING_INVARIANT_VIOLATION",
+        "LOGGING_INVARIANT_VIOLATION", "UNREGISTERED_EVENT_TYPE",
         
         // Notification failures
         "NOTIFICATION_SEND_FAILED",
@@ -501,7 +518,7 @@ public static class RobotEventTypes
         
         // DRYRUN events
         "ENTRY_ORDER_DRYRUN", "STOP_ENTRY_ORDER_DRYRUN", "PROTECTIVE_STOP_DRYRUN",
-        "TARGET_ORDER_DRYRUN", "BE_MODIFY_DRYRUN",
+        "TARGET_ORDER_DRYRUN", "BE_MODIFY_DRYRUN", "BE_PATH_ACTIVE",
         
         // Tick/stream state
         "UPDATE_APPLIED",
@@ -523,5 +540,10 @@ public static class RobotEventTypes
         
         // Incident persistence
         "INCIDENT_PERSIST_ERROR",
+        
+        // Critical execution failures
+        "FLATTEN_FAILED_ALL_RETRIES", "DUPLICATE_INSTANCE_DETECTED",
+        "INTENT_POLICY_MISSING_AT_ORDER_CREATE", "INTENT_NOT_FOUND_FLATTEN_FAILED",
+        "UNKNOWN_ORDER_FILL_FLATTEN_FAILED", "UNTRACKED_FILL_FLATTEN_FAILED",
     };
 }

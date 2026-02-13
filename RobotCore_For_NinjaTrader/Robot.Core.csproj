@@ -23,5 +23,6 @@
     <!-- Exclude NT wrapper files that reference Strategy types (not available at DLL compile time) -->
     <Compile Remove="NinjaTraderBarProviderRequest.cs" />
     <Compile Remove="NinjaTraderBarProviderWrapper.cs" />
+    <Compile Remove="Strategies\RobotSimStrategy.cs" />
   </ItemGroup>
 </Project>

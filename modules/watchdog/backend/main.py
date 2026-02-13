@@ -165,7 +165,7 @@ print()
 print("WebSocket Routes:")
 if ws_routes:
     for route in ws_routes:
-        print(f"  ✓ {route}")
+        print(f"  [OK] {route}")
 else:
     print("  ⚠️  NO WEBSOCKET ROUTES FOUND!")
 print()
@@ -183,7 +183,7 @@ if '/ws/events' not in ws_routes:
     print("WebSocket will NOT work!")
     print("=" * 60)
 else:
-    print("✓ /ws/events route confirmed registered")
+    print("[OK] /ws/events route confirmed registered")
 
 logger.info(f"WS_ROUTES_REGISTERED {ws_routes}")
 logger.info(f"Total routes: {len(all_routes)}, WebSocket: {len(ws_routes)}, HTTP: {len(http_routes)}")

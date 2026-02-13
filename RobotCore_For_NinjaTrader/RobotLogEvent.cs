@@ -20,7 +20,7 @@ public sealed class RobotLogEvent
     /// <summary>ISO8601 UTC timestamp string</summary>
     public string ts_utc { get; set; } = "";
 
-    /// <summary>Log level: DEBUG, INFO, WARN, ERROR</summary>
+    /// <summary>Log level: DEBUG, INFO, WARN, ERROR, CRITICAL</summary>
     public string level { get; set; } = "INFO";
 
     /// <summary>Source component name: RobotEngine, NinjaTraderAdapter, StrategyHost, etc.</summary>

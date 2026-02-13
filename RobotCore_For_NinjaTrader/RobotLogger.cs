@@ -7,6 +7,9 @@ namespace QTSW2.Robot.Core;
 
 public sealed class RobotLogger
 {
+    private static readonly HashSet<string> _warnedUnregisteredTypes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object _unregisteredWarnLock = new();
+
     private readonly string _jsonlPath;
     private readonly object _lock = new();
     private DateTime _lastErrorLogTime = DateTime.MinValue;
@@ -270,6 +273,21 @@ public sealed class RobotLogger
         }
 
         var eventType = dict.TryGetValue("event_type", out var et) ? et?.ToString() ?? "" : "";
+        // One-time warning for unregistered event types (registry discipline)
+        if (!string.IsNullOrWhiteSpace(eventType) && !RobotEventTypes.IsValid(eventType))
+        {
+            lock (_unregisteredWarnLock)
+            {
+                if (!_warnedUnregisteredTypes.Contains(eventType))
+                {
+                    _warnedUnregisteredTypes.Add(eventType);
+                    var warnEvt = new RobotLogEvent(DateTimeOffset.UtcNow, "WARN", "RobotLogger", "", "UNREGISTERED_EVENT_TYPE",
+                        $"Unregistered event type used: {eventType}. Add to RobotEventTypes registry.", runId: _runId,
+                        data: new Dictionary<string, object?> { ["event_type"] = eventType });
+                    _loggingService?.Log(warnEvt);
+                }
+            }
+        }
         // Use centralized event registry for level assignment (replaces fragile string matching)
         var level = RobotEventTypes.GetLevel(eventType);
 

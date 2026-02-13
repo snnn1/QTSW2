@@ -61,6 +61,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "ENGINE_TICK_AFTER_LOCK",  # Diagnostic: after lock released
     "ENGINE_BUILD_STAMP",  # Diagnostic: engine build and instance ID
     "ENGINE_TICK_HEARTBEAT",  # Bar-driven heartbeat (keep for bar tracking)
+    "ENGINE_ALIVE",  # Strategy heartbeat (every N bars in Realtime) - fallback when ENGINE_TICK_CALLSITE not emitted
     "ENGINE_TICK_STALL_DETECTED",
     "ENGINE_TICK_STALL_RECOVERED",
     # Recovery State

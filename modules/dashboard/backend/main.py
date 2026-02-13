@@ -848,7 +848,7 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         import pytz
         from pathlib import Path
         
-        output_dir = Path("data/timetable")
+        output_dir = QTSW2_ROOT / "data" / "timetable"
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Clean up old files

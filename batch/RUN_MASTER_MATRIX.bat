@@ -149,7 +149,7 @@ REM ================================================
 REM Step 4: Start frontend (only after backend ready)
 REM ================================================
 echo [4/6] Starting frontend...
-start "Master Matrix Frontend" cmd /k "cd /d %PROJECT_ROOT%\matrix_timetable_app\frontend && npm run dev"
+start "Master Matrix Frontend" cmd /k "cd /d %PROJECT_ROOT%\modules\matrix_timetable_app\frontend && npm run dev"
 echo Frontend process started. Waiting for it to initialize...
 timeout /t 2 /nobreak >nul
 echo.
@@ -203,7 +203,7 @@ if %ATTEMPT% geq %MAX_ATTEMPTS% (
     echo   1. Check the "Master Matrix Frontend" window for errors
     echo   2. Verify Node.js and npm are installed
     echo   3. Check if port 5174 is accessible
-    echo   4. Try running: cd %PROJECT_ROOT%\matrix_timetable_app\frontend ^&^& npm install
+    echo   4. Try running: cd %PROJECT_ROOT%\modules\matrix_timetable_app\frontend ^&^& npm install
     echo ================================================
     echo.
     pause

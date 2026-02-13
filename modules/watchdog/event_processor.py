@@ -168,6 +168,11 @@ class EventProcessor:
                 logger.info(f"ENGINE_TICK_CALLSITE processed: timestamp_utc={timestamp_utc.isoformat()}")
             self._state_manager.update_engine_tick(timestamp_utc)
         
+        elif event_type == "ENGINE_ALIVE":
+            # ENGINE_ALIVE: Strategy heartbeat (every N bars in Realtime)
+            # Fallback liveness when ENGINE_TICK_CALLSITE not emitted (e.g. older DLL)
+            self._state_manager.update_engine_tick(timestamp_utc)
+        
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status
             # CRITICAL: Extract from payload string if not in data dict (C# anonymous object serialization)

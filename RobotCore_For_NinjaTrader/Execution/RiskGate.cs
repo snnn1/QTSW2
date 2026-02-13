@@ -131,7 +131,7 @@ public sealed class RiskGate
     {
         // Only log if diagnostics enabled (check via LoggingConfig)
         var config = LoggingConfig.LoadFromFile(ProjectRootResolver.ResolveProjectRoot() ?? "");
-        if (!config.diagnostics_enabled)
+        if (!config.DiagnosticsEnabled)
         {
             return;
         }

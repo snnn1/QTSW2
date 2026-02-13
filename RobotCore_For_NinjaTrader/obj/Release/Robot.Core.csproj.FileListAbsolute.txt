@@ -1,0 +1,4 @@
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\Robot.Core.csproj.AssemblyReference.cache
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\Robot.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\Robot.Core.csproj.CoreCompileInputs.cache
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\Robot.Core.sourcelink.json

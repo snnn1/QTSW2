@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using QTSW2.Robot.Core;
@@ -16,6 +17,7 @@ public sealed class ExecutionJournal
     private readonly string _journalDir;
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
+    private readonly Dictionary<string, bool> _entryFillByStream = new(); // key = "tradingDate_stream", O(1) HasEntryFillForStream
     private readonly object _lock = new object();
     
     // Callback for stream stand-down on journal corruption
@@ -354,6 +356,7 @@ public sealed class ExecutionJournal
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
+            _entryFillByStream[$"{tradingDate}_{stream}"] = true;
         }
     }
 
@@ -577,6 +580,7 @@ public sealed class ExecutionJournal
             
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
+            _entryFillByStream[$"{tradingDate}_{stream}"] = true;
         }
     }
     
@@ -1200,13 +1204,17 @@ public sealed class ExecutionJournal
     {
         lock (_lock)
         {
-            // Scan journal directory for entries matching tradingDate_stream_*
+            var cacheKey = $"{tradingDate}_{stream}";
+            if (_entryFillByStream.TryGetValue(cacheKey, out var cached))
+                return cached;
+
+            // Cache miss: scan journal directory for entries matching tradingDate_stream_*
             var pattern = $"{tradingDate}_{stream}_*.json";
-            
+            var result = false;
             try
             {
                 if (!Directory.Exists(_journalDir)) return false;
-                
+
                 var files = Directory.GetFiles(_journalDir, pattern);
                 foreach (var file in files)
                 {
@@ -1216,10 +1224,10 @@ public sealed class ExecutionJournal
                         var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                         if (entry != null)
                         {
-                            // Check both legacy EntryFilled flag and new EntryFilledQuantityTotal
                             if (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0)
                             {
-                                return true; // Found at least one filled entry
+                                result = true;
+                                break;
                             }
                         }
                     }
@@ -1228,14 +1236,15 @@ public sealed class ExecutionJournal
                         // Skip corrupted files, continue scanning
                     }
                 }
+                _entryFillByStream[cacheKey] = result;
             }
             catch
             {
                 // Fail-safe: return false on error (assume no fill)
                 return false;
             }
-            
-            return false;
+
+            return result;
         }
     }
 
@@ -1324,6 +1333,62 @@ public sealed class ExecutionJournal
     
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
+
+    /// <summary>
+    /// Pre-load all journal entries for a trading date into cache.
+    /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
+    /// </summary>
+    public void WarmCacheForTradingDate(string tradingDate)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate)) return;
+
+        var prefix = $"{tradingDate.Trim()}_";
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, $"{prefix}*.json");
+        }
+        catch
+        {
+            return; // Directory doesn't exist or inaccessible - no-op
+        }
+
+        lock (_lock)
+        {
+            foreach (var path in files)
+            {
+                try
+                {
+                    var key = Path.GetFileNameWithoutExtension(path);
+                    if (_cache.ContainsKey(key)) continue; // Already cached
+
+                    var json = File.ReadAllText(path);
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                    {
+                        _cache[key] = entry;
+                        // Populate entry-fill cache for O(1) HasEntryFillForStream
+                        var parts = key.Split('_');
+                        if (parts.Length >= 3)
+                        {
+                            var date = parts[0];
+                            var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+                            var hasFill = entry.EntryFilled || entry.EntryFilledQuantityTotal > 0;
+                            var fillKey = $"{date}_{stream}";
+                            if (!_entryFillByStream.TryGetValue(fillKey, out var existing) || !existing)
+                                _entryFillByStream[fillKey] = hasFill;
+                            else if (hasFill)
+                                _entryFillByStream[fillKey] = true; // OR: any intent with fill => true
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip individual file errors - best-effort warm
+                }
+            }
+        }
+    }
 
     private void SaveJournal(string path, ExecutionJournalEntry entry)
     {

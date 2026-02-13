@@ -67,6 +67,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>
+    /// Pre-load execution journal cache for trading date.
+    /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
+    /// </summary>
+    public void WarmExecutionJournalCacheForTradingDate(string tradingDate)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate)) return;
+        _executionJournal.WarmCacheForTradingDate(tradingDate);
+    }
+
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
     
@@ -101,6 +111,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Gap violation summary tracking (rate-limited)
     private DateTimeOffset? _lastGapViolationSummaryUtc = null;
+
+    // Stream status summary (rate-limited, diagnostic only)
+    private DateTimeOffset? _lastStreamStatusSummaryUtc = null;
+    private const double STREAM_STATUS_SUMMARY_INTERVAL_MINUTES = 5.0;
+
+    // Event-driven snapshot (strict 60s rate limit, independent of periodic)
+    private DateTimeOffset? _lastEventDrivenSnapshotUtc = null;
+    private const double EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS = 60.0;
     
     // PHASE 3.1: Identity invariants status tracking (rate-limited)
     private DateTimeOffset? _lastIdentityInvariantsCheckUtc = null;
@@ -222,6 +240,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 canonical_instrument = canonicalInstrument,
                 note = "BarsRequest marked as completed - range lock can proceed"
             });
+            TryEmitEventDrivenSnapshot(utcNow, "BARSREQUEST_COMPLETE");
         }
     }
     
@@ -515,7 +534,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     max_file_size_mb = _loggingConfig.max_file_size_mb,
                     max_rotated_files = _loggingConfig.max_rotated_files,
                     min_log_level = _loggingConfig.min_log_level,
-                    enable_diagnostic_logs = _loggingConfig.enable_diagnostic_logs,
+                    enable_diagnostic_logs = _loggingConfig.DiagnosticsEnabled,
                     diagnostic_rate_limits = _loggingConfig.diagnostic_rate_limits,
                     archive_days = _loggingConfig.archive_days
                 }));
@@ -1278,6 +1297,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             foreach (var s in _streams.Values)
                 s.Tick(utcNow);
 
+            // Periodic stream status summary (diagnostic only, rate-limited to every 5 minutes)
+            if (_loggingConfig.DiagnosticsEnabled && _streams.Count > 0)
+            {
+                var timeSinceLastSummary = (_lastStreamStatusSummaryUtc == null)
+                    ? double.MaxValue
+                    : (utcNow - _lastStreamStatusSummaryUtc.Value).TotalMinutes;
+                if (timeSinceLastSummary >= STREAM_STATUS_SUMMARY_INTERVAL_MINUTES)
+                {
+                    _lastStreamStatusSummaryUtc = utcNow;
+                    LogStreamStatusSummary(utcNow);
+                }
+            }
+
             // Track and log gap violations across all streams (rate-limited to once per 5 minutes)
             var timeSinceLastGapViolationSummary = (utcNow - (_lastGapViolationSummaryUtc ?? DateTimeOffset.MinValue)).TotalMinutes;
             if (timeSinceLastGapViolationSummary >= 5.0 || _lastGapViolationSummaryUtc == null)
@@ -1670,7 +1702,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 s.OnBar(barUtc, open, high, low, close, utcNow);
                 
                 // Log bar delivery to stream (rate-limited, diagnostic only)
-                if (_loggingConfig.enable_diagnostic_logs)
+                if (_loggingConfig.DiagnosticsEnabled)
                 {
                     var deliveryKey = $"bar_delivery_{instrument}_{s.Session}_{s.SlotTimeChicago}";
                     var shouldLogDelivery = !_lastBarDeliveryLogUtc.TryGetValue(deliveryKey, out var lastDelivery) ||
@@ -1697,7 +1729,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         
         // 🔴 Diagnostic Point #2: Log bar routing summary (every bar, diagnostic-only)
-        if (_loggingConfig.enable_diagnostic_logs)
+        if (_loggingConfig.DiagnosticsEnabled)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
                 new
@@ -1795,7 +1827,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private void LogBarDeliverySummaryIfNeeded(DateTimeOffset utcNow, string instrument, List<string> streamsReceivingBar, List<string> streamsFilteredOut)
     {
-        if (!_loggingConfig.enable_diagnostic_logs) return;
+        if (!_loggingConfig.DiagnosticsEnabled) return;
         
         if (_lastBarDeliverySummaryUtc.HasValue && 
             (utcNow - _lastBarDeliverySummaryUtc.Value).TotalMinutes < BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES)
@@ -1918,6 +1950,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// This method allows the NinjaTrader strategy to request historical bars and feed them to streams.
     /// Streams must exist before calling this method (created in Start()).
     /// Filters out bars that are in the future relative to current time to avoid duplicates with live bars.
+    /// See docs/PRE_HYDRATION_DEEP_DIVE.md for flow, Operator Decision Tree, and troubleshooting.
     /// </summary>
     public void LoadPreHydrationBars(string instrument, List<Bar> bars, DateTimeOffset utcNow)
     {
@@ -3490,8 +3523,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     /// <summary>
     /// Expose execution adapter for strategy files (replaces reflection-based access).
+    /// Public so NinjaTrader.Custom assembly can access when using DLL-only deployment.
     /// </summary>
-    internal IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
+    public IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
     
     /// <summary>
     /// Expose time service for components that need direct access (e.g., bar providers).
@@ -3999,6 +4033,96 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         lock (_engineLock)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", data));
+        }
+    }
+
+    /// <summary>
+    /// Log a periodic summary of all stream states (diagnostic only, rate-limited from Tick).
+    /// Independent of event-driven snapshots - never suppressed.
+    /// </summary>
+    private void LogStreamStatusSummary(DateTimeOffset utcNow)
+    {
+        if (_streams.Count == 0) return;
+        var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE",
+            new
+            {
+                streams = streams,
+                stream_count = streams.Count,
+                trading_date = TradingDateString,
+                trigger = "PERIODIC",
+                note = "Periodic snapshot of all stream states (diagnostic)"
+            }));
+    }
+
+    /// <summary>
+    /// Emit event-driven stream snapshot if 60s rate limit allows.
+    /// Call from: stream Transition, stream Commit, MarkBarsRequestCompleted.
+    /// Rate limit applies only to event-driven; periodic snapshot remains independent.
+    /// </summary>
+    public void TryEmitEventDrivenSnapshot(DateTimeOffset utcNow, string trigger)
+    {
+        lock (_engineLock)
+        {
+            if (_lastEventDrivenSnapshotUtc.HasValue &&
+                (utcNow - _lastEventDrivenSnapshotUtc.Value).TotalSeconds < EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS)
+                return;
+            if (_streams.Count == 0) return;
+
+            _lastEventDrivenSnapshotUtc = utcNow;
+            var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE",
+                new
+                {
+                    streams = streams,
+                    stream_count = streams.Count,
+                    trading_date = TradingDateString,
+                    trigger = trigger,
+                    note = "Event-driven snapshot"
+                }));
+        }
+    }
+
+    /// <summary>
+    /// Log a one-time snapshot of all stream states (e.g., when Realtime is reached).
+    /// Call from strategy when transitioning to Realtime state.
+    /// </summary>
+    public void LogStreamStateSnapshot(DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            if (_streams.Count == 0) return;
+            var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATE_SNAPSHOT", state: "ENGINE",
+                new
+                {
+                    streams = streams,
+                    stream_count = streams.Count,
+                    trading_date = TradingDateString,
+                    note = "Snapshot of all stream states at Realtime transition"
+                }));
+        }
+    }
+
+    /// <summary>
+    /// Get timetable file path (for UI/logging so strategy can show "timetable read from X").
+    /// </summary>
+    public string GetTimetablePath()
+    {
+        lock (_engineLock)
+        {
+            return _timetablePath ?? "";
+        }
+    }
+
+    /// <summary>
+    /// Get number of streams created from timetable for this instrument (for UI/logging).
+    /// </summary>
+    public int GetStreamCount()
+    {
+        lock (_engineLock)
+        {
+            return _streams?.Count ?? 0;
         }
     }
     
