@@ -19,6 +19,7 @@ from .config import (
     ROBOT_LOGS_DIR,
     FRONTEND_FEED_FILE,
     LIVE_CRITICAL_EVENT_TYPES,
+    ROBOT_LOG_READ_POSITIONS_FILE,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class EventFeedGenerator:
     def __init__(self):
         self._event_seq_by_run_id: Dict[str, int] = defaultdict(int)
         self._last_read_positions: Dict[str, int] = {}  # File path -> byte position
+        self._load_read_positions()
         # Rate limiting for very frequent events (per run_id)
         self._last_engine_tick_callsite_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
         self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5  # Only write ENGINE_TICK_CALLSITE every 5 seconds
@@ -359,13 +361,35 @@ class EventFeedGenerator:
                 if parse_errors > 0:
                     logger.debug(f"Skipped {parse_errors} malformed JSON lines in {log_file.name}")
                 
-                # Update last read position
+                # Update last read position (persisted at end of process_new_events)
                 self._last_read_positions[str(log_file)] = f.tell()
         
         except Exception as e:
             logger.error(f"Error reading log file {log_file}: {e}", exc_info=True)
         
         return events
+    
+    def _load_read_positions(self) -> None:
+        """Load persisted read positions from disk (survives watchdog restarts)."""
+        if not ROBOT_LOG_READ_POSITIONS_FILE.exists():
+            return
+        try:
+            with open(ROBOT_LOG_READ_POSITIONS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._last_read_positions = {k: int(v) for k, v in data.items()}
+                logger.debug(f"Loaded read positions for {len(self._last_read_positions)} log file(s)")
+        except Exception as e:
+            logger.warning(f"Failed to load read positions: {e}")
+    
+    def _save_read_positions(self) -> None:
+        """Persist read positions to disk (including empty dict after rotation)."""
+        try:
+            ROBOT_LOG_READ_POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(ROBOT_LOG_READ_POSITIONS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._last_read_positions, f, indent=0)
+        except Exception as e:
+            logger.warning(f"Failed to save read positions: {e}")
     
     def _find_robot_log_files(self) -> List[Path]:
         """Find all robot log files."""
@@ -404,6 +428,7 @@ class EventFeedGenerator:
                 
                 # Reset read positions since we're starting fresh
                 self._last_read_positions.clear()
+                self._save_read_positions()
         except Exception as e:
             logger.warning(f"Failed to rotate frontend_feed.jsonl: {e}")
     
@@ -431,8 +456,9 @@ class EventFeedGenerator:
             events = self._read_log_file_incremental(log_file)
             all_events.extend(events)
         
-        # Sort events by timestamp_utc to maintain chronological order
-        all_events.sort(key=lambda e: e.get("timestamp_utc", ""))
+        # Sort events by timestamp to maintain chronological order
+        # RobotLogEvent uses "ts_utc"; converted format uses "timestamp_utc"
+        all_events.sort(key=lambda e: e.get("timestamp_utc") or e.get("ts_utc") or e.get("timestamp") or "")
         
         # Process events and write to frontend feed
         tick_callsite_written = 0
@@ -451,6 +477,9 @@ class EventFeedGenerator:
         
         if processed_count > 0:
             logger.debug(f"Processed {processed_count} new events")
+        
+        # Persist read positions after each cycle (survives watchdog restarts)
+        self._save_read_positions()
         
         # Diagnostic: Check if tick/heartbeat events are in the raw logs
         tick_or_alive_in_raw = False

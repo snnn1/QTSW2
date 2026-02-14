@@ -29,9 +29,9 @@ start "Watchdog Backend" cmd /k "cd /d %CD% && python -m uvicorn modules.watchdo
 REM Wait for backend
 timeout /t 3 /nobreak >nul
 
-REM Start frontend
+REM Start frontend (uses dashboard frontend with watchdog config - proven working)
 echo [2/2] Starting frontend...
-cd /d "%CD%\modules\watchdog\frontend"
+cd /d "%CD%\modules\dashboard\frontend"
 
 if not exist "package.json" (
     echo ERROR: Frontend not found at %CD%
@@ -42,6 +42,11 @@ if not exist "package.json" (
 if not exist "node_modules" (
     echo Installing dependencies...
     call npm install
+    if errorlevel 1 (
+        echo ERROR: npm install failed
+        pause
+        exit /b 1
+    )
 )
 
 REM Open browser after delay
@@ -53,4 +58,4 @@ echo Press Ctrl+C to stop frontend
 echo ============================================================
 echo.
 
-call npm run dev
+call npm run dev:watchdog

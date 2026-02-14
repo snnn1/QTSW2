@@ -90,6 +90,82 @@ public sealed class JournalStore
     public string GetJournalPath(string tradingDate, string stream)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}.json");
 
+    private static string GetForcedFlattenMarkersPath(string journalDir)
+        => Path.Combine(journalDir, "_forced_flatten_markers.json");
+
+    /// <summary>
+    /// Check if FORCED_FLATTEN_TRIGGERED was already emitted for (tradingDay, sessionClass).
+    /// </summary>
+    public bool HasForcedFlattenTriggeredEmitted(string tradingDay, string sessionClass)
+    {
+        var path = GetForcedFlattenMarkersPath(_journalDir);
+        var key = $"{tradingDay}|{sessionClass}";
+        var fileLock = GetFileLock(path);
+        lock (fileLock)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                var json = File.ReadAllText(path);
+                var dict = JsonUtil.Deserialize<Dictionary<string, bool>>(json);
+                return dict != null && dict.TryGetValue(key, out var v) && v;
+            }
+            catch { return false; }
+        }
+    }
+
+    /// <summary>
+    /// Mark FORCED_FLATTEN_TRIGGERED as emitted for (tradingDay, sessionClass). Atomic write.
+    /// </summary>
+    public void MarkForcedFlattenTriggeredEmitted(string tradingDay, string sessionClass)
+    {
+        var path = GetForcedFlattenMarkersPath(_journalDir);
+        var key = $"{tradingDay}|{sessionClass}";
+        var fileLock = GetFileLock(path);
+        lock (fileLock)
+        {
+            try
+            {
+                var dict = new Dictionary<string, bool>();
+                if (File.Exists(path))
+                {
+                    var json = File.ReadAllText(path);
+                    var existing = JsonUtil.Deserialize<Dictionary<string, bool>>(json);
+                    if (existing != null)
+                        dict = new Dictionary<string, bool>(existing);
+                }
+                dict[key] = true;
+                var newJson = JsonUtil.Serialize(dict);
+                var tempPath = path + ".tmp";
+                File.WriteAllText(tempPath, newJson);
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(tempPath, path);
+            }
+            catch (IOException ex)
+            {
+                Thread.Sleep(10);
+                try
+                {
+                    var dict = new Dictionary<string, bool>();
+                    if (File.Exists(path))
+                    {
+                        var json = File.ReadAllText(path);
+                        var existing = JsonUtil.Deserialize<Dictionary<string, bool>>(json);
+                        if (existing != null)
+                            dict = new Dictionary<string, bool>(existing);
+                    }
+                    dict[key] = true;
+                    var newJson = JsonUtil.Serialize(dict);
+                    var tempPath = path + ".tmp";
+                    File.WriteAllText(tempPath, newJson);
+                    if (File.Exists(path)) File.Delete(path);
+                    File.Move(tempPath, path);
+                }
+                catch { /* best effort */ }
+            }
+        }
+    }
+
     public StreamJournal? TryLoad(string tradingDate, string stream)
     {
         var path = GetJournalPath(tradingDate, stream);
@@ -219,6 +295,16 @@ public sealed class StreamJournal
     /// When forced flatten occurred (optional).
     /// </summary>
     public DateTimeOffset? ForcedFlattenTimestamp { get; set; }
+
+    /// <summary>
+    /// Trading day when forced flatten ran (for re-entry gate).
+    /// </summary>
+    public string? TradingDayAtFlatten { get; set; }
+
+    /// <summary>
+    /// Session index within day when forced flatten ran (for re-entry gate).
+    /// </summary>
+    public int? SessionIndexAtFlatten { get; set; }
     
     /// <summary>
     /// Reference to locate canonical ExecutionJournalEntry (contains bracket levels).

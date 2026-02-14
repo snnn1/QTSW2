@@ -104,6 +104,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // BE path diagnostic: once per minute when in position — confirms BE check runs, shows active_intent_count.
         private readonly Dictionary<string, DateTimeOffset> _lastBePathActiveLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BE_PATH_ACTIVE_RATE_LIMIT_SECONDS = 60;
+
+        // SessionCloseResolver: last trading date we resolved for (Realtime only, once per day)
+        private string? _lastSessionCloseResolvedTradingDay;
         
         // Phase 3.3: Latch last price every tick; run BE scan on cadence only (reduces work per tick).
         private decimal _lastTickPriceForBE = 0;
@@ -666,12 +669,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "instrument", instrumentName },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
-                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state" }
+                        { "bars_array_length", BarsArray?.Length ?? 0 },
+                        { "has_secondary_series", BarsArray != null && BarsArray.Length >= 2 },
+                        { "be_detection_path", BarsArray != null && BarsArray.Length >= 2 ? "1-second series (BIP 1)" : "fallback (primary bar)" },
+                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. has_secondary_series=true enables BE detection via 1-second bars." }
                     });
                     _engine.LogStreamStateSnapshot(DateTimeOffset.UtcNow);
 
                     // Pre-warm execution journal cache so BE monitoring never hits disk on first lookup
                     _engine.WarmExecutionJournalCacheForTradingDate(_engine.GetTradingDate());
+
+                    // SessionCloseResolver: resolve S1 and S2 on Realtime transition (defer to Realtime only)
+                    ResolveAndSetSessionCloseIfNeeded();
 
                     // RESTART-AWARE: Check if any streams need BarsRequest for restart
                     // This handles the case where streams restart mid-session and need historical bars
@@ -1329,15 +1338,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
-            // FALLBACK: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 5s)
-            if (BarsArray.Length < 2 && State == State.Realtime && Position.MarketPosition != MarketPosition.Flat)
+            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 5s)
+            // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
+            var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
+            var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
+            var runBeFromBip0 = inPositionRealtime && (
+                BarsArray.Length < 2 ||
+                (_lastBip1WorkUtc != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - _lastBip1WorkUtc).TotalSeconds >= bip1StaleSeconds));
+            if (runBeFromBip0)
             {
                 var now = DateTimeOffset.UtcNow;
                 if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 5.0)
                 {
                     _lastBip1WorkUtc = now;
-                    // BE path diagnostic: once per minute — confirms BE check runs when in position (fallback path)
                     var instrumentNameFallback = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var hasSecondary = BarsArray != null && BarsArray.Length >= 2;
                     if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentNameFallback, out var lastPathLogF) || (now - lastPathLogF).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
                     {
                         _lastBePathActiveLogUtc[instrumentNameFallback] = now;
@@ -1346,10 +1361,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             { "instrument", instrumentNameFallback },
                             { "bars_in_progress", 0 },
-                            { "has_secondary_series", false },
+                            { "has_secondary_series", hasSecondary },
                             { "in_position", true },
                             { "active_intent_count", activeCountF },
-                            { "note", "BE check path active (fallback: primary bar close). active_intent_count>0 means intents await BE trigger." }
+                            { "note", hasSecondary ? "BE check (fallback: BIP 1 stale, using primary bar). 1-second series may not be updating." : "BE check path active (fallback: primary bar close)." }
                         });
                     }
                     RunBreakEvenCheck();
@@ -1593,6 +1608,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 });
             }
             if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+#if NINJATRADER
+            // SessionCloseResolver: resolve on Realtime when trading date changes (once per day)
+            if (State == State.Realtime)
+            {
+                ResolveAndSetSessionCloseIfNeeded();
+                UpdateSessionIndices(tickTimeUtc);
+            }
+#endif
             _engine.Tick(tickTimeUtc);
             if (logTiming) TraceLifecycle("OnBarUpdate_AFTER_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
             LogBarProfileIfSlow("tick", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
@@ -1625,6 +1648,63 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
         }
+
+#if NINJATRADER
+        /// <summary>
+        /// Resolve session close for S1 and S2, call SetSessionCloseResolved. Defer to Realtime only.
+        /// Called on Realtime transition and when trading date changes.
+        /// </summary>
+        private void ResolveAndSetSessionCloseIfNeeded()
+        {
+            if (_engine == null || State != State.Realtime) return;
+            if (Bars == null || Bars.Count == 0) return;
+
+            var tradingDay = _engine.GetTradingDate();
+            if (string.IsNullOrWhiteSpace(tradingDay)) return;
+            if (tradingDay == _lastSessionCloseResolvedTradingDay) return;
+
+            var spec = _engine.GetParitySpec();
+            if (spec == null) return;
+
+            try
+            {
+                foreach (var sessionClass in new[] { "S1", "S2" })
+                {
+                    var result = SessionCloseResolver.Resolve(Bars, spec, sessionClass, tradingDay);
+                    _engine.SetSessionCloseResolved(tradingDay, sessionClass, result);
+                }
+                _lastSessionCloseResolvedTradingDay = tradingDay;
+            }
+            catch (Exception ex)
+            {
+                Log($"WARNING: SessionCloseResolver failed: {ex.Message}", LogLevel.Warning);
+                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "SESSION_CLOSE_RESOLVER_FAILED", new Dictionary<string, object>
+                {
+                    { "error", ex.Message },
+                    { "trading_day", tradingDay },
+                    { "note", "Resolver failed - forced flatten may not trigger; check logs" }
+                });
+            }
+        }
+
+        /// <summary>
+        /// Update session index for S1 and S2. Called each Realtime tick for re-entry gate.
+        /// </summary>
+        private void UpdateSessionIndices(DateTimeOffset utcNow)
+        {
+            if (_engine == null || Bars == null || Bars.Count == 0) return;
+            var spec = _engine.GetParitySpec();
+            if (spec == null) return;
+
+            var nowChicago = _engine.ConvertUtcToChicago(utcNow).DateTime;
+            foreach (var sessionClass in new[] { "S1", "S2" })
+            {
+                var tuple = SessionCloseResolver.GetCurrentSessionIndex(Bars, spec, sessionClass, nowChicago);
+                if (tuple.HasValue)
+                    _engine.SetCurrentSessionIndex(tuple.Value.tradingDay, sessionClass, tuple.Value.index);
+            }
+        }
+#endif
         
         /// <summary>BE evaluation using price series. When secondary 1-second series enabled: Closes[1][0]. When disabled: Closes[0][0] (primary bar).</summary>
         private void RunBreakEvenCheck()
@@ -1663,6 +1743,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         /// <summary>
+        /// Get execution instrument name for BE monitoring filter (e.g. MGC, MES, MYM).
+        /// Must match Intent.ExecutionInstrument - use FullName root, not MasterInstrument.Name (which returns base e.g. GC for MGC).
+        /// </summary>
+        private string GetExecutionInstrumentForBE()
+        {
+            if (Instrument == null) return "";
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(Instrument.FullName))
+                {
+                    var parts = Instrument.FullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length > 0)
+                        return parts[0].ToUpperInvariant();
+                }
+            }
+            catch { }
+            return Instrument.MasterInstrument?.Name?.ToUpperInvariant() ?? "";
+        }
+
+        /// <summary>
         /// Check break-even triggers for all active intents and modify stop orders when triggered.
         /// Tick-based version: Uses actual tick price instead of bar high/low for immediate detection.
         /// </summary>
@@ -1690,7 +1790,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    activeIntents = _adapter.GetActiveIntentsForBEMonitoring();
+                    // CRITICAL: Use execution instrument (e.g. MGC, MES) not MasterInstrument.Name (e.g. GC, ES).
+                    // Intent.ExecutionInstrument is MGC/MES - MasterInstrument.Name for MGC returns GC, which would filter out GC2 intent!
+                    var executionInstrument = GetExecutionInstrumentForBE();
+                    activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
                     _cachedActiveIntentsForBE = activeIntents;
                     _cachedActiveIntentsForBEUtc = utcNow;
                 }

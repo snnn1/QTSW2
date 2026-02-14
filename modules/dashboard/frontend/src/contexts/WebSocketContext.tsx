@@ -199,33 +199,15 @@ export function WebSocketProvider({ children }) {
       return
     }
 
-    // Build WebSocket URL - connect directly to backend instead of relying on Vite proxy
-    // This fixes connection failures when proxy is unstable
+    // Build WebSocket URL - use same-origin (Vite proxy) in dev to avoid connection failures
+    // Direct ws://localhost:8002 can fail with "connection interrupted" in Firefox during page load
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // Detect which frontend app is running and connect to corresponding backend
-    // Dashboard (5173) -> Dashboard backend (8001)
-    // Watchdog (5175) -> Watchdog backend (8002)
-    // Matrix (5174) -> Matrix backend (8000)
-    const isWatchdog = window.location.hostname === 'localhost' && window.location.port === '5175'
-    const isDashboard = window.location.hostname === 'localhost' && window.location.port === '5173'
-    const isDev = isWatchdog || isDashboard || (window.location.hostname === 'localhost' && window.location.port === '5174')
+    const isDev = window.location.hostname === 'localhost' && ['5173', '5174', '5175'].includes(window.location.port)
     
-    let backendPort = window.location.port
-    if (isWatchdog) {
-      backendPort = '8002'  // Watchdog backend
-    } else if (isDashboard) {
-      backendPort = '8001'  // Dashboard backend
-    } else if (isDev && window.location.port === '5174') {
-      backendPort = '8000'  // Matrix backend
-    }
-    
-    const backendHost = isDev ? `localhost:${backendPort}` : window.location.host
-    
-    // SUBSCRIPTION SCOPE:
-    // - Dashboard app: Could filter by run_id if needed: /ws/events?run_id=<run_id>
-    // - Watchdog app: Subscribe to all events: /ws/events
-    // Currently both use /ws/events (all events), but intent is explicit above
-    const wsUrl = `${protocol}//${backendHost}/ws/events`
+    // In dev: use same origin so Vite proxy forwards /ws/* to backend (avoids cross-origin WS issues)
+    // In prod: backend is same host
+    const wsHost = isDev ? window.location.host : window.location.host
+    const wsUrl = `${protocol}//${wsHost}/ws/events`
 
     console.log(`[WS] Connecting to ${wsUrl}`)
 

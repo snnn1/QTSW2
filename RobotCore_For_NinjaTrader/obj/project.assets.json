@@ -929,11 +929,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
+      "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
       "projectName": "Robot.Core",
-      "projectPath": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
+      "projectPath": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
       "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\obj\\",
+      "outputPath": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"

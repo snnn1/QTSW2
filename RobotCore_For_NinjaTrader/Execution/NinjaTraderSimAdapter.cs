@@ -1443,7 +1443,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// overwrite entry orders in _orderMap (entry order is replaced with stop/target orders).
     /// Execution journal is the source of truth for entry fill status.
     /// </summary>
+    /// <param name="executionInstrument">Optional. When provided, only return intents for this execution instrument (e.g. MES, MYM).
+    /// CRITICAL: Each strategy instance receives ticks for ONE instrument only. Without this filter, we'd compare MES tick price
+    /// against YM/GC/NG intents (wrong price scales) causing false triggers or missed triggers.</param>
     public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring()
+    {
+        return GetActiveIntentsForBEMonitoring(null);
+    }
+
+    public List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring(string? executionInstrument)
     {
         var activeIntents = new List<(string, Intent, decimal, decimal, decimal?, string)>();
         
@@ -1454,6 +1462,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         {
             var intentId = kvp.Key;
             var intent = kvp.Value;
+            
+            // CRITICAL FIX: Filter by execution instrument - each strategy only gets ticks for its chart
+            // Without this, MES strategy would compare MES tick price against YM/GC/NG intents (wrong!)
+            if (!string.IsNullOrEmpty(executionInstrument) &&
+                !string.Equals(intent.ExecutionInstrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
+                continue;
             
             // Check if intent has required fields for BE monitoring
             if (intent.BeTrigger == null || intent.EntryPrice == null || intent.Direction == null)

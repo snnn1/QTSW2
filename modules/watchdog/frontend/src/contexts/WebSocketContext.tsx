@@ -161,33 +161,14 @@ export function WebSocketProvider({ children }) {
     // Fix B.2: Set connecting flag
     connectingRef.current = true
 
-    // Build WebSocket URL - connect directly to backend instead of relying on Vite proxy
-    // This fixes connection failures when proxy is unstable
+    // Build WebSocket URL - use Vite proxy (same origin) so it works on any port (5175, 5176, etc.)
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // Detect which frontend app is running and connect to corresponding backend
-    // Dashboard (5173) -> Dashboard backend (8001)
-    // Watchdog (5175) -> Watchdog backend (8002)
-    // Matrix (5174) -> Matrix backend (8000)
-    const isWatchdog = window.location.hostname === 'localhost' && window.location.port === '5175'
-    const isDashboard = window.location.hostname === 'localhost' && window.location.port === '5173'
-    const isDev = isWatchdog || isDashboard || (window.location.hostname === 'localhost' && window.location.port === '5174')
-    
-    let backendPort = window.location.port
-    if (isWatchdog) {
-      backendPort = '8002'  // Watchdog backend
-    } else if (isDashboard) {
-      backendPort = '8001'  // Dashboard backend
-    } else if (isDev && window.location.port === '5174') {
-      backendPort = '8000'  // Matrix backend
-    }
-    
-    const backendHost = isDev ? `localhost:${backendPort}` : window.location.host
+    const wsUrl = `${protocol}//${window.location.host}/ws/events`
     
     // SUBSCRIPTION SCOPE:
     // - Dashboard app: Could filter by run_id if needed: /ws/events?run_id=<run_id>
     // - Watchdog app: Subscribe to all events: /ws/events
     // Currently both use /ws/events (all events), but intent is explicit above
-    const wsUrl = `${protocol}//${backendHost}/ws/events`
 
     console.log(`[WS] Connecting to ${wsUrl}`)
 

@@ -46,6 +46,17 @@ export function sortEventsBySeq(events: WatchdogEvent[]): WatchdogEvent[] {
 }
 
 /**
+ * Sort events by timestamp ASC - use for display when event_seq can wrap on watchdog restart.
+ */
+export function sortEventsByTimestamp(events: WatchdogEvent[]): WatchdogEvent[] {
+  return [...events].sort((a, b) => {
+    const tsA = a.timestamp_utc || a.timestamp_chicago || ''
+    const tsB = b.timestamp_utc || b.timestamp_chicago || ''
+    return tsA.localeCompare(tsB)
+  })
+}
+
+/**
  * Deduplicate events by (run_id, event_seq) tuple
  */
 export function deduplicateEvents(events: WatchdogEvent[]): WatchdogEvent[] {

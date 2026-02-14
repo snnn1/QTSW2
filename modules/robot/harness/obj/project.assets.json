@@ -184,11 +184,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
+      "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
       "projectName": "Robot.Harness",
-      "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
+      "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
       "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\obj\\",
+      "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -203,8 +203,8 @@
         "net8.0": {
           "targetAlias": "net8.0",
           "projectReferences": {
-            "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
-              "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj"
+            "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
+              "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj"
             }
           }
         }

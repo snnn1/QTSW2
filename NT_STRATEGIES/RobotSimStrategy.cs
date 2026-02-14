@@ -662,7 +662,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "instrument", instrumentName },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
-                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state" }
+                        { "bars_array_length", BarsArray?.Length ?? 0 },
+                        { "has_secondary_series", BarsArray != null && BarsArray.Length >= 2 },
+                        { "be_detection_path", BarsArray != null && BarsArray.Length >= 2 ? "1-second series (BIP 1)" : "fallback (primary bar)" },
+                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. has_secondary_series=true enables BE detection via 1-second bars." }
                     });
                     
                     // RESTART-AWARE: Check if any streams need BarsRequest for restart
@@ -1300,13 +1303,35 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
-            // FALLBACK: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 5s)
-            if (BarsArray.Length < 2 && State == State.Realtime && Position.MarketPosition != MarketPosition.Flat)
+            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 5s)
+            // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
+            var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
+            var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
+            var runBeFromBip0 = inPositionRealtime && (
+                BarsArray.Length < 2 ||
+                (_lastBip1WorkUtc != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - _lastBip1WorkUtc).TotalSeconds >= bip1StaleSeconds));
+            if (runBeFromBip0)
             {
                 var now = DateTimeOffset.UtcNow;
                 if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 5.0)
                 {
                     _lastBip1WorkUtc = now;
+                    var instrumentNameFallback = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var hasSecondary = BarsArray != null && BarsArray.Length >= 2;
+                    if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentNameFallback, out var lastPathLogF) || (now - lastPathLogF).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
+                    {
+                        _lastBePathActiveLogUtc[instrumentNameFallback] = now;
+                        var activeCountF = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring().Count : -1;
+                        _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentNameFallback },
+                            { "bars_in_progress", 0 },
+                            { "has_secondary_series", hasSecondary },
+                            { "in_position", true },
+                            { "active_intent_count", activeCountF },
+                            { "note", hasSecondary ? "BE check (fallback: BIP 1 stale, using primary bar). 1-second series may not be updating." : "BE check path active (fallback: primary bar close)." }
+                        });
+                    }
                     RunBreakEvenCheck();
                 }
             }
@@ -1618,6 +1643,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         /// <summary>
+        /// Get execution instrument name for BE monitoring filter (e.g. MGC, MES, MYM).
+        /// Must match Intent.ExecutionInstrument - use FullName root, not MasterInstrument.Name (which returns base e.g. GC for MGC).
+        /// </summary>
+        private string GetExecutionInstrumentForBE()
+        {
+            if (Instrument == null) return "";
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(Instrument.FullName))
+                {
+                    var parts = Instrument.FullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length > 0)
+                        return parts[0].ToUpperInvariant();
+                }
+            }
+            catch { }
+            return Instrument.MasterInstrument?.Name?.ToUpperInvariant() ?? "";
+        }
+
+        /// <summary>
         /// Check break-even triggers for all active intents and modify stop orders when triggered.
         /// Tick-based version: Uses actual tick price instead of bar high/low for immediate detection.
         /// </summary>
@@ -1645,7 +1690,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    activeIntents = _adapter.GetActiveIntentsForBEMonitoring();
+                    // CRITICAL: Filter by execution instrument (e.g. MGC, MES) - each strategy gets ticks for ONE instrument only.
+                    var executionInstrument = GetExecutionInstrumentForBE();
+                    activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
                     _cachedActiveIntentsForBE = activeIntents;
                     _cachedActiveIntentsForBEUtc = utcNow;
                 }

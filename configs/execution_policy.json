@@ -1,5 +1,6 @@
 {
   "schema": "qtsw2.execution_policy",
+  "disable_canonical_market_lock": true,
   "canonical_markets": {
     "ES": {
       "execution_instruments": {

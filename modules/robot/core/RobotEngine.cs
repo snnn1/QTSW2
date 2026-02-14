@@ -72,6 +72,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Session start time per instrument (from TradingHours, fallback to 17:00 CST)
     private readonly Dictionary<string, string> _sessionStartTimes = new Dictionary<string, string>();
+
+    // SessionCloseResolver: cache per (tradingDay, sessionClass)
+    private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _sessionCloseResults = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseEmittedKeys = new();
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
@@ -708,9 +712,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 4: Policy validation occurs in ApplyTimetable based on actual enabled directives
                 // No single-instrument assumption validation here - enforcement happens where streams are created
                 
-                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging
+                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging (unless disabled)
                 // This ensures observability consistency: lock acquisition happens before policy activation logs
-                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
+                var lockDisabled = _executionPolicy?.DisableCanonicalMarketLock == true;
+                if (!lockDisabled && !string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
                 {
                     var canonicalInstrument = GetCanonicalInstrument(_executionInstrument);
                     _canonicalMarketLock = new CanonicalMarketLock(_root, canonicalInstrument, _runId, _log);
@@ -1842,6 +1847,49 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     source = "TradingHours",
                     note = "Session start time set from NinjaTrader TradingHours template"
                 }));
+        }
+    }
+
+    /// <summary>
+    /// Set session close resolution result for (tradingDay, sessionClass).
+    /// Called by strategy (SessionCloseResolver) or HistoricalReplay harness.
+    /// Emits SESSION_CLOSE_RESOLVED or SESSION_CLOSE_HOLIDAY with source for log distinction.
+    /// </summary>
+    /// <param name="source">"LIVE_RESOLVER" or "HARNESS_CONFIG"</param>
+    public void SetSessionCloseResolved(string tradingDay, string sessionClass, SessionCloseResult result, string source = "LIVE_RESOLVER")
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return;
+        if (sessionClass != "S1" && sessionClass != "S2") return;
+
+        var r = result ?? new SessionCloseResult();
+        bool shouldEmit;
+        lock (_engineLock)
+        {
+            var key = (tradingDay, sessionClass);
+            _sessionCloseResults[key] = r;
+            shouldEmit = _sessionCloseEmittedKeys.Add(key);
+        }
+
+        if (!shouldEmit) return; // Already emitted for this (tradingDay, sessionClass)
+
+        var utcNow = DateTimeOffset.UtcNow;
+        if (r.HasSession)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLVED", state: "ENGINE",
+                new
+                {
+                    trading_day = tradingDay,
+                    session_class = sessionClass,
+                    source = source,
+                    flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
+                    resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
+                    buffer_seconds = r.BufferSeconds
+                }));
+        }
+        else
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY", state: "ENGINE",
+                new { trading_day = tradingDay, session_class = sessionClass, source = source, note = "No eligible segments (holiday)" }));
         }
     }
     

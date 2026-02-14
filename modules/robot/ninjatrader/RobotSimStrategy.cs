@@ -1470,6 +1470,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
         
         /// <summary>
+        /// Get execution instrument name for BE monitoring filter (e.g. MGC, MES, MYM).
+        /// Must match Intent.ExecutionInstrument - use FullName root, not MasterInstrument.Name (which returns base e.g. GC for MGC).
+        /// </summary>
+        private string GetExecutionInstrumentForBE()
+        {
+            if (Instrument == null) return "";
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(Instrument.FullName))
+                {
+                    var parts = Instrument.FullName.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length > 0)
+                        return parts[0].ToUpperInvariant();
+                }
+            }
+            catch { }
+            return Instrument.MasterInstrument?.Name?.ToUpperInvariant() ?? "";
+        }
+
+        /// <summary>
         /// Check break-even triggers for all active intents and modify stop orders when triggered.
         /// Tick-based version: Uses actual tick price instead of bar high/low for immediate detection.
         /// </summary>
@@ -1482,8 +1502,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 if (_adapter == null || !_engineReady) return;
                 
-                // Get active intents that need BE monitoring
-                var activeIntents = _adapter.GetActiveIntentsForBEMonitoring();
+                // Get active intents that need BE monitoring - CRITICAL: filter by this strategy's EXECUTION instrument
+                // Each strategy receives ticks for ONE instrument only. Without filter, we'd compare wrong price scales.
+                // CRITICAL FIX: Use execution instrument (e.g. MGC, MES) not MasterInstrument.Name (e.g. GC, ES).
+                // Intent.ExecutionInstrument is MGC/MES - MasterInstrument.Name for MGC chart returns GC, which would filter out GC2 intent!
+                var executionInstrument = GetExecutionInstrumentForBE();
+                var activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
                 
                 foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
                 {

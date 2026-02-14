@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "VY2lbU9cBA8=",
+  "dgSpecHash": "tVi+X83M3+o=",
   "success": true,
-  "projectFilePath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
+  "projectFilePath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\jakej\\.nuget\\packages\\system.text.encodings.web\\8.0.0\\system.text.encodings.web.8.0.0.nupkg.sha512",
     "C:\\Users\\jakej\\.nuget\\packages\\system.text.json\\8.0.0\\system.text.json.8.0.0.nupkg.sha512"

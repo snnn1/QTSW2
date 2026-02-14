@@ -40,8 +40,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string _executionPolicyPath = ""; // PHASE 4: Execution policy file path
     private ExecutionPolicy? _executionPolicy; // PHASE 4: Loaded execution policy
     
-    // PHASE 3.1: Single-executor guard for canonical markets
-    private CanonicalMarketLock? _canonicalMarketLock;
     private readonly string? _executionInstrument; // Execution instrument from constructor (MES, ES, etc.)
     private readonly string? _masterInstrumentName; // MasterInstrument.Name from NinjaTrader (for explicit canonical matching)
 
@@ -54,6 +52,22 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Returns empty string if trading date is not yet set.
     /// </summary>
     private string TradingDateString => _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+
+    /// <summary>
+    /// Convert UTC to Chicago timezone. For strategy layer (e.g. SessionCloseResolver).
+    /// </summary>
+    public DateTimeOffset ConvertUtcToChicago(DateTimeOffset utcTime)
+    {
+        lock (_engineLock) { return _time?.ConvertUtcToChicago(utcTime) ?? utcTime; }
+    }
+
+    /// <summary>
+    /// Get parity spec for SessionCloseResolver (strategy layer). Returns null if not loaded.
+    /// </summary>
+    public ParitySpec? GetParitySpec()
+    {
+        lock (_engineLock) { return _spec; }
+    }
 
     /// <summary>
     /// Get current trading date (for external access, e.g., NinjaTrader strategy).
@@ -82,6 +96,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Session start time per instrument (from TradingHours, fallback to 17:00 CST)
     private readonly Dictionary<string, string> _sessionStartTimes = new Dictionary<string, string>();
+
+    // SessionCloseResolver: cache per (tradingDay, sessionClass)
+    private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _sessionCloseResults = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseEmittedKeys = new();
+
+    // Session index per sessionClass for re-entry gate (S1, S2)
+    private readonly Dictionary<string, (string tradingDay, int index)> _currentSessionKeyByClass = new();
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
@@ -308,7 +329,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         _root = projectRoot;
         _executionMode = executionMode;
-        _executionInstrument = instrument; // PHASE 3.1: Store execution instrument for canonical lock
+        _executionInstrument = instrument;
         _masterInstrumentName = masterInstrumentName; // Store MasterInstrument.Name for explicit canonical matching
         
         // Log the instrument passed from NinjaTrader (for debugging)
@@ -727,62 +748,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 4: Policy validation occurs in ApplyTimetable based on actual enabled directives
                 // No single-instrument assumption validation here - enforcement happens where streams are created
                 
-                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging
-                // This ensures observability consistency: lock acquisition happens before policy activation logs
-                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
+                // PHASE 4: Emit policy activation log (canonical market lock removed - multiple instances per market allowed)
+                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _executionPolicy != null)
                 {
                     var canonicalInstrument = GetCanonicalInstrument(_executionInstrument);
-                    _canonicalMarketLock = new CanonicalMarketLock(_root, canonicalInstrument, _runId, _log);
-                    
-                    if (!_canonicalMarketLock.TryAcquire(utcNow))
+                    var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
+                    if (execInstPolicy != null && execInstPolicy.enabled)
                     {
-                        // Lock acquisition failed - another instance is active
-                        var errorMsg = $"PHASE 3.1: Another robot instance is already executing canonical market '{canonicalInstrument}'. " +
-                                     $"This instance (execution instrument: {_executionInstrument}) will not start to prevent duplicate execution.";
-                        
-                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANONICAL_MARKET_ALREADY_ACTIVE", state: "ENGINE",
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
                             new
                             {
                                 canonical_instrument = canonicalInstrument,
                                 execution_instrument = _executionInstrument,
-                                run_id = _runId,
-                                note = errorMsg
+                                resolved_order_quantity = execInstPolicy.base_size,
+                                base_size = execInstPolicy.base_size,
+                                max_size = execInstPolicy.max_size,
+                                note = "Policy loaded at startup; not reloadable"
                             }));
-                        
-                        // Trigger high-priority alert
-                        if (_healthMonitor != null)
-                        {
-                            var notificationService = _healthMonitor.GetNotificationService();
-                            if (notificationService != null)
-                            {
-                                notificationService.EnqueueNotification(
-                                    "CANONICAL_MARKET_ALREADY_ACTIVE",
-                                    "CRITICAL: Duplicate Executor Blocked",
-                                    errorMsg,
-                                    priority: 2); // Emergency priority
-                            }
-                        }
-                        
-                        throw new InvalidOperationException(errorMsg);
-                    }
-                    
-                    // PHASE 4: Emit policy activation log AFTER lock acquisition (observability consistency)
-                    if (_executionPolicy != null)
-                    {
-                        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
-                        if (execInstPolicy != null && execInstPolicy.enabled)
-                        {
-                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
-                                new
-                                {
-                                    canonical_instrument = canonicalInstrument,
-                                    execution_instrument = _executionInstrument,
-                                    resolved_order_quantity = execInstPolicy.base_size,
-                                    base_size = execInstPolicy.base_size,
-                                    max_size = execInstPolicy.max_size,
-                                    note = "Policy loaded at startup; not reloadable"
-                                }));
-                        }
                     }
                 }
             }
@@ -1130,9 +1112,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         var utcNow = DateTimeOffset.UtcNow;
         
-        // PHASE 3.1: Release canonical market lock on shutdown
-        _canonicalMarketLock?.Release(utcNow);
-        
         string? summaryPathToWrite = null;
         string? summaryJson = null;
 
@@ -1292,6 +1271,45 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _healthMonitor?.UpdateTimetablePoll(utcNow);
 
                 ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
+            }
+
+            // Forced flatten block (BEFORE stream.Tick) — per sessionClass
+            var tradingDateStr = TradingDateString;
+            if (!string.IsNullOrEmpty(tradingDateStr))
+            {
+                foreach (var sessionClass in new[] { "S1", "S2" })
+                {
+                    if (!TryGetSessionCloseResult(tradingDateStr, sessionClass, out var closeResult) || closeResult == null)
+                        continue;
+                    if (!closeResult.HasSession || !closeResult.FlattenTriggerUtc.HasValue)
+                        continue;
+                    if (utcNow < closeResult.FlattenTriggerUtc.Value)
+                        continue;
+
+                    // Emit FORCED_FLATTEN_TRIGGERED once per (tradingDay, sessionClass)
+                    if (!_journals.HasForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass))
+                    {
+                        _journals.MarkForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass);
+                        var streamsInSession = _streams.Values.Where(s => s.Session == sessionClass && !s.Committed).ToList();
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_TRIGGERED", state: "ENGINE",
+                            new
+                            {
+                                reason = "SESSION_CLOSE",
+                                session_class = sessionClass,
+                                source = "LIVE_RESOLVER",
+                                resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
+                                buffer_seconds = closeResult.BufferSeconds,
+                                trading_date = tradingDateStr,
+                                streams_impacted = streamsInSession.Select(s => s.Stream).ToList()
+                            }));
+                    }
+
+                    foreach (var s in _streams.Values)
+                    {
+                        if (s.Session != sessionClass || s.Committed) continue;
+                        s.HandleForcedFlatten(utcNow);
+                    }
+                }
             }
 
             foreach (var s in _streams.Values)
@@ -1875,6 +1893,97 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     note = "Session start time set from NinjaTrader TradingHours template"
                 }));
         }
+    }
+
+    /// <summary>
+    /// Set session close resolution result for (tradingDay, sessionClass).
+    /// Called by strategy (SessionCloseResolver) or HistoricalReplay harness.
+    /// Emits SESSION_CLOSE_RESOLVED or SESSION_CLOSE_HOLIDAY.
+    /// </summary>
+    public void SetSessionCloseResolved(string tradingDay, string sessionClass, SessionCloseResult result)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return;
+        if (sessionClass != "S1" && sessionClass != "S2") return;
+
+        var r = result ?? new SessionCloseResult();
+        bool shouldEmit;
+        lock (_engineLock)
+        {
+            var key = (tradingDay, sessionClass);
+            _sessionCloseResults[key] = r;
+            shouldEmit = _sessionCloseEmittedKeys.Add(key);
+        }
+
+        if (!shouldEmit) return; // Already emitted for this (tradingDay, sessionClass)
+
+        var utcNow = DateTimeOffset.UtcNow;
+        if (r.HasSession)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLVED", state: "ENGINE",
+                new
+                {
+                    trading_day = tradingDay,
+                    session_class = sessionClass,
+                    flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
+                    resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
+                    buffer_seconds = r.BufferSeconds
+                }));
+        }
+        else
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY", state: "ENGINE",
+                new { trading_day = tradingDay, session_class = sessionClass, note = "No eligible segments (holiday)" }));
+        }
+    }
+
+    /// <summary>
+    /// Set current session index for re-entry gate. Called by strategy each Realtime tick per sessionClass.
+    /// </summary>
+    public void SetCurrentSessionIndex(string tradingDay, string sessionClass, int index)
+    {
+        if (string.IsNullOrWhiteSpace(sessionClass) || sessionClass != "S1" && sessionClass != "S2") return;
+        lock (_engineLock)
+        {
+            _currentSessionKeyByClass[sessionClass] = (tradingDay ?? "", index);
+        }
+    }
+
+    /// <summary>
+    /// Try get cached session close result for (tradingDay, sessionClass).
+    /// </summary>
+    public bool TryGetSessionCloseResult(string tradingDay, string sessionClass, out SessionCloseResult? result)
+    {
+        result = null;
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return false;
+        lock (_engineLock)
+        {
+            if (_sessionCloseResults.TryGetValue((tradingDay, sessionClass), out var r))
+            {
+                result = r;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Try get current session index for sessionClass. Used by stream re-entry gate.
+    /// </summary>
+    public bool TryGetCurrentSessionIndex(string sessionClass, out string tradingDay, out int index)
+    {
+        tradingDay = "";
+        index = 0;
+        if (string.IsNullOrWhiteSpace(sessionClass)) return false;
+        lock (_engineLock)
+        {
+            if (_currentSessionKeyByClass.TryGetValue(sessionClass, out var tuple))
+            {
+                tradingDay = tuple.tradingDay;
+                index = tuple.index;
+                return true;
+            }
+        }
+        return false;
     }
     
     /// <summary>

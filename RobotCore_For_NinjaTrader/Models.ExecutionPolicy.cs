@@ -14,11 +14,15 @@ public sealed class ExecutionPolicy
     
     public Dictionary<string, CanonicalMarketPolicy> canonical_markets => _canonicalMarkets;
     
+    /// <summary>When true, canonical market lock is disabled (multiple instances per market allowed).</summary>
+    public bool DisableCanonicalMarketLock { get; }
+
     // Private constructor - use LoadFromFile
-    private ExecutionPolicy(Dictionary<string, CanonicalMarketPolicy> canonicalMarkets, string schema)
+    private ExecutionPolicy(Dictionary<string, CanonicalMarketPolicy> canonicalMarkets, string schema, bool disableCanonicalMarketLock)
     {
         _canonicalMarkets = canonicalMarkets;
         this.schema = schema;
+        DisableCanonicalMarketLock = disableCanonicalMarketLock;
     }
     
     public static ExecutionPolicy LoadFromFile(string path)
@@ -70,7 +74,7 @@ public sealed class ExecutionPolicy
             normalizedCanonicalMarkets[canonicalKey] = new CanonicalMarketPolicy(normalizedExecInstruments);
         }
         
-        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "");
+        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "", rawPolicy.disable_canonical_market_lock);
         policy.ValidateOrThrow();
         return policy;
     }
@@ -169,6 +173,8 @@ internal sealed class ExecutionPolicyRaw
 {
     public string? schema { get; set; }
     public Dictionary<string, CanonicalMarketPolicyRaw>? canonical_markets { get; set; }
+    /// <summary>When true, skip canonical market lock (allow multiple instances per market). Default: false.</summary>
+    public bool disable_canonical_market_lock { get; set; }
 }
 
 internal sealed class CanonicalMarketPolicyRaw

@@ -11,6 +11,8 @@ public sealed class Intent
     public string TradingDate { get; private set; }
     public string Stream { get; private set; }
     public string Instrument { get; private set; }
+    /// <summary>Execution instrument (e.g. MES, MYM) - used for BE monitoring filter so each strategy only checks intents for its chart.</summary>
+    public string ExecutionInstrument { get; private set; }
     public string Session { get; private set; }
     public string SlotTimeChicago { get; private set; }
     public string? Direction { get; private set; }
@@ -25,6 +27,7 @@ public sealed class Intent
         string tradingDate,
         string stream,
         string instrument,
+        string executionInstrument,
         string session,
         string slotTimeChicago,
         string? direction,
@@ -38,6 +41,7 @@ public sealed class Intent
         TradingDate = tradingDate;
         Stream = stream;
         Instrument = instrument;
+        ExecutionInstrument = executionInstrument ?? instrument;
         Session = session;
         SlotTimeChicago = slotTimeChicago;
         Direction = direction;

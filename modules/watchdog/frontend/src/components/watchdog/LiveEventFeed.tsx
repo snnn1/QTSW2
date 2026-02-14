@@ -144,8 +144,8 @@ function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedP
     return true
   }
   
-  // Compare by checking if the last event (highest seq) is the same
-  // This is efficient because new events are always appended
+  // Compare by checking if the last event (by timestamp) is the same
+  // Events are sorted by timestamp, so last in array = most recent
   const prevLast = prevProps.events[prevProps.events.length - 1]
   const nextLast = nextProps.events[nextProps.events.length - 1]
   
@@ -153,11 +153,11 @@ function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedP
     return false
   }
   
-  // Events are equal if the last event has the same run_id and event_seq
-  // This means no new events were added
+  // Events are equal if the last event has the same run_id, event_seq, and timestamp
   return (
     prevLast.run_id === nextLast.run_id &&
-    prevLast.event_seq === nextLast.event_seq
+    prevLast.event_seq === nextLast.event_seq &&
+    (prevLast.timestamp_chicago || prevLast.timestamp_utc) === (nextLast.timestamp_chicago || nextLast.timestamp_utc)
   )
 }
 
