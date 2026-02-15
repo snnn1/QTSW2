@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "1M+eUeXJVXM=",
+  "dgSpecHash": "tJocQmVaByI=",
   "success": true,
-  "projectFilePath": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
+  "projectFilePath": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\jakej\\.nuget\\packages\\microsoft.bcl.asyncinterfaces\\8.0.0\\microsoft.bcl.asyncinterfaces.8.0.0.nupkg.sha512",
     "C:\\Users\\jakej\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",

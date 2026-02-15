@@ -3009,6 +3009,33 @@ public sealed partial class NinjaTraderSimAdapter
                 var error = "Stop order not found for BE modification";
                 return OrderModificationResult.FailureResult(error, utcNow);
             }
+            // CRITICAL: Do NOT record BE when stop not found — retry later. RecordBEModification only below.
+
+            // Only tighten: never move stop backward (e.g. if trailing logic already moved it tighter)
+            var currentStop = (decimal)stopOrder.StopPrice;
+            var (_, _, _, _, _, intentDirection, _) = GetIntentInfo(intentId);
+            var stopAlreadyTighter = intentDirection == "Long"
+                ? currentStop >= beStopPrice   // Long: current stop at or above BE = already tighter
+                : currentStop <= beStopPrice;  // Short: current stop at or below BE = already tighter
+            if (stopAlreadyTighter)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_SKIP_STOP_ALREADY_TIGHTER", new
+                {
+                    current_stop = currentStop,
+                    be_stop_price = beStopPrice,
+                    direction = intentDirection,
+                    note = "Stop already at or tighter than BE - skip modification (idempotent)"
+                }));
+                // Record as modified so we don't retry. Safe: we only reach here after confirming valid stop
+                // order exists (found by intent tag QTSW2:{intentId}:STOP) and comparison is meaningful.
+                var (tradingDateSkip, streamSkip, intentEntrySkip, _, _, _, _) = GetIntentInfo(intentId);
+                decimal? beTriggerSkip = null;
+                if (_intentMap.TryGetValue(intentId, out var skipIntent))
+                    beTriggerSkip = skipIntent.BeTrigger;
+                _executionJournal.RecordBEModification(intentId, tradingDateSkip ?? "", streamSkip ?? "", currentStop, utcNow,
+                    previousStopPrice: currentStop, beTriggerPrice: beTriggerSkip, entryPrice: intentEntrySkip);
+                return OrderModificationResult.SuccessResult(utcNow);
+            }
 
             // Real NT API: Modify stop price
             stopOrder.StopPrice = (double)beStopPrice;

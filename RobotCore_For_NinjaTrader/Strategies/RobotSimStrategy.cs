@@ -1306,7 +1306,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Secondary series (BIP 1): BE + heartbeat only. DISABLED when AddDataSeries(Second,1) is commented out.
             // LAG FIX: Only run when in a position — skip entirely when flat to avoid chart lag.
-            // Throttle to 5s when in position — 1/sec across 7+ strategies was blocking UI thread.
+            // Throttle to 1s when in position (was 5s; reduced for faster BE detection).
             if (BarsInProgress == 1)
             {
                 if (State != State.Realtime)
@@ -1314,7 +1314,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Position.MarketPosition == MarketPosition.Flat)
                     return; // No trade — skip BE + heartbeat entirely
                 var now = DateTimeOffset.UtcNow;
-                if ((now - _lastBip1WorkUtc).TotalSeconds < 5.0 && _lastBip1WorkUtc != DateTimeOffset.MinValue)
+                if ((now - _lastBip1WorkUtc).TotalSeconds < 1.0 && _lastBip1WorkUtc != DateTimeOffset.MinValue)
                     return;
                 _lastBip1WorkUtc = now;
                 // BE path diagnostic: once per minute — confirms BE check runs when in position
@@ -1322,7 +1322,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
                 {
                     _lastBePathActiveLogUtc[instrumentName] = now;
-                    var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring().Count : -1;
+                    var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
                     _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
                     {
                         { "instrument", instrumentName },
@@ -1338,7 +1338,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
-            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 5s)
+            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 1s)
             // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
             var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
             var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
@@ -1348,7 +1348,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (runBeFromBip0)
             {
                 var now = DateTimeOffset.UtcNow;
-                if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 5.0)
+                if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 1.0)
                 {
                     _lastBip1WorkUtc = now;
                     var instrumentNameFallback = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
@@ -1356,7 +1356,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentNameFallback, out var lastPathLogF) || (now - lastPathLogF).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
                     {
                         _lastBePathActiveLogUtc[instrumentNameFallback] = now;
-                        var activeCountF = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring().Count : -1;
+                        var activeCountF = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
                         _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
                         {
                             { "instrument", instrumentNameFallback },
@@ -1959,7 +1959,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
                                 { "tick_price", _lastTickPriceForBE },
-                                { "detection_method", "TICK_BASED" },
+                                { "detection_method", "BAR_CLOSE" },
                                 { "seconds_to_modify", (utcNow - triggerReachedAt).TotalSeconds },
                                 { "note", "Break-even trigger reached (tick-based detection) - stop order modified to break-even using breakout level (1 tick before breakout point)" }
                             });
@@ -1986,7 +1986,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
                                 { "tick_price", _lastTickPriceForBE },
-                                { "detection_method", "TICK_BASED" },
+                                { "detection_method", "BAR_CLOSE" },
                                 { "error", modifyResult.ErrorMessage },
                                 { "is_retryable", isRetryableError },
                                 { "seconds_since_trigger_reached", secondsSinceTriggerReached },
