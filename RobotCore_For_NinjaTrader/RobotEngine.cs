@@ -996,6 +996,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     {
                         _healthMonitor = new HealthMonitor(_root, healthMonitorConfig, _log);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
+                        _healthMonitor.SetMarketOpenCallback(() => _time != null && TimeService.IsCmeMarketOpen(_time.ConvertUtcToChicago(DateTimeOffset.UtcNow)));
                     }
                     else
                     {

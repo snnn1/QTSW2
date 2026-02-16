@@ -117,5 +117,24 @@ public sealed class TimeService
     /// Format DateOnly as yyyy-MM-dd string (replaces .ToString("yyyy-MM-dd") pattern).
     /// </summary>
     public static string FormatDateOnly(DateOnly date) => date.ToString("yyyy-MM-dd");
+
+    /// <summary>
+    /// CME futures session rules (matches modules/watchdog/market_session.py).
+    /// Open: Sun 17:00 CT → Fri 16:00 CT. Daily maintenance break: 16:00–17:00 CT. Closed Saturday.
+    /// </summary>
+    public static bool IsCmeMarketOpen(DateTimeOffset chicagoTime)
+    {
+        var dt = chicagoTime.DateTime;
+        var weekday = dt.DayOfWeek; // Sun=0 … Sat=6
+        var hour = dt.Hour;
+        var minute = dt.Minute;
+        var t = hour * 60 + minute; // minutes since midnight
+
+        if (weekday == DayOfWeek.Saturday) return false;
+        if (weekday == DayOfWeek.Sunday) return t >= 17 * 60; // 17:00
+        if (weekday == DayOfWeek.Friday) return t < 16 * 60;  // before 16:00
+        if (t >= 16 * 60 && t < 17 * 60) return false;        // maintenance break
+        return true;
+    }
 }
 
