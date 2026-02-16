@@ -1343,10 +1343,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
             // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 1s)
             // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
+            // FALLBACK 3: When BIP 1 has NEVER fired (_lastBip1WorkUtc == MinValue), run BE from BIP 0 (fix for instruments with no 1s bars)
             var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
             var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
             var runBeFromBip0 = inPositionRealtime && (
                 BarsArray.Length < 2 ||
+                _lastBip1WorkUtc == DateTimeOffset.MinValue || // BIP 1 never fired — use primary bar (fix for MCL/M2K/MNG etc.)
                 (_lastBip1WorkUtc != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - _lastBip1WorkUtc).TotalSeconds >= bip1StaleSeconds));
             if (runBeFromBip0)
             {
