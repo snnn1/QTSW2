@@ -13,6 +13,7 @@ from collections import defaultdict
 import pytz
 
 from .config import (
+    EXECUTION_JOURNALS_DIR,
     FRONTEND_CURSOR_FILE,
     ENGINE_TICK_STALL_THRESHOLD_SECONDS,
     ENGINE_TICK_STALL_HYSTERESIS_SECONDS,
@@ -20,6 +21,7 @@ from .config import (
     UNPROTECTED_TIMEOUT_SECONDS,
     DATA_STALL_THRESHOLD_SECONDS,
     RECOVERY_TIMEOUT_SECONDS,
+    STREAM_MAX_AGE_DAYS,
 )
 from .market_session import is_market_open
 
@@ -33,6 +35,29 @@ SLOT_ENDS = {
 }
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+
+def _is_trading_date_within_max_age(
+    trading_date: str,
+    current_trading_date: Optional[str] = None,
+    max_days: int = STREAM_MAX_AGE_DAYS,
+) -> bool:
+    """
+    Return True if trading_date is within max_days of current_trading_date (inclusive).
+    Streams older than this are filtered out (realistically positions only carry over ~24h).
+    """
+    if not trading_date:
+        return False
+    try:
+        td_date = datetime.strptime(trading_date, "%Y-%m-%d").date()
+        if current_trading_date:
+            current_date = datetime.strptime(current_trading_date, "%Y-%m-%d").date()
+        else:
+            current_date = datetime.now(CHICAGO_TZ).date()
+        cutoff = current_date - timedelta(days=max_days)
+        return cutoff <= td_date <= current_date
+    except (ValueError, TypeError):
+        return False
 
 
 class WatchdogStateManager:
@@ -232,7 +257,8 @@ class WatchdogStateManager:
     
     def update_intent_exposure(self, intent_id: str, stream_id: str, instrument: str,
                               direction: str, entry_filled_qty: int = 0, exit_filled_qty: int = 0,
-                              state: str = "ACTIVE", entry_filled_at_utc: Optional[datetime] = None):
+                              state: str = "ACTIVE", entry_filled_at_utc: Optional[datetime] = None,
+                              trading_date: Optional[str] = None):
         """Update intent exposure."""
         if intent_id not in self._intent_exposures:
             self._intent_exposures[intent_id] = IntentExposureInfo(
@@ -243,7 +269,8 @@ class WatchdogStateManager:
                 entry_filled_qty=entry_filled_qty,
                 exit_filled_qty=exit_filled_qty,
                 state=state,
-                entry_filled_at_utc=entry_filled_at_utc
+                entry_filled_at_utc=entry_filled_at_utc,
+                trading_date=trading_date
             )
         else:
             info = self._intent_exposures[intent_id]
@@ -252,7 +279,120 @@ class WatchdogStateManager:
             info.state = state
             if entry_filled_at_utc:
                 info.entry_filled_at_utc = entry_filled_at_utc
-    
+            if trading_date:
+                info.trading_date = trading_date
+
+    def hydrate_intent_exposures_from_journals(self, journals_dir: Optional[Path] = None) -> int:
+        """
+        Scan execution journals for EntryFilled && !TradeCompleted and populate _intent_exposures.
+        Called on rollover/startup to ensure carry-over positions from previous day are visible.
+        Skips journals older than STREAM_MAX_AGE_DAYS (realistically ~24h carry-over only).
+        Returns count of intents hydrated.
+        """
+        journals_dir = journals_dir or EXECUTION_JOURNALS_DIR
+        if not journals_dir.exists():
+            return 0
+        current_trading_date = self.get_trading_date()
+        if not current_trading_date:
+            from .timetable_poller import compute_timetable_trading_date
+            current_trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+        hydrated = 0
+        closed_from_journal = 0
+        try:
+            for journal_file in journals_dir.glob("*.json"):
+                try:
+                    with open(journal_file, "r") as f:
+                        entry = json.load(f)
+                    if not entry.get("EntryFilled"):
+                        continue
+                    # Parse filename early for intent_id/stream/trading_date
+                    stem = journal_file.stem
+                    parts = stem.split("_")
+                    if len(parts) < 3:
+                        continue
+                    trading_date = parts[0]
+                    intent_id = parts[-1]
+                    stream = "_".join(parts[1:-1])
+                    if entry.get("TradeCompleted"):
+                        # Journal shows trade completed (reconciliation or normal exit) - close intent and stream
+                        if intent_id in self._intent_exposures:
+                            self._intent_exposures[intent_id].state = "CLOSED"
+                            closed_from_journal += 1
+                        key = (trading_date, stream)
+                        if key in self._stream_states and _is_trading_date_within_max_age(trading_date, current_trading_date):
+                            info = self._stream_states[key]
+                            info.state = "DONE"
+                            info.committed = True
+                            info.commit_reason = entry.get("CompletionReason") or entry.get("completion_reason") or "TRADE_COMPLETED"
+                        continue
+                    entry_qty = entry.get("EntryFilledQuantityTotal") or entry.get("FillQuantity") or 0
+                    if entry_qty <= 0:
+                        continue
+                    if not _is_trading_date_within_max_age(trading_date, current_trading_date):
+                        continue  # Skip journals older than ~24h
+                    instrument = entry.get("Instrument", "UNKNOWN") or "UNKNOWN"
+                    direction = entry.get("Direction", "Long") or "Long"
+                    exit_qty = entry.get("ExitFilledQuantityTotal", 0) or 0
+                    entry_filled_at = None
+                    if entry.get("EntryFilledAtUtc"):
+                        try:
+                            entry_filled_at = datetime.fromisoformat(
+                                entry["EntryFilledAtUtc"].replace("Z", "+00:00")
+                            )
+                            if entry_filled_at.tzinfo is None:
+                                entry_filled_at = entry_filled_at.replace(tzinfo=timezone.utc)
+                        except (ValueError, TypeError):
+                            pass
+                    if intent_id not in self._intent_exposures:
+                        self._intent_exposures[intent_id] = IntentExposureInfo(
+                            intent_id=intent_id,
+                            stream_id=stream,
+                            instrument=instrument,
+                            direction=direction,
+                            entry_filled_qty=entry_qty,
+                            exit_filled_qty=exit_qty,
+                            state="ACTIVE",
+                            entry_filled_at_utc=entry_filled_at,
+                            trading_date=trading_date
+                        )
+                        hydrated += 1
+                        # Ensure stream state exists so get_stream_states shows carry-over
+                        key = (trading_date, stream)
+                        if key not in self._stream_states:
+                            self._stream_states[key] = StreamStateInfo(
+                                trading_date=trading_date,
+                                stream=stream,
+                                state="RANGE_LOCKED",  # Carry-over: had position
+                                committed=False,
+                                state_entry_time_utc=entry_filled_at or datetime.now(timezone.utc),
+                                execution_instrument=instrument
+                            )
+                    else:
+                        info = self._intent_exposures[intent_id]
+                        if not info.trading_date:
+                            info.trading_date = trading_date
+                except Exception as e:
+                    logger.debug(f"Skip journal {journal_file.name}: {e}")
+        except Exception as e:
+            logger.warning(f"hydrate_intent_exposures_from_journals failed: {e}", exc_info=True)
+        if hydrated > 0 or closed_from_journal > 0:
+            logger.info(
+                f"hydrate_intent_exposures_from_journals: hydrated {hydrated}, closed {closed_from_journal} "
+                f"(from TradeCompleted journals)"
+            )
+        return hydrated
+
+    def get_active_intent_stream_keys(self) -> Set[tuple]:
+        """Return set of (trading_date, stream_id) with active intent exposures."""
+        keys = set()
+        for exp in self._intent_exposures.values():
+            if getattr(exp, "state", "") == "ACTIVE":
+                td = getattr(exp, "trading_date", None)
+                sid = getattr(exp, "stream_id", None)
+                if td and sid:
+                    keys.add((td, sid))
+        return keys
+
     def record_protective_order_submitted(self, intent_id: str, timestamp_utc: datetime):
         """Record protective order submission."""
         self._protective_events[intent_id].add(timestamp_utc.isoformat())
@@ -468,16 +608,31 @@ class WatchdogStateManager:
             utc_now: Current UTC time for age calculations
             clear_all_for_date: If True, clear streams for current_trading_date that haven't been updated recently
         """
-        # Remove streams from different trading dates
+        # Build set of (trading_date, stream) with active intents (from events or journals)
+        active_stream_keys = set()
+        for exp in self._intent_exposures.values():
+            if getattr(exp, "state", "") == "ACTIVE" and getattr(exp, "trading_date", None) and getattr(exp, "stream_id", None):
+                active_stream_keys.add((exp.trading_date, exp.stream_id))
+
+        # Remove streams from different trading dates (unless they have active intents AND are within max age)
         keys_to_remove = []
         for (trading_date, stream), info in self._stream_states.items():
             # Always remove streams from different trading dates (stale from previous day)
+            # EXCEPT: preserve streams with active intent exposures (carry-over) AND within ~24h
             if trading_date != current_trading_date:
-                logger.debug(
-                    f"Removing stale stream from different trading date: {stream} "
-                    f"(date: {trading_date}, current: {current_trading_date})"
-                )
-                keys_to_remove.append((trading_date, stream))
+                if (trading_date, stream) in active_stream_keys and _is_trading_date_within_max_age(
+                    trading_date, current_trading_date
+                ):
+                    logger.debug(
+                        f"Preserving stream with active intent: {stream} "
+                        f"(date: {trading_date}, current: {current_trading_date})"
+                    )
+                else:
+                    reason = "too old" if not _is_trading_date_within_max_age(trading_date, current_trading_date) else "no active intent"
+                    logger.debug(
+                        f"Removing stale stream: {stream} (date: {trading_date}, current: {current_trading_date}, reason: {reason})"
+                    )
+                    keys_to_remove.append((trading_date, stream))
             # If clear_all_for_date is True (ENGINE_START), only remove streams that haven't been updated recently
             # This prevents clearing active streams that are still transitioning
             elif clear_all_for_date and trading_date == current_trading_date:
@@ -1206,7 +1361,7 @@ class IntentExposureInfo:
     """Information about an intent's exposure."""
     def __init__(self, intent_id: str, stream_id: str, instrument: str, direction: str,
                  entry_filled_qty: int = 0, exit_filled_qty: int = 0, state: str = "ACTIVE",
-                 entry_filled_at_utc: Optional[datetime] = None):
+                 entry_filled_at_utc: Optional[datetime] = None, trading_date: Optional[str] = None):
         self.intent_id = intent_id
         self.stream_id = stream_id
         self.instrument = instrument
@@ -1215,6 +1370,7 @@ class IntentExposureInfo:
         self.exit_filled_qty = exit_filled_qty
         self.state = state
         self.entry_filled_at_utc = entry_filled_at_utc
+        self.trading_date = trading_date  # For cross-day visibility (preserve streams with open intents)
 
 
 class DuplicateInstanceInfo:

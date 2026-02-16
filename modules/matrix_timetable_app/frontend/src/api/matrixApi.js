@@ -92,6 +92,7 @@ export async function getMatrixData({
   includeFilteredExecuted = false,
   streamInclude = null
 }) {
+  console.log(`[API] getMatrixData called with includeFilteredExecuted=${includeFilteredExecuted} (type: ${typeof includeFilteredExecuted})`)
   const params = new URLSearchParams({
     limit: limit.toString(),
     order,
@@ -100,6 +101,7 @@ export async function getMatrixData({
     contract_multiplier: contractMultiplier.toString(),
     include_filtered_executed: includeFilteredExecuted.toString()
   })
+  console.log(`[API] Query params: include_filtered_executed=${params.get('include_filtered_executed')}`)
   
   // Add stream_include if specified
   if (streamInclude && Array.isArray(streamInclude) && streamInclude.length > 0) {

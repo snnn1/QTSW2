@@ -93,37 +93,57 @@ export function WatchdogPage() {
   }, [status?.recovery_state, status?.engine_activity_state]) // Only depend on fields that affect result
   
   // Determine data flow status - memoized with stable dependencies
+  // Uses same engine tick source as engine liveness (ENGINE_TICK_CALLSITE) when bar-age data unavailable
   const dataFlowStatus = useMemo(() => {
     if (!status) return 'UNKNOWN'
     
     const stalls = Object.values(status.data_stall_detected || {})
+    const DATA_STALL_THRESHOLD = 120 // Match backend threshold (seconds)
     
-    // If no instruments tracked yet, check if bars are being received
-    // If worst_last_bar_age_seconds is set and recent, data is flowing
+    // Helper: compute engine tick age in seconds (same source as engine liveness)
+    const getEngineTickAgeSeconds = (): number | null => {
+      const tickStr = status?.last_engine_tick_chicago
+      if (!tickStr) return null
+      try {
+        const tickMs = new Date(tickStr).getTime()
+        if (isNaN(tickMs)) return null
+        return (Date.now() - tickMs) / 1000
+      } catch {
+        return null
+      }
+    }
+    
+    // If no instruments tracked yet, check bars (worst_last_bar_age) or engine tick (fallback)
     if (stalls.length === 0) {
       // If market is known to be closed, show acceptable silence
       if (status.market_open === false) {
         return 'ACCEPTABLE_SILENCE'
       }
       
-      // If bars are being received (worst_last_bar_age_seconds is set and recent), show FLOWING
-      // This handles the case where streams are in PRE_HYDRATION but bars are arriving
+      // Primary: bars are being received (worst_last_bar_age_seconds set and recent)
       if (status.worst_last_bar_age_seconds !== null && status.worst_last_bar_age_seconds !== undefined) {
-        // Bars are being received - show FLOWING if recent (< 2 minutes), otherwise show based on threshold
-        // Use DATA_STALL_THRESHOLD (120s) as the threshold for showing STALLED vs FLOWING
-        const DATA_STALL_THRESHOLD = 120 // Match backend threshold (increased from 90s to prevent flickering)
         if (status.worst_last_bar_age_seconds < DATA_STALL_THRESHOLD) {
           return 'FLOWING'
         } else if (status.worst_last_bar_age_seconds < 150) {
-          // Between 120-150 seconds: add small buffer to prevent flickering
           return 'FLOWING'
         } else {
-          // Over 2.5 minutes: show as stalled if market is open
           return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
         }
       }
       
-      // Otherwise, show unknown (waiting for first bar or streams to transition)
+      // Fallback: use engine tick (same as engine liveness - ENGINE_TICK_CALLSITE)
+      // Engine tick = bars being processed; if tick is recent, data is flowing
+      const tickAge = getEngineTickAgeSeconds()
+      if (tickAge !== null && tickAge < DATA_STALL_THRESHOLD) {
+        return 'FLOWING'
+      }
+      if (tickAge !== null && tickAge < 150) {
+        return 'FLOWING'
+      }
+      if (tickAge !== null && tickAge >= DATA_STALL_THRESHOLD) {
+        return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
+      }
+      
       return 'UNKNOWN'
     }
     
@@ -141,7 +161,7 @@ export function WatchdogPage() {
     
     // No stalls detected = data flowing
     return 'FLOWING'
-  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds]) // Only depend on fields that affect result
+  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago]) // Only depend on fields that affect result
   
   // Build critical alerts
   const alerts = useMemo(() => {

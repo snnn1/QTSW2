@@ -160,6 +160,43 @@ async def get_active_intents():
         raise HTTPException(status_code=500, detail=f"Error getting active intents: {str(e)}")
 
 
+@router.get("/open-journals")
+async def get_open_journals(
+    include_previous_days: int = Query(0, ge=0, description="Include journals from previous N days (0 = all)")
+):
+    """
+    Get all open execution journals (EntryFilled && !TradeCompleted).
+    Operational visibility for carry-over positions from previous days.
+    """
+    entries = []
+    if not EXECUTION_JOURNALS_DIR.exists():
+        return {"entries": entries, "count": 0}
+    cutoff_date = None
+    if include_previous_days > 0:
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=include_previous_days)).date()
+    for journal_file in EXECUTION_JOURNALS_DIR.glob("*.json"):
+        try:
+            with open(journal_file, 'r') as f:
+                entry = json.load(f)
+            if not entry.get("EntryFilled") or entry.get("TradeCompleted"):
+                continue
+            if entry.get("EntryFilledQuantityTotal", 0) <= 0 and entry.get("FillQuantity", 0) <= 0:
+                continue
+            if cutoff_date:
+                td_str = entry.get("TradingDate") or journal_file.stem.split("_")[0]
+                try:
+                    entry_date = datetime.strptime(td_str, "%Y-%m-%d").date()
+                    if entry_date < cutoff_date:
+                        continue
+                except (ValueError, IndexError):
+                    pass
+            entry = _convert_entry_timestamps_to_chicago(entry)
+            entries.append(entry)
+        except Exception as e:
+            logger.debug(f"Skip journal {journal_file.name}: {e}")
+    return {"entries": entries, "count": len(entries)}
+
+
 @router.get("/ws-health")
 async def get_ws_health():
     """Get WebSocket health status and connection metrics."""

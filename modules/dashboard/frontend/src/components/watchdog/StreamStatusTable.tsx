@@ -14,8 +14,9 @@ interface StreamStatusTableProps {
 }
 
 export function StreamStatusTable({ streams, onStreamClick, marketOpen }: StreamStatusTableProps) {
-  // Get current trading date from first stream (all streams should have same trading_date)
-  const currentTradingDate = streams[0]?.trading_date || new Date().toISOString().split('T')[0]
+  // Get current trading date (today) for PnL and carry-over styling
+  const todayStr = new Date().toISOString().split('T')[0]
+  const currentTradingDate = streams[0]?.trading_date || todayStr
   const { pnl } = useStreamPnl(currentTradingDate)
   const [, forceUpdate] = useState(0)
   
@@ -56,6 +57,9 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
   }
   
   const getStateBadgeColor = (state: string) => {
+    if (!state || state === '') {
+      return 'bg-gray-700 text-gray-400'
+    }
     switch (state) {
       case 'PRE_HYDRATION':
         return 'bg-gray-600 text-white'
@@ -78,12 +82,44 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
     return 'text-white'
   }
   
+  // Sort streams: today first, then by date (newest first), then by slot_time_chicago (latest first), then by stream name
+  const sortedStreams = [...streams].sort((a, b) => {
+    const aDate = a.trading_date || ''
+    const bDate = b.trading_date || ''
+    if (aDate !== bDate) {
+      if (aDate === todayStr) return -1
+      if (bDate === todayStr) return 1
+      return bDate.localeCompare(aDate)
+    }
+    const parseSlotTime = (slotTime: string | null | undefined): number => {
+      if (!slotTime || slotTime === '-' || slotTime === '') return 0
+      if (slotTime.includes('T')) {
+        try {
+          const match = slotTime.match(/T(\d{2}):(\d{2})/)
+          if (match) return parseInt(match[1], 10) * 60 + parseInt(match[2], 10)
+        } catch {}
+      }
+      if (slotTime.includes(':')) {
+        try {
+          const [hours, minutes] = slotTime.split(':').map(Number)
+          if (!isNaN(hours) && !isNaN(minutes)) return hours * 60 + minutes
+        } catch {}
+      }
+      return 0
+    }
+    const aSlot = parseSlotTime(a.slot_time_chicago)
+    const bSlot = parseSlotTime(b.slot_time_chicago)
+    if (bSlot !== aSlot) return bSlot - aSlot
+    return a.stream.localeCompare(b.stream)
+  })
+  
   return (
     <div className="bg-gray-800 rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
         <table className="w-full">
           <thead className="bg-gray-700">
             <tr>
+              <th className="px-4 py-2 text-left whitespace-nowrap min-w-[5rem]">Date</th>
               <th className="px-4 py-2 text-left">Stream</th>
               <th className="px-4 py-2 text-left">Instr</th>
               <th className="px-4 py-2 text-left">Session</th>
@@ -97,17 +133,19 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
             </tr>
           </thead>
           <tbody>
-            {streams.map((stream) => {
+            {sortedStreams.map((stream) => {
               const timeInState = computeTimeInState(stream.state_entry_time_utc)
               const issues: string[] = []
               
-              // Determine issues (simplified - would need more data)
               if (stream.committed && stream.commit_reason === 'RANGE_INVALIDATED') {
                 issues.push('⚠️ Range Invalidated')
               }
               
-              // Get P&L for this stream
               const streamPnl = pnl[stream.stream]
+              const isCarryOver = stream.trading_date !== todayStr
+              const dateLabel = stream.trading_date
+                ? (stream.trading_date === todayStr ? 'Today' : stream.trading_date)
+                : '-'
               
               return (
                 <tr
@@ -115,13 +153,22 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   onClick={() => onStreamClick(stream)}
                   className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
                 >
+                  <td className="px-4 py-2 whitespace-nowrap min-w-[5rem]" title={stream.trading_date || undefined}>
+                    <span className={isCarryOver ? 'text-amber-400 font-medium' : 'text-gray-300'}>
+                      {dateLabel}
+                    </span>
+                  </td>
                   <td className="px-4 py-2 font-mono">{stream.stream}</td>
-                  <td className="px-4 py-2">{stream.instrument || '-'}</td>
+                  <td className="px-4 py-2">{stream.execution_instrument || stream.instrument || '-'}</td>
                   <td className="px-4 py-2">{stream.session || '-'}</td>
                   <td className="px-4 py-2">
-                    <span className={`px-2 py-1 rounded text-xs ${getStateBadgeColor(stream.state)}`}>
-                      {stream.state}
-                    </span>
+                    {stream.state ? (
+                      <span className={`px-2 py-0.5 rounded text-xs ${getStateBadgeColor(stream.state)}`}>
+                        {stream.state}
+                      </span>
+                    ) : (
+                      <span className="px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-400">-</span>
+                    )}
                   </td>
                   <td className={`px-4 py-2 font-mono ${getTimeInStateColor(timeInState)}`}>
                     {formatDuration(timeInState)}
@@ -129,7 +176,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   <td className="px-4 py-2 font-mono">
                     {(() => {
                       const slotTime = stream.slot_time_chicago
-                      if (!slotTime || slotTime === '-') return '-'
+                      if (!slotTime || slotTime === '' || slotTime === '-') return '-'
                       // Extract time portion if it's in ISO format (e.g., "2026-01-26T07:30:00-06:00" -> "07:30")
                       if (slotTime.includes('T')) {
                         try {
@@ -140,10 +187,17 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                       return slotTime
                     })()}
                   </td>
-                  <td className="px-4 py-2 font-mono">
-                    {stream.range_high !== null && stream.range_low !== null
-                      ? `${stream.range_high.toFixed(2)} / ${stream.range_low.toFixed(2)}`
-                      : '-'}
+                  <td className="px-4 py-2 font-mono whitespace-nowrap">
+                    {(() => {
+                      const rangeHigh = stream.range_high
+                      const rangeLow = stream.range_low
+                      if (rangeHigh != null && rangeLow != null &&
+                          !isNaN(rangeHigh) && !isNaN(rangeLow) &&
+                          isFinite(rangeHigh) && isFinite(rangeLow)) {
+                        return `${rangeHigh.toFixed(2)} / ${rangeLow.toFixed(2)}`
+                      }
+                      return '-'
+                    })()}
                   </td>
                   <td className="px-4 py-2 font-mono">
                     {(() => {
@@ -167,15 +221,28 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                       )
                     })()}
                   </td>
-                  <td className="px-4 py-2">{stream.commit_reason || '-'}</td>
                   <td className="px-4 py-2">
-                    {issues.length > 0 ? (
-                      <span className="text-amber-500" title={issues.join(', ')}>
-                        {issues[0]}
-                      </span>
-                    ) : (
-                      '-'
-                    )}
+                    {stream.committed && stream.commit_reason
+                      ? stream.commit_reason
+                      : stream.committed
+                        ? 'COMMITTED'
+                        : '-'}
+                  </td>
+                  <td className="px-4 py-2">
+                    {(() => {
+                      const issueList: string[] = []
+                      if (stream.range_invalidated) issueList.push('⚠️ Range Invalidated')
+                      if (stream.committed && stream.commit_reason === 'RANGE_INVALIDATED') {
+                        issueList.push('⚠️ Range Invalidated')
+                      }
+                      return issueList.length > 0 ? (
+                        <span className="text-amber-500" title={issueList.join(', ')}>
+                          {issueList[0]}
+                        </span>
+                      ) : (
+                        '-'
+                      )
+                    })()}
                   </td>
                 </tr>
               )

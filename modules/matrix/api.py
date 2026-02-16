@@ -371,7 +371,12 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         if len(stream_include_list) == 0:
             stream_include_list = None
     
-    logger.info(f"GET /api/matrix/data called with contract_multiplier={contract_multiplier}, include_filtered_executed={include_filtered_executed}, stream_include={stream_include_list}")
+    # Explicitly parse include_filtered_executed to ensure boolean (FastAPI query params can be strings)
+    if isinstance(include_filtered_executed, str):
+        include_filtered_executed = include_filtered_executed.lower() in ('true', '1', 'yes', 'on')
+    include_filtered_executed = bool(include_filtered_executed)
+    
+    logger.info(f"GET /api/matrix/data called with contract_multiplier={contract_multiplier}, include_filtered_executed={include_filtered_executed} (parsed as bool), stream_include={stream_include_list}")
     
     try:
         import pandas as pd
@@ -482,10 +487,15 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             # Force recomputation of ProfitDollars with the correct multiplier by dropping it if it exists
             if "ProfitDollars" in df_for_stats.columns:
                 df_for_stats = df_for_stats.drop(columns=["ProfitDollars"])
+            logger.info(f"[API] Calculating stats with include_filtered_executed={include_filtered_executed} (type: {type(include_filtered_executed).__name__})")
             stats_full = statistics.calculate_summary_stats(df_for_stats, include_filtered_executed=include_filtered_executed, contract_multiplier=contract_multiplier)
             total_profit = stats_full.get('performance_trade_metrics', {}).get('total_profit', 'N/A') if stats_full else 'N/A'
             total_rows = len(df_full)
+            executed_total = stats_full.get('sample_counts', {}).get('executed_trades_total', 0) if stats_full else 0
+            executed_allowed = stats_full.get('sample_counts', {}).get('executed_trades_allowed', 0) if stats_full else 0
+            executed_filtered = stats_full.get('sample_counts', {}).get('executed_trades_filtered', 0) if stats_full else 0
             logger.info(f"Calculated full-dataset stats from {total_rows} total rows: {len(stats_full) if stats_full else 0} metrics (contract_multiplier={contract_multiplier}, include_filtered_executed={include_filtered_executed}, total_profit={total_profit})")
+            logger.info(f"[API] Stats sample counts: total={executed_total}, allowed={executed_allowed}, filtered={executed_filtered}")
         except Exception as e:
             logger.error(f"CRITICAL: Could not calculate full-dataset stats - stats will be incomplete: {e}")
             import traceback

@@ -14,6 +14,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -72,12 +73,107 @@ namespace NinjaTrader.NinjaScript.Strategies
         
         // Diagnostic Point #1: Rate-limited OnBarUpdate logging
         private readonly Dictionary<string, DateTimeOffset> _lastOnBarUpdateLogUtc = new Dictionary<string, DateTimeOffset>();
+        private readonly Dictionary<string, DateTimeOffset> _lastTickTimeDiagnosticUtc = new Dictionary<string, DateTimeOffset>();
         private const int ON_BAR_UPDATE_RATE_LIMIT_MINUTES = 1; // Log at most once per minute per instrument
+        private const int CALCULATING_PROGRESS_INTERVAL_BARS = 250; // Log every N bars during Historical to diagnose "stuck on Calculating"
         
         
         // Rate-limiting for BarsRequest skipped warnings (per instrument)
         private readonly Dictionary<string, DateTimeOffset> _lastBarsRequestSkippedLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BARSREQUEST_SKIPPED_RATE_LIMIT_MINUTES = 5; // Log at most once per 5 minutes per instrument
+        
+        // CRITICAL OBSERVABILITY FIX: Rate-limited BE evaluation heartbeat log
+        // This proves BE logic runs on every tick and shows what it finds
+        private readonly Dictionary<string, DateTimeOffset> _lastBeEvaluationLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int BE_EVALUATION_RATE_LIMIT_SECONDS = 1; // Log at most once per second per instrument
+
+        // MES/lag fix: cache GetActiveIntentsForBEMonitoring() result so we don't hit journal + lock on every Last tick.
+        private List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)>? _cachedActiveIntentsForBE;
+        private DateTimeOffset _cachedActiveIntentsForBEUtc = DateTimeOffset.MinValue;
+        private const double BE_INTENTS_CACHE_MS = 200; // Refresh at most ~5/sec; 200ms stale is fine for BE trigger detection.
+        
+        // OPTIONAL ENHANCEMENT: Track when BE trigger is reached but modification hasn't completed
+        private readonly Dictionary<string, DateTimeOffset> _beTriggerReachedPendingModification = new Dictionary<string, DateTimeOffset>();
+        private const int BE_TRIGGER_TIMEOUT_SECONDS = 5; // ERROR if trigger reached but no modification after 5 seconds
+
+        // Chart lag fix: throttle BE modify attempts. We were calling ModifyStopToBreakEven on every Last tick until success,
+        // causing hundreds of account.Orders iterations + NT Change() per second. Cap to one attempt per 200ms per intent.
+        private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new Dictionary<string, DateTimeOffset>();
+        private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
+        
+        // BE path diagnostic: once per minute when in position — confirms BE check runs, shows active_intent_count.
+        private readonly Dictionary<string, DateTimeOffset> _lastBePathActiveLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int BE_PATH_ACTIVE_RATE_LIMIT_SECONDS = 60;
+
+        // SessionCloseResolver: last trading date we resolved for (Realtime only, once per day)
+        private string? _lastSessionCloseResolvedTradingDay;
+        
+        // Phase 3.3: Latch last price every tick; run BE scan on cadence only (reduces work per tick).
+        private decimal _lastTickPriceForBE = 0;
+        private DateTimeOffset _lastBeCheckUtc = DateTimeOffset.MinValue;
+        private DateTimeOffset _lastBip1WorkUtc = DateTimeOffset.MinValue;
+        private const double BE_SCAN_THROTTLE_MS = 200; // Run intent scan at most ~5/sec; latch updated every tick.
+        
+        // Lightweight heartbeat: BIP 0 only, every N bars. Decoupled from trade state; no secondary series.
+        private const int HEARTBEAT_BARS_INTERVAL = 1; // Every bar = ~1 min on 1-min chart; 30–60s is fine for liveness.
+        
+        // Per-bar profiling: log when sections exceed threshold (chart lag diagnosis)
+        private const int BAR_PROFILE_THRESHOLD_MS = 5;
+        private readonly Dictionary<string, DateTimeOffset> _lastBarProfileLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int BAR_PROFILE_RATE_LIMIT_SECONDS = 30;
+
+        /// <summary>Check if diagnostic logging during Historical is enabled. Uses reflection for backward compatibility with older Robot.Core.dll.</summary>
+        private static bool IsDiagnosticLoggingDuringHistoricalEnabled(RobotEngine? engine)
+        {
+            if (engine == null) return false;
+            try
+            {
+                var method = engine.GetType().GetMethod("IsDiagnosticLoggingDuringHistoricalEnabled", Type.EmptyTypes);
+                if (method != null)
+                    return (bool)(method.Invoke(engine, null) ?? false);
+            }
+            catch { /* older DLL: method doesn't exist */ }
+            return false;
+        }
+
+        /// <summary>Check if diagnostic slow logs (BAR_PROFILE_SLOW, TICK_SLOW) are enabled. Uses reflection for backward compatibility.</summary>
+        private static bool IsDiagnosticSlowLogsEnabled(RobotEngine? engine)
+        {
+            if (engine == null) return false;
+            try
+            {
+                var method = engine.GetType().GetMethod("IsDiagnosticSlowLogsEnabled", Type.EmptyTypes);
+                if (method != null)
+                    return (bool)(method.Invoke(engine, null) ?? false);
+            }
+            catch { /* older DLL: method doesn't exist */ }
+            return false;
+        }
+
+        /// <summary>File-based lifecycle trace for diagnosing "stuck in Calculating". Writes to logs/robot/strategy_lifecycle.log.</summary>
+        private static void TraceLifecycle(string step, string? instrument = null, string? state = null)
+        {
+            TraceLifecycle(step, instrument, state, null);
+        }
+
+        private static void TraceLifecycle(string step, string? instrument, string? state, string? instanceId, string? extra = null)
+        {
+            try
+            {
+                var root = Environment.GetEnvironmentVariable("QTSW2_PROJECT_ROOT") ?? "C:\\Users\\jakej\\QTSW2";
+                var path = Path.Combine(root, "logs", "robot", "strategy_lifecycle.log");
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                var parts = new List<string> { $"{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}Z", step };
+                if (!string.IsNullOrEmpty(instrument)) parts.Add($"instrument={instrument}");
+                if (!string.IsNullOrEmpty(state)) parts.Add($"state={state}");
+                if (!string.IsNullOrEmpty(instanceId)) parts.Add($"instance={instanceId}");
+                if (!string.IsNullOrEmpty(extra)) parts.Add(extra);
+                var line = string.Join(" | ", parts) + Environment.NewLine;
+                File.AppendAllText(path, line);
+            }
+            catch { /* never throw from trace */ }
+        }
 
         public RobotSimStrategy()
         {
@@ -92,8 +188,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name = "RobotSimStrategy";
                 // CRITICAL FIX: Use OnBarClose to prevent NinjaTrader from blocking Realtime transition
                 // OnEachTick requires tick data to be available, which may block MGC/MYM/M2K strategies
-                // OnMarketData() override still provides tick-based BE detection when ticks are available
-                Calculate = Calculate.OnBarClose; // Bar-based to avoid blocking Realtime transition, OnMarketData() handles tick-based BE
+                // Secondary 1-second series provides BE + heartbeat (throttled to 5s)
+                Calculate = Calculate.OnBarClose; // Bar-based to avoid blocking Realtime transition
                 IsUnmanaged = true; // Required for manual order management
                 IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only
                 
@@ -105,8 +201,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file
 #endif
             }
+            else if (State == State.Configure)
+            {
+                TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
+                AddDataSeries(BarsPeriodType.Second, 1);
+                TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
+            }
             else if (State == State.DataLoaded)
             {
+                TraceLifecycle("DataLoaded_ENTER", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 try
                 {
                     // Verify SIM account only
@@ -178,20 +281,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         ["invariant"] = "One execution instrument → one strategy instance per account"
                                     });
                                     
-                                    // Report to HealthMonitor for push notification
-                                    var healthMonitor = _engine.GetHealthMonitor();
-                                    if (healthMonitor != null)
+                                    // Critical event (HealthMonitor removed; tail logs for CRITICAL_ENGINE_EVENT to alert)
+                                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "CRITICAL_ENGINE_EVENT", new Dictionary<string, object>
                                     {
-                                        var payload = new Dictionary<string, object>
-                                        {
-                                            ["account"] = accountName,
-                                            ["execution_instrument"] = executionInstrumentFullName,
-                                            ["instance_id"] = _instanceId,
-                                            ["error"] = errorMsg,
-                                            ["action"] = "STAND_DOWN"
-                                        };
-                                        healthMonitor.ReportCritical("DUPLICATE_INSTANCE_DETECTED", payload);
-                                    }
+                                        ["critical_event_type"] = "DUPLICATE_INSTANCE_DETECTED",
+                                        ["account"] = accountName,
+                                        ["execution_instrument"] = executionInstrumentFullName,
+                                        ["instance_id"] = _instanceId,
+                                        ["error"] = errorMsg,
+                                        ["action"] = "STAND_DOWN"
+                                    });
                                 }
                                 catch
                                 {
@@ -265,57 +364,36 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // CRITICAL: Pass both execution instrument (e.g., "MGC") and MasterInstrument.Name (e.g., "GC")
                     // for explicit canonical matching per authoritative rule
                     var masterInstrumentName = Instrument.MasterInstrument.Name; // e.g., "GC" for "MGC 03-26"
-                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(2), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName, masterInstrumentName: masterInstrumentName);
+                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(5), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName, masterInstrumentName: masterInstrumentName);
                 
                 // PHASE 1: Set account info for startup banner
                 // Reuse accountName variable declared above
                 var environment = _simAccountVerified ? "SIM" : "UNKNOWN";
                 _engine.SetAccountInfo(accountName, environment);
                 
-                // Start engine
+                // Start engine (loads timetable and creates streams before returning)
                 _engine.Start();
+                TraceLifecycle("DataLoaded_ENGINE_START_DONE", engineInstrumentName, "DataLoaded");
                 
-                // Set session start time from TradingHours (if available)
-                // CRITICAL FIX: Wrap in try-catch and make non-blocking to prevent NinjaTrader state transition delays
-                // TradingHours access can sometimes block if data isn't fully loaded
-                try
-                {
-                    // Use null-conditional operators to safely access TradingHours
-                    var tradingHours = Instrument?.MasterInstrument?.TradingHours;
-                    if (tradingHours != null && tradingHours.Sessions != null && tradingHours.Sessions.Count > 0)
-                    {
-                        try
-                        {
-                            // Get first session's begin time (in hhmm format, e.g., 1700 = 17:00)
-                            var beginTime = tradingHours.Sessions[0].BeginTime;
-                            if (beginTime > 0)
-                            {
-                                // Convert hhmm int to HH:MM string (e.g., 1700 -> "17:00")
-                                var hours = beginTime / 100;
-                                var minutes = beginTime % 100;
-                                var sessionStartTime = $"{hours:D2}:{minutes:D2}";
-                                
-                                _engine.SetSessionStartTime(engineInstrumentName, sessionStartTime);
-                                Log($"Session start time set from TradingHours: {sessionStartTime} for {engineInstrumentName}", LogLevel.Information);
-                            }
-                        }
-                        catch (Exception sessionEx)
-                        {
-                            // TradingHours.Sessions access can fail if data not loaded - don't block
-                            Log($"Warning: Could not access TradingHours.Sessions: {sessionEx.Message}. Using default 17:00 CST.", LogLevel.Warning);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    // Log but don't fail - will fall back to default 17:00 CST
-                    // CRITICAL: Don't let TradingHours access block NinjaTrader state transition
-                    Log($"Warning: Could not extract session start from TradingHours: {ex.Message}. Using default 17:00 CST.", LogLevel.Warning);
-                }
+                // Make timetable visibility explicit in NinjaTrader Control Center log
+                var timetablePath = _engine.GetTimetablePath();
+                var tradingDateFromEngine = _engine.GetTradingDate();
+                var streamCount = _engine.GetStreamCount();
+                if (!string.IsNullOrEmpty(timetablePath))
+                    Log($"Timetable read: path={timetablePath}, trading_date={(string.IsNullOrEmpty(tradingDateFromEngine) ? "(not locked)" : tradingDateFromEngine)}, stream_count={streamCount}", LogLevel.Information);
+                else
+                    Log("Timetable path not set - engine may not have loaded timetable", LogLevel.Warning);
+                TraceLifecycle("DataLoaded_AFTER_TIMETABLE_LOG", engineInstrumentName, "DataLoaded");
+                
+                // LAG FIX: Skip TradingHours access in DataLoaded - it can block UI thread causing "stuck in buffering".
+                // Use default 17:00 CST; session start is also set from TradingHours in Realtime when wiring.
+                _engine.SetSessionStartTime(engineInstrumentName, "17:00");
+                TraceLifecycle("DataLoaded_AFTER_SESSION_START", engineInstrumentName, "DataLoaded");
+
+                var tradingDateStr = _engine.GetTradingDate();
 
                 // CRITICAL: Verify engine startup succeeded before requesting bars
                 // Check that trading date is locked and streams are created
-                var tradingDateStr = _engine.GetTradingDate();
                 if (string.IsNullOrEmpty(tradingDateStr))
                 {
                     var errorMsg = "CRITICAL: Engine started but trading date not locked. " +
@@ -328,8 +406,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Strategy will continue but may not function properly
                     Log("WARNING: Continuing despite trading date not locked - strategy may not function properly", LogLevel.Warning);
                 }
+                TraceLifecycle("DataLoaded_BEFORE_BARSREQUEST", engineInstrumentName, "DataLoaded");
 
-                // CRITICAL FIX: Request bars for ALL execution instruments from enabled streams
+                // CRITICAL FIX: Request bars for ALL execution instruments from enabled streams (State.DataLoaded, not Configure).
+                // See docs/PRE_HYDRATION_DEEP_DIVE.md for flow, Operator Decision Tree, and troubleshooting.
                 // This ensures micro futures (MYM, MCL) route to base instrument streams (YM, CL) via canonical mapping
                 // Pattern: Get all execution instruments → Mark ALL as pending FIRST → Then queue BarsRequest for each
                 try
@@ -383,16 +463,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "note", "Skipping BarsRequest - no enabled streams. Engine will continue without pre-hydration bars." }
                         });
                         
-                        // NQ2 FIX: Report critical if BarsRequest is skipped
-                        var healthMonitor = _engine?.GetHealthMonitor();
-                        if (healthMonitor != null)
+                        // Critical event (HealthMonitor removed; tail logs for CRITICAL_ENGINE_EVENT to alert)
+                        _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "CRITICAL_ENGINE_EVENT", new Dictionary<string, object>
                         {
-                            healthMonitor.ReportCritical("BARSREQUEST_SKIPPED_NO_INSTRUMENTS", new Dictionary<string, object>
-                            {
-                                { "reason", "No execution instruments found" },
-                                { "note", "BarsRequest was skipped - streams may not have historical bars" }
-                            });
-                        }
+                            ["critical_event_type"] = "BARSREQUEST_SKIPPED_NO_INSTRUMENTS",
+                            ["reason"] = "No execution instruments found",
+                            ["note"] = "BarsRequest was skipped - streams may not have historical bars"
+                        });
                     }
                     else
                     {
@@ -423,17 +500,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         { "note", "Skipping BarsRequest - no enabled streams for this instrument." }
                                     });
                                     
-                                    // NQ2 FIX: Report critical if BarsRequest is skipped due to streams not ready
-                                    var healthMonitor = _engine?.GetHealthMonitor();
-                                    if (healthMonitor != null)
+                                    // Critical event (HealthMonitor removed; tail logs for CRITICAL_ENGINE_EVENT to alert)
+                                    _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "CRITICAL_ENGINE_EVENT", new Dictionary<string, object>
                                     {
-                                        healthMonitor.ReportCritical("BARSREQUEST_SKIPPED_STREAMS_NOT_READY", new Dictionary<string, object>
-                                        {
-                                            { "instrument", executionInstrument },
-                                            { "reason", "Streams not ready" },
-                                            { "note", "BarsRequest skipped - streams may not receive historical bars" }
-                                        });
-                                    }
+                                        ["critical_event_type"] = "BARSREQUEST_SKIPPED_STREAMS_NOT_READY",
+                                        ["instrument"] = executionInstrument,
+                                        ["reason"] = "Streams not ready",
+                                        ["note"] = "BarsRequest skipped - streams may not receive historical bars"
+                                    });
                                     
                                     continue;
                                 }
@@ -493,9 +567,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Log($"WARNING: BarsRequest loop failed but engine will continue: {ex.Message}", LogLevel.Warning);
                 }
 
+                if (_engine != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_BARSREQUEST_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "BarsRequest block finished - proceeding to WireNTContext" } });
+                TraceLifecycle("DataLoaded_AFTER_BARSREQUEST", Instrument?.MasterInstrument?.Name, "DataLoaded");
+
                 // Get the adapter instance and wire NT context
                 // Note: This requires exposing adapter from engine or using dependency injection
                 // For now, we'll wire events directly to adapter via reflection or adapter registration
+                if (_engine != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_STARTING", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "About to call WireNTContextToAdapter()" } });
+                TraceLifecycle("DataLoaded_BEFORE_WIRE", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 try
                 {
                     WireNTContextToAdapter();
@@ -505,13 +586,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // CRITICAL FIX: Catch exceptions during adapter wiring to prevent strategy from hanging
                     Log($"CRITICAL: Failed to wire NT context to adapter: {ex.Message}. Strategy will not function properly.", LogLevel.Error);
                     Log($"Exception details: {ex.GetType().Name} - {ex.StackTrace}", LogLevel.Error);
+                    if (_engine != null)
+                    {
+                        try
+                        {
+                            _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_FAILED", new Dictionary<string, object>
+                            {
+                                { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
+                                { "exception_type", ex.GetType().Name },
+                                { "exception_message", ex.Message },
+                                { "stack_trace", ex.StackTrace ?? "" },
+                                { "note", "WireNTContextToAdapter threw - strategy will not function" }
+                            });
+                        }
+                        catch { /* ignore */ }
+                    }
                     // Don't set _engineReady = true, preventing further execution
                     return;
                 }
+                if (_engine != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "WireNTContextToAdapter completed" } });
+                TraceLifecycle("DataLoaded_WIRE_DONE", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 
                 // ENGINE_READY latch: Set once when all initialization is complete
                 // This flag guards all execution paths to simplify reasoning and reduce repetition
                 _engineReady = true;
+                TraceLifecycle("DataLoaded_ENGINE_READY_TRUE", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
                 Log($"Engine ready - all initialization complete. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
                 
@@ -534,15 +634,30 @@ namespace NinjaTrader.NinjaScript.Strategies
                     Log($"CRITICAL: Exception during DataLoaded initialization: {ex.GetType().Name}: {ex.Message}", LogLevel.Error);
                     Log($"Stack trace: {ex.StackTrace}", LogLevel.Error);
                     Log("Strategy initialization FAILED - strategy marked as INIT_FAILED and will not function. Check logs for details.", LogLevel.Error);
+                    if (_engine != null)
+                    {
+                        try
+                        {
+                            _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_INIT_EXCEPTION", new Dictionary<string, object>
+                            {
+                                { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
+                                { "exception_type", ex.GetType().Name },
+                                { "exception_message", ex.Message },
+                                { "stack_trace", (ex.StackTrace ?? "").Length > 2000 ? (ex.StackTrace ?? "").Substring(0, 2000) + "..." : (ex.StackTrace ?? "") },
+                                { "note", "DataLoaded initialization threw - strategy marked INIT_FAILED" }
+                            });
+                        }
+                        catch { /* ignore */ }
+                    }
                     // Don't set _engineReady = true, preventing further execution
                     // Strategy will remain in DataLoaded state but won't crash NinjaTrader
                 }
             }
             else if (State == State.Realtime)
             {
-                // Engine is ready and strategy is in Realtime state
-                // No timer needed - Tick() is now driven by bar flow
-                
+                // Realtime: No timer (any timer caused contention). Tick + BE from OnBarUpdate only.
+
+                TraceLifecycle("REALTIME_ENTER", Instrument?.MasterInstrument?.Name, "Realtime");
                 // DIAGNOSTIC: Log Realtime state transition to help diagnose "stuck in loading" issues
                 var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
                 Log($"REALTIME_STATE_REACHED: Strategy transitioned to Realtime state. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
@@ -554,9 +669,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "instrument", instrumentName },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
-                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state" }
+                        { "bars_array_length", BarsArray?.Length ?? 0 },
+                        { "has_secondary_series", BarsArray != null && BarsArray.Length >= 2 },
+                        { "be_detection_path", BarsArray != null && BarsArray.Length >= 2 ? "1-second series (BIP 1)" : "fallback (primary bar)" },
+                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. has_secondary_series=true enables BE detection via 1-second bars." }
                     });
-                    
+                    _engine.LogStreamStateSnapshot(DateTimeOffset.UtcNow);
+
+                    // Pre-warm execution journal cache so BE monitoring never hits disk on first lookup
+                    _engine.WarmExecutionJournalCacheForTradingDate(_engine.GetTradingDate());
+
+                    // Reconciliation: close orphaned journals when broker flat (NT context ready)
+                    _engine.RunReconciliationOnRealtimeStart();
+
+                    // SessionCloseResolver: resolve S1 and S2 on Realtime transition (defer to Realtime only)
+                    ResolveAndSetSessionCloseIfNeeded();
+
                     // RESTART-AWARE: Check if any streams need BarsRequest for restart
                     // This handles the case where streams restart mid-session and need historical bars
                     try
@@ -619,10 +747,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
             }
+            else if (State == State.Historical)
+            {
+                TraceLifecycle("Historical_ENTER", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, "note=Calculating phase - OnBarUpdate will fire for each historical bar");
+            }
             else if (State == State.Terminated)
             {
+                TraceLifecycle("Terminated_ENTER", Instrument?.MasterInstrument?.Name, "Terminated", _instanceId);
                 _engine?.Stop();
-                
+
                 // FUTURE HARDENING: Unregister instance on termination
                 if (Account != null && Instrument != null)
                 {
@@ -646,7 +779,8 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         /// <summary>
         /// Request historical bars from NinjaTrader using BarsRequest API for pre-hydration.
-        /// Called after engine.Start() when streams are created and trading date is locked.
+        /// Called from State.DataLoaded (not Configure) after engine.Start() when streams are created and trading date is locked.
+        /// See docs/PRE_HYDRATION_DEEP_DIVE.md for flow, Operator Decision Tree, and troubleshooting.
         /// </summary>
         private void RequestHistoricalBarsForPreHydration(string instrumentName)
         {
@@ -888,7 +1022,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Request bars using helper class (only up to current time)
                 // Note: NinjaTraderBarRequest returns QTSW2.Robot.Core.Bar (CoreBar), not NinjaTrader.Data.Bar
                 // Use alias to avoid ambiguity with NinjaTrader.Data.Bar
-                List<CoreBar> bars;
+                List<CoreBar>? bars = null;
                 try
                 {
                     // Build log callback for BARSREQUEST_RAW_RESULT
@@ -945,6 +1079,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Don't throw - allow strategy to continue with live bars only
                     return;
                 }
+                finally
+                {
+                    // Clear pending on ANY exit (timeout, exception, partial failure) — use same key as when marked pending
+                    _engine.MarkBarsRequestCompleted(instrumentName, DateTimeOffset.UtcNow);
+                }
 
                 // HARDENING FIX 2: BarsRequest is non-blocking - log warning but continue
                 if (bars == null)
@@ -972,13 +1111,17 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (bars.Count == 0)
                 {
-                    // No bars returned - this may be acceptable if started after slot_time, but log as error for visibility
-                    var errorMsg = $"WARNING: No historical bars returned from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago}). " +
-                                 $"Possible causes: " +
-                                 $"1) Strategy started after slot_time (bars already passed), " +
-                                 $"2) NinjaTrader 'Days to load' setting too low, " +
-                                 $"3) No historical data available for this date. " +
-                                 $"Range computation will rely on live bars only - may be incomplete.";
+                    // No bars returned - this may be acceptable if started after slot_time, but log as warning for visibility
+                    var nowStr = nowChicago.ToString("HH:mm");
+                    var isAfterSlot = false;
+                    if (TimeSpan.TryParse(endTimeChicago.Contains(":") ? endTimeChicago : endTimeChicago + ":00", out var slotEnd))
+                        isAfterSlot = nowChicago.TimeOfDay > slotEnd;
+                    var expectedNote = isAfterSlot
+                        ? $" Current time {nowStr} is after slot end {endTimeChicago} — this is expected when starting the strategy late."
+                        : "";
+                    var errorMsg = $"BarsRequest returned 0 bars for {tradingDateStr} {rangeStartChicago} to {endTimeChicago} (current: {nowStr}).{expectedNote} " +
+                                 $"If started before slot: confirm historical data exists for this date. " +
+                                 $"Range will use live bars only; breakout levels may be delayed until first bar.";
                     Log(errorMsg, LogLevel.Warning);
                     
                     // FIX #3: Log final disposition - EXECUTED with zero count
@@ -1133,52 +1276,124 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             try
             {
-                // 🔴 Diagnostic Point #0: Fire BEFORE any early returns to confirm OnBarUpdate() is being called
-                // This will help us understand if NinjaTrader is calling OnBarUpdate() at all
-                if (_engine != null)
-            {
-                // Use execution instrument full name (e.g., "M2K 03-26") for bar tracking
-                // Canonical instrument (MasterInstrument.Name) remains for backward compatibility
-                var executionInstrumentFullName = Instrument?.FullName ?? "UNKNOWN";
-                var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN"; // Canonical for backward compatibility
-                var diagTimeUtc = DateTimeOffset.UtcNow;
-                var diagCanLog = !_lastOnBarUpdateLogUtc.TryGetValue(executionInstrumentFullName, out var diagPrevLogUtc) ||
-                               (diagTimeUtc - diagPrevLogUtc).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
-                
-                if (diagCanLog)
+                // Dormant: init failed or engine not ready — skip all work immediately (Tier 2.1)
+                if (_initFailed || !_engineReady || _engine is null) return;
+
+                // Strict phase control: skip only when State.Historical AND config disabled. Do NOT use !isRealtime — Transition exists between Historical and Realtime.
+                var skipHistoricalDiagEarly = State == State.Historical && _engine != null && !IsDiagnosticLoggingDuringHistoricalEnabled(_engine);
+                // Diagnostic Point #0: primary series only (restrict to avoid BIP 1 spam) — gated when diagnostic_logging_during_historical=false
+                if (BarsInProgress == 0 && _engine != null && !skipHistoricalDiagEarly)
                 {
-                    _lastOnBarUpdateLogUtc[executionInstrumentFullName] = diagTimeUtc;
-                    _engine.LogEngineEvent(diagTimeUtc, "ONBARUPDATE_CALLED", new Dictionary<string, object>
+                    var executionInstrumentFullName = Instrument?.FullName ?? "UNKNOWN";
+                    var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var diagTimeUtc = DateTimeOffset.UtcNow;
+                    var diagCanLog = !_lastOnBarUpdateLogUtc.TryGetValue(executionInstrumentFullName, out var diagPrevLogUtc) ||
+                                   (diagTimeUtc - diagPrevLogUtc).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
+                    if (diagCanLog)
                     {
-                        { "instrument", diagInstrument }, // Canonical instrument (backward compatibility)
-                        { "execution_instrument_full_name", executionInstrumentFullName }, // Full contract name (e.g., "M2K 03-26")
-                        { "engine_ready", _engineReady },
-                        { "engine_null", _engine is null },
-                        { "current_bar", CurrentBar },
-                        { "state", State.ToString() },
-                        { "note", "Diagnostic Point #0: Confirms OnBarUpdate() is being called by NinjaTrader. If this doesn't fire, NinjaTrader isn't calling OnBarUpdate() at all." }
+                        _lastOnBarUpdateLogUtc[executionInstrumentFullName] = diagTimeUtc;
+                        _engine.LogEngineEvent(diagTimeUtc, "ONBARUPDATE_CALLED", new Dictionary<string, object>
+                        {
+                            { "instrument", diagInstrument },
+                            { "execution_instrument_full_name", executionInstrumentFullName },
+                            { "engine_ready", _engineReady },
+                            { "engine_null", _engine is null },
+                            { "current_bar", CurrentBar },
+                            { "state", State.ToString() },
+                            { "note", "Diagnostic Point #0: Confirms OnBarUpdate() is being called by NinjaTrader." }
+                        });
+                    }
+                }
+
+            if (CurrentBars[BarsInProgress] < 1) return;
+
+            // Secondary series (BIP 1): BE + heartbeat only. DISABLED when AddDataSeries(Second,1) is commented out.
+            // LAG FIX: Only run when in a position — skip entirely when flat to avoid chart lag.
+            // Throttle to 1s when in position (was 5s; reduced for faster BE detection).
+            if (BarsInProgress == 1)
+            {
+                if (State != State.Realtime)
+                    return;
+                if (Position.MarketPosition == MarketPosition.Flat)
+                    return; // No trade — skip BE + heartbeat entirely
+                var now = DateTimeOffset.UtcNow;
+                if ((now - _lastBip1WorkUtc).TotalSeconds < 1.0 && _lastBip1WorkUtc != DateTimeOffset.MinValue)
+                    return;
+                _lastBip1WorkUtc = now;
+                // BE path diagnostic: once per minute — confirms BE check runs when in position
+                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
+                {
+                    _lastBePathActiveLogUtc[instrumentName] = now;
+                    var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
+                    _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "bars_in_progress", 1 },
+                        { "has_secondary_series", BarsArray.Length >= 2 },
+                        { "in_position", true },
+                        { "active_intent_count", activeCount },
+                        { "note", "BE check path active (1-second series). active_intent_count>0 means intents await BE trigger." }
                     });
                 }
-            }
-            
-            // HARDENING FIX 3: Fail closed - don't execute if init failed
-            if (_initFailed)
-            {
-                // Strategy initialization failed - do not process bars or execute trades
+                RunBreakEvenCheck();
                 return;
             }
+
+            // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
+            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 1s)
+            // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
+            var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
+            var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
+            var runBeFromBip0 = inPositionRealtime && (
+                BarsArray.Length < 2 ||
+                (_lastBip1WorkUtc != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - _lastBip1WorkUtc).TotalSeconds >= bip1StaleSeconds));
+            if (runBeFromBip0)
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 1.0)
+                {
+                    _lastBip1WorkUtc = now;
+                    var instrumentNameFallback = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var hasSecondary = BarsArray != null && BarsArray.Length >= 2;
+                    if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentNameFallback, out var lastPathLogF) || (now - lastPathLogF).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
+                    {
+                        _lastBePathActiveLogUtc[instrumentNameFallback] = now;
+                        var activeCountF = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
+                        _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentNameFallback },
+                            { "bars_in_progress", 0 },
+                            { "has_secondary_series", hasSecondary },
+                            { "in_position", true },
+                            { "active_intent_count", activeCountF },
+                            { "note", hasSecondary ? "BE check (fallback: BIP 1 stale, using primary bar). 1-second series may not be updating." : "BE check path active (fallback: primary bar close)." }
+                        });
+                    }
+                    RunBreakEvenCheck();
+                }
+            }
+            var barProfileSw = Stopwatch.StartNew();
+            long barProfileLastMs = 0L;
+            var skipHistoricalDiag = skipHistoricalDiagEarly;
             
-            // Use ENGINE_READY latch to guard execution
-            if (!_engineReady || _engine is null) return;
-            if (CurrentBar < 1) return;
+            // Lightweight heartbeat: Realtime only, every N bars. Minimal payload; decoupled from trade state.
+            if (State == State.Realtime && CurrentBar > 0 && CurrentBar % HEARTBEAT_BARS_INTERVAL == 0 && _engine != null)
+                _engine.LogEngineEvent(DateTimeOffset.UtcNow, "ENGINE_ALIVE", new Dictionary<string, object> { { "note", "heartbeat" } });
             
-            // 🔴 Diagnostic Point #1: Rate-limited OnBarUpdate logging (ground truth)
-            // NOTE: This diagnostic fires even if enable_diagnostic_logs is false, because it's the ground truth
-            // If this doesn't fire, OnBarUpdate() isn't being called by NinjaTrader
+            // Lifecycle trace: first bar only so we know we're processing Historical (gated when diagnostic_logging_during_historical=false)
+            if (!skipHistoricalDiag && CurrentBar == 1)
+                TraceLifecycle("OnBarUpdate_FIRST_BAR", Instrument?.MasterInstrument?.Name, State.ToString(), _instanceId);
+            // Extensive diagnostic: progress every N bars during Historical (gated when diagnostic_logging_during_historical=false)
+            var logTiming = !skipHistoricalDiag && State == State.Historical && CurrentBar > 0 && CurrentBar % CALCULATING_PROGRESS_INTERVAL_BARS == 0;
+            if (logTiming) TraceLifecycle("OnBarUpdate_PROGRESS", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+            if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_BARTIME", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+            
+            // Diagnostic Point #1: primary series only (BIP 0) — gated when diagnostic_logging_during_historical=false
             var diagInstrument1 = Instrument.MasterInstrument.Name;
             var diagTimeUtc1 = DateTimeOffset.UtcNow;
-            var diagCanLog1 = !_lastOnBarUpdateLogUtc.TryGetValue(diagInstrument1, out var diagPrevLogUtc1) ||
-                           (diagTimeUtc1 - diagPrevLogUtc1).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES;
+            var diagCanLog1 = !skipHistoricalDiag && (!_lastOnBarUpdateLogUtc.TryGetValue(diagInstrument1, out var diagPrevLogUtc1) ||
+                           (diagTimeUtc1 - diagPrevLogUtc1).TotalMinutes >= ON_BAR_UPDATE_RATE_LIMIT_MINUTES);
             
             if (diagCanLog1 && _engine != null)
             {
@@ -1194,6 +1409,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "note", "Diagnostic Point #1: Ground truth - what NinjaTrader is feeding. If this doesn't fire, OnBarUpdate() isn't being called." }
                 });
             }
+            LogBarProfileIfSlow("diagnostics", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
+            barProfileLastMs = barProfileSw.ElapsedMilliseconds;
 
             // CRITICAL FIX: NinjaTrader Times[0][0] timezone handling with locking
             // Lock interpretation after first detection to prevent mid-run flips
@@ -1201,8 +1418,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             var nowUtc = DateTimeOffset.UtcNow;
             DateTimeOffset barUtc;
             
-            // DIAGNOSTIC: Log when detection path is entered (first bar only)
-            if (!_barTimeInterpretationLocked && _engine != null)
+            // DIAGNOSTIC: Log when detection path is entered (first bar only) — gated when diagnostic_logging_during_historical=false
+            if (!skipHistoricalDiag && !_barTimeInterpretationLocked && _engine != null)
             {
                 var instrumentName = Instrument.MasterInstrument.Name;
                 _engine.LogEngineEvent(nowUtc, "BAR_TIME_DETECTION_STARTING", new Dictionary<string, object>
@@ -1258,9 +1475,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Lock interpretation
                 _barTimeInterpretationLocked = true;
                 
-                // CRITICAL INVARIANT LOG: Explicit log right after locking to make it impossible to miss
+                // CRITICAL INVARIANT LOG: Explicit log right after locking (gated when diagnostic_logging_during_historical=false)
                 // This ensures if interpretation is wrong, we know immediately in logs (seconds, not hours)
-                if (_engine != null)
+                if (!skipHistoricalDiag && _engine != null)
                 {
                     var instrumentName = Instrument.MasterInstrument.Name;
                     var finalBarAge = (nowUtc - barUtc).TotalMinutes;
@@ -1320,6 +1537,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                 }
             }
+            LogBarProfileIfSlow("bar_time", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
+            barProfileLastMs = barProfileSw.ElapsedMilliseconds;
 
             var open = (decimal)Open[0];
             var high = (decimal)High[0];
@@ -1364,14 +1583,45 @@ namespace NinjaTrader.NinjaScript.Strategies
             var barUtcOpenTime = barUtc.AddMinutes(-1);
 
             // Deliver bar data to engine (bars only provide market data, not time advancement)
+            if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_ONBAR", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
             _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
+            if (logTiming) TraceLifecycle("OnBarUpdate_AFTER_ONBAR", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+            LogBarProfileIfSlow("onbar", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
+            barProfileLastMs = barProfileSw.ElapsedMilliseconds;
             
             // PATTERN 1: Drive Tick() from bar flow (bar-driven liveness)
             // Tick() is now invoked only when bars arrive, not from a synthetic timer
-            _engine.Tick(nowUtc);
-            
-            // Break-even monitoring: Now handled in OnMarketData() for tick-based detection
-            // Removed CheckBreakEvenTriggers() call - BE checks happen on every tick, not bar close
+            // CRITICAL: During State.Historical ("Calculating"), pass bar time so that time-based logic
+            // (forced flatten, PRE_HYDRATION transition, range lock at slot time) runs in bar context.
+            // Using real time during Historical caused: wrong timeframe range lock, forced flatten
+            // firing on every bar (if enabled after 15:55 CT), and "stuck on Calculating". See
+            // PRE_HYDRATION_AND_FORCED_FLATTEN_DEEP_DIVE.md.
+            var tickTimeUtc = State == State.Historical ? barUtc : nowUtc;
+            // Diagnostic: log once per 2 min so we can confirm bar-time fix is deployed (bar_time_used only in Historical) — gated when diagnostic_logging_during_historical=false
+            if (!skipHistoricalDiag && _engine != null && (!_lastTickTimeDiagnosticUtc.TryGetValue(Instrument?.MasterInstrument?.Name ?? "", out var lastDiag) || (nowUtc - lastDiag).TotalMinutes >= 2.0))
+            {
+                _lastTickTimeDiagnosticUtc[Instrument?.MasterInstrument?.Name ?? ""] = nowUtc;
+                _engine.LogEngineEvent(nowUtc, "TICK_TIME_SOURCE", new Dictionary<string, object>
+                {
+                    { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
+                    { "state", State.ToString() },
+                    { "bar_time_used", State == State.Historical },
+                    { "tick_time_utc", tickTimeUtc.ToString("o") },
+                    { "note", "Historical=bar time, Realtime=wall clock. Confirms bar-time fix is active." }
+                });
+            }
+            if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+#if NINJATRADER
+            // SessionCloseResolver: resolve on Realtime when trading date changes (once per day)
+            if (State == State.Realtime)
+            {
+                ResolveAndSetSessionCloseIfNeeded();
+                UpdateSessionIndices(tickTimeUtc);
+            }
+#endif
+            _engine.Tick(tickTimeUtc);
+            if (logTiming) TraceLifecycle("OnBarUpdate_AFTER_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
+            LogBarProfileIfSlow("tick", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
             }
             catch (Exception ex)
             {
@@ -1401,74 +1651,100 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
         }
-        
+
+#if NINJATRADER
         /// <summary>
-        /// OnMarketData override: Process tick data for break-even detection.
-        /// Only processes Last price ticks (actual trades) to avoid bid/ask noise.
+        /// Resolve session close for S1 and S2, call SetSessionCloseResolved. Defer to Realtime only.
+        /// Called on Realtime transition and when trading date changes.
         /// </summary>
-        protected override void OnMarketData(MarketDataEventArgs e)
+        private void ResolveAndSetSessionCloseIfNeeded()
         {
+            if (_engine == null || State != State.Realtime) return;
+            if (Bars == null || Bars.Count == 0) return;
+
+            var tradingDay = _engine.GetTradingDate();
+            if (string.IsNullOrWhiteSpace(tradingDay)) return;
+            if (tradingDay == _lastSessionCloseResolvedTradingDay) return;
+
+            var spec = _engine.GetParitySpec();
+            if (spec == null) return;
+
             try
             {
-                // HARDENING FIX 3: Fail closed - don't execute if init failed
-                if (_initFailed) return;
-                
-                // Guard: Only process if engine ready
-                if (!_engineReady || _adapter == null || _engine == null) return;
-                
-                // CRITICAL: Only process Last price ticks (avoid bid/ask noise)
-                if (e.MarketDataType != MarketDataType.Last) return;
-                
-                // Guard: Only process ticks for this strategy's instrument
-                if (e.Instrument != Instrument) return;
-                
-                // Get tick price
-                var tickPrice = (decimal)e.Price;
-                var utcNow = DateTimeOffset.UtcNow;
-                
-                // CRITICAL FIX: Drive Tick() from tick flow to ensure continuous execution
-                // This ensures range lock checks and time-based logic run even when bars aren't closing
-                // Tick() is idempotent and safe to call frequently
-                // 
-                // INVARIANT: Tick() must run even when bars are not closing.
-                // Tick() must NEVER depend on OnBarUpdate liveness.
-                // This prevents regression if someone removes OnBarUpdate Tick() call.
-                
-                _engine.Tick(utcNow);
-                
-                // Check break-even triggers using tick price
-                CheckBreakEvenTriggersTickBased(tickPrice, utcNow);
+                foreach (var sessionClass in new[] { "S1", "S2" })
+                {
+                    var result = SessionCloseResolver.Resolve(Bars, spec, sessionClass, tradingDay);
+                    _engine.SetSessionCloseResolved(tradingDay, sessionClass, result);
+                }
+                _lastSessionCloseResolvedTradingDay = tradingDay;
             }
             catch (Exception ex)
             {
-                // CRITICAL: Catch all exceptions to prevent NinjaTrader chart crashes
-                // Log error but don't rethrow - allow strategy to continue
-                var errorMsg = $"OnMarketData exception: {ex.GetType().Name}: {ex.Message}";
-                Log(errorMsg, LogLevel.Error);
-                
-                // Log to engine if available
-                if (_engine != null)
+                Log($"WARNING: SessionCloseResolver failed: {ex.Message}", LogLevel.Warning);
+                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "SESSION_CLOSE_RESOLVER_FAILED", new Dictionary<string, object>
                 {
-                    try
-                    {
-                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "ONMARKETDATA_EXCEPTION", new Dictionary<string, object>
-                        {
-                            { "exception_type", ex.GetType().Name },
-                            { "exception_message", ex.Message },
-                            { "stack_trace", ex.StackTrace ?? "N/A" },
-                            { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
-                            { "market_data_type", e?.MarketDataType.ToString() ?? "N/A" },
-                            { "note", "Exception caught to prevent chart crash - strategy will continue" }
-                        });
-                    }
-                    catch
-                    {
-                        // If logging fails, at least we caught the exception
-                    }
-                }
+                    { "error", ex.Message },
+                    { "trading_day", tradingDay },
+                    { "note", "Resolver failed - forced flatten may not trigger; check logs" }
+                });
             }
         }
+
+        /// <summary>
+        /// Update session index for S1 and S2. Called each Realtime tick for re-entry gate.
+        /// </summary>
+        private void UpdateSessionIndices(DateTimeOffset utcNow)
+        {
+            if (_engine == null || Bars == null || Bars.Count == 0) return;
+            var spec = _engine.GetParitySpec();
+            if (spec == null) return;
+
+            var nowChicago = _engine.ConvertUtcToChicago(utcNow).DateTime;
+            foreach (var sessionClass in new[] { "S1", "S2" })
+            {
+                var tuple = SessionCloseResolver.GetCurrentSessionIndex(Bars, spec, sessionClass, nowChicago);
+                if (tuple.HasValue)
+                    _engine.SetCurrentSessionIndex(tuple.Value.tradingDay, sessionClass, tuple.Value.index);
+            }
+        }
+#endif
         
+        /// <summary>BE evaluation using price series. When secondary 1-second series enabled: Closes[1][0]. When disabled: Closes[0][0] (primary bar).</summary>
+        private void RunBreakEvenCheck()
+        {
+            if (Position.MarketPosition == MarketPosition.Flat)
+                return;
+            if (_adapter == null || !_engineReady) return;
+            // Use primary series when secondary disabled; otherwise 1-second series for faster BE detection
+            var priceBarsIndex = BarsArray.Length >= 2 ? 1 : 0;
+            if (CurrentBars[priceBarsIndex] < 1) return;
+            decimal currentPrice = (decimal)Closes[priceBarsIndex][0];
+            CheckBreakEvenTriggersTickBased(currentPrice, DateTimeOffset.UtcNow);
+        }
+
+        /// <summary>Log BAR_PROFILE_SLOW when a section exceeds threshold (chart lag diagnosis). Rate-limited. Only runs when diagnostic_slow_logs=true.</summary>
+        private void LogBarProfileIfSlow(string section, long durationMs)
+        {
+            if (_engine == null || !IsDiagnosticSlowLogsEnabled(_engine)) return;
+            if (durationMs < BAR_PROFILE_THRESHOLD_MS) return;
+            var instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var key = $"{instrument}:{section}";
+            var now = DateTimeOffset.UtcNow;
+            if (_lastBarProfileLogUtc.TryGetValue(key, out var last) && (now - last).TotalSeconds < BAR_PROFILE_RATE_LIMIT_SECONDS)
+                return;
+            _lastBarProfileLogUtc[key] = now;
+            _engine.LogEngineEvent(now, "BAR_PROFILE_SLOW", new Dictionary<string, object>
+            {
+                { "instrument", instrument },
+                { "section", section },
+                { "duration_ms", durationMs },
+                { "threshold_ms", BAR_PROFILE_THRESHOLD_MS },
+                { "current_bar", CurrentBar },
+                { "state", State.ToString() },
+                { "note", "Per-bar section exceeded threshold - chart lag diagnosis" }
+            });
+        }
+
         /// <summary>
         /// Get execution instrument name for BE monitoring filter (e.g. MGC, MES, MYM).
         /// Must match Intent.ExecutionInstrument - use FullName root, not MasterInstrument.Name (which returns base e.g. GC for MGC).
@@ -1495,38 +1771,116 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void CheckBreakEvenTriggersTickBased(decimal tickPrice, DateTimeOffset utcNow)
         {
+            // HARDENING FIX 3: Fail closed - don't execute if init failed
+            if (_initFailed) return;
+            if (_adapter == null || !_engineReady) return;
+
+            // Phase 3.3: Latch price every tick (O(1)); scan runs on cadence only.
+            _lastTickPriceForBE = tickPrice;
+            if ((utcNow - _lastBeCheckUtc).TotalMilliseconds < BE_SCAN_THROTTLE_MS)
+                return; // Skip scan this tick; latch already updated.
+            _lastBeCheckUtc = utcNow;
+
+            var beStopwatch = Stopwatch.StartNew();
             try
             {
-                // HARDENING FIX 3: Fail closed - don't execute if init failed
-                if (_initFailed) return;
+                // MES/lag fix: use cached list for 200ms so we don't hit journal + lock on every scan.
+                var cacheAgeMs = (utcNow - _cachedActiveIntentsForBEUtc).TotalMilliseconds;
+                List<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> activeIntents;
+                if (_cachedActiveIntentsForBE != null && cacheAgeMs < BE_INTENTS_CACHE_MS)
+                {
+                    activeIntents = _cachedActiveIntentsForBE;
+                }
+                else
+                {
+                    // CRITICAL: Use execution instrument (e.g. MGC, MES) not MasterInstrument.Name (e.g. GC, ES).
+                    // Intent.ExecutionInstrument is MGC/MES - MasterInstrument.Name for MGC returns GC, which would filter out GC2 intent!
+                    var executionInstrument = GetExecutionInstrumentForBE();
+                    activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
+                    _cachedActiveIntentsForBE = activeIntents;
+                    _cachedActiveIntentsForBEUtc = utcNow;
+                }
+
+                // Rate-limited heartbeat log (minimal payload)
+                // This single log unlocks debugging: proves BE logic ran, shows intent count, enables diagnosis
+                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                var shouldLogBeEval = !_lastBeEvaluationLogUtc.TryGetValue(instrumentName, out var lastBeLogUtc) ||
+                                     (utcNow - lastBeLogUtc).TotalSeconds >= BE_EVALUATION_RATE_LIMIT_SECONDS;
                 
-                if (_adapter == null || !_engineReady) return;
-                
-                // Get active intents that need BE monitoring - CRITICAL: filter by this strategy's EXECUTION instrument
-                // Each strategy receives ticks for ONE instrument only. Without filter, we'd compare wrong price scales.
-                // CRITICAL FIX: Use execution instrument (e.g. MGC, MES) not MasterInstrument.Name (e.g. GC, ES).
-                // Intent.ExecutionInstrument is MGC/MES - MasterInstrument.Name for MGC chart returns GC, which would filter out GC2 intent!
-                var executionInstrument = GetExecutionInstrumentForBE();
-                var activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
+                // MES/lag fix: minimal payload only; no intent_details (was allocating List + N dicts every second per instrument).
+                if (shouldLogBeEval && _engine != null)
+                {
+                    _lastBeEvaluationLogUtc[instrumentName] = utcNow;
+                    _engine.LogEngineEvent(utcNow, "BE_EVALUATION_TICK", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "tick_price", _lastTickPriceForBE },
+                        { "active_intent_count", activeIntents.Count },
+                        { "note", "BE evaluation ran (rate-limited). active_intent_count=0 means no intents need BE." }
+                    });
+                }
                 
                 foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
                 {
-                // Check if BE trigger has been reached using tick price
+                // Check if BE trigger has been reached using latched price (Phase 3.3: same price used for whole scan)
                 bool beTriggerReached = false;
                 
                 if (direction == "Long")
                 {
-                    // For long positions: trigger when tick price >= BE trigger price
-                    beTriggerReached = tickPrice >= beTriggerPrice;
+                    beTriggerReached = _lastTickPriceForBE >= beTriggerPrice;
                 }
                 else if (direction == "Short")
                 {
-                    // For short positions: trigger when tick price <= BE trigger price
-                    beTriggerReached = tickPrice <= beTriggerPrice;
+                    beTriggerReached = _lastTickPriceForBE <= beTriggerPrice;
+                }
+                else
+                {
+                    // CRITICAL FIX: Handle invalid direction values
+                    if (_engine != null)
+                    {
+                        _engine.LogEngineEvent(utcNow, "BE_DETECTION_INVALID_DIRECTION", new Dictionary<string, object>
+                        {
+                            { "intent_id", intentId },
+                            { "instrument", intent.Instrument ?? "" },
+                            { "stream", intent.Stream ?? "" },
+                            { "direction", direction ?? "NULL" },
+                            { "tick_price", _lastTickPriceForBE },
+                            { "be_trigger_price", beTriggerPrice },
+                            { "note", "Invalid direction value - BE detection skipped for this intent. This indicates an intent creation bug." }
+                        });
+                    }
+                    continue; // Skip this intent - invalid direction
                 }
                 
                 if (beTriggerReached)
                 {
+                    // OPTIONAL ENHANCEMENT: Track when trigger is reached but modification hasn't completed
+                    // Check if this is the first time trigger was reached for this intent
+                    if (!_beTriggerReachedPendingModification.TryGetValue(intentId, out var triggerReachedAt))
+                    {
+                        // First time trigger reached - record timestamp
+                        _beTriggerReachedPendingModification[intentId] = utcNow;
+                        triggerReachedAt = utcNow;
+                    }
+                    
+                    // OPTIONAL ENHANCEMENT: Invariant assertion - if trigger reached for N seconds without modification → ERROR
+                    var secondsSinceTriggerReached = (utcNow - triggerReachedAt).TotalSeconds;
+                    if (secondsSinceTriggerReached >= BE_TRIGGER_TIMEOUT_SECONDS && _engine != null)
+                    {
+                        _engine.LogEngineEvent(utcNow, "BE_TRIGGER_TIMEOUT_ERROR", new Dictionary<string, object>
+                        {
+                            { "intent_id", intentId },
+                            { "instrument", intent.Instrument ?? "" },
+                            { "stream", intent.Stream ?? "" },
+                            { "direction", direction },
+                            { "be_trigger_price", beTriggerPrice },
+                            { "tick_price", _lastTickPriceForBE },
+                            { "seconds_since_trigger_reached", secondsSinceTriggerReached },
+                            { "timeout_threshold_seconds", BE_TRIGGER_TIMEOUT_SECONDS },
+                            { "note", $"INVARIANT VIOLATION: BE trigger reached {secondsSinceTriggerReached:F1} seconds ago but stop modification has not completed. This indicates a persistent failure in BE modification logic." }
+                        });
+                    }
+                    
                     // CRITICAL FIX: Use breakout level (entryPrice) for BE stop, not actual fill price
                     // "1 tick before breakout point" means 1 tick before the breakout level (entryPrice)
                     // The breakout level is the strategic entry point, slippage shouldn't affect BE stop placement
@@ -1539,6 +1893,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Instrument.GetInstrument() can block/hang if instrument doesn't exist (e.g., M2K)
                     // Strategy's Instrument is already loaded and available - use it as source of truth
                     decimal tickSize = 0.25m; // Default fallback
+                    bool tickSizeFallbackUsed = false;
                     try
                     {
                         // Use strategy's instrument tick size (already loaded, no resolution needed)
@@ -1546,25 +1901,52 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             tickSize = (decimal)Instrument.MasterInstrument.TickSize;
                         }
+                        else
+                        {
+                            tickSizeFallbackUsed = true;
+                        }
                     }
                     catch
                     {
                         // Use default fallback if tick size access fails
+                        tickSizeFallbackUsed = true;
+                    }
+                    
+                    // CRITICAL FIX: Log warning when tick size fallback is used
+                    if (tickSizeFallbackUsed && _engine != null)
+                    {
+                        _engine.LogEngineEvent(utcNow, "BE_TICK_SIZE_FALLBACK_WARNING", new Dictionary<string, object>
+                        {
+                            { "intent_id", intentId },
+                            { "instrument", intent.Instrument ?? "" },
+                            { "stream", intent.Stream ?? "" },
+                            { "fallback_tick_size", tickSize },
+                            { "be_stop_price", direction == "Long" ? breakoutLevel - tickSize : breakoutLevel + tickSize },
+                            { "note", "Tick size fallback used - BE stop price may be incorrect for instruments with non-standard tick sizes. Verify instrument tick size configuration." }
+                        });
                     }
                     
                     // CRITICAL FIX: BE stop should be 1 tick before breakout point (breakout level, not fill price)
-                    // For long: breakoutLevel - tickSize (1 tick below breakout level)
-                    // For short: breakoutLevel + tickSize (1 tick above breakout level)
                     decimal beStopPrice = direction == "Long" 
                         ? breakoutLevel - tickSize  // 1 tick below breakout level for long
                         : breakoutLevel + tickSize; // 1 tick above breakout level for short
                     
-                    // Modify stop order to break-even
-                    // CRITICAL FIX: Add retry awareness for race condition (stop order may not be in account.Orders yet)
+                    // Chart lag fix: only attempt BE modify at most once per 200ms per intent. Previously we called
+                    // ModifyStopToBreakEven on every Last tick until success → hundreds of account.Orders + NT Change()/sec.
+                    var lastAttempt = _lastBeModifyAttemptUtcByIntent.TryGetValue(intentId, out var t) ? t : DateTimeOffset.MinValue;
+                    var attemptIntervalMs = (utcNow - lastAttempt).TotalMilliseconds;
+                    if (attemptIntervalMs < BE_MODIFY_ATTEMPT_INTERVAL_MS)
+                        continue; // Skip this tick; we'll retry when interval has elapsed
+                    _lastBeModifyAttemptUtcByIntent[intentId] = utcNow;
+
+                    // Modify stop order to break-even (retry awareness: stop order may not be in account.Orders yet)
                     var modifyResult = _adapter.ModifyStopToBreakEven(intentId, intent.Instrument ?? "", beStopPrice, utcNow);
                     
                     if (modifyResult.Success)
                     {
+                        _beTriggerReachedPendingModification.Remove(intentId);
+                        _lastBeModifyAttemptUtcByIntent.Remove(intentId); // avoid dict growth
+                        
                         // Log successful BE trigger
                         if (_engine != null)
                         {
@@ -1579,8 +1961,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_trigger_price", beTriggerPrice },
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
-                                { "tick_price", tickPrice },
-                                { "detection_method", "TICK_BASED" },
+                                { "tick_price", _lastTickPriceForBE },
+                                { "detection_method", "BAR_CLOSE" },
+                                { "seconds_to_modify", (utcNow - triggerReachedAt).TotalSeconds },
                                 { "note", "Break-even trigger reached (tick-based detection) - stop order modified to break-even using breakout level (1 tick before breakout point)" }
                             });
                         }
@@ -1588,8 +1971,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     else
                     {
                         // Log failure with retry awareness
-                        // CRITICAL FIX: Handle race condition where stop order may not be in account.Orders yet
-                        // Use IndexOf for .NET Framework compatibility (Contains with StringComparison may not be available)
                         var errorMsg = modifyResult.ErrorMessage ?? "";
                         var isRetryableError = (errorMsg.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0) ||
                                               (errorMsg.IndexOf("Stop order", StringComparison.OrdinalIgnoreCase) >= 0);
@@ -1607,16 +1988,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_trigger_price", beTriggerPrice },
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
-                                { "tick_price", tickPrice },
-                                { "detection_method", "TICK_BASED" },
+                                { "tick_price", _lastTickPriceForBE },
+                                { "detection_method", "BAR_CLOSE" },
                                 { "error", modifyResult.ErrorMessage },
                                 { "is_retryable", isRetryableError },
+                                { "seconds_since_trigger_reached", secondsSinceTriggerReached },
                                 { "note", isRetryableError 
                                     ? "Break-even trigger reached but stop order not found yet (race condition) - will retry on next tick"
                                     : "Break-even trigger reached but stop modification failed" }
                             });
                         }
                     }
+                }
+                else
+                {
+                    // Trigger not reached - clear pending tracking if it exists (price moved back below trigger)
+                    _beTriggerReachedPendingModification.Remove(intentId);
                 }
                 }
             }
@@ -1647,6 +2034,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                         // If logging fails, at least we caught the exception
                     }
                 }
+            }
+            // Diagnostic: log when BE check is slow (source of MES/instrument slowness)
+            if (beStopwatch.ElapsedMilliseconds > 10 && _engine != null && IsDiagnosticSlowLogsEnabled(_engine))
+            {
+                _engine.LogEngineEvent(DateTimeOffset.UtcNow, "BE_CHECK_SLOW", new Dictionary<string, object>
+                {
+                    { "duration_ms", beStopwatch.ElapsedMilliseconds },
+                    { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
+                    { "tick_price", _lastTickPriceForBE },
+                    { "note", "CheckBreakEvenTriggersTickBased exceeded 10ms" }
+                });
             }
         }
 
@@ -1845,32 +2243,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public Instrument GetInstrument() => Instrument;
         
         /// <summary>
-        /// Send a test notification to verify Pushover is working.
-        /// Call this method from NinjaTrader or external code to test notifications.
+        /// Test notifications were removed (HealthMonitor/Pushover). Use log tail on CRITICAL_ENGINE_EVENT for alerting.
         /// </summary>
         public void SendTestNotification()
         {
-            if (_engine is null)
-            {
-                Log("ERROR: Cannot send test notification - engine is null", LogLevel.Error);
-                return;
-            }
-            
-            // HARDENING FIX 3: Fail closed - don't execute if init failed
-            if (_initFailed)
-            {
-                Log("ERROR: Cannot send test notification - strategy initialization failed", LogLevel.Error);
-                return;
-            }
-            
-            if (!_engineReady)
-            {
-                Log("WARNING: Cannot send test notification - engine not ready yet", LogLevel.Warning);
-                return;
-            }
-            
-            _engine.SendTestNotification();
-            Log("Test notification requested - check logs for PUSHOVER_NOTIFY_ENQUEUED event", LogLevel.Information);
+            Log("Test notification is no longer supported. Alert via log tail on CRITICAL_ENGINE_EVENT.", LogLevel.Information);
         }
     }
 }

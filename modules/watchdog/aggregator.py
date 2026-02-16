@@ -12,9 +12,9 @@ import pytz
 
 from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor
-from .state_manager import WatchdogStateManager, CursorManager
+from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
-from .config import FRONTEND_FEED_FILE
+from .config import EXECUTION_JOURNALS_DIR, FRONTEND_FEED_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,7 @@ class WatchdogAggregator:
         # Buffer size: 200 events (configurable)
         self._important_events_buffer: deque = deque(maxlen=200)
         self._event_seq_counter: int = 0  # Monotonic sequence ID counter
+        self._last_hydrate_utc: Optional[datetime] = None  # Throttle journal hydrate in get_active_intents
     
     async def start(self):
         """Start the aggregator service."""
@@ -94,6 +95,10 @@ class WatchdogAggregator:
         logger.info("Rebuilding connection status from recent events")
         self._rebuild_connection_status_from_recent_events()
         
+        # Hydrate intent exposures from execution journals (carry-over positions from previous day)
+        logger.info("Hydrating intent exposures from execution journals")
+        self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
+
         # Always initialize engine tick from recent ticks on startup
         logger.info("Initializing engine tick from recent events")
         try:
@@ -334,6 +339,8 @@ class WatchdogAggregator:
                             f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}, "
                             f"cleaned up {streams_before - streams_after} stale stream(s)"
                         )
+                        # Hydrate from journals so carry-over positions are visible
+                        self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
                     
                     # Hash change detection (separate from day rollover)
                     # Only used for enabled_streams updates, not day changes
@@ -1127,13 +1134,18 @@ class WatchdogAggregator:
                     f"get_stream_states: Timetable unavailable, falling back to watchdog-only streams"
                 )
                 
+                active_stream_keys = self._state_manager.get_active_intent_stream_keys()
                 filtered_by_date = 0
                 filtered_by_enabled = 0
                 for (trading_date, stream), info in stream_states_dict.items():
-                    # Only include streams from current trading date
+                    # Include streams from current trading date, OR carry-over with active intents AND within ~24h
                     if trading_date != current_trading_date:
-                        filtered_by_date += 1
-                        continue
+                        if (trading_date, stream) not in active_stream_keys:
+                            filtered_by_date += 1
+                            continue
+                        if not _is_trading_date_within_max_age(trading_date, current_trading_date):
+                            filtered_by_date += 1
+                            continue
                     
                     # If enabled_streams is available, filter by it
                     if enabled_streams is not None:
@@ -1184,6 +1196,49 @@ class WatchdogAggregator:
                     f"get_stream_states: Returning {len(streams)} streams (fallback mode - watchdog only), "
                     f"filtered_by_date: {filtered_by_date}, filtered_by_enabled: {filtered_by_enabled}"
                 )
+
+            # Add carry-over streams (from previous day with active intents) not already in streams
+            # Only include streams within STREAM_MAX_AGE_DAYS (~24h) - no 10-day-old carry-over
+            active_stream_keys = self._state_manager.get_active_intent_stream_keys()
+            existing_keys = {(s.get("trading_date"), s.get("stream")) for s in streams}
+            for (trading_date, stream) in active_stream_keys:
+                if (trading_date, stream) in existing_keys:
+                    continue
+                if trading_date == current_trading_date:
+                    continue  # Already handled by timetable loop
+                if not _is_trading_date_within_max_age(trading_date, current_trading_date):
+                    continue  # Skip streams older than ~24h
+                info = stream_states_dict.get((trading_date, stream))
+                if info:
+                    state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
+                    slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
+                    if slot_time_chicago and 'T' in slot_time_chicago:
+                        try:
+                            slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
+                            if slot_dt.tzinfo:
+                                slot_dt = slot_dt.astimezone(CHICAGO_TZ)
+                            slot_time_chicago = slot_dt.strftime("%H:%M")
+                        except Exception:
+                            pass
+                    streams.append({
+                        "trading_date": trading_date,
+                        "stream": stream,
+                        "instrument": getattr(info, 'instrument', ''),
+                        "session": getattr(info, 'session', None) or "",
+                        "state": getattr(info, 'state', 'RANGE_LOCKED'),
+                        "committed": False,
+                        "commit_reason": None,
+                        "slot_time_chicago": slot_time_chicago or None,
+                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or None,
+                        "range_high": getattr(info, 'range_high', None),
+                        "range_low": getattr(info, 'range_low', None),
+                        "freeze_close": getattr(info, 'freeze_close', None),
+                        "range_invalidated": getattr(info, 'range_invalidated', False),
+                        "state_entry_time_utc": state_entry_time_utc.isoformat(),
+                        "range_locked_time_utc": state_entry_time_utc.isoformat(),
+                        "range_locked_time_chicago": state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                    })
+                    logger.debug(f"get_stream_states: Added carry-over stream {stream} ({trading_date})")
             
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
@@ -1318,7 +1373,12 @@ class WatchdogAggregator:
         return [event for event in self._important_events_buffer if event.get("seq", 0) > seq_id]
     
     def get_active_intents(self) -> Dict:
-        """Get current active intents."""
+        """Get current active intents. Merges journal truth (open journals) for reliability."""
+        # Merge journal truth: hydrate from journals (throttled to every 60s)
+        now = datetime.now(timezone.utc)
+        if self._last_hydrate_utc is None or (now - self._last_hydrate_utc).total_seconds() >= 60:
+            self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
+            self._last_hydrate_utc = now
         intents = []
         try:
             if hasattr(self._state_manager, '_intent_exposures'):

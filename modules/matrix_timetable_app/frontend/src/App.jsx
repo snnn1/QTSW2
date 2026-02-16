@@ -462,7 +462,10 @@ function AppContent() {
     
     // Only refetch if the value actually changed (not on initial mount) and we have data loaded
     if (prevValue !== undefined && prevValue !== includeFilteredExecuted && masterData.length > 0 && refetchMasterStats) {
-      console.log(`[Master Stats] Toggle changed: ${prevValue} -> ${includeFilteredExecuted}, refetching stats...`)
+      console.log(`[Master Stats] Toggle changed: ${prevValue} -> ${includeFilteredExecuted}, clearing old stats and refetching...`)
+      // Clear backend stats first to force refresh and prevent showing stale data
+      setBackendStatsFull(null)
+      console.log(`[Master Stats] Cleared backendStatsFull, will refetch with includeFilteredExecuted=${includeFilteredExecuted}`)
       // Clear individual stream stats (they need to be refetched with new setting)
       setBackendStreamStats({})
       setBackendStreamStatsLoading({})
@@ -1137,6 +1140,11 @@ function AppContent() {
       if (streamId === 'master' && backendStatsFull && formatWorkerStats) {
         // Use backendStatsFull - it contains full-history stats with correct includeFilteredExecuted setting
         console.log(`[Master Stats] Using backendStatsFull (full-history) with includeFilteredExecuted=${includeFilteredExecuted}`)
+        console.log(`[Master Stats] Stats sample counts:`, {
+          total: backendStatsFull?.sample_counts?.executed_trades_total,
+          allowed: backendStatsFull?.sample_counts?.executed_trades_allowed,
+          filtered: backendStatsFull?.sample_counts?.executed_trades_filtered
+        })
         stats = formatWorkerStats(backendStatsFull, streamId)
         
         // Dev-only sanity check: Compare backend vs worker stats when both available
@@ -4045,7 +4053,6 @@ function WorstDaysTable({ contractMultiplier = 1 }) {
       setLoading(true)
       setError(null)
       try {
-        // Fetch ALL data from backend (limit: 0 means no limit)
         const data = await matrixApi.getMatrixData({
           limit: 0, // Get all data
           order: 'oldest', // Get in chronological order
@@ -4064,10 +4071,8 @@ function WorstDaysTable({ contractMultiplier = 1 }) {
           return
         }
         
-        // Calculate daily profit using the existing utility
         const dailyProfit = calculateDateProfit(trades, contractMultiplier)
         
-        // Sum profits across all streams for each date
         const dailyTotals = Object.keys(dailyProfit).map(date => {
           const streams = dailyProfit[date]
           const totalProfit = Object.values(streams).reduce((sum, profit) => sum + profit, 0)
@@ -4079,7 +4084,6 @@ function WorstDaysTable({ contractMultiplier = 1 }) {
           }
         })
         
-        // Sort by profit (ascending - worst first) and take top 50
         const sorted = dailyTotals
           .sort((a, b) => a.totalProfit - b.totalProfit)
           .slice(0, 50)

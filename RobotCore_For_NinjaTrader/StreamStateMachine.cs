@@ -74,6 +74,32 @@ public sealed class StreamStateMachine
     public DateTimeOffset RangeStartUtc { get; private set; }
     public DateTimeOffset SlotTimeUtc { get; private set; }
     public DateTimeOffset MarketCloseUtc { get; private set; }
+
+    /// <summary>
+    /// Returns a dictionary of stream status fields for logging (STREAM_STATUS_SUMMARY, STREAM_STATE_SNAPSHOT).
+    /// </summary>
+    public Dictionary<string, object> GetStatusForLogging(DateTimeOffset utcNow)
+    {
+        return new Dictionary<string, object>
+        {
+            ["stream_id"] = Stream,
+            ["instrument"] = Instrument,
+            ["execution_instrument"] = ExecutionInstrument,
+            ["canonical_instrument"] = CanonicalInstrument,
+            ["session"] = Session,
+            ["slot_time_chicago"] = SlotTimeChicago,
+            ["state"] = State.ToString(),
+            ["committed"] = Committed,
+            ["range_invalidated"] = RangeInvalidated,
+            ["trading_date"] = TradingDate,
+            ["range_high"] = RangeHigh ?? (object)"UNSET",
+            ["range_low"] = RangeLow ?? (object)"UNSET",
+            ["range_start_utc"] = RangeStartUtc.ToString("o"),
+            ["slot_time_utc"] = SlotTimeUtc.ToString("o"),
+            ["market_close_utc"] = MarketCloseUtc.ToString("o"),
+            ["now_utc"] = utcNow.ToString("o")
+        };
+    }
     
     // Chicago time boundaries for range computation (authoritative for bar filtering)
     // CRITICAL: These are DateTimeOffset values in Chicago timezone, not strings

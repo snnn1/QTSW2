@@ -412,10 +412,14 @@ def calculate_summary_stats(
     # - If include_filtered_executed == True: Same as executed_all
     # - If include_filtered_executed == False: Only allowed executed trades
     # This is the BEHAVIORAL / REPORTING SAMPLE
+    logger.info(f"[Statistics] include_filtered_executed={include_filtered_executed} (type: {type(include_filtered_executed).__name__})")
+    logger.info(f"[Statistics] executed_all count: {len(executed_all)}, allowed: {executed_all['final_allowed'].sum()}, filtered: {(~executed_all['final_allowed']).sum()}")
     if include_filtered_executed:
         executed_selected = executed_all.copy()
+        logger.info(f"[Statistics] Using ALL executed trades (include_filtered_executed=True): {len(executed_selected)} trades")
     else:
         executed_selected = executed_all[executed_all["final_allowed"]].copy()
+        logger.info(f"[Statistics] Using ONLY allowed executed trades (include_filtered_executed=False): {len(executed_selected)} trades (filtered out {len(executed_all) - len(executed_selected)} trades)")
     
     # ========================================================================
     # PHASE 5.2: Population Alignment Diagnostics

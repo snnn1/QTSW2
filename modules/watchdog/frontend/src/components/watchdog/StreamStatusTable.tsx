@@ -14,8 +14,9 @@ interface StreamStatusTableProps {
 }
 
 export function StreamStatusTable({ streams, onStreamClick, marketOpen }: StreamStatusTableProps) {
-  // Get current trading date from first stream (all streams should have same trading_date)
-  const currentTradingDate = streams[0]?.trading_date || new Date().toISOString().split('T')[0]
+  // Get current trading date (today) for PnL and carry-over styling
+  const todayStr = new Date().toISOString().split('T')[0]
+  const currentTradingDate = streams[0]?.trading_date || todayStr
   const { pnl } = useStreamPnl(currentTradingDate)
   const [, forceUpdate] = useState(0)
   
@@ -81,8 +82,16 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
     return 'text-white'
   }
   
-  // Sort streams by slot_time_chicago (latest first), then by stream name
+  // Sort streams: today first, then by date (newest first), then by slot_time_chicago (latest first), then by stream name
   const sortedStreams = [...streams].sort((a, b) => {
+    // Date order: today first, then by date descending
+    const aDate = a.trading_date || ''
+    const bDate = b.trading_date || ''
+    if (aDate !== bDate) {
+      if (aDate === todayStr) return -1
+      if (bDate === todayStr) return 1
+      return bDate.localeCompare(aDate)  // Newer dates first
+    }
     // Parse slot times for comparison
     const parseSlotTime = (slotTime: string | null | undefined): number => {
       if (!slotTime || slotTime === '-' || slotTime === '') return 0
@@ -125,6 +134,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
         <table className="w-full">
           <thead className="bg-gray-700">
             <tr>
+              <th className="px-2 py-1 text-left whitespace-nowrap min-w-[5rem]">Date</th>
               <th className="px-2 py-1 text-left">Stream</th>
               <th className="px-2 py-1 text-left">Instr</th>
               <th className="px-2 py-1 text-left">Session</th>
@@ -149,6 +159,10 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
               
               // Get P&L for this stream
               const streamPnl = pnl[stream.stream]
+              const isCarryOver = stream.trading_date !== todayStr
+              const dateLabel = stream.trading_date
+                ? (stream.trading_date === todayStr ? 'Today' : stream.trading_date)
+                : '-'
               
               return (
                 <tr
@@ -156,6 +170,11 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   onClick={() => onStreamClick(stream)}
                   className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
                 >
+                  <td className="px-2 py-1 whitespace-nowrap min-w-[5rem]" title={stream.trading_date || undefined}>
+                    <span className={isCarryOver ? 'text-amber-400 font-medium' : 'text-gray-300'}>
+                      {dateLabel}
+                    </span>
+                  </td>
                   <td className="px-2 py-1 font-mono">{stream.stream}</td>
                   <td className="px-2 py-1">{stream.execution_instrument || stream.instrument || '-'}</td>
                   <td className="px-2 py-1">{stream.session || '-'}</td>

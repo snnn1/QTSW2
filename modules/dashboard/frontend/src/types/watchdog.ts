@@ -59,13 +59,14 @@ export interface StreamArmedStatus {
 export interface StreamState {
   stream: string;
   instrument: string;
+  execution_instrument?: string | null;
   session: string;
   trading_date: string;
-  state: StreamStateEnum;
+  state: StreamStateEnum | string;
   committed: boolean;
   commit_reason: string | null;
-  slot_time_chicago: string;
-  slot_time_utc: string;
+  slot_time_chicago: string | null;
+  slot_time_utc: string | null;
   range_high: number | null;
   range_low: number | null;
   freeze_close: number | null;

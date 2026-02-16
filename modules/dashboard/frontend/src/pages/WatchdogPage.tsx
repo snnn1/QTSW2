@@ -90,38 +90,40 @@ export function WatchdogPage() {
     }
   }, [status?.recovery_state, status?.engine_activity_state]) // Only depend on fields that affect result
   
-  // Determine data flow status - memoized with stable dependencies
+  // Determine data flow status - uses engine tick (same as engine liveness) when bar-age unavailable
   const dataFlowStatus = useMemo(() => {
     if (!status) return 'UNKNOWN'
     
     const stalls = Object.values(status.data_stall_detected || {})
+    const DATA_STALL_THRESHOLD = 120
     
-    // If no instruments tracked yet, we can't determine data flow status
-    // But if market is closed, we can infer acceptable silence
-    if (stalls.length === 0) {
-      // If market is known to be closed, show acceptable silence
-      // Otherwise, show unknown (waiting for first bar)
-      if (status.market_open === false) {
-        return 'ACCEPTABLE_SILENCE'
+    const getEngineTickAgeSeconds = (): number | null => {
+      const tickStr = status?.last_engine_tick_chicago
+      if (!tickStr) return null
+      try {
+        const tickMs = new Date(tickStr).getTime()
+        if (isNaN(tickMs)) return null
+        return (Date.now() - tickMs) / 1000
+      } catch {
+        return null
       }
+    }
+    
+    if (stalls.length === 0) {
+      if (status.market_open === false) return 'ACCEPTABLE_SILENCE'
+      if (status.worst_last_bar_age_seconds != null && status.worst_last_bar_age_seconds < DATA_STALL_THRESHOLD) return 'FLOWING'
+      const tickAge = getEngineTickAgeSeconds()
+      if (tickAge !== null && tickAge < DATA_STALL_THRESHOLD) return 'FLOWING'
+      if (tickAge !== null && tickAge >= DATA_STALL_THRESHOLD) return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
       return 'UNKNOWN'
     }
     
-    // Check for critical stalls (market open + stalled)
     const criticalStall = stalls.some(d => d.stall_detected && d.market_open)
-    if (criticalStall) {
-      return 'STALLED'
-    }
-    
-    // Check for acceptable silence (market closed + stalled)
+    if (criticalStall) return 'STALLED'
     const acceptableSilence = stalls.some(d => d.stall_detected && !d.market_open)
-    if (acceptableSilence) {
-      return 'ACCEPTABLE_SILENCE'
-    }
-    
-    // No stalls detected = data flowing
+    if (acceptableSilence) return 'ACCEPTABLE_SILENCE'
     return 'FLOWING'
-  }, [status?.data_stall_detected, status?.market_open]) // Only depend on fields that affect result
+  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago])
   
   // Build critical alerts
   const alerts = useMemo(() => {

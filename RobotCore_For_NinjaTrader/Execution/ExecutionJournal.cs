@@ -1335,6 +1335,137 @@ public sealed class ExecutionJournal
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 
     /// <summary>
+    /// Get all open journal entries (EntryFilled && !TradeCompleted) grouped by execution instrument.
+    /// Used by ReconciliationRunner to find orphaned journals when broker is flat.
+    /// </summary>
+    public Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> GetOpenJournalEntriesByInstrument()
+    {
+        var result = new Dictionary<string, List<(string, string, string, ExecutionJournalEntry)>>(StringComparer.OrdinalIgnoreCase);
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            return result;
+        }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+
+                var tradingDate = parts[0];
+                var intentId = parts[parts.Length - 1];
+                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    if (_cache.TryGetValue(fileName, out var cached))
+                    {
+                        entry = cached;
+                    }
+                    else
+                    {
+                        var json = File.ReadAllText(path);
+                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                        if (entry != null)
+                            _cache[fileName] = entry;
+                    }
+                }
+
+                if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;
+                if (entry.EntryFilledQuantityTotal <= 0) continue;
+
+                var instrument = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!result.TryGetValue(instrument, out var list))
+                {
+                    list = new List<(string, string, string, ExecutionJournalEntry)>();
+                    result[instrument] = list;
+                }
+                list.Add((tradingDate, stream, intentId, entry));
+            }
+            catch
+            {
+                // Skip corrupt files - best-effort
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Record trade completion via reconciliation (broker flat, no exit fill received).
+    /// Sets TradeCompleted, CompletionReason=RECONCILIATION_BROKER_FLAT.
+    /// Exit price and P&L left null so reporting layer can treat reconciled trades specially.
+    /// </summary>
+    public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            ExecutionJournalEntry? entry;
+            if (_cache.TryGetValue(key, out var existing))
+            {
+                entry = existing;
+            }
+            else if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                        _cache[key] = entry;
+                    else
+                        return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted)
+                return false;
+
+            if (entry.EntryFilledQuantityTotal <= 0)
+                return false;
+
+            // Mark closed; exit price and P&L unknown (broker closed externally)
+            entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+            entry.ExitAvgFillPrice = null;
+            entry.ExitFillNotional = null;
+            entry.ExitFilledAtUtc = utcNow.ToString("o");
+            entry.ExitOrderType = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+            entry.TradeCompleted = true;
+            entry.CompletedAtUtc = utcNow.ToString("o");
+            entry.CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+            entry.RealizedPnLPoints = null;
+            entry.RealizedPnLGross = null;
+            entry.RealizedPnLNet = null;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Pre-load all journal entries for a trading date into cache.
     /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
     /// </summary>
@@ -1503,4 +1634,15 @@ public class ExecutionJournalEntry
     public decimal? RealizedPnLPoints { get; set; } // Gross points before multiplier
     public string? CompletionReason { get; set; } // Exit order type that completed the trade
     public string? CompletedAtUtc { get; set; } // Trade completion timestamp (ISO-8601 UTC)
+}
+
+/// <summary>
+/// Completion reason constants for execution journal (copy-safe, no enum).
+/// </summary>
+public static class CompletionReasons
+{
+    /// <summary>
+    /// Trade was closed externally; broker position flat; journal reconciled.
+    /// </summary>
+    public const string RECONCILIATION_BROKER_FLAT = "RECONCILIATION_BROKER_FLAT";
 }

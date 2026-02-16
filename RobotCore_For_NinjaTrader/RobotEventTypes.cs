@@ -283,6 +283,11 @@ public static class RobotEventTypes
         ["EXECUTION_JOURNAL_CORRUPTION"] = "ERROR",
         ["EXECUTION_SLIPPAGE_DETECTED"] = "INFO",
         
+        // Reconciliation
+        ["TRADE_RECONCILED"] = "INFO",
+        ["RECONCILIATION_SKIPPED_HAS_WORKING_ORDERS"] = "INFO",
+        ["RECONCILIATION_PASS_SUMMARY"] = "INFO",
+        
         // Slot persistence
         ["FORCED_FLATTEN_MARKET_CLOSE"] = "WARN",
         ["FORCED_FLATTEN_TRIGGERED"] = "INFO",
@@ -487,6 +492,9 @@ public static class RobotEventTypes
         
         // Journal
         "JOURNAL_WRITTEN", "EXECUTION_JOURNAL_ERROR", "EXECUTION_JOURNAL_READ_ERROR", "EXECUTION_JOURNAL_CORRUPTION", "EXECUTION_SLIPPAGE_DETECTED",
+        
+        // Reconciliation
+        "TRADE_RECONCILED", "RECONCILIATION_SKIPPED_HAS_WORKING_ORDERS", "RECONCILIATION_PASS_SUMMARY",
         
         // Slot persistence
         "FORCED_FLATTEN_MARKET_CLOSE", "FORCED_FLATTEN_TRIGGERED", "SESSION_CLOSE_RESOLVED", "SESSION_CLOSE_HOLIDAY",

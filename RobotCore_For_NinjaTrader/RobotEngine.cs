@@ -91,6 +91,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _executionJournal.WarmCacheForTradingDate(tradingDate);
     }
 
+    /// <summary>
+    /// Run reconciliation once on Realtime transition (NT context ready).
+    /// Closes orphaned journals when broker position is flat.
+    /// </summary>
+    public void RunReconciliationOnRealtimeStart()
+    {
+        _reconciliationRunner?.RunOnRealtimeStart(DateTimeOffset.UtcNow);
+    }
+
+    /// <summary>
+    /// Run reconciliation periodically (throttled). Call from Tick.
+    /// </summary>
+    public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
+    {
+        _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+    }
+
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
     
@@ -106,6 +123,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
+    private ReconciliationRunner? _reconciliationRunner;
     private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
@@ -815,6 +833,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 simAdapter.SetCoordinator(coordinator);
             }
 
+            // Create reconciliation runner for orphaned journal cleanup
+            _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log);
+
             // Log execution mode and adapter
             var adapterType = _executionAdapter.GetType().Name;
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_MODE_SET", state: "ENGINE",
@@ -1263,6 +1284,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // Start recovery runner (idempotent, single-threaded)
                 RunRecovery(utcNow);
             }
+
+            // Reconciliation: periodic orphaned journal cleanup (throttled)
+            RunReconciliationPeriodicThrottle(utcNow);
 
             // Timetable reactivity (disk I/O already completed outside lock)
             if (shouldPoll)
@@ -4153,15 +4177,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         if (_streams.Count == 0) return;
         var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE",
-            new
-            {
-                streams = streams,
-                stream_count = streams.Count,
-                trading_date = TradingDateString,
-                trigger = "PERIODIC",
-                note = "Periodic snapshot of all stream states (diagnostic)"
-            }));
+        var payload = new Dictionary<string, object>
+        {
+            ["streams"] = streams,
+            ["stream_count"] = streams.Count,
+            ["trading_date"] = TradingDateString,
+            ["trigger"] = "PERIODIC",
+            ["note"] = "Periodic snapshot of all stream states (diagnostic)"
+        };
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE", payload));
     }
 
     /// <summary>
@@ -4180,15 +4204,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             _lastEventDrivenSnapshotUtc = utcNow;
             var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE",
-                new
-                {
-                    streams = streams,
-                    stream_count = streams.Count,
-                    trading_date = TradingDateString,
-                    trigger = trigger,
-                    note = "Event-driven snapshot"
-                }));
+            var payload = new Dictionary<string, object>
+            {
+                ["streams"] = streams,
+                ["stream_count"] = streams.Count,
+                ["trading_date"] = TradingDateString,
+                ["trigger"] = trigger,
+                ["note"] = "Event-driven snapshot"
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE", payload));
         }
     }
 
@@ -4202,14 +4226,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             if (_streams.Count == 0) return;
             var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATE_SNAPSHOT", state: "ENGINE",
-                new
-                {
-                    streams = streams,
-                    stream_count = streams.Count,
-                    trading_date = TradingDateString,
-                    note = "Snapshot of all stream states at Realtime transition"
-                }));
+            var payload = new Dictionary<string, object>
+            {
+                ["streams"] = streams,
+                ["stream_count"] = streams.Count,
+                ["trading_date"] = TradingDateString,
+                ["note"] = "Snapshot of all stream states at Realtime transition"
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATE_SNAPSHOT", state: "ENGINE", payload));
         }
     }
 

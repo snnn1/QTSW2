@@ -36,6 +36,10 @@ DATA_STALL_THRESHOLD_SECONDS = 120  # Default, can be configurable per instrumen
 # Set to 10 minutes - recovery should complete quickly, but allow time for slow reconnections
 RECOVERY_TIMEOUT_SECONDS = 600  # 10 minutes
 
+# STREAM_MAX_AGE_DAYS: Maximum age for streams to be shown (today + N days back).
+# Streams older than this are filtered out. Must cover weekend carry-over (Fri -> Mon = 3 days).
+STREAM_MAX_AGE_DAYS = 3  # Allow today + Fri->Mon weekend carry-over
+
 # Update frequencies (seconds)
 ENGINE_ALIVE_UPDATE_FREQUENCY = 5
 STREAM_STUCK_UPDATE_FREQUENCY = 10
@@ -101,6 +105,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "INTENT_EXPOSURE_REGISTERED",
     "INTENT_EXPOSURE_CLOSED",
     "INTENT_EXIT_FILL",
+    "TRADE_RECONCILED",  # Orphaned journal closed; broker flat
     # Data Health
     "DATA_LOSS_DETECTED",
     "DATA_STALL_RECOVERED",

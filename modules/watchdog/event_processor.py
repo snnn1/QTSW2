@@ -759,12 +759,15 @@ class EventProcessor:
                 execution_instrument = instrument or ""
             
             if intent_id and canonical_stream_id and canonical_instrument and direction:
+                # Standardized fields: trading_date at top level
+                trading_date = event.get("trading_date") or data.get("trading_date")
                 # PHASE 2: Use canonical stream ID and instrument for intent exposure
                 self._state_manager.update_intent_exposure(
                     intent_id, canonical_stream_id, canonical_instrument, direction,
                     entry_filled_qty=entry_filled_qty,
                     state="ACTIVE",
-                    entry_filled_at_utc=timestamp_utc
+                    entry_filled_at_utc=timestamp_utc,
+                    trading_date=trading_date
                 )
         
         elif event_type == "INTENT_EXPOSURE_CLOSED":
@@ -772,6 +775,28 @@ class EventProcessor:
             if intent_id and intent_id in self._state_manager._intent_exposures:
                 exposure = self._state_manager._intent_exposures[intent_id]
                 exposure.state = "CLOSED"
+        
+        elif event_type == "TRADE_RECONCILED":
+            # Orphaned journal closed via reconciliation; broker was flat. Transition stream to DONE.
+            intent_id = data.get("intent_id")
+            stream = event.get("stream") or data.get("stream")
+            trading_date = event.get("trading_date") or data.get("trading_date")
+            completion_reason = data.get("completion_reason", "RECONCILIATION_BROKER_FLAT")
+            if intent_id and intent_id in self._state_manager._intent_exposures:
+                self._state_manager._intent_exposures[intent_id].state = "CLOSED"
+            if trading_date and stream:
+                instrument = data.get("instrument") or event.get("instrument") or ""
+                execution_instrument = event.get("execution_instrument") or instrument
+                canonical_stream = canonicalize_stream(stream, execution_instrument) if execution_instrument else stream
+                self._state_manager.update_stream_state(
+                    trading_date, canonical_stream, "DONE",
+                    committed=True, commit_reason=completion_reason,
+                    state_entry_time_utc=timestamp_utc
+                )
+                logger.info(
+                    f"TRADE_RECONCILED: Stream {canonical_stream} ({trading_date}) -> DONE "
+                    f"(intent_id={intent_id}, reason={completion_reason})"
+                )
         
         elif event_type == "INTENT_EXIT_FILL":
             intent_id = data.get("intent_id")

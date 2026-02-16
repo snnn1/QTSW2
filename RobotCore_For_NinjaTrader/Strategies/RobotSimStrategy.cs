@@ -679,6 +679,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Pre-warm execution journal cache so BE monitoring never hits disk on first lookup
                     _engine.WarmExecutionJournalCacheForTradingDate(_engine.GetTradingDate());
 
+                    // Reconciliation: close orphaned journals when broker flat (NT context ready)
+                    _engine.RunReconciliationOnRealtimeStart();
+
                     // SessionCloseResolver: resolve S1 and S2 on Realtime transition (defer to Realtime only)
                     ResolveAndSetSessionCloseIfNeeded();
 
