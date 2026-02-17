@@ -36,6 +36,28 @@ DATA_STALL_THRESHOLD_SECONDS = 120  # Default, can be configurable per instrumen
 # Set to 10 minutes - recovery should complete quickly, but allow time for slow reconnections
 RECOVERY_TIMEOUT_SECONDS = 600  # 10 minutes
 
+# ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS: Reject ENGINE_TICK_CALLSITE events older than this when
+# initializing from end-of-file. Prevents false ENGINE ALIVE when feed has stale ticks from previous run.
+ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS = 90
+
+# IDENTITY_EXPIRY_SECONDS: If no IDENTITY_INVARIANTS_STATUS event in this many seconds, treat identity as Unknown.
+IDENTITY_EXPIRY_SECONDS = 600  # 10 minutes
+
+# INGESTION: Single tail read per cycle - line count for frontend_feed.jsonl tail.
+# Reduced from 5000 to 3000 to lower I/O cost (WATCHDOG_INGESTION_HARDENING).
+TAIL_LINE_COUNT = 3000
+
+# INGESTION: Degradation mode - enter when loop_duration_ms > DEGRADATION_LOOP_THRESHOLD_MS
+# for DEGRADATION_CONSECUTIVE_CYCLES consecutive cycles.
+DEGRADATION_LOOP_THRESHOLD_MS = 900
+DEGRADATION_CONSECUTIVE_CYCLES = 10
+
+# INGESTION: Telemetry emit interval (seconds).
+INGESTION_STATS_INTERVAL_SECONDS = 10
+
+# INGESTION: /events cache TTL (seconds). Multiple clients within TTL share one disk read.
+EVENTS_CACHE_TTL_SECONDS = 1
+
 # STREAM_MAX_AGE_DAYS: Maximum age for streams to be shown (today + N days back).
 # Streams older than this are filtered out. Must cover weekend carry-over (Fri -> Mon = 3 days).
 STREAM_MAX_AGE_DAYS = 3  # Allow today + Fri->Mon weekend carry-over
@@ -118,6 +140,8 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Additional events needed for state tracking
     "RANGE_LOCKED",
     "RANGE_LOCK_SNAPSHOT",  # Contains range data for RANGE_LOCKED streams
+    "RANGE_LOCKED_RESTORED_FROM_HYDRATION",  # Restore events include range/session metadata
+    "RANGE_LOCKED_RESTORED_FROM_RANGES",
     "TIMETABLE_VALIDATED",
     # Stream State Machine transitions (plan requirement #2)
     "STREAM_STATE_TRANSITION",

@@ -9,21 +9,25 @@ namespace QTSW2.Robot.Core.Execution;
 /// Reconciles orphaned execution journals when broker position is flat.
 /// Run on Realtime start and periodically (throttled) to close journals
 /// for trades closed externally (e.g. strategy stop before slot expiry).
+/// Also performs quantity reconciliation: account vs journal.
 /// </summary>
 public sealed class ReconciliationRunner
 {
     private readonly IExecutionAdapter _adapter;
     private readonly ExecutionJournal _journal;
     private readonly RobotLogger _log;
+    private readonly Action<string, DateTimeOffset, string>? _onQuantityMismatch;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
 
-    public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log)
+    public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
+        Action<string, DateTimeOffset, string>? onQuantityMismatch = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _log = log ?? throw new ArgumentNullException(nameof(log));
+        _onQuantityMismatch = onQuantityMismatch;
     }
 
     /// <summary>
@@ -67,10 +71,37 @@ public sealed class ReconciliationRunner
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
 
         var instrumentsWithPosition = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var accountQtyByInstrument = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var p in positions)
         {
             if (p.Quantity != 0 && !string.IsNullOrWhiteSpace(p.Instrument))
-                instrumentsWithPosition.Add(p.Instrument.Trim());
+            {
+                var inst = p.Instrument.Trim();
+                instrumentsWithPosition.Add(inst);
+                var qty = Math.Abs(p.Quantity);
+                accountQtyByInstrument.TryGetValue(inst, out var existing);
+                accountQtyByInstrument[inst] = existing + qty;
+            }
+        }
+
+        foreach (var kvp in accountQtyByInstrument)
+        {
+            var inst = kvp.Key;
+            var accountQty = kvp.Value;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            if (journalQty != accountQty)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_QTY_MISMATCH", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        account_qty = accountQty,
+                        journal_qty = journalQty,
+                        note = "Partial protection is worse than none. Freeze instrument-level."
+                    }));
+                _onQuantityMismatch?.Invoke(inst, utcNow, $"QTY_MISMATCH:account={accountQty},journal={journalQty}");
+            }
         }
 
         var openByInstrument = _journal.GetOpenJournalEntriesByInstrument();

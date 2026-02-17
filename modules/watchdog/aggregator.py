@@ -2,10 +2,18 @@
 Watchdog Aggregator Service
 
 Main service that coordinates event feed generation, event processing, and state management.
+
+INGESTION INVARIANTS (WATCHDOG_INGESTION_HARDENING):
+- At most ONE tail read per ingestion cycle.
+- No full-file reads under any circumstance.
+- All ingestion lag measured using event timestamps (never processing time).
+- Observational only — no trade gating logic.
 """
+import json
 import logging
 import asyncio
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 import pytz
@@ -14,7 +22,16 @@ from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
-from .config import EXECUTION_JOURNALS_DIR, FRONTEND_FEED_FILE
+from .config import (
+    EXECUTION_JOURNALS_DIR,
+    FRONTEND_FEED_FILE,
+    TAIL_LINE_COUNT,
+    ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS,
+    DEGRADATION_LOOP_THRESHOLD_MS,
+    DEGRADATION_CONSECUTIVE_CYCLES,
+    INGESTION_STATS_INTERVAL_SECONDS,
+    EVENTS_CACHE_TTL_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +77,113 @@ def _read_last_lines(path, n: int, encoding: str = "utf-8-sig") -> List[str]:
     return lines
 
 
+def _read_last_lines_with_metrics(
+    path, n: int, encoding: str = "utf-8-sig"
+) -> Tuple[List[str], int, float]:
+    """
+    Read last N lines with telemetry. Returns (lines, bytes_read, duration_ms).
+    Tracks actual bytes read from disk for ingestion metrics.
+    """
+    if not path.exists():
+        return [], 0, 0.0
+    lines = []
+    total_bytes = 0
+    chunk_size = 65536
+    start = time.perf_counter()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            pos = size
+            buffer = b""
+            while pos > 0 and len(lines) < n:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                total_bytes += len(chunk)
+                buffer = chunk + buffer
+                while b"\n" in buffer and len(lines) < n:
+                    last_nl = buffer.rfind(b"\n")
+                    if last_nl == -1:
+                        break
+                    line = buffer[last_nl + 1:].decode(encoding, errors="replace").strip()
+                    buffer = buffer[:last_nl]
+                    if line:
+                        lines.append(line)
+            if buffer.strip() and len(lines) < n:
+                line = buffer.decode(encoding, errors="replace").strip()
+                if line:
+                    lines.append(line)
+        lines.reverse()
+    except Exception as e:
+        logger.warning(f"Error reading last {n} lines from {path}: {e}")
+    duration_ms = (time.perf_counter() - start) * 1000
+    return lines, total_bytes, duration_ms
+
+
+class IngestionTelemetry:
+    """Per-cycle ingestion metrics for WATCHDOG_INGESTION_STATS."""
+
+    def __init__(self):
+        self._tail_read_durations: deque = deque(maxlen=100)
+        self._loop_durations: deque = deque(maxlen=100)
+        self._lines_parsed: deque = deque(maxlen=100)
+        self._last_stats_emit_utc: Optional[datetime] = None
+        self._degraded_consecutive_count: int = 0
+
+    def record_cycle(
+        self,
+        tail_read_bytes: int,
+        tail_read_duration_ms: float,
+        lines_parsed: int,
+        events_processed: int,
+        parse_errors: int,
+        newest_event_ts: Optional[datetime],
+        loop_duration_ms: float,
+    ) -> None:
+        self._tail_read_durations.append(tail_read_duration_ms)
+        self._loop_durations.append(loop_duration_ms)
+        self._lines_parsed.append(lines_parsed)
+        if loop_duration_ms > DEGRADATION_LOOP_THRESHOLD_MS:
+            self._degraded_consecutive_count += 1
+        else:
+            self._degraded_consecutive_count = 0
+
+    def should_emit_stats(self, now: datetime) -> bool:
+        if self._last_stats_emit_utc is None:
+            return True
+        return (now - self._last_stats_emit_utc).total_seconds() >= INGESTION_STATS_INTERVAL_SECONDS
+
+    def emit_stats(self, now: datetime, ingestion_lag_seconds: Optional[float]) -> Dict[str, Any]:
+        self._last_stats_emit_utc = now
+        dr = list(self._tail_read_durations)
+        dl = list(self._loop_durations)
+        lp = list(self._lines_parsed)
+        avg_tail = sum(dr) / len(dr) if dr else 0
+        p95_tail = sorted(dr)[int(len(dr) * 0.95)] if len(dr) >= 20 else (dr[-1] if dr else 0)
+        avg_loop = sum(dl) / len(dl) if dl else 0
+        total_time_sec = sum(dl) / 1000.0 if dl else 1.0
+        total_lines = sum(lp) if lp else 0
+        lines_per_sec = total_lines / total_time_sec if total_time_sec > 0 else 0
+        return {
+            "event_type": "WATCHDOG_INGESTION_STATS",
+            "timestamp_utc": now.isoformat(),
+            "avg_tail_read_ms": round(avg_tail, 2),
+            "p95_tail_read_ms": round(p95_tail, 2),
+            "avg_loop_duration_ms": round(avg_loop, 2),
+            "ingestion_lag_seconds": round(ingestion_lag_seconds, 2) if ingestion_lag_seconds is not None else None,
+            "lines_parsed_per_second": round(lines_per_sec, 1),
+            "sample_count": len(dr),
+        }
+
+    def is_degraded(self) -> bool:
+        return self._degraded_consecutive_count >= DEGRADATION_CONSECUTIVE_CYCLES
+
+    def reset_degraded_count(self) -> None:
+        self._degraded_consecutive_count = 0
+
+
 class WatchdogAggregator:
     """Main aggregator service."""
     
@@ -76,6 +200,14 @@ class WatchdogAggregator:
         self._important_events_buffer: deque = deque(maxlen=200)
         self._event_seq_counter: int = 0  # Monotonic sequence ID counter
         self._last_hydrate_utc: Optional[datetime] = None  # Throttle journal hydrate in get_active_intents
+
+        # INGESTION: Single tail read per cycle, telemetry, degradation mode
+        self._ingestion_telemetry = IngestionTelemetry()
+        self._ingestion_degraded: bool = False
+        self._ingestion_degraded_entered_at: Optional[datetime] = None
+
+        # INGESTION: /events cache - (events, cached_at_utc) to avoid linear disk scaling
+        self._events_cache: Optional[Tuple[List[Dict], datetime]] = None
     
     async def start(self):
         """Start the aggregator service."""
@@ -87,84 +219,82 @@ class WatchdogAggregator:
         logger.info(f"Loaded cursor state: {cursor}")
         
         # Initialize state from recent events on startup
-        # This ensures all state is set immediately before processing begins
-        # CRITICAL: Always rebuild state on startup to ensure it's current
+        # INGESTION: Single tail read for all startup init (connection, tick, bars, identity)
         logger.info("Initializing watchdog state from recent events on startup")
-        
-        # Always rebuild connection status on startup
-        logger.info("Rebuilding connection status from recent events")
-        self._rebuild_connection_status_from_recent_events()
-        
-        # Hydrate intent exposures from execution journals (carry-over positions from previous day)
+        startup_snapshot: List[Dict] = []
+        if FRONTEND_FEED_FILE.exists():
+            lines, _, _ = _read_last_lines_with_metrics(FRONTEND_FEED_FILE, TAIL_LINE_COUNT)
+            for line_str in lines:
+                line = line_str.strip() if isinstance(line_str, str) else str(line_str)
+                if not line:
+                    continue
+                try:
+                    startup_snapshot.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        logger.info("Rebuilding connection status from startup snapshot")
+        self._rebuild_connection_status_from_snapshot(startup_snapshot)
+
         logger.info("Hydrating intent exposures from execution journals")
         self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
 
-        # Always initialize engine tick from recent ticks on startup
-        logger.info("Initializing engine tick from recent events")
-        try:
-            recent_ticks = self._read_recent_ticks_from_end(max_events=1)
-            if recent_ticks:
-                most_recent_tick = recent_ticks[-1]
-                self._event_processor.process_event(most_recent_tick)
-                logger.info(f"Initialized engine tick from recent events: {most_recent_tick.get('timestamp_utc', '')[:19]}")
-            else:
-                logger.warning("No recent ticks found for initialization")
-        except Exception as e:
-            logger.warning(f"Failed to initialize engine tick on startup: {e}", exc_info=True)
-        
-        # Always initialize bar tracking from recent bars on startup
-        logger.info("Initializing bar tracking from recent events")
-        try:
-            recent_bars = self._read_recent_bar_events_from_end(max_events=50)  # Read more bars to ensure we get recent ones
-            bars_processed = 0
-            for bar_event in recent_bars:
+        # Init engine tick from snapshot
+        ticks = [e for e in reversed(startup_snapshot) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE")]
+        if ticks:
+            most_recent_tick = ticks[0]
+            ts_str = most_recent_tick.get("timestamp_utc")
+            if ts_str:
                 try:
-                    self._event_processor.process_event(bar_event)
-                    bars_processed += 1
+                    tick_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    if tick_ts.tzinfo is None:
+                        tick_ts = tick_ts.replace(tzinfo=timezone.utc)
+                    age_sec = (datetime.now(timezone.utc) - tick_ts).total_seconds()
+                    if age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
+                        self._event_processor.process_event(most_recent_tick)
+                        logger.info(f"Initialized engine tick from snapshot: age={age_sec:.0f}s")
+                    else:
+                        logger.info(f"Skipped stale tick on init: age={age_sec:.0f}s > {ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS}s")
                 except Exception as e:
-                    logger.debug(f"Failed to process bar event during startup init: {e}")
-            if bars_processed > 0:
-                logger.info(f"Initialized bar tracking from {bars_processed} recent bar events on startup")
-            else:
-                logger.info("No recent bars found for initialization")
-        except Exception as e:
-            logger.warning(f"Failed to initialize bar tracking on startup: {e}", exc_info=True)
-        
-        # Always initialize identity status from recent identity events on startup
-        logger.info("Initializing identity status from recent events")
+                    logger.warning(f"Failed to parse tick on init: {e}")
+        else:
+            logger.info("No recent ticks found for initialization")
+
+        # Init bar tracking from snapshot
+        bar_types = ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED")
+        bars = [e for e in reversed(startup_snapshot) if e.get("event_type") in bar_types][:50]
+        for bar_ev in bars:
+            try:
+                self._event_processor.process_event(bar_ev)
+            except Exception as e:
+                logger.debug(f"Failed to process bar event during startup init: {e}")
+        if bars:
+            logger.info(f"Initialized bar tracking from {len(bars)} bar events on startup")
+
+        # Init identity from snapshot
+        logger.info("Initializing identity status from startup snapshot")
         try:
-            # Read recent events and find identity events
-            from .config import FRONTEND_FEED_FILE
-            import json
-            if FRONTEND_FEED_FILE.exists():
-                recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
-                
+            if startup_snapshot:
                 latest_identity_event = None
                 latest_timestamp = None
-                
-                for line in recent_lines:
-                    if line.strip():
-                        try:
-                            event = json.loads(line.strip())
-                            if event.get('event_type') == 'IDENTITY_INVARIANTS_STATUS':
-                                ts_str = event.get('timestamp_utc', '')
-                                if ts_str:
-                                    try:
-                                        from datetime import datetime, timezone
-                                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                                        if ts.tzinfo is None:
-                                            ts = ts.replace(tzinfo=timezone.utc)
-                                        if latest_timestamp is None or ts > latest_timestamp:
-                                            latest_identity_event = event
-                                            latest_timestamp = ts
-                                    except:
-                                        pass
-                        except:
-                            continue
-                
+                for event in startup_snapshot:
+                    if event.get("event_type") != "IDENTITY_INVARIANTS_STATUS":
+                        continue
+                    ts_str = event.get("timestamp_utc", "")
+                    if not ts_str:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        if latest_timestamp is None or ts > latest_timestamp:
+                            latest_identity_event = event
+                            latest_timestamp = ts
+                    except Exception:
+                        pass
                 if latest_identity_event:
                     self._event_processor.process_event(latest_identity_event)
-                    logger.info(f"Initialized identity status from recent event at {latest_timestamp.isoformat()[:19] if latest_timestamp else 'unknown'}")
+                    logger.info(f"Initialized identity status from snapshot at {latest_timestamp.isoformat()[:19] if latest_timestamp else 'unknown'}")
                 else:
                     logger.info("No identity events found for initialization")
         except Exception as e:
@@ -391,159 +521,145 @@ class WatchdogAggregator:
             logger.warning(f"Error in periodic cleanup: {e}", exc_info=True)
     
     def _process_feed_events_sync(self):
-        """Process new events from frontend_feed.jsonl (synchronous, runs in thread pool)."""
+        """
+        Process new events from frontend_feed.jsonl (synchronous, runs in thread pool).
+        INGESTION INVARIANT: Exactly ONE tail read per cycle.
+        """
+        cycle_start = time.perf_counter()
+        cycle_start_utc = datetime.now(timezone.utc)
+        cursor_events: List[Dict] = []
         try:
-            # Load cursor to know where we left off
             cursor = self._cursor_manager.load_cursor()
-            
-            # Check if state manager is empty - if so, rebuild state from most recent events
-            # This handles the case where streams were cleared but events were already processed
+
+            # --- SINGLE TAIL READ PER CYCLE ---
+            lines, tail_read_bytes, tail_read_duration_ms = _read_last_lines_with_metrics(
+                FRONTEND_FEED_FILE, TAIL_LINE_COUNT
+            )
+
+            # Parse lines into events (single pass)
+            parsed_events: List[Dict] = []
+            parse_errors = 0
+            newest_event_ts: Optional[datetime] = None
+            for line_str in lines:
+                line = line_str.strip() if isinstance(line_str, str) else str(line_str)
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    parsed_events.append(ev)
+                    ts_str = ev.get("timestamp_utc") or ev.get("ts_utc")
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            if ts.tzinfo is None:
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            if newest_event_ts is None or ts > newest_event_ts:
+                                newest_event_ts = ts
+                        except Exception:
+                            pass
+                except json.JSONDecodeError:
+                    parse_errors += 1
+
+            # Rebuilds from snapshot (no second read)
             if len(self._state_manager._stream_states) == 0:
-                logger.info("State manager is empty - rebuilding stream states from most recent events")
-                self._rebuild_stream_states_from_recent_events()
+                logger.info("State manager is empty - rebuilding stream states from snapshot")
+                self._rebuild_stream_states_from_snapshot(parsed_events)
             
             # Check if connection status needs initialization - rebuild from recent events
             # This handles initialization or state loss scenarios
             # Note: connection_status defaults to "Connected" but may be Unknown if state_manager was reset
             # We rebuild if status is Unknown OR if we've never seen a connection event
-            if (self._state_manager._connection_status == "Unknown" or 
-                self._state_manager._last_connection_event_utc is None):
-                logger.info(
-                    f"Connection status needs initialization "
-                    f"(status={self._state_manager._connection_status}, "
-                    f"last_event={self._state_manager._last_connection_event_utc}) - "
-                    f"rebuilding from recent events"
-                )
-                self._rebuild_connection_status_from_recent_events()
+            if (
+                self._state_manager._connection_status == "Unknown"
+                or self._state_manager._last_connection_event_utc is None
+            ):
+                logger.info("Connection status needs initialization - rebuilding from snapshot")
+                self._rebuild_connection_status_from_snapshot(parsed_events)
             
-            # CRITICAL: Always check for the most recent ENGINE_TICK_CALLSITE event from the end of file
-            # This ensures we catch ticks even if cursor is ahead or events are out of order
-            # We only need the most recent one to update liveness timestamp
-            try:
-                recent_ticks = self._read_recent_ticks_from_end(max_events=1)
-                if recent_ticks:
-                    # Process the most recent tick to update liveness immediately
-                    most_recent_tick = recent_ticks[-1]  # Get the newest one
-                    tick_timestamp_str = most_recent_tick.get("timestamp_utc")
-                    if tick_timestamp_str:
-                        try:
-                            from datetime import datetime, timezone
-                            tick_timestamp = datetime.fromisoformat(tick_timestamp_str.replace('Z', '+00:00'))
-                            if tick_timestamp.tzinfo is None:
-                                tick_timestamp = tick_timestamp.replace(tzinfo=timezone.utc)
-                            
-                            # Check if this is newer than what we already have
+            # Extract ticks from snapshot (no second read)
+            ticks = [e for e in reversed(parsed_events) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE")]
+            if ticks:
+                most_recent_tick = ticks[0]
+                tick_ts_str = most_recent_tick.get("timestamp_utc")
+                if tick_ts_str:
+                    try:
+                        tick_ts = datetime.fromisoformat(tick_ts_str.replace("Z", "+00:00"))
+                        if tick_ts.tzinfo is None:
+                            tick_ts = tick_ts.replace(tzinfo=timezone.utc)
+                        tick_age_sec = (cycle_start_utc - tick_ts).total_seconds()
+                        if tick_age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
                             current_tick_utc = self._state_manager._last_engine_tick_utc
-                            if not current_tick_utc or tick_timestamp > current_tick_utc:
-                                # Process it to update state manager
+                            if not current_tick_utc or tick_ts > current_tick_utc:
                                 self._event_processor.process_event(most_recent_tick)
-                                logger.info(
-                                    f"✅ Updated liveness from end-of-file: tick_timestamp={tick_timestamp.isoformat()}, "
-                                    f"previous_tick={current_tick_utc.isoformat() if current_tick_utc else 'None'}, "
-                                    f"tick_age={(datetime.now(timezone.utc) - tick_timestamp).total_seconds():.1f}s"
-                                )
-                            else:
-                                logger.debug(
-                                    f"End-of-file tick not newer: tick={tick_timestamp.isoformat()}, "
-                                    f"current={current_tick_utc.isoformat() if current_tick_utc else 'None'}"
-                                )
-                        except Exception as e:
-                            logger.warning(f"Failed to parse tick timestamp for end-of-file check: {e}", exc_info=True)
-                else:
-                    # No ticks found - this is a problem if engine should be running
-                    current_tick_utc = self._state_manager._last_engine_tick_utc
-                    if current_tick_utc:
-                        tick_age = (datetime.now(timezone.utc) - current_tick_utc).total_seconds()
-                        from .config import ENGINE_TICK_STALL_THRESHOLD_SECONDS
-                        logger.warning(
-                            f"⚠️ No ENGINE_TICK_CALLSITE events found in feed file. "
-                            f"Current tick age: {tick_age:.1f}s, threshold: {ENGINE_TICK_STALL_THRESHOLD_SECONDS}s"
-                        )
-                    else:
-                        # No ticks ever received - log this as a warning
-                        logger.warning(
-                            f"⚠️ No ENGINE_TICK_CALLSITE events found in feed file and no previous ticks. "
-                            f"This may indicate events aren't being processed or feed file is empty."
-                        )
-            except Exception as e:
-                logger.error(f"Error reading ticks from end of file: {e}", exc_info=True)
-            
-            # CRITICAL: Also check for recent bar events from the end of file
-            # This ensures bar tracking stays current even if cursor is ahead
-            try:
-                recent_bars = self._read_recent_bar_events_from_end(max_events=10)
-                if recent_bars:
-                    from datetime import datetime, timezone
-                    now = datetime.now(timezone.utc)
-                    bars_processed = 0
-                    for bar_event in recent_bars:
-                        try:
-                            # Process bar event to update bar tracking
-                            self._event_processor.process_event(bar_event)
-                            bars_processed += 1
-                        except Exception as e:
-                            logger.warning(f"Failed to process bar event from end-of-file: {e}", exc_info=True)
-                    
-                    if bars_processed > 0:
-                        logger.info(f"✅ Processed {bars_processed} recent bar event(s) from end-of-file for bar tracking")
-                    else:
-                        logger.warning(f"⚠️ Found {len(recent_bars)} bar events but failed to process them")
-                else:
-                    # Check if we have any bars tracked at all
-                    if not self._state_manager._last_bar_utc_by_execution_instrument:
-                        logger.debug("No bar events found in feed and no bars tracked yet")
-            except Exception as e:
-                logger.error(f"Error reading bar events from end of file: {e}", exc_info=True)
-            
-            # Normal incremental processing - read new events since cursor
-            # CRITICAL: This now reads from end of file (last 5000 lines) to catch all recent events
-            # including new run_ids that aren't in cursor yet
-            events = self._read_feed_events_since(cursor)
-            
-            # Process each event
-            tick_events_count = 0
-            latest_tick_timestamp = None
-            for event in events:
-                event_type = event.get("event_type", "")
-                if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
-                    tick_events_count += 1
-                    timestamp_utc = event.get("timestamp_utc")
-                    if timestamp_utc:
-                        latest_tick_timestamp = timestamp_utc
-                self._event_processor.process_event(event)
-                # Add important events to ring buffer for WebSocket streaming
-                self._add_to_ring_buffer_if_important(event)
-            
-            # Diagnostic: Log when tick/heartbeat events are read from feed
-            if tick_events_count > 0:
-                logger.info(
-                    f"Processed {tick_events_count} tick/heartbeat event(s) from feed. "
-                    f"Latest tick timestamp: {latest_tick_timestamp}"
-                )
-            elif len(events) > 0:
-                # No tick events in this batch - log what we did get
-                event_types = [e.get("event_type", "UNKNOWN") for e in events[:5]]
-                logger.debug(f"Processed {len(events)} events (no tick/heartbeat): {event_types}")
-            
-            # Update cursor for all run_ids that had events
-            if events:
-                # Group events by run_id and update cursor for each
-                run_ids_seen = {}
-                for event in events:
-                    run_id = event.get("run_id")
-                    event_seq = event.get("event_seq", 0)
-                    if run_id:
-                        # Keep the highest seq for each run_id
-                        if run_id not in run_ids_seen or event_seq > run_ids_seen[run_id]:
-                            run_ids_seen[run_id] = event_seq
-                
-                # Update cursor for all run_ids
-                for run_id, last_seq in run_ids_seen.items():
-                    cursor[run_id] = last_seq
-                
-                if run_ids_seen:
+                                logger.info(f"✅ Updated liveness from snapshot: tick_age={tick_age_sec:.1f}s")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse tick timestamp: {e}")
+
+            # Extract bars from snapshot
+            bar_types = ("BAR_RECEIVED_NO_STREAMS", "BAR_ACCEPTED", "ONBARUPDATE_CALLED")
+            bars = [e for e in reversed(parsed_events) if e.get("event_type") in bar_types][:10]
+            for bar_ev in bars:
+                try:
+                    self._event_processor.process_event(bar_ev)
+                except Exception as e:
+                    logger.warning(f"Failed to process bar event: {e}")
+
+            # Degradation mode: skip full event processing if loop too slow
+            degraded = self._ingestion_telemetry.is_degraded()
+            if degraded and not self._ingestion_degraded:
+                self._ingestion_degraded = True
+                self._ingestion_degraded_entered_at = cycle_start_utc
+                logger.warning("WATCHDOG_DEGRADED_MODE_ENTERED: loop_duration exceeded threshold for 10 consecutive cycles")
+            elif not degraded and self._ingestion_degraded:
+                self._ingestion_degraded = False
+                logger.info("WATCHDOG_DEGRADED_MODE_EXITED: loop duration recovered")
+                self._ingestion_telemetry.reset_degraded_count()
+
+            cursor_events: List[Dict] = []
+            if not degraded:
+                is_bar = lambda e: e.get("event_type") in bar_types
+                is_tick = lambda e: e.get("event_type") == "ENGINE_TICK_CALLSITE"
+                for ev in parsed_events:
+                    run_id = ev.get("run_id")
+                    event_seq = ev.get("event_seq", 0)
+                    if not run_id:
+                        continue
+                    last_seq = cursor.get(run_id, 0)
+                    if is_bar(ev) or is_tick(ev) or event_seq > last_seq:
+                        cursor_events.append(ev)
+                cursor_events.sort(key=lambda e: e.get("timestamp_utc", ""))
+
+                for ev in cursor_events:
+                    self._event_processor.process_event(ev)
+                    self._add_to_ring_buffer_if_important(ev)
+
+                if cursor_events:
+                    run_ids_seen = {}
+                    for ev in cursor_events:
+                        rid, seq = ev.get("run_id"), ev.get("event_seq", 0)
+                        if rid and (rid not in run_ids_seen or seq > run_ids_seen[rid]):
+                            run_ids_seen[rid] = seq
+                    for rid, seq in run_ids_seen.items():
+                        cursor[rid] = seq
                     self._cursor_manager.save_cursor(cursor)
-                    logger.debug(f"Updated cursor for {len(run_ids_seen)} run_id(s): {list(run_ids_seen.keys())[:3]}...")
+
+            loop_duration_ms = (time.perf_counter() - cycle_start) * 1000
+            ingestion_lag_seconds = (cycle_start_utc - newest_event_ts).total_seconds() if newest_event_ts else None
+
+            self._ingestion_telemetry.record_cycle(
+                tail_read_bytes=tail_read_bytes,
+                tail_read_duration_ms=tail_read_duration_ms,
+                lines_parsed=len(parsed_events),
+                events_processed=len(bars) + (0 if degraded else len(cursor_events)),
+                parse_errors=parse_errors,
+                newest_event_ts=newest_event_ts,
+                loop_duration_ms=loop_duration_ms,
+            )
+
+            now_utc = datetime.now(timezone.utc)
+            if self._ingestion_telemetry.should_emit_stats(now_utc):
+                stats = self._ingestion_telemetry.emit_stats(now_utc, ingestion_lag_seconds)
+                logger.info(f"WATCHDOG_INGESTION_STATS: {stats}")
         
         except Exception as e:
             logger.error(f"Error processing feed events: {e}", exc_info=True)
@@ -824,52 +940,116 @@ class WatchdogAggregator:
                     f"last_event_utc={self._state_manager._last_connection_event_utc.isoformat() if self._state_manager._last_connection_event_utc else None}"
                 )
             else:
-                logger.info("No connection events found in recent feed - connection status remains Unknown")
-                # Default to Connected if no connection events found (assume connected state)
-                # This is safer than Unknown for monitoring purposes
-                if self._state_manager._connection_status == "Unknown":
-                    self._state_manager._connection_status = "Connected"
-                    logger.info("Set connection status to Connected (default - no connection events found)")
+                logger.info("No connection events found in recent feed - keeping connection status Unknown")
+                # Do NOT default to Connected - we have no evidence of connection.
+                # Unknown is correct when no connection events have ever been received.
         
         except Exception as e:
             logger.error(f"Error rebuilding connection status from recent events: {e}", exc_info=True)
+
+    def _rebuild_stream_states_from_snapshot(self, parsed_events: List[Dict]) -> None:
+        """Rebuild stream states from in-memory snapshot (no file read).
+        
+        Processes STREAM_STATE_TRANSITION for state, and RANGE_LOCKED / RANGE_LOCK_SNAPSHOT /
+        RANGE_LOCKED_RESTORED_* for full metadata (range, session, instrument, slot).
+        Events are processed in timestamp order so metadata from restore events is applied.
+        """
+        rebuild_types = {
+            "STREAM_STATE_TRANSITION",
+            "RANGE_LOCKED",
+            "RANGE_LOCK_SNAPSHOT",
+            "RANGE_LOCKED_RESTORED_FROM_HYDRATION",
+            "RANGE_LOCKED_RESTORED_FROM_RANGES",
+        }
+        to_process: List[Tuple[Dict, datetime]] = []
+        for event in parsed_events:
+            event_type = event.get("event_type")
+            if event_type not in rebuild_types:
+                continue
+            timestamp_str = event.get("timestamp_utc")
+            if not timestamp_str:
+                continue
+            trading_date = event.get("trading_date") or (event.get("data") or {}).get("trading_date")
+            stream = event.get("stream") or (event.get("data") or {}).get("stream_id")
+            if not trading_date or not stream:
+                continue
+            try:
+                ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            to_process.append((event, ts))
+        to_process.sort(key=lambda x: x[1])
+        for ev, _ in to_process:
+            self._event_processor.process_event(ev)
+        if to_process:
+            logger.info(f"Rebuilt stream states from snapshot ({len(to_process)} events processed)")
+
+    def _rebuild_connection_status_from_snapshot(self, parsed_events: List[Dict]) -> None:
+        """Rebuild connection status from in-memory snapshot (no file read)."""
+        conn_types = ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED",
+                     "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION")
+        latest_ev = None
+        latest_ts = None
+        for event in parsed_events:
+            if event.get("event_type") not in conn_types:
+                continue
+            ts_str = event.get("timestamp_utc")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if latest_ts is None or ts > latest_ts:
+                latest_ev = event
+                latest_ts = ts
+        if latest_ev:
+            self._event_processor.process_event(latest_ev)
+            logger.info(f"Rebuilt connection status from snapshot: {latest_ev.get('event_type')}")
     
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
         """
         Get most recent events for Live Events feed.
         
-        CRITICAL: Return the most recent 200 events by timestamp, NO run_id filter.
-        Filtering by run_id caused 15+ min stale display - multiple runs interleave,
-        and we'd sometimes pick a run with sparse/old events in the tail.
-        Frontend dedupes by run_id:event_seq, so we can return mixed runs safely.
-        
-        Size optimization: Read only last 1000 lines (~700KB) instead of 5000 (~3.4MB)
-        on a 50MB+ file - reduces I/O and parse time for faster response.
+        INGESTION: Cached for EVENTS_CACHE_TTL_SECONDS. Multiple clients within TTL
+        share one disk read to avoid linear I/O scaling.
         """
-        import json
-        
+        now = datetime.now(timezone.utc)
+        if self._events_cache:
+            cached_events, cached_at = self._events_cache
+            age = (now - cached_at).total_seconds()
+            if age < EVENTS_CACHE_TTL_SECONDS:
+                all_events = cached_events
+            else:
+                all_events = self._read_events_tail(1000)
+                self._events_cache = (all_events, now)
+        else:
+            all_events = self._read_events_tail(1000)
+            self._events_cache = (all_events, now)
+
+        all_events.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
+        return all_events[-200:] if len(all_events) > 200 else all_events
+
+    def _read_events_tail(self, n: int) -> List[Dict]:
+        """Read last N lines from feed and parse to events. No cache."""
         events = []
         if not FRONTEND_FEED_FILE.exists():
             return events
-        
         try:
-            # Read last 1000 lines only - enough for 200 events, much faster on large files
-            lines = _read_last_lines(FRONTEND_FEED_FILE, 1000)
-            all_events = []
+            lines = _read_last_lines(FRONTEND_FEED_FILE, n)
             for line_str in lines:
                 if not line_str.strip():
                     continue
                 try:
-                    event = json.loads(line_str)
-                    all_events.append(event)
+                    events.append(json.loads(line_str))
                 except json.JSONDecodeError:
                     continue
-            # Sort by timestamp - most recent last
-            all_events.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
-            # Take the most recent 200 (matches frontend MAX_EVENTS)
-            events = all_events[-200:] if len(all_events) > 200 else all_events
         except Exception as e:
-            logger.error(f"Error reading feed file: {e}", exc_info=True)
+            logger.error(f"Error reading feed file for events: {e}", exc_info=True)
         return events
     
     def get_watchdog_status(self) -> Dict:

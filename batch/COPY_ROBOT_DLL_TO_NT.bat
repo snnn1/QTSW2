@@ -1,18 +1,17 @@
 @echo off
 REM Copy Robot.Core.dll to NinjaTrader Custom folder
-REM This ensures NinjaTrader uses the latest DLL
+REM ALWAYS uses OneDrive\Documents\NinjaTrader 8 (NinjaTrader loads from MyDocuments = OneDrive)
+REM Close NinjaTrader before running if DLL is locked
 
 cd /d "%~dp0\.."
 
 set "SOURCE=RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.dll"
-set "DEST1=%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll"
-set "DEST2=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll"
+set "DEST=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll"
 set "PDB_SOURCE=RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.pdb"
-set "PDB_DEST1=%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\Robot.Core.pdb"
-set "PDB_DEST2=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\Robot.Core.pdb"
+set "PDB_DEST=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\Robot.Core.pdb"
 
 echo ============================================================
-echo   Copying Robot.Core.dll to NinjaTrader
+echo   Copying Robot.Core.dll to NinjaTrader (OneDrive)
 echo ============================================================
 echo.
 
@@ -24,32 +23,19 @@ if not exist "%SOURCE%" (
 )
 
 echo Source: %SOURCE%
+echo Target: %DEST%
 echo.
 
-REM Copy to regular Documents folder
-if exist "%DEST1%" (
-    echo Copying to: %DEST1%
-    copy /Y "%SOURCE%" "%DEST1%"
-    if exist "%PDB_SOURCE%" (
-        copy /Y "%PDB_SOURCE%" "%PDB_DEST1%"
+if exist "%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\" (
+    copy /Y "%SOURCE%" "%DEST%"
+    if errorlevel 1 (
+        echo [ERROR] Copy failed - close NinjaTrader and try again.
+    ) else (
+        echo [OK] Copied to OneDrive folder.
+        if exist "%PDB_SOURCE%" copy /Y "%PDB_SOURCE%" "%PDB_DEST%" >nul
     )
-    echo [OK] Copied to Documents folder
 ) else (
-    echo [SKIP] Documents folder not found: %DEST1%
-)
-
-echo.
-
-REM Copy to OneDrive folder
-if exist "%DEST2%" (
-    echo Copying to: %DEST2%
-    copy /Y "%SOURCE%" "%DEST2%"
-    if exist "%PDB_SOURCE%" (
-        copy /Y "%PDB_SOURCE%" "%PDB_DEST2%"
-    )
-    echo [OK] Copied to OneDrive folder
-) else (
-    echo [SKIP] OneDrive folder not found: %DEST2%
+    echo [ERROR] OneDrive NinjaTrader folder not found.
 )
 
 echo.

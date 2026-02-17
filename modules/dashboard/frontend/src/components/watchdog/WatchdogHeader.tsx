@@ -83,7 +83,7 @@ export function WatchdogHeader({
   
   // Get broker connection status badge
   const getBrokerStatusBadge = () => {
-    if (connectionStatus === null) {
+    if (connectionStatus === null || connectionStatus === 'Unknown') {
       return <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">BROKER UNKNOWN</span>
     }
     if (connectionStatus === 'Connected') {

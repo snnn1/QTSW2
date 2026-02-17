@@ -404,8 +404,9 @@ class EventFeedGenerator:
         return sorted(log_files)
     
     def _rotate_feed_file_if_needed(self):
-        """Rotate frontend_feed.jsonl if it exceeds size limit."""
-        MAX_FILE_SIZE_MB = 100  # Rotate at 100 MB
+        """Rotate frontend_feed.jsonl if it exceeds size limit.
+        WATCHDOG_INGESTION_HARDENING: 80MB threshold (was 100MB) for better tail scan variance."""
+        MAX_FILE_SIZE_MB = 80  # Rotate at 80 MB (was 100)
         MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
         
         if not FRONTEND_FEED_FILE.exists():

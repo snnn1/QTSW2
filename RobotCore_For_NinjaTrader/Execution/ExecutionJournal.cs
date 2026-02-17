@@ -1400,6 +1400,45 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Get count of open journal entries for an instrument. Matches execution instrument and optionally canonical.
+    /// </summary>
+    public int GetOpenJournalCountForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var count = 0;
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (string.Equals(key, executionInstrument, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                count += kvp.Value.Count;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Get sum of EntryFilledQuantityTotal for open journal entries matching an instrument. For quantity reconciliation.
+    /// </summary>
+    public int GetOpenJournalQuantitySumForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var sum = 0;
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (string.Equals(key, executionInstrument, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+            {
+                foreach (var (_, _, _, entry) in kvp.Value)
+                    sum += entry.EntryFilledQuantityTotal;
+            }
+        }
+        return sum;
+    }
+
+    /// <summary>
     /// Record trade completion via reconciliation (broker flat, no exit fill received).
     /// Sets TradeCompleted, CompletionReason=RECONCILIATION_BROKER_FLAT.
     /// Exit price and P&L left null so reporting layer can treat reconciled trades specially.

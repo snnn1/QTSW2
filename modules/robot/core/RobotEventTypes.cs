@@ -339,6 +339,8 @@ public static class RobotEventTypes
         ["PROTECTIVE_STOP_DRYRUN"] = "DEBUG",
         ["TARGET_ORDER_DRYRUN"] = "DEBUG",
         ["BE_MODIFY_DRYRUN"] = "DEBUG",
+        ["BE_PATH_ACTIVE"] = "INFO",
+        ["ONMARKETDATA_LAST_DIAG"] = "INFO",
         
         // Tick/stream state
         ["UPDATE_APPLIED"] = "DEBUG",
@@ -501,7 +503,7 @@ public static class RobotEventTypes
         
         // DRYRUN events
         "ENTRY_ORDER_DRYRUN", "STOP_ENTRY_ORDER_DRYRUN", "PROTECTIVE_STOP_DRYRUN",
-        "TARGET_ORDER_DRYRUN", "BE_MODIFY_DRYRUN",
+        "TARGET_ORDER_DRYRUN", "BE_MODIFY_DRYRUN", "BE_PATH_ACTIVE", "ONMARKETDATA_LAST_DIAG",
         
         // Tick/stream state
         "UPDATE_APPLIED",

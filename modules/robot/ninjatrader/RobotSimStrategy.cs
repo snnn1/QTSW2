@@ -100,6 +100,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // causing hundreds of account.Orders iterations + NT Change() per second. Cap to one attempt per 200ms per intent.
         private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new Dictionary<string, DateTimeOffset>();
         private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
+        private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private const int BE_MODIFY_MAX_RETRIES = 25;
         
         // BE path diagnostic: once per minute when in position — confirms BE check runs, shows active_intent_count.
         private readonly Dictionary<string, DateTimeOffset> _lastBePathActiveLogUtc = new Dictionary<string, DateTimeOffset>();
@@ -111,8 +113,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Phase 3.3: Latch last price every tick; run BE scan on cadence only (reduces work per tick).
         private decimal _lastTickPriceForBE = 0;
         private DateTimeOffset _lastBeCheckUtc = DateTimeOffset.MinValue;
-        private DateTimeOffset _lastBip1WorkUtc = DateTimeOffset.MinValue;
         private const double BE_SCAN_THROTTLE_MS = 200; // Run intent scan at most ~5/sec; latch updated every tick.
+        
+        // BE audit: concrete definition of "evaluation occurred" — drives BE_GATE_BLOCKED and BE_INACTIVE_WHILE_EXPOSED
+        private DateTimeOffset _lastBeEvaluationUtc = DateTimeOffset.MinValue; // Updated only when scan actually runs (after throttles, after obtaining intents)
+        private DateTimeOffset _lastTickUpdateUtcForBE = DateTimeOffset.MinValue; // When we last latched tick price (for stale tick detection)
+        private readonly Dictionary<string, DateTimeOffset> _lastBeGateBlockedUtcByReason = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+        private const int BE_GATE_BLOCKED_RATE_LIMIT_SECONDS = 60;
+        private const int BE_GATE_BLOCKED_NOISY_RATE_LIMIT_SECONDS = 300; // WRONG_MARKETDATA_TYPE, THROTTLED_SCAN — proof only, not every tick
+        private const int BE_INACTIVE_WHILE_EXPOSED_THRESHOLD_SECONDS = 12;
+        private const int BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT_RATE_LIMIT_SECONDS = 300; // 5 minutes
+        private const double BE_TICK_STALE_WARNING_SECONDS = 5;
+        private const double BE_TICK_STALE_FAIL_CLOSED_SECONDS = 12;
         
         // Lightweight heartbeat: BIP 0 only, every N bars. Decoupled from trade state; no secondary series.
         private const int HEARTBEAT_BARS_INTERVAL = 1; // Every bar = ~1 min on 1-min chart; 30–60s is fine for liveness.
@@ -204,7 +216,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Configure)
             {
                 TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
-                AddDataSeries(BarsPeriodType.Second, 1);
+                // BE detection moved to OnMarketData (tick-level) — no secondary series needed
                 TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
@@ -664,17 +676,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 if (_engine != null)
                 {
-                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "REALTIME_STATE_REACHED", new Dictionary<string, object>
+                    var utcNow = DateTimeOffset.UtcNow;
+                    _engine.LogEngineBuildSignatureIfNeeded(utcNow, instrumentName);
+                    _engine.LogEngineEvent(utcNow, "REALTIME_STATE_REACHED", new Dictionary<string, object>
                     {
                         { "instrument", instrumentName },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
                         { "bars_array_length", BarsArray?.Length ?? 0 },
-                        { "has_secondary_series", BarsArray != null && BarsArray.Length >= 2 },
-                        { "be_detection_path", BarsArray != null && BarsArray.Length >= 2 ? "1-second series (BIP 1)" : "fallback (primary bar)" },
-                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. has_secondary_series=true enables BE detection via 1-second bars." }
+                        { "be_detection_path", "OnMarketData (tick-level)" },
+                        { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. BE detection via OnMarketData(Last)." }
                     });
-                    _engine.LogStreamStateSnapshot(DateTimeOffset.UtcNow);
+                    _engine.LogStreamStateSnapshot(utcNow);
 
                     // Pre-warm execution journal cache so BE monitoring never hits disk on first lookup
                     _engine.WarmExecutionJournalCacheForTradingDate(_engine.GetTradingDate());
@@ -1307,74 +1320,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (CurrentBars[BarsInProgress] < 1) return;
 
-            // Secondary series (BIP 1): BE + heartbeat only. DISABLED when AddDataSeries(Second,1) is commented out.
-            // LAG FIX: Only run when in a position — skip entirely when flat to avoid chart lag.
-            // Throttle to 1s when in position (was 5s; reduced for faster BE detection).
-            if (BarsInProgress == 1)
-            {
-                if (State != State.Realtime)
-                    return;
-                if (Position.MarketPosition == MarketPosition.Flat)
-                    return; // No trade — skip BE + heartbeat entirely
-                var now = DateTimeOffset.UtcNow;
-                if ((now - _lastBip1WorkUtc).TotalSeconds < 1.0 && _lastBip1WorkUtc != DateTimeOffset.MinValue)
-                    return;
-                _lastBip1WorkUtc = now;
-                // BE path diagnostic: once per minute — confirms BE check runs when in position
-                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-                if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
-                {
-                    _lastBePathActiveLogUtc[instrumentName] = now;
-                    var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
-                    _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
-                    {
-                        { "instrument", instrumentName },
-                        { "bars_in_progress", 1 },
-                        { "has_secondary_series", BarsArray.Length >= 2 },
-                        { "in_position", true },
-                        { "active_intent_count", activeCount },
-                        { "note", "BE check path active (1-second series). active_intent_count>0 means intents await BE trigger." }
-                    });
-                }
-                RunBreakEvenCheck();
-                return;
-            }
-
-            // Primary series (BIP 0) only below — Times[0][0], Open[0], _engine.Tick(), hydration, etc.
-            // FALLBACK 1: When secondary series disabled, run BE from BIP 0 (uses primary bar close, throttled 1s)
-            // FALLBACK 2: When secondary enabled BUT 1-second bars not firing (e.g. MCL/M2K data feed), run BE from BIP 0
-            // FALLBACK 3: When BIP 1 has NEVER fired (_lastBip1WorkUtc == MinValue), run BE from BIP 0 (fix for instruments with no 1s bars)
-            var inPositionRealtime = State == State.Realtime && Position.MarketPosition != MarketPosition.Flat;
-            var bip1StaleSeconds = 10.0; // If no BIP 1 in 10s, 1-second series likely not updating
-            var runBeFromBip0 = inPositionRealtime && (
-                BarsArray.Length < 2 ||
-                _lastBip1WorkUtc == DateTimeOffset.MinValue || // BIP 1 never fired — use primary bar (fix for MCL/M2K/MNG etc.)
-                (_lastBip1WorkUtc != DateTimeOffset.MinValue && (DateTimeOffset.UtcNow - _lastBip1WorkUtc).TotalSeconds >= bip1StaleSeconds));
-            if (runBeFromBip0)
-            {
-                var now = DateTimeOffset.UtcNow;
-                if (_lastBip1WorkUtc == DateTimeOffset.MinValue || (now - _lastBip1WorkUtc).TotalSeconds >= 1.0)
-                {
-                    _lastBip1WorkUtc = now;
-                    var instrumentNameFallback = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-                    var hasSecondary = BarsArray != null && BarsArray.Length >= 2;
-                    if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentNameFallback, out var lastPathLogF) || (now - lastPathLogF).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
-                    {
-                        _lastBePathActiveLogUtc[instrumentNameFallback] = now;
-                        var activeCountF = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(GetExecutionInstrumentForBE()).Count : -1;
-                        _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
-                        {
-                            { "instrument", instrumentNameFallback },
-                            { "bars_in_progress", 0 },
-                            { "has_secondary_series", hasSecondary },
-                            { "in_position", true },
-                            { "active_intent_count", activeCountF },
-                            { "note", hasSecondary ? "BE check (fallback: BIP 1 stale, using primary bar). 1-second series may not be updating." : "BE check path active (fallback: primary bar close)." }
-                        });
-                    }
-                    RunBreakEvenCheck();
-                }
-            }
+            // BE detection moved to OnMarketData (tick-level) — no bar-based path
             var barProfileSw = Stopwatch.StartNew();
             long barProfileLastMs = 0L;
             var skipHistoricalDiag = skipHistoricalDiagEarly;
@@ -1619,6 +1565,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ResolveAndSetSessionCloseIfNeeded();
                 UpdateSessionIndices(tickTimeUtc);
+                var tickAgeSec = (nowUtc - _lastTickUpdateUtcForBE).TotalSeconds;
+                if (tickAgeSec > BE_TICK_STALE_WARNING_SECONDS && HasAccountPositionInInstrument() && _engine != null)
+                {
+                    var instName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var key = $"{instName}:BE_TICK_STALE";
+                    if (!_lastBeGateBlockedUtcByReason.TryGetValue(key, out var lastStale) || (nowUtc - lastStale).TotalSeconds >= BE_GATE_BLOCKED_RATE_LIMIT_SECONDS)
+                    {
+                        _lastBeGateBlockedUtcByReason[key] = nowUtc;
+                        _engine.LogEngineEvent(nowUtc, "BE_TICK_STALE_WARNING", new Dictionary<string, object>
+                        {
+                            { "instrument", instName },
+                            { "tick_age_seconds", tickAgeSec },
+                            { "note", "BE tick price may be stale - blind risk control" }
+                        });
+                    }
+                    if (tickAgeSec > BE_TICK_STALE_FAIL_CLOSED_SECONDS && _adapter != null && _cachedActiveIntentsForBE != null && _cachedActiveIntentsForBE.Count > 0)
+                    {
+                        foreach (var (_, intent, _, _, _, _) in _cachedActiveIntentsForBE)
+                        {
+                            _engine.StandDownStream(intent.Stream ?? "", nowUtc, "BE_TICK_STALE_FAIL_CLOSED");
+                            break;
+                        }
+                    }
+                }
             }
 #endif
             _engine.Tick(tickTimeUtc);
@@ -1711,17 +1681,161 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 #endif
         
-        /// <summary>BE evaluation using price series. When secondary 1-second series enabled: Closes[1][0]. When disabled: Closes[0][0] (primary bar).</summary>
-        private void RunBreakEvenCheck()
+        /// <summary>True if account has a position in this strategy's instrument. Uses Account.Positions (not Position) because Position is strategy-specific and can be Flat when account has positions from other sources. Checks both execution instrument and canonical (MasterInstrument.Name).</summary>
+        private bool HasAccountPositionInInstrument()
         {
-            if (Position.MarketPosition == MarketPosition.Flat)
+            var (hasExposure, _, _) = GetExposureState();
+            return hasExposure;
+        }
+
+        /// <summary>Exposure identity for BE_GATE_BLOCKED. Returns (hasExposure, accountPositionCount, mismatchedInstrumentName). hasExposure = position matching execution or canonical. If account has position in other instrument, mismatchedInstrumentName set for INSTRUMENT_MISMATCH logging.</summary>
+        private (bool hasExposure, int accountPositionCount, string? mismatchedInstrumentName) GetExposureState()
+        {
+            if (Account == null || Instrument == null) return (false, 0, null);
+            var positions = Account.Positions;
+            if (positions == null) return (false, 0, null);
+            var count = 0;
+            string? firstOtherInstrument = null;
+            var executionInstrument = GetExecutionInstrumentForBE();
+            var canonicalName = Instrument.MasterInstrument?.Name ?? "";
+            foreach (Position pos in positions)
+            {
+                if (pos?.Instrument?.MasterInstrument == null) continue;
+                if (pos.MarketPosition == MarketPosition.Flat) continue;
+                count++;
+                var posMaster = pos.Instrument.MasterInstrument.Name ?? "";
+                var posExecution = pos.Instrument.FullName?.Split(' ')[0]?.ToUpperInvariant() ?? "";
+                var matchesCanonical = string.Equals(posMaster, canonicalName, StringComparison.OrdinalIgnoreCase);
+                var matchesExecution = string.Equals(posExecution, executionInstrument, StringComparison.OrdinalIgnoreCase);
+                if (matchesCanonical || matchesExecution)
+                    return (true, count, null);
+                if (firstOtherInstrument == null)
+                    firstOtherInstrument = posMaster;
+            }
+            return (false, count, firstOtherInstrument);
+        }
+
+        /// <summary>Emit BE_GATE_BLOCKED when hasExposure and we're exiting early. Rate-limited per reason per instrument. Noisy reasons (WRONG_MARKETDATA_TYPE, THROTTLED_SCAN) use 5-min limit.</summary>
+        private void TryEmitBeGateBlocked(string blockedReason, string instrumentName, int accountPositionCount, string? executionInstrument = null, string? accountPositionInstrument = null)
+        {
+            if (_engine == null) return;
+            var key = $"{instrumentName}:{blockedReason}";
+            var utcNow = DateTimeOffset.UtcNow;
+            var limitSec = (blockedReason == "WRONG_MARKETDATA_TYPE" || blockedReason == "THROTTLED_SCAN") ? BE_GATE_BLOCKED_NOISY_RATE_LIMIT_SECONDS : BE_GATE_BLOCKED_RATE_LIMIT_SECONDS;
+            if (_lastBeGateBlockedUtcByReason.TryGetValue(key, out var last) && (utcNow - last).TotalSeconds < limitSec)
                 return;
+            _lastBeGateBlockedUtcByReason[key] = utcNow;
+            var payload = new Dictionary<string, object>
+            {
+                { "instrument", instrumentName },
+                { "blocking_reason", blockedReason },
+                { "account_position_count", accountPositionCount },
+                { "note", "Account has exposure but BE did not evaluate - invariant: no silent exit with exposure" }
+            };
+            if (!string.IsNullOrEmpty(executionInstrument)) payload["execution_instrument"] = executionInstrument;
+            if (!string.IsNullOrEmpty(accountPositionInstrument)) payload["account_position_instrument"] = accountPositionInstrument;
+            _engine.LogEngineEvent(utcNow, "BE_GATE_BLOCKED", payload);
+        }
+
+        /// <summary>BE evaluation at tick-level. Called from OnMarketData(Last) with actual tick price.</summary>
+        private void RunBreakEvenCheck(decimal tickPrice)
+        {
+            var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var executionInstrument = GetExecutionInstrumentForBE();
+            var (hasExposure, accountPositionCount, _) = GetExposureState();
+
+            if (!hasExposure)
+            {
+                _cachedActiveIntentsForBE = null;
+                _cachedActiveIntentsForBEUtc = DateTimeOffset.MinValue;
+                TryEmitBeGateBlocked("SECOND_POSITION_CHECK_FAILED", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
             if (_adapter == null || !_engineReady) return;
-            // Use primary series when secondary disabled; otherwise 1-second series for faster BE detection
-            var priceBarsIndex = BarsArray.Length >= 2 ? 1 : 0;
-            if (CurrentBars[priceBarsIndex] < 1) return;
-            decimal currentPrice = (decimal)Closes[priceBarsIndex][0];
-            CheckBreakEvenTriggersTickBased(currentPrice, DateTimeOffset.UtcNow);
+            CheckBreakEvenTriggersTickBased(tickPrice, DateTimeOffset.UtcNow);
+        }
+
+        /// <summary>OnMarketData: tick-level BE evaluation. Deterministic trigger semantics; no bar starvation.</summary>
+        protected override void OnMarketData(MarketDataEventArgs e)
+        {
+            var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var executionInstrument = GetExecutionInstrumentForBE();
+            var (hasExposure, accountPositionCount, mismatchedInstrumentName) = GetExposureState();
+
+            if (e.MarketDataType != MarketDataType.Last)
+            {
+                if (hasExposure) TryEmitBeGateBlocked("WRONG_MARKETDATA_TYPE", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
+            _lastTickUpdateUtcForBE = DateTimeOffset.UtcNow;
+
+            if (_initFailed)
+            {
+                if (hasExposure) TryEmitBeGateBlocked("INIT_FAILED", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
+            if (!_engineReady)
+            {
+                if (hasExposure) TryEmitBeGateBlocked("ENGINE_NOT_READY", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
+            if (_engine is null)
+            {
+                if (hasExposure) TryEmitBeGateBlocked("ENGINE_NULL", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
+            if (State != State.Realtime)
+            {
+                if (hasExposure) TryEmitBeGateBlocked("STATE_NOT_REALTIME", instrumentName, accountPositionCount, executionInstrument);
+                return;
+            }
+            if (!hasExposure)
+            {
+                if (accountPositionCount > 0 && !string.IsNullOrEmpty(mismatchedInstrumentName))
+                    TryEmitBeGateBlocked("INSTRUMENT_MISMATCH", instrumentName, accountPositionCount, executionInstrument, mismatchedInstrumentName);
+                return;
+            }
+
+            var tickPrice = (decimal)e.Price;
+            var strategyPosition = Position.MarketPosition.ToString();
+
+            // DIAGNOSTIC: Log when OnMarketData(Last) fires in Realtime — proves callback runs, shows position + tick
+            if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue("_diag", out var diagLast) || (DateTimeOffset.UtcNow - diagLast).TotalSeconds >= 60))
+            {
+                _lastBePathActiveLogUtc["_diag"] = DateTimeOffset.UtcNow;
+                var diagData = new Dictionary<string, object>
+                {
+                    { "instrument", instrumentName },
+                    { "strategy_position", strategyPosition },
+                    { "has_account_position", true },
+                    { "account", Account?.Name ?? "NULL" },
+                    { "tick_price", tickPrice },
+                    { "engine_ready", _engineReady },
+                    { "note", "OnMarketData(Last) fired. has_account_position uses Account.Positions; strategy_position may be Flat when account has positions." }
+                };
+                if (Account != null && Account.Positions != null)
+                    diagData["account_position_count"] = Account.Positions.Count;
+                _engine.LogEngineEvent(DateTimeOffset.UtcNow, "ONMARKETDATA_LAST_DIAG", diagData);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+
+            // BE_PATH_ACTIVE diagnostic: rate-limited to once per minute per instrument
+            if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
+            {
+                _lastBePathActiveLogUtc[instrumentName] = now;
+                var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(executionInstrument).Count : -1;
+                _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
+                {
+                    { "instrument", instrumentName },
+                    { "tick_price", tickPrice },
+                    { "in_position", true },
+                    { "active_intent_count", activeCount },
+                    { "note", "BE check path active (OnMarketData). active_intent_count>0 means intents await BE trigger." }
+                });
+            }
+
+            RunBreakEvenCheck(tickPrice);
         }
 
         /// <summary>Log BAR_PROFILE_SLOW when a section exceeds threshold (chart lag diagnosis). Rate-limited. Only runs when diagnostic_slow_logs=true.</summary>
@@ -1773,14 +1887,36 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void CheckBreakEvenTriggersTickBased(decimal tickPrice, DateTimeOffset utcNow)
         {
-            // HARDENING FIX 3: Fail closed - don't execute if init failed
             if (_initFailed) return;
             if (_adapter == null || !_engineReady) return;
+
+            var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var executionInstrument = GetExecutionInstrumentForBE();
+            var (hasExposure, accountPositionCount, _) = GetExposureState();
 
             // Phase 3.3: Latch price every tick (O(1)); scan runs on cadence only.
             _lastTickPriceForBE = tickPrice;
             if ((utcNow - _lastBeCheckUtc).TotalMilliseconds < BE_SCAN_THROTTLE_MS)
-                return; // Skip scan this tick; latch already updated.
+            {
+                if (hasExposure) TryEmitBeGateBlocked("THROTTLED_SCAN", instrumentName, accountPositionCount, executionInstrument);
+                if (hasExposure && _cachedActiveIntentsForBE != null && _cachedActiveIntentsForBE.Count > 0 &&
+                    (utcNow - _lastBeEvaluationUtc).TotalSeconds > BE_INACTIVE_WHILE_EXPOSED_THRESHOLD_SECONDS && _engine != null)
+                {
+                    var key = $"{instrumentName}:BE_INACTIVE_WHILE_EXPOSED";
+                    if (!_lastBeGateBlockedUtcByReason.TryGetValue(key, out var lastInactive) || (utcNow - lastInactive).TotalSeconds >= BE_GATE_BLOCKED_RATE_LIMIT_SECONDS)
+                    {
+                        _lastBeGateBlockedUtcByReason[key] = utcNow;
+                        _engine.LogEngineEvent(utcNow, "BE_INACTIVE_WHILE_EXPOSED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "seconds_since_last_evaluation", (utcNow - _lastBeEvaluationUtc).TotalSeconds },
+                            { "active_intent_count", _cachedActiveIntentsForBE.Count },
+                            { "note", "Account exposure + intent eligible for BE but no full scan in threshold - timing pathology" }
+                        });
+                    }
+                }
+                return;
+            }
             _lastBeCheckUtc = utcNow;
 
             var beStopwatch = Stopwatch.StartNew();
@@ -1795,21 +1931,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    // CRITICAL: Use execution instrument (e.g. MGC, MES) not MasterInstrument.Name (e.g. GC, ES).
-                    // Intent.ExecutionInstrument is MGC/MES - MasterInstrument.Name for MGC returns GC, which would filter out GC2 intent!
-                    var executionInstrument = GetExecutionInstrumentForBE();
                     activeIntents = _adapter.GetActiveIntentsForBEMonitoring(executionInstrument);
                     _cachedActiveIntentsForBE = activeIntents;
                     _cachedActiveIntentsForBEUtc = utcNow;
                 }
 
-                // Rate-limited heartbeat log (minimal payload)
-                // This single log unlocks debugging: proves BE logic ran, shows intent count, enables diagnosis
-                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                _lastBeEvaluationUtc = utcNow;
+
                 var shouldLogBeEval = !_lastBeEvaluationLogUtc.TryGetValue(instrumentName, out var lastBeLogUtc) ||
                                      (utcNow - lastBeLogUtc).TotalSeconds >= BE_EVALUATION_RATE_LIMIT_SECONDS;
                 
-                // MES/lag fix: minimal payload only; no intent_details (was allocating List + N dicts every second per instrument).
                 if (shouldLogBeEval && _engine != null)
                 {
                     _lastBeEvaluationLogUtc[instrumentName] = utcNow;
@@ -1820,6 +1951,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "active_intent_count", activeIntents.Count },
                         { "note", "BE evaluation ran (rate-limited). active_intent_count=0 means no intents need BE." }
                     });
+                }
+
+                if (activeIntents.Count == 0)
+                {
+                    if (hasExposure) TryEmitBeGateBlocked("NO_ACTIVE_INTENTS", instrumentName, accountPositionCount, executionInstrument);
+                    if (hasExposure && _engine != null)
+                    {
+                        var key = $"{instrumentName}:BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT";
+                        if (!_lastBeGateBlockedUtcByReason.TryGetValue(key, out var lastExp) || (utcNow - lastExp).TotalSeconds >= BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT_RATE_LIMIT_SECONDS)
+                        {
+                            _lastBeGateBlockedUtcByReason[key] = utcNow;
+                            var openByInst = _adapter.GetOpenJournalCountForInstrument(executionInstrument, Instrument?.MasterInstrument?.Name);
+                            _engine.LogEngineEvent(utcNow, "BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT", new Dictionary<string, object>
+                            {
+                                { "instrument", instrumentName },
+                                { "account_position_count", accountPositionCount },
+                                { "journal_open_count", openByInst },
+                                { "note", "Account has exposure but no BE-eligible intents; possible manual trade or missed fill" }
+                            });
+                        }
+                    }
                 }
                 
                 foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
@@ -1947,7 +2099,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (modifyResult.Success)
                     {
                         _beTriggerReachedPendingModification.Remove(intentId);
-                        _lastBeModifyAttemptUtcByIntent.Remove(intentId); // avoid dict growth
+                        _lastBeModifyAttemptUtcByIntent.Remove(intentId);
+                        _beModifyFailureCountByIntent.Remove(intentId);
                         
                         // Log successful BE trigger
                         if (_engine != null)
@@ -1957,6 +2110,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "intent_id", intentId },
                                 { "instrument", intent.Instrument ?? "" },
                                 { "stream", intent.Stream ?? "" },
+                                { "trading_date", intent.TradingDate ?? "" },
+                                { "account", Account?.Name ?? "NULL" },
+                                { "execution_instrument", executionInstrument },
+                                { "canonical_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                                 { "direction", direction },
                                 { "breakout_level", breakoutLevel },
                                 { "actual_fill_price", actualFillPrice },
@@ -1964,7 +2121,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
                                 { "tick_price", _lastTickPriceForBE },
-                                { "detection_method", "BAR_CLOSE" },
+                                { "detection_method", "ON_MARKET_DATA_LAST" },
                                 { "seconds_to_modify", (utcNow - triggerReachedAt).TotalSeconds },
                                 { "note", "Break-even trigger reached (tick-based detection) - stop order modified to break-even using breakout level (1 tick before breakout point)" }
                             });
@@ -1972,18 +2129,50 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     else
                     {
-                        // Log failure with retry awareness
                         var errorMsg = modifyResult.ErrorMessage ?? "";
                         var isRetryableError = (errorMsg.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0) ||
                                               (errorMsg.IndexOf("Stop order", StringComparison.OrdinalIgnoreCase) >= 0);
-                        
-                        if (_engine != null)
+                        var stopMissing = isRetryableError;
+
+                        var failCount = _beModifyFailureCountByIntent.TryGetValue(intentId, out var c) ? c + 1 : 1;
+                        _beModifyFailureCountByIntent[intentId] = failCount;
+
+                        if (failCount >= BE_MODIFY_MAX_RETRIES && _engine != null)
+                        {
+                            var actionTaken = stopMissing ? "FLATTEN" : "STAND_DOWN";
+                            _engine.LogEngineEvent(utcNow, "BE_MODIFY_MAX_RETRIES_EXCEEDED", new Dictionary<string, object>
+                            {
+                                { "intent_id", intentId },
+                                { "instrument", intent.Instrument ?? "" },
+                                { "stream", intent.Stream ?? "" },
+                                { "action_taken", actionTaken },
+                                { "failure_count", failCount },
+                                { "error", errorMsg },
+                                { "note", stopMissing ? "Stop missing - flattening. Never stop retrying without action." : "Protection uncertain - standing down stream." }
+                            });
+                            if (stopMissing && _adapter != null)
+                            {
+                                _adapter.Flatten(intentId, intent.Instrument ?? "", utcNow);
+                            }
+                            else
+                            {
+                                _engine.StandDownStream(intent.Stream ?? "", utcNow, $"BE_MODIFY_MAX_RETRIES:{intentId}");
+                            }
+                            _beModifyFailureCountByIntent.Remove(intentId);
+                            _beTriggerReachedPendingModification.Remove(intentId);
+                            _lastBeModifyAttemptUtcByIntent.Remove(intentId);
+                        }
+                        else if (_engine != null)
                         {
                             _engine.LogEngineEvent(utcNow, isRetryableError ? "BE_TRIGGER_RETRY_NEEDED" : "BE_TRIGGER_FAILED", new Dictionary<string, object>
                             {
                                 { "intent_id", intentId },
                                 { "instrument", intent.Instrument ?? "" },
                                 { "stream", intent.Stream ?? "" },
+                                { "trading_date", intent.TradingDate ?? "" },
+                                { "account", Account?.Name ?? "NULL" },
+                                { "execution_instrument", executionInstrument },
+                                { "canonical_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                                 { "direction", direction },
                                 { "breakout_level", breakoutLevel },
                                 { "actual_fill_price", actualFillPrice },
@@ -1991,7 +2180,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 { "be_stop_price", beStopPrice },
                                 { "tick_size", tickSize },
                                 { "tick_price", _lastTickPriceForBE },
-                                { "detection_method", "BAR_CLOSE" },
+                                { "detection_method", "ON_MARKET_DATA_LAST" },
                                 { "error", modifyResult.ErrorMessage },
                                 { "is_retryable", isRetryableError },
                                 { "seconds_since_trigger_reached", secondsSinceTriggerReached },

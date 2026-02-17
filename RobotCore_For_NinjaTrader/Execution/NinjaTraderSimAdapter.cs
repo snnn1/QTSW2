@@ -1508,6 +1508,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         
         return activeIntents;
     }
+
+    /// <summary>
+    /// Get count of open journal entries for an instrument (for BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT).
+    /// </summary>
+    public int GetOpenJournalCountForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        return _executionJournal.GetOpenJournalCountForInstrument(executionInstrument, canonicalInstrument);
+    }
     
     /// <summary>
     /// Cancel orders for a specific intent only.

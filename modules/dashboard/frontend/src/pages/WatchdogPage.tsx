@@ -90,13 +90,17 @@ export function WatchdogPage() {
     }
   }, [status?.recovery_state, status?.engine_activity_state]) // Only depend on fields that affect result
   
-  // Determine data flow status - uses engine tick (same as engine liveness) when bar-age unavailable
+  // Determine data flow status - prefer backend data_status when available (handles UNKNOWN when no bars ever received)
   const dataFlowStatus = useMemo(() => {
     if (!status) return 'UNKNOWN'
-    
+    // Use backend-computed data_status when available (includes UNKNOWN for broker-off scenario)
+    if (status.data_status) {
+      return status.data_status
+    }
+
     const stalls = Object.values(status.data_stall_detected || {})
     const DATA_STALL_THRESHOLD = 120
-    
+
     const getEngineTickAgeSeconds = (): number | null => {
       const tickStr = status?.last_engine_tick_chicago
       if (!tickStr) return null
@@ -108,7 +112,7 @@ export function WatchdogPage() {
         return null
       }
     }
-    
+
     if (stalls.length === 0) {
       if (status.market_open === false) return 'ACCEPTABLE_SILENCE'
       if (status.worst_last_bar_age_seconds != null && status.worst_last_bar_age_seconds < DATA_STALL_THRESHOLD) return 'FLOWING'
@@ -117,13 +121,13 @@ export function WatchdogPage() {
       if (tickAge !== null && tickAge >= DATA_STALL_THRESHOLD) return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
       return 'UNKNOWN'
     }
-    
+
     const criticalStall = stalls.some(d => d.stall_detected && d.market_open)
     if (criticalStall) return 'STALLED'
     const acceptableSilence = stalls.some(d => d.stall_detected && !d.market_open)
     if (acceptableSilence) return 'ACCEPTABLE_SILENCE'
     return 'FLOWING'
-  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago])
+  }, [status?.data_stall_detected, status?.data_status, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago])
   
   // Build critical alerts
   const alerts = useMemo(() => {

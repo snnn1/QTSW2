@@ -537,10 +537,10 @@ class EventProcessor:
         
         elif event_type == "RANGE_LOCKED":
             # Standardized fields are now always at top level (plan requirement #1)
-            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
-            trading_date = self._state_manager.get_trading_date()
+            # Prefer timetable's trading_date; fallback to event's for startup rebuild
+            trading_date = self._state_manager.get_trading_date() or event.get("trading_date") or data.get("trading_date")
             if not trading_date:
-                logger.debug(f"RANGE_LOCKED skipped: timetable trading_date not set yet")
+                logger.debug(f"RANGE_LOCKED skipped: no trading_date available")
                 return
             stream = event.get("stream")
             instrument = event.get("instrument")
@@ -637,10 +637,10 @@ class EventProcessor:
         elif event_type == "RANGE_LOCK_SNAPSHOT":
             # Handle RANGE_LOCK_SNAPSHOT events as fallback/update source for range data
             # This ensures range data is captured even if RANGE_LOCKED event doesn't have all fields
-            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
-            trading_date = self._state_manager.get_trading_date()
+            # Prefer timetable's trading_date; fallback to event's for startup rebuild
+            trading_date = self._state_manager.get_trading_date() or event.get("trading_date") or data.get("trading_date")
             if not trading_date:
-                logger.debug(f"RANGE_LOCK_SNAPSHOT skipped: timetable trading_date not set yet")
+                logger.debug(f"RANGE_LOCK_SNAPSHOT skipped: no trading_date available")
                 return
             stream = event.get("stream")
             instrument = event.get("instrument")
@@ -717,6 +717,72 @@ class EventProcessor:
                             info.range_low = float(range_low) if range_low is not None else None
                         if freeze_close is not None:
                             info.freeze_close = float(freeze_close) if freeze_close is not None else None
+        
+        elif event_type in ("RANGE_LOCKED_RESTORED_FROM_HYDRATION", "RANGE_LOCKED_RESTORED_FROM_RANGES"):
+            # Robot emits these when restoring RANGE_LOCKED from hydration/ranges log on restart.
+            # Same structure as RANGE_LOCKED: stream, instrument, session, slot_time at top level;
+            # range_high, range_low in data. Process identically to populate metadata for display.
+            trading_date = self._state_manager.get_trading_date() or event.get("trading_date") or data.get("trading_date")
+            if not trading_date:
+                logger.debug(f"{event_type} skipped: no trading_date available")
+                return
+            stream = event.get("stream") or data.get("stream_id")
+            instrument = event.get("instrument")
+            execution_instrument = event.get("execution_instrument")
+            execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
+            canonical_instrument_field = event.get("canonical_instrument")
+            session = event.get("session")
+            slot_time_chicago = event.get("slot_time_chicago") or data.get("slot_time_chicago")
+            slot_time_utc_str = event.get("slot_time_utc") or data.get("slot_time_utc")
+            range_high = data.get("range_high")
+            range_low = data.get("range_low")
+            freeze_close = data.get("freeze_close")
+            state_entry_time_utc_str = data.get("state_entry_time_utc") or event.get("timestamp_utc")
+            
+            if canonical_instrument_field:
+                canonical_instrument = canonical_instrument_field
+                canonical_stream = stream
+                if not execution_instrument:
+                    execution_instrument = instrument if instrument and instrument != canonical_instrument else instrument
+            elif execution_instrument:
+                canonical_instrument = get_canonical_instrument(execution_instrument)
+                canonical_stream = canonicalize_stream(stream, execution_instrument) if stream else stream
+            elif instrument:
+                canonical_instrument = get_canonical_instrument(instrument)
+                canonical_stream = canonicalize_stream(stream, instrument) if stream else stream
+                execution_instrument = instrument
+            else:
+                canonical_instrument = instrument or ""
+                canonical_stream = stream or ""
+                execution_instrument = instrument or ""
+            
+            if canonical_stream:
+                state_entry_time_utc = self._parse_timestamp(state_entry_time_utc_str) if state_entry_time_utc_str else timestamp_utc
+                self._state_manager.update_stream_state(
+                    trading_date, canonical_stream, "RANGE_LOCKED",
+                    state_entry_time_utc=state_entry_time_utc,
+                    execution_instrument=execution_instrument_full_name
+                )
+                key = (trading_date, canonical_stream)
+                if key in self._state_manager._stream_states:
+                    info = self._state_manager._stream_states[key]
+                    if canonical_instrument:
+                        info.instrument = canonical_instrument
+                    if execution_instrument_full_name:
+                        info.execution_instrument = execution_instrument_full_name
+                    if session:
+                        info.session = session
+                    if slot_time_chicago:
+                        info.slot_time_chicago = slot_time_chicago
+                    if slot_time_utc_str:
+                        info.slot_time_utc = slot_time_utc_str
+                    if range_high is not None:
+                        info.range_high = float(range_high)
+                    if range_low is not None:
+                        info.range_low = float(range_low)
+                    if freeze_close is not None:
+                        info.freeze_close = float(freeze_close)
+                logger.debug(f"Processed {event_type}: {canonical_stream} ({trading_date}) range={range_high}/{range_low}")
         
         elif event_type == "EXECUTION_BLOCKED":
             self._state_manager.record_execution_blocked(timestamp_utc)

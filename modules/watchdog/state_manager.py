@@ -22,6 +22,7 @@ from .config import (
     DATA_STALL_THRESHOLD_SECONDS,
     RECOVERY_TIMEOUT_SECONDS,
     STREAM_MAX_AGE_DAYS,
+    IDENTITY_EXPIRY_SECONDS,
 )
 from .market_session import is_market_open
 
@@ -70,7 +71,7 @@ class WatchdogStateManager:
         self._recovery_state: str = "CONNECTED_OK"
         self._recovery_started_utc: Optional[datetime] = None  # Track when recovery started for timeout
         self._kill_switch_active: bool = False
-        self._connection_status: str = "Connected"
+        self._connection_status: str = "Unknown"  # Default until we receive a connection event
         self._last_connection_event_utc: Optional[datetime] = None
         
         # Stream states: (trading_date, stream) -> StreamStateInfo
@@ -180,6 +181,19 @@ class WatchdogStateManager:
         self._connection_status = status
         self._last_connection_event_utc = timestamp_utc
     
+    def _effective_identity_pass(self, now: datetime) -> Optional[bool]:
+        """Return identity pass value, or None if last identity event is older than IDENTITY_EXPIRY_SECONDS."""
+        if self._last_identity_invariants_event_chicago is None:
+            return None
+        event_dt = self._last_identity_invariants_event_chicago
+        if event_dt.tzinfo is None:
+            event_dt = event_dt.replace(tzinfo=CHICAGO_TZ)
+        event_utc = event_dt.astimezone(timezone.utc)
+        age_sec = (now - event_utc).total_seconds()
+        if age_sec > IDENTITY_EXPIRY_SECONDS:
+            return None
+        return self._last_identity_invariants_pass
+
     def update_identity_invariants(
         self,
         pass_value: bool,
@@ -1206,9 +1220,13 @@ class WatchdogStateManager:
                 self._last_connection_event_utc = now
         
         # Apply smoothing to data stall detection
-        # Compute data status: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE'
+        # Compute data status: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN'
+        # UNKNOWN when we expect bars but have never received any (broker may be off)
         data_status = "FLOWING"
-        if data_stall_detected:
+        if instruments_with_bars_expected and not self._last_bar_utc_by_execution_instrument and market_open:
+            # Bars expected, market open, but no bar events ever received - likely broker off
+            data_status = "UNKNOWN"
+        elif data_stall_detected:
             critical_stall = any(d.get('stall_detected', False) and d.get('market_open', False) 
                                 for d in data_stall_detected.values())
             if critical_stall:
@@ -1270,12 +1288,13 @@ class WatchdogStateManager:
             "execution_blocked_count": len(self._execution_blocked_events),
             "protective_failures_count": len(self._protective_failure_events),
             "data_stall_detected": smoothed_data_stall_detected,  # Smoothed to prevent flickering
+            "data_status": smoothed_data_status,  # FLOWING | STALLED | ACCEPTABLE_SILENCE | UNKNOWN
             "market_open": market_open,  # Always included, even if error occurred
             # PATTERN 1: Bars expected observability
             "bars_expected_count": bars_expected_count,
             "worst_last_bar_age_seconds": worst_last_bar_age_seconds,
-            # PHASE 3.1: Identity invariants status
-            "last_identity_invariants_pass": self._last_identity_invariants_pass,
+            # PHASE 3.1: Identity invariants status (expire after IDENTITY_EXPIRY_SECONDS)
+            "last_identity_invariants_pass": self._effective_identity_pass(now),
             "last_identity_invariants_event_chicago": (
                 self._last_identity_invariants_event_chicago.isoformat()
                 if self._last_identity_invariants_event_chicago else None

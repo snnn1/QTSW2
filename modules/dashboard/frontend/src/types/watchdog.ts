@@ -16,6 +16,7 @@ export interface WatchdogStatus {
   execution_blocked_count: number;
   protective_failures_count: number;
   data_stall_detected: Record<string, DataStallInfo>;
+  data_status?: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN';
   market_open: boolean | null;
   // PHASE 3.1: Identity invariants status
   last_identity_invariants_pass: boolean | null;

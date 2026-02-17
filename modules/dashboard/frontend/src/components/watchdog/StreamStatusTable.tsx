@@ -4,7 +4,7 @@
  */
 import { useState, useEffect } from 'react'
 import { formatDuration, computeTimeInState } from '../../utils/timeUtils.ts'
-import { useStreamPnl } from '../../hooks/useStreamPnl'
+import { useStreamPnlForStreams } from '../../hooks/useStreamPnl'
 import type { StreamState } from '../../types/watchdog'
 
 interface StreamStatusTableProps {
@@ -14,10 +14,8 @@ interface StreamStatusTableProps {
 }
 
 export function StreamStatusTable({ streams, onStreamClick, marketOpen }: StreamStatusTableProps) {
-  // Get current trading date (today) for PnL and carry-over styling
   const todayStr = new Date().toISOString().split('T')[0]
-  const currentTradingDate = streams[0]?.trading_date || todayStr
-  const { pnl } = useStreamPnl(currentTradingDate)
+  const { getPnl } = useStreamPnlForStreams(streams)
   const [, forceUpdate] = useState(0)
   
   // Force re-render every second for live timers
@@ -141,7 +139,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                 issues.push('⚠️ Range Invalidated')
               }
               
-              const streamPnl = pnl[stream.stream]
+              const streamPnl = getPnl(stream)
               const isCarryOver = stream.trading_date !== todayStr
               const dateLabel = stream.trading_date
                 ? (stream.trading_date === todayStr ? 'Today' : stream.trading_date)

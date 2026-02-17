@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 
 namespace QTSW2.Robot.Core;
 
@@ -833,8 +834,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 simAdapter.SetCoordinator(coordinator);
             }
 
-            // Create reconciliation runner for orphaned journal cleanup
-            _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log);
+            // Create reconciliation runner for orphaned journal cleanup + quantity reconciliation
+            _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log,
+                onQuantityMismatch: (instrument, now, reason) =>
+                {
+                    StandDownStreamsForInstrument(instrument, now, reason);
+                    _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
+                    {
+                        { "instrument", instrument },
+                        { "reason", reason },
+                        { "note", "Push notification + instrument freeze" }
+                    });
+                });
 
             // Log execution mode and adapter
             var adapterType = _executionAdapter.GetType().Name;
@@ -3781,6 +3792,30 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
     }
+
+    /// <summary>
+    /// Stand down all streams for an instrument (freeze instrument-level for quantity mismatch).
+    /// </summary>
+    private void StandDownStreamsForInstrument(string instrument, DateTimeOffset utcNow, string reason)
+    {
+        lock (_engineLock)
+        {
+            foreach (var kvp in _streams)
+            {
+                var stream = kvp.Value;
+                var streamInst = stream.Instrument ?? "";
+                var streamExec = stream.ExecutionInstrument ?? "";
+                if (string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                {
+                    stream.EnterRecoveryManage(utcNow, reason);
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                        eventType: "STREAM_STAND_DOWN", state: "ENGINE",
+                        new { stream_id = kvp.Key, reason = reason, instrument }));
+                }
+            }
+        }
+    }
     
     /// <summary>
     /// Flatten exposure for a specific intent (helper for coordinator callback).
@@ -4168,6 +4203,50 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", data));
         }
+    }
+
+    private bool _robotBuildSignatureEmitted;
+
+    /// <summary>
+    /// Emit ROBOT_BUILD_SIGNATURE once per engine run when strategy reaches Realtime.
+    /// Proves which Robot.Core.dll is actually loaded (assembly path, last write time).
+    /// Call from RobotSimStrategy when State == Realtime.
+    /// </summary>
+    public void LogEngineBuildSignatureIfNeeded(DateTimeOffset utcNow, string instrumentName)
+    {
+        if (_robotBuildSignatureEmitted) return;
+        lock (_engineLock)
+        {
+            if (_robotBuildSignatureEmitted) return;
+            _robotBuildSignatureEmitted = true;
+        }
+        var asm = typeof(RobotEngine).Assembly;
+        var loc = asm.Location;
+        DateTime utcWrite = default;
+        try
+        {
+            if (!string.IsNullOrEmpty(loc) && File.Exists(loc))
+                utcWrite = File.GetLastWriteTimeUtc(loc);
+        }
+        catch { /* best-effort */ }
+        var ver = asm.GetName().Version;
+        var payload = new Dictionary<string, object>
+        {
+            ["assembly_name"] = asm.GetName().Name ?? "Robot.Core",
+            ["assembly_version"] = ver?.ToString() ?? "0.0.0.0",
+            ["assembly_location"] = loc ?? "(null)",
+            ["assembly_last_write_utc"] = utcWrite.ToString("o"),
+            ["build_configuration"] = 
+#if DEBUG
+                "Debug"
+#else
+                "Release"
+#endif
+            ,
+            ["instrument"] = instrumentName,
+            ["note"] = "Runtime proof of loaded Robot.Core.dll; validate this signature appears in robot_ENGINE.jsonl after restart"
+        };
+        LogEngineEvent(utcNow, "ROBOT_BUILD_SIGNATURE", payload);
     }
 
     /// <summary>
