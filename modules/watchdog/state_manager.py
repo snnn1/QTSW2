@@ -15,6 +15,8 @@ import pytz
 from .config import (
     EXECUTION_JOURNALS_DIR,
     FRONTEND_CURSOR_FILE,
+    ROBOT_JOURNAL_DIR,
+    ROBOT_LOGS_DIR,
     ENGINE_TICK_STALL_THRESHOLD_SECONDS,
     ENGINE_TICK_STALL_HYSTERESIS_SECONDS,
     STUCK_STREAM_THRESHOLD_SECONDS,
@@ -133,19 +135,20 @@ class WatchdogStateManager:
         This represents engine loop (Tick()) execution - primary liveness indicator.
         ENGINE_TICK_CALLSITE fires every Tick() call (rate-limited in feed to every 5 seconds).
         
-        SIMPLE FIX: Always use processing time (now). We're actively receiving ticks = engine is alive.
-        Event timestamps can be stale when pipeline lags, causing false STALLED flickering.
+        Use event timestamp (not processing time) so stale ticks from feed file (robot closed)
+        do not reset the stall timer. When robot is closed, we read old ticks from frontend_feed.jsonl;
+        using "now" would make ENGINE ALIVE persist for 75s after every tail read.
         """
         now = datetime.now(timezone.utc)
         prev_tick = self._last_engine_tick_utc
-        self._last_engine_tick_utc = now
-        
+        self._last_engine_tick_utc = timestamp_utc
+
         # Diagnostic: Log when ticks are received (rate-limited to avoid spam)
         if not hasattr(self, '_last_tick_update_log_utc'):
             self._last_tick_update_log_utc = None
         if self._last_tick_update_log_utc is None or (now - self._last_tick_update_log_utc).total_seconds() >= 30:
             self._last_tick_update_log_utc = now
-            elapsed_since_prev = (self._last_engine_tick_utc - prev_tick).total_seconds() if prev_tick else None
+            elapsed_since_prev = (timestamp_utc - prev_tick).total_seconds() if prev_tick else None
             elapsed_str = f"{elapsed_since_prev:.1f}s" if elapsed_since_prev is not None else "first_tick"
             logger.debug(
                 f"ENGINE_TICK_UPDATED: timestamp_utc={timestamp_utc.isoformat()}, "
@@ -395,6 +398,132 @@ class WatchdogStateManager:
                 f"(from TradeCompleted journals)"
             )
         return hydrated
+
+    def hydrate_stream_states_from_slot_journals(self, journals_dir: Optional[Path] = None) -> int:
+        """
+        Populate _stream_states from slot journals (logs/robot/journal/) when event-derived state
+        is missing. Fixes streams showing empty state when: watchdog restarted after robot,
+        events were missed, or timetable wasn't loaded when STREAM_STATE_TRANSITION fired.
+        Only fills gaps - does not overwrite existing event-derived state.
+        Returns count of streams hydrated.
+        """
+        journals_dir = journals_dir or ROBOT_JOURNAL_DIR
+        if not journals_dir.exists():
+            return 0
+        current_trading_date = self.get_trading_date()
+        if not current_trading_date:
+            from .timetable_poller import compute_timetable_trading_date
+            current_trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+        hydrated = 0
+        try:
+            for journal_file in journals_dir.glob("*.json"):
+                try:
+                    stem = journal_file.stem
+                    parts = stem.split("_", 2)
+                    if len(parts) < 2:
+                        continue
+                    trading_date = parts[0]
+                    stream = parts[1] if len(parts) == 2 else "_".join(parts[1:])
+                    if not _is_trading_date_within_max_age(trading_date, current_trading_date):
+                        continue
+                    with open(journal_file, "r") as f:
+                        entry = json.load(f)
+                    last_state = entry.get("LastState") or entry.get("last_state", "")
+                    committed = entry.get("Committed", False) or entry.get("committed", False)
+                    commit_reason = entry.get("CommitReason") or entry.get("commit_reason")
+                    last_update_str = entry.get("LastUpdateUtc") or entry.get("last_update_utc", "")
+                    if not last_state:
+                        continue
+                    key = (trading_date, stream)
+                    existing = self._stream_states.get(key)
+                    if existing and existing.state:
+                        continue
+                    state_entry_utc = datetime.now(timezone.utc)
+                    if last_update_str:
+                        try:
+                            state_entry_utc = datetime.fromisoformat(
+                                last_update_str.replace("Z", "+00:00")
+                            )
+                            if state_entry_utc.tzinfo is None:
+                                state_entry_utc = state_entry_utc.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            pass
+                    if existing:
+                        existing.state = last_state
+                        existing.committed = committed
+                        if commit_reason:
+                            existing.commit_reason = commit_reason
+                        existing.state_entry_time_utc = state_entry_utc
+                    else:
+                        self._stream_states[key] = StreamStateInfo(
+                            trading_date=trading_date,
+                            stream=stream,
+                            state=last_state,
+                            committed=committed,
+                            commit_reason=commit_reason,
+                            state_entry_time_utc=state_entry_utc,
+                            execution_instrument=None,
+                        )
+                    hydrated += 1
+                except Exception as e:
+                    logger.debug(f"Skip slot journal {journal_file.name}: {e}")
+        except Exception as e:
+            logger.warning(f"hydrate_stream_states_from_slot_journals failed: {e}", exc_info=True)
+        if hydrated > 0:
+            logger.info(f"hydrate_stream_states_from_slot_journals: hydrated {hydrated} stream(s)")
+        return hydrated
+
+    def hydrate_range_data_from_ranges_file(self, trading_date: Optional[str] = None) -> int:
+        """
+        Populate range_high, range_low, freeze_close for RANGE_LOCKED streams from ranges_{date}.jsonl
+        when event-derived range data is missing. Slot journal hydration gives state but not ranges.
+        Returns count of streams updated with range data.
+        """
+        current_td = trading_date or self.get_trading_date()
+        if not current_td:
+            from .timetable_poller import compute_timetable_trading_date
+            current_td = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+        ranges_file = ROBOT_LOGS_DIR / f"ranges_{current_td}.jsonl"
+        if not ranges_file.exists():
+            return 0
+        updated = 0
+        try:
+            with open(ranges_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if entry.get("event_type") != "RANGE_LOCKED":
+                            continue
+                        stream_id = entry.get("stream_id", "")
+                        range_high = entry.get("range_high")
+                        range_low = entry.get("range_low")
+                        freeze_close = entry.get("freeze_close")
+                        if not stream_id or (range_high is None and range_low is None):
+                            continue
+                        key = (current_td, stream_id)
+                        info = self._stream_states.get(key)
+                        if not info or info.state != "RANGE_LOCKED":
+                            continue
+                        if info.range_high is not None and info.range_low is not None:
+                            continue
+                        if range_high is not None:
+                            info.range_high = float(range_high)
+                        if range_low is not None:
+                            info.range_low = float(range_low)
+                        if freeze_close is not None:
+                            info.freeze_close = float(freeze_close)
+                        updated += 1
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        logger.debug(f"Skip ranges line: {e}")
+                        continue
+        except Exception as e:
+            logger.warning(f"hydrate_range_data_from_ranges_file failed: {e}", exc_info=True)
+        if updated > 0:
+            logger.info(f"hydrate_range_data_from_ranges_file: updated {updated} stream(s) with range data")
+        return updated
 
     def get_active_intent_stream_keys(self) -> Set[tuple]:
         """Return set of (trading_date, stream_id) with active intent exposures."""
@@ -839,8 +968,15 @@ class WatchdogStateManager:
         recovery_state_allowed = self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
         kill_switch_allowed = not self._kill_switch_active
         
+        # Only include streams for current trading date (exclude past dates from slot journal hydration)
+        current_td = self.get_trading_date()
+        if not current_td:
+            from .timetable_poller import compute_timetable_trading_date
+            current_td = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
         stream_armed = []
         for (trading_date, stream), info in self._stream_states.items():
+            if trading_date != current_td:
+                continue
             # PATTERN 1: A stream is "armed" only when it's in the ARMED state
             # Not when it's in PRE_HYDRATION, RANGE_BUILDING, etc.
             stream_armed.append({

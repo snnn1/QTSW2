@@ -17,17 +17,20 @@ public sealed class ReconciliationRunner
     private readonly ExecutionJournal _journal;
     private readonly RobotLogger _log;
     private readonly Action<string, DateTimeOffset, string>? _onQuantityMismatch;
+    private readonly Action<Dictionary<string, (int AccountQty, int JournalQty)>>? _onReconciliationPassComplete;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
 
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
-        Action<string, DateTimeOffset, string>? onQuantityMismatch = null)
+        Action<string, DateTimeOffset, string>? onQuantityMismatch = null,
+        Action<Dictionary<string, (int AccountQty, int JournalQty)>>? onReconciliationPassComplete = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _onQuantityMismatch = onQuantityMismatch;
+        _onReconciliationPassComplete = onReconciliationPassComplete;
     }
 
     /// <summary>
@@ -167,5 +170,27 @@ public sealed class ReconciliationRunner
                 journals_reconciled = journalsReconciled,
                 note = "Reconciliation pass complete"
             }));
+
+        // Notify engine of qty by instrument (for unfreezing when mismatch resolved)
+        _onReconciliationPassComplete?.Invoke(BuildQtyByInstrument(accountQtyByInstrument));
+    }
+
+    private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)
+    {
+        var result = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase);
+        var allInstruments = new HashSet<string>(accountQtyByInstrument.Keys, StringComparer.OrdinalIgnoreCase);
+        foreach (var inst in _journal.GetOpenJournalEntriesByInstrument().Keys)
+        {
+            if (!string.IsNullOrWhiteSpace(inst))
+                allInstruments.Add(inst.Trim());
+        }
+        foreach (var inst in allInstruments)
+        {
+            var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            result[inst] = (accountQty, journalQty);
+        }
+        return result;
     }
 }

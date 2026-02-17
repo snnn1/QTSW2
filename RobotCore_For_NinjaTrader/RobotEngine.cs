@@ -106,7 +106,53 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
     {
+        RunPendingForceReconcile(utcNow);
         _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+    }
+
+    private const string PENDING_FORCE_RECONCILE_FILE = "pending_force_reconcile.json";
+
+    /// <summary>
+    /// Check for pending force-reconcile trigger file. When operator confirms account is correct,
+    /// create data/pending_force_reconcile.json with {"instruments": ["MYM", "MCL"]} to force-close orphan journals.
+    /// </summary>
+    private void RunPendingForceReconcile(DateTimeOffset utcNow)
+    {
+        var path = Path.Combine(_root, "data", PENDING_FORCE_RECONCILE_FILE);
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var parsed = JsonUtil.Deserialize<ForceReconcileTrigger>(json);
+            if (parsed?.instruments == null || parsed.instruments.Count == 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_SKIPPED", state: "ENGINE",
+                    new { reason = "INVALID_FORMAT", path, note = "Expected {\"instruments\": [\"MYM\", ...]}" }));
+                File.Delete(path);
+                return;
+            }
+
+            var totalClosed = 0;
+            foreach (var inst in parsed.instruments.Where(x => !string.IsNullOrWhiteSpace(x)))
+            {
+                var instTrimmed = inst!.Trim();
+                var closed = _executionJournal.ForceReconcileOrphanJournalsForInstrument(instTrimmed, utcNow);
+                totalClosed += closed;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "FORCE_RECONCILE_EXECUTED", state: "ENGINE",
+                    new { instrument = instTrimmed, journals_closed = closed }));
+            }
+
+            File.Delete(path);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_COMPLETE", state: "ENGINE",
+                new { total_journals_closed = totalClosed, instruments = parsed.instruments }));
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_ERROR", state: "ENGINE",
+                new { path, error = ex.Message }));
+        }
     }
 
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
@@ -174,6 +220,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string? _accountName;
     private string? _environment;
     
+    // Instruments frozen due to RECONCILIATION_QTY_MISMATCH (block execution; allow range building)
+    private readonly HashSet<string> _frozenInstruments = new(StringComparer.OrdinalIgnoreCase);
+
     // Disconnect recovery state machine
     private ConnectionRecoveryState _recoveryState = ConnectionRecoveryState.CONNECTED_OK;
     private DateTimeOffset? _disconnectFirstUtc;
@@ -797,7 +846,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Initialize execution components now that spec is loaded
             if (_killSwitch == null)
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
-            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this);
+            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this, isInstrumentFrozen: inst => _frozenInstruments.Contains(inst));
 
             // Try to create adapter (will throw if LIVE mode)
             _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
@@ -845,6 +894,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         { "reason", reason },
                         { "note", "Push notification + instrument freeze" }
                     });
+                },
+                onReconciliationPassComplete: qtyByInstrument =>
+                {
+                    lock (_engineLock)
+                    {
+                        foreach (var inst in _frozenInstruments.ToList())
+                        {
+                            var shouldUnfreeze = qtyByInstrument.TryGetValue(inst, out var qtys)
+                                ? qtys.AccountQty == qtys.JournalQty
+                                : true; // Not in map = no position + no open journals = resolved
+                            if (shouldUnfreeze)
+                            {
+                                _frozenInstruments.Remove(inst);
+                                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                                    eventType: "INSTRUMENT_UNFROZEN", state: "ENGINE",
+                                    new { instrument = inst, note = "Reconciliation qty match restored" }));
+                            }
+                        }
+                    }
                 });
 
             // Log execution mode and adapter
@@ -3794,24 +3862,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Stand down all streams for an instrument (freeze instrument-level for quantity mismatch).
+    /// Freeze instrument (block execution) and stand down only streams that have positions.
+    /// Streams without positions (e.g. PRE_HYDRATION, RANGE_BUILDING) continue to compute range; execution blocked via RiskGate.
     /// </summary>
     private void StandDownStreamsForInstrument(string instrument, DateTimeOffset utcNow, string reason)
     {
         lock (_engineLock)
         {
+            _frozenInstruments.Add(instrument);
+
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
             foreach (var kvp in _streams)
             {
                 var stream = kvp.Value;
                 var streamInst = stream.Instrument ?? "";
                 var streamExec = stream.ExecutionInstrument ?? "";
-                if (string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                if (!string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Only stand down streams with entry fills (have positions). Others continue to range-build; execution blocked by RiskGate.
+                var hasPosition = _executionJournal.HasEntryFillForStream(tradingDateStr, stream.Stream);
+                if (hasPosition)
                 {
                     stream.EnterRecoveryManage(utcNow, reason);
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
                         eventType: "STREAM_STAND_DOWN", state: "ENGINE",
                         new { stream_id = kvp.Key, reason = reason, instrument }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                        eventType: "STREAM_FROZEN_NO_STAND_DOWN", state: "ENGINE",
+                        new { stream_id = kvp.Key, reason = reason, instrument, note = "No position; range building continues; execution blocked" }));
                 }
             }
         }
@@ -4688,4 +4771,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return (earliestRangeStart, latestSlotTime);
         }
     }
+}
+
+/// <summary>
+/// Trigger file format for manual force-reconcile of orphan journals.
+/// Create data/pending_force_reconcile.json with this structure.
+/// </summary>
+internal sealed class ForceReconcileTrigger
+{
+    public List<string> instruments { get; set; } = new();
 }

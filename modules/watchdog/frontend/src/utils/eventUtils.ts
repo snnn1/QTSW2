@@ -80,10 +80,11 @@ export function deduplicateEvents(events: WatchdogEvent[]): WatchdogEvent[] {
 export function filterRepetitiveEvents(events: WatchdogEvent[], timeWindowMs: number = 60000): WatchdogEvent[] {
   if (events.length === 0) return events
   
-  // Events to filter/throttle (repetitive gate violations, etc.)
+  // Events to filter/throttle (repetitive gate violations, bar events, etc.)
   const repetitiveEventTypes = [
     'EXECUTION_GATE_INVARIANT_VIOLATION',
-    // Add more event types here if needed
+    'IDENTITY_INVARIANTS_STATUS',  // Every 60s when no violations - throttle
+    'TIMETABLE_VALIDATED',        // Periodic validation - throttle
   ]
   
   const filtered: WatchdogEvent[] = []

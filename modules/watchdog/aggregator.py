@@ -200,6 +200,7 @@ class WatchdogAggregator:
         self._important_events_buffer: deque = deque(maxlen=200)
         self._event_seq_counter: int = 0  # Monotonic sequence ID counter
         self._last_hydrate_utc: Optional[datetime] = None  # Throttle journal hydrate in get_active_intents
+        self._last_slot_journal_hydrate_utc: Optional[datetime] = None  # Throttle slot journal hydrate in get_stream_states
 
         # INGESTION: Single tail read per cycle, telemetry, degradation mode
         self._ingestion_telemetry = IngestionTelemetry()
@@ -618,14 +619,15 @@ class WatchdogAggregator:
             cursor_events: List[Dict] = []
             if not degraded:
                 is_bar = lambda e: e.get("event_type") in bar_types
-                is_tick = lambda e: e.get("event_type") == "ENGINE_TICK_CALLSITE"
                 for ev in parsed_events:
                     run_id = ev.get("run_id")
                     event_seq = ev.get("event_seq", 0)
                     if not run_id:
                         continue
                     last_seq = cursor.get(run_id, 0)
-                    if is_bar(ev) or is_tick(ev) or event_seq > last_seq:
+                    # Include bars and new events only. Ticks are handled by snapshot path (lines 579-598)
+                    # and must not be re-processed every cycle — that would refresh liveness from old ticks.
+                    if is_bar(ev) or event_seq > last_seq:
                         cursor_events.append(ev)
                 cursor_events.sort(key=lambda e: e.get("timestamp_utc", ""))
 
@@ -1011,12 +1013,52 @@ class WatchdogAggregator:
             self._event_processor.process_event(latest_ev)
             logger.info(f"Rebuilt connection status from snapshot: {latest_ev.get('event_type')}")
     
+    # Event types excluded from Live Event Feed (too verbose, backend/diagnostic only)
+    _LIVE_FEED_EXCLUDED_TYPES = frozenset({
+        "ENGINE_TICK_CALLSITE",      # Backend liveness only, ~12/min
+        "ENGINE_TICK_HEARTBEAT",     # Backend liveness
+        "ENGINE_ALIVE",              # Backend liveness
+        "ENGINE_TICK_EXECUTED",      # Diagnostic
+        "ENGINE_TICK_BEFORE_LOCK",   # Diagnostic
+        "ENGINE_TICK_LOCK_ACQUIRED", # Diagnostic
+        "ENGINE_TICK_AFTER_LOCK",    # Diagnostic
+        "ENGINE_BUILD_STAMP",        # Diagnostic
+        "BAR_ACCEPTED",              # Bar heartbeat, low signal
+        "BAR_RECEIVED_NO_STREAMS",   # Bar heartbeat, low signal
+        "ONBARUPDATE_CALLED",        # Diagnostic, can flood
+        "ONBARUPDATE_DIAGNOSTIC",    # Diagnostic
+        "BAR_ROUTING_DIAGNOSTIC",    # Diagnostic
+        "RANGE_LOCK_SNAPSHOT",       # Redundant with RANGE_LOCKED
+    })
+
+    def _filter_events_for_live_feed(self, events: List[Dict]) -> List[Dict]:
+        """Filter events for Live Event Feed - exclude noisy/diagnostic types."""
+        filtered = []
+        for ev in events:
+            event_type = ev.get("event_type", "")
+            if event_type in self._LIVE_FEED_EXCLUDED_TYPES:
+                continue
+            # IDENTITY_INVARIANTS_STATUS: only include when violations detected
+            if event_type == "IDENTITY_INVARIANTS_STATUS":
+                data = ev.get("data") or {}
+                if isinstance(data, dict):
+                    violations = data.get("violations", [])
+                    if not violations:
+                        continue
+                else:
+                    continue
+            filtered.append(ev)
+        return filtered
+
     def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
         """
         Get most recent events for Live Events feed.
         
         INGESTION: Cached for EVENTS_CACHE_TTL_SECONDS. Multiple clients within TTL
         share one disk read to avoid linear I/O scaling.
+        
+        Filters out noisy event types (tick heartbeats, bar heartbeats, diagnostics)
+        to reduce verbosity - same philosophy as WebSocket important_events buffer.
         """
         now = datetime.now(timezone.utc)
         if self._events_cache:
@@ -1031,8 +1073,10 @@ class WatchdogAggregator:
             all_events = self._read_events_tail(1000)
             self._events_cache = (all_events, now)
 
-        all_events.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
-        return all_events[-200:] if len(all_events) > 200 else all_events
+        # Filter out noisy event types for Live Event Feed
+        filtered = self._filter_events_for_live_feed(all_events)
+        filtered.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
+        return filtered[-200:] if len(filtered) > 200 else filtered
 
     def _read_events_tail(self, n: int) -> List[Dict]:
         """Read last N lines from feed and parse to events. No cache."""
@@ -1161,6 +1205,15 @@ class WatchdogAggregator:
         timetable_unavailable = False
         
         try:
+            # Hydrate stream states from slot journals when event-derived state is missing (throttled 60s)
+            # Also hydrate range data from ranges_{date}.jsonl for RANGE_LOCKED streams missing range_high/low
+            now_utc = datetime.now(timezone.utc)
+            if self._last_slot_journal_hydrate_utc is None or \
+                    (now_utc - self._last_slot_journal_hydrate_utc).total_seconds() >= 60:
+                self._state_manager.hydrate_stream_states_from_slot_journals()
+                self._state_manager.hydrate_range_data_from_ranges_file()
+                self._last_slot_journal_hydrate_utc = now_utc
+
             # CRITICAL: Use getter, never access private fields directly
             current_trading_date = self._state_manager.get_trading_date()
             if not current_trading_date:

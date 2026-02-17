@@ -1439,6 +1439,98 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Force-close orphan journals for an instrument when operator has confirmed account is correct.
+    /// Use only after verifying broker position matches expectation. Marks journals with RECONCILIATION_MANUAL_OVERRIDE.
+    /// </summary>
+    /// <returns>Number of journals force-closed.</returns>
+    public int ForceReconcileOrphanJournalsForInstrument(string instrument, DateTimeOffset utcNow)
+    {
+        var execVariant = instrument.StartsWith("M") && instrument.Length > 1 ? instrument : "M" + instrument;
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var count = 0;
+
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (!string.Equals(key, instrument, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(key, execVariant, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var (tradingDate, stream, intentId, _) in kvp.Value)
+            {
+                if (ForceReconcileJournal(tradingDate, stream, intentId, utcNow))
+                    count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Force-close a single journal (manual override). Use when operator confirms position was closed externally.
+    /// </summary>
+    private bool ForceReconcileJournal(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            ExecutionJournalEntry? entry;
+            if (_cache.TryGetValue(key, out var existing))
+            {
+                entry = existing;
+            }
+            else if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                        _cache[key] = entry;
+                    else
+                        return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted)
+                return false;
+
+            if (entry.EntryFilledQuantityTotal <= 0)
+                return false;
+
+            entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+            entry.ExitAvgFillPrice = null;
+            entry.ExitFillNotional = null;
+            entry.ExitFilledAtUtc = utcNow.ToString("o");
+            entry.ExitOrderType = CompletionReasons.RECONCILIATION_MANUAL_OVERRIDE;
+            entry.TradeCompleted = true;
+            entry.CompletedAtUtc = utcNow.ToString("o");
+            entry.CompletionReason = CompletionReasons.RECONCILIATION_MANUAL_OVERRIDE;
+            entry.RealizedPnLPoints = null;
+            entry.RealizedPnLGross = null;
+            entry.RealizedPnLNet = null;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Record trade completion via reconciliation (broker flat, no exit fill received).
     /// Sets TradeCompleted, CompletionReason=RECONCILIATION_BROKER_FLAT.
     /// Exit price and P&L left null so reporting layer can treat reconciled trades specially.
@@ -1684,4 +1776,9 @@ public static class CompletionReasons
     /// Trade was closed externally; broker position flat; journal reconciled.
     /// </summary>
     public const string RECONCILIATION_BROKER_FLAT = "RECONCILIATION_BROKER_FLAT";
+
+    /// <summary>
+    /// Operator confirmed account correct; orphan journals force-closed via manual trigger.
+    /// </summary>
+    public const string RECONCILIATION_MANUAL_OVERRIDE = "RECONCILIATION_MANUAL_OVERRIDE";
 }

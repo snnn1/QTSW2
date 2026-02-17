@@ -290,13 +290,17 @@ class EventProcessor:
             self._state_manager.update_kill_switch(True)
         
         elif event_type == "STREAM_STATE_TRANSITION":
-            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
-            # The timetable is the single source of truth for trading_date
-            trading_date = self._state_manager.get_trading_date()
+            # Prefer timetable's trading_date (authoritative when loaded); fallback to event's for startup
+            # Without fallback, events are skipped when timetable poll hasn't run yet (first ~60s),
+            # and they're never re-processed, so stream states never appear on the Watchdog streams tab
+            trading_date = (
+                self._state_manager.get_trading_date()
+                or event.get("trading_date")
+                or data.get("trading_date")
+            )
             if not trading_date:
-                # Fallback: If timetable not loaded yet, skip this event (will be processed on next poll)
                 logger.debug(
-                    f"STREAM_STATE_TRANSITION skipped: timetable trading_date not set yet "
+                    f"STREAM_STATE_TRANSITION skipped: no trading_date "
                     f"(event trading_date: {event.get('trading_date')}, stream: {event.get('stream')})"
                 )
                 return
@@ -445,10 +449,14 @@ class EventProcessor:
         elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
             # MARKET_CLOSE_NO_TRADE is treated the same as STREAM_STAND_DOWN
-            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
-            trading_date = self._state_manager.get_trading_date()
+            # Prefer timetable's trading_date; fallback to event's for startup (same as STREAM_STATE_TRANSITION)
+            trading_date = (
+                self._state_manager.get_trading_date()
+                or event.get("trading_date")
+                or data.get("trading_date")
+            )
             if not trading_date:
-                logger.debug(f"{event_type} skipped: timetable trading_date not set yet")
+                logger.debug(f"{event_type} skipped: no trading_date")
                 return
             stream = event.get("stream")
             instrument = event.get("instrument")
@@ -491,10 +499,14 @@ class EventProcessor:
         
         elif event_type == "RANGE_INVALIDATED":
             # Standardized fields are now always at top level (plan requirement #1)
-            # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
-            trading_date = self._state_manager.get_trading_date()
+            # Prefer timetable's trading_date; fallback to event's for startup (same as STREAM_STATE_TRANSITION)
+            trading_date = (
+                self._state_manager.get_trading_date()
+                or event.get("trading_date")
+                or data.get("trading_date")
+            )
             if not trading_date:
-                logger.debug(f"RANGE_INVALIDATED skipped: timetable trading_date not set yet")
+                logger.debug(f"RANGE_INVALIDATED skipped: no trading_date")
                 return
             stream = event.get("stream")
             instrument = event.get("instrument")

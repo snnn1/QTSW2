@@ -122,7 +122,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
               <th className="px-4 py-2 text-left">Instr</th>
               <th className="px-4 py-2 text-left">Session</th>
               <th className="px-4 py-2 text-left">State</th>
-              <th className="px-4 py-2 text-left">Time in State</th>
+              <th className="px-4 py-2 text-left" title="Time in State">TIS</th>
               <th className="px-4 py-2 text-left">Slot</th>
               <th className="px-4 py-2 text-left">Range</th>
               <th className="px-4 py-2 text-left">PnL</th>
@@ -168,7 +168,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                       <span className="px-2 py-0.5 rounded text-xs bg-gray-700 text-gray-400">-</span>
                     )}
                   </td>
-                  <td className={`px-4 py-2 font-mono ${getTimeInStateColor(timeInState)}`}>
+                  <td className={`px-4 py-2 font-mono whitespace-nowrap ${getTimeInStateColor(timeInState)}`}>
                     {formatDuration(timeInState)}
                   </td>
                   <td className="px-4 py-2 font-mono">
