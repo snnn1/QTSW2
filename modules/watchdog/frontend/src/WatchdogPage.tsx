@@ -113,6 +113,12 @@ export function WatchdogPage() {
       }
     }
     
+    // CRITICAL: When ticks are flowing (ENGINE_TICK_CALLSITE recent), treat as FLOWING even if bar age is stale.
+    // Bar age can lag due to ONBARUPDATE_CALLED rate limit (1/min) or bar type (e.g. 5-min bars).
+    // Ticks = OnMarketData firing = data feed alive.
+    const tickAge = getEngineTickAgeSeconds()
+    const ticksFlowing = tickAge !== null && tickAge < DATA_STALL_THRESHOLD
+    
     // If no instruments tracked yet, check bars (worst_last_bar_age) or engine tick (fallback)
     if (stalls.length === 0) {
       // If market is known to be closed, show acceptable silence
@@ -127,13 +133,14 @@ export function WatchdogPage() {
         } else if (status.worst_last_bar_age_seconds < 150) {
           return 'FLOWING'
         } else {
+          // Bar age stale - but if ticks flowing, data is flowing (fix for false DATA STALLED)
+          if (ticksFlowing) return 'FLOWING'
           return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
         }
       }
       
       // Fallback: use engine tick (same as engine liveness - ENGINE_TICK_CALLSITE)
       // Engine tick = bars being processed; if tick is recent, data is flowing
-      const tickAge = getEngineTickAgeSeconds()
       if (tickAge !== null && tickAge < DATA_STALL_THRESHOLD) {
         return 'FLOWING'
       }
@@ -148,9 +155,10 @@ export function WatchdogPage() {
     }
     
     // Check for critical stalls (market open + stalled)
+    // If ticks flowing, override - bar age can lag; ticks indicate data feed alive
     const criticalStall = stalls.some(d => d.stall_detected && d.market_open)
     if (criticalStall) {
-      return 'STALLED'
+      return ticksFlowing ? 'FLOWING' : 'STALLED'
     }
     
     // Check for acceptable silence (market closed + stalled)
@@ -327,6 +335,7 @@ export function WatchdogPage() {
       
       <StreamDetailDrawer
         stream={selectedStream}
+        events={events}
         isOpen={selectedStream !== null}
         onClose={() => setSelectedStream(null)}
       />

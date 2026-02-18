@@ -113,17 +113,21 @@ export function WatchdogPage() {
       }
     }
 
+    const tickAge = getEngineTickAgeSeconds()
+    const ticksFlowing = tickAge !== null && tickAge < DATA_STALL_THRESHOLD
+
     if (stalls.length === 0) {
       if (status.market_open === false) return 'ACCEPTABLE_SILENCE'
       if (status.worst_last_bar_age_seconds != null && status.worst_last_bar_age_seconds < DATA_STALL_THRESHOLD) return 'FLOWING'
-      const tickAge = getEngineTickAgeSeconds()
+      // When bar age stale, ticks flowing overrides (fix for false DATA STALLED when receiving ticks)
+      if (status.worst_last_bar_age_seconds != null && status.worst_last_bar_age_seconds >= DATA_STALL_THRESHOLD && ticksFlowing) return 'FLOWING'
       if (tickAge !== null && tickAge < DATA_STALL_THRESHOLD) return 'FLOWING'
       if (tickAge !== null && tickAge >= DATA_STALL_THRESHOLD) return status.market_open ? 'STALLED' : 'ACCEPTABLE_SILENCE'
       return 'UNKNOWN'
     }
 
     const criticalStall = stalls.some(d => d.stall_detected && d.market_open)
-    if (criticalStall) return 'STALLED'
+    if (criticalStall) return ticksFlowing ? 'FLOWING' : 'STALLED'
     const acceptableSilence = stalls.some(d => d.stall_detected && !d.market_open)
     if (acceptableSilence) return 'ACCEPTABLE_SILENCE'
     return 'FLOWING'
@@ -293,6 +297,7 @@ export function WatchdogPage() {
       
       <StreamDetailDrawer
         stream={selectedStream}
+        events={events}
         isOpen={selectedStream !== null}
         onClose={() => setSelectedStream(null)}
       />

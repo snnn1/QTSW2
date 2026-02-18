@@ -128,6 +128,11 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         return OrderModificationResult.FailureResult("LIVE adapter not yet implemented", utcNow);
     }
 
+    public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)
+    {
+        // LIVE: Not yet implemented
+    }
+
     public FlattenResult Flatten(
         string intentId,
         string instrument,

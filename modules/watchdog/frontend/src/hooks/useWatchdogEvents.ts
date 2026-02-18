@@ -1,11 +1,12 @@
 /**
- * Hook for polling watchdog events with cursor management
- * Polls every 1-2 seconds
- * Maintains cursor state and deduplicates events
+ * Hook for watchdog events with WebSocket-primary, REST-fallback.
+ * When WebSocket connected: uses WS for live events, REST every 10s for catch-up.
+ * When WebSocket disconnected: REST polling every 1.5s.
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { fetchWatchdogEvents } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
+import { useWebSocket } from '../contexts/WebSocketContext'
 import { sortEventsByTimestamp, deduplicateEvents, filterRepetitiveEvents } from '../utils/eventUtils'
 import type { WatchdogEvent } from '../types/watchdog'
 
@@ -15,6 +16,27 @@ interface Cursor {
 }
 
 const MAX_EVENTS = 200
+const REST_POLL_MS_WHEN_WS_CONNECTED = 10000  // 10s catch-up when WS primary
+const REST_POLL_MS_WHEN_WS_DISCONNECTED = 1500  // 1.5s when REST only
+
+/** Convert WebSocket event format to WatchdogEvent */
+function wsEventToWatchdogEvent(ws: { seq?: number; type?: string; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }): WatchdogEvent {
+  const tsUtc = ws.ts_utc || new Date().toISOString()
+  const d = new Date(tsUtc)
+  const chicago = d.toLocaleString('en-US', { timeZone: 'America/Chicago' })
+  return {
+    event_seq: ws.seq ?? 0,
+    run_id: ws.run_id ?? '',
+    timestamp_utc: tsUtc,
+    timestamp_chicago: chicago,
+    event_type: ws.type ?? 'UNKNOWN',
+    trading_date: null,
+    stream: ws.stream_id ?? null,
+    instrument: null,
+    session: null,
+    data: ws.data ?? {},
+  }
+}
 
 export function useWatchdogEvents() {
   const [events, setEvents] = useState<WatchdogEvent[]>([])
@@ -22,10 +44,10 @@ export function useWatchdogEvents() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const processedEventsRef = useRef<Set<string>>(new Set())
-  
   const hasLoadedRef = useRef(false)
-  
-    const poll = useCallback(async () => {
+  const { isConnected: wsConnected, subscribe: wsSubscribe } = useWebSocket()
+
+  const poll = useCallback(async () => {
     // Only show loading on initial load, not on subsequent polls
     if (!hasLoadedRef.current) {
       setLoading(true)
@@ -109,8 +131,27 @@ export function useWatchdogEvents() {
     setLoading(false)
   }, [cursor.runId, cursor.lastEventSeq])
   
-  const { lastSuccessfulPollTimestamp } = usePollingInterval(poll, 1500) // 1.5 seconds
-  
+  const pollIntervalMs = wsConnected ? REST_POLL_MS_WHEN_WS_CONNECTED : REST_POLL_MS_WHEN_WS_DISCONNECTED
+  const { lastSuccessfulPollTimestamp } = usePollingInterval(poll, pollIntervalMs)
+
+  // WebSocket subscription: merge live events when WS connected
+  useEffect(() => {
+    if (!wsSubscribe) return
+    const unsub = wsSubscribe((wsEvent: { type?: string; seq?: number; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }) => {
+      if (wsEvent.type === 'heartbeat') return
+      const key = `ws:${wsEvent.run_id}:${wsEvent.seq}`
+      if (processedEventsRef.current.has(key)) return
+      processedEventsRef.current.add(key)
+      const ev = wsEventToWatchdogEvent(wsEvent)
+      setEvents((prev) => {
+        const combined = [...prev, ev]
+        const sorted = sortEventsByTimestamp(combined)
+        return sorted.slice(-MAX_EVENTS)
+      })
+    })
+    return unsub
+  }, [wsSubscribe])
+
   // Initial load
   useEffect(() => {
     poll()

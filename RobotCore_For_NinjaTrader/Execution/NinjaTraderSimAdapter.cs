@@ -23,23 +23,38 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor
 {
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
     private readonly ExecutionJournal _executionJournal;
     
-    // Order tracking: intentId -> NT order info
+    // Order tracking: intentId -> NT order info (or IEA's when use_instrument_execution_authority)
     private readonly ConcurrentDictionary<string, OrderInfo> _orderMap = new();
     
-    // Intent tracking: intentId -> Intent (for protective order submission)
+    // Intent tracking: intentId -> Intent (or IEA's when IEA enabled)
     private readonly ConcurrentDictionary<string, Intent> _intentMap = new();
     
     // Fill callback: intentId -> callback action (for protective order submission)
     private readonly ConcurrentDictionary<string, Action<string, decimal, int, DateTimeOffset>> _fillCallbacks = new();
     
-    // Intent policy tracking: intentId -> policy expectation
+    // Intent policy tracking: intentId -> policy expectation (or IEA's when IEA enabled)
     private readonly Dictionary<string, IntentPolicyExpectation> _intentPolicy = new();
+    
+    // IEA: when enabled, use shared maps so all instances see same orders
+    private bool _useInstrumentExecutionAuthority = false;
+    private AggregationPolicy? _aggregationPolicy;
+    private InstrumentExecutionAuthority? _iea;
+    private string? _ieaAccountName;
+    private string? _ieaEngineExecutionInstrument;
+    private readonly Dictionary<string, DateTimeOffset> _lastIeaExecUpdateRoutedUtc = new();
+    
+    /// <summary>Effective order map: IEA's when enabled, else adapter's.</summary>
+    private ConcurrentDictionary<string, OrderInfo> OrderMap => _useInstrumentExecutionAuthority && _iea != null ? _iea.OrderMap : _orderMap;
+    /// <summary>Effective intent map: IEA's when enabled, else adapter's.</summary>
+    private ConcurrentDictionary<string, Intent> IntentMap => _useInstrumentExecutionAuthority && _iea != null ? _iea.IntentMap : _intentMap;
+    /// <summary>Effective intent policy: IEA's when enabled, else adapter's.</summary>
+    private Dictionary<string, IntentPolicyExpectation> IntentPolicy => _useInstrumentExecutionAuthority && _iea != null ? _iea.IntentPolicy : _intentPolicy;
     
     // Track which intents have already triggered emergency (idempotent)
     private readonly HashSet<string> _emergencyTriggered = new();
@@ -58,6 +73,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     
     // PHASE 2: Callback to check if execution is allowed (recovery state guard)
     private Func<bool>? _isExecutionAllowedCallback;
+
+    /// <summary>Gap 5: Callback when IEA EnqueueAndWait fails (timeout/overflow). Engine blocks instrument and stands down streams.</summary>
+    private Action<string, DateTimeOffset, string>? _blockInstrumentCallback;
     
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
@@ -69,6 +87,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     
     // Diagnostic: Track rate-limit diagnostic logs separately
     private readonly Dictionary<string, DateTimeOffset> _lastInstrumentMismatchDiagLogUtc = new();
+
+    // Broker flatten recognition: when we call Flatten(), the resulting close order has no QTSW2 tag.
+    // Track recent flatten calls so we don't treat that fill as UNTrackED and trigger another flatten.
+    private readonly object _flattenRecognitionLock = new();
+    private string? _lastFlattenInstrument;
+    private DateTimeOffset _lastFlattenUtc;
+    private const int FLATTEN_RECOGNITION_WINDOW_SECONDS = 10;
 
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
@@ -82,12 +107,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     
     /// <summary>
     /// PHASE 2: Set callbacks for stream stand-down and notification service access.
+    /// Gap 5: blockInstrumentCallback invoked when IEA EnqueueAndWait fails (timeout/overflow); engine freezes instrument and stands down streams.
     /// </summary>
-    public void SetEngineCallbacks(Action<string, DateTimeOffset, string>? standDownStreamCallback, Func<object?>? getNotificationServiceCallback, Func<bool>? isExecutionAllowedCallback = null)
+    public void SetEngineCallbacks(
+        Action<string, DateTimeOffset, string>? standDownStreamCallback,
+        Func<object?>? getNotificationServiceCallback,
+        Func<bool>? isExecutionAllowedCallback = null,
+        Action<string, DateTimeOffset, string>? blockInstrumentCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
         _isExecutionAllowedCallback = isExecutionAllowedCallback;
+        _blockInstrumentCallback = blockInstrumentCallback;
     }
     
     /// <summary>
@@ -102,14 +133,106 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// Set NinjaTrader context (Account, Instrument) from Strategy host.
     /// Called by RobotSimStrategy after NT context is available.
     /// </summary>
-    public void SetNTContext(object account, object instrument)
+    /// <param name="account">NT Account.</param>
+    /// <param name="instrument">NT Instrument.</param>
+    /// <param name="engineExecutionInstrument">Engine's execution instrument (e.g., MNQ) — used for IEA key when IEA enabled.</param>
+    public void SetNTContext(object account, object instrument, string? engineExecutionInstrument = null)
     {
         _ntAccount = account;
         _ntInstrument = instrument;
         _ntContextSet = true;
+        _ieaEngineExecutionInstrument = engineExecutionInstrument;
+        
+        // Resolve IEA when use_instrument_execution_authority is enabled
+        if (_useInstrumentExecutionAuthority)
+        {
+            var accountName = GetAccountName(account);
+            var executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, instrument, engineExecutionInstrument);
+            _ieaAccountName = accountName;
+            _iea = InstrumentExecutionAuthorityRegistry.GetOrCreate(accountName, executionInstrumentKey,
+                () => new InstrumentExecutionAuthority(accountName, executionInstrumentKey, this, _log, _aggregationPolicy));
+            _iea.SetOnEnqueueFailureCallback(_blockInstrumentCallback);
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "IEA_BINDING", state: "ENGINE",
+                new
+                {
+                    account_name = accountName,
+                    execution_instrument_key = executionInstrumentKey,
+                    iea_instance_id = _iea.InstanceId,
+                    note = "IEA bound for execution routing"
+                }));
+        }
         
         // STEP 1: SIM Account Verification (MANDATORY) - now with real NT account
         VerifySimAccount();
+    }
+    
+    /// <summary>Get account name from NT account object.</summary>
+    private static string GetAccountName(object account)
+    {
+        if (account == null) return "";
+        try
+        {
+            dynamic dyn = account;
+            return dyn.Name as string ?? "";
+        }
+        catch { return ""; }
+    }
+    
+    /// <summary>
+    /// Get IEA identity for CRITICAL event payloads (when IEA enabled).
+    /// </summary>
+    private object? GetIeaIdentityForCriticalEvents()
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return null;
+        return new { iea_instance_id = _iea.InstanceId, execution_instrument_key = _iea.ExecutionInstrumentKey, account_name = _iea.AccountName };
+    }
+
+    /// <summary>
+    /// Gap 6: Ensure CRITICAL events include iea_instance_id when IEA enabled. Invariant: no CRITICAL without IEA context.
+    /// </summary>
+    internal void LogCriticalWithIeaContext(DateTimeOffset utcNow, string intentId, string instrument, string eventType, object data)
+    {
+        var payload = _iea != null ? MergeIeaContext(data, _iea) : data;
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, eventType, payload));
+    }
+
+    /// <summary>
+    /// Gap 6: EngineBase variant for CRITICAL events.
+    /// </summary>
+    internal void LogCriticalEngineWithIeaContext(DateTimeOffset utcNow, string tradingDate, string eventType, string state, object data)
+    {
+        var payload = _iea != null ? MergeIeaContext(data, _iea) : data;
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, eventType, state, payload));
+    }
+
+    private static System.Collections.Generic.Dictionary<string, object> MergeIeaContext(object data, InstrumentExecutionAuthority iea)
+    {
+        var dict = new System.Collections.Generic.Dictionary<string, object>();
+        if (data != null)
+        {
+            foreach (var p in data.GetType().GetProperties())
+                dict[p.Name] = p.GetValue(data);
+        }
+        dict["iea_instance_id"] = iea.InstanceId;
+        dict["execution_instrument_key"] = iea.ExecutionInstrumentKey;
+        return dict;
+    }
+
+    /// <summary>
+    /// Set whether to use Instrument Execution Authority (IEA).
+    /// Must be called before SetNTContext. Called by RobotEngine when execution policy has use_instrument_execution_authority.
+    /// </summary>
+    public void SetUseInstrumentExecutionAuthority(bool use)
+    {
+        _useInstrumentExecutionAuthority = use;
+    }
+
+    /// <summary>
+    /// Phase 2: Set aggregation/bracket policy for IEA. Must be called before SetNTContext when IEA is enabled.
+    /// </summary>
+    public void SetAggregationPolicy(AggregationPolicy? policy)
+    {
+        _aggregationPolicy = policy;
     }
 
     /// <summary>
@@ -199,6 +322,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        // Invariant 1: When IEA enabled, IEA must be bound (SetNTContext with engineExecutionInstrument)
+        if (_useInstrumentExecutionAuthority && _iea == null)
+        {
+            var error = "CRITICAL: IEA enabled but not bound - order submission blocked (IEA_BYPASS_ATTEMPTED)";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_BYPASS_ATTEMPTED", state: "ENGINE",
+                new { intent_id = intentId, instrument, reason = "IEA_ENABLED_BUT_NOT_BOUND", error }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
         try
         {
             return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
@@ -209,7 +341,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // Get Intent info for journal logging
             string tradingDate = "";
             string stream = "";
-            if (_intentMap.TryGetValue(intentId, out var entryIntent))
+            if (IntentMap.TryGetValue(intentId, out var entryIntent))
             {
                 tradingDate = entryIntent.TradingDate;
                 stream = entryIntent.Stream;
@@ -291,6 +423,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        // Invariant 1: When IEA enabled, IEA must be bound
+        if (_useInstrumentExecutionAuthority && _iea == null)
+        {
+            var error = "CRITICAL: IEA enabled but not bound - order submission blocked (IEA_BYPASS_ATTEMPTED)";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_BYPASS_ATTEMPTED", state: "ENGINE",
+                new { intent_id = intentId, instrument, reason = "IEA_ENABLED_BUT_NOT_BOUND", error }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
         try
         {
             return SubmitStopEntryOrderReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
@@ -300,7 +441,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // Get Intent info for journal logging
             string tradingDate = "";
             string stream = "";
-            if (_intentMap.TryGetValue(intentId, out var stopEntryIntent))
+            if (IntentMap.TryGetValue(intentId, out var stopEntryIntent))
             {
                 tradingDate = stopEntryIntent.TradingDate;
                 stream = stopEntryIntent.Stream;
@@ -334,7 +475,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             new { reason = "NINJATRADER_NOT_DEFINED", error }));
         throw new InvalidOperationException(error);
 #endif
-        HandleOrderUpdateReal(order, orderUpdate);
+        // Gap 2: When IEA enabled, route through queue so OrderMap mutations run on worker (single mutation lane).
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            _iea.EnqueueOrderUpdate(order, orderUpdate);
+        }
+        else
+        {
+            HandleOrderUpdateReal(order, orderUpdate);
+        }
     }
 
     /// <summary>
@@ -351,7 +500,22 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             new { reason = "NINJATRADER_NOT_DEFINED", error }));
         throw new InvalidOperationException(error);
 #endif
-        HandleExecutionUpdateReal(execution, order);
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            var key = $"{_iea.AccountName}:{_iea.ExecutionInstrumentKey}";
+            if (!_lastIeaExecUpdateRoutedUtc.TryGetValue(key, out var last) || (utcNow - last).TotalSeconds >= 1)
+            {
+                _lastIeaExecUpdateRoutedUtc[key] = utcNow;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_EXEC_UPDATE_ROUTED", state: "ENGINE",
+                    new { account_name = _iea.AccountName, execution_instrument_key = _iea.ExecutionInstrumentKey, iea_instance_id = _iea.InstanceId }));
+            }
+            _iea.EnqueueExecutionUpdate(execution, order);
+        }
+        else
+        {
+            HandleExecutionUpdateReal(execution, order);
+        }
     }
     
     /// <summary>
@@ -364,7 +528,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         // This prevents position accumulation bugs where protective orders only cover the delta
         
         // Record entry fill time for watchdog tracking
-        if (_orderMap.TryGetValue(intentId, out var entryOrderInfo))
+        if (OrderMap.TryGetValue(intentId, out var entryOrderInfo))
         {
             entryOrderInfo.EntryFillTime = utcNow;
             entryOrderInfo.ProtectiveStopAcknowledged = false;
@@ -692,6 +856,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 logData[prop.Name] = prop.GetValue(additionalData);
             }
         }
+
+        // Gap 3: Ensure CRITICAL logs include IEA context when IEA enabled.
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            logData["iea_instance_id"] = _iea.InstanceId;
+            logData["execution_instrument_key"] = _iea.ExecutionInstrumentKey;
+        }
         
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, eventType, logData));
     }
@@ -752,7 +923,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     internal void RegisterIntent(Intent intent)
     {
         var intentId = intent.ComputeIntentId();
-        _intentMap[intentId] = intent;
+        IntentMap[intentId] = intent;
         
         // Log intent registration for debugging
         _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, intent.Instrument, "INTENT_REGISTERED",
@@ -804,7 +975,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         string execution, 
         string policySource = "EXECUTION_POLICY_FILE")
     {
-        _intentPolicy[intentId] = new IntentPolicyExpectation
+        IntentPolicy[intentId] = new IntentPolicyExpectation
         {
             ExpectedQuantity = expectedQty,
             MaxQuantity = maxQty,
@@ -891,7 +1062,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // Get Intent info for journal logging
             string tradingDate = "";
             string stream = "";
-            if (_intentMap.TryGetValue(intentId, out var stopIntent))
+            if (IntentMap.TryGetValue(intentId, out var stopIntent))
             {
                 tradingDate = stopIntent.TradingDate;
                 stream = stopIntent.Stream;
@@ -971,7 +1142,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // Get Intent info for journal logging
             string tradingDate = "";
             string stream = "";
-            if (_intentMap.TryGetValue(intentId, out var targetIntent))
+            if (IntentMap.TryGetValue(intentId, out var targetIntent))
             {
                 tradingDate = targetIntent.TradingDate;
                 stream = targetIntent.Stream;
@@ -988,6 +1159,23 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             
             return OrderSubmissionResult.FailureResult($"Target order submission failed: {ex.Message}", utcNow);
         }
+    }
+
+    /// <summary>
+    /// Phase 3: Evaluate break-even. When IEA enabled, delegates to IEA. When not, runs BE logic (legacy path).
+    /// </summary>
+    public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)
+    {
+#if NINJATRADER
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            _iea.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+        }
+        else
+        {
+            EvaluateBreakEvenNonIEA(tickPrice, tickTimeFromEvent ?? DateTimeOffset.UtcNow, executionInstrument);
+        }
+#endif
     }
 
     /// <summary>
@@ -1017,7 +1205,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             // CRITICAL: Use tradingDate and stream from intent - empty strings never match journal keys
             var tradingDate = "";
             var stream = "";
-            if (_intentMap.TryGetValue(intentId, out var intentForBe))
+            if (IntentMap.TryGetValue(intentId, out var intentForBe))
             {
                 tradingDate = intentForBe.TradingDate ?? "";
                 stream = intentForBe.Stream ?? "";
@@ -1077,8 +1265,21 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// REAL RISK FIX: Flatten with retry logic (3 retries, short delay).
     /// Flatten is the last line of defense - if it fails due to transient issues,
     /// we must retry before giving up.
+    /// Gap 7: When IEA enabled, route through queue for serialization.
     /// </summary>
     private FlattenResult FlattenWithRetry(
+        string intentId,
+        string instrument,
+        DateTimeOffset utcNow)
+    {
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            return _iea.EnqueueFlattenAndWait(() => FlattenWithRetryCore(intentId, instrument, utcNow), 10000);
+        }
+        return FlattenWithRetryCore(intentId, instrument, utcNow);
+    }
+
+    private FlattenResult FlattenWithRetryCore(
         string intentId,
         string instrument,
         DateTimeOffset utcNow)
@@ -1166,7 +1367,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
         
         // Stand down stream if callback available
-        if (_intentMap.TryGetValue(intentId, out var intent))
+        if (IntentMap.TryGetValue(intentId, out var intent))
         {
             _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"FLATTEN_FAILED_ALL_RETRIES: {finalError}");
         }
@@ -1320,7 +1521,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     {
         const double UNPROTECTED_POSITION_TIMEOUT_SECONDS = 10.0;
         
-        foreach (var kvp in _orderMap)
+        foreach (var kvp in OrderMap)
         {
             var orderInfo = kvp.Value;
             
@@ -1352,7 +1553,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                         }));
                     
                     // Get intent to find stream
-                    if (_intentMap.TryGetValue(intentId, out var intent))
+                    if (IntentMap.TryGetValue(intentId, out var intent))
                     {
                         // SIMPLIFICATION: Use centralized fail-closed pattern
                         var failureReason = $"Unprotected position timeout ({UNPROTECTED_POSITION_TIMEOUT_SECONDS}s) - protective orders not acknowledged";
@@ -1405,7 +1606,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         CancelIntentOrders(intentId, utcNow);
         
         // Flatten intent exposure with retry logic
-        if (_intentMap.TryGetValue(intentId, out var intent))
+        if (IntentMap.TryGetValue(intentId, out var intent))
         {
             FlattenWithRetry(intentId, intent.Instrument, utcNow);
         }
@@ -1429,7 +1630,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
         
         // Stand down stream/intent (via callback)
-        if (_intentMap.TryGetValue(intentId, out var intentForCallback))
+        if (IntentMap.TryGetValue(intentId, out var intentForCallback))
         {
             _standDownStreamCallback?.Invoke(intentForCallback.Stream, utcNow, emergencyType);
         }
@@ -1439,8 +1640,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     /// Get active intents that need break-even monitoring.
     /// Returns intents with filled entries that haven't had BE triggered yet.
     /// 
-    /// CRITICAL FIX: Check execution journal instead of _orderMap because protective orders
-    /// overwrite entry orders in _orderMap (entry order is replaced with stop/target orders).
+    /// CRITICAL FIX: Check execution journal instead of OrderMap because protective orders
+    /// overwrite entry orders in OrderMap (entry order is replaced with stop/target orders).
     /// Execution journal is the source of truth for entry fill status.
     /// </summary>
     /// <param name="executionInstrument">Optional. When provided, only return intents for this execution instrument (e.g. MES, MYM).
@@ -1455,10 +1656,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     {
         var activeIntents = new List<(string, Intent, decimal, decimal, decimal?, string)>();
         
-        // CRITICAL FIX: Iterate over _intentMap instead of _orderMap
-        // _orderMap gets overwritten by protective orders (stop/target), so entry orders are lost
+        // CRITICAL FIX: Iterate over IntentMap instead of OrderMap
+        // OrderMap gets overwritten by protective orders (stop/target), so entry orders are lost
         // Execution journal is the authoritative source for entry fill status
-        foreach (var kvp in _intentMap)
+        foreach (var kvp in IntentMap)
         {
             var intentId = kvp.Key;
             var intent = kvp.Value;
@@ -1474,7 +1675,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
                 continue;
             
             // Check if entry has been filled using execution journal (source of truth)
-            // Execution journal tracks entry fills regardless of _orderMap state
+            // Execution journal tracks entry fills regardless of OrderMap state
             var tradingDate = intent.TradingDate ?? "";
             var stream = intent.Stream ?? "";
             
@@ -1606,53 +1807,4 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         return FlattenWithRetry(intentId, instrument, utcNow);
     }
 
-    /// <summary>
-    /// Order tracking info for callback correlation.
-    /// </summary>
-    private partial class OrderInfo
-    {
-        public string IntentId { get; set; } = "";
-        public string Instrument { get; set; } = "";
-        public string OrderId { get; set; } = "";
-        public string OrderType { get; set; } = ""; // ENTRY, STOP, TARGET
-        public string Direction { get; set; } = "";
-        public int Quantity { get; set; }
-        public decimal? Price { get; set; }
-        public string State { get; set; } = ""; // SUBMITTED, FILLED, REJECTED, CANCELLED
-
-        // Classification: true for entry intents (ENTRY and ENTRY_STOP)
-        public bool IsEntryOrder { get; set; }
-
-        // Partial fill handling
-        public int FilledQuantity { get; set; }
-        
-        // Watchdog tracking for unprotected positions
-        public DateTimeOffset? EntryFillTime { get; set; }
-        public bool ProtectiveStopAcknowledged { get; set; }
-        public bool ProtectiveTargetAcknowledged { get; set; }
-        
-        // Policy expectation snapshot (copied from _intentPolicy when OrderInfo is created)
-        public int ExpectedQuantity { get; set; }
-        public int MaxQuantity { get; set; }
-        public string PolicySource { get; set; } = "";
-        public string CanonicalInstrument { get; set; } = "";
-        public string ExecutionInstrument { get; set; } = "";
-        
-        // NT-specific: Store NT Order object for callbacks (only when NINJATRADER is defined)
-#if NINJATRADER
-        public object? NTOrder { get; set; } // NinjaTrader.Cbi.Order
-#endif
-    }
-    
-    /// <summary>
-    /// Intent policy expectation model for quantity invariant tracking.
-    /// </summary>
-    private sealed class IntentPolicyExpectation
-    {
-        public int ExpectedQuantity { get; set; }
-        public int MaxQuantity { get; set; }
-        public string PolicySource { get; set; } = "EXECUTION_POLICY_FILE";
-        public string CanonicalInstrument { get; set; } = "";
-        public string ExecutionInstrument { get; set; } = "";
-    }
 }

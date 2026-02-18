@@ -11,8 +11,10 @@ INGESTION INVARIANTS (WATCHDOG_INGESTION_HARDENING):
 """
 import json
 import logging
+import re
 import asyncio
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timezone
 from collections import defaultdict, deque
@@ -36,6 +38,50 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+# Execution policy path for canonical->execution instrument lookup
+_EXECUTION_POLICY_PATH = Path(__file__).parent.parent.parent / "configs" / "execution_policy.json"
+_execution_instrument_cache: Optional[Dict[str, str]] = None
+
+
+def _canonical_instrument_root(instrument: str) -> str:
+    """Extract canonical root from instrument (e.g. YM2 -> YM, NQ 03-26 -> NQ)."""
+    if not instrument:
+        return ""
+    m = re.match(r"^([A-Za-z]+)", str(instrument).strip().upper())
+    return m.group(1) if m else str(instrument).strip().upper()
+
+
+def _get_execution_instrument_for_canonical(canonical_instrument: str) -> Optional[str]:
+    """
+    Get the enabled execution instrument for a canonical market from execution policy.
+    E.g., YM -> MYM, NQ -> MNQ, CL -> MCL. Returns None if not found.
+    """
+    global _execution_instrument_cache
+    if not canonical_instrument:
+        return None
+    canonical = _canonical_instrument_root(canonical_instrument)
+    if not canonical:
+        return None
+    try:
+        if _execution_instrument_cache is None:
+            if not _EXECUTION_POLICY_PATH.exists():
+                return None
+            with open(_EXECUTION_POLICY_PATH, "r", encoding="utf-8") as f:
+                policy = json.load(f)
+            markets = policy.get("canonical_markets", {})
+            cache = {}
+            for canon, cfg in markets.items():
+                exec_instrs = cfg.get("execution_instruments", {})
+                for exec_inst, inst_cfg in exec_instrs.items():
+                    if inst_cfg.get("enabled"):
+                        cache[canon.upper()] = exec_inst
+                        break
+            _execution_instrument_cache = cache
+        return _execution_instrument_cache.get(canonical)
+    except Exception as e:
+        logger.debug(f"Failed to get execution instrument for {canonical}: {e}")
+        return None
 
 
 def _read_last_lines(path, n: int, encoding: str = "utf-8-sig") -> List[str]:
@@ -157,6 +203,14 @@ class IngestionTelemetry:
 
     def emit_stats(self, now: datetime, ingestion_lag_seconds: Optional[float]) -> Dict[str, Any]:
         self._last_stats_emit_utc = now
+        stats = self.get_latest_stats(now, ingestion_lag_seconds)
+        stats["event_type"] = "WATCHDOG_INGESTION_STATS"
+        return stats
+
+    def get_latest_stats(self, now: Optional[datetime] = None, ingestion_lag_seconds: Optional[float] = None) -> Dict[str, Any]:
+        """Get latest ingestion metrics (for API / debugging)."""
+        from datetime import timezone as tz
+        now = now or datetime.now(tz.utc)
         dr = list(self._tail_read_durations)
         dl = list(self._loop_durations)
         lp = list(self._lines_parsed)
@@ -167,7 +221,6 @@ class IngestionTelemetry:
         total_lines = sum(lp) if lp else 0
         lines_per_sec = total_lines / total_time_sec if total_time_sec > 0 else 0
         return {
-            "event_type": "WATCHDOG_INGESTION_STATS",
             "timestamp_utc": now.isoformat(),
             "avg_tail_read_ms": round(avg_tail, 2),
             "p95_tail_read_ms": round(p95_tail, 2),
@@ -175,6 +228,7 @@ class IngestionTelemetry:
             "ingestion_lag_seconds": round(ingestion_lag_seconds, 2) if ingestion_lag_seconds is not None else None,
             "lines_parsed_per_second": round(lines_per_sec, 1),
             "sample_count": len(dr),
+            "degraded": self.is_degraded(),
         }
 
     def is_degraded(self) -> bool:
@@ -568,7 +622,7 @@ class WatchdogAggregator:
             
             # Check if connection status needs initialization - rebuild from recent events
             # This handles initialization or state loss scenarios
-            # Note: connection_status defaults to "Connected" but may be Unknown if state_manager was reset
+            # Note: connection_status defaults to "Unknown" until we receive a connection event
             # We rebuild if status is Unknown OR if we've never seen a connection event
             if (
                 self._state_manager._connection_status == "Unknown"
@@ -1130,6 +1184,10 @@ class WatchdogAggregator:
                 "market_open": market_open
             }
     
+    def get_ingestion_stats(self) -> Dict:
+        """Get latest ingestion telemetry (tail read duration, loop duration, etc.)."""
+        return self._ingestion_telemetry.get_latest_stats()
+
     def get_risk_gate_status(self) -> Dict:
         """Get current risk gate status."""
         try:
@@ -1307,11 +1365,13 @@ class WatchdogAggregator:
                             else:
                                 slot_time_chicago = watchdog_slot_time
                         
+                        canonical = getattr(watchdog_info, 'instrument', None) or instrument
+                        exec_instr = getattr(watchdog_info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
-                            "instrument": getattr(watchdog_info, 'instrument', None) or instrument,  # Canonical instrument (DO NOT CHANGE)
-                            "execution_instrument": getattr(watchdog_info, 'execution_instrument', None),  # Full contract name (e.g., "MES 03-26")
+                            "instrument": canonical,  # Canonical instrument (DO NOT CHANGE)
+                            "execution_instrument": exec_instr,  # Execution instrument (e.g., MYM, MNQ) from events/ranges or policy
                             "session": getattr(watchdog_info, 'session', None) or session,
                             "state": getattr(watchdog_info, 'state', ''),
                             "committed": getattr(watchdog_info, 'committed', False),
@@ -1335,11 +1395,12 @@ class WatchdogAggregator:
                     else:
                         # No watchdog state - use timetable data with defaults for watchdog fields
                         # CRITICAL: Ensure ranges are None (not from yesterday)
+                        exec_instr = _get_execution_instrument_for_canonical(instrument)
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
                             "instrument": instrument,  # Canonical instrument (DO NOT CHANGE)
-                            "execution_instrument": None,  # Not available from timetable (will be set from events)
+                            "execution_instrument": exec_instr,  # From execution policy when not yet from events
                             "session": session,
                             "state": "",  # No state yet
                             "committed": False,
@@ -1400,10 +1461,13 @@ class WatchdogAggregator:
                     if slot_time_chicago == "":
                         slot_time_chicago = None
                     
+                    canonical = getattr(info, 'instrument', '')
+                    exec_instr = getattr(info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
                     streams.append({
                         "trading_date": trading_date,
                         "stream": stream,
-                        "instrument": getattr(info, 'instrument', ''),
+                        "instrument": canonical,
+                        "execution_instrument": exec_instr,
                         "session": getattr(info, 'session', None) or "",
                         "state": getattr(info, 'state', ''),
                         "committed": getattr(info, 'committed', False),
@@ -1453,10 +1517,13 @@ class WatchdogAggregator:
                             slot_time_chicago = slot_dt.strftime("%H:%M")
                         except Exception:
                             pass
+                    canonical = getattr(info, 'instrument', '')
+                    exec_instr = getattr(info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
                     streams.append({
                         "trading_date": trading_date,
                         "stream": stream,
-                        "instrument": getattr(info, 'instrument', ''),
+                        "instrument": canonical,
+                        "execution_instrument": exec_instr,
                         "session": getattr(info, 'session', None) or "",
                         "state": getattr(info, 'state', 'RANGE_LOCKED'),
                         "committed": False,

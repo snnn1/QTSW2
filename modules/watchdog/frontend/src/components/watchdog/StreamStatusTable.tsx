@@ -161,7 +161,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
               const streamPnl = pnl[stream.stream]
               const isCarryOver = stream.trading_date !== todayStr
               const dateLabel = stream.trading_date
-                ? (stream.trading_date === todayStr ? 'Today' : stream.trading_date)
+                ? stream.trading_date
                 : '-'
               
               return (

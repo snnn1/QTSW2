@@ -142,6 +142,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         };
     }
     
+    public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)
+    {
+        // DRYRUN: No-op
+    }
+
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         // DRYRUN: Log what would be cancelled, but do nothing

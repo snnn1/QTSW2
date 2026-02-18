@@ -130,6 +130,14 @@ public interface IExecutionAdapter
     /// <param name="snap">Account snapshot from GetAccountSnapshot</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Phase 3: Evaluate break-even triggers. When IEA enabled, delegates to IEA. Uses tick de-dupe when tickTimeFromEvent provided.
+    /// </summary>
+    /// <param name="tickPrice">Current tick price</param>
+    /// <param name="tickTimeFromEvent">Event timestamp from market data (for de-dupe). Null = use UtcNow fallback.</param>
+    /// <param name="executionInstrument">Execution instrument filter (e.g. MNQ, MGC)</param>
+    void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument);
 }
 
 /// <summary>

@@ -83,6 +83,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
+    /// Get execution instrument (e.g., MNQ, MGC) for IEA routing.
+    /// </summary>
+    public string GetExecutionInstrument() => _executionInstrument ?? "";
+
+    /// <summary>
     /// Pre-load execution journal cache for trading date.
     /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
     /// </summary>
@@ -874,10 +879,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 2: Set engine callbacks for protective order failure recovery
             if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
             {
+                simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
+                simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
-                    isExecutionAllowedCallback: () => IsExecutionAllowed()); // CRITICAL FIX: Pass recovery state check
+                    isExecutionAllowedCallback: () => IsExecutionAllowed(),
+                    blockInstrumentCallback: (instrument, now, reason) =>
+                    {
+                        StandDownStreamsForInstrument(instrument, now, reason);
+                        _healthMonitor?.ReportCritical("IEA_ENQUEUE_FAILURE_INSTRUMENT_BLOCKED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrument },
+                            { "reason", reason },
+                            { "policy", "IEA_FAIL_CLOSED_BLOCK_INSTRUMENT" },
+                            { "note", "IEA queue timeout or overflow — instrument blocked; no new intents until restart" }
+                        });
+                    }); // Gap 5: IEA EnqueueAndWait failure → block instrument
                 
                 // Wire coordinator to adapter
                 simAdapter.SetCoordinator(coordinator);

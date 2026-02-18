@@ -58,6 +58,147 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    // IIEAOrderExecutor implementation (Phase 2: IEA delegates order ops to adapter)
+    object IIEAOrderExecutor.CreateStopMarketOrder(string instrument, string direction, int quantity, decimal stopPrice, string tag, string? ocoGroup)
+    {
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        if (account == null || ntInstrument == null) throw new InvalidOperationException("NT context not set");
+        var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
+        var order = account.CreateOrder(ntInstrument, orderAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Day,
+            quantity, 0.0, (double)stopPrice, ocoGroup ?? "", tag, DateTime.MinValue, null);
+        SetOrderTag(order, tag);
+        if (!string.IsNullOrEmpty(ocoGroup)) order.Oco = ocoGroup;
+        return order;
+    }
+
+    void IIEAOrderExecutor.CancelOrders(IReadOnlyList<object> orders)
+    {
+        var account = _ntAccount as Account;
+        if (account == null || orders == null) return;
+        var ntOrders = orders.OfType<Order>().ToArray();
+        if (ntOrders.Length > 0) account.Cancel(ntOrders);
+    }
+
+    void IIEAOrderExecutor.SubmitOrders(IReadOnlyList<object> orders)
+    {
+        var account = _ntAccount as Account;
+        if (account == null || orders == null) return;
+        var ntOrders = orders.OfType<Order>().ToArray();
+        if (ntOrders.Length > 0) account.Submit(ntOrders);
+    }
+
+    void IIEAOrderExecutor.SetOrderTag(object order, string tag) => SetOrderTag(order as Order, tag);
+
+    string IIEAOrderExecutor.GetOrderTag(object order) => GetOrderTag(order as Order) ?? "";
+
+    string IIEAOrderExecutor.GetOrderId(object order) => (order as Order)?.OrderId ?? "";
+
+    void IIEAOrderExecutor.RecordSubmission(string intentId, string tradingDate, string stream, string instrument, string orderType, string brokerOrderId, DateTimeOffset utcNow) =>
+        _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, orderType, brokerOrderId, utcNow);
+
+    (string, string, decimal?, decimal?, decimal?, string?, string?) IIEAOrderExecutor.GetIntentInfo(string intentId)
+    {
+        var (td, stream, ep, sp, tp, dir, oco) = GetIntentInfo(intentId);
+        return (td, stream, ep, sp, tp, dir, oco);
+    }
+
+    object IIEAOrderExecutor.GetInstrument() => _ntInstrument!;
+
+    object IIEAOrderExecutor.GetAccount() => _ntAccount!;
+
+    OrderSubmissionResult IIEAOrderExecutor.SubmitProtectiveStop(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow) =>
+        SubmitProtectiveStop(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+
+    OrderSubmissionResult IIEAOrderExecutor.SubmitTargetOrder(string intentId, string instrument, string direction, decimal targetPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow) =>
+        SubmitTargetOrder(intentId, instrument, direction, targetPrice, quantity, ocoGroup, utcNow);
+
+    bool IIEAOrderExecutor.CanSubmitExit(string intentId, int quantity) =>
+        _coordinator == null || _coordinator.CanSubmitExit(intentId, quantity);
+
+    bool IIEAOrderExecutor.HasWorkingProtectivesForIntent(string intentId)
+    {
+        var account = _ntAccount as Account;
+        if (account?.Orders == null) return false;
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+        bool hasStop = false, hasTarget = false;
+        foreach (Order o in account.Orders)
+        {
+            var tag = GetOrderTag(o);
+            if (string.Equals(tag, stopTag, StringComparison.OrdinalIgnoreCase) &&
+                (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted))
+                hasStop = true;
+            if (string.Equals(tag, targetTag, StringComparison.OrdinalIgnoreCase) &&
+                (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted))
+                hasTarget = true;
+            if (hasStop && hasTarget) return true;
+        }
+        return hasStop && hasTarget;
+    }
+
+    (decimal? stopPrice, decimal? targetPrice) IIEAOrderExecutor.GetWorkingProtectivePrices(string intentId)
+    {
+        var (sp, tp, _, _) = ((IIEAOrderExecutor)this).GetWorkingProtectiveState(intentId);
+        return (sp, tp);
+    }
+
+    (decimal? stopPrice, decimal? targetPrice, int? stopQty, int? targetQty) IIEAOrderExecutor.GetWorkingProtectiveState(string intentId)
+    {
+        var account = _ntAccount as Account;
+        if (account?.Orders == null) return (null, null, null, null);
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+        decimal? stopPrice = null, targetPrice = null;
+        int? stopQty = null, targetQty = null;
+        foreach (Order o in account.Orders)
+        {
+            var tag = GetOrderTag(o);
+            if ((o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)) continue;
+            if (string.Equals(tag, stopTag, StringComparison.OrdinalIgnoreCase))
+            {
+                stopPrice = (decimal)o.StopPrice;
+                stopQty = o.Quantity;
+            }
+            if (string.Equals(tag, targetTag, StringComparison.OrdinalIgnoreCase))
+            {
+                targetPrice = (decimal)o.LimitPrice;
+                targetQty = o.Quantity;
+            }
+        }
+        return (stopPrice, targetPrice, stopQty, targetQty);
+    }
+
+    bool IIEAOrderExecutor.IsExecutionAllowed() =>
+        _isExecutionAllowedCallback == null || _isExecutionAllowedCallback();
+
+    IReadOnlyList<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> IIEAOrderExecutor.GetActiveIntentsForBEMonitoring(string? executionInstrument) =>
+        GetActiveIntentsForBEMonitoring(executionInstrument);
+
+    OrderModificationResult IIEAOrderExecutor.ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow) =>
+        ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow);
+
+    decimal IIEAOrderExecutor.GetTickSize()
+    {
+        var inst = _ntInstrument as Instrument;
+        return inst?.MasterInstrument != null ? (decimal)inst.MasterInstrument.TickSize : 0.25m;
+    }
+
+    FlattenResult IIEAOrderExecutor.Flatten(string intentId, string instrument, DateTimeOffset utcNow) =>
+        Flatten(intentId, instrument, utcNow);
+
+    void IIEAOrderExecutor.StandDownStream(string streamId, DateTimeOffset utcNow, string reason) =>
+        _standDownStreamCallback?.Invoke(streamId, utcNow, reason);
+
+    void IIEAOrderExecutor.ProcessExecutionUpdate(object execution, object order) =>
+        HandleExecutionUpdateReal(execution, order);
+
+    void IIEAOrderExecutor.ProcessOrderUpdate(object order, object orderUpdate) =>
+        HandleOrderUpdateReal(order, orderUpdate);
+
+    void IIEAOrderExecutor.FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) =>
+        FailClosed(intentId, intent, failureReason, eventType, notificationKey, notificationTitle, notificationMessage, stopResult, targetResult, additionalData, utcNow);
+
     /// <summary>
     /// Check if executionInstrument matches the strategy's NinjaTrader Instrument.
     /// Handles both root-only names (e.g., "MGC") and full contract names (e.g., "MGC 04-26").
@@ -114,11 +255,11 @@ public sealed partial class NinjaTraderSimAdapter
 
     /// <summary>
     /// Helper method to get Intent info for journal logging.
-    /// Returns tradingDate, stream, and intent prices from _intentMap if available.
+    /// Returns tradingDate, stream, and intent prices from IntentMap if available.
     /// </summary>
     private (string tradingDate, string stream, decimal? entryPrice, decimal? stopPrice, decimal? targetPrice, string? direction, string? ocoGroup) GetIntentInfo(string intentId)
     {
-        if (_intentMap.TryGetValue(intentId, out var intent))
+        if (IntentMap.TryGetValue(intentId, out var intent))
         {
             return (intent.TradingDate, intent.Stream, intent.EntryPrice, intent.StopPrice, intent.TargetPrice, intent.Direction, null);
         }
@@ -192,7 +333,7 @@ public sealed partial class NinjaTraderSimAdapter
 
         // EXECUTION AUDIT FIX 1: Prevent multiple entry orders for same intent
         // CRITICAL: Check if entry order already exists for this intent
-        if (_orderMap.TryGetValue(intentId, out var existingOrder))
+        if (OrderMap.TryGetValue(intentId, out var existingOrder))
         {
             // Check if existing order is an entry order and still active
             if (existingOrder.IsEntryOrder && 
@@ -307,7 +448,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Pre-submission invariant check
-            if (!_intentPolicy.TryGetValue(intentId, out var expectation))
+            if (!IntentPolicy.TryGetValue(intentId, out var expectation))
             {
                 // HARD BLOCK: expectation missing (fail-closed by default)
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
@@ -329,7 +470,7 @@ public sealed partial class NinjaTraderSimAdapter
 
             var expectedQty = expectation.ExpectedQuantity;
             var maxQty = expectation.MaxQuantity;
-            var filledQty = _orderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
+            var filledQty = OrderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
             var remainingAllowed = expectedQty - filledQty;
 
             // Get Chart Trader quantity if accessible
@@ -734,7 +875,7 @@ public sealed partial class NinjaTraderSimAdapter
                             }));
                         
                         // Remove from order map if already added
-                        _orderMap.TryRemove(intentId, out _);
+                        OrderMap.TryRemove(intentId, out _);
                         
                         return OrderSubmissionResult.FailureResult(
                             $"Order tag verification failed after retry: {error}. Order creation aborted (fail-closed).", 
@@ -768,7 +909,7 @@ public sealed partial class NinjaTraderSimAdapter
                         }));
                     
                     // Remove from order map if already added
-                    _orderMap.TryRemove(intentId, out _);
+                    OrderMap.TryRemove(intentId, out _);
                     
                     return OrderSubmissionResult.FailureResult(
                         $"Order tag verification retry failed: {ex.Message}. Order creation aborted (fail-closed).", 
@@ -792,8 +933,8 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             
-            // Copy policy expectation from _intentPolicy if available
-            if (_intentPolicy.TryGetValue(intentId, out var expectationForOrder))
+            // Copy policy expectation from IntentPolicy if available
+            if (IntentPolicy.TryGetValue(intentId, out var expectationForOrder))
             {
                 orderInfo.ExpectedQuantity = expectationForOrder.ExpectedQuantity;
                 orderInfo.MaxQuantity = expectationForOrder.MaxQuantity;
@@ -813,7 +954,7 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
             }
             
-            _orderMap[intentId] = orderInfo;
+            OrderMap[intentId] = orderInfo;
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -941,7 +1082,7 @@ public sealed partial class NinjaTraderSimAdapter
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
 
-        if (!_orderMap.TryGetValue(intentId, out var orderInfo))
+        if (!OrderMap.TryGetValue(intentId, out var orderInfo))
         {
             // CRITICAL FIX: Handle execution updates for untracked orders gracefully
             // This can happen if:
@@ -1139,7 +1280,7 @@ public sealed partial class NinjaTraderSimAdapter
                 
                 // Get intent to find stream
                 string? stream = null;
-                if (_intentMap.TryGetValue(intentId, out var intent))
+                if (IntentMap.TryGetValue(intentId, out var intent))
                 {
                     stream = intent.Stream;
                     
@@ -1167,7 +1308,7 @@ public sealed partial class NinjaTraderSimAdapter
                         notificationService.EnqueueNotification($"PROTECTIVE_REJECTED:{intentId}", title, message, priority: 2); // Emergency priority
                     }
                     
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_FLATTENED",
+                    LogCriticalWithIeaContext(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_FLATTENED",
                         new
                         {
                             intent_id = intentId,
@@ -1182,12 +1323,12 @@ public sealed partial class NinjaTraderSimAdapter
                             flatten_error = flattenResult.ErrorMessage,
                             failure_reason = failureReason,
                             note = "Position flattened due to protective order rejection by broker (fail-closed behavior)"
-                        }));
+                        });
                 }
                 else
                 {
                     // Intent not found - log error but still log rejection
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_INTENT_NOT_FOUND",
+                    LogCriticalWithIeaContext(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_ORDER_REJECTED_INTENT_NOT_FOUND",
                         new
                         {
                             intent_id = intentId,
@@ -1196,7 +1337,7 @@ public sealed partial class NinjaTraderSimAdapter
                             broker_order_id = order.OrderId,
                             error = fullErrorMsg,
                             note = "Protective order rejected but intent not found - cannot flatten (orphan rejection)"
-                        }));
+                        });
                     
                     // Still log the rejection
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REJECTED",
@@ -1267,7 +1408,7 @@ public sealed partial class NinjaTraderSimAdapter
     {
         context = default;
         
-        if (!_intentMap.TryGetValue(intentId, out var intent))
+        if (!IntentMap.TryGetValue(intentId, out var intent))
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "INTENT_NOT_FOUND");
@@ -1283,7 +1424,7 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 var flattenResult = Flatten(intentId, instrument, utcNow);
                 
-                _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
+                LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
                     new
                     {
                         intent_id = intentId,
@@ -1296,8 +1437,8 @@ public sealed partial class NinjaTraderSimAdapter
                         action_taken = "EXECUTION_BLOCKED_AND_FLATTENED",
                         flatten_success = flattenResult.Success,
                         flatten_error = flattenResult.ErrorMessage,
-                        note = "Intent not found in _intentMap - orphan fill logged, position flattened (fail-closed)"
-                    }));
+                        note = "Intent not found in IntentMap - orphan fill logged, position flattened (fail-closed)"
+                    });
                 
                 // Raise high-priority alert if flatten succeeded
                 if (flattenResult.Success)
@@ -1324,7 +1465,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             catch (Exception ex)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_FLATTEN_EXCEPTION", "ENGINE",
+                LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_FLATTEN_EXCEPTION", "ENGINE",
                     new
                     {
                         intent_id = intentId,
@@ -1338,7 +1479,7 @@ public sealed partial class NinjaTraderSimAdapter
                         exception_type = ex.GetType().Name,
                         action_taken = "EXECUTION_BLOCKED_FLATTEN_EXCEPTION",
                         note = "CRITICAL: Intent not found and flatten operation threw exception - MANUAL INTERVENTION REQUIRED"
-                    }));
+                    });
                 
                 // Critical alert for flatten exception
                 var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -1451,7 +1592,7 @@ public sealed partial class NinjaTraderSimAdapter
             File.AppendAllText(orphanFile, json + "\n");
             
             // Also log as CRITICAL event
-            _log.Write(RobotEvents.EngineBase(utcNow, stream ?? "", "ORPHAN_FILL_CRITICAL", "ENGINE",
+            LogCriticalEngineWithIeaContext(utcNow, stream ?? "", "ORPHAN_FILL_CRITICAL", "ENGINE",
                 new
                 {
                     intent_id = intentId,
@@ -1463,8 +1604,9 @@ public sealed partial class NinjaTraderSimAdapter
                     stream = stream ?? "UNKNOWN",
                     reason = reason,
                     orphan_file = orphanFile,
-                    action_taken = "EXECUTION_BLOCKED"
-                }));
+                    action_taken = "EXECUTION_BLOCKED",
+                    account_name = _iea?.AccountName
+                });
         }
         catch (Exception ex)
         {
@@ -1491,6 +1633,14 @@ public sealed partial class NinjaTraderSimAdapter
         var order = orderObj as Order;
         if (execution == null || order == null) return;
 
+        // Gap 3: Deduplicate execution callbacks before any state mutation
+        if (_useInstrumentExecutionAuthority && _iea != null && _iea.TryMarkAndCheckDuplicate(executionObj, orderObj))
+        {
+            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_SKIPPED",
+                new { broker_order_id = order.OrderId, note = "Duplicate execution callback skipped (Gap 3 dedup)" }));
+            return;
+        }
+
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
@@ -1498,7 +1648,7 @@ public sealed partial class NinjaTraderSimAdapter
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
         
-        // CRITICAL FIX: Determine order type from tag (STOP/TARGET suffix) before looking up in _orderMap
+        // CRITICAL FIX: Determine order type from tag (STOP/TARGET suffix) before looking up in OrderMap
         // Protective orders have tags like QTSW2:{intentId}:STOP or QTSW2:{intentId}:TARGET
         // Entry orders have tags like QTSW2:{intentId}
         string? orderTypeFromTag = null;
@@ -1520,11 +1670,35 @@ public sealed partial class NinjaTraderSimAdapter
         // CRITICAL FIX: Fail-closed behavior for untracked fills
         // If a fill can't be tracked, the position still exists in NinjaTrader but is unprotected
         // We MUST flatten immediately to prevent unprotected position accumulation
+        // EXCEPTION: When we call Flatten(), the broker creates a close order with no QTSW2 tag.
+        // That fill would be untracked - don't flatten again (would cause redundant flatten cascade).
         if (string.IsNullOrEmpty(intentId))
         {
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             
-            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "EXECUTION_UPDATE_UNTrackED_FILL_CRITICAL",
+            // Broker flatten recognition: if we recently called Flatten for this instrument,
+            // this fill is likely our own flatten order - don't flatten again
+            lock (_flattenRecognitionLock)
+            {
+                if (!string.IsNullOrEmpty(_lastFlattenInstrument) &&
+                    string.Equals(_lastFlattenInstrument, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    (utcNow - _lastFlattenUtc).TotalSeconds < FLATTEN_RECOGNITION_WINDOW_SECONDS)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "BROKER_FLATTEN_FILL_RECOGNIZED",
+                        new
+                        {
+                            broker_order_id = order.OrderId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            seconds_since_flatten = (utcNow - _lastFlattenUtc).TotalSeconds,
+                            note = "Fill has no QTSW2 tag but we recently called Flatten for this instrument - treating as broker flatten order fill, skipping redundant flatten"
+                        }));
+                    CheckAllInstrumentsForFlatPositions(utcNow);
+                    return;
+                }
+            }
+            
+            LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_UPDATE_UNTrackED_FILL_CRITICAL",
                 new 
                 { 
                     error = "Execution update (fill) received for order with missing/invalid tag - position may exist but is untracked",
@@ -1534,8 +1708,9 @@ public sealed partial class NinjaTraderSimAdapter
                     fill_quantity = fillQuantity,
                     instrument = instrument,
                     action = "FLATTEN_IMMEDIATELY",
-                    note = "CRITICAL: Fill happened but can't be tracked. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
-                }));
+                    note = "CRITICAL: Fill happened but can't be tracked. Flattening position immediately (fail-closed) to prevent unprotected accumulation.",
+                    account_name = _iea?.AccountName
+                });
             
             // CRITICAL: Flatten position immediately (fail-closed)
             // The fill happened in NinjaTrader, so we must flatten to prevent unprotected position
@@ -1545,7 +1720,7 @@ public sealed partial class NinjaTraderSimAdapter
                 // Use a dummy intent_id to flatten instrument position
                 // FlattenIntentReal flattens the entire instrument anyway, so this works
                 var flattenResult = Flatten("UNKNOWN_UNTrackED_FILL", instrument, utcNow);
-                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "UNTrackED_FILL_FLATTENED",
+                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTENED",
                     new
                     {
                         broker_order_id = order.OrderId,
@@ -1554,7 +1729,7 @@ public sealed partial class NinjaTraderSimAdapter
                         flatten_success = flattenResult.Success,
                         flatten_error = flattenResult.ErrorMessage,
                         note = "Position flattened due to untracked fill (fail-closed behavior)"
-                    }));
+                    });
                 
                 // Alert if flatten succeeded (info) or failed (critical)
                 var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -1576,7 +1751,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             catch (Exception ex)
             {
-                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_FAILED",
+                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_FAILED",
                     new
                     {
                         error = ex.Message,
@@ -1585,7 +1760,7 @@ public sealed partial class NinjaTraderSimAdapter
                         fill_price = fillPrice,
                         fill_quantity = fillQuantity,
                         note = "CRITICAL: Failed to flatten untracked fill position - manual intervention required"
-                    }));
+                    });
                 
                 // Critical alert for flatten failure
                 var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -1604,20 +1779,20 @@ public sealed partial class NinjaTraderSimAdapter
             return; // Fail-closed: don't process untracked fill
         }
 
-        // CRITICAL FIX: Handle race condition where fill arrives before order is fully added to _orderMap
+        // CRITICAL FIX: Handle race condition where fill arrives before order is fully added to OrderMap
         // This can happen when order state is "Initialized" - order is being submitted but fill arrives immediately
-        // CRITICAL FIX: Handle protective orders that aren't in _orderMap
-        // Protective orders (STOP/TARGET) are not always added to _orderMap, but we can create OrderInfo from tag
+        // CRITICAL FIX: Handle protective orders that aren't in OrderMap
+        // Protective orders (STOP/TARGET) are not always added to OrderMap, but we can create OrderInfo from tag
         OrderInfo? orderInfo = null;
         bool orderInfoCreatedFromTag = false;
         
-        if (!_orderMap.TryGetValue(intentId, out orderInfo))
+        if (!OrderMap.TryGetValue(intentId, out orderInfo))
         {
             // If this is a protective order (detected from tag), create OrderInfo on the fly
             if (isProtectiveOrder && !string.IsNullOrEmpty(orderTypeFromTag) && !string.IsNullOrEmpty(intentId))
             {
                 // Get intent to get direction and instrument
-                if (_intentMap.TryGetValue(intentId, out var intent))
+                if (IntentMap.TryGetValue(intentId, out var intent))
                 {
                     orderInfo = new OrderInfo
                     {
@@ -1644,7 +1819,7 @@ public sealed partial class NinjaTraderSimAdapter
                             intent_id = intentId,
                             fill_price = fillPrice,
                             fill_quantity = fillQuantity,
-                            note = "Protective order fill tracked from tag (order not in _orderMap - created OrderInfo on the fly)"
+                            note = "Protective order fill tracked from tag (order not in OrderMap - created OrderInfo on the fly)"
                         }));
                 }
             }
@@ -1655,32 +1830,70 @@ public sealed partial class NinjaTraderSimAdapter
         {
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             var orderState = order.OrderState;
-            
-            // RACE CONDITION FIX: If order is in Initialized state, wait briefly and retry
-            // Order is added to _orderMap BEFORE submission (line 706), but there might be a threading visibility issue
-            // or the fill is arriving from a different order instance
-            if (orderState == OrderState.Initialized)
+
+            // MULTI-INSTANCE FIX: When multiple strategy instances run for same instrument (e.g. two MNQ charts),
+            // all receive execution callbacks. Only the instance that submitted has the order in OrderMap.
+            // If we have NO orders for this instrument, we're the wrong instance - skip (don't flatten).
+            // The instance that submitted will process the fill and place protective orders.
+            // IEA: When use_instrument_execution_authority is enabled, we use shared maps - wrong-instance skip
+            // is demoted to diagnostic only (don't skip) so real unknown fills are not suppressed.
+            // CRITICAL: Use IsSameInstrument so NQ (order.MasterInstrument.Name) matches MNQ (orderInfo.Instrument).
+            // Matching logic only — does NOT affect IEA registry keying; (account, MNQ) and (account, NQ) remain distinct.
+            var hasAnyOrderForInstrument = OrderMap.Values.Any(oi =>
+                ExecutionInstrumentResolver.IsSameInstrument(oi.Instrument, instrument));
+            if (!hasAnyOrderForInstrument)
             {
-                // EXECUTION AUDIT FIX 3: Increased retry delay from 50ms to 100ms for better race condition resolution
-                // Brief wait for order to be added to map (max 3 retries, 100ms each)
-                const int MAX_RETRIES = 3;
-                const int RETRY_DELAY_MS = 100; // Increased from 50ms to improve race condition resolution
-                
-                bool found = false;
-                for (int retry = 0; retry < MAX_RETRIES; retry++)
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                    _useInstrumentExecutionAuthority ? "EXECUTION_UPDATE_WRONG_INSTANCE_DIAGNOSTIC" : "EXECUTION_UPDATE_SKIPPED_WRONG_INSTANCE",
+                    new
+                    {
+                        broker_order_id = order.OrderId,
+                        tag = encodedTag,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        iea_enabled = _useInstrumentExecutionAuthority,
+                        note = _useInstrumentExecutionAuthority
+                            ? "Order not in map and no orders for instrument - IEA enabled so continuing (diagnostic only, not skipping)"
+                            : "Order not in map and we have no orders for this instrument - likely wrong instance (multiple charts), skipping to let submitting instance handle"
+                    }));
+                if (!_useInstrumentExecutionAuthority)
+                    return;
+            }
+
+            // RACE CONDITION FIX: Retry lookup when order not in map (single-instance MNQ incident).
+            // Fill can arrive before order is visible in OrderMap (same-tick sim fill, threading).
+            // Previously only retried when orderState==Initialized; now retry for ALL states.
+            const int MAX_RETRIES = 5; // Increased from 3 for same-tick fill race
+            const int RETRY_DELAY_MS = 50; // Shorter delay, more retries
+            bool found = false;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_ORDER_MAP_RETRY",
+                new
                 {
+                    broker_order_id = order.OrderId,
+                    tag = encodedTag,
+                    intent_id = intentId,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    order_state = orderState.ToString(),
+                    order_map_count = OrderMap.Count,
+                    order_map_intent_ids = OrderMap.Keys.Take(10).ToList(),
+                    max_retries = MAX_RETRIES,
+                    note = "Order not in map - retrying lookup (race condition fix for single-instance fill)"
+                }));
+            for (int retry = 0; retry < MAX_RETRIES; retry++)
+            {
+                if (retry > 0)
+                    System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+
+                if (OrderMap.TryGetValue(intentId, out orderInfo))
+                {
+                    found = true;
                     if (retry > 0)
                     {
-                        System.Threading.Thread.Sleep(RETRY_DELAY_MS);
-                    }
-                    
-                    if (_orderMap.TryGetValue(intentId, out orderInfo))
-                    {
-                        found = true;
                         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_RACE_CONDITION_RESOLVED",
-                            new 
-                            { 
-                                broker_order_id = order.OrderId, 
+                            new
+                            {
+                                broker_order_id = order.OrderId,
                                 tag = encodedTag,
                                 intent_id = intentId,
                                 fill_price = fillPrice,
@@ -1689,14 +1902,15 @@ public sealed partial class NinjaTraderSimAdapter
                                 order_state = orderState.ToString(),
                                 note = "Fill arrived before order was visible in map - retry succeeded (race condition resolved)"
                             }));
-                        break; // Found it - continue processing below
                     }
+                    break;
                 }
-                
-                if (!found)
+            }
+
+            if (!found)
                 {
                     // Still not found after retries - flatten (fail-closed)
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
+                    LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
                         new 
                         { 
                             error = "Execution update (fill) received for untracked order - order not found in map after retries",
@@ -1709,14 +1923,15 @@ public sealed partial class NinjaTraderSimAdapter
                             order_state = orderState.ToString(),
                             retry_count = MAX_RETRIES,
                             action = "FLATTEN_IMMEDIATELY",
-                            note = "CRITICAL: Fill happened but order not in tracking map after retries. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
-                        }));
+                            note = "CRITICAL: Fill happened but order not in tracking map after retries. Flattening position immediately (fail-closed) to prevent unprotected accumulation.",
+                            account_name = _iea?.AccountName
+                        });
                     
                     try
                     {
                         var flattenResult = Flatten(intentId, instrument, utcNow);
                         
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
+                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
                             new
                             {
                                 broker_order_id = order.OrderId,
@@ -1726,7 +1941,7 @@ public sealed partial class NinjaTraderSimAdapter
                                 flatten_success = flattenResult.Success,
                                 flatten_error = flattenResult.ErrorMessage,
                                 note = "Position flattened due to untracked order fill (fail-closed behavior)"
-                            }));
+                            });
                         
                         // Alert if flatten succeeded (info) or failed (critical)
                         var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -1748,7 +1963,7 @@ public sealed partial class NinjaTraderSimAdapter
                     }
                     catch (Exception ex)
                     {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
+                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
                             new
                             {
                                 error = ex.Message,
@@ -1756,72 +1971,17 @@ public sealed partial class NinjaTraderSimAdapter
                                 broker_order_id = order.OrderId,
                                 intent_id = intentId,
                                 note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
-                            }));
+                            });
+                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                        if (notificationService != null)
+                        {
+                            var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
+                            var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
+                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3);
+                        }
                     }
-                    
                     return; // Fail-closed: don't process untracked fill
                 }
-            }
-            else
-            {
-                // Order not in Initialized state - immediate flatten (fail-closed)
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
-                    new 
-                    { 
-                        error = "Execution update (fill) received for untracked order - position may exist but is untracked",
-                        broker_order_id = order.OrderId, 
-                        tag = encodedTag,
-                        intent_id = intentId,
-                        fill_price = fillPrice,
-                        fill_quantity = fillQuantity,
-                        instrument = instrument,
-                        order_state = orderState.ToString(),
-                        action = "FLATTEN_IMMEDIATELY",
-                        note = "CRITICAL: Fill happened but order not in tracking map. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
-                    }));
-                
-                try
-                {
-                    var flattenResult = Flatten(intentId, instrument, utcNow);
-                    
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
-                        new
-                        {
-                            broker_order_id = order.OrderId,
-                            intent_id = intentId,
-                            fill_price = fillPrice,
-                            fill_quantity = fillQuantity,
-                            flatten_success = flattenResult.Success,
-                            flatten_error = flattenResult.ErrorMessage,
-                            note = "Position flattened due to untracked order fill (fail-closed behavior)"
-                        }));
-                }
-                catch (Exception ex)
-                {
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
-                        new
-                        {
-                            error = ex.Message,
-                            exception_type = ex.GetType().Name,
-                            broker_order_id = order.OrderId,
-                            intent_id = intentId,
-                            fill_price = fillPrice,
-                            fill_quantity = fillQuantity,
-                            note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
-                        }));
-                    
-                    // Critical alert for flatten failure
-                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                    if (notificationService != null)
-                    {
-                        var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
-                        var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
-                        notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
-                    }
-                }
-                
-                return; // Fail-closed: don't process untracked fill
-            }
         }
 
         // Track cumulative fills for partial-fill safety
@@ -1830,9 +1990,9 @@ public sealed partial class NinjaTraderSimAdapter
         
         // Get expectation for fill accounting
         var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity : 
-            (_intentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
+            (IntentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
         var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
-            (_intentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
+            (IntentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
         var remainingQty = expectedQty - filledTotal;
         var overfill = filledTotal > expectedQty;
         
@@ -1875,22 +2035,70 @@ public sealed partial class NinjaTraderSimAdapter
         
         // Explicit Entry vs Exit Classification
         // CRITICAL FIX: Use orderTypeFromTag to determine if it's an entry or exit order
-        // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry order in _orderMap)
+        // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry order in OrderMap)
         bool isEntryFill = !isProtectiveOrder && orderInfo.IsEntryOrder == true;
         if (isEntryFill)
         {
-            // Entry fill
-            _executionJournal.RecordEntryFill(
-                context.IntentId, 
-                context.TradingDate, 
-                context.Stream,
-                fillPrice, 
-                fillQuantity,  // DELTA ONLY - not filledTotal
-                utcNow, 
-                context.ContractMultiplier, 
-                context.Direction,
-                context.ExecutionInstrument, 
-                context.CanonicalInstrument);
+            // Entry fill - handle aggregated orders (multiple streams, one broker order)
+            var intentIdsToUpdate = orderInfo.AggregatedIntentIds ?? new List<string> { context.IntentId };
+            var isAggregated = intentIdsToUpdate.Count > 1;
+
+            // Deterministic partial-fill allocation: allocate in lexicographic order, first fill goes to intentIds[0]
+            // until its policy qty satisfied, then next. Track cumulative per intent.
+            // Phase 2: When IEA enabled, IEA owns allocation; otherwise adapter does it.
+            var allocations = (_useInstrumentExecutionAuthority && _iea != null)
+                ? _iea.AllocateFillToIntents(intentIdsToUpdate, fillQuantity, orderInfo)
+                : AllocateFillToIntents(intentIdsToUpdate, fillQuantity, orderInfo);
+
+            foreach (var alloc in allocations)
+            {
+                var allocIntentId = alloc.Item1;
+                var allocQty = alloc.Item2;
+                if (allocQty <= 0) continue;
+                if (!IntentMap.TryGetValue(allocIntentId, out Intent? allocIntent) || allocIntent == null) continue;
+                var allocContext = new IntentContext
+                {
+                    IntentId = allocIntentId,
+                    TradingDate = allocIntent.TradingDate ?? context.TradingDate,
+                    Stream = allocIntent.Stream ?? context.Stream,
+                    Direction = allocIntent.Direction ?? context.Direction,
+                    ExecutionInstrument = context.ExecutionInstrument,
+                    CanonicalInstrument = context.CanonicalInstrument,
+                    ContractMultiplier = context.ContractMultiplier,
+                    Tag = context.Tag
+                };
+                _executionJournal.RecordEntryFill(
+                    allocContext.IntentId,
+                    allocContext.TradingDate,
+                    allocContext.Stream,
+                    fillPrice,
+                    allocQty,
+                    utcNow,
+                    allocContext.ContractMultiplier,
+                    allocContext.Direction,
+                    allocContext.ExecutionInstrument,
+                    allocContext.CanonicalInstrument);
+                _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, allocContext.ExecutionInstrument, allocContext.Direction ?? "", utcNow);
+            }
+
+            if (isAggregated && allocations.Count > 0)
+            {
+                var allocDict = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                foreach (var a in allocations)
+                    allocDict[a.Item1] = a.Item2;
+                var cumulative = orderInfo.AggregatedFilledByIntent != null
+                    ? new Dictionary<string, int>(orderInfo.AggregatedFilledByIntent, StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "AGG_ENTRY_FILL_ALLOCATED",
+                    new
+                    {
+                        fill_qty = fillQuantity,
+                        allocations = allocDict,
+                        cumulative_qty_per_intent = cumulative,
+                        broker_order_id = order.OrderId,
+                        note = "Deterministic allocation in lexicographic order for partial fills"
+                    }));
+            }
             
             // Log fill event
             if (filledTotal < orderInfo.Quantity)
@@ -1922,12 +2130,15 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
             }
             
-            // Register entry fill with coordinator
-            if (_intentMap.TryGetValue(intentId, out var entryIntent))
+            // Register entry fill with coordinator and HandleEntryFill for protective orders
+            if (IntentMap.TryGetValue(intentId, out var entryIntent))
             {
-                // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
-                // OnEntryFill does: exposure.EntryFilledQty += qty, so passing cumulative totals causes double-counting
-                _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+                // CRITICAL FIX: For aggregated orders, we already called OnEntryFill for each intent in the loop above.
+                // Do NOT call again for primary - that would double-count.
+                if (!isAggregated)
+                {
+                    _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
+                }
                 
                 // CRITICAL FIX: Check if position is now flat after entry fill - if so, cancel entry stop orders
                 // This handles manual position closures (user clicks "Flatten" in NinjaTrader UI) that happen
@@ -1938,7 +2149,11 @@ public sealed partial class NinjaTraderSimAdapter
                 // HandleEntryFill needs TOTAL filled quantity to submit protective orders that cover the ENTIRE position
                 // For incremental fills, protective orders must be updated to cover cumulative position, not just delta
                 // filledTotal is already updated: orderInfo.FilledQuantity += fillQuantity (line 1372)
-                HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
+                // Phase 2: When IEA is enabled, IEA owns HandleEntryFill; otherwise adapter handles it
+                if (_useInstrumentExecutionAuthority && _iea != null)
+                    _iea.HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
+                else
+                    HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
             }
             else
             {
@@ -1947,7 +2162,7 @@ public sealed partial class NinjaTraderSimAdapter
                 _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_ERROR", "ENGINE",
                     new 
                     { 
-                        error = "Intent not found in _intentMap after context resolution - defensive check",
+                        error = "Intent not found in IntentMap after context resolution - defensive check",
                         intent_id = intentId,
                         fill_price = fillPrice,
                         fill_quantity = filledTotal,
@@ -1964,7 +2179,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
                     
-                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
+                    LogCriticalEngineWithIeaContext(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
                         new
                         {
                             intent_id = intentId,
@@ -1975,7 +2190,7 @@ public sealed partial class NinjaTraderSimAdapter
                             flatten_success = flattenResult.Success,
                             flatten_error = flattenResult.ErrorMessage,
                             note = "Position flattened due to missing intent - protective orders could not be placed"
-                        }));
+                        });
                     
                     // Stand down stream
                     _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
@@ -1992,7 +2207,7 @@ public sealed partial class NinjaTraderSimAdapter
                 catch (Exception ex)
                 {
                     // Log flatten failure but don't throw - we've already logged the error
-                    _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_FAILED", "ENGINE",
+                    LogCriticalEngineWithIeaContext(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_FAILED", "ENGINE",
                         new
                         {
                             intent_id = intentId,
@@ -2001,7 +2216,7 @@ public sealed partial class NinjaTraderSimAdapter
                             error = ex.Message,
                             exception_type = ex.GetType().Name,
                             note = "Failed to flatten position after intent not found - manual intervention may be required"
-                        }));
+                        });
                 }
             }
         }
@@ -2009,7 +2224,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Exit fill
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
-            // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
+            // orderInfo might be from entry order if protective order wasn't added to OrderMap yet
             _executionJournal.RecordExitFill(
                 context.IntentId, 
                 context.TradingDate, 
@@ -2046,16 +2261,16 @@ public sealed partial class NinjaTraderSimAdapter
             // can still be active and fill later, creating an unwanted new position
             // This applies to BOTH stop loss and target (limit) fills - when either fills, position is closed
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
-            // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
-            if ((orderTypeForContext == "STOP" || orderTypeForContext == "TARGET") && _intentMap.TryGetValue(intentId, out var filledIntent))
+            // orderInfo might be from entry order if protective order wasn't added to OrderMap yet
+            if ((orderTypeForContext == "STOP" || orderTypeForContext == "TARGET") && IntentMap.TryGetValue(intentId, out var filledIntent))
             {
                 // Find the opposite entry intent for this stream
                 // Entry intents are created in pairs: one Long, one Short with same TradingDate/Stream/SlotTime
                 var oppositeDirection = filledIntent.Direction == "Long" ? "Short" : "Long";
                 
-                // Find opposite intent by searching _intentMap for same stream with opposite direction
+                // Find opposite intent by searching IntentMap for same stream with opposite direction
                 string? oppositeIntentId = null;
-                foreach (var kvp in _intentMap)
+                foreach (var kvp in IntentMap)
                 {
                     var otherIntent = kvp.Value;
                     if (otherIntent.Stream == filledIntent.Stream &&
@@ -2538,7 +2753,7 @@ public sealed partial class NinjaTraderSimAdapter
                 expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice ?? stopPrice, 
                 targetPrice: intentTargetPrice, direction: direction, ocoGroup: ocoGroupToUse);
 
-            // CRITICAL FIX: Add protective stop order to _orderMap so it can be tracked when it fills
+            // CRITICAL FIX: Add protective stop order to OrderMap so it can be tracked when it fills
             // Without this, protective stop fills are treated as untracked and trigger flatten operations
             var stopOrderInfo = new OrderInfo
             {
@@ -2554,7 +2769,7 @@ public sealed partial class NinjaTraderSimAdapter
                 IsEntryOrder = false, // Protective order, not entry
                 FilledQuantity = 0
             };
-            _orderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
+            OrderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -2564,7 +2779,7 @@ public sealed partial class NinjaTraderSimAdapter
                 stop_price = stopPrice,
                 quantity,
                 account = "SIM",
-                note = "Protective stop order added to _orderMap for tracking"
+                note = "Protective stop order added to OrderMap for tracking"
             }));
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
@@ -2930,12 +3145,12 @@ public sealed partial class NinjaTraderSimAdapter
                 expectedEntryPrice: null, entryPrice: null, stopPrice: intentStopPrice2, 
                 targetPrice: intentTargetPrice2 ?? targetPrice, direction: direction, ocoGroup: ocoGroup2);
 
-            // CRITICAL FIX: Add protective target order to _orderMap so it can be tracked when it fills
+            // CRITICAL FIX: Add protective target order to OrderMap so it can be tracked when it fills
             // Without this, protective target fills are treated as untracked and trigger flatten operations
-            // Note: This overwrites entry order in _orderMap, but that's OK because:
+            // Note: This overwrites entry order in OrderMap, but that's OK because:
             // - Entry order is already filled by the time protective orders are submitted
             // - Entry fills are tracked in execution journal (ground truth)
-            // - Tag-based detection provides fallback if _orderMap lookup fails
+            // - Tag-based detection provides fallback if OrderMap lookup fails
             var targetOrderInfo = new OrderInfo
             {
                 IntentId = intentId,
@@ -2950,7 +3165,7 @@ public sealed partial class NinjaTraderSimAdapter
                 IsEntryOrder = false, // Protective order, not entry
                 FilledQuantity = 0
             };
-            _orderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
+            OrderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -2960,7 +3175,7 @@ public sealed partial class NinjaTraderSimAdapter
                 target_price = targetPrice,
                 quantity,
                 account = "SIM",
-                note = "Protective target order added to _orderMap for tracking"
+                note = "Protective target order added to OrderMap for tracking"
             }));
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
@@ -2971,6 +3186,75 @@ public sealed partial class NinjaTraderSimAdapter
             _executionJournal.RecordRejection(intentId, tradingDate6, stream6, $"TARGET_SUBMIT_FAILED: {ex.Message}", utcNow, 
                 orderType: "TARGET", rejectedPrice: targetPrice, rejectedQuantity: quantity);
             return OrderSubmissionResult.FailureResult($"Target order submission failed: {ex.Message}", utcNow);
+        }
+    }
+
+    // Phase 3: BE evaluation state (non-IEA path)
+    private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
+    private const int BE_MODIFY_MAX_RETRIES = 25;
+    private const double BE_SCAN_THROTTLE_MS = 200;
+    private DateTimeOffset _lastBeCheckUtcNonIEA = DateTimeOffset.MinValue;
+
+    private void EvaluateBreakEvenNonIEA(decimal tickPrice, DateTimeOffset utcNow, string executionInstrument)
+    {
+        if ((utcNow - _lastBeCheckUtcNonIEA).TotalMilliseconds < BE_SCAN_THROTTLE_MS)
+            return;
+        _lastBeCheckUtcNonIEA = utcNow;
+
+        var activeIntents = GetActiveIntentsForBEMonitoring(executionInstrument);
+        if (activeIntents.Count == 0) return;
+
+        decimal tickSize = 0.25m;
+        try
+        {
+            var inst = _ntInstrument as Instrument;
+            if (inst?.MasterInstrument != null)
+                tickSize = (decimal)inst.MasterInstrument.TickSize;
+        }
+        catch { }
+
+        foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
+        {
+            bool beTriggerReached = direction == "Long" ? tickPrice >= beTriggerPrice : direction == "Short" ? tickPrice <= beTriggerPrice : false;
+            if (!beTriggerReached) continue;
+
+            var breakoutLevel = entryPrice;
+            var beStopPrice = direction == "Long" ? breakoutLevel - tickSize : breakoutLevel + tickSize;
+
+            if ((utcNow - (_lastBeModifyAttemptUtcByIntent.TryGetValue(intentId, out var lastAttempt) ? lastAttempt : DateTimeOffset.MinValue)).TotalMilliseconds < BE_MODIFY_ATTEMPT_INTERVAL_MS)
+                continue;
+            _lastBeModifyAttemptUtcByIntent[intentId] = utcNow;
+
+            var modifyResult = ModifyStopToBreakEven(intentId, intent.Instrument ?? "", beStopPrice, utcNow);
+
+            if (modifyResult.Success)
+            {
+                _lastBeModifyAttemptUtcByIntent.Remove(intentId);
+                _beModifyFailureCountByIntent.Remove(intentId);
+            }
+            else
+            {
+                var errorMsg = modifyResult.ErrorMessage ?? "";
+                var isRetryableError = errorMsg.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      errorMsg.IndexOf("Stop order", StringComparison.OrdinalIgnoreCase) >= 0;
+                var stopMissing = isRetryableError;
+
+                var failCount = _beModifyFailureCountByIntent.TryGetValue(intentId, out var c) ? c + 1 : 1;
+                _beModifyFailureCountByIntent[intentId] = failCount;
+
+                if (failCount >= BE_MODIFY_MAX_RETRIES)
+                {
+                    _beModifyFailureCountByIntent.Remove(intentId);
+                    _lastBeModifyAttemptUtcByIntent.Remove(intentId);
+
+                    if (stopMissing)
+                        Flatten(intentId, intent.Instrument ?? "", utcNow);
+                    else
+                        _standDownStreamCallback?.Invoke(intent.Stream ?? "", utcNow, $"BE_MODIFY_MAX_RETRIES:{intentId}");
+                }
+            }
         }
     }
 
@@ -3030,7 +3314,7 @@ public sealed partial class NinjaTraderSimAdapter
                 // order exists (found by intent tag QTSW2:{intentId}:STOP) and comparison is meaningful.
                 var (tradingDateSkip, streamSkip, intentEntrySkip, _, _, _, _) = GetIntentInfo(intentId);
                 decimal? beTriggerSkip = null;
-                if (_intentMap.TryGetValue(intentId, out var skipIntent))
+                if (IntentMap.TryGetValue(intentId, out var skipIntent))
                     beTriggerSkip = skipIntent.BeTrigger;
                 _executionJournal.RecordBEModification(intentId, tradingDateSkip ?? "", streamSkip ?? "", currentStop, utcNow,
                     previousStopPrice: currentStop, beTriggerPrice: beTriggerSkip, entryPrice: intentEntrySkip);
@@ -3124,7 +3408,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Get BE trigger price from Intent
-            if (_intentMap.TryGetValue(intentId, out var beIntent))
+            if (IntentMap.TryGetValue(intentId, out var beIntent))
             {
                 beTriggerPrice = beIntent.BeTrigger;
             }
@@ -3350,7 +3634,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     var tag = GetOrderTag(order) ?? "";
                     var decodedIntentId = RobotOrderIds.DecodeIntentId(tag);
-                    if (decodedIntentId == intentId && _orderMap.TryGetValue(intentId, out var orderInfo))
+                    if (decodedIntentId == intentId && OrderMap.TryGetValue(intentId, out var orderInfo))
                     {
                         orderInfo.State = "CANCELLED";
                     }
@@ -3367,13 +3651,13 @@ public sealed partial class NinjaTraderSimAdapter
             
             // CRITICAL FIX: Defensively cancel opposite entry stop order to prevent re-entry
             // This handles cases where cancellation is called but opposite entry wasn't explicitly cancelled
-            if (_intentMap.TryGetValue(intentId, out var cancelledIntent))
+            if (IntentMap.TryGetValue(intentId, out var cancelledIntent))
             {
                 // Find the opposite entry intent for this stream
                 var oppositeDirection = cancelledIntent.Direction == "Long" ? "Short" : "Long";
                 string? oppositeIntentId = null;
                 
-                foreach (var kvp in _intentMap)
+                foreach (var kvp in IntentMap)
                 {
                     var otherIntent = kvp.Value;
                     if (otherIntent.Stream == cancelledIntent.Stream &&
@@ -3534,6 +3818,13 @@ public sealed partial class NinjaTraderSimAdapter
             // CRITICAL FIX: Add null checks before flattening
             bool flattenSucceeded = false;
             
+            // Record flatten call for broker flatten recognition (avoids UNTrackED_FILL cascade)
+            lock (_flattenRecognitionLock)
+            {
+                _lastFlattenInstrument = instrumentName ?? instrument;
+                _lastFlattenUtc = utcNow;
+            }
+            
             // Flatten - use dynamic to handle different API signatures
             if (ntInstrument != null)
             {
@@ -3582,7 +3873,7 @@ public sealed partial class NinjaTraderSimAdapter
             // When user manually cancels a position, entry stop orders remain active
             // If price is at/through opposite breakout level, opposite entry stop fills immediately → re-entry
             // Solution: Cancel BOTH entry stop orders (long and short) for this stream when flattening
-            if (_intentMap.TryGetValue(intentId, out var flattenedIntent))
+            if (IntentMap.TryGetValue(intentId, out var flattenedIntent))
             {
                 // Find the stream and trading date from the flattened intent
                 var stream = flattenedIntent.Stream ?? "";
@@ -3592,7 +3883,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     // Find both entry intents (long and short) for this stream
                     var entryIntentIds = new List<string>();
-                    foreach (var kvp in _intentMap)
+                    foreach (var kvp in IntentMap)
                     {
                         var otherIntent = kvp.Value;
                         if (otherIntent.Stream == stream &&
@@ -3732,12 +4023,16 @@ public sealed partial class NinjaTraderSimAdapter
                 // Find all entry intents for this instrument that haven't filled yet
                 var entryIntentIdsToCancel = new List<string>();
                 
-                foreach (var kvp in _intentMap)
+                foreach (var kvp in IntentMap)
                 {
                     var intent = kvp.Value;
                     
-                    // Match instrument
-                    if (intent.Instrument != instrument)
+                    // Match instrument (intent may store canonical NG, orderInfo may have execution MNG)
+                    var intentInstrument = intent.Instrument ?? "";
+                    var intentExecutionInstrument = intent.ExecutionInstrument ?? intentInstrument;
+                    if (string.IsNullOrEmpty(instrument) ||
+                        (string.Compare(intentInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0 &&
+                         string.Compare(intentExecutionInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0))
                         continue;
                     
                     // Only check entry stop bracket intents
@@ -3872,6 +4167,319 @@ public sealed partial class NinjaTraderSimAdapter
     }
     
     /// <summary>
+    /// Find opposite entry intent (same stream, opposite direction) for OCO pairing.
+    /// </summary>
+    private string? FindOppositeEntryIntentId(string intentId)
+    {
+        if (!IntentMap.TryGetValue(intentId, out var intent))
+            return null;
+        var oppositeDirection = intent.Direction == "Long" ? "Short" : "Long";
+        var oppositeTrigger = oppositeDirection == "Long" ? "ENTRY_STOP_BRACKET_LONG" : "ENTRY_STOP_BRACKET_SHORT";
+        foreach (var kvp in IntentMap)
+        {
+            var other = kvp.Value;
+            if (other.Stream == intent.Stream &&
+                other.TradingDate == intent.TradingDate &&
+                other.Direction == oppositeDirection &&
+                other.TriggerReason != null &&
+                other.TriggerReason.Contains(oppositeTrigger))
+                return kvp.Key;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Allocate fill quantity to intents deterministically: lexicographic order, first fill goes to intentIds[0]
+    /// until its policy qty satisfied, then next. Updates orderInfo.AggregatedFilledByIntent.
+    /// </summary>
+    private List<(string allocIntentId, int allocQty)> AllocateFillToIntents(
+        IReadOnlyList<string> intentIds,
+        int fillQuantity,
+        OrderInfo orderInfo)
+    {
+        var result = new List<(string, int)>();
+        if (fillQuantity <= 0 || intentIds == null || intentIds.Count == 0)
+            return result;
+
+        // Single intent: allocate all to it (no cumulative tracking needed)
+        if (intentIds.Count == 1)
+        {
+            result.Add((intentIds[0], fillQuantity));
+            return result;
+        }
+
+        // Aggregated: sort lexicographically, allocate in order
+        var sorted = intentIds.OrderBy(id => id, StringComparer.Ordinal).ToList();
+        orderInfo.AggregatedFilledByIntent ??= new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        var remaining = fillQuantity;
+        foreach (var id in sorted)
+        {
+            if (remaining <= 0) break;
+            var policyQty = IntentPolicy.TryGetValue(id, out var pol) ? pol.ExpectedQuantity : 1;
+            var current = orderInfo.AggregatedFilledByIntent.TryGetValue(id, out var cur) ? cur : 0;
+            var needed = policyQty - current;
+            if (needed <= 0) continue;
+            var toAlloc = Math.Min(needed, remaining);
+            if (toAlloc > 0)
+            {
+                result.Add((id, toAlloc));
+                orderInfo.AggregatedFilledByIntent[id] = current + toAlloc;
+                remaining -= toAlloc;
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// When multiple streams have entry stops at same price, aggregate into one broker order.
+    /// Returns non-null if aggregation was attempted (success or failure); null to continue with normal flow.
+    /// </summary>
+    private OrderSubmissionResult? TryAggregateWithExistingOrders(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int quantity,
+        string? ocoGroup,
+        Account account,
+        Instrument ntInstrument,
+        DateTimeOffset utcNow)
+    {
+        if (!IntentMap.TryGetValue(intentId, out var currentIntent))
+            return null;
+
+        // Find existing working entry orders at same (instrument, price, direction) from other streams
+        // Eligibility guard: only aggregate if stop/target/trading_date also match (one bracket can't satisfy different intents)
+        var toAggregate = new List<(string intentId, string stream, int qty, string? oco)>();
+        foreach (var kvp in IntentMap)
+        {
+            var other = kvp.Value;
+            if (kvp.Key == intentId) continue;
+            if (other.Direction != direction) continue;
+            if (other.EntryPrice != stopPrice) continue;
+            var execInst = other.ExecutionInstrument ?? other.Instrument ?? "";
+            if (string.Compare(execInst, instrument, StringComparison.OrdinalIgnoreCase) != 0 &&
+                string.Compare(other.Instrument ?? "", instrument, StringComparison.OrdinalIgnoreCase) != 0)
+                continue;
+            // Eligibility: same protective parameters - one bracket must satisfy both streams
+            if (other.StopPrice != currentIntent.StopPrice) continue;
+            if (other.TargetPrice != currentIntent.TargetPrice) continue;
+            if (other.TradingDate != currentIntent.TradingDate) continue;
+            if (!OrderMap.TryGetValue(kvp.Key, out var orderInfo) || !orderInfo.IsEntryOrder) continue;
+            if (orderInfo.State != "SUBMITTED" && orderInfo.State != "ACCEPTED" && orderInfo.State != "WORKING") continue;
+            var policyQty = IntentPolicy.TryGetValue(kvp.Key, out var pol) ? pol.ExpectedQuantity : 1;
+            var oco = orderInfo.OcoGroup ?? (orderInfo.NTOrder is Order o ? o.Oco ?? "" : "");
+            toAggregate.Add((kvp.Key, other.Stream ?? "", policyQty, oco));
+        }
+
+        if (toAggregate.Count == 0)
+            return null;
+
+        // We have existing orders at same price - aggregate
+        var totalQty = quantity;
+        foreach (var (_, _, q, _) in toAggregate)
+            totalQty += q;
+
+        var allIntentIds = new List<string> { intentId };
+        foreach (var (id, _, _, _) in toAggregate)
+            allIntentIds.Add(id);
+
+        var qtyPerIntent = new List<object> { new { id = intentId, qty = quantity } };
+        foreach (var (id, _, q, _) in toAggregate)
+            qtyPerIntent.Add(new { id, qty = q });
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_AGGREGATION_ATTEMPT",
+            new
+            {
+                execution_instrument = instrument,
+                current_intent = intentId,
+                existing_intents = toAggregate.Select(x => x.intentId).ToList(),
+                intent_ids = allIntentIds,
+                qty_per_intent = qtyPerIntent,
+                total_quantity = totalQty,
+                stop_price = stopPrice,
+                direction,
+                eligibility_passed = true,
+                note = "Multiple streams at same price - aggregating into one broker order"
+            }));
+
+        string? failedStep = null;
+        var replacedOrderIds = new List<string>();
+        var resubmittedOrderIds = new List<string>();
+        try
+        {
+            // 1. Cancel existing orders (OCO will auto-cancel their opposite-side pairs)
+            failedStep = "CANCEL_EXISTING";
+            var ordersToCancel = new List<Order>();
+            foreach (var (existingIntentId, _, _, _) in toAggregate)
+            {
+                if (OrderMap.TryGetValue(existingIntentId, out var oi) && oi.NTOrder is Order ord)
+                {
+                    ordersToCancel.Add(ord);
+                    replacedOrderIds.Add(ord.OrderId);
+                }
+            }
+            if (ordersToCancel.Count > 0)
+            {
+                account.Cancel(ordersToCancel.ToArray());
+                foreach (var (existingIntentId, _, _, _) in toAggregate)
+                {
+                    if (OrderMap.TryGetValue(existingIntentId, out var oi))
+                        oi.State = "CANCELLED";
+                }
+            }
+
+            // 2. Cancel current stream's opposite order if already submitted (e.g. NG2 long was submitted before NG2 short)
+            failedStep = "CANCEL_CURRENT_OPPOSITE";
+            var oppositeIntentId = FindOppositeEntryIntentId(intentId);
+            if (oppositeIntentId != null && OrderMap.TryGetValue(oppositeIntentId, out var oppOrderInfo) && oppOrderInfo.NTOrder is Order oppOrd)
+            {
+                if (oppOrderInfo.State == "SUBMITTED" || oppOrderInfo.State == "ACCEPTED" || oppOrderInfo.State == "WORKING")
+                {
+                    account.Cancel(new[] { oppOrd });
+                    oppOrderInfo.State = "CANCELLED";
+                    replacedOrderIds.Add(oppOrd.OrderId);
+                }
+            }
+
+            // 3. Create new OCO group for aggregated set
+            failedStep = "SUBMIT_AGGREGATED";
+            var newOcoGroup = RobotOrderIds.EncodeEntryOco(currentIntent.TradingDate ?? "", $"AGG_{string.Join("_", allIntentIds.Take(2))}", currentIntent.SlotTimeChicago ?? "");
+
+            // 4. Submit aggregated entry order with composite tag
+            var aggregatedTag = RobotOrderIds.EncodeAggregatedTag(allIntentIds);
+            var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
+            var stopPriceD = (double)stopPrice;
+
+            var order = account.CreateOrder(
+                ntInstrument,
+                orderAction,
+                OrderType.StopMarket,
+                OrderEntry.Manual,
+                TimeInForce.Day,
+                totalQty,
+                0.0,
+                stopPriceD,
+                newOcoGroup,
+                aggregatedTag,
+                DateTime.MinValue,
+                null);
+
+            SetOrderTag(order, aggregatedTag);
+            order.Oco = newOcoGroup;
+
+            var primaryIntentId = allIntentIds[0];
+            var orderInfo = new OrderInfo
+            {
+                IntentId = primaryIntentId,
+                Instrument = instrument,
+                OrderId = order.OrderId,
+                OrderType = "ENTRY_STOP",
+                Direction = direction,
+                Quantity = totalQty,
+                Price = stopPrice,
+                State = "SUBMITTED",
+                NTOrder = order,
+                IsEntryOrder = true,
+                FilledQuantity = 0,
+                AggregatedIntentIds = allIntentIds,
+                AggregatedFilledByIntent = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+            };
+            if (IntentPolicy.TryGetValue(primaryIntentId, out var exp))
+            {
+                orderInfo.ExpectedQuantity = exp.ExpectedQuantity * allIntentIds.Count;
+                orderInfo.MaxQuantity = exp.MaxQuantity * allIntentIds.Count;
+            }
+
+            foreach (var id in allIntentIds)
+                OrderMap[id] = orderInfo;
+
+            var ordersToSubmit = new List<Order> { order };
+
+            // 5. Submit opposite-side orders (longs) so they're in same OCO - when short fills, longs cancel
+            var oppositeDirection = direction == "Long" ? "Short" : "Long";
+            foreach (var id in allIntentIds)
+            {
+                var oppId = FindOppositeEntryIntentId(id);
+                if (oppId == null || !IntentMap.TryGetValue(oppId, out var oppIntent)) continue;
+                var oppPrice = oppIntent.EntryPrice ?? 0;
+                var oppQty = IntentPolicy.TryGetValue(oppId, out var oppPol) ? oppPol.ExpectedQuantity : 1;
+                var oppAction = oppositeDirection == "Long" ? OrderAction.Buy : OrderAction.SellShort;
+                var oppOrder = account.CreateOrder(ntInstrument, oppAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Day,
+                    oppQty, 0.0, (double)oppPrice, newOcoGroup, RobotOrderIds.EncodeTag(oppId), DateTime.MinValue, null);
+                SetOrderTag(oppOrder, RobotOrderIds.EncodeTag(oppId));
+                oppOrder.Oco = newOcoGroup;
+                ordersToSubmit.Add(oppOrder);
+                resubmittedOrderIds.Add(oppOrder.OrderId);
+                var oppOi = new OrderInfo
+                {
+                    IntentId = oppId,
+                    Instrument = instrument,
+                    OrderId = oppOrder.OrderId,
+                    OrderType = "ENTRY_STOP",
+                    Direction = oppositeDirection,
+                    Quantity = oppQty,
+                    Price = oppPrice,
+                    State = "SUBMITTED",
+                    NTOrder = oppOrder,
+                    IsEntryOrder = true,
+                    FilledQuantity = 0
+                };
+                OrderMap[oppId] = oppOi;
+                if (_executionJournal != null)
+                    _executionJournal.RecordSubmission(oppId, oppIntent.TradingDate ?? "", oppIntent.Stream ?? "", instrument, $"ENTRY_STOP_{oppositeDirection}", oppOrder.OrderId, utcNow);
+            }
+
+            account.Submit(ordersToSubmit.ToArray());
+
+            foreach (var id in allIntentIds)
+            {
+                if (IntentMap.TryGetValue(id, out var intent) && _executionJournal != null)
+                    _executionJournal.RecordSubmission(id, intent.TradingDate ?? "", intent.Stream ?? "", instrument, $"ENTRY_STOP_{direction}", order.OrderId, utcNow);
+            }
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_AGGREGATION_SUCCESS",
+                new
+                {
+                    agg_tag = aggregatedTag,
+                    broker_order_id = order.OrderId,
+                    aggregated_intents = allIntentIds,
+                    total_quantity = totalQty,
+                    oco_group = newOcoGroup,
+                    replaced_order_ids = replacedOrderIds,
+                    resubmitted_order_ids = resubmittedOrderIds,
+                    note = "One broker order for multiple streams - eliminates same-tick dual-fill race"
+                }));
+
+            return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow);
+        }
+        catch (Exception ex)
+        {
+            var exposureAtFailure = 0;
+            try
+            {
+                var pos = account.Positions?.FirstOrDefault(p =>
+                    string.Equals(p.Instrument?.MasterInstrument?.Name ?? "", instrument, StringComparison.OrdinalIgnoreCase));
+                if (pos != null)
+                    exposureAtFailure = Math.Abs(pos.Quantity);
+            }
+            catch { /* best-effort */ }
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_AGGREGATION_FAILED",
+                new
+                {
+                    failed_step = failedStep ?? "UNKNOWN",
+                    nt_error = ex.Message,
+                    action_taken = "STAND_DOWN",
+                    exposure_at_failure = exposureAtFailure,
+                    existing_intents = toAggregate.Select(x => x.intentId).ToList(),
+                    note = "Aggregation failed - stream blocked; flatten if exposure exists"
+                }));
+            return OrderSubmissionResult.FailureResult($"Entry aggregation failed at {failedStep}: {ex.Message}", utcNow);
+        }
+    }
+
+    /// <summary>
     /// STEP 2b: Submit stop-market entry order using real NT API (breakout stop).
     /// </summary>
     private OrderSubmissionResult SubmitStopEntryOrderReal(
@@ -3966,7 +4574,7 @@ public sealed partial class NinjaTraderSimAdapter
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
 
             // Pre-submission invariant check
-            if (!_intentPolicy.TryGetValue(intentId, out var expectation))
+            if (!IntentPolicy.TryGetValue(intentId, out var expectation))
             {
                 // HARD BLOCK: expectation missing (fail-closed by default)
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, 
@@ -3988,7 +4596,7 @@ public sealed partial class NinjaTraderSimAdapter
 
             var expectedQty = expectation.ExpectedQuantity;
             var maxQty = expectation.MaxQuantity;
-            var filledQty = _orderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
+            var filledQty = OrderMap.TryGetValue(intentId, out var existingOrderInfo) ? existingOrderInfo.FilledQuantity : 0;
             var remainingAllowed = expectedQty - filledQty;
 
             // Get Chart Trader quantity if accessible
@@ -4188,6 +4796,29 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Order rejected before submission to prevent NinjaTrader price limit error. This indicates a stale breakout level or significant market gap."
                 }));
                 return OrderSubmissionResult.FailureResult($"Stop price validation failed: {priceValidationReason}", utcNow);
+            }
+
+            // ENTRY AGGREGATION: When IEA enabled, route through queue (Gap 1). IEA owns aggregation + single-order fallback.
+            // Both paths run on worker to preserve single mutation lane invariant.
+            if (_useInstrumentExecutionAuthority && _iea != null)
+            {
+                var (success, ieaResult) = _iea.EnqueueAndWait(() =>
+                {
+                    var aggResult = _iea.SubmitStopEntryOrder(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+                    if (aggResult != null)
+                        return aggResult;
+                    return SubmitSingleEntryOrderCore(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+                });
+                if (!success)
+                    return OrderSubmissionResult.FailureResult("Entry submission failed (IEA queue overflow or timeout)", utcNow);
+                return ieaResult ?? OrderSubmissionResult.FailureResult("Entry submission returned null", utcNow);
+            }
+
+            if (!_useInstrumentExecutionAuthority)
+            {
+                var aggregateResult = TryAggregateWithExistingOrders(intentId, instrument, direction, stopPrice, quantity, ocoGroup, account, ntInstrument, utcNow);
+                if (aggregateResult != null)
+                    return aggregateResult;
             }
 
             // Real NT API: Create stop-market entry using official NT8 CreateOrder factory method
@@ -4399,8 +5030,8 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             
-            // Copy policy expectation from _intentPolicy if available
-            if (_intentPolicy.TryGetValue(intentId, out var expectationForOrder))
+            // Copy policy expectation from IntentPolicy if available
+            if (IntentPolicy.TryGetValue(intentId, out var expectationForOrder))
             {
                 orderInfo.ExpectedQuantity = expectationForOrder.ExpectedQuantity;
                 orderInfo.MaxQuantity = expectationForOrder.MaxQuantity;
@@ -4420,7 +5051,7 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
             }
             
-            _orderMap[intentId] = orderInfo;
+            OrderMap[intentId] = orderInfo;
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -4555,6 +5186,161 @@ public sealed partial class NinjaTraderSimAdapter
             }));
             return OrderSubmissionResult.FailureResult($"Stop entry order submission failed: {ex.Message}", utcNow);
         }
+    }
+
+    /// <summary>
+    /// Gap 1: Single-order entry submission (runs on IEA worker when IEA enabled).
+    /// Called when IEA.SubmitStopEntryOrder returns null (no aggregation). Preserves single mutation lane.
+    /// </summary>
+    private OrderSubmissionResult SubmitSingleEntryOrderCore(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int quantity,
+        string? ocoGroup,
+        DateTimeOffset utcNow)
+    {
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        if (account == null || ntInstrument == null)
+            return OrderSubmissionResult.FailureResult("NT context not set", utcNow);
+
+        var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
+
+        // Runtime safety checks
+        if (!_ntContextSet)
+            return OrderSubmissionResult.FailureResult("NT context not set - cannot create StopMarket order", utcNow);
+        if (quantity <= 0)
+            throw new InvalidOperationException($"Order quantity unresolved: {quantity}");
+
+        var stopPriceD = (double)stopPrice;
+        if (stopPriceD <= 0)
+            return OrderSubmissionResult.FailureResult($"Invalid stop price: {stopPriceD} (must be > 0)", utcNow);
+
+        Order order;
+        try
+        {
+            string? ocoForOrder = string.IsNullOrWhiteSpace(ocoGroup) ? null : ocoGroup;
+            order = account.CreateOrder(
+                ntInstrument, orderAction, OrderType.StopMarket, OrderEntry.Manual, TimeInForce.Day,
+                quantity, 0.0, stopPriceD, ocoForOrder, RobotOrderIds.EncodeTag(intentId), DateTime.MinValue, null);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
+            {
+                error = $"Failed to create StopMarket order: {ex.Message}",
+                order_type = "StopMarket",
+                quantity, stop_price = stopPriceD, instrument, intent_id = intentId, account = "SIM",
+                exception_type = ex.GetType().Name
+            }));
+            return OrderSubmissionResult.FailureResult($"Failed to create StopMarket order: {ex.Message}", utcNow);
+        }
+
+        if (order.Quantity != quantity)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_VERIFICATION", new
+            {
+                intent_id = intentId, requested_quantity = quantity, order_quantity = order.Quantity,
+                order_id = order.OrderId, instrument, verified = false
+            }));
+            TriggerQuantityEmergency(intentId, "QUANTITY_MISMATCH_EMERGENCY", utcNow, new Dictionary<string, object>
+            {
+                { "requested_quantity", quantity }, { "order_quantity", order.Quantity },
+                { "reason", "Order creation quantity mismatch" }
+            });
+            return OrderSubmissionResult.FailureResult($"Order quantity mismatch: requested {quantity}, order has {order.Quantity}", utcNow);
+        }
+
+        SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
+        order.TimeInForce = TimeInForce.Day;
+        if (!string.IsNullOrWhiteSpace(ocoGroup))
+            order.Oco = ocoGroup;
+
+        var orderInfo = new OrderInfo
+        {
+            IntentId = intentId,
+            Instrument = instrument,
+            OrderId = order.OrderId,
+            OrderType = "ENTRY_STOP",
+            Direction = direction,
+            Quantity = quantity,
+            Price = stopPrice,
+            State = "SUBMITTED",
+            NTOrder = order,
+            IsEntryOrder = true,
+            FilledQuantity = 0
+        };
+        if (IntentPolicy.TryGetValue(intentId, out var expectationForOrder))
+        {
+            orderInfo.ExpectedQuantity = expectationForOrder.ExpectedQuantity;
+            orderInfo.MaxQuantity = expectationForOrder.MaxQuantity;
+            orderInfo.PolicySource = expectationForOrder.PolicySource;
+            orderInfo.CanonicalInstrument = expectationForOrder.CanonicalInstrument;
+            orderInfo.ExecutionInstrument = expectationForOrder.ExecutionInstrument;
+        }
+
+        OrderMap[intentId] = orderInfo;
+
+        dynamic dynAccountSubmit = account;
+        Order submitResult;
+        try
+        {
+            object? result = dynAccountSubmit.Submit(new[] { order });
+            submitResult = (result != null && result is Order[] arr && arr.Length > 0) ? arr[0] : order;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                dynAccountSubmit.Submit(new[] { order });
+                submitResult = order;
+            }
+            catch (Exception fallbackEx)
+            {
+                var errorMsg = $"Entry stop order submission failed: {ex.Message} (fallback: {fallbackEx.Message})";
+                var (td, streamReject, _, _, _, _, _) = GetIntentInfo(intentId);
+                _executionJournal.RecordRejection(intentId, td, streamReject, $"ENTRY_STOP_SUBMIT_FAILED: {errorMsg}", utcNow,
+                    orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+                {
+                    error = errorMsg, first_error = ex.Message, fallback_error = fallbackEx.Message,
+                    broker_order_id = order.OrderId, account = "SIM"
+                }));
+                return OrderSubmissionResult.FailureResult(errorMsg, utcNow);
+            }
+        }
+
+        if (submitResult.OrderState == OrderState.Rejected)
+        {
+            dynamic dynOrder = submitResult;
+            string error = "Order rejected";
+            try { error = (string?)dynOrder.ErrorMessage ?? (string?)dynOrder.Error ?? "Order rejected"; }
+            catch { try { error = (string?)dynOrder.Error ?? "Order rejected"; } catch { } }
+            var (td, streamReject, _, _, _, _, _) = GetIntentInfo(intentId);
+            _executionJournal.RecordRejection(intentId, td, streamReject, $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow,
+                orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+            {
+                error, order_type = "ENTRY_STOP", broker_order_id = order.OrderId, account = "SIM"
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
+        var acknowledgedAt = DateTimeOffset.UtcNow;
+        var (tradingDate, stream, intentEntryPrice, intentStopPrice, intentTargetPrice, intentDirection, ocoGroupVal) = GetIntentInfo(intentId);
+        _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY_STOP", order.OrderId, acknowledgedAt,
+            expectedEntryPrice: null, entryPrice: intentEntryPrice, stopPrice: intentStopPrice ?? stopPrice,
+            targetPrice: intentTargetPrice, direction: intentDirection ?? direction, ocoGroup: ocoGroupVal ?? ocoGroup);
+
+        _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
+        {
+            broker_order_id = order.OrderId, order_type = "ENTRY_STOP", direction, stop_price = stopPrice,
+            quantity, oco_group = ocoGroup, account = "SIM", order_action = orderAction.ToString()
+        }));
+
+        return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
     }
 
     /// <summary>

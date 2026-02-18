@@ -7,7 +7,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
@@ -114,6 +114,17 @@ async def get_events(
     except Exception as e:
         logger.error(f"Error getting events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting events: {str(e)}")
+
+
+@router.get("/ingestion-stats")
+async def get_ingestion_stats():
+    """Get ingestion telemetry (tail read duration, loop duration, parse rate)."""
+    try:
+        aggregator = get_aggregator()
+        return aggregator.get_ingestion_stats()
+    except Exception as e:
+        logger.error(f"Error getting ingestion stats: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting ingestion stats: {str(e)}")
 
 
 @router.get("/risk-gates")

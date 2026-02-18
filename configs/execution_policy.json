@@ -1,6 +1,19 @@
 {
   "schema": "qtsw2.execution_policy",
+  "use_instrument_execution_authority": true,
   "disable_canonical_market_lock": true,
+  "aggregation": {
+    "bracket_policy": {
+      "stop": "TIGHTEST",
+      "target": "TIGHTEST"
+    },
+    "require_identical_bracket": true,
+    "bracket_tolerance_ticks": 1
+  },
+  "break_even": {
+    "trigger_policy": "FIRST_TO_TRIGGER",
+    "stop_price_policy": "TIGHTEST"
+  },
   "canonical_markets": {
     "ES": {
       "execution_instruments": {

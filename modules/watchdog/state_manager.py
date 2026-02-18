@@ -501,6 +501,8 @@ class WatchdogStateManager:
                         range_high = entry.get("range_high")
                         range_low = entry.get("range_low")
                         freeze_close = entry.get("freeze_close")
+                        execution_instrument = entry.get("execution_instrument")
+                        canonical_instrument = entry.get("canonical_instrument")
                         if not stream_id or (range_high is None and range_low is None):
                             continue
                         key = (current_td, stream_id)
@@ -515,6 +517,10 @@ class WatchdogStateManager:
                             info.range_low = float(range_low)
                         if freeze_close is not None:
                             info.freeze_close = float(freeze_close)
+                        if execution_instrument:
+                            info.execution_instrument = str(execution_instrument)
+                        if canonical_instrument and not info.instrument:
+                            info.instrument = str(canonical_instrument)
                         updated += 1
                     except (json.JSONDecodeError, ValueError, TypeError) as e:
                         logger.debug(f"Skip ranges line: {e}")
@@ -1357,18 +1363,22 @@ class WatchdogStateManager:
         
         # Apply smoothing to data stall detection
         # Compute data status: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN'
-        # UNKNOWN when we expect bars but have never received any (broker may be off)
-        data_status = "FLOWING"
-        if instruments_with_bars_expected and not self._last_bar_utc_by_execution_instrument and market_open:
-            # Bars expected, market open, but no bar events ever received - likely broker off
+        # UNKNOWN when we've never received any bar events (broker may be off, robot not started)
+        if not self._last_bar_utc_by_execution_instrument:
             data_status = "UNKNOWN"
         elif data_stall_detected:
-            critical_stall = any(d.get('stall_detected', False) and d.get('market_open', False) 
+            critical_stall = any(d.get('stall_detected', False) and d.get('market_open', False)
                                 for d in data_stall_detected.values())
             if critical_stall:
-                data_status = "STALLED"
+                # When ticks flowing (ENGINE_TICK_CALLSITE recent), bar age can lag - treat as FLOWING
+                # Bar age lags due to ONBARUPDATE_CALLED rate limit (1/min) or bar type (e.g. 5-min bars)
+                data_status = "FLOWING" if engine_alive else "STALLED"
             elif any(d.get('stall_detected', False) for d in data_stall_detected.values()):
                 data_status = "ACCEPTABLE_SILENCE"  # Market closed or acceptable pause
+            else:
+                data_status = "FLOWING"
+        else:
+            data_status = "FLOWING"
         
         # Apply smoothing/debouncing to data status
         self._data_status_history.append((now, data_status))
