@@ -22,7 +22,7 @@ Entry submission, aggregation, protectives, BE, and flatten all execute on the I
 | **Flatten** | `FlattenWithRetry` → `EnqueueFlattenAndWait` → worker runs `FlattenWithRetryCore` | Yes |
 | **Protective submission** | Via `HandleEntryFill` (called from `HandleExecutionUpdateReal` on worker) | Yes |
 
-**Gap:** When IEA has no aggregation candidates, `SubmitStopEntryOrder` returns null. The adapter then falls through to the single-order creation block (lines 4858+), which runs on the strategy thread. So the single-order path is not serialized when IEA is enabled.
+**Fixed:** When IEA has no aggregation candidates, `SubmitStopEntryOrder` returns null. The adapter's `EnqueueAndWait` lambda then calls `SubmitSingleEntryOrderCore` on the worker. Single-order fallback runs on IEA worker (Gap 1 fixed).
 
 **OrderUpdate:** `HandleOrderUpdate` is not routed through IEA. Order state changes (rejections, etc.) are processed on the strategy thread. The adapter's `HandleOrderUpdateReal` may mutate shared state. Flatten (when protective rejected) is routed through `FlattenWithRetry` → `EnqueueFlattenAndWait`, so the actual flatten runs on the worker.
 
@@ -195,7 +195,7 @@ Confirmed:
 
 ## Summary of Gaps
 
-1. **Single-order fallback:** When IEA returns null (no aggregation), the single-order creation runs on the strategy thread, not the worker.
+1. ~~**Single-order fallback:**~~ **Fixed.** Single-order path now runs on IEA worker via `EnqueueAndWait` → `SubmitSingleEntryOrderCore`.
 2. **FailClosed log:** Does not use `LogCriticalWithIeaContext`; missing `iea_instance_id` when IEA enabled.
 3. **Timeout/overflow logs:** `IEA_ENQUEUE_AND_WAIT_TIMEOUT` and `IEA_ENQUEUE_AND_WAIT_QUEUE_OVERFLOW` do not include `enqueue_sequence` or `last_processed_sequence`.
 4. **EnqueueAndWait failure policy:** Not explicitly documented; no defined stand-down or halt behavior.

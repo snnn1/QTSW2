@@ -23,6 +23,7 @@ BE_EVENTS = [
     "BE_TRIGGER_TIMEOUT_ERROR",  # Trigger reached 5+ sec ago, no modify
     "REALTIME_STATE_REACHED",  # Strategy in Realtime (prerequisite for BE)
 ]
+BE_GATE_BLOCKED = "BE_GATE_BLOCKED"  # Path blocked - check reason for pre-flight
 
 def main():
     print("=" * 70)
@@ -80,7 +81,7 @@ def main():
             if not event_type:
                 continue
 
-            if event_type in BE_EVENTS:
+            if event_type in BE_EVENTS or event_type == BE_GATE_BLOCKED:
                 counts[event_type] += 1
                 ts = e.get("ts_utc", e.get("timestamp_utc", ""))[:19]
                 latest[event_type] = ts
@@ -122,6 +123,27 @@ def main():
             print("  REALTIME reached but no BE_PATH_ACTIVE -> may be flat (no position)")
 
         # Sample BE_PATH_ACTIVE or BE_EVALUATION_TICK
+        # Pre-flight verdict for tomorrow
+        print()
+        print("PRE-FLIGHT VERDICT (for tomorrow)")
+        print("-" * 70)
+        if counts.get(BE_GATE_BLOCKED):
+            reasons = set()
+            for s in samples.get(BE_GATE_BLOCKED, []):
+                d = (s.get("data") or s) if isinstance(s, dict) else {}
+                if isinstance(d, dict) and "blocking_reason" in d:
+                    reasons.add(str(d["blocking_reason"]))
+            print(f"  WARN: BE_GATE_BLOCKED seen ({counts[BE_GATE_BLOCKED]}x). Reasons: {reasons or 'unknown'}")
+            print("  -> Fix blocked reason before market open")
+        if counts.get("REALTIME_STATE_REACHED") and counts.get("BE_PATH_ACTIVE"):
+            print("  OK: REALTIME + BE_PATH_ACTIVE -> BE path was active when in position")
+        elif counts.get("REALTIME_STATE_REACHED") and not counts.get("BE_PATH_ACTIVE"):
+            print("  INFO: REALTIME reached but no BE_PATH_ACTIVE -> likely flat (no position) or blocked")
+        if counts.get("BE_TRIGGER_REACHED"):
+            print("  OK: BE_TRIGGER_REACHED -> BE successfully modified a stop")
+        if not counts.get("REALTIME_STATE_REACHED"):
+            print("  WARN: No REALTIME_STATE_REACHED -> strategy may not have run to Realtime")
+
         for evt in ["BE_PATH_ACTIVE", "BE_EVALUATION_TICK", "BE_TRIGGER_REACHED"]:
             if samples[evt]:
                 print()
