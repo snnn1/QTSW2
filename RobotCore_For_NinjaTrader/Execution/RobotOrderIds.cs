@@ -99,5 +99,50 @@ public static class RobotOrderIds
         var baseToken = remainder.Substring(0, idx);
         return string.IsNullOrEmpty(baseToken) ? null : baseToken;
     }
+
+    /// <summary>
+    /// Parse tag into tokens. Returns intent_id, leg (STOP/TARGET/ENTRY), and optional metadata.
+    /// Use this everywhere for BE confirm, ORDER_UPDATED, STOP/TARGET logging to prevent one-off parsing drift.
+    /// Leg is detected by token match, not EndsWith — supports future :STOP:BE or :STOP:1 variations.
+    /// </summary>
+    public static ParsedTagResult ParseTag(string? tag)
+    {
+        var result = new ParsedTagResult();
+        if (string.IsNullOrEmpty(tag) || !tag.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase))
+            return result;
+
+        var tokens = tag.Split(':');
+        if (tokens.Length < 2) return result;
+
+        // AGG:id1,id2,... — intent_id from first id, leg null
+        if (tokens[1].Equals("AGG", StringComparison.OrdinalIgnoreCase))
+        {
+            var ids = DecodeAggregatedIntentIds(tag);
+            result.IntentId = ids?.Count > 0 ? ids[0] : null;
+            return result;
+        }
+
+        result.IntentId = tokens[1];
+        if (tokens.Length >= 3)
+        {
+            var legToken = tokens[2];
+            if (legToken.Equals("STOP", StringComparison.OrdinalIgnoreCase))
+                result.Leg = "STOP";
+            else if (legToken.Equals("TARGET", StringComparison.OrdinalIgnoreCase))
+                result.Leg = "TARGET";
+            else if (legToken.Equals("ENTRY", StringComparison.OrdinalIgnoreCase))
+                result.Leg = "ENTRY";
+        }
+        return result;
+    }
+}
+
+/// <summary>Result of ParseTag. Leg is STOP, TARGET, ENTRY, or null. Stream/TradingDate from IntentMap when needed.</summary>
+public struct ParsedTagResult
+{
+    public string? IntentId { get; set; }
+    public string? Leg { get; set; }
+    public string? Stream { get; set; }
+    public string? TradingDate { get; set; }
 }
 

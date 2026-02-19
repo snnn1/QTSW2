@@ -688,6 +688,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "note", "Strategy successfully transitioned from DataLoaded to Realtime state. BE detection via OnMarketData(Last)." }
                     });
                     _engine.LogStreamStateSnapshot(utcNow);
+                    _engine.LogStreamInstrumentInvariantCheck(utcNow);
 
                     // Pre-warm execution journal cache so BE monitoring never hits disk on first lookup
                     _engine.WarmExecutionJournalCacheForTradingDate(_engine.GetTradingDate());
@@ -1697,7 +1698,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (positions == null) return (false, 0, null);
             var count = 0;
             string? firstOtherInstrument = null;
-            var executionInstrument = GetExecutionInstrumentForBE();
+            var executionInstrument = !string.IsNullOrEmpty(_engine?.GetExecutionInstrument())
+                ? _engine.GetExecutionInstrument()
+                : GetExecutionInstrumentForBE();
             var canonicalName = Instrument.MasterInstrument?.Name ?? "";
             foreach (Position pos in positions)
             {
@@ -1742,7 +1745,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         protected override void OnMarketData(MarketDataEventArgs e)
         {
             var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-            var executionInstrument = GetExecutionInstrumentForBE();
+            // CRITICAL: Use engine's execution instrument when available. NQ chart trades MNQ via execution policy;
+            // intents have ExecutionInstrument=MNQ. Chart-derived "NQ" would filter out the intent and BE would never trigger.
+            var executionInstrument = !string.IsNullOrEmpty(_engine?.GetExecutionInstrument())
+                ? _engine.GetExecutionInstrument()
+                : GetExecutionInstrumentForBE();
             var (hasExposure, accountPositionCount, mismatchedInstrumentName) = GetExposureState();
 
             if (e.MarketDataType != MarketDataType.Last)
@@ -1816,6 +1823,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "active_intent_count", activeCount },
                     { "note", "BE check path active (OnMarketData). active_intent_count>0 means intents await BE trigger." }
                 });
+                // HARDENING: If we have exposure but 0 intents for BE, the filter excluded them (e.g., execution instrument mismatch)
+                if (activeCount == 0 && hasExposure)
+                {
+                    _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "execution_instrument", executionInstrument },
+                        { "tick_price", tickPrice },
+                        { "note", "CRITICAL: Account has exposure but BE filter returned 0 intents. Likely execution instrument mismatch (chart vs intent)." }
+                    });
+                }
             }
 
             // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path)

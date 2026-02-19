@@ -128,6 +128,13 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
 
         return FlattenResult.SuccessResult(utcNow);
     }
+
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_DRYRUN", state: "ENGINE",
+            new { instrument, note = "DRYRUN mode - flatten not executed" }));
+        return FlattenResult.SuccessResult(utcNow);
+    }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

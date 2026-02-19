@@ -31,15 +31,42 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private static string? GetOrderTag(Order order)
     {
+        var (tag, _) = GetOrderTagWithSource(order);
+        return tag;
+    }
+
+    /// <summary>
+    /// Get best available tag string and which NT field it came from.
+    /// NT may use Tag, Name, FromEntrySignal, or SignalName. Log tag_source for diagnostics.
+    /// </summary>
+    private static (string? tag, string tagSource) GetOrderTagWithSource(Order order)
+    {
         dynamic dynOrder = order;
         try
         {
-            return dynOrder.Tag as string ?? dynOrder.Name as string;
+            var tag = dynOrder.Tag as string;
+            if (!string.IsNullOrEmpty(tag)) return (tag, "Tag");
         }
-        catch
+        catch { }
+        try
         {
-            return dynOrder.Name as string;
+            var name = dynOrder.Name as string;
+            if (!string.IsNullOrEmpty(name)) return (name, "Name");
         }
+        catch { }
+        try
+        {
+            var fromEntry = dynOrder.FromEntrySignal as string;
+            if (!string.IsNullOrEmpty(fromEntry)) return (fromEntry, "FromEntrySignal");
+        }
+        catch { }
+        try
+        {
+            var signalName = dynOrder.SignalName as string;
+            if (!string.IsNullOrEmpty(signalName)) return (signalName, "SignalName");
+        }
+        catch { }
+        return (null, "None");
     }
 
     /// <summary>
@@ -1074,13 +1101,72 @@ public sealed partial class NinjaTraderSimAdapter
         dynamic orderUpdate = orderUpdateObj;
         if (order == null) return;
 
-        // Get tag/name (try Tag first, fallback to Name)
-        var encodedTag = GetOrderTag(order);
-        var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
+        // Get tag/name with source (Tag, Name, FromEntrySignal, SignalName)
+        var (encodedTag, tagSource) = GetOrderTagWithSource(order);
+        var parsed = RobotOrderIds.ParseTag(encodedTag);
+        var intentId = parsed.IntentId ?? RobotOrderIds.DecodeIntentId(encodedTag);
         if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
 
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
+
+        // Pre-flight diagnostic: when tag indicates STOP, log for BE confirmation verification
+        if (parsed.Leg == "STOP")
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "BE_PREFLIGHT_STOP_ORDER_UPDATE",
+                new
+                {
+                    stop_order_id = order.OrderId,
+                    broker_order_id = order.OrderId,
+                    raw_tag = encodedTag ?? "",
+                    tag_source = tagSource,
+                    parsed_intent_id = parsed.IntentId,
+                    parsed_leg = parsed.Leg,
+                    order_type_from_tag = "STOP",
+                    order_state = orderState.ToString(),
+                    stop_price = order.StopPrice,
+                    note = "Pre-flight: STOP OrderUpdate received; verify BE confirmation pipeline"
+                }));
+        }
+
+        // BE confirmation: when STOP order update arrives, check pending BE requests
+        if (parsed.Leg == "STOP")
+        {
+            TryConfirmPendingBE(order, intentId, parsed, orderState, utcNow);
+            // ORDER_UPDATED for STOP orders
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "ORDER_UPDATED", new
+            {
+                order_type = "STOP",
+                stop_order_id = order.OrderId,
+                stop_price = order.StopPrice,
+                order_state = orderState.ToString(),
+                intent_id = intentId
+            }));
+            // Stop order Rejected: emit STOP_MODIFY_REJECTED if pending
+            if (orderState == OrderState.Rejected)
+            {
+                var stopOrderId = order.OrderId ?? "";
+                if (_pendingBERequests.TryRemove(stopOrderId, out var rejectedPending))
+                {
+                    string errorMsg = "Order rejected";
+                    try { dynamic du = orderUpdate; errorMsg = (string?)du.Comment ?? errorMsg; } catch { }
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "STOP_MODIFY_REJECTED", new
+                    {
+                        stop_order_id = stopOrderId,
+                        intent_id = intentId,
+                        oco_id = rejectedPending.OcoId,
+                        error = errorMsg,
+                        order_state = "Rejected",
+                        note = "OrderUpdate Rejected for pending BE"
+                    }));
+                }
+                // Also record CancelPending for replace-semantics (when old stop goes CancelPending)
+            }
+            else if (orderState == OrderState.CancelPending || orderState == OrderState.Cancelled)
+            {
+                _pendingBECancelUtcByIntent[intentId] = utcNow;
+            }
+        }
 
         if (!OrderMap.TryGetValue(intentId, out var orderInfo))
         {
@@ -1103,18 +1189,19 @@ public sealed partial class NinjaTraderSimAdapter
             return;
         }
 
-        // Update journal based on order state
+        // Update journal based on order state. Truth source: use parsed.Leg from tag, NOT orderInfo.OrderType.
         if (orderState == OrderState.Accepted)
         {
+            var orderTypeFromTag = parsed.Leg ?? orderInfo.OrderType;
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_ACKNOWLEDGED",
-                new { broker_order_id = order.OrderId, order_type = orderInfo.OrderType }));
+                new { broker_order_id = order.OrderId, order_type = orderTypeFromTag }));
             
             // Mark protective orders as acknowledged for watchdog tracking
-            if (orderInfo.OrderType == "STOP")
+            if (parsed.Leg == "STOP")
             {
                 orderInfo.ProtectiveStopAcknowledged = true;
             }
-            else if (orderInfo.OrderType == "TARGET")
+            else if (parsed.Leg == "TARGET")
             {
                 orderInfo.ProtectiveTargetAcknowledged = true;
             }
@@ -2222,6 +2309,8 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            // Intent exit: purge pending BE (target/stop fill)
+            PurgePendingBEForIntent(intentId, utcNow, orderInfo.Instrument, "exit_fill");
             // Exit fill
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
             // orderInfo might be from entry order if protective order wasn't added to OrderMap yet
@@ -3259,13 +3348,179 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// Timeout check: runs in EvaluateBreakEven tick path. Post-read, retry, or STOP_MODIFY_FAILED.
+    /// Confirmation always wins over timeout — if CONFIRMED arrives after TIMEOUT but before FAILED, we cancel retry.
+    /// </summary>
+    private void CheckPendingBETimeouts(DateTimeOffset utcNow)
+    {
+        var account = _ntAccount as Account;
+        if (account == null) return;
+
+        var toProcess = _pendingBERequests.ToArray();
+
+        foreach (var kvp in toProcess)
+        {
+            var stopOrderId = kvp.Key;
+            var pending = kvp.Value;
+
+            // Phase 1: Retry scheduled — time to retry
+            if (pending.RetryUtc != null && pending.RetryUtc.Value <= utcNow && pending.RetryCount < BE_MAX_RETRY_ATTEMPTS)
+            {
+                _pendingBERequests.TryRemove(stopOrderId, out _);
+                ModifyStopToBreakEven(pending.IntentId, pending.Instrument, pending.RequestedStopPriceQuantized, utcNow, pending.RetryCount + 1);
+                continue;
+            }
+
+            // Phase 2: Initial wait timed out (no retry scheduled yet)
+            if (pending.RetryUtc == null && (utcNow - pending.RequestedUtc).TotalSeconds <= BE_CONFIRM_TIMEOUT_SEC)
+                continue;
+
+            if (pending.RetryUtc != null)
+                continue; // Already in retry wait, not yet time
+
+            // Timeout: try post-read first
+            var tickSize = GetTickSizeForInstrument(pending.Instrument);
+            Order? stopOrder = null;
+            try
+            {
+                stopOrder = account.Orders.FirstOrDefault(o =>
+                    (o.OrderId == stopOrderId || GetOrderTag(o) == pending.RawTag) &&
+                    (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+            }
+            catch { }
+
+            if (stopOrder != null)
+            {
+                var orderStopQuantized = QuantizeToTick((decimal)stopOrder.StopPrice, tickSize);
+                if (orderStopQuantized == pending.RequestedStopPriceQuantized)
+                {
+                    _pendingBERequests.TryRemove(stopOrderId, out _);
+                    ConfirmAndRecordBE(pending, orderStopQuantized, utcNow);
+                    continue;
+                }
+            }
+
+            // Post-read did not confirm: emit TIMEOUT, schedule retry or fail
+            _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Instrument, "STOP_MODIFY_TIMEOUT", new
+            {
+                stop_order_id = stopOrderId,
+                intent_id = pending.IntentId,
+                retry_count = pending.RetryCount,
+                requested_stop_price_quantized = pending.RequestedStopPriceQuantized
+            }));
+
+            var nextRetryCount = pending.RetryCount + 1;
+            if (nextRetryCount >= BE_MAX_RETRY_ATTEMPTS)
+            {
+                _pendingBERequests.TryRemove(stopOrderId, out _);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Instrument, "STOP_MODIFY_FAILED", new
+                {
+                    stop_order_id = stopOrderId,
+                    intent_id = pending.IntentId,
+                    reason = "MAX_RETRIES_EXCEEDED",
+                    retry_count = nextRetryCount
+                }));
+                _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Instrument, "STOP_MODIFY_FAILED_SNAPSHOT", new
+                {
+                    stop_order_id = stopOrderId,
+                    last_seen_stop_price = stopOrder != null ? (decimal?)(decimal)stopOrder.StopPrice : null,
+                    order_state = stopOrder != null ? stopOrder.OrderState.ToString() : "NotFound",
+                    retry_count = nextRetryCount,
+                    instrument = pending.Instrument,
+                    intent_id = pending.IntentId
+                }));
+            }
+            else
+            {
+                pending.RetryCount = nextRetryCount;
+                pending.RetryUtc = utcNow.AddSeconds(BE_RETRY_INTERVAL_SEC);
+                _pendingBERequests[stopOrderId] = pending;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Check if STOP order update confirms a pending BE request. Direct match: stop_order_id. Replace: intent_id + same OCO or recent CancelPending.
+    /// </summary>
+    private void TryConfirmPendingBE(Order order, string intentId, ParsedTagResult parsed, OrderState orderState, DateTimeOffset utcNow)
+    {
+        if (parsed.Leg != "STOP") return;
+        if (orderState != OrderState.Working && orderState != OrderState.Accepted) return;
+
+        var stopOrderId = order.OrderId ?? "";
+        var orderStopPrice = (decimal)order.StopPrice;
+        var instrument = order.Instrument?.MasterInstrument?.Name ?? "";
+        var accountName = (_ntAccount as Account)?.Name ?? "";
+        var orderExecutionKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, order.Instrument, _ieaEngineExecutionInstrument);
+        var tickSize = GetTickSizeForInstrument(instrument);
+        var orderStopQuantized = QuantizeToTick(orderStopPrice, tickSize);
+
+        // Direct match: stop_order_id in pending
+        if (_pendingBERequests.TryGetValue(stopOrderId, out var pending))
+        {
+            if (orderExecutionKey != pending.ExecutionInstrumentKey) return;
+            if (orderStopQuantized != pending.RequestedStopPriceQuantized) return;
+
+            _pendingBERequests.TryRemove(stopOrderId, out _);
+            ConfirmAndRecordBE(pending, orderStopQuantized, utcNow);
+            return;
+        }
+
+        // Replace-semantics: new STOP with different id, same intent_id, stop price matches, (same OCO or recent CancelPending)
+        foreach (var kvp in _pendingBERequests.ToArray())
+        {
+            var p = kvp.Value;
+            if (p.IntentId != intentId) continue;
+            if (orderExecutionKey != p.ExecutionInstrumentKey) continue;
+            if (orderStopQuantized != p.RequestedStopPriceQuantized) continue;
+
+            var sameOco = !string.IsNullOrEmpty(p.OcoId) && string.Equals(order.Oco as string, p.OcoId, StringComparison.OrdinalIgnoreCase);
+            var recentCancel = _pendingBECancelUtcByIntent.TryGetValue(intentId, out var cancelUtc) &&
+                (utcNow - cancelUtc).TotalSeconds <= BE_REPLACE_CANCEL_WINDOW_SEC;
+            if (!sameOco && !recentCancel) continue;
+
+            _pendingBERequests.TryRemove(kvp.Key, out _);
+            ConfirmAndRecordBE(p, orderStopQuantized, utcNow);
+            return;
+        }
+    }
+
+    private void ConfirmAndRecordBE(PendingBERequest pending, decimal confirmedStopPrice, DateTimeOffset utcNow)
+    {
+        decimal? previousStopPrice = null;
+        decimal? beTriggerPrice = null;
+        if (IntentMap.TryGetValue(pending.IntentId, out var intent))
+            beTriggerPrice = intent.BeTrigger;
+        var journalPath = System.IO.Path.Combine(_projectRoot, "data", "execution_journals", $"{pending.TradingDate}_{pending.Stream}_{pending.IntentId}.json");
+        if (System.IO.File.Exists(journalPath))
+        {
+            try
+            {
+                var journalJson = System.IO.File.ReadAllText(journalPath);
+                var journalEntry = QTSW2.Robot.Core.JsonUtil.Deserialize<ExecutionJournalEntry>(journalJson);
+                previousStopPrice = journalEntry?.StopPrice ?? journalEntry?.BEStopPrice;
+            }
+            catch { }
+        }
+        _executionJournal.RecordBEModification(pending.IntentId, pending.TradingDate, pending.Stream, confirmedStopPrice, utcNow,
+            previousStopPrice: previousStopPrice, beTriggerPrice: beTriggerPrice, entryPrice: null);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Instrument, "STOP_MODIFY_CONFIRMED", new
+        {
+            intent_id = pending.IntentId,
+            confirmed_stop_price = confirmedStopPrice,
+            requested_stop_price_quantized = pending.RequestedStopPriceQuantized
+        }));
+    }
+
+    /// <summary>
     /// STEP 5: Modify stop to break-even using real NT API.
     /// </summary>
     private OrderModificationResult ModifyStopToBreakEvenReal(
         string intentId,
         string instrument,
         decimal beStopPrice,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        int retryCount = 0)
     {
         if (_ntAccount == null)
         {
@@ -3321,106 +3576,65 @@ public sealed partial class NinjaTraderSimAdapter
                 return OrderModificationResult.SuccessResult(utcNow);
             }
 
-            // Real NT API: Modify stop price
-            stopOrder.StopPrice = (double)beStopPrice;
-            dynamic dynAccountModify = account;
-            Order[]? result = null;
+            // Quantize requested stop (deterministic rounding)
+            var tickSize = GetTickSizeForInstrument(instrument);
+            var beStopQuantized = QuantizeToTick(beStopPrice, tickSize);
+            var (tradingDate8, stream8, intentEntryPrice2, intentStopPrice3, intentTargetPrice3, _, _) = GetIntentInfo(intentId);
+            var accountName = (account as Account)?.Name ?? "";
+            var executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, stopOrder.Instrument, _ieaEngineExecutionInstrument);
+            var rawTag = GetOrderTag(stopOrder) ?? RobotOrderIds.EncodeStopTag(intentId);
+            var ocoId = stopOrder.Oco as string;
+
+            // 1. Register pending BEFORE Change() — race hardening: OrderUpdate may arrive immediately
+            var pending = new PendingBERequest
+            {
+                IntentId = intentId,
+                OcoId = ocoId,
+                RequestedStopPriceRaw = beStopPrice,
+                RequestedStopPriceQuantized = beStopQuantized,
+                RequestedUtc = utcNow,
+                TradingDate = tradingDate8 ?? "",
+                Stream = stream8 ?? "",
+                Instrument = instrument,
+                ExecutionInstrumentKey = executionInstrumentKey,
+                RetryCount = retryCount,
+                RawTag = rawTag
+            };
+            var stopOrderId = stopOrder.OrderId ?? "";
+            _pendingBERequests[stopOrderId] = pending;
+
+            // 2. Real NT API: Modify stop price. Change() returns void — do NOT assign.
+            stopOrder.StopPrice = (double)beStopQuantized;
             try
             {
-                object? changeResult = dynAccountModify.Change(new[] { stopOrder });
-                if (changeResult != null && changeResult is Order[] changeArray)
-                {
-                    result = changeArray;
-                }
+                account.Change(new[] { stopOrder });
             }
             catch (Exception ex)
             {
-                // Change() call failed - log and attempt fallback
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FALLBACK", new
+                _pendingBERequests.TryRemove(stopOrderId, out _);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_REJECTED", new
                 {
+                    stop_order_id = stopOrderId,
+                    intent_id = intentId,
+                    oco_id = ocoId,
                     error = ex.Message,
                     exception_type = ex.GetType().Name,
-                    order_type = "STOP_BREAK_EVEN",
-                    broker_order_id = stopOrder.OrderId,
-                    note = "Change() call failed for BE modification, attempting fallback (Change returns void)"
+                    note = "Change() threw; BE modification rejected"
                 }));
-                
-                // Fallback: Change returns void - check order state directly
-                try
-                {
-                    // Try calling Change() again (void return)
-                    dynAccountModify.Change(new[] { stopOrder });
-                    result = new[] { stopOrder };
-                }
-                catch (Exception fallbackEx)
-                {
-                    // Both attempts failed - reject modification
-                    var errorMsg = $"BE modification failed: {ex.Message} (fallback also failed: {fallbackEx.Message})";
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CHANGE_FAIL", new
-                    {
-                        error = errorMsg,
-                        first_error = ex.Message,
-                        fallback_error = fallbackEx.Message,
-                        order_type = "STOP_BREAK_EVEN",
-                        broker_order_id = stopOrder.OrderId,
-                        account = "SIM",
-                        exception_type = ex.GetType().Name,
-                        fallback_exception_type = fallbackEx.GetType().Name
-                    }));
-                    return OrderModificationResult.FailureResult(errorMsg, utcNow);
-                }
+                return OrderModificationResult.FailureResult($"BE modification failed: {ex.Message}", utcNow);
             }
 
-            if (result == null || result.Length == 0 || result[0].OrderState == OrderState.Rejected)
+            // 3. Emit STOP_MODIFY_REQUESTED. Journal gating: RecordBEModification only on STOP_MODIFY_CONFIRMED.
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_REQUESTED", new
             {
-                dynamic dynResult = result?[0];
-                var error = (string?)dynResult?.ErrorMessage ?? (string?)dynResult?.Error ?? "BE modification rejected";
-                return OrderModificationResult.FailureResult(error, utcNow);
-            }
-
-            // Get Intent and previous stop price for BE modification context
-            var (tradingDate8, stream8, intentEntryPrice2, intentStopPrice3, intentTargetPrice3, _, _) = GetIntentInfo(intentId);
-            decimal? previousStopPrice = null;
-            decimal? beTriggerPrice = null;
-            
-            // Get previous stop price from journal entry
-            var journalPath = System.IO.Path.Combine(_projectRoot, "data", "execution_journals", $"{tradingDate8}_{stream8}_{intentId}.json");
-            if (System.IO.File.Exists(journalPath))
-            {
-                try
-                {
-                    var journalJson = System.IO.File.ReadAllText(journalPath);
-                    var journalEntry = QTSW2.Robot.Core.JsonUtil.Deserialize<ExecutionJournalEntry>(journalJson);
-                    if (journalEntry != null && journalEntry.StopPrice.HasValue)
-                    {
-                        previousStopPrice = journalEntry.StopPrice.Value;
-                    }
-                    if (journalEntry != null && journalEntry.BEStopPrice.HasValue)
-                    {
-                        // If BE was already modified, use the previous BE stop price
-                        previousStopPrice = journalEntry.BEStopPrice.Value;
-                    }
-                }
-                catch
-                {
-                    // Ignore errors reading journal
-                }
-            }
-            
-            // Get BE trigger price from Intent
-            if (IntentMap.TryGetValue(intentId, out var beIntent))
-            {
-                beTriggerPrice = beIntent.BeTrigger;
-            }
-            
-            _executionJournal.RecordBEModification(intentId, tradingDate8, stream8, beStopPrice, utcNow, 
-                previousStopPrice: previousStopPrice, beTriggerPrice: beTriggerPrice, entryPrice: intentEntryPrice2);
-
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_SUCCESS", new
-            {
-                be_stop_price = beStopPrice,
-                broker_order_id = stopOrder.OrderId,
-                account = "SIM"
+                stop_order_id = stopOrderId,
+                oco_id = ocoId,
+                intent_id = intentId,
+                requested_stop_price_raw = beStopPrice,
+                requested_stop_price_quantized = beStopQuantized,
+                raw_tag = rawTag,
+                instrument,
+                requested_utc = utcNow.ToString("o")
             }));
 
             return OrderModificationResult.SuccessResult(utcNow);
@@ -3732,10 +3946,22 @@ public sealed partial class NinjaTraderSimAdapter
     }
     
     /// <summary>
+    /// Emergency flatten when IEA is blocked. Bypasses IEA queue — calls broker directly.
+    /// Prevents position with no protectives when EnqueueAndWait times out.
+    /// </summary>
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_ON_BLOCK", state: "ENGINE",
+            new { instrument, note = "Flatten on block — bypassing IEA queue" }));
+        return FlattenIntentReal("EMERGENCY_BLOCK", instrument, utcNow);
+    }
+
+    /// <summary>
     /// Flatten exposure for a specific intent only using real NT API.
     /// </summary>
     private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
     {
+        PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
         if (_ntAccount == null || _ntInstrument == null)
         {
             var error = "NT context not set";
@@ -4800,6 +5026,8 @@ public sealed partial class NinjaTraderSimAdapter
 
             // ENTRY AGGREGATION: When IEA enabled, route through queue (Gap 1). IEA owns aggregation + single-order fallback.
             // Both paths run on worker to preserve single mutation lane invariant.
+            // ENTRY_SUBMISSION_TIMEOUT_MS: 12s (was 5s) — NT CreateOrder/Submit can block 6+ seconds under load (2026-02-18 YM1 incident).
+            const int ENTRY_SUBMISSION_TIMEOUT_MS = 12000;
             if (_useInstrumentExecutionAuthority && _iea != null)
             {
                 var (success, ieaResult) = _iea.EnqueueAndWait(() =>
@@ -4808,7 +5036,7 @@ public sealed partial class NinjaTraderSimAdapter
                     if (aggResult != null)
                         return aggResult;
                     return SubmitSingleEntryOrderCore(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
-                });
+                }, ENTRY_SUBMISSION_TIMEOUT_MS);
                 if (!success)
                     return OrderSubmissionResult.FailureResult("Entry submission failed (IEA queue overflow or timeout)", utcNow);
                 return ieaResult ?? OrderSubmissionResult.FailureResult("Entry submission returned null", utcNow);

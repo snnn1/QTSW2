@@ -1,0 +1,82 @@
+name: Replay Determinism
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  determinism:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore modules/robot/replay/Robot.Replay.csproj
+
+      - name: Determinism test (golden replay)
+        env:
+          REPLAY_HOST_VERSION: ${{ github.sha }}
+        run: |
+          dotnet run --project modules/robot/replay/Robot.Replay.csproj -c Release --no-build -- \
+            --determinism-test --file modules/robot/replay/sample_replay.jsonl
+
+  incident-packs:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: |
+          dotnet restore modules/robot/replay/Robot.Replay.csproj
+          dotnet restore modules/robot/replay_host/Robot.ReplayHost.csproj
+
+      - name: Build
+        run: |
+          dotnet build modules/robot/replay/Robot.Replay.csproj -c Release --no-restore
+          dotnet build modules/robot/replay_host/Robot.ReplayHost.csproj -c Release --no-restore
+
+      - name: Run incident packs
+        env:
+          REPLAY_HOST_VERSION: ${{ github.sha }}
+        run: |
+          $incidentsDir = "modules/robot/replay/incidents"
+          if (-not (Test-Path $incidentsDir)) {
+            Write-Host "No incidents directory, skipping"
+            exit 0
+          }
+          $failed = $false
+          Get-ChildItem -Path $incidentsDir -Directory | ForEach-Object {
+            $canonical = Join-Path $_.FullName "canonical.json"
+            $expected = Join-Path $_.FullName "expected.json"
+            if (-not (Test-Path $canonical)) {
+              Write-Host "Skipping $($_.Name): no canonical.json"
+              return
+            }
+            Write-Host "Running incident pack: $($_.Name)"
+            $hostArgs = @("--determinism-test", "--file", $canonical)
+            if (Test-Path $expected) {
+              $hostArgs += "--run-invariants", "--expected", $expected
+            }
+            $proc = Start-Process -FilePath "dotnet" -ArgumentList @("run", "--project", "modules/robot/replay_host/Robot.ReplayHost.csproj", "-c", "Release", "--no-build", "--") + $hostArgs -NoNewWindow -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "FAIL: $($_.Name)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }

@@ -83,9 +83,22 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Get execution instrument (e.g., MNQ, MGC) for IEA routing.
+    /// Get execution instrument (e.g., MNQ, MGC) for IEA routing and BE monitoring.
+    /// Resolves chart instrument to execution instrument via policy: CL→MCL, NQ→MNQ, etc.
+    /// CRITICAL: Intents have ExecutionInstrument from streams (MCL, MNQ). BE filter must match.
     /// </summary>
-    public string GetExecutionInstrument() => _executionInstrument ?? "";
+    public string GetExecutionInstrument()
+    {
+        var chartOrCanonical = _executionInstrument ?? "";
+        if (string.IsNullOrWhiteSpace(chartOrCanonical)) return "";
+        if (_executionPolicy != null)
+        {
+            var resolved = _executionPolicy.GetEnabledExecutionInstrument(chartOrCanonical);
+            if (!string.IsNullOrWhiteSpace(resolved))
+                return resolved;
+        }
+        return chartOrCanonical;
+    }
 
     /// <summary>
     /// Pre-load execution journal cache for trading date.
@@ -887,6 +900,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     isExecutionAllowedCallback: () => IsExecutionAllowed(),
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
+                        // Flatten on block: prevent position with no protectives when IEA queue is blocked
+                        var flattenResult = _executionAdapter.FlattenEmergency(instrument, now);
+                        if (!flattenResult.Success)
+                        {
+                            LogEvent(RobotEvents.EngineBase(now, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                                eventType: "FLATTEN_EMERGENCY_ON_BLOCK_FAILED", state: "ENGINE",
+                                new { instrument, reason, error = flattenResult.ErrorMessage, note = "Flatten on block failed; position may be unprotected" }));
+                        }
                         StandDownStreamsForInstrument(instrument, now, reason);
                         _healthMonitor?.ReportCritical("IEA_ENQUEUE_FAILURE_INSTRUMENT_BLOCKED", new Dictionary<string, object>
                         {
@@ -4415,6 +4436,36 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ["note"] = "Snapshot of all stream states at Realtime transition"
             };
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATE_SNAPSHOT", state: "ENGINE", payload));
+        }
+    }
+
+    /// <summary>
+    /// Log invariant check for each active stream: chart/canonical instrument vs execution policy mapping vs stream execution instrument.
+    /// Prevents silent regressions (e.g., CL chart passing "CL" to BE filter when intents have "MCL").
+    /// Call from strategy at Realtime transition, after LogStreamStateSnapshot.
+    /// </summary>
+    public void LogStreamInstrumentInvariantCheck(DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            if (_streams.Count == 0 || _executionPolicy == null) return;
+            foreach (var stream in _streams.Values)
+            {
+                var chartInstrument = stream.CanonicalInstrument;
+                var executionPolicyMapped = _executionPolicy.GetEnabledExecutionInstrument(chartInstrument) ?? "N/A";
+                var streamExecutionInstrument = stream.ExecutionInstrument;
+                var status = string.Equals(executionPolicyMapped, streamExecutionInstrument, StringComparison.OrdinalIgnoreCase) ? "OK" : "MISMATCH";
+                var payload = new Dictionary<string, object>
+                {
+                    ["chartInstrument"] = chartInstrument,
+                    ["executionPolicyMapped"] = executionPolicyMapped,
+                    ["streamExecutionInstrument"] = streamExecutionInstrument,
+                    ["stream_id"] = stream.Stream,
+                    ["status"] = status
+                };
+                var eventType = status == "OK" ? "STREAM_INSTRUMENT_INVARIANT_CHECK" : "STREAM_INSTRUMENT_INVARIANT_MISMATCH";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", payload));
+            }
         }
     }
 

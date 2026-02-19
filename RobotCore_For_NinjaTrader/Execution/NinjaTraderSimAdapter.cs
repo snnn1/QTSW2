@@ -95,6 +95,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private DateTimeOffset _lastFlattenUtc;
     private const int FLATTEN_RECOGNITION_WINDOW_SECONDS = 10;
 
+    // BE Modify Confirmation: pending requests keyed by stop_order_id. Register BEFORE Change(); confirm via OrderUpdate.
+    private readonly ConcurrentDictionary<string, PendingBERequest> _pendingBERequests = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _pendingBECancelUtcByIntent = new(); // Replace-semantics: intent_id -> when old stop went CancelPending
+    private const int BE_REPLACE_CANCEL_WINDOW_SEC = 30;
+    private const int BE_CONFIRM_TIMEOUT_SEC = 15;
+    private const int BE_RETRY_INTERVAL_SEC = 5;
+    private const int BE_MAX_RETRY_ATTEMPTS = 3;
+
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
         _projectRoot = projectRoot;
@@ -1163,10 +1171,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>
     /// Phase 3: Evaluate break-even. When IEA enabled, delegates to IEA. When not, runs BE logic (legacy path).
+    /// Timeout check runs first (same tick path) — post-read, retry, or STOP_MODIFY_FAILED.
     /// </summary>
     public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)
     {
 #if NINJATRADER
+        CheckPendingBETimeouts(DateTimeOffset.UtcNow);
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
             _iea.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
@@ -1179,18 +1189,30 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
-    /// STEP 5: Break-Even Modification
+    /// STEP 5: Break-Even Modification.
     /// </summary>
     public OrderModificationResult ModifyStopToBreakEven(
         string intentId,
         string instrument,
         decimal beStopPrice,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow) =>
+        ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow, retryCount: 0);
+
+    /// <summary>
+    /// Internal overload for retry path (retryCount > 0).
+    /// </summary>
+    internal OrderModificationResult ModifyStopToBreakEven(
+        string intentId,
+        string instrument,
+        decimal beStopPrice,
+        DateTimeOffset utcNow,
+        int retryCount)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_ATTEMPT", new
         {
             be_stop_price = beStopPrice,
-            account = "SIM"
+            account = "SIM",
+            retry_count = retryCount
         }));
 
         if (!_simAccountVerified)
@@ -1246,7 +1268,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 return OrderModificationResult.FailureResult(error, utcNow);
             }
 
-            return ModifyStopToBreakEvenReal(intentId, instrument, beStopPrice, utcNow);
+            return ModifyStopToBreakEvenReal(intentId, instrument, beStopPrice, utcNow, retryCount);
         }
         catch (Exception ex)
         {
@@ -1807,4 +1829,67 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         return FlattenWithRetry(intentId, instrument, utcNow);
     }
 
+    /// <summary>Quantize price to tick using deterministic rounding (MidpointRounding.AwayFromZero).</summary>
+    private static decimal QuantizeToTick(decimal price, decimal tickSize)
+    {
+        if (tickSize <= 0) return price;
+        return Math.Round(price / tickSize, 0, MidpointRounding.AwayFromZero) * tickSize;
+    }
+
+    /// <summary>Purge pending BE for intent on exit (target/stop fill, flatten, journal close). Emit STOP_MODIFY_PENDING_CLEARED_ON_EXIT.</summary>
+    internal void PurgePendingBEForIntent(string intentId, DateTimeOffset utcNow, string instrument = "", string reason = "exit")
+    {
+        var purged = new List<string>();
+        string? lastInstrument = null;
+        foreach (var kvp in _pendingBERequests.ToArray())
+        {
+            if (kvp.Value.IntentId == intentId)
+            {
+                lastInstrument = kvp.Value.Instrument;
+                if (_pendingBERequests.TryRemove(kvp.Key, out _))
+                    purged.Add(kvp.Key);
+            }
+        }
+        if (purged.Count > 0)
+        {
+            _pendingBECancelUtcByIntent.TryRemove(intentId, out _);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, lastInstrument ?? instrument, "STOP_MODIFY_PENDING_CLEARED_ON_EXIT", new
+            {
+                intent_id = intentId,
+                purged_stop_order_ids = purged,
+                reason
+            }));
+        }
+    }
+
+    /// <summary>Get tick size for instrument. YM: 1, CL: 0.01, etc.</summary>
+    private static decimal GetTickSizeForInstrument(string instrument)
+    {
+        var u = (instrument ?? "").ToUpperInvariant();
+        if (u.Contains("YM") || u.Contains("MYM")) return 1m;
+        if (u.Contains("CL") || u.Contains("MCL")) return 0.01m;
+        if (u.Contains("NQ") || u.Contains("MNQ") || u.Contains("M2K")) return 0.25m;
+        if (u.Contains("ES") || u.Contains("MES")) return 0.25m;
+        if (u.Contains("GC") || u.Contains("MGC")) return 0.1m;
+        if (u.Contains("NG") || u.Contains("MNG")) return 0.001m;
+        return 0.01m; // default
+    }
+}
+
+/// <summary>Pending BE modification request. Keyed by stop_order_id.</summary>
+internal sealed class PendingBERequest
+{
+    public string IntentId { get; set; } = "";
+    public string? OcoId { get; set; }
+    public decimal RequestedStopPriceRaw { get; set; }
+    public decimal RequestedStopPriceQuantized { get; set; }
+    public DateTimeOffset RequestedUtc { get; set; }
+    public string TradingDate { get; set; } = "";
+    public string Stream { get; set; } = "";
+    public string Instrument { get; set; } = "";
+    public string ExecutionInstrumentKey { get; set; } = "";
+    public int RetryCount { get; set; }
+    public string RawTag { get; set; } = "";
+    /// <summary>When set, we're waiting for retry time. Null = initial confirmation wait.</summary>
+    public DateTimeOffset? RetryUtc { get; set; }
 }

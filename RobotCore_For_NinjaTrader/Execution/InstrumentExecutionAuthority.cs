@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -77,13 +78,21 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Phase 2: Bracket/aggregation policy. Null = use defaults (require identical, 0 tolerance).</summary>
     internal readonly AggregationPolicy? AggregationPolicy;
 
-    public InstrumentExecutionAuthority(string accountName, string executionInstrumentKey, IIEAOrderExecutor? executor = null, RobotLogger? log = null, AggregationPolicy? aggregationPolicy = null)
+    /// <summary>Event clock for BE/dedup. Null = use UtcNow (live). Injected for replay.</summary>
+    private readonly IEventClock? _eventClock;
+
+    /// <summary>Wall clock for EnqueueAndWait timeouts. Null = use UtcNow (live). Injected for Full-System replay.</summary>
+    private readonly IWallClock? _wallClock;
+
+    public InstrumentExecutionAuthority(string accountName, string executionInstrumentKey, IIEAOrderExecutor? executor = null, RobotLogger? log = null, AggregationPolicy? aggregationPolicy = null, IEventClock? eventClock = null, IWallClock? wallClock = null)
     {
         AccountName = accountName ?? "";
         ExecutionInstrumentKey = (executionInstrumentKey ?? "").Trim().ToUpperInvariant();
         Executor = executor;
         Log = log;
         AggregationPolicy = aggregationPolicy;
+        _eventClock = eventClock;
+        _wallClock = wallClock;
         _instanceId = System.Threading.Interlocked.Increment(ref _instanceCounter);
 
         _workerThread = new Thread(WorkerLoop) { IsBackground = true, Name = $"IEA-{ExecutionInstrumentKey}-{_instanceId}" };
@@ -155,6 +164,9 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Last mutation timestamp for heartbeat.</summary>
     internal DateTimeOffset LastMutationUtc => _lastMutationUtc;
 
+    private DateTimeOffset NowEvent() => _eventClock?.NowEvent() ?? DateTimeOffset.UtcNow;
+    private DateTimeOffset NowWall() => _wallClock?.NowWall() ?? DateTimeOffset.UtcNow;
+
     /// <summary>
     /// Gap 1: Enqueue work and block until result. Used for entry submission and flatten.
     /// Deadlock guard: if called from worker thread, executes inline. Fail-fast on queue overflow or timeout.
@@ -183,7 +195,7 @@ public sealed partial class InstrumentExecutionAuthority
         if (QueueDepth > MAX_QUEUE_DEPTH_FOR_ENQUEUE)
         {
             _instrumentBlocked = true;
-            var utcNow = DateTimeOffset.UtcNow;
+            var utcNow = NowWall();
             Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_QUEUE_OVERFLOW", state: "ENGINE",
                 new
                 {
@@ -218,7 +230,7 @@ public sealed partial class InstrumentExecutionAuthority
             if (!done.Wait(timeoutMs))
             {
                 _instrumentBlocked = true;
-                var utcNow = DateTimeOffset.UtcNow;
+                var utcNow = NowWall();
                 Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_TIMEOUT", state: "ENGINE",
                     new
                     {
@@ -332,6 +344,27 @@ public sealed partial class InstrumentExecutionAuthority
     internal bool TryGetIntentPolicy(string intentId, out IntentPolicyExpectation? policy)
     {
         return IntentPolicy.TryGetValue(intentId, out policy);
+    }
+
+    /// <summary>
+    /// Gap 3: Deduplicate execution by primitives. Returns true if duplicate (caller should skip), false if new (marks as processed).
+    /// Used by replay and by NT adapter (after parsing NT types to primitives).
+    /// </summary>
+    internal bool TryMarkAndCheckDuplicateCore(string? executionId, string orderId, long executionTimeTicks, int quantity, string marketPosition)
+    {
+        var key = !string.IsNullOrEmpty(executionId)
+            ? executionId
+            : $"{orderId}|{executionTimeTicks}|{quantity}|{marketPosition ?? ""}|{orderId}";
+        if (string.IsNullOrEmpty(key)) return false;
+
+        if (_processedExecutionIds.TryAdd(key, NowEvent()))
+        {
+            var count = Interlocked.Increment(ref _dedupInsertCount);
+            if (count % DEDUP_EVICTION_INTERVAL == 0)
+                EvictDedupEntries();
+            return false;
+        }
+        return true;
     }
 
     /// <summary>

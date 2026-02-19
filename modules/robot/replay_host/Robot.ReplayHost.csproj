@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>QTSW2.Robot.ReplayHost</RootNamespace>
+    <Description>net48 replay host. Runs IEA via ReplayDriver. Consumes validated JSON from net8.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\contracts\Robot.Contracts.csproj" />
+    <ProjectReference Include="..\..\..\RobotCore_For_NinjaTrader\Robot.Core.csproj" />
+  </ItemGroup>
+</Project>

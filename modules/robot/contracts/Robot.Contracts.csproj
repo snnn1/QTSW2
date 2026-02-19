@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>QTSW2.Robot.Contracts</RootNamespace>
+    <Description>Shared DTOs and interfaces for IEA replay. Referenced by net48 IEA and net8 Replay.</Description>
+  </PropertyGroup>
+</Project>

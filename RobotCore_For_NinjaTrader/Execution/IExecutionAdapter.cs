@@ -118,6 +118,15 @@ public interface IExecutionAdapter
         DateTimeOffset utcNow);
     
     /// <summary>
+    /// Emergency flatten by instrument when IEA is blocked. Bypasses IEA queue — calls broker directly.
+    /// Used when EnqueueAndWait times out to prevent leaving position unprotected.
+    /// </summary>
+    /// <param name="instrument">Execution instrument key (e.g. MYM, MNQ)</param>
+    /// <param name="utcNow">Current UTC timestamp</param>
+    /// <returns>Flatten result</returns>
+    FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
     /// Get account snapshot (positions and working orders) for recovery reconciliation.
     /// </summary>
     /// <param name="utcNow">Current UTC timestamp</param>

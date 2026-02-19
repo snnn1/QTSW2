@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using NinjaTrader.Cbi;
+using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -22,6 +23,7 @@ public sealed partial class InstrumentExecutionAuthority
     private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _beTriggerReachedPendingModification = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _beTriggeredIntentIds = new(StringComparer.OrdinalIgnoreCase);
     private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
     private const int BE_MODIFY_MAX_RETRIES = 25;
     private const double BE_SCAN_THROTTLE_MS = 200;
@@ -74,7 +76,7 @@ public sealed partial class InstrumentExecutionAuthority
             return null;
 
         var toAggregate = new List<(string intentId, string stream, int qty, string? oco)>();
-        foreach (var kvp in IntentMap)
+        foreach (var kvp in IntentMap.OrderBy(k => k.Key))
         {
             var other = kvp.Value;
             if (kvp.Key == intentId) continue;
@@ -333,7 +335,7 @@ public sealed partial class InstrumentExecutionAuthority
             return null;
         var oppositeDirection = intent.Direction == "Long" ? "Short" : "Long";
         var oppositeTrigger = oppositeDirection == "Long" ? "ENTRY_STOP_BRACKET_LONG" : "ENTRY_STOP_BRACKET_SHORT";
-        foreach (var kvp in IntentMap)
+        foreach (var kvp in IntentMap.OrderBy(k => k.Key))
         {
             var other = kvp.Value;
             if (other.Stream == intent.Stream &&
@@ -554,61 +556,150 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>
     /// Gap 3: Deduplicate execution callbacks. Returns true if duplicate (caller should skip), false if new (marks as processed).
-    /// Key: ExecutionId if available; else orderId|execution.Time.Ticks|execution.Quantity|execution.MarketPosition|execution.OrderId.
-    /// Eviction: periodic sweep every 100 inserts, remove entries older than 5 minutes.
+    /// Parses NT types and delegates to TryMarkAndCheckDuplicateCore.
     /// </summary>
     internal bool TryMarkAndCheckDuplicate(object execution, object order)
     {
         if (execution == null || order == null) return false;
-        string key;
         try
         {
             dynamic dynExec = execution;
             dynamic dynOrder = order;
             var execId = dynExec.ExecutionId as string;
-            if (!string.IsNullOrEmpty(execId))
-                key = execId;
-            else
+            var orderId = (dynOrder.OrderId ?? "").ToString();
+            var time = dynExec.Time;
+            long ticks = 0;
+            if (time != null)
             {
-                var orderId = (dynOrder.OrderId ?? "").ToString();
-                var time = dynExec.Time;
-                long ticks = 0;
-                if (time != null)
-                {
-                    if (time is DateTime dt) ticks = dt.Ticks;
-                    else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
-                    else try { ticks = ((dynamic)time).Ticks; } catch { }
-                }
-                var qty = dynExec.Quantity?.ToString() ?? "0";
-                var mpos = (dynExec.MarketPosition?.ToString() ?? "");
-                var execOrderId = (dynExec.OrderId ?? "").ToString();
-                key = $"{orderId}|{ticks}|{qty}|{mpos}|{execOrderId}";
+                if (time is DateTime dt) ticks = dt.Ticks;
+                else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
+                else try { ticks = ((dynamic)time).Ticks; } catch { }
             }
+            var qty = (int)(dynExec.Quantity ?? 0);
+            var mpos = (dynExec.MarketPosition?.ToString() ?? "");
+            return TryMarkAndCheckDuplicateCore(execId, orderId, ticks, qty, mpos);
         }
         catch { return false; }
-        if (string.IsNullOrEmpty(key)) return false;
-
-        if (_processedExecutionIds.TryAdd(key, DateTimeOffset.UtcNow))
-        {
-            var count = Interlocked.Increment(ref _dedupInsertCount);
-            if (count % DEDUP_EVICTION_INTERVAL == 0)
-                EvictDedupEntries();
-            return false;
-        }
-        return true;
     }
 
     private void EvictDedupEntries()
     {
-        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-DEDUP_MAX_AGE_MINUTES);
+        var cutoff = NowEvent().AddMinutes(-DEDUP_MAX_AGE_MINUTES);
         var toRemove = new List<string>();
-        foreach (var kvp in _processedExecutionIds)
+        foreach (var kvp in _processedExecutionIds.OrderBy(k => k.Key))
         {
             if (kvp.Value < cutoff)
                 toRemove.Add(kvp.Key);
         }
         foreach (var k in toRemove)
             _processedExecutionIds.TryRemove(k, out _);
+    }
+
+    /// <summary>
+    /// Deterministic snapshot for replay hash. Keys sorted for canonical serialization.
+    /// </summary>
+    internal IEASnapshot GetSnapshot()
+    {
+        var snap = new IEASnapshot
+        {
+            InstrumentBlocked = _instrumentBlocked
+        };
+        foreach (var kvp in OrderMap.OrderBy(k => k.Key))
+        {
+            var oi = kvp.Value;
+            snap.OrderMap[kvp.Key] = new OrderInfoSnapshot
+            {
+                IntentId = oi.IntentId,
+                OrderId = oi.OrderId,
+                OrderType = oi.OrderType ?? "",
+                State = oi.State,
+                FilledQuantity = oi.FilledQuantity,
+                EntryFillTime = oi.EntryFillTime,
+                IsEntryOrder = oi.IsEntryOrder,
+                ProtectiveStopAcknowledged = oi.ProtectiveStopAcknowledged,
+                ProtectiveTargetAcknowledged = oi.ProtectiveTargetAcknowledged
+            };
+        }
+        foreach (var kvp in IntentPolicy.OrderBy(k => k.Key))
+        {
+            var p = kvp.Value;
+            snap.IntentPolicy[kvp.Key] = new IntentPolicySnapshot
+            {
+                IntentId = kvp.Key,
+                ExpectedQuantity = p.ExpectedQuantity,
+                MaxQuantity = p.MaxQuantity
+            };
+        }
+        foreach (var kvp in IntentMap.OrderBy(k => k.Key))
+        {
+            var i = kvp.Value;
+            snap.IntentMap[kvp.Key] = new IntentSnapshot
+            {
+                IntentId = kvp.Key,
+                Instrument = i.Instrument ?? "",
+                Direction = i.Direction,
+                StopPrice = i.StopPrice,
+                TargetPrice = i.TargetPrice,
+                BeTrigger = i.BeTrigger,
+                EntryPrice = i.EntryPrice
+            };
+        }
+        foreach (var kvp in _processedExecutionIds.OrderBy(k => k.Key))
+            snap.DedupState[kvp.Key] = kvp.Value.ToString("o");
+        foreach (var kvp in _lastBeModifyAttemptUtcByIntent.OrderBy(k => k.Key))
+            snap.BeState[$"lastAttempt:{kvp.Key}"] = kvp.Value.ToString("o");
+        foreach (var kvp in _beTriggerReachedPendingModification.OrderBy(k => k.Key))
+            snap.BeState[$"triggerReached:{kvp.Key}"] = kvp.Value.ToString("o");
+        foreach (var id in _beTriggeredIntentIds.OrderBy(x => x))
+            snap.BeState[$"triggered:{id}"] = "1";
+
+        // BE diagnostics: per-intent BE state for invariant checks (keys sorted for determinism)
+        if (Executor != null)
+        {
+            var diagByIntent = new Dictionary<string, BEDiagnosticSnapshot>(StringComparer.OrdinalIgnoreCase);
+            var activeIntents = Executor.GetActiveIntentsForBEMonitoring(null);
+            foreach (var (intentId, intent, beTriggerPrice, entryPrice, _, direction) in activeIntents)
+            {
+                var priceCrossed = snap.BeState.ContainsKey($"triggerReached:{intentId}") || snap.BeState.ContainsKey($"triggered:{intentId}");
+                var beTriggered = snap.BeState.ContainsKey($"triggered:{intentId}");
+                diagByIntent[intentId] = new BEDiagnosticSnapshot
+                {
+                    IntentId = intentId,
+                    BeTriggerPrice = beTriggerPrice,
+                    EntryPrice = entryPrice,
+                    Direction = direction ?? "",
+                    PriceCrossed = priceCrossed,
+                    BeTriggered = beTriggered
+                };
+            }
+            foreach (var id in _beTriggeredIntentIds)
+            {
+                if (diagByIntent.ContainsKey(id)) continue;
+                if (!IntentMap.TryGetValue(id, out var intent)) continue;
+                diagByIntent[id] = new BEDiagnosticSnapshot
+                {
+                    IntentId = id,
+                    BeTriggerPrice = intent.BeTrigger ?? 0,
+                    EntryPrice = intent.EntryPrice ?? 0,
+                    Direction = intent.Direction ?? "",
+                    PriceCrossed = true,
+                    BeTriggered = true
+                };
+            }
+            foreach (var kvp in diagByIntent.OrderBy(k => k.Key))
+                snap.BeDiagnostics[kvp.Key] = kvp.Value;
+        }
+
+        return snap;
+    }
+
+    /// <summary>
+    /// Phase 3: Evaluate break-even triggers directly (replay). Runs synchronously; no queue.
+    /// </summary>
+    internal void EvaluateBreakEvenDirect(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
+    {
+        if (Executor == null) return;
+        EvaluateBreakEvenCore(tickPrice, eventTime, true, executionInstrument);
     }
 
     /// <summary>
@@ -619,16 +710,16 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (Executor == null || Log == null) return;
         var hasEventTime = tickTimeFromEvent.HasValue;
-        var eventTime = tickTimeFromEvent ?? DateTimeOffset.UtcNow;
+        var eventTime = tickTimeFromEvent ?? NowEvent();
         Enqueue(() => EvaluateBreakEvenCore(tickPrice, eventTime, hasEventTime, executionInstrument));
     }
 
     /// <summary>BE evaluation core (runs on worker thread).</summary>
     private void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, bool hasEventTime, string executionInstrument)
     {
-        if (Executor == null || Log == null) return;
+        if (Executor == null) return;
 
-        var utcNow = DateTimeOffset.UtcNow;
+        var utcNow = NowEvent();
 
         // 3.1 Tick de-dupe: if (price == lastPrice && eventTimestamp == lastTimestamp) return
             if (hasEventTime)
@@ -689,10 +780,12 @@ public sealed partial class InstrumentExecutionAuthority
 
                 if (modifyResult.Success)
                 {
+                    _beTriggeredIntentIds.Add(intentId);
                     _beTriggerReachedPendingModification.Remove(intentId);
                     _lastBeModifyAttemptUtcByIntent.Remove(intentId);
                     _beModifyFailureCountByIntent.Remove(intentId);
-                    Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_TRIGGER_REACHED",
+                    if (Log != null)
+                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_TRIGGER_REACHED",
                         new
                         {
                             direction,
@@ -720,7 +813,8 @@ public sealed partial class InstrumentExecutionAuthority
                     if (failCount >= BE_MODIFY_MAX_RETRIES)
                     {
                         var actionTaken = stopMissing ? "FLATTEN" : "STAND_DOWN";
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_MODIFY_MAX_RETRIES_EXCEEDED",
+                        if (Log != null)
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_MODIFY_MAX_RETRIES_EXCEEDED",
                             new
                             {
                                 action_taken = actionTaken,

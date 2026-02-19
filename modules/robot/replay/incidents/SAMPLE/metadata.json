@@ -1,0 +1,30 @@
+{
+  "IncidentId": "SAMPLE",
+  "CreatedUtc": "2026-02-19T03:06:34.3032957Z",
+  "SourceLog": "modules/robot/replay/sample_replay.jsonl",
+  "Account": null,
+  "ExecutionInstrumentKey": "MNQ",
+  "Start": {
+    "Sequence": 0,
+    "TsUtc": ""
+  },
+  "End": {
+    "Sequence": 2,
+    "TsUtc": ""
+  },
+  "Selector": {
+    "ErrorEventType": null,
+    "MessageContains": null,
+    "Instrument": null,
+    "Account": null,
+    "PreEvents": 200,
+    "PostEvents": 200
+  },
+  "ErrorSignature": {
+    "EventType": null,
+    "MessageContains": null,
+    "Code": null
+  },
+  "CanonicalSha256": "78fbdc6890814dfddaaea416429a04e278461379f91b0668c6feffefa807e45b",
+  "HostVersion": null
+}

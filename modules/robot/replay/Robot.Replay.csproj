@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>QTSW2.Robot.Replay</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <Description>IEA deterministic replay module. Does not compile into NinjaTrader deployment.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\contracts\Robot.Contracts.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="sample_replay.jsonl">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <!-- No reference to Robot.Core or NinjaTrader. Replay POCOs are independent. -->
+</Project>
