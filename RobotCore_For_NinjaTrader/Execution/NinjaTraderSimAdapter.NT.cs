@@ -1351,6 +1351,53 @@ public sealed partial class NinjaTraderSimAdapter
             if (!string.IsNullOrEmpty(errorCode)) fullErrorMsg += $" (ErrorCode: {errorCode})";
             if (!string.IsNullOrEmpty(comment)) fullErrorMsg += $" (Comment: {comment})";
             
+            // OCO sibling cancellation: NinjaTrader reports cancelled OCO sibling as Rejected with "CancelPending"
+            // Narrow predicate: require OCO present + CancelPending (entry bracket or protective bracket)
+            var ocoGroupId = order.Oco as string;
+            var hasCancelPending = (fullErrorMsg?.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0;
+            var isOcoSiblingCancel = hasCancelPending && !string.IsNullOrEmpty(ocoGroupId);
+            if (isOcoSiblingCancel)
+            {
+                orderInfo.State = "CANCELLED";
+                // Forensic traceability: log all fields for audit depth
+                var siblingOrderId = order.OrderId; // This order (cancelled sibling)
+                string? filledOrderId = null;
+                string? executionInstrumentKey = null;
+                try
+                {
+                    var account = _ntAccount as Account;
+                    if (account != null)
+                    {
+                        var accountName = account.Name ?? "";
+                        executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, order.Instrument, _ieaEngineExecutionInstrument);
+                        if (!string.IsNullOrEmpty(ocoGroupId))
+                        {
+                            foreach (Order o in account.Orders)
+                            {
+                                if (o.OrderId != siblingOrderId && string.Equals(o.Oco as string, ocoGroupId, StringComparison.OrdinalIgnoreCase) && o.OrderState == OrderState.Filled)
+                                {
+                                    filledOrderId = o.OrderId;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { /* best-effort forensic fields */ }
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "OCO_SIBLING_CANCELLED",
+                    new
+                    {
+                        oco_group_id = ocoGroupId,
+                        sibling_order_id = siblingOrderId,
+                        filled_order_id = filledOrderId,
+                        execution_instrument_key = executionInstrumentKey,
+                        intent_id = intentId,
+                        order_type = orderInfo.OrderType,
+                        note = "OCO sibling cancelled (other leg filled) - expected behavior, not a rejection"
+                    }));
+                return; // Skip rejection handling
+            }
+            
             var (tradingDate11, stream11, _, _, _, _, _) = GetIntentInfo(intentId);
             _executionJournal.RecordRejection(intentId, tradingDate11, stream11, $"ORDER_REJECTED: {fullErrorMsg}", utcNow, 
                 orderType: orderInfo.OrderType, rejectedPrice: orderInfo.Price, rejectedQuantity: orderInfo.Quantity);
@@ -2814,6 +2861,19 @@ public sealed partial class NinjaTraderSimAdapter
                         error = "Stop order rejected";
                     }
                 }
+                // OCO sibling suppression: if error is CancelPending and we have OCO, emit OCO_SIBLING_CANCELLED instead of ORDER_SUBMIT_FAIL
+                var isOcoCancelPending = (error?.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0 && !string.IsNullOrEmpty(ocoGroupToUse);
+                if (isOcoCancelPending)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "OCO_SIBLING_CANCELLED", new
+                    {
+                        oco_group_id = ocoGroupToUse,
+                        order_type = "STOP",
+                        intent_id = intentId,
+                        note = "OCO sibling cancelled at submit (other leg filled) - expected, not ORDER_SUBMIT_FAIL"
+                    }));
+                    return OrderSubmissionResult.FailureResult(error, utcNow); // Still return failure, but no ORDER_SUBMIT_FAIL log
+                }
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
                 {
                     error,
@@ -3220,6 +3280,19 @@ public sealed partial class NinjaTraderSimAdapter
                         // Fallback if dynamic access fails
                         error = "Target order rejected";
                     }
+                }
+                // OCO sibling suppression: if error is CancelPending and we have OCO, emit OCO_SIBLING_CANCELLED instead of ORDER_SUBMIT_FAIL
+                var ocoForTarget = ocoGroup ?? GetIntentInfo(intentId).Item7;
+                var isOcoCancelPendingTarget = (error?.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0 && !string.IsNullOrEmpty(ocoForTarget);
+                if (isOcoCancelPendingTarget)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "OCO_SIBLING_CANCELLED", new
+                    {
+                        oco_group_id = ocoForTarget,
+                        order_type = "TARGET",
+                        intent_id = intentId,
+                        note = "OCO sibling cancelled at submit (other leg filled) - expected, not ORDER_SUBMIT_FAIL"
+                    }));
                 }
                 
                 var (tradingDate4, stream4, _, _, _, _, _) = GetIntentInfo(intentId);
@@ -5356,16 +5429,21 @@ public sealed partial class NinjaTraderSimAdapter
                         error = "Order rejected";
                     }
                 }
-                var (tradingDate18, stream18, _, _, _, _, _) = GetIntentInfo(intentId);
+                var (tradingDate18, stream18, _, _, _, _, ocoGroup18) = GetIntentInfo(intentId);
+                var ocoForEntryStop = ocoGroup ?? ocoGroup18;
+                var isOcoCancelPendingEntry = (error?.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0 && !string.IsNullOrEmpty(ocoForEntryStop);
+                if (isOcoCancelPendingEntry)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "OCO_SIBLING_CANCELLED", new
+                    {
+                        oco_group_id = ocoForEntryStop,
+                        order_type = "ENTRY_STOP",
+                        intent_id = intentId,
+                        note = "OCO sibling cancelled at submit (other leg filled) - expected, not ORDER_SUBMIT_FAIL"
+                    }));
+                }
                 _executionJournal.RecordRejection(intentId, tradingDate18, stream18, $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow, 
                     orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
-                {
-                    error,
-                    order_type = "ENTRY_STOP",
-                    broker_order_id = order.OrderId,
-                    account = "SIM"
-                }));
                 return OrderSubmissionResult.FailureResult(error, utcNow);
             }
 
@@ -5546,13 +5624,21 @@ public sealed partial class NinjaTraderSimAdapter
             string error = "Order rejected";
             try { error = (string?)dynOrder.ErrorMessage ?? (string?)dynOrder.Error ?? "Order rejected"; }
             catch { try { error = (string?)dynOrder.Error ?? "Order rejected"; } catch { } }
-            var (td, streamReject, _, _, _, _, _) = GetIntentInfo(intentId);
+            var (td, streamReject, _, _, _, _, ocoGroupReject) = GetIntentInfo(intentId);
+            var ocoForEntryStop2 = ocoGroup ?? ocoGroupReject;
+            var isOcoCancelPendingEntry2 = (error?.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) ?? -1) >= 0 && !string.IsNullOrEmpty(ocoForEntryStop2);
+            if (isOcoCancelPendingEntry2)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "OCO_SIBLING_CANCELLED", new
+                {
+                    oco_group_id = ocoForEntryStop2,
+                    order_type = "ENTRY_STOP",
+                    intent_id = intentId,
+                    note = "OCO sibling cancelled at submit (other leg filled) - expected, not ORDER_SUBMIT_FAIL"
+                }));
+            }
             _executionJournal.RecordRejection(intentId, td, streamReject, $"ENTRY_STOP_SUBMIT_FAILED: {error}", utcNow,
                 orderType: "ENTRY_STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
-            {
-                error, order_type = "ENTRY_STOP", broker_order_id = order.OrderId, account = "SIM"
-            }));
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 

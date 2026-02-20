@@ -15,6 +15,17 @@ if (args.Length > 0 && args[0] == "--test-loader")
     return 0;
 }
 
+if (args.Length >= 3 && args[0] == "--write-canonical" && args[1] == "--file")
+{
+    var inPath = args[2];
+    var outPath = args.Length >= 5 && args[3] == "--out" ? args[4] : Path.ChangeExtension(inPath, ".canonical.json");
+    if (!File.Exists(inPath)) { Console.WriteLine($"File not found: {inPath}"); return 1; }
+    var events = ReplayLoader.LoadAndValidate(inPath);
+    ReplayLoader.WriteCanonical(outPath, events);
+    Console.WriteLine($"Wrote {outPath}");
+    return 0;
+}
+
 if (args.Length >= 3 && args[0] == "--checksum" && args[1] == "--file")
 {
     var path = args[2];
@@ -123,6 +134,7 @@ Console.WriteLine("Robot.Replay — IEA deterministic replay module");
 Console.WriteLine("Usage:");
 Console.WriteLine("  --test-loader [path]           Run loader self-test");
 Console.WriteLine("  --checksum --file <path>       Print state checksum");
+Console.WriteLine("  --write-canonical --file <path> [--out <path>]  Load JSONL, write canonical JSON");
 Console.WriteLine("  --determinism-test --file <path>  Validate, spawn net48 host, run per-step IEA determinism");
 Console.WriteLine("  --extract-incident --from <path> --out <dir> [--error-event-type X] [--message-contains S] [--instrument I] [--account A] [--pre-events N] [--post-events N]");
 return 0;

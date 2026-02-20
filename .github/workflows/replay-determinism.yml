@@ -61,21 +61,26 @@ jobs:
             exit 0
           }
           $failed = $false
-          Get-ChildItem -Path $incidentsDir -Directory | ForEach-Object {
-            $canonical = Join-Path $_.FullName "canonical.json"
-            $expected = Join-Path $_.FullName "expected.json"
+          $dirs = Get-ChildItem -Path $incidentsDir -Directory | Sort-Object Name
+          foreach ($dir in $dirs) {
+            $canonical = Join-Path $dir.FullName "canonical.json"
+            $expected = Join-Path $dir.FullName "expected.json"
             if (-not (Test-Path $canonical)) {
-              Write-Host "Skipping $($_.Name): no canonical.json"
-              return
+              Write-Host "Skipping $($dir.Name): no canonical.json"
+              continue
             }
-            Write-Host "Running incident pack: $($_.Name)"
+            if (Test-Path (Join-Path $dir.FullName ".ci-skip")) {
+              Write-Host "Skipping $($dir.Name): .ci-skip (negative control)"
+              continue
+            }
+            Write-Host "Running incident pack: $($dir.Name)"
             $hostArgs = @("--determinism-test", "--file", $canonical)
             if (Test-Path $expected) {
               $hostArgs += "--run-invariants", "--expected", $expected
             }
             $proc = Start-Process -FilePath "dotnet" -ArgumentList @("run", "--project", "modules/robot/replay_host/Robot.ReplayHost.csproj", "-c", "Release", "--no-build", "--") + $hostArgs -NoNewWindow -Wait -PassThru
             if ($proc.ExitCode -ne 0) {
-              Write-Host "FAIL: $($_.Name)"
+              Write-Host "FAIL: $($dir.Name)"
               $failed = $true
             }
           }

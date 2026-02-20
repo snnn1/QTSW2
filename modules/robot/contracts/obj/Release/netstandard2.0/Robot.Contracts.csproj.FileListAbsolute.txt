@@ -1,0 +1,11 @@
+C:\Users\jakej\QTSW2\modules\robot\contracts\bin\Release\netstandard2.0\Robot.Contracts.deps.json
+C:\Users\jakej\QTSW2\modules\robot\contracts\bin\Release\netstandard2.0\Robot.Contracts.dll
+C:\Users\jakej\QTSW2\modules\robot\contracts\bin\Release\netstandard2.0\Robot.Contracts.pdb
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.csproj.AssemblyReference.cache
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.AssemblyInfoInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.AssemblyInfo.cs
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.csproj.CoreCompileInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.sourcelink.json
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.dll
+C:\Users\jakej\QTSW2\modules\robot\contracts\obj\Release\netstandard2.0\Robot.Contracts.pdb

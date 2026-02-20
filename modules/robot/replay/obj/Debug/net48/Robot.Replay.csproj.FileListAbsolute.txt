@@ -1,0 +1,8 @@
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.csproj.AssemblyReference.cache
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.csproj.SuggestedBindingRedirects.cache
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.exe.config
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.AssemblyInfoInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.AssemblyInfo.cs
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.csproj.CoreCompileInputs.cache
+C:\Users\jakej\QTSW2\modules\robot\replay\obj\Debug\net48\Robot.Replay.sourcelink.json

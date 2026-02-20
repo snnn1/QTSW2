@@ -50,6 +50,7 @@ public sealed class HealthMonitor
     // PHASE 3: Engine heartbeat and timetable poll tracking
     private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _lastTimetablePollUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue; // For startup grace period
     
     // PHASE 4: Session-aware monitoring state
     private readonly Dictionary<string, bool> _instrumentHasReceivedData = new(StringComparer.OrdinalIgnoreCase);
@@ -99,6 +100,7 @@ public sealed class HealthMonitor
     
     // PHASE 3: Stall detection thresholds
     private const int ENGINE_TICK_STALL_SECONDS = 120; // Engine tick should occur at least every 120 seconds (increased for noise reduction)
+    private const int ENGINE_START_GRACE_PERIOD_SECONDS = 180; // Suppress stall detection for 3 min after engine start (hydration/startup)
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
     private const int CONNECTION_LOST_SUSTAINED_SECONDS = 60; // Must be disconnected for 60+ seconds before notifying
@@ -146,6 +148,7 @@ public sealed class HealthMonitor
     public void SetRunId(string runId)
     {
         _runId = runId;
+        _engineStartUtc = DateTimeOffset.UtcNow; // For startup grace period (suppress stall during hydration)
     }
     
     /// <summary>
@@ -251,9 +254,22 @@ public sealed class HealthMonitor
             {
                 if (!_sharedConnectionLostLoggedByIncident.TryGetValue(incidentId.Value, out var logged) || !logged)
                 {
-                    // First instance to detect: log the event and initialize shared state
+                    // First instance to detect: emit CONNECTION_CONTEXT then log the event and initialize shared state
                     _sharedConnectionLostLoggedByIncident[incidentId.Value] = true;
                     _sharedConnectionLostInstanceCountByIncident[incidentId.Value] = 1;
+                    
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_CONTEXT", state: "ENGINE",
+                        new
+                        {
+                            connection_name = connectionName,
+                            connection_status = status.ToString(),
+                            last_engine_tick_utc = _lastEngineTickUtc != DateTimeOffset.MinValue ? _lastEngineTickUtc.ToString("o") : null,
+                            last_timetable_poll_utc = _lastTimetablePollUtc != DateTimeOffset.MinValue ? _lastTimetablePollUtc.ToString("o") : null,
+                            engine_start_utc = _engineStartUtc != DateTimeOffset.MinValue ? _engineStartUtc.ToString("o") : null,
+                            trading_date = _currentTradingDate,
+                            incident_id = incidentId.Value,
+                            note = "Context at disconnect for ops diagnostics"
+                        }));
                     
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_LOST", state: "ENGINE",
                         new
@@ -497,6 +513,7 @@ public sealed class HealthMonitor
     
     /// <summary>
     /// PHASE 3: Evaluate engine tick stall.
+    /// Split into STALL_STARTUP (info, during grace) vs STALL_RUNTIME (critical, after grace).
     /// Session-aware: only evaluates during active trading windows.
     /// </summary>
     private void EvaluateEngineTickStall(DateTimeOffset utcNow)
@@ -513,25 +530,34 @@ public sealed class HealthMonitor
             return;
         
         var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
+        if (elapsed < ENGINE_TICK_STALL_SECONDS)
+            return;
         
-        if (elapsed >= ENGINE_TICK_STALL_SECONDS)
+        var inStartupGrace = _engineStartUtc != DateTimeOffset.MinValue &&
+            (utcNow - _engineStartUtc).TotalSeconds < ENGINE_START_GRACE_PERIOD_SECONDS;
+        
+        if (!_engineTickStallActive)
         {
-            if (!_engineTickStallActive)
+            _engineTickStallActive = true;
+            var eventType = inStartupGrace ? "ENGINE_TICK_STALL_STARTUP" : "ENGINE_TICK_STALL_RUNTIME";
+            var causeHint = inStartupGrace ? "hydration_or_bars_loading" : null;
+            
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE",
+                new
+                {
+                    last_tick_utc = _lastEngineTickUtc.ToString("o"),
+                    elapsed_seconds = elapsed,
+                    threshold_seconds = ENGINE_TICK_STALL_SECONDS,
+                    cause_hint = causeHint,
+                    in_startup_grace = inStartupGrace
+                }));
+            
+            // Only notify for runtime stall (critical); startup stall is info-only
+            if (!inStartupGrace)
             {
-                _engineTickStallActive = true;
-                
-                var title = "Engine Tick Stall Detected";
+                var title = "Engine Tick Stall Detected (Runtime)";
                 var message = $"Engine Tick() has not been called for {elapsed:F0}s. Last tick: {_lastEngineTickUtc:o} UTC. Threshold: {ENGINE_TICK_STALL_SECONDS}s";
-                
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_STALL_DETECTED", state: "ENGINE",
-                    new
-                    {
-                        last_tick_utc = _lastEngineTickUtc.ToString("o"),
-                        elapsed_seconds = elapsed,
-                        threshold_seconds = ENGINE_TICK_STALL_SECONDS
-                    }));
-                
-                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipPerKeyRateLimit: true); // Emergency priority, respects per-event-type limiter
+                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipPerKeyRateLimit: true);
             }
         }
     }

@@ -1,0 +1,5 @@
+is_global = true
+build_property.RootNamespace = QTSW2.Robot.Contracts
+build_property.ProjectDir = C:\Users\jakej\QTSW2\modules\robot\contracts\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 

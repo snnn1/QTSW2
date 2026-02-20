@@ -1,0 +1,6 @@
+{
+  "invariants": [
+    {"id":"be-triggered","type":"BE_TRIGGERED_BY_STEP","params":{"intent_id":"b332f40221252b4a","latest_step_index":4},"expected":{}}
+  ],
+  "_note": "Negative control: tick 21502 < trigger 21505, so BE does NOT trigger. Invariant expects BE_TRIGGERED → FAIL (BE_NOT_TRIGGERED). Run manually to validate invariant harness."
+}

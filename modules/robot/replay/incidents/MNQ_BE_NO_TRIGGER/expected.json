@@ -1,0 +1,6 @@
+{
+  "invariants": [
+    { "id": "no-dup", "type": "NO_DUPLICATE_EXECUTION_PROCESSED", "params": {}, "expected": {} },
+    { "id": "policy", "type": "INTENT_REQUIRES_POLICY_BEFORE_SUBMISSION", "params": {}, "expected": {} }
+  ]
+}

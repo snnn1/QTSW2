@@ -166,15 +166,25 @@ export async function getSchedulerStatus() {
   }
 }
 
+async function parseApiError(res) {
+  const text = await res.text()
+  try {
+    const j = JSON.parse(text)
+    return j.detail || text
+  } catch {
+    return text
+  }
+}
+
 export async function enableScheduler() {
   const res = await fetchWithTimeout(`${API_BASE}/scheduler/enable`, { method: 'POST' }, API_TIMEOUT_LONG)
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) throw new Error(await parseApiError(res))
   return await safeJson(res)
 }
 
 export async function disableScheduler() {
   const res = await fetchWithTimeout(`${API_BASE}/scheduler/disable`, { method: 'POST' }, 15000)
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) throw new Error(await parseApiError(res))
   return await safeJson(res)
 }
 

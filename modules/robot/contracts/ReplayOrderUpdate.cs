@@ -15,6 +15,8 @@ public sealed class ReplayOrderUpdate
     public int? Quantity { get; set; }
     public string? Tag { get; set; }
     public string? IntentId { get; set; }
+    /// <summary>Broker comment/error message. Used for OCO: "CancelPending" → treat as CANCELLED.</summary>
+    public string? Comment { get; set; }
     public DateTimeOffset? UpdateTime { get; set; }
 }
 }

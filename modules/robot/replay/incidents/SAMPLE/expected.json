@@ -1,3 +1,5 @@
 {
-  "invariants": []
+  "invariants": [
+    {"id":"no-dup","type":"NO_DUPLICATE_EXECUTION_PROCESSED","params":{},"expected":{}}
+  ]
 }

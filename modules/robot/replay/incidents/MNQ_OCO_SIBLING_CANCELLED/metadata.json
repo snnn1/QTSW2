@@ -1,0 +1,12 @@
+{
+  "IncidentId": "MNQ_OCO_SIBLING_CANCELLED",
+  "CreatedUtc": "2026-02-20T00:00:00Z",
+  "SourceLog": "modules/robot/replay/incidents/MNQ_OCO_SIBLING_CANCELLED/events.jsonl",
+  "Account": null,
+  "ExecutionInstrumentKey": "MNQ",
+  "ErrorSignature": {
+    "EventType": "ORDER_REJECTED",
+    "MessageContains": "CancelPending",
+    "Note": "OCO sibling cancellation - NinjaTrader reports as Rejected. Expected: treat as OCO_SIBLING_CANCELLED, state CANCELLED."
+  }
+}

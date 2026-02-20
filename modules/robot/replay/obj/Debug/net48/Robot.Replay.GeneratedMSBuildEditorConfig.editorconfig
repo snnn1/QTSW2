@@ -1,0 +1,5 @@
+is_global = true
+build_property.RootNamespace = QTSW2.Robot.Replay
+build_property.ProjectDir = C:\Users\jakej\QTSW2\modules\robot\replay\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 

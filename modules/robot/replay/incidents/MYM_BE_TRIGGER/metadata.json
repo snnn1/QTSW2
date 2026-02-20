@@ -1,0 +1,30 @@
+{
+  "IncidentId": "MYM_BE_TRIGGER",
+  "CreatedUtc": "2026-02-20T01:56:46.1255244Z",
+  "SourceLog": "modules/robot/replay/incidents/MYM_BE_TRIGGER/events.jsonl",
+  "Account": null,
+  "ExecutionInstrumentKey": "MYM",
+  "Start": {
+    "Sequence": 0,
+    "TsUtc": ""
+  },
+  "End": {
+    "Sequence": 3,
+    "TsUtc": ""
+  },
+  "Selector": {
+    "ErrorEventType": null,
+    "MessageContains": null,
+    "Instrument": null,
+    "Account": null,
+    "PreEvents": 200,
+    "PostEvents": 200
+  },
+  "ErrorSignature": {
+    "EventType": null,
+    "MessageContains": null,
+    "Code": null
+  },
+  "CanonicalSha256": "5230596848da8fca0c9e538c33a202d6fff34388653aef9f51deb0d539af1c71",
+  "HostVersion": null
+}

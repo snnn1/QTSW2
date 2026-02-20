@@ -1,0 +1,7 @@
+{
+  "invariants": [
+    {"id":"no-dup","type":"NO_DUPLICATE_EXECUTION_PROCESSED","params":{},"expected":{}},
+    {"id":"policy","type":"INTENT_REQUIRES_POLICY_BEFORE_SUBMISSION","params":{},"expected":{}},
+    {"id":"oco-cancelled","type":"ORDER_STATE_BY_STEP","params":{"intent_id":"e079d2d1e350342d","expected_state":"CANCELLED","latest_step_index":6},"expected":{}}
+  ]
+}

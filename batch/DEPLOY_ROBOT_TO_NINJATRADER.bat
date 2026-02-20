@@ -24,19 +24,25 @@ if errorlevel 1 (
 echo [OK] Build succeeded.
 echo.
 
-REM Step 2: Copy DLL (OneDrive only - close NinjaTrader first if DLL is locked)
-echo [2/3] Copying DLL to NinjaTrader Custom (OneDrive)...
-set "SOURCE=RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.dll"
+REM Step 2: Copy DLLs and dependencies (OneDrive only - close NinjaTrader first if locked)
+echo [2/3] Copying DLLs to NinjaTrader Custom (OneDrive)...
+set "BIN=RobotCore_For_NinjaTrader\bin\Release\net48"
 set "NT_CUSTOM=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom"
-set "PDB_SOURCE=RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.pdb"
 if exist "%NT_CUSTOM%" (
-    copy /Y "%SOURCE%" "%NT_CUSTOM%\Robot.Core.dll"
-    if errorlevel 1 (
-        echo [WARN] DLL copy failed - close NinjaTrader and run this script again.
-    ) else (
-        echo [OK] DLL copied.
-    )
-    if exist "%PDB_SOURCE%" copy /Y "%PDB_SOURCE%" "%NT_CUSTOM%\Robot.Core.pdb" >nul
+    copy /Y "%BIN%\Robot.Core.dll" "%NT_CUSTOM%\Robot.Core.dll" >nul
+    copy /Y "%BIN%\Robot.Core.pdb" "%NT_CUSTOM%\Robot.Core.pdb" >nul 2>&1
+    copy /Y "%BIN%\Robot.Contracts.dll" "%NT_CUSTOM%\Robot.Contracts.dll" >nul
+    copy /Y "%BIN%\Robot.Contracts.pdb" "%NT_CUSTOM%\Robot.Contracts.pdb" >nul 2>&1
+    copy /Y "%BIN%\System.Text.Json.dll" "%NT_CUSTOM%\System.Text.Json.dll" >nul
+    copy /Y "%BIN%\System.Text.Encodings.Web.dll" "%NT_CUSTOM%\System.Text.Encodings.Web.dll" >nul
+    copy /Y "%BIN%\System.Buffers.dll" "%NT_CUSTOM%\System.Buffers.dll" >nul
+    copy /Y "%BIN%\System.Memory.dll" "%NT_CUSTOM%\System.Memory.dll" >nul
+    copy /Y "%BIN%\System.Numerics.Vectors.dll" "%NT_CUSTOM%\System.Numerics.Vectors.dll" >nul
+    copy /Y "%BIN%\System.Runtime.CompilerServices.Unsafe.dll" "%NT_CUSTOM%\System.Runtime.CompilerServices.Unsafe.dll" >nul
+    copy /Y "%BIN%\System.Threading.Tasks.Extensions.dll" "%NT_CUSTOM%\System.Threading.Tasks.Extensions.dll" >nul
+    copy /Y "%BIN%\System.ValueTuple.dll" "%NT_CUSTOM%\System.ValueTuple.dll" >nul
+    copy /Y "%BIN%\Microsoft.Bcl.AsyncInterfaces.dll" "%NT_CUSTOM%\Microsoft.Bcl.AsyncInterfaces.dll" >nul
+    echo [OK] DLLs and dependencies copied.
 ) else (
     echo [ERROR] OneDrive NinjaTrader folder not found: %NT_CUSTOM%
 )

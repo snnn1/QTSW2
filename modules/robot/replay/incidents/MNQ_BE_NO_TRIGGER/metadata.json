@@ -1,0 +1,30 @@
+{
+  "IncidentId": "MNQ_BE_NO_TRIGGER",
+  "CreatedUtc": "2026-02-20T01:57:12.5783545Z",
+  "SourceLog": "modules/robot/replay/incidents/MNQ_BE_NO_TRIGGER/events.jsonl",
+  "Account": null,
+  "ExecutionInstrumentKey": "MNQ",
+  "Start": {
+    "Sequence": 0,
+    "TsUtc": ""
+  },
+  "End": {
+    "Sequence": 3,
+    "TsUtc": ""
+  },
+  "Selector": {
+    "ErrorEventType": null,
+    "MessageContains": null,
+    "Instrument": null,
+    "Account": null,
+    "PreEvents": 200,
+    "PostEvents": 200
+  },
+  "ErrorSignature": {
+    "EventType": null,
+    "MessageContains": null,
+    "Code": null
+  },
+  "CanonicalSha256": "6e76b7d59885f9cb490ac3aec25d1c74857f09503ef338b3903100ea4a750251",
+  "HostVersion": null
+}

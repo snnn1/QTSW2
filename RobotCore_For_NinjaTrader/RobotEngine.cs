@@ -646,6 +646,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     archive_days = _loggingConfig.archive_days
                 }));
 
+            // Startup dependency check: verify Robot.Contracts.dll is loadable (deployment integrity)
+            try
+            {
+                var contractsType = Type.GetType("QTSW2.Robot.Contracts.IEventClock, Robot.Contracts");
+                if (contractsType == null)
+                    throw new InvalidOperationException("Robot.Contracts.IEventClock type not found");
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "STARTUP_DEPENDENCY_CHECK_FAILED", state: "ENGINE",
+                    new
+                    {
+                        assembly = "Robot.Contracts",
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        fix_hint = "Deploy Robot.Contracts.dll to NinjaTrader bin directory; verify project reference and build output"
+                    }));
+            }
+
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE",
                 new
                 {
@@ -1170,7 +1189,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         range_start_utc = stream.RangeStartUtc.ToString("o"),
                         range_start_chicago = rangeStartChicago.ToString("o"),
                         slot_time_chicago = stream.SlotTimeChicago,
-                        note = "Ensure NinjaTrader 'Days to load' setting includes historical data for the range window"
+                        note = "Ensure NinjaTrader 'Days to load' setting includes historical data for the range window",
+                        fix_hint = "Chart → Right-click → Data Series → set 'Days to load' to cover range window (e.g. 5–10 days)"
                     }));
             }
         }

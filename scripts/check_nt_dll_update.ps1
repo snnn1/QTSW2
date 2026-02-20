@@ -6,7 +6,15 @@ $ErrorActionPreference = "Stop"
 # Get project root - script is in scripts/ folder, project root is parent
 $projectRoot = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { $PWD }
 $sourceDll = Join-Path $projectRoot "RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.dll"
-$targetDll = Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll"
+# Resolve NinjaTrader Custom path (OneDrive or Documents)
+$ntCustom = $null
+foreach ($base in @(
+    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+    (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
+)) {
+    if (Test-Path $base) { $ntCustom = $base; break }
+}
+$targetDll = if ($ntCustom) { Join-Path $ntCustom "Robot.Core.dll" } else { Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll" }
 
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  Checking Robot.Core.dll Update Status" -ForegroundColor Cyan

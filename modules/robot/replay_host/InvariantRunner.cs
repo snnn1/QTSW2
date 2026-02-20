@@ -65,6 +65,8 @@ public static class InvariantRunner
                 return CheckBEPriceCrossedByStep(inv, snapshot, stepIndex);
             case "BE_TRIGGERED_BY_STEP":
                 return CheckBETriggeredByStep(inv, snapshot, stepIndex);
+            case "ORDER_STATE_BY_STEP":
+                return CheckOrderStateByStep(inv, snapshot, stepIndex);
             default:
                 return null;
         }
@@ -193,6 +195,45 @@ public static class InvariantRunner
                 Step = stepIndex,
                 Detail = $"BE price not crossed for intent {intentId} by step {latestStep}",
                 Reason = "BE_PRICE_NOT_CROSSED"
+            };
+        }
+        return null;
+    }
+
+    /// <summary>OCO sibling cancel: OrderUpdate Rejected+CancelPending → state CANCELLED (not REJECTED).</summary>
+    private static InvariantResult? CheckOrderStateByStep(InvariantExpectation inv, IEASnapshot snapshot, int stepIndex)
+    {
+        var intentId = GetParamString(inv, "intent_id");
+        var expectedState = GetParamString(inv, "expected_state");
+        var latestStep = GetParamInt(inv, "latest_step_index", -1);
+        if (string.IsNullOrEmpty(intentId) || string.IsNullOrEmpty(expectedState) || latestStep < 0)
+            return new InvariantResult { Passed = false, InvariantId = inv.Id, InvariantType = inv.Type, Step = stepIndex, Detail = "Missing intent_id, expected_state, or latest_step_index", Reason = "INVALID_PARAMS" };
+
+        if (stepIndex < latestStep) return null;
+        if (stepIndex > latestStep) return null;
+
+        if (!snapshot.OrderMap.TryGetValue(intentId, out var orderInfo))
+        {
+            return new InvariantResult
+            {
+                Passed = false,
+                InvariantId = inv.Id,
+                InvariantType = inv.Type,
+                Step = stepIndex,
+                Detail = $"Order for intent {intentId} not in OrderMap",
+                Reason = "ORDER_NOT_FOUND"
+            };
+        }
+        if (!string.Equals(orderInfo.State, expectedState, StringComparison.OrdinalIgnoreCase))
+        {
+            return new InvariantResult
+            {
+                Passed = false,
+                InvariantId = inv.Id,
+                InvariantType = inv.Type,
+                Step = stepIndex,
+                Detail = $"Order state '{orderInfo.State}' != expected '{expectedState}' for intent {intentId}",
+                Reason = "ORDER_STATE_MISMATCH"
             };
         }
         return null;

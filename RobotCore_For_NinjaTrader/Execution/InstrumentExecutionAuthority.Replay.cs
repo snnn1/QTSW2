@@ -80,6 +80,7 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>
     /// Process order update from replay DTO. Updates OrderMap (State, ProtectiveStopAcknowledged, ProtectiveTargetAcknowledged).
+    /// OCO sibling cancellation: Rejected + Comment contains "CancelPending" → state CANCELLED (not REJECTED).
     /// </summary>
     internal void ProcessOrderUpdateCore(ReplayOrderUpdate evt)
     {
@@ -88,6 +89,11 @@ public sealed partial class InstrumentExecutionAuthority
 
         var parsed = RobotOrderIds.ParseTag(evt.Tag ?? "");
         var orderState = evt.OrderState ?? "";
+        var comment = evt.Comment ?? "";
+
+        // OCO sibling cancellation: NinjaTrader reports cancelled OCO sibling as Rejected with "CancelPending"
+        var hasCancelPending = comment.IndexOf("CancelPending", StringComparison.OrdinalIgnoreCase) >= 0;
+        var isOcoSiblingCancel = orderState.Equals("Rejected", StringComparison.OrdinalIgnoreCase) && hasCancelPending;
 
         var mapKey = intentId;
         if (parsed.Leg == "STOP")
@@ -96,9 +102,35 @@ public sealed partial class InstrumentExecutionAuthority
             mapKey = $"{intentId}:TARGET";
 
         if (!OrderMap.TryGetValue(mapKey, out var orderInfo))
-            return;
+        {
+            // Entry order may not exist yet (replay has no submit event). Create if intent registered.
+            if (parsed.Leg == null || parsed.Leg == "ENTRY")
+            {
+                if (IntentMap.TryGetValue(intentId, out var intent))
+                {
+                    orderInfo = new OrderInfo
+                    {
+                        IntentId = intentId,
+                        Instrument = intent.Instrument ?? "",
+                        OrderId = evt.OrderId,
+                        OrderType = "ENTRY",
+                        Direction = intent.Direction ?? "",
+                        Quantity = evt.Quantity ?? 0,
+                        Price = 0,
+                        State = "SUBMITTED",
+                        IsEntryOrder = true,
+                        FilledQuantity = 0
+                    };
+                    OrderMap[mapKey] = orderInfo;
+                }
+                else
+                    return;
+            }
+            else
+                return;
+        }
 
-        orderInfo.State = orderState;
+        orderInfo.State = isOcoSiblingCancel ? "CANCELLED" : orderState;
         if (orderState.Equals("Accepted", StringComparison.OrdinalIgnoreCase) || orderState.Equals("ACCEPTED", StringComparison.OrdinalIgnoreCase))
         {
             if (parsed.Leg == "STOP")

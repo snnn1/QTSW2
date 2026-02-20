@@ -1,0 +1,8 @@
+{
+  "invariants": [
+    { "id": "no-dup", "type": "NO_DUPLICATE_EXECUTION_PROCESSED", "params": {}, "expected": {} },
+    { "id": "policy", "type": "INTENT_REQUIRES_POLICY_BEFORE_SUBMISSION", "params": {}, "expected": {} },
+    { "id": "be-crossed", "type": "BE_PRICE_CROSSED_BY_STEP", "params": { "intent_id": "edd93f90843dc0ea", "latest_step_index": 4 }, "expected": {} },
+    { "id": "be-triggered", "type": "BE_TRIGGERED_BY_STEP", "params": { "intent_id": "edd93f90843dc0ea", "latest_step_index": 4 }, "expected": {} }
+  ]
+}

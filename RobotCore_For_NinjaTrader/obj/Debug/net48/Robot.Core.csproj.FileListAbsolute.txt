@@ -16,3 +16,5 @@ C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Debug\net48\Robot.Core.source
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Debug\net48\Robot.Core.csproj.Up2Date
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Debug\net48\Robot.Core.dll
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Debug\net48\Robot.Core.pdb
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Debug\net48\Robot.Contracts.dll
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Debug\net48\Robot.Contracts.pdb

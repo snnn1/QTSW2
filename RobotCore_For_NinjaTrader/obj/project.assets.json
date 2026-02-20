@@ -182,6 +182,16 @@
             "related": ".xml"
           }
         }
+      },
+      "Robot.Contracts/1.0.0": {
+        "type": "project",
+        "framework": ".NETStandard,Version=v2.0",
+        "compile": {
+          "bin/placeholder/Robot.Contracts.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Robot.Contracts.dll": {}
+        }
       }
     }
   },
@@ -915,11 +925,17 @@
         "useSharedDesignerContext.txt",
         "version.txt"
       ]
+    },
+    "Robot.Contracts/1.0.0": {
+      "type": "project",
+      "path": "../modules/robot/contracts/Robot.Contracts.csproj",
+      "msbuildProject": "../modules/robot/contracts/Robot.Contracts.csproj"
     }
   },
   "projectFileDependencyGroups": {
     ".NETFramework,Version=v4.8": [
       "Microsoft.NETFramework.ReferenceAssemblies >= 1.0.3",
+      "Robot.Contracts >= 1.0.0",
       "System.Text.Json >= 8.0.0"
     ]
   },
@@ -947,7 +963,11 @@
       "frameworks": {
         "net48": {
           "targetAlias": "net48",
-          "projectReferences": {}
+          "projectReferences": {
+            "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+              "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
+            }
+          }
         }
       },
       "warningProperties": {
