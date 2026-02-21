@@ -23,7 +23,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor
 {
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
@@ -95,14 +95,110 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private DateTimeOffset _lastFlattenUtc;
     private const int FLATTEN_RECOGNITION_WINDOW_SECONDS = 10;
 
+    /// <summary>Flatten verification: instrumentKey -> (requestedUtc, retryCount, deadline, correlationId, instrumentRef).
+    /// instrumentRef: strategy's Instrument instance used for position check (avoids string-resolution ambiguity).</summary>
+    private readonly ConcurrentDictionary<string, (DateTimeOffset RequestedUtc, int RetryCount, DateTimeOffset VerifyDeadlineUtc, string CorrelationId, object? InstrumentRef)> _pendingFlattenVerifications = new();
+    private const double FLATTEN_VERIFY_WINDOW_SEC = 4.0;
+    private const int FLATTEN_VERIFY_MAX_RETRIES = 4;
+
     // BE Modify Confirmation: pending requests keyed by stop_order_id. Register BEFORE Change(); confirm via OrderUpdate.
     private readonly ConcurrentDictionary<string, PendingBERequest> _pendingBERequests = new();
+
+    /// <summary>Strategy-thread NT action queue. Worker enqueues; strategy drains under EntrySubmissionLock.</summary>
+    private StrategyThreadExecutor? _ntActionQueue;
+
+    /// <summary>Strategy-thread context: ref-count for nested Enter/Exit, and thread ID for strict validation.</summary>
+    [ThreadStatic] private static int _strategyThreadContextCount;
+    [ThreadStatic] private static int _strategyThreadId;
+
+    private void SetStrategyThreadContext(bool value)
+    {
+        if (value)
+        {
+            _strategyThreadContextCount++;
+            if (_strategyThreadContextCount == 1)
+                _strategyThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        }
+        else
+        {
+            if (_strategyThreadContextCount > 0)
+                _strategyThreadContextCount--;
+            if (_strategyThreadContextCount == 0)
+                _strategyThreadId = 0;
+        }
+    }
+
+    /// <summary>
+    /// Guard: ensure we're on strategy thread before calling NT APIs.
+    /// If not on strategy thread: emit NT_THREAD_VIOLATION, enqueue action, return false.
+    /// In DEBUG: assert. In RELEASE: fail-safe by enqueuing.
+    /// </summary>
+    /// <returns>true if action ran; false if enqueued (caller should return without touching NT APIs).</returns>
+    private bool EnsureStrategyThreadOrEnqueue(string methodName, string? intentId, string? instrument, string? correlationId, Action ntAction)
+    {
+        var currentThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == currentThreadId;
+        if (inContext)
+        {
+            ntAction();
+            return true;
+        }
+        var utcNow = DateTimeOffset.UtcNow;
+        var cid = correlationId ?? $"GUARD:{methodName}:{intentId ?? ""}:{instrument ?? ""}:{utcNow:yyyyMMddHHmmssfff}";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "NT_THREAD_VIOLATION", state: "CRITICAL",
+            new
+            {
+                method = methodName,
+                intent_id = intentId,
+                instrument = instrument,
+                correlation_id = cid,
+                note = "NT API called from non-strategy thread - action enqueued for strategy thread"
+            }));
+#if DEBUG
+        System.Diagnostics.Debug.Fail($"NT_THREAD_VIOLATION: {methodName} called from worker thread. Action enqueued.");
+#endif
+        if (_ntActionQueue != null)
+            _ntActionQueue.EnqueueNtAction(new NtDeferredAction(cid, intentId, instrument, $"THREAD_VIOLATION:{methodName}", ntAction), out _);
+        _guardViolationCallback?.Invoke(methodName);
+        return false;
+    }
+
+    /// <summary>Optional callback for canary tests. Invoked when guard triggers (NT_THREAD_VIOLATION).</summary>
+    private Action<string>? _guardViolationCallback;
+    internal void SetGuardViolationCallback(Action<string>? callback) => _guardViolationCallback = callback;
+
+    bool IIEAOrderExecutor.EnqueueNtAction(INtAction action)
+    {
+        if (_ntActionQueue == null) return false;
+        return _ntActionQueue.EnqueueNtAction(action, out _);
+    }
+
+    object? IIEAOrderExecutor.GetEntrySubmissionLock() => _iea?.EntrySubmissionLock;
+
+    void IIEAOrderExecutor.EnterStrategyThreadContext() => SetStrategyThreadContext(true);
+    void IIEAOrderExecutor.ExitStrategyThreadContext() => SetStrategyThreadContext(false);
+
+    void IIEAOrderExecutor.DrainNtActions()
+    {
+        if (_ntActionQueue != null && this is INtActionExecutor executor)
+            _ntActionQueue.DrainNtActions(executor);
+        OnVerifyPendingFlattens();
+    }
+
+    partial void OnVerifyPendingFlattens();
+
+    private bool HasPendingBEForIntent(string intentId)
+    {
+        foreach (var p in _pendingBERequests.Values)
+            if (string.Equals(p.IntentId, intentId, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
     private readonly ConcurrentDictionary<string, DateTimeOffset> _pendingBECancelUtcByIntent = new(); // Replace-semantics: intent_id -> when old stop went CancelPending
     private const int BE_REPLACE_CANCEL_WINDOW_SEC = 30;
     private const int BE_CONFIRM_TIMEOUT_SEC = 15;
     private const int BE_RETRY_INTERVAL_SEC = 5;
     private const int BE_MAX_RETRY_ATTEMPTS = 3;
-
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
         _projectRoot = projectRoot;
@@ -154,6 +250,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // Resolve IEA when use_instrument_execution_authority is enabled
         if (_useInstrumentExecutionAuthority)
         {
+            _ntActionQueue = new StrategyThreadExecutor(_log);
             var accountName = GetAccountName(account);
             var executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, instrument, engineExecutionInstrument);
             _ieaAccountName = accountName;
@@ -816,8 +913,29 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     {
         // Notify coordinator of protective failure
         _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
-        
-        // Flatten position immediately with retry logic
+
+        // NT THREADING FIX: When IEA enabled, worker may call FailClosed. Enqueue NT actions for strategy thread.
+        if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+        {
+            var cid = $"FAILCLOSED:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+            _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, intentId, intent.Instrument, false, failureReason, utcNow), out _);
+            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid + ":F", intentId, intent.Instrument ?? "", failureReason, utcNow), out _);
+            _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"{eventType}: {failureReason}");
+            PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, FlattenResult.FailureResult("Enqueued for strategy thread", utcNow), utcNow);
+            var notificationSvc = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationSvc != null)
+                notificationSvc.EnqueueNotification(notificationKey, notificationTitle, notificationMessage, priority: 2);
+            var logDataIea = new Dictionary<string, object>
+            {
+                { "intent_id", intentId }, { "stream", intent.Stream }, { "instrument", intent.Instrument },
+                { "failure_reason", failureReason }, { "note", "Fail-closed: NT actions enqueued for strategy thread" }
+            };
+            if (_iea != null) { logDataIea["iea_instance_id"] = _iea.InstanceId; logDataIea["execution_instrument_key"] = _iea.ExecutionInstrumentKey; }
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, eventType, logDataIea));
+            return;
+        }
+
+        // Flatten position immediately with retry logic (strategy thread path)
         var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
         
         // Stand down stream
@@ -827,14 +945,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, flattenResult, utcNow);
         
         // Raise high-priority alert
-        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-        if (notificationService != null)
+        var notificationSvc2 = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+        if (notificationSvc2 != null)
         {
-            notificationService.EnqueueNotification(notificationKey, notificationTitle, notificationMessage, priority: 2); // Emergency priority
+            notificationSvc2.EnqueueNotification(notificationKey, notificationTitle, notificationMessage, priority: 2); // Emergency priority
         }
         
         // Log final flattened event
-        var logData = new Dictionary<string, object>
+        var logDataFlatten = new Dictionary<string, object>
         {
             { "intent_id", intentId },
             { "stream", intent.Stream },
@@ -847,13 +965,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         
         if (stopResult != null)
         {
-            logData["stop_success"] = stopResult.Success;
-            logData["stop_error"] = stopResult.ErrorMessage;
+            logDataFlatten["stop_success"] = stopResult.Success;
+            logDataFlatten["stop_error"] = stopResult.ErrorMessage;
         }
         if (targetResult != null)
         {
-            logData["target_success"] = targetResult.Success;
-            logData["target_error"] = targetResult.ErrorMessage;
+            logDataFlatten["target_success"] = targetResult.Success;
+            logDataFlatten["target_error"] = targetResult.ErrorMessage;
         }
         if (additionalData != null)
         {
@@ -861,18 +979,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             var props = additionalData.GetType().GetProperties();
             foreach (var prop in props)
             {
-                logData[prop.Name] = prop.GetValue(additionalData);
+                logDataFlatten[prop.Name] = prop.GetValue(additionalData);
             }
         }
 
         // Gap 3: Ensure CRITICAL logs include IEA context when IEA enabled.
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            logData["iea_instance_id"] = _iea.InstanceId;
-            logData["execution_instrument_key"] = _iea.ExecutionInstrumentKey;
+            logDataFlatten["iea_instance_id"] = _iea.InstanceId;
+            logDataFlatten["execution_instrument_key"] = _iea.ExecutionInstrumentKey;
         }
         
-        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, eventType, logData));
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, eventType, logDataFlatten));
     }
     
     /// <summary>
@@ -1179,11 +1297,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         CheckPendingBETimeouts(DateTimeOffset.UtcNow);
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            _iea.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+            // NT THREADING FIX: order.Change() must run on strategy thread (OnMarketData context).
+            // IEA worker caused stop ping-pong (49604↔49305) and BE not sticking. Same pattern as entry submission.
+            lock (_iea.EntrySubmissionLock)
+            {
+                var eventTime = tickTimeFromEvent ?? DateTimeOffset.UtcNow;
+                var hasEventTime = tickTimeFromEvent.HasValue;
+                _iea.EvaluateBreakEvenDirect(tickPrice, eventTime, hasEventTime, executionInstrument);
+            }
         }
         else
         {
-            EvaluateBreakEvenNonIEA(tickPrice, tickTimeFromEvent ?? DateTimeOffset.UtcNow, executionInstrument);
+            EvaluateBreakEvenCoreImpl(tickPrice, tickTimeFromEvent ?? DateTimeOffset.UtcNow, executionInstrument);
         }
 #endif
     }
@@ -1533,8 +1658,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// </summary>
     private void CheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow)
     {
-        // Implementation in NinjaTraderSimAdapter.NT.cs
+        OnCheckAllInstrumentsForFlatPositions(utcNow);
     }
+
+    partial void OnCheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow);
     
     /// <summary>
     /// Check for unprotected positions and flatten if protectives not acknowledged within timeout.
@@ -1718,6 +1845,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             
             // Check if BE has already been triggered (idempotency check)
             if (_executionJournal.IsBEModified(intentId, tradingDate, stream))
+                continue;
+
+            // Skip if pending modify (waiting for confirmation)
+            if (HasPendingBEForIntent(intentId))
                 continue;
             
             // Get actual fill price from execution journal for logging/debugging purposes

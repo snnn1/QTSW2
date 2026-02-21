@@ -238,8 +238,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string? _accountName;
     private string? _environment;
     
-    // Instruments frozen due to RECONCILIATION_QTY_MISMATCH (block execution; allow range building)
+    // Instruments frozen due to RECONCILIATION_QTY_MISMATCH or FLATTEN_FAILED_PERSISTENT (block execution; allow range building)
     private readonly HashSet<string> _frozenInstruments = new(StringComparer.OrdinalIgnoreCase);
+    private RiskLatchManager? _riskLatchManager;
 
     // Disconnect recovery state machine
     private ConnectionRecoveryState _recoveryState = ConnectionRecoveryState.CONNECTED_OK;
@@ -883,6 +884,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Initialize execution components now that spec is loaded
             if (_killSwitch == null)
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
+            // Hydrate risk latches (persisted instrument blocks) so blocks survive restarts
+            _riskLatchManager = new RiskLatchManager(_root, _accountName ?? "UNKNOWN");
+            foreach (var inst in _riskLatchManager.Hydrate())
+            {
+                _frozenInstruments.Add(inst);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RISK_LATCH_HYDRATED", state: "ENGINE",
+                    new { instrument = inst, note = "Persisted block re-applied on startup" }));
+            }
             _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this, isInstrumentFrozen: inst => _frozenInstruments.Contains(inst));
 
             // Try to create adapter (will throw if LIVE mode)
@@ -965,6 +974,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             if (shouldUnfreeze)
                             {
                                 _frozenInstruments.Remove(inst);
+                                _riskLatchManager?.Clear(inst);
                                 LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
                                     eventType: "INSTRUMENT_UNFROZEN", state: "ENGINE",
                                     new { instrument = inst, note = "Reconciliation qty match restored" }));
@@ -2061,7 +2071,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Set session close resolution result for (tradingDay, sessionClass).
     /// Called by strategy (SessionCloseResolver) or HistoricalReplay harness.
-    /// Emits SESSION_CLOSE_RESOLVED or SESSION_CLOSE_HOLIDAY.
+    /// Emits SESSION_CLOSE_RESOLVED or failure event per FailureReason:
+    /// SESSION_CLOSE_HOLIDAY, SESSION_CLOSE_NO_ELIGIBLE_SEGMENTS, SESSION_CLOSE_ITERATION_ERROR, SESSION_CLOSE_EXCEPTION.
     /// </summary>
     public void SetSessionCloseResolved(string tradingDay, string sessionClass, SessionCloseResult result)
     {
@@ -2094,8 +2105,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         else
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY", state: "ENGINE",
-                new { trading_day = tradingDay, session_class = sessionClass, note = "No eligible segments (holiday)" }));
+            var eventType = r.FailureReason switch
+            {
+                "HOLIDAY" => "SESSION_CLOSE_HOLIDAY",
+                "NO_ELIGIBLE_SEGMENTS" => "SESSION_CLOSE_NO_ELIGIBLE_SEGMENTS",
+                "ITERATION_ERROR" => "SESSION_CLOSE_ITERATION_ERROR",
+                "EXCEPTION" => "SESSION_CLOSE_EXCEPTION",
+                _ => "SESSION_CLOSE_HOLIDAY" // Backward compat: unknown reason defaults to legacy event
+            };
+            var note = r.FailureReason switch
+            {
+                "HOLIDAY" => "Exchange holiday per TradingHours template",
+                "NO_ELIGIBLE_SEGMENTS" => "Sessions exist but none overlap timetable window",
+                "ITERATION_ERROR" => "Date resolution failed",
+                "EXCEPTION" => "Resolver threw",
+                _ => "No eligible segments"
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE",
+                new { trading_day = tradingDay, session_class = sessionClass, failure_reason = r.FailureReason, note }));
         }
     }
 
@@ -3929,6 +3956,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         lock (_engineLock)
         {
             _frozenInstruments.Add(instrument);
+            _riskLatchManager?.Persist(instrument, reason);
 
             var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
             foreach (var kvp in _streams)

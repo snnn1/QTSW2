@@ -104,7 +104,10 @@ public sealed partial class NinjaTraderSimAdapter
         var account = _ntAccount as Account;
         if (account == null || orders == null) return;
         var ntOrders = orders.OfType<Order>().ToArray();
-        if (ntOrders.Length > 0) account.Cancel(ntOrders);
+        if (ntOrders.Length == 0) return;
+        var orderIds = string.Join(",", ntOrders.Select(o => o.OrderId));
+        if (!EnsureStrategyThreadOrEnqueue("CancelOrders", null, null, $"CANCEL:{orderIds}", () => account!.Cancel(ntOrders)))
+            return;
     }
 
     void IIEAOrderExecutor.SubmitOrders(IReadOnlyList<object> orders)
@@ -112,7 +115,9 @@ public sealed partial class NinjaTraderSimAdapter
         var account = _ntAccount as Account;
         if (account == null || orders == null) return;
         var ntOrders = orders.OfType<Order>().ToArray();
-        if (ntOrders.Length > 0) account.Submit(ntOrders);
+        if (ntOrders.Length == 0) return;
+        if (!EnsureStrategyThreadOrEnqueue("SubmitOrders", null, null, null, () => account!.Submit(ntOrders)))
+            return;
     }
 
     void IIEAOrderExecutor.SetOrderTag(object order, string tag) => SetOrderTag(order as Order, tag);
@@ -225,6 +230,124 @@ public sealed partial class NinjaTraderSimAdapter
 
     void IIEAOrderExecutor.FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) =>
         FailClosed(intentId, intent, failureReason, eventType, notificationKey, notificationTitle, notificationMessage, stopResult, targetResult, additionalData, utcNow);
+
+    void INtActionExecutor.ExecuteSubmitProtectives(NtSubmitProtectivesCommand cmd)
+    {
+        const int MAX_RETRIES = 3;
+        const int RETRY_DELAY_MS = 100;
+        OrderSubmissionResult? stopResult = null;
+        OrderSubmissionResult? targetResult = null;
+        if (!IntentMap.TryGetValue(cmd.IntentId ?? "", out var intent))
+            throw new InvalidOperationException($"Intent not found: {cmd.IntentId}");
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
+        {
+            if (attempt > 0) System.Threading.Thread.Sleep(RETRY_DELAY_MS);
+            if (_coordinator != null && !_coordinator.CanSubmitExit(cmd.IntentId!, cmd.Quantity))
+            {
+                var err = "Exit validation failed during retry";
+                FailClosed(cmd.IntentId!, intent, err, "PROTECTIVE_ORDERS_FAILED_FLATTENED", $"PROTECTIVE_FAILURE:{cmd.IntentId}",
+                    "CRITICAL: Protective Order Failure", $"Exit validation failed. Stream: {intent.Stream}, Intent: {cmd.IntentId}.",
+                    null, null, new { retry_count = MAX_RETRIES }, cmd.UtcNow);
+                return;
+            }
+            var protectiveOcoGroup = GenerateProtectiveOcoGroup(cmd.IntentId!, attempt, cmd.UtcNow);
+            _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "STOP_SUBMIT_REQUESTED", new { correlation_id = cmd.CorrelationId, attempt = attempt + 1 }));
+            stopResult = SubmitProtectiveStopReal(cmd.IntentId!, cmd.Instrument, cmd.Direction, cmd.StopPrice, cmd.Quantity, protectiveOcoGroup, cmd.UtcNow);
+            _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "STOP_SUBMIT_CONFIRMED", new { correlation_id = cmd.CorrelationId, success = stopResult.Success }));
+            if (!stopResult.Success) { targetResult = OrderSubmissionResult.FailureResult("Stop failed", cmd.UtcNow); continue; }
+            _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "TARGET_SUBMIT_REQUESTED", new { correlation_id = cmd.CorrelationId, attempt = attempt + 1 }));
+            targetResult = SubmitTargetOrderReal(cmd.IntentId!, cmd.Instrument, cmd.Direction, cmd.TargetPrice, cmd.Quantity, protectiveOcoGroup, cmd.UtcNow);
+            _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "TARGET_SUBMIT_CONFIRMED", new { correlation_id = cmd.CorrelationId, success = targetResult.Success }));
+            if (targetResult.Success) return;
+        }
+        var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: STOP: {stopResult?.ErrorMessage}, TARGET: {targetResult?.ErrorMessage}";
+        FailClosed(cmd.IntentId!, intent, failureReason, "PROTECTIVE_ORDERS_FAILED_FLATTENED", $"PROTECTIVE_FAILURE:{cmd.IntentId}",
+            "CRITICAL: Protective Order Failure", $"Entry filled but protective orders failed. Stream: {intent.Stream}, Intent: {cmd.IntentId}. {failureReason}",
+            stopResult, targetResult, new { retry_count = MAX_RETRIES }, cmd.UtcNow);
+    }
+
+    void INtActionExecutor.ExecuteCancelOrders(NtCancelOrdersCommand cmd)
+    {
+        if (!string.IsNullOrEmpty(cmd.IntentId))
+        {
+            if (cmd.ProtectiveOrdersOnly)
+                CancelProtectiveOrdersForIntent(cmd.IntentId, cmd.UtcNow);
+            else
+                CancelIntentOrdersReal(cmd.IntentId, cmd.UtcNow);
+        }
+    }
+
+    void INtActionExecutor.ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd)
+    {
+        _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_REQUESTED", new { correlation_id = cmd.CorrelationId, reason = cmd.Reason }));
+        // Cancel-then-flatten: cancel robot-owned working orders first to prevent refills/reopens
+        CancelRobotOwnedWorkingOrdersReal(default, cmd.UtcNow);
+        var result = FlattenIntentReal(cmd.IntentId ?? "NT_FLATTEN", cmd.Instrument, cmd.UtcNow);
+        _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_SUBMITTED", new { correlation_id = cmd.CorrelationId, success = result.Success }));
+        if (!result.Success) throw new InvalidOperationException($"Flatten failed: {result.ErrorMessage}");
+        RegisterPendingFlattenVerification(cmd.Instrument, cmd.CorrelationId, cmd.UtcNow);
+    }
+
+    private void RegisterPendingFlattenVerification(string instrumentKey, string correlationId, DateTimeOffset utcNow)
+    {
+        var deadline = utcNow.AddSeconds(FLATTEN_VERIFY_WINDOW_SEC);
+        var instrumentRef = _ntInstrument;
+        _pendingFlattenVerifications[instrumentKey] = (utcNow, 0, deadline, correlationId, instrumentRef);
+    }
+
+    partial void OnVerifyPendingFlattens()
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        var account = _ntAccount as Account;
+        if (account == null) return;
+
+        var toRemove = new List<string>();
+        foreach (var kvp in _pendingFlattenVerifications.ToArray())
+        {
+            var instrumentKey = kvp.Key;
+            var (requestedUtc, retryCount, deadline, correlationId, instrumentRef) = kvp.Value;
+            if (utcNow < deadline) continue;
+
+            int positionQty = 0;
+            try
+            {
+                var inj = instrumentRef as Instrument ?? _ntInstrument as Instrument;
+                if (inj != null)
+                {
+                    dynamic dynAccount = account;
+                    var pos = dynAccount.GetPosition(inj);
+                    positionQty = pos?.Quantity ?? 0;
+                }
+            }
+            catch { }
+
+            if (positionQty == 0)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_VERIFY_PASS", new { correlation_id = correlationId, instrument = instrumentKey }));
+                toRemove.Add(instrumentKey);
+            }
+            else
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_VERIFY_FAIL", new { correlation_id = correlationId, instrument = instrumentKey, position_qty = positionQty, retry_count = retryCount }));
+                if (retryCount < FLATTEN_VERIFY_MAX_RETRIES)
+                {
+                    var newCid = $"{correlationId}:R{retryCount + 1}";
+                    _ntActionQueue?.EnqueueNtAction(new NtFlattenInstrumentCommand(newCid, null, instrumentKey, $"VERIFY_FAIL_RETRY_{retryCount + 1}", utcNow), out _);
+                    _pendingFlattenVerifications[instrumentKey] = (utcNow, retryCount + 1, utcNow.AddSeconds(FLATTEN_VERIFY_WINDOW_SEC), newCid, instrumentRef);
+                }
+                else
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_FAILED_PERSISTENT", state: "CRITICAL",
+                        new { correlation_id = correlationId, instrument = instrumentKey, position_qty = positionQty, retry_count = retryCount, note = "Flatten verify failed after max retries - fail-closed" }));
+                    _standDownStreamCallback?.Invoke("", utcNow, $"FLATTEN_FAILED_PERSISTENT:{instrumentKey}");
+                    _blockInstrumentCallback?.Invoke(instrumentKey, utcNow, $"FLATTEN_FAILED_PERSISTENT:{instrumentKey}");
+                    toRemove.Add(instrumentKey);
+                }
+            }
+        }
+        foreach (var k in toRemove)
+            _pendingFlattenVerifications.TryRemove(k, out _);
+    }
 
     /// <summary>
     /// Check if executionInstrument matches the strategy's NinjaTrader Instrument.
@@ -1552,8 +1675,27 @@ public sealed partial class NinjaTraderSimAdapter
             _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:INTENT_NOT_FOUND:{intentId}");
             
             // CRITICAL FIX: Flatten position immediately (fail-closed)
-            // Entry fill happened but intent not found - position exists but is unprotected
-            // Must flatten to prevent unprotected position accumulation
+            // NT THREADING FIX: Worker MUST NOT call account.Flatten. Enqueue for strategy thread.
+            if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+            {
+                var cid = $"ORPHAN_FILL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+                _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "ORPHAN_FILL_INTENT_NOT_FOUND", utcNow), out _);
+                LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_ENQUEUED", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        tag = encodedTag,
+                        order_type = orderType,
+                        instrument = instrument,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        reason = "INTENT_NOT_FOUND",
+                        correlation_id = cid,
+                        note = "Flatten enqueued for strategy thread (orphan fill)"
+                    });
+            }
+            else
+            {
             try
             {
                 var flattenResult = Flatten(intentId, instrument, utcNow);
@@ -1623,6 +1765,7 @@ public sealed partial class NinjaTraderSimAdapter
                     var message = $"Entry fill occurred but intent not found. Flatten operation threw exception - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Exception: {ex.Message}";
                     notificationService.EnqueueNotification($"INTENT_NOT_FOUND_FLATTEN_EXCEPTION:{intentId}", title, message, priority: 3); // Highest priority
                 }
+            }
             }
             
             return false;
@@ -1847,62 +1990,52 @@ public sealed partial class NinjaTraderSimAdapter
                 });
             
             // CRITICAL: Flatten position immediately (fail-closed)
-            // The fill happened in NinjaTrader, so we must flatten to prevent unprotected position
-            // Since we don't have intent_id, we'll flatten the entire instrument position
-            try
+            // NT THREADING FIX: Worker MUST NOT call account.Flatten. Enqueue for strategy thread.
+            if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
             {
-                // Use a dummy intent_id to flatten instrument position
-                // FlattenIntentReal flattens the entire instrument anyway, so this works
-                var flattenResult = Flatten("UNKNOWN_UNTrackED_FILL", instrument, utcNow);
-                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTENED",
+                var cid = $"UNTrackED_FILL:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+                _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, null, instrument, "UNTrackED_FILL", utcNow), out _);
+                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_ENQUEUED",
                     new
                     {
                         broker_order_id = order.OrderId,
                         fill_price = fillPrice,
                         fill_quantity = fillQuantity,
-                        flatten_success = flattenResult.Success,
-                        flatten_error = flattenResult.ErrorMessage,
-                        note = "Position flattened due to untracked fill (fail-closed behavior)"
+                        correlation_id = cid,
+                        note = "Flatten enqueued for strategy thread (fail-closed)"
                     });
-                
-                // Alert if flatten succeeded (info) or failed (critical)
                 var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                 if (notificationService != null)
                 {
-                    if (flattenResult.Success)
-                    {
-                        var title = $"Untracked Fill - Position Flattened - {instrument}";
-                        var message = $"Untracked fill occurred (missing/invalid tag) and position was flattened automatically. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
-                        notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTENED:{order.OrderId}", title, message, priority: 1); // Info priority
-                    }
-                    else
-                    {
-                        var title = $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}";
-                        var message = $"Untracked fill occurred but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
-                        notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTEN_FAILED:{order.OrderId}", title, message, priority: 3); // Highest priority
-                    }
+                    var title = $"Untracked Fill - Flatten Enqueued - {instrument}";
+                    var message = $"Untracked fill occurred (missing/invalid tag). Flatten enqueued for strategy thread. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
+                    notificationService.EnqueueNotification($"UNTrackED_FILL_ENQUEUED:{order.OrderId}", title, message, priority: 1);
                 }
             }
-            catch (Exception ex)
+            else
             {
-                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_FAILED",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        broker_order_id = order.OrderId,
-                        fill_price = fillPrice,
-                        fill_quantity = fillQuantity,
-                        note = "CRITICAL: Failed to flatten untracked fill position - manual intervention required"
-                    });
-                
-                // Critical alert for flatten failure
-                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                if (notificationService != null)
+                try
                 {
-                    var title = $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}";
-                    var message = $"Untracked fill occurred (missing/invalid tag) but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
-                    notificationService.EnqueueNotification($"UNTrackED_FILL_FLATTEN_FAILED:{order.OrderId}", title, message, priority: 3); // Highest priority
+                    var flattenResult = Flatten("UNKNOWN_UNTrackED_FILL", instrument, utcNow);
+                    LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTENED",
+                        new { broker_order_id = order.OrderId, fill_price = fillPrice, fill_quantity = fillQuantity, flatten_success = flattenResult.Success, flatten_error = flattenResult.ErrorMessage });
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                    {
+                        var title = flattenResult.Success ? $"Untracked Fill - Position Flattened - {instrument}" : $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}";
+                        var message = flattenResult.Success
+                            ? $"Untracked fill occurred and position was flattened. Broker Order ID: {order.OrderId}"
+                            : $"Untracked fill occurred but flatten FAILED - MANUAL INTERVENTION REQUIRED. Error: {flattenResult.ErrorMessage}";
+                        notificationService.EnqueueNotification($"UNTrackED_FILL:{order.OrderId}", title, message, priority: flattenResult.Success ? 1 : 3);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_FAILED",
+                        new { error = ex.Message, broker_order_id = order.OrderId, fill_price = fillPrice, fill_quantity = fillQuantity });
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                        notificationService.EnqueueNotification($"UNTrackED_FILL_FAILED:{order.OrderId}", $"CRITICAL: Untracked Fill - Flatten FAILED - {instrument}", $"Error: {ex.Message}", priority: 3);
                 }
             }
             
@@ -2061,58 +2194,34 @@ public sealed partial class NinjaTraderSimAdapter
                             account_name = _iea?.AccountName
                         });
                     
+                    if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+                    {
+                        var cid = $"UNKNOWN_ORDER:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+                        _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "UNKNOWN_ORDER_FILL", utcNow), out _);
+                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_ENQUEUED",
+                            new { broker_order_id = order.OrderId, intent_id = intentId, fill_price = fillPrice, fill_quantity = fillQuantity, correlation_id = cid });
+                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                        if (notificationService != null)
+                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_ENQUEUED:{intentId}", $"Unknown Order Fill - Flatten Enqueued - {instrument}", $"Fill for order not in map. Flatten enqueued. Intent: {intentId}", priority: 1);
+                    }
+                    else
+                    {
                     try
                     {
                         var flattenResult = Flatten(intentId, instrument, utcNow);
-                        
                         LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
-                            new
-                            {
-                                broker_order_id = order.OrderId,
-                                intent_id = intentId,
-                                fill_price = fillPrice,
-                                fill_quantity = fillQuantity,
-                                flatten_success = flattenResult.Success,
-                                flatten_error = flattenResult.ErrorMessage,
-                                note = "Position flattened due to untracked order fill (fail-closed behavior)"
-                            });
-                        
-                        // Alert if flatten succeeded (info) or failed (critical)
+                            new { broker_order_id = order.OrderId, intent_id = intentId, flatten_success = flattenResult.Success, flatten_error = flattenResult.ErrorMessage });
                         var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                         if (notificationService != null)
-                        {
-                            if (flattenResult.Success)
-                            {
-                                var title = $"Unknown Order Fill - Position Flattened - {instrument}";
-                                var message = $"Fill occurred for order not found in tracking map and position was flattened automatically. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
-                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTENED:{intentId}", title, message, priority: 1); // Info priority
-                            }
-                            else
-                            {
-                                var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
-                                var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
-                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
-                            }
-                        }
+                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL:{intentId}", flattenResult.Success ? "Position Flattened" : "Flatten FAILED", flattenResult.Success ? "Position flattened" : $"Error: {flattenResult.ErrorMessage}", priority: flattenResult.Success ? 1 : 3);
                     }
                     catch (Exception ex)
                     {
-                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
-                            new
-                            {
-                                error = ex.Message,
-                                exception_type = ex.GetType().Name,
-                                broker_order_id = order.OrderId,
-                                intent_id = intentId,
-                                note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
-                            });
+                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED", new { error = ex.Message, broker_order_id = order.OrderId, intent_id = intentId });
                         var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                         if (notificationService != null)
-                        {
-                            var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
-                            var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3);
-                        }
+                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FAILED:{intentId}", $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}", $"Error: {ex.Message}", priority: 3);
+                    }
                     }
                     return; // Fail-closed: don't process untracked fill
                 }
@@ -2309,34 +2418,29 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
                 
                 // Emergency flatten to prevent unprotected position
+                // NT THREADING FIX: Worker MUST NOT call account.Flatten. Enqueue for strategy thread.
+                if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+                {
+                    var cid = $"INTENT_LOST:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+                    _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, orderInfo.Instrument, "INTENT_NOT_FOUND_AFTER_CONTEXT", utcNow), out _);
+                    LogCriticalEngineWithIeaContext(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_ENQUEUED", "ENGINE",
+                        new { intent_id = intentId, instrument = orderInfo.Instrument, stream = context.Stream, correlation_id = cid });
+                    _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
+                    var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                    if (notificationService != null)
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", $"CRITICAL: Intent Not Found - {orderInfo.Instrument}", $"Intent lost after context resolution. Flatten enqueued. Stream: {context.Stream}", priority: 2);
+                }
+                else
+                {
                 try
                 {
                     var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
-                    
                     LogCriticalEngineWithIeaContext(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
-                        new
-                        {
-                            intent_id = intentId,
-                            instrument = orderInfo.Instrument,
-                            stream = context.Stream,
-                            fill_price = fillPrice,
-                            fill_quantity = filledTotal,
-                            flatten_success = flattenResult.Success,
-                            flatten_error = flattenResult.ErrorMessage,
-                            note = "Position flattened due to missing intent - protective orders could not be placed"
-                        });
-                    
-                    // Stand down stream
+                        new { intent_id = intentId, instrument = orderInfo.Instrument, stream = context.Stream, flatten_success = flattenResult.Success, flatten_error = flattenResult.ErrorMessage });
                     _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
-                    
-                    // Raise high-priority alert
                     var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                     if (notificationService != null)
-                    {
-                        var title = $"CRITICAL: Intent Not Found - {orderInfo.Instrument}";
-                        var message = $"Entry order filled but intent was not registered. Position flattened. Stream: {context.Stream}, Intent: {intentId}";
-                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2); // Emergency priority
-                    }
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", $"CRITICAL: Intent Not Found - {orderInfo.Instrument}", $"Position flattened. Stream: {context.Stream}, Intent: {intentId}", priority: 2);
                 }
                 catch (Exception ex)
                 {
@@ -2351,6 +2455,7 @@ public sealed partial class NinjaTraderSimAdapter
                             exception_type = ex.GetType().Name,
                             note = "Failed to flatten position after intent not found - manual intervention may be required"
                         });
+                }
                 }
             }
         }
@@ -3356,15 +3461,18 @@ public sealed partial class NinjaTraderSimAdapter
     private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new(StringComparer.OrdinalIgnoreCase);
     private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
     private const int BE_MODIFY_MAX_RETRIES = 25;
-    private const double BE_SCAN_THROTTLE_MS = 200;
-    private DateTimeOffset _lastBeCheckUtcNonIEA = DateTimeOffset.MinValue;
+    private readonly Dictionary<string, DateTimeOffset> _lastBePreChangeSnapshotUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private const double BE_PRE_CHANGE_SNAPSHOT_RATE_LIMIT_SEC = 5;
 
-    private void EvaluateBreakEvenNonIEA(decimal tickPrice, DateTimeOffset utcNow, string executionInstrument)
+    /// <summary>Single BE evaluation function. Gating: IsBEModified and pending modify in GetActiveIntentsForBEMonitoring. Branch only at ModifyStopToBreakEven.</summary>
+    void IIEAOrderExecutor.EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
     {
-        if ((utcNow - _lastBeCheckUtcNonIEA).TotalMilliseconds < BE_SCAN_THROTTLE_MS)
-            return;
-        _lastBeCheckUtcNonIEA = utcNow;
+        EvaluateBreakEvenCoreImpl(tickPrice, eventTime, executionInstrument);
+    }
 
+    private void EvaluateBreakEvenCoreImpl(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
         var activeIntents = GetActiveIntentsForBEMonitoring(executionInstrument);
         if (activeIntents.Count == 0) return;
 
@@ -3395,6 +3503,16 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 _lastBeModifyAttemptUtcByIntent.Remove(intentId);
                 _beModifyFailureCountByIntent.Remove(intentId);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_TRIGGERED", new
+                {
+                    direction,
+                    breakout_level = breakoutLevel,
+                    actual_fill_price = actualFillPrice,
+                    be_trigger_price = beTriggerPrice,
+                    be_stop_price = beStopPrice,
+                    tick_size = tickSize,
+                    tick_price = tickPrice
+                }));
             }
             else
             {
@@ -3406,8 +3524,27 @@ public sealed partial class NinjaTraderSimAdapter
                 var failCount = _beModifyFailureCountByIntent.TryGetValue(intentId, out var c) ? c + 1 : 1;
                 _beModifyFailureCountByIntent[intentId] = failCount;
 
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_MODIFY_RETRY", new
+                {
+                    fail_count = failCount,
+                    max_retries = BE_MODIFY_MAX_RETRIES,
+                    error = errorMsg,
+                    direction,
+                    be_trigger_price = beTriggerPrice,
+                    tick_price = tickPrice,
+                    note = failCount >= BE_MODIFY_MAX_RETRIES ? "Max retries exceeded" : "Modify failed, will retry"
+                }));
+
                 if (failCount >= BE_MODIFY_MAX_RETRIES)
                 {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_MODIFY_FAILED", new
+                    {
+                        fail_count = failCount,
+                        error = errorMsg,
+                        direction,
+                        be_trigger_price = beTriggerPrice,
+                        action = stopMissing ? "FLATTEN" : "STAND_DOWN"
+                    }));
                     _beModifyFailureCountByIntent.Remove(intentId);
                     _lastBeModifyAttemptUtcByIntent.Remove(intentId);
 
@@ -3676,11 +3813,27 @@ public sealed partial class NinjaTraderSimAdapter
             var stopOrderId = stopOrder.OrderId ?? "";
             _pendingBERequests[stopOrderId] = pending;
 
+            // BE_PRE_CHANGE_SNAPSHOT: log state before Change() (diagnostic for ping-pong, rate-limited)
+            if (!_lastBePreChangeSnapshotUtcByIntent.TryGetValue(intentId, out var lastSnapshot) || (utcNow - lastSnapshot).TotalSeconds >= BE_PRE_CHANGE_SNAPSHOT_RATE_LIMIT_SEC)
+            {
+                _lastBePreChangeSnapshotUtcByIntent[intentId] = utcNow;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_PRE_CHANGE_SNAPSHOT", new
+                {
+                    stop_order_id = stopOrderId,
+                    current_stop_price = (decimal)stopOrder.StopPrice,
+                    requested_stop_price = beStopQuantized,
+                    order_state = stopOrder.OrderState.ToString(),
+                    oco_id = ocoId,
+                    note = "State immediately before account.Change()"
+                }));
+            }
+
             // 2. Real NT API: Modify stop price. Change() returns void — do NOT assign.
             stopOrder.StopPrice = (double)beStopQuantized;
             try
             {
-                account.Change(new[] { stopOrder });
+                if (!EnsureStrategyThreadOrEnqueue("ModifyStopToBreakEven", intentId, instrument, $"BE_CHANGE:{stopOrderId}", () => account.Change(new[] { stopOrder })))
+                    return OrderModificationResult.FailureResult("Enqueued for strategy thread", utcNow);
             }
             catch (Exception ex)
             {
@@ -3841,9 +3994,9 @@ public sealed partial class NinjaTraderSimAdapter
             
             if (ordersToCancel.Count > 0)
             {
-                // Real NT API: Cancel orders
-                account.Cancel(ordersToCancel.ToArray());
-                
+                var ordersArr = ordersToCancel.ToArray();
+                if (!EnsureStrategyThreadOrEnqueue("CancelProtectiveOrdersForRecreate", intentId, null, $"CANCEL_PROTECTIVE:{intentId}", () => account.Cancel(ordersArr)))
+                    return;
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
                 {
                     intent_id = intentId,
@@ -3913,9 +4066,9 @@ public sealed partial class NinjaTraderSimAdapter
             
             if (ordersToCancel.Count > 0)
             {
-                // Real NT API: Cancel orders
-                account.Cancel(ordersToCancel.ToArray());
-                
+                var ordersArr = ordersToCancel.ToArray();
+                if (!EnsureStrategyThreadOrEnqueue("CancelIntentOrdersReal", intentId, null, $"CANCEL_INTENT:{intentId}", () => account.Cancel(ordersArr)))
+                    return false;
                 // Update order map
                 foreach (var order in ordersToCancel)
                 {
@@ -4124,40 +4277,43 @@ public sealed partial class NinjaTraderSimAdapter
                 _lastFlattenUtc = utcNow;
             }
             
-            // Flatten - use dynamic to handle different API signatures
-            if (ntInstrument != null)
+            // Flatten - use dynamic to handle different API signatures. Guard: must run on strategy thread.
+            var flattenSuccess = new[] { false };
+            if (!EnsureStrategyThreadOrEnqueue("FlattenIntentReal", intentId, instrument, $"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", () =>
             {
-                try
+                if (ntInstrument != null)
                 {
-                    dynAccountFlatten.Flatten(ntInstrument);
-                    flattenSucceeded = true;
-                }
-                catch
-                {
-                    // Try alternative signature - Flatten might take ICollection<Instrument>
                     try
                     {
-                        dynAccountFlatten.Flatten(new[] { ntInstrument });
-                        flattenSucceeded = true;
+                        dynAccountFlatten.Flatten(ntInstrument);
+                        flattenSuccess[0] = true;
                     }
                     catch
                     {
-                        // Try with instrument name string
-                        if (!string.IsNullOrEmpty(instrumentName))
+                        try
                         {
-                            try
+                            dynAccountFlatten.Flatten(new[] { ntInstrument });
+                            flattenSuccess[0] = true;
+                        }
+                        catch
+                        {
+                            if (!string.IsNullOrEmpty(instrumentName))
                             {
-                                dynAccountFlatten.Flatten(instrumentName);
-                                flattenSucceeded = true;
-                            }
-                            catch
-                            {
-                                // All flatten attempts failed
+                                try
+                                {
+                                    dynAccountFlatten.Flatten(instrumentName);
+                                    flattenSuccess[0] = true;
+                                }
+                                catch { }
                             }
                         }
                     }
                 }
+            }))
+            {
+                return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
             }
+            flattenSucceeded = flattenSuccess[0];
             
             if (!flattenSucceeded)
             {
@@ -4267,9 +4423,18 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
     
+    partial void OnCheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow)
+    {
+        var inj = _ntInstrument as Instrument;
+        var instrument = inj?.MasterInstrument?.Name ?? inj?.FullName ?? "";
+        if (!string.IsNullOrEmpty(instrument))
+            CheckAndCancelEntryStopsOnPositionFlat(instrument, utcNow);
+    }
+
     /// <summary>
     /// Check if position is flat and cancel all entry stop orders for the instrument.
     /// Called after execution updates to detect manual position closures.
+    /// When IEA enabled: enqueues NtCancelOrdersCommand instead of calling account.Cancel on worker.
     /// </summary>
     private void CheckAndCancelEntryStopsOnPositionFlat(string instrument, DateTimeOffset utcNow)
     {
@@ -4354,34 +4519,55 @@ public sealed partial class NinjaTraderSimAdapter
                     }
                 }
                 
-                // Cancel all unfilled entry stop orders
-                foreach (var entryIntentId in entryIntentIdsToCancel)
+                // Cancel all unfilled entry stop orders.
+                // NT THREADING FIX: When IEA enabled, worker must not call account.Cancel. Enqueue for strategy thread.
+                if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
                 {
-                    try
+                    foreach (var entryIntentId in entryIntentIdsToCancel)
                     {
-                        var cancelled = CancelIntentOrders(entryIntentId, utcNow);
-                        if (cancelled)
-                        {
-                            _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCELLED_ON_POSITION_FLAT",
-                                new
-                                {
-                                    cancelled_entry_intent_id = entryIntentId,
-                                    instrument = instrument,
-                                    position_market_position = "Flat",
-                                    note = "Cancelled entry stop order because position is flat (manual closure detected)"
-                                }));
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_FAILED_ON_POSITION_FLAT",
+                        var cid = $"CANCEL:{entryIntentId}:POSITION_FLAT_CLEANUP";
+                        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, entryIntentId, instrument, false, "POSITION_FLAT_CLEANUP", utcNow), out _);
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_ENQUEUED_ON_POSITION_FLAT",
                             new
                             {
-                                error = ex.Message,
-                                entry_intent_id = entryIntentId,
+                                cancelled_entry_intent_id = entryIntentId,
                                 instrument = instrument,
-                                note = "Failed to cancel entry stop order when position went flat - re-entry may occur"
+                                position_market_position = "Flat",
+                                correlation_id = cid,
+                                note = "Cancel enqueued for strategy thread (position flat cleanup)"
                             }));
+                    }
+                }
+                else
+                {
+                    foreach (var entryIntentId in entryIntentIdsToCancel)
+                    {
+                        try
+                        {
+                            var cancelled = CancelIntentOrders(entryIntentId, utcNow);
+                            if (cancelled)
+                            {
+                                _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCELLED_ON_POSITION_FLAT",
+                                    new
+                                    {
+                                        cancelled_entry_intent_id = entryIntentId,
+                                        instrument = instrument,
+                                        position_market_position = "Flat",
+                                        note = "Cancelled entry stop order because position is flat (manual closure detected)"
+                                    }));
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_FAILED_ON_POSITION_FLAT",
+                                new
+                                {
+                                    error = ex.Message,
+                                    entry_intent_id = entryIntentId,
+                                    instrument = instrument,
+                                    note = "Failed to cancel entry stop order when position went flat - re-entry may occur"
+                                }));
+                        }
                     }
                 }
             }
@@ -4441,9 +4627,9 @@ public sealed partial class NinjaTraderSimAdapter
             
             if (ordersToCancel.Count > 0)
             {
-                // Real NT API: Cancel orders
-                account.Cancel(ordersToCancel.ToArray());
-                
+                var ordersArr = ordersToCancel.ToArray();
+                if (!EnsureStrategyThreadOrEnqueue("CancelRobotOwnedWorkingOrdersReal", null, null, "CANCEL_ROBOT_ORDERS", () => account.Cancel(ordersArr)))
+                    return;
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ROBOT_ORDERS_CANCELLED", state: "ENGINE",
                     new
                     {
@@ -4620,7 +4806,9 @@ public sealed partial class NinjaTraderSimAdapter
             }
             if (ordersToCancel.Count > 0)
             {
-                account.Cancel(ordersToCancel.ToArray());
+                var ordersArr = ordersToCancel.ToArray();
+                if (!EnsureStrategyThreadOrEnqueue("CancelReplaceWithAggregated", intentId, null, $"CANCEL_AGG:{intentId}", () => account.Cancel(ordersArr)))
+                    throw new InvalidOperationException("CancelReplaceWithAggregated enqueued for strategy thread");
                 foreach (var (existingIntentId, _, _, _) in toAggregate)
                 {
                     if (OrderMap.TryGetValue(existingIntentId, out var oi))
@@ -4635,7 +4823,8 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 if (oppOrderInfo.State == "SUBMITTED" || oppOrderInfo.State == "ACCEPTED" || oppOrderInfo.State == "WORKING")
                 {
-                    account.Cancel(new[] { oppOrd });
+                    if (!EnsureStrategyThreadOrEnqueue("CancelReplaceWithAggregated_Opposite", oppositeIntentId, null, $"CANCEL_OPP:{oppOrd.OrderId}", () => account.Cancel(new[] { oppOrd })))
+                        throw new InvalidOperationException("Cancel opposite enqueued for strategy thread");
                     oppOrderInfo.State = "CANCELLED";
                     replacedOrderIds.Add(oppOrd.OrderId);
                 }
@@ -5097,22 +5286,18 @@ public sealed partial class NinjaTraderSimAdapter
                 return OrderSubmissionResult.FailureResult($"Stop price validation failed: {priceValidationReason}", utcNow);
             }
 
-            // ENTRY AGGREGATION: When IEA enabled, route through queue (Gap 1). IEA owns aggregation + single-order fallback.
-            // Both paths run on worker to preserve single mutation lane invariant.
-            // ENTRY_SUBMISSION_TIMEOUT_MS: 12s (was 5s) — NT CreateOrder/Submit can block 6+ seconds under load (2026-02-18 YM1 incident).
-            const int ENTRY_SUBMISSION_TIMEOUT_MS = 12000;
+            // NT THREADING FIX: NT CreateOrder/Submit must run on strategy thread (OnBarUpdate context).
+            // IEA worker caused IEA_ENQUEUE_AND_WAIT_TIMEOUT when NT APIs blocked the worker.
+            // Run entry submission on caller thread with lock for serialization across instances sharing this IEA.
             if (_useInstrumentExecutionAuthority && _iea != null)
             {
-                var (success, ieaResult) = _iea.EnqueueAndWait(() =>
+                lock (_iea.EntrySubmissionLock)
                 {
                     var aggResult = _iea.SubmitStopEntryOrder(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
                     if (aggResult != null)
                         return aggResult;
                     return SubmitSingleEntryOrderCore(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
-                }, ENTRY_SUBMISSION_TIMEOUT_MS);
-                if (!success)
-                    return OrderSubmissionResult.FailureResult("Entry submission failed (IEA queue overflow or timeout)", utcNow);
-                return ieaResult ?? OrderSubmissionResult.FailureResult("Entry submission returned null", utcNow);
+                }
             }
 
             if (!_useInstrumentExecutionAuthority)
