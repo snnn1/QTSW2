@@ -63,6 +63,9 @@ public interface IIEAOrderExecutor
     /// <summary>Phase 3: Get active intents eligible for BE monitoring (entry filled, BE not yet applied).</summary>
     IReadOnlyList<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring(string? executionInstrument);
 
+    /// <summary>Phase 3: Evaluate BE triggers and dispatch modify. Single evaluation function; branch only at mutation.</summary>
+    void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument);
+
     /// <summary>Phase 3: Modify stop order to break-even price.</summary>
     OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow);
 
@@ -83,4 +86,22 @@ public interface IIEAOrderExecutor
 
     /// <summary>Gap 2: Process order update (called by IEA worker when queue serialization enabled).</summary>
     void ProcessOrderUpdate(object order, object orderUpdate);
+
+    /// <summary>Enqueue NT action for strategy-thread execution. Callable from worker. Returns false if duplicate dropped.</summary>
+    bool EnqueueNtAction(INtAction action);
+
+    /// <summary>Get lock for strategy-thread operations. Strategy holds this when draining NT actions.</summary>
+    object? GetEntrySubmissionLock();
+
+    /// <summary>Drain NT action queue. MUST be called from strategy thread while holding EntrySubmissionLock.</summary>
+    void DrainNtActions();
+
+    /// <summary>Set ProtectionState to Working when adopting an existing stop from account.Orders on restart.</summary>
+    void SetProtectionStateWorkingForAdoptedStop(string intentId);
+
+    /// <summary>Mark strategy-thread context. Call at start of OnMarketData/OnBarUpdate before any adapter work.</summary>
+    void EnterStrategyThreadContext();
+
+    /// <summary>Clear strategy-thread context. Call in finally at end of OnMarketData/OnBarUpdate.</summary>
+    void ExitStrategyThreadContext();
 }

@@ -30,6 +30,8 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
     public (decimal?, decimal?) GetWorkingProtectivePrices(string intentId) => (null, null);
     public (decimal?, decimal?, int?, int?) GetWorkingProtectiveState(string intentId) => (null, null, null, null);
     public bool IsExecutionAllowed() => true;
+    public void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument) { }
+
     public OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow) => OrderModificationResult.SuccessResult(utcNow);
     public decimal GetTickSize() => 0.25m;
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow) => FlattenResult.SuccessResult(utcNow);
@@ -37,6 +39,12 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
     public void FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) { }
     public void ProcessExecutionUpdate(object execution, object order) { }
     public void ProcessOrderUpdate(object order, object orderUpdate) { }
+    public bool EnqueueNtAction(INtAction action) => false;
+    public object? GetEntrySubmissionLock() => _iea?.EntrySubmissionLock;
+    public void DrainNtActions() { }
+    public void EnterStrategyThreadContext() { }
+    public void ExitStrategyThreadContext() { }
+    public void SetProtectionStateWorkingForAdoptedStop(string intentId) { }
 
     public IReadOnlyList<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring(string? executionInstrument)
     {

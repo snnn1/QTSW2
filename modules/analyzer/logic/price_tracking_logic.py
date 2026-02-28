@@ -84,7 +84,8 @@ class PriceTracker:
                      entry_price: float, direction: str, target_level: float,
                      stop_loss: float, expiry_time: pd.Timestamp,
                      target_pts: float, instrument: str = "ES",
-                     time_label: str = None, date: pd.Timestamp = None, debug: bool = False) -> TradeExecution:
+                     time_label: str = None, date: pd.Timestamp = None, debug: bool = False,
+                     target_mode: str = "fixed", session: str = None) -> TradeExecution:
         """
         Execute trade with integrated MFE calculation and break even logic
         
@@ -101,6 +102,8 @@ class PriceTracker:
             time_label: Time slot for MFE calculation (e.g., "08:00")
             date: Trading date for MFE calculation
             debug: Debug flag
+            target_mode: "fixed" = exit on price target; "time" = exit at 02:00 (S1) / 08:00 (S2) only
+            session: Session (S1 or S2) - required for time mode MFE/expiry
             
         Returns:
             TradeExecution object with all details
@@ -182,10 +185,10 @@ class PriceTracker:
             current_stop_loss = stop_loss
             stop_loss_adjusted = False
             
-            # Determine MFE calculation end time (next day same slot)
+            # Determine MFE calculation end time (next day same slot, or 02:00/08:00 for time mode)
             mfe_end_time = None
-            if time_label and date is not None:
-                mfe_end_time = self._get_peak_end_time(date, time_label)
+            if date is not None and (time_label or (target_mode == "time" and session)):
+                mfe_end_time = self._get_peak_end_time(date, time_label, session, target_mode)
             
             # Get bars for MFE calculation (until next day same slot or original stop hit)
             if mfe_end_time:
@@ -364,8 +367,8 @@ class PriceTracker:
                         except Exception:
                             pass
                 
-                if target_hit_first:
-                    # Target hit first - exit with full profit
+                if target_hit_first and target_mode != "time":
+                    # Target hit first - exit with full profit (skip in time mode - no price target exit)
                     exit_reason = "Win"
                     result_classification = self._classify_result(
                         t1_triggered, exit_reason, True, entry_price, bar["timestamp"], df, direction, t1_removed
@@ -962,13 +965,16 @@ class PriceTracker:
         after_entry = df[df["timestamp"] >= entry_time]
         return len(after_entry) > 0
     
-    def _get_peak_end_time(self, date: pd.Timestamp, time_label: str) -> pd.Timestamp:
+    def _get_peak_end_time(self, date: pd.Timestamp, time_label: str = None,
+                           session: str = None, target_mode: str = "fixed") -> pd.Timestamp:
         """
-        Calculate peak end time (next day same slot)
+        Calculate peak end time (next day same slot, or 02:00/08:00 for time mode)
         
         Args:
             date: Trading date (timezone-aware, should be Chicago time)
-            time_label: Time slot in Chicago time (e.g., "07:30" = 7:30 AM Chicago)
+            time_label: Time slot in Chicago time (e.g., "07:30") - used when target_mode="fixed"
+            session: Session (S1 or S2) - used when target_mode="time"
+            target_mode: "fixed" = next day same slot; "time" = S1→02:00, S2→08:00 next day
             
         Returns:
             Peak end timestamp in Chicago time
@@ -981,12 +987,18 @@ class PriceTracker:
             # Regular day - peak continues to next day same slot
             peak_end_date = date + pd.Timedelta(days=1)
         
-        # Slot times are Chicago trading hours - create timestamp directly in Chicago time
-        hour_part = int(time_label.split(":")[0])
-        minute_part = int(time_label.split(":")[1])
+        if target_mode == "time" and session:
+            # Time mode: use slot_start for session (S1→02:00, S2→08:00)
+            time_str = self.config_manager.get_slot_start(session)
+            hour_part, minute_part = map(int, time_str.split(":"))
+        else:
+            # Fixed mode: next day same slot
+            time_str = time_label or "08:00"
+            hour_part, minute_part = map(int, time_str.split(":"))
+        
         peak_end_time = peak_end_date.replace(
-            hour=hour_part, 
-            minute=minute_part, 
+            hour=hour_part,
+            minute=minute_part,
             second=0
         )
         

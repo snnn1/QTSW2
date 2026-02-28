@@ -11,9 +11,15 @@ namespace QTSW2.Robot.Core.Execution;
 /// 
 /// Design Principle: Journals are authoritative, aggregation is convenience.
 /// All aggregation is derived from journal files - no separate ledger maintained.
+/// 
+/// Journal hygiene: Test streams (e.g. TEST_INJECT) are excluded from metrics
+/// to avoid contaminating performance, risk, and health gating.
 /// </summary>
 public sealed class StreamPnLAggregator
 {
+    /// <summary>Streams starting with this prefix are excluded from P&amp;L metrics (test inject, etc.).</summary>
+    private const string TestStreamPrefix = "TEST";
+
     private readonly string _journalDir;
     private readonly RobotLogger _log;
 
@@ -164,7 +170,7 @@ public sealed class StreamPnLAggregator
                         {
                             var json = File.ReadAllText(file);
                             var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                            if (entry != null && entry.TradeCompleted)
+                            if (entry != null && entry.TradeCompleted && !IsTestStream(entry.Stream))
                             {
                                 allEntries.Add(entry);
                             }
@@ -269,7 +275,7 @@ public sealed class StreamPnLAggregator
                 {
                     var json = File.ReadAllText(file);
                     var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                    if (entry != null)
+                    if (entry != null && !IsTestStream(entry.Stream))
                     {
                         entries.Add(entry);
                     }
@@ -286,6 +292,13 @@ public sealed class StreamPnLAggregator
         }
 
         return entries;
+    }
+
+    /// <summary>Exclude test streams (e.g. TEST_INJECT) from P&amp;L metrics.</summary>
+    private static bool IsTestStream(string? stream)
+    {
+        return !string.IsNullOrEmpty(stream) &&
+               stream.StartsWith(TestStreamPrefix, StringComparison.OrdinalIgnoreCase);
     }
 }
 

@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyDescriptionAttribute("net48 replay host. Runs IEA via ReplayDriver. Consumes validated JSON from net8.")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5b0425b67910bccb2fb71a7ec3676837be45f591")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+debade54e4fd1aab6663df16031181e0bff70ec9")]
 [assembly: System.Reflection.AssemblyProductAttribute("Robot.ReplayHost")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Robot.ReplayHost")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

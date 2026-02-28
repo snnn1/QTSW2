@@ -237,13 +237,18 @@ public sealed partial class NinjaTraderSimAdapter
         const int RETRY_DELAY_MS = 100;
         OrderSubmissionResult? stopResult = null;
         OrderSubmissionResult? targetResult = null;
-        if (!IntentMap.TryGetValue(cmd.IntentId ?? "", out var intent))
+        var intentId = cmd.IntentId ?? "";
+        if (!string.IsNullOrEmpty(intentId))
+            SetProtectionState(intentId, ProtectionState.Executing);
+        if (!IntentMap.TryGetValue(intentId, out var intent))
             throw new InvalidOperationException($"Intent not found: {cmd.IntentId}");
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
             if (attempt > 0) System.Threading.Thread.Sleep(RETRY_DELAY_MS);
             if (_coordinator != null && !_coordinator.CanSubmitExit(cmd.IntentId!, cmd.Quantity))
             {
+                if (!string.IsNullOrEmpty(intentId))
+                    PruneIntentState(intentId, "exit_validation_failed");
                 var err = "Exit validation failed during retry";
                 FailClosed(cmd.IntentId!, intent, err, "PROTECTIVE_ORDERS_FAILED_FLATTENED", $"PROTECTIVE_FAILURE:{cmd.IntentId}",
                     "CRITICAL: Protective Order Failure", $"Exit validation failed. Stream: {intent.Stream}, Intent: {cmd.IntentId}.",
@@ -258,8 +263,15 @@ public sealed partial class NinjaTraderSimAdapter
             _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "TARGET_SUBMIT_REQUESTED", new { correlation_id = cmd.CorrelationId, attempt = attempt + 1 }));
             targetResult = SubmitTargetOrderReal(cmd.IntentId!, cmd.Instrument, cmd.Direction, cmd.TargetPrice, cmd.Quantity, protectiveOcoGroup, cmd.UtcNow);
             _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "TARGET_SUBMIT_CONFIRMED", new { correlation_id = cmd.CorrelationId, success = targetResult.Success }));
-            if (targetResult.Success) return;
+            if (targetResult.Success)
+            {
+                if (!string.IsNullOrEmpty(intentId))
+                    SetProtectionState(intentId, ProtectionState.Submitted);
+                return;
+            }
         }
+        if (!string.IsNullOrEmpty(intentId))
+            PruneIntentState(intentId, "protective_orders_failed");
         var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: STOP: {stopResult?.ErrorMessage}, TARGET: {targetResult?.ErrorMessage}";
         FailClosed(cmd.IntentId!, intent, failureReason, "PROTECTIVE_ORDERS_FAILED_FLATTENED", $"PROTECTIVE_FAILURE:{cmd.IntentId}",
             "CRITICAL: Protective Order Failure", $"Entry filled but protective orders failed. Stream: {intent.Stream}, Intent: {cmd.IntentId}. {failureReason}",
@@ -695,9 +707,6 @@ public sealed partial class NinjaTraderSimAdapter
             }));
             
             // Real NT API: CreateOrder
-            // Use dynamic to handle different CreateOrder signatures
-            // CRITICAL: Catch RuntimeBinderException specifically for dynamic binding failures
-            dynamic dynAccount = account;
             Order order = null!; // Initialize to satisfy compiler, will be assigned before use
             
             // StopMarket orders: Use official NT8 CreateOrder factory method with full parameter list
@@ -839,100 +848,51 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else
             {
-                // Market/Limit orders: Try 5-argument version first
-                // Attempt 1: 5-argument version (instrument, action, type, quantity, price)
-                // For Market orders, pass 0 as price (NT will ignore it)
-                bool orderCreated = false;
-                string? lastError = null;
-                
-                if (!orderCreated)
+                // Market/Limit orders: Use same 12-parameter CreateOrder overload as StopMarket
+                // NT8 CreateOrder(instrument, action, orderType, orderEntry, timeInForce, quantity, limitPrice, stopPrice, oco, orderName, gtd, customOrder)
+                double limitPrice = orderType == OrderType.Market ? 0.0 : ntEntryPrice;
+                double stopPrice = 0.0;
+                try
                 {
-                    try
+                    order = account.CreateOrder(
+                        ntInstrument,                           // Instrument
+                        orderAction,                            // OrderAction
+                        orderType,                              // OrderType (Market or Limit)
+                        OrderEntry.Manual,                      // OrderEntry
+                        TimeInForce.Day,                        // TimeInForce
+                        quantity,                               // Quantity
+                        limitPrice,                             // LimitPrice (0 for Market)
+                        stopPrice,                              // StopPrice (0 for Market/Limit)
+                        null,                                   // Oco (entry orders don't have ocoGroup)
+                        RobotOrderIds.EncodeTag(intentId),       // OrderName
+                        DateTime.MinValue,                      // Gtd
+                        null                                    // CustomOrder
+                    );
+                    SetOrderTag(order, RobotOrderIds.EncodeTag(intentId));
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATED_MARKET_OR_LIMIT", new
                     {
-                        double priceForOrder = orderType == OrderType.Market ? 0 : ntEntryPrice;
-                        order = dynAccount.CreateOrder(ntInstrument, orderAction, orderType, quantity, priceForOrder);
-                        orderCreated = true;
-                    }
-                    catch (RuntimeBinderException ex)
-                    {
-                        lastError = ex.Message;
-                        // 5-argument version doesn't exist, try next
-                    }
-                    catch (Exception ex)
-                    {
-                        lastError = ex.Message;
-                        // Other exception, try next signature
-                    }
+                        order_name = RobotOrderIds.EncodeTag(intentId),
+                        order_type = orderType.ToString(),
+                        quantity = quantity,
+                        limit_price = limitPrice,
+                        order_action = orderAction.ToString(),
+                        instrument = instrument
+                    }));
                 }
-                
-                // Attempt 2: 3-argument version (instrument, action, quantity) - then set properties
-                if (!orderCreated)
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        order = dynAccount.CreateOrder(ntInstrument, orderAction, quantity);
-                        dynamic dynOrder = order;
-                        // Set order type and price via properties
-                        dynOrder.OrderType = orderType;
-                        if (orderType == OrderType.Limit)
-                        {
-                            dynOrder.LimitPrice = ntEntryPrice;
-                        }
-                        orderCreated = true;
-                    }
-                    catch (RuntimeBinderException ex)
-                    {
-                        lastError = ex.Message;
-                        // 3-argument version doesn't exist, try next
-                    }
-                    catch (Exception ex)
-                    {
-                        lastError = ex.Message;
-                        // Other exception, try next signature
-                    }
-                }
-                
-                // Attempt 3: Try with different parameter order
-                if (!orderCreated)
-                {
-                    try
-                    {
-                        // Some NT versions might use: CreateOrder(instrument, quantity, action, type, price)
-                        order = dynAccount.CreateOrder(ntInstrument, quantity, orderAction, orderType, ntEntryPrice);
-                        orderCreated = true;
-                    }
-                    catch (RuntimeBinderException ex)
-                    {
-                        lastError = ex.Message;
-                        // This signature doesn't exist either
-                    }
-                    catch (Exception ex)
-                    {
-                        lastError = ex.Message;
-                    }
-                }
-                
-                // If all attempts failed, throw descriptive error
-                if (!orderCreated)
-                {
-                    string errorMsg = $"Failed to create order: No compatible CreateOrder overload found. " +
-                                  $"Tried signatures: (instrument, action, type, qty, price), (instrument, action, qty), " +
-                                  $"(instrument, qty, action, type, price). OrderType={orderType}, Action={orderAction}, " +
-                                  $"Quantity={quantity}, Price={ntEntryPrice}. Last error: {lastError}";
-                    string[] attemptedSignatures = new[] { "(instrument, action, type, qty, price)", "(instrument, action, qty)", "(instrument, qty, action, type, price)" };
-                    
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_CREATE_FAIL", new
                     {
-                        error = errorMsg,
+                        error = $"Failed to create {orderType} order: {ex.Message}",
                         order_type = orderType.ToString(),
                         order_action = orderAction.ToString(),
                         quantity = quantity,
                         entry_price = ntEntryPrice,
-                        account = "SIM",
-                        last_error = lastError,
-                        attempted_signatures = attemptedSignatures
+                        instrument = instrument,
+                        intent_id = intentId,
+                        account = "SIM"
                     }));
-                    throw new InvalidOperationException(errorMsg);
+                    return OrderSubmissionResult.FailureResult($"Failed to create {orderType} order: {ex.Message}", utcNow);
                 }
             }
             
@@ -1255,6 +1215,21 @@ public sealed partial class NinjaTraderSimAdapter
         // BE confirmation: when STOP order update arrives, check pending BE requests
         if (parsed.Leg == "STOP")
         {
+            if (orderState == OrderState.Working || orderState == OrderState.Accepted)
+                SetProtectionState(intentId, ProtectionState.Working);
+            // BE cancel+replace: log when new stop becomes Working (quantify overlap/gap distribution)
+            if (orderState == OrderState.Working && _pendingBECancelReplaceByIntent.TryGetValue(intentId, out var beReplace) && string.Equals(beReplace.NewStopOrderId, order.OrderId, StringComparison.OrdinalIgnoreCase))
+            {
+                _pendingBECancelReplaceByIntent.TryRemove(intentId, out _);
+                var elapsedMs = (utcNow - beReplace.StartUtc).TotalMilliseconds;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "BE_CANCEL_REPLACE_STOP_WORKING", new
+                {
+                    stop_order_id = order.OrderId,
+                    start_utc = beReplace.StartUtc,
+                    elapsed_ms = Math.Round(elapsedMs, 1),
+                    note = "New BE stop Working; overlap/gap distribution metric"
+                }));
+            }
             TryConfirmPendingBE(order, intentId, parsed, orderState, utcNow);
             // ORDER_UPDATED for STOP orders
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "ORDER_UPDATED", new
@@ -1821,8 +1796,8 @@ public sealed partial class NinjaTraderSimAdapter
             Stream = stream,
             Direction = direction,
             ContractMultiplier = contractMultiplier.Value,
-            ExecutionInstrument = intent.Instrument ?? "",
-            CanonicalInstrument = intent.Instrument ?? "", // TODO: derive canonical if different from execution
+            ExecutionInstrument = intent.ExecutionInstrument ?? intent.Instrument ?? "",
+            CanonicalInstrument = intent.Instrument ?? "",
             Tag = encodedTag,
             IntentId = intentId
         };
@@ -1899,22 +1874,128 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    /// <summary>Build dedup key for non-IEA path. Same format as IEA: executionId or orderId|ticks|qty|mpos.</summary>
+    private static string BuildNonIeaDedupKey(dynamic execution, Order order)
+    {
+        try
+        {
+            var execId = execution.ExecutionId as string;
+            var orderId = (order.OrderId ?? "").ToString();
+            var time = execution.Time;
+            long ticks = 0;
+            if (time != null)
+            {
+                if (time is DateTime dt) ticks = dt.Ticks;
+                else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
+                else try { ticks = ((dynamic)time).Ticks; } catch { }
+            }
+            var qty = (int)(execution.Quantity ?? 0);
+            var mpos = (execution.MarketPosition?.ToString() ?? "");
+            return !string.IsNullOrEmpty(execId) ? execId : $"{orderId}|{ticks}|{qty}|{mpos}|{orderId}";
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>Defer unresolved execution for non-blocking retry. IEA: enqueue to worker. Non-IEA: add to pending list.</summary>
+    private void DeferUnresolvedExecution(UnresolvedExecutionRecord record)
+    {
+        if (_useInstrumentExecutionAuthority && _iea != null)
+            _iea.Enqueue(() => ProcessUnresolvedRetry(record));
+        else
+        {
+            lock (_pendingUnresolvedLock)
+                _pendingUnresolvedExecutions.Add(record);
+        }
+    }
+
+    /// <summary>Process unresolved retry: try lookup, if found continue; if elapsed >= 500ms flatten; else re-enqueue.</summary>
+    private void ProcessUnresolvedRetry(UnresolvedExecutionRecord record)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        var elapsed = record.ElapsedMs;
+        var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(record.Order);
+        var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder((record.Order as Order)?.Instrument);
+
+        if (OrderMap.TryGetValue(record.IntentId, out var orderInfo))
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_RESOLVED",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+            HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+            return;
+        }
+        if (elapsed < UNRESOLVED_GRACE_MS)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_RETRY",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+            DeferUnresolvedExecution(record);
+            return;
+        }
+        _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_EXPIRED",
+            new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+        TriggerUnknownOrderFlatten(record);
+    }
+
+    private void TriggerUnknownOrderFlatten(UnresolvedExecutionRecord record)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        var order = record.Order as Order;
+        var intentId = record.IntentId;
+        var instrument = record.Instrument;
+        LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
+            new { error = "Order not found in map after 500ms grace", broker_order_id = order?.OrderId, intent_id = intentId, fill_price = record.FillPrice, fill_quantity = record.FillQuantity, account_name = _iea?.AccountName });
+        if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+        {
+            var cid = $"UNKNOWN_ORDER:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "UNKNOWN_ORDER_FILL", utcNow), out _);
+            var ns = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            ns?.EnqueueNotification($"UNKNOWN_ORDER_FILL_ENQUEUED:{intentId}", $"Unknown Order Fill - Flatten Enqueued - {instrument}", $"Fill for order not in map. Intent: {intentId}", priority: 1);
+        }
+        else
+        {
+            try
+            {
+                var r = Flatten(intentId, instrument, utcNow);
+                var ns = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                ns?.EnqueueNotification($"UNKNOWN_ORDER_FILL:{intentId}", r.Success ? "Position Flattened" : "Flatten FAILED", r.Success ? "Flattened" : r.ErrorMessage ?? "", priority: r.Success ? 1 : 3);
+            }
+            catch (Exception ex)
+            {
+                var ns = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                ns?.EnqueueNotification($"UNKNOWN_ORDER_FILL_FAILED:{intentId}", $"CRITICAL: Flatten FAILED - {instrument}", ex.Message, priority: 3);
+            }
+        }
+    }
+
     /// <summary>
     /// STEP 3: Handle real NT ExecutionUpdate event.
     /// Called from public HandleExecutionUpdate() method.
     /// </summary>
-    private void HandleExecutionUpdateReal(object executionObj, object orderObj)
+    private void HandleExecutionUpdateReal(object executionObj, object orderObj, UnresolvedExecutionRecord? retryRecord = null, OrderInfo? retryOrderInfo = null)
     {
         // Use dynamic for Execution type to avoid namespace conflicts
-        dynamic execution = executionObj;
-        var order = orderObj as Order;
+        dynamic execution = retryRecord != null ? retryRecord.Execution : executionObj;
+        var order = (retryRecord != null ? retryRecord.Order : orderObj) as Order;
         if (execution == null || order == null) return;
 
-        // Gap 3: Deduplicate execution callbacks before any state mutation
-        if (_useInstrumentExecutionAuthority && _iea != null && _iea.TryMarkAndCheckDuplicate(executionObj, orderObj))
+        if (retryRecord != null && retryOrderInfo != null)
+        {
+            ProcessExecutionUpdateContinuation(retryRecord, retryOrderInfo);
+            return;
+        }
+
+        // Gap 3 / Step 5: Deduplicate execution callbacks before any state mutation (multi-forwarding from router)
+        bool isDuplicate = false;
+        if (_useInstrumentExecutionAuthority && _iea != null)
+            isDuplicate = _iea.TryMarkAndCheckDuplicate(executionObj, orderObj);
+        else
+        {
+            var dedupKey = BuildNonIeaDedupKey(execution, order);
+            isDuplicate = TryMarkAndCheckDuplicateNonIea(dedupKey);
+        }
+        if (isDuplicate)
         {
             _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_SKIPPED",
-                new { broker_order_id = order.OrderId, note = "Duplicate execution callback skipped (Gap 3 dedup)" }));
+                new { broker_order_id = order.OrderId, note = "Duplicate execution callback skipped (dedup)" }));
             return;
         }
 
@@ -2127,105 +2208,39 @@ public sealed partial class NinjaTraderSimAdapter
                     return;
             }
 
-            // RACE CONDITION FIX: Retry lookup when order not in map (single-instance MNQ incident).
-            // Fill can arrive before order is visible in OrderMap (same-tick sim fill, threading).
-            // Previously only retried when orderState==Initialized; now retry for ALL states.
-            const int MAX_RETRIES = 5; // Increased from 3 for same-tick fill race
-            const int RETRY_DELAY_MS = 50; // Shorter delay, more retries
-            bool found = false;
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_ORDER_MAP_RETRY",
-                new
-                {
-                    broker_order_id = order.OrderId,
-                    tag = encodedTag,
-                    intent_id = intentId,
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    order_state = orderState.ToString(),
-                    order_map_count = OrderMap.Count,
-                    order_map_intent_ids = OrderMap.Keys.Take(10).ToList(),
-                    max_retries = MAX_RETRIES,
-                    note = "Order not in map - retrying lookup (race condition fix for single-instance fill)"
-                }));
-            for (int retry = 0; retry < MAX_RETRIES; retry++)
-            {
-                if (retry > 0)
-                    System.Threading.Thread.Sleep(RETRY_DELAY_MS);
-
-                if (OrderMap.TryGetValue(intentId, out orderInfo))
-                {
-                    found = true;
-                    if (retry > 0)
-                    {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_RACE_CONDITION_RESOLVED",
-                            new
-                            {
-                                broker_order_id = order.OrderId,
-                                tag = encodedTag,
-                                intent_id = intentId,
-                                fill_price = fillPrice,
-                                fill_quantity = fillQuantity,
-                                retry_count = retry + 1,
-                                order_state = orderState.ToString(),
-                                note = "Fill arrived before order was visible in map - retry succeeded (race condition resolved)"
-                            }));
-                    }
-                    break;
-                }
-            }
-
-            if (!found)
-                {
-                    // Still not found after retries - flatten (fail-closed)
-                    LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
-                        new 
-                        { 
-                            error = "Execution update (fill) received for untracked order - order not found in map after retries",
-                            broker_order_id = order.OrderId, 
-                            tag = encodedTag,
-                            intent_id = intentId,
-                            fill_price = fillPrice,
-                            fill_quantity = fillQuantity,
-                            instrument = instrument,
-                            order_state = orderState.ToString(),
-                            retry_count = MAX_RETRIES,
-                            action = "FLATTEN_IMMEDIATELY",
-                            note = "CRITICAL: Fill happened but order not in tracking map after retries. Flattening position immediately (fail-closed) to prevent unprotected accumulation.",
-                            account_name = _iea?.AccountName
-                        });
-                    
-                    if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
-                    {
-                        var cid = $"UNKNOWN_ORDER:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-                        _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "UNKNOWN_ORDER_FILL", utcNow), out _);
-                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_ENQUEUED",
-                            new { broker_order_id = order.OrderId, intent_id = intentId, fill_price = fillPrice, fill_quantity = fillQuantity, correlation_id = cid });
-                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                        if (notificationService != null)
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_ENQUEUED:{intentId}", $"Unknown Order Fill - Flatten Enqueued - {instrument}", $"Fill for order not in map. Flatten enqueued. Intent: {intentId}", priority: 1);
-                    }
-                    else
-                    {
-                    try
-                    {
-                        var flattenResult = Flatten(intentId, instrument, utcNow);
-                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
-                            new { broker_order_id = order.OrderId, intent_id = intentId, flatten_success = flattenResult.Success, flatten_error = flattenResult.ErrorMessage });
-                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                        if (notificationService != null)
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL:{intentId}", flattenResult.Success ? "Position Flattened" : "Flatten FAILED", flattenResult.Success ? "Position flattened" : $"Error: {flattenResult.ErrorMessage}", priority: flattenResult.Success ? 1 : 3);
-                    }
-                    catch (Exception ex)
-                    {
-                        LogCriticalWithIeaContext(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED", new { error = ex.Message, broker_order_id = order.OrderId, intent_id = intentId });
-                        var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-                        if (notificationService != null)
-                            notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FAILED:{intentId}", $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}", $"Error: {ex.Message}", priority: 3);
-                    }
-                    }
-                    return; // Fail-closed: don't process untracked fill
-                }
+            // Phase 1: Non-blocking deferred retry (no Thread.Sleep). Enqueue for retry; expire after 500ms.
+            string? execId = null;
+            try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
+            var record = new UnresolvedExecutionRecord(execution, order, intentId, instrument, encodedTag,
+                fillPrice, fillQuantity, orderState.ToString(), isProtectiveOrder, orderTypeFromTag, utcNow, execId);
+            var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(order);
+            var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_GRACE_STARTED",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = intentId, execution_id = execId, elapsed_ms = 0 }));
+            DeferUnresolvedExecution(record);
+            return;
         }
+
+        // Build record for continuation (normal path)
+        string? execIdNorm = null;
+        try { dynamic d = execution; execIdNorm = d.ExecutionId as string; } catch { }
+        var instrumentNorm = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+        var recordNorm = new UnresolvedExecutionRecord(execution, order, intentId, instrumentNorm, encodedTag,
+            fillPrice, fillQuantity, order.OrderState.ToString(), isProtectiveOrder, orderTypeFromTag, utcNow, execIdNorm);
+        ProcessExecutionUpdateContinuation(recordNorm, orderInfo);
+    }
+
+    private void ProcessExecutionUpdateContinuation(UnresolvedExecutionRecord record, OrderInfo orderInfo)
+    {
+        var intentId = record.IntentId;
+        var encodedTag = record.EncodedTag;
+        var fillPrice = record.FillPrice;
+        var fillQuantity = record.FillQuantity;
+        var isProtectiveOrder = record.IsProtectiveOrder;
+        var orderTypeFromTag = record.OrderTypeFromTag;
+        var order = record.Order as Order;
+        var execution = record.Execution;
+        var utcNow = DateTimeOffset.UtcNow;
 
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
@@ -2320,7 +2335,8 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.ContractMultiplier,
                     allocContext.Direction,
                     allocContext.ExecutionInstrument,
-                    allocContext.CanonicalInstrument);
+                    allocContext.CanonicalInstrument,
+                    brokerOrderInstrumentKey: orderInfo.Instrument);
                 _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, allocContext.ExecutionInstrument, allocContext.Direction ?? "", utcNow);
             }
 
@@ -2461,6 +2477,7 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            PruneIntentState(intentId, "exit_fill");
             // Intent exit: purge pending BE (target/stop fill)
             PurgePendingBEForIntent(intentId, utcNow, orderInfo.Instrument, "exit_fill");
             // Exit fill
@@ -3458,11 +3475,48 @@ public sealed partial class NinjaTraderSimAdapter
 
     // Phase 3: BE evaluation state (non-IEA path)
     private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new(StringComparer.OrdinalIgnoreCase);
-    private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
-    private const int BE_MODIFY_MAX_RETRIES = 25;
     private readonly Dictionary<string, DateTimeOffset> _lastBePreChangeSnapshotUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
     private const double BE_PRE_CHANGE_SNAPSHOT_RATE_LIMIT_SEC = 5;
+
+    /// <summary>Part 3 (optional): Check Enqueued backlog. Only in tick/bar path. No timers.</summary>
+    private void CheckEnqueuedBacklog(DateTimeOffset utcNow)
+    {
+        foreach (var kvp in _firstEnqueuedUtcByIntent.ToArray())
+        {
+            var intentId = kvp.Key;
+            var firstUtc = kvp.Value;
+            if (GetProtectionState(intentId) != ProtectionState.Enqueued) continue;
+            var elapsedSec = (utcNow - firstUtc).TotalSeconds;
+            if (elapsedSec >= PROTECTION_ENQUEUED_WARN_SEC && elapsedSec < PROTECTION_ENQUEUED_TIMEOUT_SEC)
+            {
+                if (!_lastEnqueuedWarnUtcByIntent.TryGetValue(intentId, out var lastWarn) || (utcNow - lastWarn).TotalSeconds >= 30)
+                {
+                    _lastEnqueuedWarnUtcByIntent[intentId] = utcNow;
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTION_ENQUEUED_BACKLOG_WARN", new
+                    {
+                        intent_id = intentId,
+                        elapsed_sec = Math.Round(elapsedSec, 1),
+                        warn_sec = PROTECTION_ENQUEUED_WARN_SEC,
+                        note = "Protectives enqueued for extended time - queue may be backed up"
+                    }));
+                }
+            }
+            if (ENABLE_PROTECTION_ENQUEUED_TIMEOUT && elapsedSec >= PROTECTION_ENQUEUED_TIMEOUT_SEC)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTION_ENQUEUED_BACKLOG_TIMEOUT", new
+                {
+                    intent_id = intentId,
+                    elapsed_sec = Math.Round(elapsedSec, 1),
+                    timeout_sec = PROTECTION_ENQUEUED_TIMEOUT_SEC,
+                    note = "CRITICAL: Enqueued timeout - fail-closed flatten"
+                }));
+                _firstEnqueuedUtcByIntent.TryRemove(intentId, out _);
+                if (IntentMap.TryGetValue(intentId, out var intent))
+                    FailClosed(intentId, intent, $"Protection enqueued timeout ({elapsedSec:F0}s)", "PROTECTION_ENQUEUED_TIMEOUT", $"PROTECTION_TIMEOUT:{intentId}", "CRITICAL: Protection Enqueued Timeout", $"Protectives stuck in queue {elapsedSec:F0}s. Stream: {intent.Stream}.", null, null, new { elapsed_sec = elapsedSec }, utcNow);
+            }
+        }
+    }
 
     /// <summary>Single BE evaluation function. Gating: IsBEModified and pending modify in GetActiveIntentsForBEMonitoring. Branch only at ModifyStopToBreakEven.</summary>
     void IIEAOrderExecutor.EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
@@ -3473,6 +3527,7 @@ public sealed partial class NinjaTraderSimAdapter
     private void EvaluateBreakEvenCoreImpl(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
     {
         var utcNow = DateTimeOffset.UtcNow;
+        CheckEnqueuedBacklog(utcNow);
         var activeIntents = GetActiveIntentsForBEMonitoring(executionInstrument);
         if (activeIntents.Count == 0) return;
 
@@ -3490,7 +3545,8 @@ public sealed partial class NinjaTraderSimAdapter
             bool beTriggerReached = direction == "Long" ? tickPrice >= beTriggerPrice : direction == "Short" ? tickPrice <= beTriggerPrice : false;
             if (!beTriggerReached) continue;
 
-            var breakoutLevel = entryPrice;
+            // Use actual fill price when available (market orders, test inject) - more accurate than bar Close
+            var breakoutLevel = actualFillPrice ?? entryPrice;
             var beStopPrice = direction == "Long" ? breakoutLevel - tickSize : breakoutLevel + tickSize;
 
             if ((utcNow - (_lastBeModifyAttemptUtcByIntent.TryGetValue(intentId, out var lastAttempt) ? lastAttempt : DateTimeOffset.MinValue)).TotalMilliseconds < BE_MODIFY_ATTEMPT_INTERVAL_MS)
@@ -3502,7 +3558,7 @@ public sealed partial class NinjaTraderSimAdapter
             if (modifyResult.Success)
             {
                 _lastBeModifyAttemptUtcByIntent.Remove(intentId);
-                _beModifyFailureCountByIntent.Remove(intentId);
+                _firstMissingStopUtcByIntent.TryRemove(intentId, out _);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_TRIGGERED", new
                 {
                     direction,
@@ -3521,37 +3577,53 @@ public sealed partial class NinjaTraderSimAdapter
                                       errorMsg.IndexOf("Stop order", StringComparison.OrdinalIgnoreCase) >= 0;
                 var stopMissing = isRetryableError;
 
-                var failCount = _beModifyFailureCountByIntent.TryGetValue(intentId, out var c) ? c + 1 : 1;
-                _beModifyFailureCountByIntent[intentId] = failCount;
-
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_MODIFY_RETRY", new
+                if (stopMissing)
                 {
-                    fail_count = failCount,
-                    max_retries = BE_MODIFY_MAX_RETRIES,
-                    error = errorMsg,
-                    direction,
-                    be_trigger_price = beTriggerPrice,
-                    tick_price = tickPrice,
-                    note = failCount >= BE_MODIFY_MAX_RETRIES ? "Max retries exceeded" : "Modify failed, will retry"
-                }));
-
-                if (failCount >= BE_MODIFY_MAX_RETRIES)
-                {
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_MODIFY_FAILED", new
+                    var protectionState = GetProtectionState(intentId);
+                    // Only skip flatten when protectives are known to be in-flight (Enqueued, Executing, Submitted)
+                    if (protectionState == ProtectionState.Enqueued || protectionState == ProtectionState.Executing || protectionState == ProtectionState.Submitted)
                     {
-                        fail_count = failCount,
-                        error = errorMsg,
-                        direction,
-                        be_trigger_price = beTriggerPrice,
-                        action = stopMissing ? "FLATTEN" : "STAND_DOWN"
-                    }));
-                    _beModifyFailureCountByIntent.Remove(intentId);
-                    _lastBeModifyAttemptUtcByIntent.Remove(intentId);
-
-                    if (stopMissing)
+                        var accountName = _iea?.AccountName ?? "";
+                        var execInstKey = _iea?.ExecutionInstrumentKey ?? intent.ExecutionInstrument ?? "";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_STOP_NOT_VISIBLE_PROTECTION_PENDING", new
+                        {
+                            intent_id = intentId,
+                            execution_instrument_key = execInstKey,
+                            account_name = accountName,
+                            protection_state = protectionState.ToString(),
+                            error = errorMsg,
+                            note = "Stop not visible; protection pending - skip flatten, wait for next tick"
+                        }));
+                        continue;
+                    }
+                    // None or Working: use 5s wall-clock. None = non-IEA path (no ProtectionState) or unknown.
+                    if (!_firstMissingStopUtcByIntent.TryGetValue(intentId, out var firstMissing))
+                    {
+                        _firstMissingStopUtcByIntent.AddOrUpdate(intentId, utcNow, (_, _) => utcNow);
+                        firstMissing = utcNow;
+                    }
+                    var elapsedMs = (utcNow - firstMissing).TotalMilliseconds;
+                    if (elapsedMs >= BE_STOP_VISIBILITY_TIMEOUT_SEC * 1000)
+                    {
+                        var accountName = _iea?.AccountName ?? "";
+                        var execInstKey = _iea?.ExecutionInstrumentKey ?? intent.ExecutionInstrument ?? "";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_STOP_VISIBILITY_TIMEOUT", new
+                        {
+                            intent_id = intentId,
+                            execution_instrument_key = execInstKey,
+                            account_name = accountName,
+                            elapsed_ms = (long)elapsedMs,
+                            timeout_sec = BE_STOP_VISIBILITY_TIMEOUT_SEC,
+                            note = "Stop still not visible after 5s wall-clock - flatten (real inconsistency)"
+                        }));
+                        _firstMissingStopUtcByIntent.TryRemove(intentId, out _);
+                        _lastBeModifyAttemptUtcByIntent.Remove(intentId);
                         Flatten(intentId, intent.Instrument ?? "", utcNow);
-                    else
-                        _standDownStreamCallback?.Invoke(intent.Stream ?? "", utcNow, $"BE_MODIFY_MAX_RETRIES:{intentId}");
+                    }
+                }
+                else
+                {
+                    _standDownStreamCallback?.Invoke(intent.Stream ?? "", utcNow, $"BE_MODIFY_MAX_RETRIES:{intentId}");
                 }
             }
         }
@@ -3669,10 +3741,22 @@ public sealed partial class NinjaTraderSimAdapter
         if (_pendingBERequests.TryGetValue(stopOrderId, out var pending))
         {
             if (orderExecutionKey != pending.ExecutionInstrumentKey) return;
-            if (orderStopQuantized != pending.RequestedStopPriceQuantized) return;
-
+            if (orderStopQuantized == pending.RequestedStopPriceQuantized)
+            {
+                _pendingBERequests.TryRemove(stopOrderId, out _);
+                ConfirmAndRecordBE(pending, orderStopQuantized, utcNow);
+                return;
+            }
+            // Broker reverted our BE change - order came back with different (old) price
             _pendingBERequests.TryRemove(stopOrderId, out _);
-            ConfirmAndRecordBE(pending, orderStopQuantized, utcNow);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_REVERTED", new
+            {
+                stop_order_id = stopOrderId,
+                intent_id = intentId,
+                requested_stop_price = pending.RequestedStopPriceQuantized,
+                actual_stop_price = orderStopQuantized,
+                note = "Broker reverted BE change - order returned with different price. May retry on next tick."
+            }));
             return;
         }
 
@@ -3795,72 +3879,86 @@ public sealed partial class NinjaTraderSimAdapter
             var rawTag = GetOrderTag(stopOrder) ?? RobotOrderIds.EncodeStopTag(intentId);
             var ocoId = stopOrder.Oco as string;
 
-            // 1. Register pending BEFORE Change() — race hardening: OrderUpdate may arrive immediately
-            var pending = new PendingBERequest
-            {
-                IntentId = intentId,
-                OcoId = ocoId,
-                RequestedStopPriceRaw = beStopPrice,
-                RequestedStopPriceQuantized = beStopQuantized,
-                RequestedUtc = utcNow,
-                TradingDate = tradingDate8 ?? "",
-                Stream = stream8 ?? "",
-                Instrument = instrument,
-                ExecutionInstrumentKey = executionInstrumentKey,
-                RetryCount = retryCount,
-                RawTag = rawTag
-            };
-            var stopOrderId = stopOrder.OrderId ?? "";
-            _pendingBERequests[stopOrderId] = pending;
+            // NT OCO FIX: account.Change() on OCO stop orders is rejected/reverted by broker.
+            // Use cancel+replace: cancel both OCO legs, submit new stop at BE + new target.
+            var quantity = stopOrder.Quantity;
+            var targetPrice = intentTargetPrice3 ?? 0m;
+            var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+            var targetOrder = account.Orders.FirstOrDefault(o =>
+                GetOrderTag(o) == targetTag &&
+                (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
+            if (targetOrder != null && intentTargetPrice3 == null)
+                targetPrice = (decimal)targetOrder.LimitPrice;
 
-            // BE_PRE_CHANGE_SNAPSHOT: log state before Change() (diagnostic for ping-pong, rate-limited)
-            if (!_lastBePreChangeSnapshotUtcByIntent.TryGetValue(intentId, out var lastSnapshot) || (utcNow - lastSnapshot).TotalSeconds >= BE_PRE_CHANGE_SNAPSHOT_RATE_LIMIT_SEC)
+            if (targetPrice <= 0)
             {
-                _lastBePreChangeSnapshotUtcByIntent[intentId] = utcNow;
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_PRE_CHANGE_SNAPSHOT", new
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_REPLACE_SKIP", new
                 {
-                    stop_order_id = stopOrderId,
-                    current_stop_price = (decimal)stopOrder.StopPrice,
-                    requested_stop_price = beStopQuantized,
-                    order_state = stopOrder.OrderState.ToString(),
-                    oco_id = ocoId,
-                    note = "State immediately before account.Change()"
-                }));
-            }
-
-            // 2. Real NT API: Modify stop price. Change() returns void — do NOT assign.
-            stopOrder.StopPrice = (double)beStopQuantized;
-            try
-            {
-                if (!EnsureStrategyThreadOrEnqueue("ModifyStopToBreakEven", intentId, instrument, $"BE_CHANGE:{stopOrderId}", () => account.Change(new[] { stopOrder })))
-                    return OrderModificationResult.FailureResult("Enqueued for strategy thread", utcNow);
-            }
-            catch (Exception ex)
-            {
-                _pendingBERequests.TryRemove(stopOrderId, out _);
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_REJECTED", new
-                {
-                    stop_order_id = stopOrderId,
+                    error = "Target price not found for BE replace",
                     intent_id = intentId,
-                    oco_id = ocoId,
-                    error = ex.Message,
-                    exception_type = ex.GetType().Name,
-                    note = "Change() threw; BE modification rejected"
+                    note = "Cannot cancel+replace without target price"
                 }));
-                return OrderModificationResult.FailureResult($"BE modification failed: {ex.Message}", utcNow);
+                return OrderModificationResult.FailureResult("Target price not found for BE replace", utcNow);
             }
 
-            // 3. Emit STOP_MODIFY_REQUESTED. Journal gating: RecordBEModification only on STOP_MODIFY_CONFIRMED.
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_MODIFY_REQUESTED", new
+            var direction = intentDirection ?? "Long";
+            var newOcoGroup = $"QTSW2:OCO_BE:{intentId}:{Guid.NewGuid():N}"; // Always unique, never reused
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_CANCEL_REPLACE_START", new
             {
-                stop_order_id = stopOrderId,
-                oco_id = ocoId,
-                intent_id = intentId,
-                requested_stop_price_raw = beStopPrice,
-                requested_stop_price_quantized = beStopQuantized,
-                raw_tag = rawTag,
-                instrument,
-                requested_utc = utcNow.ToString("o")
+                stop_order_id = stopOrder.OrderId,
+                current_stop_price = (decimal)stopOrder.StopPrice,
+                requested_be_stop = beStopQuantized,
+                target_price = targetPrice,
+                quantity,
+                old_oco_id = ocoId,
+                new_oco_id = newOcoGroup,
+                note = "OCO Change() reverts - using cancel+replace for BE"
+            }));
+
+            // 1. Cancel both OCO orders
+            CancelProtectiveOrdersForIntent(intentId, utcNow);
+
+            // 2. Submit new stop at BE price
+            var stopResult = SubmitProtectiveStop(intentId, instrument, direction, beStopQuantized, quantity, newOcoGroup, utcNow);
+            if (!stopResult.Success)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_REPLACE_STOP_FAIL", new
+                {
+                    error = stopResult.ErrorMessage,
+                    note = "BE replace: stop submit failed after cancel"
+                }));
+                return OrderModificationResult.FailureResult(stopResult.ErrorMessage ?? "BE stop submit failed", utcNow);
+            }
+
+            // Overlap adoption: both old and new stop use same intent tag (QTSW2:{intentId}:STOP).
+            // OrderMap[intentId] is overwritten by SubmitProtectiveStop with newest; we adopt newest deterministically.
+            var newStopOrderId = stopResult.BrokerOrderId ?? "";
+            if (!string.IsNullOrEmpty(newStopOrderId))
+                _pendingBECancelReplaceByIntent[intentId] = (newStopOrderId, utcNow);
+
+            // 3. Submit new target (same price as before)
+            var targetResult = SubmitTargetOrder(intentId, instrument, direction, targetPrice, quantity, newOcoGroup, utcNow);
+            if (!targetResult.Success)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_REPLACE_TARGET_FAIL", new
+                {
+                    error = targetResult.ErrorMessage,
+                    note = "BE replace: target submit failed - position has BE stop but no target"
+                }));
+                // Stop is working; target failed. Log but consider BE done (stop is at BE).
+                return OrderModificationResult.SuccessResult(utcNow);
+            }
+
+            // 4. Record BE modification (we replaced, so new stop is at BE)
+            _executionJournal.RecordBEModification(intentId, tradingDate8 ?? "", stream8 ?? "", beStopQuantized, utcNow,
+                previousStopPrice: currentStop, beTriggerPrice: IntentMap.TryGetValue(intentId, out var beIntent) ? beIntent.BeTrigger : null, entryPrice: intentEntryPrice2);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_CANCEL_REPLACE_DONE", new
+            {
+                be_stop_price = beStopQuantized,
+                target_price = targetPrice,
+                new_stop_order_id = newStopOrderId,
+                note = "BE cancel+replace complete; STOP_WORKING will log when broker confirms"
             }));
 
             return OrderModificationResult.SuccessResult(utcNow);
@@ -4188,6 +4286,8 @@ public sealed partial class NinjaTraderSimAdapter
     private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
     {
         PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
+        if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
+            PruneIntentState(intentId, "flatten");
         if (_ntAccount == null || _ntInstrument == null)
         {
             var error = "NT context not set";
@@ -4484,6 +4584,26 @@ public sealed partial class NinjaTraderSimAdapter
             // If position is flat, cancel all entry stop orders for this instrument
             if (position != null && position.MarketPosition == MarketPosition.Flat)
             {
+                // Reset ProtectionState for intents that had position (entry filled) - position now flat
+                foreach (var kvp in IntentMap)
+                {
+                    var i = kvp.Value;
+                    var intentInstrument = i.Instrument ?? "";
+                    var intentExecInst = i.ExecutionInstrument ?? intentInstrument;
+                    if (string.IsNullOrEmpty(instrument) ||
+                        (string.Compare(intentInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0 &&
+                         string.Compare(intentExecInst, instrument, StringComparison.OrdinalIgnoreCase) != 0))
+                        continue;
+                    if (i.TriggerReason == null ||
+                        (!i.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") && !i.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                        continue;
+                    if (_executionJournal != null && !string.IsNullOrEmpty(i.TradingDate) && !string.IsNullOrEmpty(i.Stream))
+                    {
+                        var je = _executionJournal.GetEntry(kvp.Key, i.TradingDate, i.Stream);
+                        if (je != null && (je.EntryFilled || je.EntryFilledQuantityTotal > 0))
+                            PruneIntentState(kvp.Key, "position_flat");
+                    }
+                }
                 // Find all entry intents for this instrument that haven't filled yet
                 var entryIntentIdsToCancel = new List<string>();
                 
@@ -5225,29 +5345,51 @@ public sealed partial class NinjaTraderSimAdapter
                     // Calculate distance from stop price to current market price
                     stopDistance = Math.Abs(stopPrice - currentMarketPrice.Value);
                     
-                    // Configurable threshold: Maximum allowed stop distance in points
-                    // M2K: ~100 points (10.0) is reasonable limit
-                    // ES: ~200 points (50.0) is reasonable limit
-                    // Use instrument-specific thresholds based on typical range sizes
-                    decimal maxStopDistancePoints = 100.0m; // Default: 100 points
+                    // QUICK BREAKOUT: If price has already passed through the stop, allow the order.
+                    // Long stop: triggers when price >= stopPrice. If current ask >= stopPrice, we're in the money.
+                    // Short stop: triggers when price <= stopPrice. If current bid <= stopPrice, we're in the money.
+                    // In these cases, the stop will fill immediately — exactly what we want for a fast breakout.
+                    bool stopInTheMoney = (direction == "Long" && currentMarketPrice.Value >= stopPrice) ||
+                                         (direction == "Short" && currentMarketPrice.Value <= stopPrice);
                     
-                    // Adjust threshold based on instrument (micro futures have smaller ranges)
-                    var instrumentName = ntInstrument.MasterInstrument?.Name ?? "";
-                    if (instrumentName.StartsWith("M", StringComparison.OrdinalIgnoreCase))
+                    if (stopInTheMoney)
                     {
-                        // Micro futures: tighter limit (e.g., M2K, MGC, MES)
-                        maxStopDistancePoints = 50.0m; // 50 points for micros
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_PRICE_VALIDATION_SKIPPED_ITM", new
+                        {
+                            stop_price = stopPrice,
+                            market_price = currentMarketPrice.Value,
+                            market_price_source = direction == "Long" ? "Ask" : "Bid",
+                            direction,
+                            stop_distance_points = stopDistance,
+                            note = "Stop in the money (quick breakout) — skipping distance validation, allowing order"
+                        }));
                     }
-                    else if (instrumentName == "ES" || instrumentName == "NQ")
+                    else
                     {
-                        // Mini futures: larger limit
-                        maxStopDistancePoints = 200.0m; // 200 points for minis
-                    }
-                    
-                    if (stopDistance > maxStopDistancePoints)
-                    {
-                        priceValidationFailed = true;
-                        priceValidationReason = $"Stop price {stopPrice} is {stopDistance:F2} points from current market {currentMarketPrice.Value:F2}, exceeding limit of {maxStopDistancePoints} points. This indicates a stale breakout level or market gap.";
+                        // Configurable threshold: Maximum allowed stop distance in points
+                        // M2K: ~100 points (10.0) is reasonable limit
+                        // ES: ~200 points (50.0) is reasonable limit
+                        // Use instrument-specific thresholds based on typical range sizes
+                        decimal maxStopDistancePoints = 100.0m; // Default: 100 points
+                        
+                        // Adjust threshold based on instrument (micro futures have smaller ranges)
+                        var instrumentName = ntInstrument.MasterInstrument?.Name ?? "";
+                        if (instrumentName.StartsWith("M", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Micro futures: tighter limit (e.g., M2K, MGC, MES, MYM)
+                            maxStopDistancePoints = 50.0m; // 50 points for micros
+                        }
+                        else if (instrumentName == "ES" || instrumentName == "NQ")
+                        {
+                            // Mini futures: larger limit
+                            maxStopDistancePoints = 200.0m; // 200 points for minis
+                        }
+                        
+                        if (stopDistance > maxStopDistancePoints)
+                        {
+                            priceValidationFailed = true;
+                            priceValidationReason = $"Stop price {stopPrice} is {stopDistance:F2} points from current market {currentMarketPrice.Value:F2}, exceeding limit of {maxStopDistancePoints} points. This indicates a stale breakout level or market gap.";
+                        }
                     }
                 }
             }

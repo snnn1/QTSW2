@@ -349,7 +349,8 @@ class MasterMatrix:
                            output_dir: str = "data/master_matrix",
                            stream_filters: Optional[Dict[str, Dict]] = None,
                            analyzer_runs_dir: Optional[str] = None,
-                           streams: Optional[List[str]] = None) -> pd.DataFrame:
+                           streams: Optional[List[str]] = None,
+                           timetable_output_dir: Optional[str] = None) -> pd.DataFrame:
         """
         Build the master matrix by loading, normalizing, and merging all streams.
         Works like sequencer: reads from analyzer_runs and applies time change logic
@@ -617,7 +618,10 @@ class MasterMatrix:
         
         # Save master matrix using file_manager
         # Execution timetable is automatically persisted by file_manager after save
-        file_manager.save_master_matrix(df, output_dir, specific_date, stream_filters=self.stream_filters)
+        file_manager.save_master_matrix(
+            df, output_dir, specific_date, stream_filters=self.stream_filters,
+            timetable_output_dir=timetable_output_dir
+        )
         
         # Create checkpoint after successful build (for window updates)
         if not df.empty and 'trade_date' in df.columns:

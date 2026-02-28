@@ -364,6 +364,9 @@ public sealed class ExecutionJournal
     /// Record entry fill (delta-based, idempotent, cumulative).
     /// Accepts delta fillQuantity only, NOT cumulative filledTotal.
     /// </summary>
+    /// <param name="brokerOrderInstrumentKey">Optional. Instrument from the broker order (e.g. "M2K 03-26").
+    /// When provided, invariant check: journal instrument must equal execution instrument (root).
+    /// Mismatch → CRITICAL JOURNAL_INSTRUMENT_KEY_MISMATCH and fail-closed.</param>
     public void RecordEntryFill(
         string intentId,
         string tradingDate,
@@ -374,10 +377,34 @@ public sealed class ExecutionJournal
         decimal contractMultiplier,
         string direction,
         string executionInstrument,
-        string canonicalInstrument)
+        string canonicalInstrument,
+        string? brokerOrderInstrumentKey = null)
     {
         lock (_lock)
         {
+            // INVARIANT: Journal instrument must equal execution instrument (broker position key).
+            // Prevents silent divergence if canonical instrument is mistakenly used.
+            if (!string.IsNullOrWhiteSpace(brokerOrderInstrumentKey) && !string.IsNullOrWhiteSpace(executionInstrument))
+            {
+                var brokerRoot = GetInstrumentRoot(brokerOrderInstrumentKey);
+                if (!string.Equals(brokerRoot, executionInstrument.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_INSTRUMENT_KEY_MISMATCH", "CRITICAL",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = stream,
+                            journal_instrument = executionInstrument,
+                            broker_order_instrument = brokerOrderInstrumentKey,
+                            broker_root = brokerRoot,
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal instrument must equal execution instrument. Canonical instrument usage would cause reconciliation mismatch. Fail-closed."
+                        }));
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    return; // Fail-closed: do not persist
+                }
+            }
+
             // CRITICAL: Validate key fields - reject empty/whitespace
             if (string.IsNullOrWhiteSpace(tradingDate))
             {
@@ -1334,6 +1361,15 @@ public sealed class ExecutionJournal
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 
+    /// <summary>Extract instrument root (e.g. "M2K 03-26" -> "M2K") for broker/reconciliation key matching.</summary>
+    private static string GetInstrumentRoot(string instrumentKey)
+    {
+        if (string.IsNullOrWhiteSpace(instrumentKey)) return "";
+        var s = instrumentKey.Trim();
+        var idx = s.IndexOf(' ');
+        return idx >= 0 ? s.Substring(0, idx) : s;
+    }
+
     /// <summary>
     /// Get all open journal entries (EntryFilled && !TradeCompleted) grouped by execution instrument.
     /// Used by ReconciliationRunner to find orphaned journals when broker is flat.
@@ -1654,16 +1690,28 @@ public sealed class ExecutionJournal
 
     private void SaveJournal(string path, ExecutionJournalEntry entry)
     {
-        try
+        const int maxRetries = 3;
+        const int retryDelayMs = 50;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
-            var json = JsonUtil.Serialize(entry);
-            File.WriteAllText(path, json);
-        }
-        catch (Exception ex)
-        {
-            // Log error but don't fail execution
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "EXECUTION_JOURNAL_ERROR", "ENGINE",
-                new { error = ex.Message, path }));
+            try
+            {
+                var json = JsonUtil.Serialize(entry);
+                File.WriteAllText(path, json);
+                return;
+            }
+            catch (Exception ex)
+            {
+                var isRetryable = ex is System.IO.IOException;
+                if (attempt < maxRetries && isRetryable)
+                {
+                    System.Threading.Thread.Sleep(retryDelayMs * attempt);
+                    continue;
+                }
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "EXECUTION_JOURNAL_ERROR", "ENGINE",
+                    new { error = ex.Message, path, attempt }));
+                return;
+            }
         }
     }
 }

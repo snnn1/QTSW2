@@ -147,6 +147,12 @@ public interface IExecutionAdapter
     /// <param name="tickTimeFromEvent">Event timestamp from market data (for de-dupe). Null = use UtcNow fallback.</param>
     /// <param name="executionInstrument">Execution instrument filter (e.g. MNQ, MGC)</param>
     void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument);
+
+    /// <summary>
+    /// Phase 1: Process pending unresolved executions (non-blocking grace retry). Called from strategy thread on OnBarUpdate/OnMarketData.
+    /// Non-IEA path only; IEA uses queue-based retry.
+    /// </summary>
+    void ProcessPendingUnresolvedExecutions();
 }
 
 /// <summary>

@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using NinjaTrader.Data;
 
@@ -9,7 +10,8 @@ namespace QTSW2.Robot.Core;
 
 /// <summary>
 /// Resolves session close for forced flatten using NinjaTrader SessionIterator.
-/// Per sessionClass (S1, S2); uses timetable-eligible segment overlap only.
+/// Flatten: structural close from largest session gap (no timetable overlap, no time-of-day heuristic).
+/// Slot classification: IsTimetableEligibleSegment and GetCurrentSessionIndex still use timetable.
 /// Defer to Realtime only (avoid DataLoaded/Historical lag).
 /// </summary>
 public static class SessionCloseResolver
@@ -61,8 +63,10 @@ public static class SessionCloseResolver
     }
 
     /// <summary>
-    /// Resolve session close for (targetTradingDay, sessionClass) using SessionIterator.
-    /// Returns SessionCloseResult; HasSession=false for holiday.
+    /// Resolve session close for flatten using SessionIterator.
+    /// Structural close: largest gap between segments defines the close (segment end before that gap).
+    /// No timetable overlap, no time-of-day heuristic. If no segments = full holiday.
+    /// Returns SessionCloseResult; HasSession=false with FailureReason: HOLIDAY, NO_ELIGIBLE_SEGMENTS, ITERATION_ERROR, or EXCEPTION.
     /// </summary>
     public static SessionCloseResult Resolve(
         Bars bars,
@@ -76,19 +80,24 @@ public static class SessionCloseResolver
         if (bars == null || paritySpec == null || (sessionClass != "S1" && sessionClass != "S2"))
         {
             result.HasSession = false;
+            result.FailureReason = "ITERATION_ERROR";
             return result;
         }
 
         if (!DateTime.TryParse(targetTradingDay, out var targetDate))
         {
             result.HasSession = false;
+            result.FailureReason = "ITERATION_ERROR";
             return result;
         }
 
         try
         {
+            // Windows uses "Central Standard Time"; Linux/macOS use "America/Chicago"
+            var tz = ResolveChicagoTimeZone();
             var si = new SessionIterator(bars);
-            var segments = new List<(DateTime begin, DateTime end, string tradingDay)>();
+            var segments = new List<(DateTimeOffset BeginUtc, DateTimeOffset EndUtc)>();
+            var sawTargetDay = false;
 
             // Start from day before target to ensure we capture first segment of target day
             var cursor = targetDate.Date.AddDays(-1).AddHours(18); // Evening before
@@ -108,8 +117,11 @@ public static class SessionCloseResolver
                 var end = si.ActualSessionEnd;
                 if (tradingDayStr == targetTradingDay)
                 {
-                    if (IsTimetableEligibleSegment(begin, end, sessionClass, paritySpec))
-                        segments.Add((begin, end, tradingDayStr));
+                    sawTargetDay = true;
+                    // Flatten: collect ALL segments (no timetable filter, no time-of-day filter)
+                    var beginOffset = new DateTimeOffset(begin, tz.GetUtcOffset(begin));
+                    var endOffset = new DateTimeOffset(end, tz.GetUtcOffset(end));
+                    segments.Add((beginOffset.ToUniversalTime(), endOffset.ToUniversalTime()));
                 }
 
                 // Advance to next session
@@ -120,23 +132,92 @@ public static class SessionCloseResolver
             if (segments.Count == 0)
             {
                 result.HasSession = false;
+                result.FlattenTriggerUtc = null;
+                result.FailureReason = sawTargetDay ? "NO_ELIGIBLE_SEGMENTS" : "HOLIDAY";
                 return result;
             }
 
-            var lastSegment = segments.OrderBy(s => s.end).Last();
-            // ActualSessionEnd is in user/local timezone; assume Chicago for CME
-            var tz = TimeZoneInfo.FindSystemTimeZoneById("America/Chicago");
-            var closeOffset = new DateTimeOffset(lastSegment.end, tz.GetUtcOffset(lastSegment.end));
-            result.ResolvedSessionCloseUtc = closeOffset.ToUniversalTime();
-            result.FlattenTriggerUtc = result.ResolvedSessionCloseUtc.Value.AddSeconds(-bufferSeconds);
+            DateTimeOffset closeEndUtc;
+            double largestGapMinutes = 0;
+
+            if (segments.Count == 1)
+            {
+                closeEndUtc = segments[0].EndUtc;
+            }
+            else
+            {
+                // Sort by BeginUtc ascending
+                var sorted = segments.OrderBy(s => s.BeginUtc).ToList();
+                var indexOfLargestGap = -1;
+                var maxGap = TimeSpan.Zero;
+
+                for (var i = 0; i < sorted.Count - 1; i++)
+                {
+                    var gap = sorted[i + 1].BeginUtc - sorted[i].EndUtc;
+                    if (gap > maxGap)
+                    {
+                        maxGap = gap;
+                        indexOfLargestGap = i;
+                    }
+                }
+
+                if (indexOfLargestGap >= 0 && maxGap > TimeSpan.Zero)
+                {
+                    closeEndUtc = sorted[indexOfLargestGap].EndUtc;
+                    largestGapMinutes = maxGap.TotalMinutes;
+                }
+                else
+                {
+                    // Fallback: no positive gap found (should not happen)
+                    closeEndUtc = sorted[sorted.Count - 1].EndUtc;
+                    Trace.TraceWarning($"[SessionCloseResolver] Resolve fallback: segments.Count={segments.Count} but no positive gap found. Using last segment EndUtc.");
+                }
+            }
+
+            var flattenTriggerUtc = closeEndUtc.AddSeconds(-bufferSeconds);
+            result.ResolvedSessionCloseUtc = closeEndUtc;
+            result.FlattenTriggerUtc = flattenTriggerUtc;
             result.HasSession = true;
+
+            // Debug log at resolution time
+            var closeEndChicago = TimeZoneInfo.ConvertTimeFromUtc(closeEndUtc.UtcDateTime, tz);
+            var flattenTriggerChicago = TimeZoneInfo.ConvertTimeFromUtc(flattenTriggerUtc.UtcDateTime, tz);
+            var instrument = GetInstrumentNameFromBars(bars);
+            Trace.TraceInformation($"[SessionCloseResolver] Resolve: instrument={instrument} tradingDay={targetTradingDay} segmentCount={segments.Count} chosenCloseEndChicago={closeEndChicago:yyyy-MM-dd HH:mm:ss} largestGapMinutes={largestGapMinutes:F1} flattenTriggerChicago={flattenTriggerChicago:yyyy-MM-dd HH:mm:ss}");
         }
-        catch
+        catch (Exception ex)
         {
             result.HasSession = false;
+            result.FailureReason = "EXCEPTION";
+            result.ExceptionMessage = ex.Message;
         }
 
         return result;
+    }
+
+    private static TimeZoneInfo ResolveChicagoTimeZone()
+    {
+        foreach (var id in new[] { "Central Standard Time", "America/Chicago" })
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
+            catch { /* try next */ }
+        }
+        throw new TimeZoneNotFoundException("Could not resolve Chicago timezone.");
+    }
+
+    private static string GetInstrumentNameFromBars(Bars bars)
+    {
+        try
+        {
+            if (bars == null) return "N/A";
+            var inst = (bars as dynamic)?.Instrument;
+            if (inst == null) return "N/A";
+            return (string)(inst.FullName ?? inst.MasterInstrument?.Name ?? "N/A");
+        }
+        catch
+        {
+            return "N/A";
+        }
     }
 
     /// <summary>

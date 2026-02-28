@@ -220,6 +220,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _lastStreamStatusSummaryUtc = null;
     private const double STREAM_STATUS_SUMMARY_INTERVAL_MINUTES = 5.0;
 
+    // Forced flatten skip diagnostic (rate-limited) — when session close not cached
+    private DateTimeOffset? _lastForcedFlattenSkipLogUtc = null;
+    private const double FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES = 5.0;
+
     // Event-driven snapshot (strict 60s rate limit, independent of periodic)
     private DateTimeOffset? _lastEventDrivenSnapshotUtc = null;
     private const double EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS = 60.0;
@@ -1453,7 +1457,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 foreach (var sessionClass in new[] { "S1", "S2" })
                 {
                     if (!TryGetSessionCloseResult(tradingDateStr, sessionClass, out var closeResult) || closeResult == null)
+                    {
+                        // Diagnostic: session close not resolved/cached — forced flatten will not trigger (rate-limited)
+                        var shouldLogSkip = !_lastForcedFlattenSkipLogUtc.HasValue ||
+                            (utcNow - _lastForcedFlattenSkipLogUtc.Value).TotalMinutes >= FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES;
+                        if (shouldLogSkip && _streams.Values.Any(s => s.Session == sessionClass && !s.Committed))
+                        {
+                            _lastForcedFlattenSkipLogUtc = utcNow;
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_SKIP_NO_CACHE", state: "ENGINE",
+                                new
+                                {
+                                    session_class = sessionClass,
+                                    trading_date = tradingDateStr,
+                                    note = "Session close not resolved — ResolveAndSetSessionCloseIfNeeded may not have run; forced flatten will not trigger"
+                                }));
+                        }
                         continue;
+                    }
                     if (!closeResult.HasSession || !closeResult.FlattenTriggerUtc.HasValue)
                         continue;
                     if (utcNow < closeResult.FlattenTriggerUtc.Value)
@@ -2122,7 +2142,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _ => "No eligible segments"
             };
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE",
-                new { trading_day = tradingDay, session_class = sessionClass, failure_reason = r.FailureReason, note }));
+                new { trading_day = tradingDay, session_class = sessionClass, failure_reason = r.FailureReason, exception_message = r.ExceptionMessage, note }));
         }
     }
 
@@ -3825,6 +3845,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Public so NinjaTrader.Custom assembly can access when using DLL-only deployment.
     /// </summary>
     public IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
+
+    /// <summary>
+    /// Submit test inject entry (RegisterIntent + RegisterIntentPolicy + SubmitEntryOrder).
+    /// Used by RobotSimStrategy when TestInjectTradeOnStart is enabled.
+    /// Returns null if adapter does not support intent registration.
+    /// </summary>
+    public OrderSubmissionResult? SubmitTestInjectEntry(Intent intent, int qty, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter == null) return null;
+        if (_executionAdapter is not IIntentRegistrationAdapter reg) return null;
+        var intentId = intent.ComputeIntentId();
+        reg.RegisterIntent(intent);
+        reg.RegisterIntentPolicy(intentId, qty, qty, intent.Instrument, intent.ExecutionInstrument, "TEST_INJECT");
+        return _executionAdapter.SubmitEntryOrder(intentId, intent.ExecutionInstrument, intent.Direction ?? "Long", null, qty, "MARKET", utcNow);
+    }
     
     /// <summary>
     /// Expose time service for components that need direct access (e.g., bar providers).

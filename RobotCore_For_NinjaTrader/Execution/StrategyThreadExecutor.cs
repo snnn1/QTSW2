@@ -1,0 +1,281 @@
+// Strategy-thread NT action queue. All account.Change/Cancel/Flatten must run on strategy thread.
+// IEA worker enqueues commands; strategy drains under EntrySubmissionLock.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using QTSW2.Robot.Core;
+
+namespace QTSW2.Robot.Core.Execution;
+
+/// <summary>
+/// NT action to be executed on strategy thread. Worker computes; strategy executes.
+/// </summary>
+public interface INtAction
+{
+    string CorrelationId { get; }
+    string ActionType { get; }
+    string? IntentId { get; }
+    string? InstrumentKey { get; }
+    string Reason { get; }
+    void Execute(INtActionExecutor executor);
+}
+
+/// <summary>
+/// Executor that runs NT API calls. Implemented by NinjaTraderSimAdapter.
+/// </summary>
+public interface INtActionExecutor
+{
+    void ExecuteSubmitProtectives(NtSubmitProtectivesCommand cmd);
+    void ExecuteCancelOrders(NtCancelOrdersCommand cmd);
+    void ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd);
+}
+
+/// <summary>
+/// Command: submit or update protective stop and target orders.
+/// </summary>
+public sealed class NtSubmitProtectivesCommand : INtAction
+{
+    public string CorrelationId { get; }
+    public string ActionType => "SUBMIT_PROTECTIVES";
+    public string? IntentId { get; }
+    public string? InstrumentKey { get; }
+    public string Reason { get; }
+    public string Instrument { get; }
+    public string Direction { get; }
+    public decimal StopPrice { get; }
+    public decimal TargetPrice { get; }
+    public int Quantity { get; }
+    public string? OcoGroup { get; }
+    public DateTimeOffset UtcNow { get; }
+
+    public NtSubmitProtectivesCommand(
+        string correlationId,
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        decimal targetPrice,
+        int quantity,
+        string? ocoGroup,
+        string reason,
+        DateTimeOffset utcNow)
+    {
+        CorrelationId = correlationId;
+        IntentId = intentId;
+        InstrumentKey = instrument;
+        Instrument = instrument;
+        Direction = direction;
+        StopPrice = stopPrice;
+        TargetPrice = targetPrice;
+        Quantity = quantity;
+        OcoGroup = ocoGroup;
+        Reason = reason;
+        UtcNow = utcNow;
+    }
+
+    public void Execute(INtActionExecutor executor) => executor.ExecuteSubmitProtectives(this);
+}
+
+/// <summary>
+/// Command: cancel orders by intent ID and/or tags.
+/// </summary>
+public sealed class NtCancelOrdersCommand : INtAction
+{
+    public string CorrelationId { get; }
+    public string ActionType => "CANCEL_ORDERS";
+    public string? IntentId { get; }
+    public string? InstrumentKey { get; }
+    public string Reason { get; }
+    public bool ProtectiveOrdersOnly { get; }
+    public DateTimeOffset UtcNow { get; }
+
+    public NtCancelOrdersCommand(
+        string correlationId,
+        string? intentId,
+        string? instrumentKey,
+        bool protectiveOrdersOnly,
+        string reason,
+        DateTimeOffset utcNow)
+    {
+        CorrelationId = correlationId;
+        IntentId = intentId;
+        InstrumentKey = instrumentKey;
+        ProtectiveOrdersOnly = protectiveOrdersOnly;
+        Reason = reason;
+        UtcNow = utcNow;
+    }
+
+    public void Execute(INtActionExecutor executor) => executor.ExecuteCancelOrders(this);
+}
+
+/// <summary>
+/// Command: flatten instrument position.
+/// </summary>
+public sealed class NtFlattenInstrumentCommand : INtAction
+{
+    public string CorrelationId { get; }
+    public string ActionType => "FLATTEN_INSTRUMENT";
+    public string? IntentId { get; }
+    public string? InstrumentKey { get; }
+    public string Reason { get; }
+    public string Instrument { get; }
+    public DateTimeOffset UtcNow { get; }
+
+    public NtFlattenInstrumentCommand(
+        string correlationId,
+        string? intentId,
+        string instrument,
+        string reason,
+        DateTimeOffset utcNow)
+    {
+        CorrelationId = correlationId;
+        IntentId = intentId;
+        InstrumentKey = instrument;
+        Instrument = instrument;
+        Reason = reason;
+        UtcNow = utcNow;
+    }
+
+    public void Execute(INtActionExecutor executor) => executor.ExecuteFlattenInstrument(this);
+}
+
+/// <summary>
+/// Deferred action: wraps a delegate for strategy-thread execution (guard fallback).
+/// </summary>
+public sealed class NtDeferredAction : INtAction
+{
+    private readonly Action _action;
+    public string CorrelationId { get; }
+    public string ActionType => "DEFERRED";
+    public string? IntentId { get; }
+    public string? InstrumentKey { get; }
+    public string Reason { get; }
+
+    public NtDeferredAction(string correlationId, string? intentId, string? instrumentKey, string reason, Action action)
+    {
+        CorrelationId = correlationId;
+        IntentId = intentId;
+        InstrumentKey = instrumentKey;
+        Reason = reason;
+        _action = action ?? throw new ArgumentNullException(nameof(action));
+    }
+
+    public void Execute(INtActionExecutor executor) => _action();
+}
+
+/// <summary>
+/// FIFO queue of NT actions. Drained only on strategy thread under EntrySubmissionLock.
+/// Idempotency: drops duplicates by correlationId.
+/// </summary>
+public sealed class StrategyThreadExecutor
+{
+    private readonly ConcurrentQueue<INtAction> _queue = new();
+    private readonly HashSet<string> _pendingCorrelationIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _pendingLock = new();
+    private readonly RobotLogger _log;
+    private readonly Func<DateTimeOffset> _utcNow;
+
+    public StrategyThreadExecutor(RobotLogger log, Func<DateTimeOffset>? utcNow = null)
+    {
+        _log = log ?? throw new ArgumentNullException(nameof(log));
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+    }
+
+    /// <summary>
+    /// Enqueue NT action. Callable from any thread (e.g. IEA worker).
+    /// If correlationId already pending, action is dropped (idempotency).
+    /// </summary>
+    public bool EnqueueNtAction(INtAction action, out bool droppedAsDuplicate)
+    {
+        droppedAsDuplicate = false;
+        lock (_pendingLock)
+        {
+            if (_pendingCorrelationIds.Contains(action.CorrelationId))
+            {
+                droppedAsDuplicate = true;
+                _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_DUPLICATE_DROPPED", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        reason = action.Reason,
+                        note = "Idempotency: duplicate correlationId dropped"
+                    }));
+                return false;
+            }
+            _pendingCorrelationIds.Add(action.CorrelationId);
+        }
+
+        _queue.Enqueue(action);
+        _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_ENQUEUED", state: "ENGINE",
+            new
+            {
+                correlation_id = action.CorrelationId,
+                action_type = action.ActionType,
+                intent_id = action.IntentId,
+                instrument_key = action.InstrumentKey,
+                reason = action.Reason,
+                queue_depth = _queue.Count,
+                note = "NT action enqueued for strategy thread execution"
+            }));
+        return true;
+    }
+
+    /// <summary>
+    /// Drain and execute all pending actions. MUST be called from strategy thread under EntrySubmissionLock.
+    /// </summary>
+    public void DrainNtActions(INtActionExecutor executor)
+    {
+        var executed = 0;
+        while (_queue.TryDequeue(out var action))
+        {
+            var utcNow = _utcNow();
+            try
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "NT_ACTION_START", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        reason = action.Reason
+                    }));
+                action.Execute(executor);
+                _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_SUCCESS", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey
+                    }));
+                executed++;
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_FAIL", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        stack_trace = ex.StackTrace
+                    }));
+            }
+            finally
+            {
+                lock (_pendingLock)
+                    _pendingCorrelationIds.Remove(action.CorrelationId);
+            }
+        }
+    }
+
+    public int PendingCount => _queue.Count;
+}

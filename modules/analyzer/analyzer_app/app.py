@@ -9,6 +9,10 @@ import sys
 # Add breakout_analyzer root to PYTHONPATH
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT))
+# Add QTSW2 root for modules.analyzer.validation (used when saving parquet)
+QTSW2_ROOT = Path(__file__).resolve().parents[3]
+if str(QTSW2_ROOT) not in sys.path:
+    sys.path.insert(0, str(QTSW2_ROOT))
 from breakout_core.engine import run_strategy
 from logic.config_logic import RunParams
 from logic.instrument_logic import InstrumentManager
@@ -257,6 +261,14 @@ def main():
     # Session breakdown display removed
 
     st.header("Target Configuration")
+
+    target_mode = st.radio(
+        "Target Mode",
+        options=["fixed", "time"],
+        format_func=lambda x: "Fixed (price target)" if x == "fixed" else "Time (exit at 02:00 S1 / 08:00 S2)",
+        index=0,
+        help="Fixed: exit when price hits target. Time: exit at session start (02:00 for S1, 08:00 for S2); break-even logic unchanged."
+    )
 
     # ---------------------------------------------------------------
     # Analysis options
@@ -633,7 +645,8 @@ def main():
                 trade_days=[0, 1, 2, 3, 4],  # Mon-Fri
                 same_bar_priority="STOP_FIRST",
                 write_setup_rows=False,
-                write_no_trade_rows=True  # Always show NoTrade entries
+                write_no_trade_rows=True,  # Always show NoTrade entries
+                target_mode=target_mode
             )
 
             print(f"Starting analysis for {inst}...")

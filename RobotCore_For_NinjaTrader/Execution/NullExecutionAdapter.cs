@@ -154,6 +154,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         // DRYRUN: No-op
     }
 
+    public void ProcessPendingUnresolvedExecutions()
+    {
+        // DRYRUN: No-op
+    }
+
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         // DRYRUN: Log what would be cancelled, but do nothing

@@ -18,6 +18,7 @@ class RunParams(BaseModel):
     write_setup_rows: bool = False
     write_no_trade_rows: bool = True  # Always show NoTrade entries by default
     target: float = 50.0  # Default target for NQ
+    target_mode: Literal["fixed", "time"] = "fixed"  # "fixed" = price target exit; "time" = exit at 02:00 (S1) / 08:00 (S2)
 
 class ConfigManager:
     """Handles configuration management and validation"""

@@ -23,8 +23,11 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor, IIntentRegistrationAdapter
 {
+    private static int _adapterInstanceCounter;
+    private readonly int _adapterInstanceId;
+
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
     private readonly ExecutionJournal _executionJournal;
@@ -95,6 +98,38 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private DateTimeOffset _lastFlattenUtc;
     private const int FLATTEN_RECOGNITION_WINDOW_SECONDS = 10;
 
+    /// <summary>Non-IEA path dedup: key (orderId, executionId or composite) -> first-seen UTC. TTL ~5 min.</summary>
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _nonIeaExecutionDedup = new();
+
+    /// <summary>Non-IEA path: pending unresolved executions for deferred retry (no Thread.Sleep).</summary>
+    private readonly List<UnresolvedExecutionRecord> _pendingUnresolvedExecutions = new();
+    private readonly object _pendingUnresolvedLock = new();
+    private const double UNRESOLVED_GRACE_MS = 500.0;
+    private int _nonIeaDedupInsertCount;
+    private const int NON_IEA_DEDUP_EVICTION_INTERVAL = 100;
+    private const double NON_IEA_DEDUP_MAX_AGE_MINUTES = 5.0;
+
+    /// <summary>Non-IEA dedup. Returns true if duplicate (skip), false if new (marks). Key built by NT partial.</summary>
+    internal bool TryMarkAndCheckDuplicateNonIea(string key)
+    {
+        if (string.IsNullOrEmpty(key)) return false;
+        var now = DateTimeOffset.UtcNow;
+        if (_nonIeaExecutionDedup.TryAdd(key, now))
+        {
+            var c = System.Threading.Interlocked.Increment(ref _nonIeaDedupInsertCount);
+            if (c % NON_IEA_DEDUP_EVICTION_INTERVAL == 0)
+                EvictNonIeaDedupEntries();
+            return false;
+        }
+        return true;
+    }
+    private void EvictNonIeaDedupEntries()
+    {
+        var cutoff = DateTimeOffset.UtcNow.AddMinutes(-NON_IEA_DEDUP_MAX_AGE_MINUTES);
+        foreach (var k in _nonIeaExecutionDedup.Where(kvp => kvp.Value < cutoff).Select(kvp => kvp.Key).ToList())
+            _nonIeaExecutionDedup.TryRemove(k, out _);
+    }
+
     /// <summary>Flatten verification: instrumentKey -> (requestedUtc, retryCount, deadline, correlationId, instrumentRef).
     /// instrumentRef: strategy's Instrument instance used for position check (avoids string-resolution ambiguity).</summary>
     private readonly ConcurrentDictionary<string, (DateTimeOffset RequestedUtc, int RetryCount, DateTimeOffset VerifyDeadlineUtc, string CorrelationId, object? InstrumentRef)> _pendingFlattenVerifications = new();
@@ -103,6 +138,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     // BE Modify Confirmation: pending requests keyed by stop_order_id. Register BEFORE Change(); confirm via OrderUpdate.
     private readonly ConcurrentDictionary<string, PendingBERequest> _pendingBERequests = new();
+
+    /// <summary>BE Phase 2: Per-intent protection state. Prevents false flatten when protectives are pending/in-flight.</summary>
+    internal enum ProtectionState { None, Enqueued, Executing, Submitted, Working }
+    private readonly ConcurrentDictionary<string, ProtectionState> _protectionStateByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private const double BE_STOP_VISIBILITY_TIMEOUT_SEC = 5.0;
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _firstMissingStopUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Part 3 (optional): Enqueued backlog warning/timeout. Default OFF.</summary>
+    private const bool ENABLE_PROTECTION_ENQUEUED_TIMEOUT = false;
+    private const double PROTECTION_ENQUEUED_WARN_SEC = 5;
+    private const double PROTECTION_ENQUEUED_TIMEOUT_SEC = 30;
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _firstEnqueuedUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastEnqueuedWarnUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Strategy-thread NT action queue. Worker enqueues; strategy drains under EntrySubmissionLock.</summary>
     private StrategyThreadExecutor? _ntActionQueue;
@@ -170,13 +218,66 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     bool IIEAOrderExecutor.EnqueueNtAction(INtAction action)
     {
         if (_ntActionQueue == null) return false;
+        if (string.Equals(action.ActionType, "SUBMIT_PROTECTIVES", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(action.IntentId))
+        {
+            SetProtectionState(action.IntentId, ProtectionState.Enqueued);
+            _firstEnqueuedUtcByIntent.TryAdd(action.IntentId, DateTimeOffset.UtcNow);
+        }
         return _ntActionQueue.EnqueueNtAction(action, out _);
+    }
+
+    private void SetProtectionState(string intentId, ProtectionState state, string? reason = null)
+    {
+        if (string.IsNullOrEmpty(intentId)) return;
+        var prev = _protectionStateByIntent.AddOrUpdate(intentId, state, (_, _) => state);
+        if (state != ProtectionState.Enqueued)
+            _firstEnqueuedUtcByIntent.TryRemove(intentId, out _);
+        var shouldLog = prev != state || !string.IsNullOrEmpty(reason);
+        if (shouldLog)
+        {
+            var accountName = _iea?.AccountName ?? "";
+            var execInstKey = _iea?.ExecutionInstrumentKey ?? "";
+            var payload = new Dictionary<string, object>
+            {
+                ["intent_id"] = intentId,
+                ["execution_instrument_key"] = execInstKey,
+                ["account_name"] = accountName,
+                ["previous_state"] = prev.ToString(),
+                ["new_state"] = state.ToString()
+            };
+            if (!string.IsNullOrEmpty(reason))
+                payload["reason"] = reason;
+            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, "", "BE_PROTECTION_STATE_CHANGED", payload));
+        }
+    }
+
+    private ProtectionState GetProtectionState(string intentId)
+    {
+        return string.IsNullOrEmpty(intentId) ? ProtectionState.None : _protectionStateByIntent.TryGetValue(intentId, out var s) ? s : ProtectionState.None;
+    }
+
+    /// <summary>Remove intent from BE state dictionaries. Call when intent is terminal/removed.</summary>
+    private void PruneIntentState(string intentId, string reason)
+    {
+        if (string.IsNullOrEmpty(intentId)) return;
+        var removed = _protectionStateByIntent.TryRemove(intentId, out _);
+        _firstMissingStopUtcByIntent.TryRemove(intentId, out _);
+        _firstEnqueuedUtcByIntent.TryRemove(intentId, out _);
+        _lastEnqueuedWarnUtcByIntent.TryRemove(intentId, out _);
+        if (removed)
+            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, intentId, "", "BE_PROTECTION_STATE_PRUNED", new { intent_id = intentId, reason }));
     }
 
     object? IIEAOrderExecutor.GetEntrySubmissionLock() => _iea?.EntrySubmissionLock;
 
     void IIEAOrderExecutor.EnterStrategyThreadContext() => SetStrategyThreadContext(true);
     void IIEAOrderExecutor.ExitStrategyThreadContext() => SetStrategyThreadContext(false);
+
+    void IIEAOrderExecutor.SetProtectionStateWorkingForAdoptedStop(string intentId)
+    {
+        if (string.IsNullOrEmpty(intentId)) return;
+        SetProtectionState(intentId, ProtectionState.Working, "ADOPT_RESTART_STOP");
+    }
 
     void IIEAOrderExecutor.DrainNtActions()
     {
@@ -195,12 +296,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         return false;
     }
     private readonly ConcurrentDictionary<string, DateTimeOffset> _pendingBECancelUtcByIntent = new(); // Replace-semantics: intent_id -> when old stop went CancelPending
+    /// <summary>BE cancel+replace: intent_id -> (new_stop_order_id, start_utc). Used to log BE_CANCEL_REPLACE_STOP_WORKING and quantify overlap/gap.</summary>
+    private readonly ConcurrentDictionary<string, (string NewStopOrderId, DateTimeOffset StartUtc)> _pendingBECancelReplaceByIntent = new(StringComparer.OrdinalIgnoreCase);
     private const int BE_REPLACE_CANCEL_WINDOW_SEC = 30;
     private const int BE_CONFIRM_TIMEOUT_SEC = 15;
     private const int BE_RETRY_INTERVAL_SEC = 5;
     private const int BE_MAX_RETRY_ATTEMPTS = 3;
     public NinjaTraderSimAdapter(string projectRoot, RobotLogger log, ExecutionJournal executionJournal)
     {
+        _adapterInstanceId = System.Threading.Interlocked.Increment(ref _adapterInstanceCounter);
         _projectRoot = projectRoot;
         _log = log;
         _executionJournal = executionJournal;
@@ -248,11 +352,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _ieaEngineExecutionInstrument = engineExecutionInstrument;
         
         // Resolve IEA when use_instrument_execution_authority is enabled
+        var accountName = GetAccountName(account);
+        var executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, instrument, engineExecutionInstrument);
         if (_useInstrumentExecutionAuthority)
         {
             _ntActionQueue = new StrategyThreadExecutor(_log);
-            var accountName = GetAccountName(account);
-            var executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, instrument, engineExecutionInstrument);
             _ieaAccountName = accountName;
             _iea = InstrumentExecutionAuthorityRegistry.GetOrCreate(accountName, executionInstrumentKey,
                 () => new InstrumentExecutionAuthority(accountName, executionInstrumentKey, this, _log, _aggregationPolicy));
@@ -266,9 +370,144 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                     note = "IEA bound for execution routing"
                 }));
         }
-        
+
+        // Deterministic routing: register endpoint for (account, executionInstrumentKey)
+        // GC chart with MGC execution registers for MGC so fills route correctly regardless of which strategy receives the callback
+        // Phase 1: TryRegisterEndpoint - fail closed on conflict (no overwrite)
+        if (!string.IsNullOrEmpty(accountName) && !string.IsNullOrEmpty(executionInstrumentKey))
+        {
+            var instanceId = _useInstrumentExecutionAuthority && _iea != null
+                ? $"IEA:{_iea.InstanceId}"
+                : $"ADAPTER:{_adapterInstanceId}";
+            var endpoint = _useInstrumentExecutionAuthority && _iea != null
+                ? (Action<object, object>)_iea.EnqueueExecutionUpdate
+                : HandleExecutionUpdate;
+            if (!ExecutionUpdateRouter.TryRegisterEndpoint(accountName, executionInstrumentKey, endpoint, instanceId, _log))
+                throw new InvalidOperationException($"EXEC_ROUTER_ENDPOINT_CONFLICT: Cannot register for ({accountName}, {executionInstrumentKey}) - different instance already owns. Fail closed.");
+        }
+
         // STEP 1: SIM Account Verification (MANDATORY) - now with real NT account
         VerifySimAccount();
+
+        // One-time: Re-register intents from open journal entries (for BE detection after restart)
+        HydrateIntentsFromOpenJournals();
+    }
+
+    /// <summary>
+    /// One-time hydration: Register intents from open journal entries so BE detection works after restart.
+    /// Only registers intents matching this adapter's execution instrument. Idempotent.
+    /// </summary>
+    private void HydrateIntentsFromOpenJournals()
+    {
+        var ourExecutionInstrument = (_iea?.ExecutionInstrumentKey ?? _ieaEngineExecutionInstrument ?? "").Trim();
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENTS_HYDRATION_ATTEMPT", state: "ENGINE",
+            new { execution_instrument = ourExecutionInstrument ?? "(empty)", iea_set = _iea != null, note = "Hydration attempt (runs on SetNTContext)" }));
+        if (string.IsNullOrEmpty(ourExecutionInstrument))
+            return;
+        var ourRoot = ourExecutionInstrument.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? ourExecutionInstrument;
+
+        var byInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var count = 0;
+        foreach (var kvp in byInst)
+        {
+            var journalInstrument = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(journalInstrument)) continue;
+            var journalRoot = journalInstrument.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? journalInstrument;
+            if (!string.Equals(journalRoot, ourRoot, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var (tradingDate, stream, intentId, entry) in kvp.Value)
+            {
+                if (IntentMap.ContainsKey(intentId)) continue;
+                var intent = CreateIntentFromJournalEntry(tradingDate, stream, intentId, entry);
+                if (intent == null) continue;
+                RegisterIntent(intent);
+                count++;
+            }
+        }
+        if (count > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENTS_HYDRATED_FROM_JOURNAL", state: "ENGINE",
+                new { intent_count = count, execution_instrument = ourRoot, note = "Re-registered intents from open journals for BE detection" }));
+        }
+        else if (byInst.Count > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENTS_HYDRATION_SKIPPED", state: "ENGINE",
+                new { execution_instrument = ourRoot, open_journal_instruments = string.Join(",", byInst.Keys), note = "Hydration ran but no matching open journals for this chart" }));
+        }
+    }
+
+    /// <summary>
+    /// Create Intent from journal entry for hydration. Returns null if required fields missing.
+    /// </summary>
+    private static Intent? CreateIntentFromJournalEntry(string tradingDate, string stream, string intentId, ExecutionJournalEntry entry)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(entry.Instrument))
+            return null;
+        var executionInstrument = entry.Instrument.Trim();
+        var canonicalInstrument = DeriveCanonicalFromStream(stream);
+        var session = DeriveSessionFromStream(stream);
+        var slotTimeChicago = ParseSlotFromOcoGroup(entry.OcoGroup) ?? "09:00";
+        var direction = entry.Direction ?? "Long";
+        var entryPrice = entry.EntryPrice ?? entry.FillPrice ?? 0;
+        var stopPrice = entry.StopPrice ?? entryPrice;
+        var targetPrice = entry.TargetPrice ?? entryPrice;
+        var beTrigger = ComputeBeTrigger(entryPrice, targetPrice, direction);
+        var entryTimeUtc = DateTimeOffset.UtcNow;
+        if (!string.IsNullOrEmpty(entry.EntryFilledAtUtc) && DateTimeOffset.TryParse(entry.EntryFilledAtUtc, out var parsed))
+            entryTimeUtc = parsed;
+
+        return new Intent(
+            tradingDate,
+            stream,
+            canonicalInstrument,
+            executionInstrument,
+            session,
+            slotTimeChicago,
+            direction,
+            entryPrice,
+            stopPrice,
+            targetPrice,
+            beTrigger,
+            entryTimeUtc,
+            "JOURNAL_REHYDRATION");
+    }
+
+    private static string DeriveCanonicalFromStream(string stream)
+    {
+        if (string.IsNullOrEmpty(stream)) return "UNKNOWN";
+        var upper = stream.ToUpperInvariant();
+        if (upper.StartsWith("RTY")) return "RTY";
+        if (upper.StartsWith("YM")) return "YM";
+        if (upper.StartsWith("ES")) return "ES";
+        if (upper.StartsWith("NQ")) return "NQ";
+        if (upper.StartsWith("GC")) return "GC";
+        if (upper.StartsWith("NG")) return "NG";
+        if (upper.StartsWith("CL")) return "CL";
+        return stream.Length >= 2 ? stream.Substring(0, 2).ToUpperInvariant() : "UNKNOWN";
+    }
+
+    private static string DeriveSessionFromStream(string stream)
+    {
+        if (string.IsNullOrEmpty(stream)) return "S1";
+        var last = stream[stream.Length - 1];
+        return char.IsDigit(last) ? $"S{last}" : "S1";
+    }
+
+    private static string? ParseSlotFromOcoGroup(string? ocoGroup)
+    {
+        if (string.IsNullOrEmpty(ocoGroup)) return null;
+        var parts = ocoGroup.Split(':');
+        if (parts.Length >= 5 && parts[4].Length >= 5)
+            return parts[4];
+        return null;
+    }
+
+    private static decimal? ComputeBeTrigger(decimal entryPrice, decimal targetPrice, string direction)
+    {
+        var dist = Math.Abs(targetPrice - entryPrice);
+        var bePts = dist * 0.65m;
+        return direction == "Long" ? entryPrice + bePts : entryPrice - bePts;
     }
     
     /// <summary>Get account name from NT account object.</summary>
@@ -622,6 +861,23 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             HandleExecutionUpdateReal(execution, order);
         }
     }
+
+    /// <summary>
+    /// Phase 1: Process pending unresolved executions (non-IEA path). Called from strategy thread on OnBarUpdate/OnMarketData.
+    /// </summary>
+    public void ProcessPendingUnresolvedExecutions()
+    {
+        if (_useInstrumentExecutionAuthority) return;
+        List<UnresolvedExecutionRecord> snapshot;
+        lock (_pendingUnresolvedLock)
+        {
+            if (_pendingUnresolvedExecutions.Count == 0) return;
+            snapshot = new List<UnresolvedExecutionRecord>(_pendingUnresolvedExecutions);
+            _pendingUnresolvedExecutions.Clear();
+        }
+        foreach (var record in snapshot)
+            ProcessUnresolvedRetry(record);
+    }
     
     /// <summary>
     /// PHASE 2: Handle entry fill and submit protective orders with retry and failure recovery.
@@ -748,7 +1004,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // Both stop and target must use the same OCO group to be paired, so we retry both together
         const int MAX_RETRIES = 3;
         const int RETRY_DELAY_MS = 100;
-        
+
+        SetProtectionState(intentId, ProtectionState.Executing);
         OrderSubmissionResult? stopResult = null;
         OrderSubmissionResult? targetResult = null;
         
@@ -801,7 +1058,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 
                 // If both succeeded, we're done
                 if (targetResult.Success)
+                {
+                    SetProtectionState(intentId, ProtectionState.Submitted);
                     break;
+                }
                 
                 // If target failed but stop succeeded, we need to cancel stop and retry both
                 // Cancel the stop order before retrying (OCO pairing broken)
@@ -824,6 +1084,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // PHASE 2: If either protective leg failed after retries, flatten position and stand down stream
         if (!stopResult.Success || !targetResult.Success)
         {
+            PruneIntentState(intentId, "protective_orders_failed");
             var failedLegs = new List<string>();
             if (!stopResult.Success) failedLegs.Add($"STOP: {stopResult.ErrorMessage}");
             if (!targetResult.Success) failedLegs.Add($"TARGET: {targetResult.ErrorMessage}");
@@ -1043,11 +1304,34 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     /// <summary>
     /// Register intent for fill callback handling.
-    /// Called by StreamStateMachine after entry submission.
-    /// Internal method - adapter-specific.
+    /// Called by StreamStateMachine or test inject.
     /// </summary>
-    internal void RegisterIntent(Intent intent)
+    public void RegisterIntent(Intent intent)
     {
+        // Option A (Stronger): Fail-closed when execution differs from canonical but ExecutionInstrument is null.
+        // Prevents journal/reconciliation mismatch (e.g. RTY stored when M2K expected).
+        var execContext = _iea?.ExecutionInstrumentKey ?? _ieaEngineExecutionInstrument ?? "";
+        var execRoot = string.IsNullOrEmpty(execContext) ? "" : execContext.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? execContext;
+        var canonical = (intent.Instrument ?? "").Trim();
+        var executionNull = string.IsNullOrWhiteSpace(intent.ExecutionInstrument);
+        var executionDiffersFromCanonical = !string.IsNullOrEmpty(execRoot) && !string.IsNullOrEmpty(canonical) &&
+            !string.Equals(execRoot, canonical, StringComparison.OrdinalIgnoreCase);
+        if (executionDiffersFromCanonical && executionNull)
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intent.TradingDate ?? "", "INTENT_EXECUTION_INSTRUMENT_MISSING", "CRITICAL",
+                new
+                {
+                    intent_id = intent.ComputeIntentId(),
+                    stream = intent.Stream,
+                    canonical_instrument = canonical,
+                    execution_instrument_context = execRoot,
+                    note = "Execution differs from canonical but intent.ExecutionInstrument is null. Would cause journal/reconciliation mismatch. Fail-closed."
+                }));
+            _standDownStreamCallback?.Invoke(intent.Stream ?? "", utcNow, $"INTENT_EXECUTION_INSTRUMENT_MISSING:{intent.ComputeIntentId()}");
+            throw new InvalidOperationException($"Intent registration rejected: ExecutionInstrument is null but execution context ({execRoot}) differs from canonical ({canonical}). Journal would store wrong instrument for reconciliation.");
+        }
+
         var intentId = intent.ComputeIntentId();
         IntentMap[intentId] = intent;
         
@@ -1093,7 +1377,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// 6. Verify end-to-end: policy_base_size → expected_quantity → order_quantity → cumulative_filled_qty
     ///    - All should match for successful execution
     /// </summary>
-    internal void RegisterIntentPolicy(
+    public void RegisterIntentPolicy(
         string intentId, 
         int expectedQty, 
         int maxQty, 
@@ -1984,6 +2268,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         if (purged.Count > 0)
         {
             _pendingBECancelUtcByIntent.TryRemove(intentId, out _);
+        _pendingBECancelReplaceByIntent.TryRemove(intentId, out _);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, lastInstrument ?? instrument, "STOP_MODIFY_PENDING_CLEARED_ON_EXIT", new
             {
                 intent_id = intentId,

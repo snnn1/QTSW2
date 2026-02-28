@@ -126,13 +126,32 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const double BE_TICK_STALE_WARNING_SECONDS = 5;
         private const double BE_TICK_STALE_FAIL_CLOSED_SECONDS = 12;
         
-        // Lightweight heartbeat: BIP 0 only, every N bars. Decoupled from trade state; no secondary series.
+        // Lightweight heartbeat: every N bars. Decoupled from trade state.
         private const int HEARTBEAT_BARS_INTERVAL = 1; // Every bar = ~1 min on 1-min chart; 30–60s is fine for liveness.
         
         // Per-bar profiling: log when sections exceed threshold (chart lag diagnosis)
         private const int BAR_PROFILE_THRESHOLD_MS = 5;
         private readonly Dictionary<string, DateTimeOffset> _lastBarProfileLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BAR_PROFILE_RATE_LIMIT_SECONDS = 30;
+
+        // Test inject: run once on first Realtime bar to exercise IEA without waiting for a real trade.
+        // Nonce (0=not run, 1=executed) prevents accidental re-execution; Interlocked ensures single execution.
+        private int _testInjectNonce = 0;
+
+        /// <summary>Derive canonical instrument from execution instrument (e.g. MES->ES, MNQ->NQ).</summary>
+        private static string DeriveCanonicalFromExecutionInstrument(string execInst)
+        {
+            if (string.IsNullOrEmpty(execInst)) return "UNKNOWN";
+            var u = execInst.ToUpperInvariant();
+            if (u.StartsWith("MES")) return "ES";
+            if (u.StartsWith("MNQ")) return "NQ";
+            if (u.StartsWith("MYM")) return "YM";
+            if (u.StartsWith("MGC")) return "GC";
+            if (u.StartsWith("MCL")) return "CL";
+            if (u.StartsWith("MNG")) return "NG";
+            if (u.StartsWith("M2K")) return "RTY";
+            return execInst.Length >= 2 ? execInst.Substring(0, 2).ToUpperInvariant() : execInst;
+        }
 
         /// <summary>Check if diagnostic logging during Historical is enabled. Uses reflection for backward compatibility with older Robot.Core.dll.</summary>
         private static bool IsDiagnosticLoggingDuringHistoricalEnabled(RobotEngine? engine)
@@ -192,6 +211,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Generate unique instance ID for forensics
             _instanceId = Guid.NewGuid().ToString("N").Substring(0, 8);
         }
+
+        /// <summary>When true, inject a synthetic market entry on first Realtime bar to exercise IEA. SIM only.</summary>
+        public bool TestInjectTradeOnStart { get; set; }
+
+        /// <summary>Direction for test inject: Long or Short.</summary>
+        public string TestInjectDirection { get; set; } = "Long";
+
+        /// <summary>Quantity for test inject (1-2 typical).</summary>
+        public int TestInjectQuantity { get; set; } = 1;
         
         protected override void OnStateChange()
         {
@@ -200,10 +228,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Name = "RobotSimStrategy";
                 // CRITICAL FIX: Use OnBarClose to prevent NinjaTrader from blocking Realtime transition
                 // OnEachTick requires tick data to be available, which may block MGC/MYM/M2K strategies
-                // Secondary 1-second series provides BE + heartbeat (throttled to 5s)
                 Calculate = Calculate.OnBarClose; // Bar-based to avoid blocking Realtime transition
                 IsUnmanaged = true; // Required for manual order management
                 IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only
+                TestInjectTradeOnStart = false;
+                TestInjectDirection = "Long";
+                TestInjectQuantity = 1;
                 
                 // Diagnostic: Check if NINJATRADER is defined
 #if NINJATRADER
@@ -216,7 +246,6 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Configure)
             {
                 TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
-                // BE detection moved to OnMarketData (tick-level) — no secondary series needed
                 TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
@@ -1294,10 +1323,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Dormant: init failed or engine not ready — skip all work immediately (Tier 2.1)
                 if (_initFailed || !_engineReady || _engine is null) return;
 
+                // NT THREADING FIX: Drain NT action queue on Realtime. All account.Change/Cancel/Flatten must run on strategy thread.
+                if (State == State.Realtime && _adapter is IIEAOrderExecutor ieaExecutorBar)
+                {
+                    ieaExecutorBar.EnterStrategyThreadContext();
+                    try
+                    {
+                        var lockObj = ieaExecutorBar.GetEntrySubmissionLock();
+                        if (lockObj != null)
+                        {
+                            lock (lockObj)
+                            {
+                                ieaExecutorBar.DrainNtActions();
+                            }
+                        }
+                        _adapter.ProcessPendingUnresolvedExecutions();
+                    }
+                    finally
+                    {
+                        ieaExecutorBar.ExitStrategyThreadContext();
+                    }
+                }
+
                 // Strict phase control: skip only when State.Historical AND config disabled. Do NOT use !isRealtime — Transition exists between Historical and Realtime.
                 var skipHistoricalDiagEarly = State == State.Historical && _engine != null && !IsDiagnosticLoggingDuringHistoricalEnabled(_engine);
-                // Diagnostic Point #0: primary series only (restrict to avoid BIP 1 spam) — gated when diagnostic_logging_during_historical=false
-                if (BarsInProgress == 0 && _engine != null && !skipHistoricalDiagEarly)
+                // Diagnostic Point #0 — gated when diagnostic_logging_during_historical=false
+                if (_engine != null && !skipHistoricalDiagEarly)
                 {
                     var executionInstrumentFullName = Instrument?.FullName ?? "UNKNOWN";
                     var diagInstrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
@@ -1321,6 +1372,92 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
             if (CurrentBars[BarsInProgress] < 1) return;
+
+            // Test inject: synthetic market entry on first Realtime bar to exercise IEA (SIM only)
+            if (TestInjectTradeOnStart && State == State.Realtime && _adapter != null && _engine != null)
+            {
+                // Safety: SIM guard — never run on live account
+                if (!_simAccountVerified)
+                {
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_SKIPPED", new Dictionary<string, object>
+                    {
+                        { "reason", "SIM_GUARD" },
+                        { "note", "Test inject requires SIM account. Skipped." }
+                    });
+                }
+                else
+                {
+                    var tradingDate = _engine.GetTradingDate();
+                    // Safety: trading date guard — intent requires valid date (allows retry on next bar)
+                    if (string.IsNullOrWhiteSpace(tradingDate))
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_SKIPPED", new Dictionary<string, object>
+                        {
+                            { "reason", "TRADING_DATE_GUARD" },
+                            { "note", "Trading date not yet set. Skipped." }
+                        });
+                    }
+                    else if (Interlocked.CompareExchange(ref _testInjectNonce, 1, 0) != 0)
+                    {
+                        // Already executed (nonce prevents re-run)
+                    }
+                    else
+                    {
+                    try
+                    {
+                        // CRITICAL: Use FullName root (e.g. MES), not MasterInstrument.Name (returns ES for MES - wrong for order placement)
+                        var execInst = GetExecutionInstrumentForBE();
+                        if (string.IsNullOrWhiteSpace(execInst)) execInst = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                        var canonical = DeriveCanonicalFromExecutionInstrument(execInst);
+                        var direction = string.Equals(TestInjectDirection, "Short", StringComparison.OrdinalIgnoreCase) ? "Short" : "Long";
+                        var qty = Math.Max(1, Math.Min(2, TestInjectQuantity));
+                        var refPrice = (decimal)Close[0];
+                        var tickSize = TickSize > 0 ? (decimal)TickSize : 0.25m;
+                        var offset = 10m * tickSize;
+                        var entryPrice = refPrice;
+                        var stopPrice = direction == "Long" ? refPrice - offset : refPrice + offset;
+                        var targetPrice = direction == "Long" ? refPrice + offset : refPrice - offset;
+                        var beTrigger = direction == "Long" ? refPrice + (offset * 0.5m) : refPrice - (offset * 0.5m);
+                        var utcNow = DateTimeOffset.UtcNow;
+                        var intent = new Intent(
+                            tradingDate, "TEST_INJECT", canonical, execInst, "RTH", "09:30",
+                            direction, entryPrice, stopPrice, targetPrice, beTrigger, utcNow, "TEST_INJECT");
+                        var result = _engine.SubmitTestInjectEntry(intent, qty, utcNow);
+                        if (result == null)
+                        {
+                            _engine.LogEngineEvent(utcNow, "TEST_INJECT_FAILED", new Dictionary<string, object>
+                            {
+                                { "error", "Adapter does not support test inject" },
+                                { "note", "SubmitTestInjectEntry returned null" }
+                            });
+                        }
+                        else if (_engine != null)
+                        {
+                            _engine.LogEngineEvent(utcNow, "TEST_INJECT_EXECUTED", new Dictionary<string, object>
+                            {
+                                { "intent_id", intent.ComputeIntentId() },
+                                { "instrument", execInst },
+                                { "direction", direction },
+                                { "quantity", qty },
+                                { "success", result.Success },
+                                { "broker_order_id", result.BrokerOrderId ?? "" },
+                                { "error", result.ErrorMessage ?? "" },
+                                { "note", "Synthetic market entry injected to exercise IEA. Full flow: fill -> protectives -> BE." }
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_FAILED", new Dictionary<string, object>
+                        {
+                            { "error", ex.Message },
+                            { "exception", ex.GetType().Name },
+                            { "note", "Test inject threw - check logs" }
+                        });
+                    }
+                    }
+                }
+            }
 
             // BE detection moved to OnMarketData (tick-level) — no bar-based path
             var barProfileSw = Stopwatch.StartNew();
@@ -1836,15 +1973,42 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path)
-            DateTimeOffset? tickTimeFromEvent = null;
-            try
+            // NT THREADING FIX: Drain NT action queue before BE. All account.Change/Cancel/Flatten must run on strategy thread.
+            if (_adapter is IIEAOrderExecutor ieaExecutor)
             {
-                if (e.Time != default)
-                    tickTimeFromEvent = new DateTimeOffset(e.Time, TimeSpan.Zero);
+                ieaExecutor.EnterStrategyThreadContext();
+                try
+                {
+                    var lockObj = ieaExecutor.GetEntrySubmissionLock();
+                    if (lockObj != null)
+                    {
+                        lock (lockObj)
+                        {
+                            ieaExecutor.DrainNtActions();
+                        }
+                    }
+                    _adapter.ProcessPendingUnresolvedExecutions();
+                    // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path)
+                    DateTimeOffset? tickTimeFromEvent = null;
+                    try
+                    {
+                        if (e.Time != default)
+                            tickTimeFromEvent = new DateTimeOffset(e.Time, TimeSpan.Zero);
+                    }
+                    catch { }
+                    _adapter?.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+                }
+                finally
+                {
+                    ieaExecutor.ExitStrategyThreadContext();
+                }
             }
-            catch { }
-            _adapter?.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+            else
+            {
+                DateTimeOffset? tickTimeFromEvent = null;
+                try { if (e.Time != default) tickTimeFromEvent = new DateTimeOffset(e.Time, TimeSpan.Zero); } catch { }
+                _adapter?.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+            }
         }
 
         /// <summary>Log BAR_PROFILE_SLOW when a section exceeds threshold (chart lag diagnosis). Rate-limited. Only runs when diagnostic_slow_logs=true.</summary>
@@ -1971,36 +2135,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 if (_engine is null) return;
-                
-                // CRITICAL FIX: Filter executions by instrument to prevent cross-instance order tracking failures
-                // When multiple strategy instances run on the same account, all instances receive ExecutionUpdate
-                // callbacks for ALL executions. Each instance should only process executions for its own instrument.
-                // This prevents fill handling errors when Instance B receives executions for orders submitted by Instance A.
-                if (e.Execution?.Order?.Instrument != Instrument)
+                if (e?.Execution?.Order == null) return;
+
+                // Deterministic routing: route by (accountName, executionInstrumentKey) derived from Order.Instrument
+                // GC chart with MGC execution → fills route to MGC endpoint regardless of which strategy receives callback
+                var orderInstrument = e.Execution.Order.Instrument;
+                var orderInstrumentKey = ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(orderInstrument);
+                var accountName = ExecutionUpdateRouter.GetAccountNameFromOrder(e.Execution.Order);
+
+                if (!ExecutionUpdateRouter.TryGetEndpoint(accountName, orderInstrumentKey, out var endpoint))
                 {
-                    // FUTURE HARDENING: Warn (not error) if filtered callback occurs
-                    // Useful signal if someone misconfigures charts (e.g., same instrument, multiple instances)
-                    _filteredExecutionUpdateCount++;
-                    if (_filteredExecutionUpdateCount == 1 || _filteredExecutionUpdateCount % 10 == 0)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "EXEC_UPDATE_NO_ENDPOINT", new Dictionary<string, object>
                     {
-                        // Log first occurrence and every 10th occurrence (rate-limited)
-                        Log($"WARNING: ExecutionUpdate filtered - execution order instrument '{e.Execution?.Order?.Instrument?.FullName ?? "NULL"}' " +
-                            $"does not match strategy instrument '{Instrument?.FullName ?? "NULL"}'. " +
-                            $"This may indicate misconfiguration (multiple instances on same instrument). " +
-                            $"Filtered count: {_filteredExecutionUpdateCount}, InstanceId={_instanceId}", LogLevel.Warning);
-                    }
+                        { "account_name", accountName ?? "" },
+                        { "execution_instrument_key", orderInstrumentKey },
+                        { "order_id", e.Execution.Order.OrderId ?? "N/A" },
+                        { "note", "No endpoint registered for (account, executionInstrument). Fail-closed." }
+                    });
                     return;
                 }
-                
-                // Update broker sync gate timestamp (before forwarding to adapter)
-                var utcNow = DateTimeOffset.UtcNow;
-                _engine.OnBrokerExecutionUpdateObserved(utcNow);
-                
-                if (_adapter is null) return;
 
-                // Forward to adapter's HandleExecutionUpdate method
-                // Adapter will correlate order.Tag (intent_id) and trigger protective orders on fill
-                _adapter.HandleExecutionUpdate(e.Execution, e.Execution.Order);
+                // Update broker sync gate timestamp (before forwarding)
+                _engine.OnBrokerExecutionUpdateObserved(DateTimeOffset.UtcNow);
+
+                endpoint(e.Execution, e.Execution.Order);
             }
             catch (Exception ex)
             {

@@ -4,7 +4,7 @@ Handles time and date calculations and conversions
 """
 
 import pandas as pd
-from typing import Optional, List
+from typing import Optional, List, Literal
 from dataclasses import dataclass
 from .config_logic import ConfigManager
 
@@ -82,18 +82,20 @@ class TimeManager:
         
         return next_time
     
-    def get_expiry_time(self, date: pd.Timestamp, time_label: str, session: str) -> pd.Timestamp:
+    def get_expiry_time(self, date: pd.Timestamp, time_label: str, session: str,
+                        target_mode: Literal["fixed", "time"] = "fixed") -> pd.Timestamp:
         """
         Calculate trade expiry time
         
         Args:
             date: Trading date (should be timezone-aware, Chicago time)
-            time_label: Time slot (e.g., "08:00")
+            time_label: Time slot (e.g., "08:00") - used when target_mode="fixed"
             session: Session (S1 or S2)
+            target_mode: "fixed" = next day same slot; "time" = S1→02:00, S2→08:00 next day
             
         Returns:
             Expiry timestamp in Chicago timezone (next trading day same slot, or Monday if Friday)
-            For ES2 (11:00 slot), expires at Monday 10:59 (1 minute before 11:00)
+            For target_mode="time": S1 expires at 02:00 next day, S2 at 08:00 next day
         """
         # Ensure date is timezone-aware (Chicago time)
         if date.tz is None:
@@ -103,7 +105,7 @@ class TimeManager:
             # If different timezone, convert to Chicago
             date = date.tz_convert("America/Chicago")
         
-        # Calculate expiry time (next trading day same slot)
+        # Calculate expiry time (next trading day)
         if date.weekday() == 4:  # Friday
             # Friday trades expire Monday (skip weekend)
             days_ahead = ConfigManager.FRIDAY_TO_MONDAY_DAYS
@@ -112,23 +114,31 @@ class TimeManager:
             days_ahead = 1
         
         expiry_date = date + pd.Timedelta(days=days_ahead)
-        hour, minute = map(int, time_label.split(":"))
         
-        # For TIME exits, expire 1 minute before the slot time
-        # e.g., 11:00 slot expires at 10:59
-        if minute > 0:
-            expiry_minute = minute - 1
+        if target_mode == "time":
+            # Time mode: use slot_start for session (S1→02:00, S2→08:00)
+            time_str = self.slot_starts.get(session, "02:00")
+            hour, minute = map(int, time_str.split(":"))
+            expiry_time = expiry_date.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0
+            )
         else:
-            # If minute is 0, go to previous hour's 59th minute
-            expiry_minute = 59
-            hour = hour - 1 if hour > 0 else 23
-        
-        expiry_time = expiry_date.replace(
-            hour=hour, 
-            minute=expiry_minute, 
-            second=59,  # End of the minute
-            microsecond=0
-        )
+            # Fixed mode: next day same slot, expire 1 minute before
+            hour, minute = map(int, time_label.split(":"))
+            if minute > 0:
+                expiry_minute = minute - 1
+            else:
+                expiry_minute = 59
+                hour = hour - 1 if hour > 0 else 23
+            expiry_time = expiry_date.replace(
+                hour=hour,
+                minute=expiry_minute,
+                second=59,
+                microsecond=0
+            )
         
         # Ensure expiry_time is in Chicago timezone
         if expiry_time.tz is None:

@@ -78,6 +78,10 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Phase 2: Bracket/aggregation policy. Null = use defaults (require identical, 0 tolerance).</summary>
     internal readonly AggregationPolicy? AggregationPolicy;
 
+    /// <summary>Lock for entry submission when running on strategy thread (NT threading fix).
+    /// NT CreateOrder/Submit must run on strategy thread; use this lock to serialize across instances sharing this IEA.</summary>
+    internal readonly object EntrySubmissionLock = new object();
+
     /// <summary>Event clock for BE/dedup. Null = use UtcNow (live). Injected for replay.</summary>
     private readonly IEventClock? _eventClock;
 

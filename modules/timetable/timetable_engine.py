@@ -53,16 +53,19 @@ class TimetableEngine:
     """
     
     def __init__(self, master_matrix_dir: str = "data/master_matrix",
-                 analyzer_runs_dir: str = "data/analyzed"):
+                 analyzer_runs_dir: str = "data/analyzed",
+                 timetable_output_dir: Optional[str] = None):
         """
         Initialize Timetable Engine.
         
         Args:
             master_matrix_dir: Directory containing master matrix files
             analyzer_runs_dir: Directory containing analyzer output files (for RS calculation)
+            timetable_output_dir: If set, write timetable to this dir as timetable_copy.json (not timetable_current.json)
         """
         self.master_matrix_dir = Path(master_matrix_dir)
         self.analyzer_runs_dir = Path(analyzer_runs_dir)
+        self.timetable_output_dir = timetable_output_dir
         
         # Streams to process
         self.streams = [
@@ -832,11 +835,12 @@ class TimetableEngine:
             streams: List of stream dicts with stream, instrument, session, slot_time, enabled, block_reason (optional)
             trade_date: Trading date (YYYY-MM-DD)
         """
-        output_dir = Path("data/timetable")
+        output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
+        filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Clean up old files (keep only timetable_current.json)
-        self._cleanup_old_timetable_files(output_dir)
+        # Clean up old files (keep only the canonical file for this output dir)
+        self._cleanup_old_timetable_files(output_dir, keep_filename=filename_base)
         
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
@@ -903,8 +907,8 @@ class TimetableEngine:
         }
         
         # Atomic write: write to temp file, then rename
-        temp_file = output_dir / "timetable_current.tmp"
-        final_file = output_dir / "timetable_current.json"
+        temp_file = output_dir / f"{filename_base}.tmp"
+        final_file = output_dir / f"{filename_base}.json"
         
         try:
             # Write to temporary file
@@ -927,7 +931,7 @@ class TimetableEngine:
     
     def write_execution_timetable(self, timetable_df: pd.DataFrame, trade_date: str) -> None:
         """
-        Write canonical execution timetable file (timetable_current.json).
+        Write canonical execution timetable file (timetable_current.json or timetable_copy.json).
         
         This is the single source of truth for NinjaTrader execution.
         Uses atomic writes to prevent partial reads.
@@ -936,11 +940,12 @@ class TimetableEngine:
             timetable_df: Timetable DataFrame
             trade_date: Trading date (YYYY-MM-DD)
         """
-        output_dir = Path("data/timetable")
+        output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
+        filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Clean up old files (keep only timetable_current.json)
-        self._cleanup_old_timetable_files(output_dir)
+        # Clean up old files (keep only the canonical file for this output dir)
+        self._cleanup_old_timetable_files(output_dir, keep_filename=filename_base)
         
         # Build streams array - include ALL streams (enabled and blocked)
         # Each stream_id maps to one session: ES1->S1, ES2->S2, etc.
@@ -982,25 +987,23 @@ class TimetableEngine:
         # Write execution timetable file using shared method
         self._write_execution_timetable_file(streams, trade_date)
     
-    def _cleanup_old_timetable_files(self, output_dir: Path) -> None:
+    def _cleanup_old_timetable_files(self, output_dir: Path, keep_filename: str = "timetable_current") -> None:
         """
-        Remove all files in timetable directory except timetable_current.json.
+        Remove all files in timetable directory except the canonical file and its temp.
         
         Args:
             output_dir: Timetable output directory
+            keep_filename: Base filename to keep (e.g. timetable_current or timetable_copy)
         """
         if not output_dir.exists():
             return
         
-        current_file = output_dir / "timetable_current.json"
-        temp_file = output_dir / "timetable_current.tmp"
-        
         removed_count = 0
         for file_path in output_dir.iterdir():
-            # Skip the current file and temp file
-            if file_path.name == "timetable_current.json":
+            # Skip the canonical file and its temp file
+            if file_path.name == f"{keep_filename}.json":
                 continue
-            if file_path.name == "timetable_current.tmp":
+            if file_path.name == f"{keep_filename}.tmp":
                 continue
             
             try:

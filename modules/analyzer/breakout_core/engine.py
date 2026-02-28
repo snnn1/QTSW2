@@ -91,31 +91,36 @@ def _process_single_range(
     # Get data for trade execution (24 hours) and MFE calculation (until next day same slot)
     day_df = df[(df["timestamp"] >= R.end_ts) & (df["timestamp"] < R.end_ts + pd.Timedelta(hours=24))].copy()
     
-    # For MFE calculation, we need data until next day same slot
+    # For MFE calculation, we need data until next day same slot (or 02:00/08:00 for time mode)
     # Calculate MFE end time
-    if time_label:
+    if time_label or (rp.target_mode == "time" and sess):
         from logic.config_logic import ConfigManager
         if R.date.weekday() == 4:  # Friday
             mfe_end_date = R.date + pd.Timedelta(days=ConfigManager.FRIDAY_TO_MONDAY_DAYS)  # Friday to Monday
         else:
             mfe_end_date = R.date + pd.Timedelta(days=1)  # Regular day
         
-        hour_part = int(time_label.split(":")[0])
-        minute_part = int(time_label.split(":")[1])
+        if rp.target_mode == "time":
+            # Time mode: S1→02:00, S2→08:00 next day
+            time_str = time_manager.slot_starts.get(sess, "02:00")
+            hour_part, minute_part = map(int, time_str.split(":"))
+        else:
+            hour_part = int(time_label.split(":")[0])
+            minute_part = int(time_label.split(":")[1])
         # Slot times are Chicago trading hours (e.g., 07:30 = 7:30 AM Chicago time)
         # Create MFE end time directly in Chicago time
         if mfe_end_date.tz is not None:
             # Timezone-aware: create timestamp in same timezone (Chicago)
             mfe_end_time = mfe_end_date.replace(
-                hour=hour_part, 
-                minute=minute_part, 
+                hour=hour_part,
+                minute=minute_part,
                 second=0
             )
         else:
             # Naive timestamp (shouldn't happen, but handle it)
             mfe_end_time = mfe_end_date.replace(
-                hour=hour_part, 
-                minute=minute_part, 
+                hour=hour_part,
+                minute=minute_part,
                 second=0
             )
         
@@ -154,14 +159,15 @@ def _process_single_range(
     target_level = entry_detector.calculate_target_level(entry_px, entry_dir, target_pts)
     initial_sl = entry_detector.calculate_stop_loss(entry_px, entry_dir, target_pts, inst, R.range_size, R.range_high, R.range_low)
     
-    # Calculate expiry time
-    expiry_time = time_manager.get_expiry_time(R.date, time_label, sess)
+    # Calculate expiry time (session-based 02:00/08:00 for time mode)
+    expiry_time = time_manager.get_expiry_time(R.date, time_label, sess, rp.target_mode)
     
     # Execute trade with integrated MFE and break even logic
     trade_execution = price_tracker.execute_trade(
-        mfe_df, entry_time, entry_px, entry_dir, 
+        mfe_df, entry_time, entry_px, entry_dir,
         target_level, initial_sl, expiry_time,
-        target_pts, inst, time_label, R.date, debug
+        target_pts, inst, time_label, R.date, debug,
+        target_mode=rp.target_mode, session=sess
     )
     
     # Calculate profit using the integrated logic

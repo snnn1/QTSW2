@@ -71,7 +71,7 @@ public sealed class ReplayDriver
                 var tick = (ReplayTick)envelope.Payload;
                 var tickTime = tick.TickTimeFromEvent ?? _clock.NowEvent();
                 _clock.SetNow(tickTime);
-                _iea.EvaluateBreakEvenDirect(tick.TickPrice, tickTime, tick.ExecutionInstrument);
+                _iea.EvaluateBreakEvenDirect(tick.TickPrice, tickTime, hasEventTime: true, tick.ExecutionInstrument);
                 break;
         }
     }

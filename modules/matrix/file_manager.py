@@ -21,7 +21,8 @@ def save_master_matrix(
     df: pd.DataFrame,
     output_dir: str,
     specific_date: Optional[str] = None,
-    stream_filters: Optional[Dict] = None
+    stream_filters: Optional[Dict] = None,
+    timetable_output_dir: Optional[str] = None
 ) -> Tuple[Path, Path]:
     """
     Save master matrix to both Parquet and JSON formats.
@@ -99,7 +100,7 @@ def save_master_matrix(
                 )
                 df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
         
-        engine = TimetableEngine()
+        engine = TimetableEngine(timetable_output_dir=timetable_output_dir) if timetable_output_dir else TimetableEngine()
         engine.write_execution_timetable_from_master_matrix(
             df, 
             trade_date=specific_date,

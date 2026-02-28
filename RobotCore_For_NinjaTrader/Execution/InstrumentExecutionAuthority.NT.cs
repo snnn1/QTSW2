@@ -14,21 +14,6 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class InstrumentExecutionAuthority
 {
-    // Phase 3: Tick de-dupe (Trap B - event timestamp first)
-    private decimal _lastTickPriceForBE;
-    private DateTimeOffset _lastTickTimeFromEvent = DateTimeOffset.MinValue;
-    private const double BE_DEDUPE_FALLBACK_MS = 50; // When event timestamp unavailable
-
-    // Phase 3: BE evaluation state
-    private readonly Dictionary<string, DateTimeOffset> _lastBeModifyAttemptUtcByIntent = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, int> _beModifyFailureCountByIntent = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, DateTimeOffset> _beTriggerReachedPendingModification = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _beTriggeredIntentIds = new(StringComparer.OrdinalIgnoreCase);
-    private const double BE_MODIFY_ATTEMPT_INTERVAL_MS = 200;
-    private const int BE_MODIFY_MAX_RETRIES = 25;
-    private const double BE_SCAN_THROTTLE_MS = 200;
-    private DateTimeOffset _lastBeCheckUtc = DateTimeOffset.MinValue;
-
     // Phase 3: Trap G - queue serialization (replaces BE-specific lock; queue handles all mutations)
     /// <summary>
     /// Submit stop entry order. Tries aggregation first; falls back to single order.
@@ -454,47 +439,20 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         }
 
-        const int MAX_RETRIES = 3;
-        const int RETRY_DELAY_MS = 100;
-        OrderSubmissionResult? stopResult = null;
-        OrderSubmissionResult? targetResult = null;
-
-        for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
-        {
-            if (attempt > 0) System.Threading.Thread.Sleep(RETRY_DELAY_MS);
-            if (!Executor.CanSubmitExit(intentId, totalFilledQuantity))
-            {
-                var err = "Exit validation failed during retry";
-                stopResult = OrderSubmissionResult.FailureResult(err, utcNow);
-                targetResult = OrderSubmissionResult.FailureResult(err, utcNow);
-                break;
-            }
-
-            var protectiveOcoGroup = GenerateProtectiveOcoGroup(intentId, attempt, intent);
-            stopResult = Executor.SubmitProtectiveStop(intentId, intent.Instrument, intent.Direction!, intent.StopPrice!.Value, totalFilledQuantity, protectiveOcoGroup, utcNow);
-
-            if (stopResult.Success)
-            {
-                targetResult = Executor.SubmitTargetOrder(intentId, intent.Instrument, intent.Direction!, intent.TargetPrice!.Value, totalFilledQuantity, protectiveOcoGroup, utcNow);
-                if (targetResult.Success) break;
-            }
-            else
-            {
-                targetResult = OrderSubmissionResult.FailureResult("Target not attempted - stop failed first", utcNow);
-            }
-        }
-
-        if (!stopResult!.Success || targetResult == null || !targetResult.Success)
-        {
-            var failedLegs = new List<string>();
-            if (!stopResult.Success) failedLegs.Add($"STOP: {stopResult.ErrorMessage}");
-            if (targetResult != null && !targetResult.Success) failedLegs.Add($"TARGET: {targetResult.ErrorMessage}");
-            var failureReason = $"Protective orders failed after {MAX_RETRIES} retries: {string.Join(", ", failedLegs)}";
-            Executor.FailClosed(intentId, intent, failureReason, "PROTECTIVE_ORDERS_FAILED_FLATTENED", $"PROTECTIVE_FAILURE:{intentId}",
-                $"CRITICAL: Protective Order Failure - {intent.Instrument}",
-                $"Entry filled but protective orders failed. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. Failures: {failureReason}",
-                stopResult, targetResult, new { retry_count = MAX_RETRIES }, utcNow);
-        }
+        // NT THREADING FIX: Worker MUST NOT call account.Change/Cancel/Flatten. Enqueue for strategy thread.
+        var correlationId = $"PROTECTIVES:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+        var cmd = new NtSubmitProtectivesCommand(
+            correlationId,
+            intentId,
+            intent.Instrument ?? "",
+            intent.Direction!,
+            intent.StopPrice!.Value,
+            intent.TargetPrice!.Value,
+            totalFilledQuantity,
+            null, // OcoGroup generated in ExecuteSubmitProtectives
+            "ENTRY_FILL",
+            utcNow);
+        Executor.EnqueueNtAction(cmd);
     }
 
     /// <summary>Enqueue execution update for serialized processing.</summary>
@@ -550,6 +508,8 @@ public sealed partial class InstrumentExecutionAuthority
                     IsEntryOrder = false
                 };
                 OrderMap[mapKey] = oi;
+                if (isStop)
+                    Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
             }
         }
     }
@@ -646,12 +606,7 @@ public sealed partial class InstrumentExecutionAuthority
         }
         foreach (var kvp in _processedExecutionIds.OrderBy(k => k.Key))
             snap.DedupState[kvp.Key] = kvp.Value.ToString("o");
-        foreach (var kvp in _lastBeModifyAttemptUtcByIntent.OrderBy(k => k.Key))
-            snap.BeState[$"lastAttempt:{kvp.Key}"] = kvp.Value.ToString("o");
-        foreach (var kvp in _beTriggerReachedPendingModification.OrderBy(k => k.Key))
-            snap.BeState[$"triggerReached:{kvp.Key}"] = kvp.Value.ToString("o");
-        foreach (var id in _beTriggeredIntentIds.OrderBy(x => x))
-            snap.BeState[$"triggered:{id}"] = "1";
+        // BE state now in adapter (EvaluateBreakEvenCore); IEA no longer tracks it
 
         // BE diagnostics: per-intent BE state for invariant checks (keys sorted for determinism)
         if (Executor != null)
@@ -660,30 +615,14 @@ public sealed partial class InstrumentExecutionAuthority
             var activeIntents = Executor.GetActiveIntentsForBEMonitoring(null);
             foreach (var (intentId, intent, beTriggerPrice, entryPrice, _, direction) in activeIntents)
             {
-                var priceCrossed = snap.BeState.ContainsKey($"triggerReached:{intentId}") || snap.BeState.ContainsKey($"triggered:{intentId}");
-                var beTriggered = snap.BeState.ContainsKey($"triggered:{intentId}");
                 diagByIntent[intentId] = new BEDiagnosticSnapshot
                 {
                     IntentId = intentId,
                     BeTriggerPrice = beTriggerPrice,
                     EntryPrice = entryPrice,
                     Direction = direction ?? "",
-                    PriceCrossed = priceCrossed,
-                    BeTriggered = beTriggered
-                };
-            }
-            foreach (var id in _beTriggeredIntentIds)
-            {
-                if (diagByIntent.ContainsKey(id)) continue;
-                if (!IntentMap.TryGetValue(id, out var intent)) continue;
-                diagByIntent[id] = new BEDiagnosticSnapshot
-                {
-                    IntentId = id,
-                    BeTriggerPrice = intent.BeTrigger ?? 0,
-                    EntryPrice = intent.EntryPrice ?? 0,
-                    Direction = intent.Direction ?? "",
-                    PriceCrossed = true,
-                    BeTriggered = true
+                    PriceCrossed = false,
+                    BeTriggered = false
                 };
             }
             foreach (var kvp in diagByIntent.OrderBy(k => k.Key))
@@ -694,147 +633,23 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     /// <summary>
-    /// Phase 3: Evaluate break-even triggers directly (replay). Runs synchronously; no queue.
+    /// Phase 3: Evaluate break-even triggers directly (replay, NT strategy thread). Runs synchronously; no queue.
+    /// Delegates to Executor.EvaluateBreakEvenCore (single evaluation function; branch only at mutation).
     /// </summary>
-    internal void EvaluateBreakEvenDirect(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument)
+    internal void EvaluateBreakEvenDirect(decimal tickPrice, DateTimeOffset eventTime, bool hasEventTime, string executionInstrument)
     {
         if (Executor == null) return;
-        EvaluateBreakEvenCore(tickPrice, eventTime, true, executionInstrument);
+        Executor.EvaluateBreakEvenCore(tickPrice, eventTime, executionInstrument);
     }
 
     /// <summary>
-    /// Phase 3: Evaluate break-even triggers. One BE per position. Tick de-dupe (event timestamp first).
-    /// Enqueues via execution queue for serialization with fills.
+    /// Phase 3: Evaluate break-even triggers. Enqueues via execution queue for serialization with fills.
     /// </summary>
     public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)
     {
         if (Executor == null || Log == null) return;
-        var hasEventTime = tickTimeFromEvent.HasValue;
         var eventTime = tickTimeFromEvent ?? NowEvent();
-        Enqueue(() => EvaluateBreakEvenCore(tickPrice, eventTime, hasEventTime, executionInstrument));
-    }
-
-    /// <summary>BE evaluation core (runs on worker thread).</summary>
-    private void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, bool hasEventTime, string executionInstrument)
-    {
-        if (Executor == null) return;
-
-        var utcNow = NowEvent();
-
-        // 3.1 Tick de-dupe: if (price == lastPrice && eventTimestamp == lastTimestamp) return
-            if (hasEventTime)
-            {
-                if (tickPrice == _lastTickPriceForBE && eventTime == _lastTickTimeFromEvent)
-                    return;
-            }
-            else
-            {
-                // Fallback when event timestamp unavailable: 50ms window
-                if (tickPrice == _lastTickPriceForBE && (utcNow - _lastBeCheckUtc).TotalMilliseconds < BE_DEDUPE_FALLBACK_MS)
-                    return;
-            }
-            _lastTickPriceForBE = tickPrice;
-            _lastTickTimeFromEvent = eventTime;
-
-            // Scan throttle
-            if ((utcNow - _lastBeCheckUtc).TotalMilliseconds < BE_SCAN_THROTTLE_MS)
-                return;
-            _lastBeCheckUtc = utcNow;
-
-            var activeIntents = Executor.GetActiveIntentsForBEMonitoring(executionInstrument);
-            if (activeIntents.Count == 0) return;
-
-            var tickSize = Executor.GetTickSize();
-
-            foreach (var (intentId, intent, beTriggerPrice, entryPrice, actualFillPrice, direction) in activeIntents)
-            {
-                bool beTriggerReached = direction == "Long"
-                    ? tickPrice >= beTriggerPrice
-                    : direction == "Short"
-                        ? tickPrice <= beTriggerPrice
-                        : false;
-
-                if (!beTriggerReached)
-                {
-                    _beTriggerReachedPendingModification.Remove(intentId);
-                    continue;
-                }
-
-                _beTriggerReachedPendingModification.TryGetValue(intentId, out var triggerReachedAt);
-                if (triggerReachedAt == default)
-                {
-                    _beTriggerReachedPendingModification[intentId] = utcNow;
-                    triggerReachedAt = utcNow;
-                }
-
-                var breakoutLevel = entryPrice;
-                var beStopPrice = direction == "Long"
-                    ? breakoutLevel - tickSize
-                    : breakoutLevel + tickSize;
-
-                if ((utcNow - (_lastBeModifyAttemptUtcByIntent.TryGetValue(intentId, out var lastAttempt) ? lastAttempt : DateTimeOffset.MinValue)).TotalMilliseconds < BE_MODIFY_ATTEMPT_INTERVAL_MS)
-                    continue;
-                _lastBeModifyAttemptUtcByIntent[intentId] = utcNow;
-
-                var modifyResult = Executor.ModifyStopToBreakEven(intentId, intent.Instrument ?? "", beStopPrice, utcNow);
-
-                if (modifyResult.Success)
-                {
-                    _beTriggeredIntentIds.Add(intentId);
-                    _beTriggerReachedPendingModification.Remove(intentId);
-                    _lastBeModifyAttemptUtcByIntent.Remove(intentId);
-                    _beModifyFailureCountByIntent.Remove(intentId);
-                    if (Log != null)
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_TRIGGER_REACHED",
-                        new
-                        {
-                            direction,
-                            breakout_level = breakoutLevel,
-                            actual_fill_price = actualFillPrice,
-                            be_trigger_price = beTriggerPrice,
-                            be_stop_price = beStopPrice,
-                            tick_size = tickSize,
-                            tick_price = tickPrice,
-                            iea_instance_id = InstanceId,
-                            execution_instrument_key = ExecutionInstrumentKey,
-                            account_name = AccountName
-                        }));
-                }
-                else
-                {
-                    var errorMsg = modifyResult.ErrorMessage ?? "";
-                    var isRetryableError = errorMsg.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                          errorMsg.IndexOf("Stop order", StringComparison.OrdinalIgnoreCase) >= 0;
-                    var stopMissing = isRetryableError;
-
-                    var failCount = _beModifyFailureCountByIntent.TryGetValue(intentId, out var c) ? c + 1 : 1;
-                    _beModifyFailureCountByIntent[intentId] = failCount;
-
-                    if (failCount >= BE_MODIFY_MAX_RETRIES)
-                    {
-                        var actionTaken = stopMissing ? "FLATTEN" : "STAND_DOWN";
-                        if (Log != null)
-                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "BE_MODIFY_MAX_RETRIES_EXCEEDED",
-                            new
-                            {
-                                action_taken = actionTaken,
-                                failure_count = failCount,
-                                error = errorMsg,
-                                iea_instance_id = InstanceId,
-                                execution_instrument_key = ExecutionInstrumentKey,
-                                account_name = AccountName
-                            }));
-                        _beModifyFailureCountByIntent.Remove(intentId);
-                        _beTriggerReachedPendingModification.Remove(intentId);
-                        _lastBeModifyAttemptUtcByIntent.Remove(intentId);
-
-                        if (stopMissing)
-                            Executor.Flatten(intentId, intent.Instrument ?? "", utcNow);
-                        else
-                            Executor.StandDownStream(intent.Stream ?? "", utcNow, $"BE_MODIFY_MAX_RETRIES:{intentId}");
-                    }
-                }
-            }
+        Enqueue(() => Executor.EvaluateBreakEvenCore(tickPrice, eventTime, executionInstrument));
     }
 }
 #endif
