@@ -177,7 +177,16 @@ export async function startApp(app) {
     { method: 'POST' }
   )
 
-  return parseJSONSafe(res)
+  const text = await res.text()
+  if (!res.ok) {
+    let message = text || `HTTP ${res.status}`
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed.detail) message = parsed.detail
+    } catch (_) {}
+    throw new Error(message)
+  }
+  return text ? JSON.parse(text) : null
 }
 
 /* ===============================

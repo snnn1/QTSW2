@@ -113,8 +113,11 @@ export function PipelineControls({
             </button>
             <button
               onClick={() => onStartApp('analyzer')}
-              className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded font-medium text-sm text-gray-200"
-              title="Start and Open Analyzer App"
+              disabled={isRunning}
+              className={`px-4 py-2 rounded font-medium text-sm ${
+                isRunning ? 'bg-gray-600 cursor-not-allowed text-gray-400' : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+              }`}
+              title={isRunning ? 'Wait for pipeline to finish (avoids multiple analyzer instances)' : 'Start and Open Analyzer App'}
             >
               Analyzer
             </button>

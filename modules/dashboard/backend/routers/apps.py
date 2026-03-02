@@ -11,6 +11,15 @@ from typing import Dict
 router = APIRouter(prefix="/api/apps", tags=["apps"])
 logger = logging.getLogger(__name__)
 
+
+def get_orchestrator():
+    """Get orchestrator instance (shared with pipeline lock)."""
+    try:
+        from ..main import orchestrator_instance
+    except ImportError:
+        from main import orchestrator_instance
+    return orchestrator_instance
+
 # Get project root (assuming this file is in dashboard/backend/routers/)
 QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 
@@ -47,6 +56,17 @@ async def start_translator_app() -> Dict:
 async def start_analyzer_app() -> Dict:
     """Start the parallel analyzer script (same as used in pipeline)"""
     try:
+        # Prevent multiple analyzer instances: check pipeline lock before starting.
+        # The parallel analyzer is also run by the pipeline (Task Scheduler or Run Analyzer).
+        orchestrator = get_orchestrator()
+        if orchestrator:
+            locked = await orchestrator.lock_manager.is_locked()
+            if locked:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Pipeline or analyzer is already running. Wait for it to finish before starting another analyzer."
+                )
+
         if not PARALLEL_ANALYZER_SCRIPT.exists():
             raise HTTPException(status_code=404, detail=f"Parallel analyzer script not found at {PARALLEL_ANALYZER_SCRIPT}")
         
