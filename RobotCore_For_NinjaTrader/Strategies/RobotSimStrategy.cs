@@ -1784,7 +1784,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 foreach (var sessionClass in new[] { "S1", "S2" })
                 {
-                    var result = SessionCloseResolver.Resolve(Bars, spec, sessionClass, tradingDay);
+                    var result = SessionCloseResolver.Resolve(Bars, spec, sessionClass, tradingDay, strategyInstanceId: _instanceId);
                     _engine.SetSessionCloseResolved(tradingDay, sessionClass, result);
                 }
                 _lastSessionCloseResolvedTradingDay = tradingDay;

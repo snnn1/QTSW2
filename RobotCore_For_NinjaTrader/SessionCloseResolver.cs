@@ -17,6 +17,7 @@ namespace QTSW2.Robot.Core;
 public static class SessionCloseResolver
 {
     private const int DefaultBufferSeconds = 300;
+    private const int MaxStackTraceLength = 1500;
 
     /// <summary>
     /// Check if a TradingHours segment overlaps the timetable-eligible window for sessionClass.
@@ -66,18 +67,43 @@ public static class SessionCloseResolver
     /// Resolve session close for flatten using SessionIterator.
     /// Structural close: largest gap between segments defines the close (segment end before that gap).
     /// No timetable overlap, no time-of-day heuristic. If no segments = full holiday.
-    /// Returns SessionCloseResult; HasSession=false with FailureReason: HOLIDAY, NO_ELIGIBLE_SEGMENTS, ITERATION_ERROR, or EXCEPTION.
+    /// Returns SessionCloseResult; HasSession=false with structured FailureReason taxonomy.
     /// </summary>
     public static SessionCloseResult Resolve(
         Bars bars,
         ParitySpec paritySpec,
         string sessionClass,
         string targetTradingDay,
-        int bufferSeconds = DefaultBufferSeconds)
+        int bufferSeconds = DefaultBufferSeconds,
+        string? strategyInstanceId = null)
     {
-        var result = new SessionCloseResult { BufferSeconds = bufferSeconds };
+        var result = new SessionCloseResult { BufferSeconds = bufferSeconds, StrategyInstanceId = strategyInstanceId };
 
-        if (bars == null || paritySpec == null || (sessionClass != "S1" && sessionClass != "S2"))
+        try
+        {
+            return ResolveCore(bars, paritySpec, sessionClass, targetTradingDay, bufferSeconds, result);
+        }
+        catch (Exception ex)
+        {
+            result.HasSession = false;
+            result.FailureReason = "UNHANDLED_EXCEPTION";
+            PopulateExceptionMetadata(result, ex, bars);
+            TraceSessionCloseResolutionFailure(result);
+            Trace.TraceError($"[SessionCloseResolver] UNHANDLED_EXCEPTION: {ex}\n{ex.StackTrace}");
+            return result;
+        }
+    }
+
+    private static SessionCloseResult ResolveCore(
+        Bars? bars,
+        ParitySpec paritySpec,
+        string sessionClass,
+        string targetTradingDay,
+        int bufferSeconds,
+        SessionCloseResult result)
+    {
+        // Input validation (no try)
+        if (paritySpec == null || (sessionClass != "S1" && sessionClass != "S2"))
         {
             result.HasSession = false;
             result.FailureReason = "ITERATION_ERROR";
@@ -91,17 +117,97 @@ public static class SessionCloseResolver
             return result;
         }
 
+        // Defensive guards before any SessionIterator usage (no try)
+        if (bars == null)
+        {
+            result.HasSession = false;
+            result.FailureReason = "NO_BARS";
+            result.BarsCount = 0;
+            result.BarsInstrument = "N/A";
+            result.TradingHoursName = null;
+            result.ExceptionMessage = null;
+            result.ExceptionType = null;
+            result.StackTraceTruncated = null;
+            TraceSessionCloseResolutionFailure(result);
+            return result;
+        }
+
+        result.BarsCount = bars.Count;
+        result.BarsInstrument = GetInstrumentNameFromBars(bars);
+        result.TradingHoursName = GetTradingHoursNameFromBars(bars);
+
+        if (bars.Count == 0)
+        {
+            result.HasSession = false;
+            result.FailureReason = "EMPTY_BARS";
+            result.ExceptionMessage = null;
+            result.ExceptionType = null;
+            result.StackTraceTruncated = null;
+            TraceSessionCloseResolutionFailure(result);
+            return result;
+        }
+
+        if (GetTradingHoursFromBars(bars) == null)
+        {
+            result.HasSession = false;
+            result.FailureReason = "TRADING_HOURS_MISSING";
+            result.ExceptionMessage = null;
+            result.ExceptionType = null;
+            result.StackTraceTruncated = null;
+            TraceSessionCloseResolutionFailure(result);
+            return result;
+        }
+
+        // Timezone resolution (narrow try/catch)
+        TimeZoneInfo? tz;
         try
         {
-            // Windows uses "Central Standard Time"; Linux/macOS use "America/Chicago"
-            var tz = ResolveChicagoTimeZone();
-            var si = new SessionIterator(bars);
+            var (resolvedTz, tzEx) = ResolveChicagoTimeZone();
+            if (resolvedTz == null)
+            {
+                result.HasSession = false;
+                result.FailureReason = "TIMEZONE_ERROR";
+                PopulateExceptionMetadata(result, tzEx, bars);
+                TraceSessionCloseResolutionFailure(result);
+                Trace.TraceError($"[SessionCloseResolver] TIMEZONE_ERROR: {tzEx?.Message ?? "Unknown"}\n{tzEx?.StackTrace ?? ""}");
+                return result;
+            }
+            tz = resolvedTz;
+        }
+        catch (Exception ex)
+        {
+            result.HasSession = false;
+            result.FailureReason = "TIMEZONE_ERROR";
+            PopulateExceptionMetadata(result, ex, bars);
+            TraceSessionCloseResolutionFailure(result);
+            Trace.TraceError($"[SessionCloseResolver] TIMEZONE_ERROR: {ex}\n{ex.StackTrace}");
+            return result;
+        }
+
+        // SessionIterator creation (narrow try/catch)
+        SessionIterator si;
+        try
+        {
+            si = new SessionIterator(bars);
+        }
+        catch (Exception ex)
+        {
+            result.HasSession = false;
+            result.FailureReason = "SESSION_ITERATOR_ERROR";
+            PopulateExceptionMetadata(result, ex, bars);
+            TraceSessionCloseResolutionFailure(result);
+            Trace.TraceError($"[SessionCloseResolver] SESSION_ITERATOR_ERROR: {ex}\n{ex.StackTrace}");
+            return result;
+        }
+
+        // Session iteration logic (narrow try/catch)
+        try
+        {
             var segments = new List<(DateTimeOffset BeginUtc, DateTimeOffset EndUtc)>();
             var sawTargetDay = false;
 
-            // Start from day before target to ensure we capture first segment of target day
-            var cursor = targetDate.Date.AddDays(-1).AddHours(18); // Evening before
-            var maxIterations = 200; // Safety limit
+            var cursor = targetDate.Date.AddDays(-1).AddHours(18);
+            var maxIterations = 200;
             var iter = 0;
 
             while (iter++ < maxIterations)
@@ -111,20 +217,18 @@ public static class SessionCloseResolver
                 var tradingDayStr = tradingDayExchange.ToString("yyyy-MM-dd");
 
                 if (string.CompareOrdinal(tradingDayStr, targetTradingDay) > 0)
-                    break; // Advanced beyond target
+                    break;
 
                 var begin = si.ActualSessionBegin;
                 var end = si.ActualSessionEnd;
                 if (tradingDayStr == targetTradingDay)
                 {
                     sawTargetDay = true;
-                    // Flatten: collect ALL segments (no timetable filter, no time-of-day filter)
                     var beginOffset = new DateTimeOffset(begin, tz.GetUtcOffset(begin));
                     var endOffset = new DateTimeOffset(end, tz.GetUtcOffset(end));
                     segments.Add((beginOffset.ToUniversalTime(), endOffset.ToUniversalTime()));
                 }
 
-                // Advance to next session
                 si.GetNextSession(si.ActualSessionEnd, true);
                 cursor = si.ActualSessionBegin;
             }
@@ -146,7 +250,6 @@ public static class SessionCloseResolver
             }
             else
             {
-                // Sort by BeginUtc ascending
                 var sorted = segments.OrderBy(s => s.BeginUtc).ToList();
                 var indexOfLargestGap = -1;
                 var maxGap = TimeSpan.Zero;
@@ -168,7 +271,6 @@ public static class SessionCloseResolver
                 }
                 else
                 {
-                    // Fallback: no positive gap found (should not happen)
                     closeEndUtc = sorted[sorted.Count - 1].EndUtc;
                     Trace.TraceWarning($"[SessionCloseResolver] Resolve fallback: segments.Count={segments.Count} but no positive gap found. Using last segment EndUtc.");
                 }
@@ -179,30 +281,68 @@ public static class SessionCloseResolver
             result.FlattenTriggerUtc = flattenTriggerUtc;
             result.HasSession = true;
 
-            // Debug log at resolution time
             var closeEndChicago = TimeZoneInfo.ConvertTimeFromUtc(closeEndUtc.UtcDateTime, tz);
             var flattenTriggerChicago = TimeZoneInfo.ConvertTimeFromUtc(flattenTriggerUtc.UtcDateTime, tz);
-            var instrument = GetInstrumentNameFromBars(bars);
-            Trace.TraceInformation($"[SessionCloseResolver] Resolve: instrument={instrument} tradingDay={targetTradingDay} segmentCount={segments.Count} chosenCloseEndChicago={closeEndChicago:yyyy-MM-dd HH:mm:ss} largestGapMinutes={largestGapMinutes:F1} flattenTriggerChicago={flattenTriggerChicago:yyyy-MM-dd HH:mm:ss}");
+            Trace.TraceInformation($"[SessionCloseResolver] Resolve: instrument={result.BarsInstrument} tradingDay={targetTradingDay} segmentCount={segments.Count} chosenCloseEndChicago={closeEndChicago:yyyy-MM-dd HH:mm:ss} largestGapMinutes={largestGapMinutes:F1} flattenTriggerChicago={flattenTriggerChicago:yyyy-MM-dd HH:mm:ss}");
+            TraceSessionCloseResolutionSuccess(result, targetTradingDay, sessionClass);
         }
         catch (Exception ex)
         {
             result.HasSession = false;
-            result.FailureReason = "EXCEPTION";
-            result.ExceptionMessage = ex.Message;
+            result.FailureReason = "SESSION_CALCULATION_ERROR";
+            PopulateExceptionMetadata(result, ex, bars);
+            TraceSessionCloseResolutionFailure(result);
+            Trace.TraceError($"[SessionCloseResolver] SESSION_CALCULATION_ERROR: {ex}\n{ex.StackTrace}");
         }
 
         return result;
     }
 
-    private static TimeZoneInfo ResolveChicagoTimeZone()
+    /// <summary>
+    /// Try "Central Standard Time" first, fallback to "America/Chicago".
+    /// Returns (tz, null) on success; (null, exception) when both fail.
+    /// </summary>
+    private static (TimeZoneInfo? tz, Exception? ex) ResolveChicagoTimeZone()
     {
+        Exception? lastEx = null;
         foreach (var id in new[] { "Central Standard Time", "America/Chicago" })
         {
-            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
-            catch { /* try next */ }
+            try
+            {
+                return (TimeZoneInfo.FindSystemTimeZoneById(id), null);
+            }
+            catch (Exception ex)
+            {
+                lastEx = ex;
+            }
         }
-        throw new TimeZoneNotFoundException("Could not resolve Chicago timezone.");
+        return (null, lastEx ?? new TimeZoneNotFoundException("Could not resolve Chicago timezone."));
+    }
+
+    private static void PopulateExceptionMetadata(SessionCloseResult result, Exception? ex, Bars? bars)
+    {
+        result.ExceptionType = ex?.GetType()?.FullName ?? null;
+        result.ExceptionMessage = ex?.Message ?? null;
+        var stack = ex?.StackTrace;
+        result.StackTraceTruncated = string.IsNullOrEmpty(stack)
+            ? null
+            : stack.Length <= MaxStackTraceLength ? stack : stack.Substring(0, MaxStackTraceLength);
+        if (bars != null)
+        {
+            result.BarsCount = bars.Count;
+            result.BarsInstrument = GetInstrumentNameFromBars(bars);
+            result.TradingHoursName = GetTradingHoursNameFromBars(bars);
+        }
+    }
+
+    private static void TraceSessionCloseResolutionSuccess(SessionCloseResult result, string tradingDay, string sessionClass)
+    {
+        Trace.TraceInformation($"[SessionCloseResolver] SESSION_CLOSE_RESOLUTION_SUCCESS trading_day={tradingDay} session_class={sessionClass} instrument={result.BarsInstrument} bars_count={result.BarsCount}");
+    }
+
+    private static void TraceSessionCloseResolutionFailure(SessionCloseResult result)
+    {
+        Trace.TraceWarning($"[SessionCloseResolver] SESSION_CLOSE_RESOLUTION_FAILURE failure_reason={result.FailureReason} exception_type={result.ExceptionType ?? "N/A"} exception_message={result.ExceptionMessage ?? "N/A"} bars_count={result.BarsCount} bars_instrument={result.BarsInstrument ?? "N/A"} trading_hours_name={result.TradingHoursName ?? "N/A"} strategy_instance_id={result.StrategyInstanceId ?? "N/A"}");
     }
 
     private static string GetInstrumentNameFromBars(Bars bars)
@@ -217,6 +357,33 @@ public static class SessionCloseResolver
         catch
         {
             return "N/A";
+        }
+    }
+
+    private static object? GetTradingHoursFromBars(Bars bars)
+    {
+        try
+        {
+            if (bars == null) return null;
+            return (bars as dynamic)?.TradingHours;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? GetTradingHoursNameFromBars(Bars bars)
+    {
+        try
+        {
+            var th = GetTradingHoursFromBars(bars);
+            if (th == null) return null;
+            return (th as dynamic)?.Name;
+        }
+        catch
+        {
+            return null;
         }
     }
 

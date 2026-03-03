@@ -2122,6 +2122,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
                     buffer_seconds = r.BufferSeconds
                 }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLUTION_SUCCESS", state: "ENGINE",
+                new { trading_day = tradingDay, session_class = sessionClass, bars_count = r.BarsCount, bars_instrument = r.BarsInstrument ?? "N/A" }));
         }
         else
         {
@@ -2130,19 +2132,42 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 "HOLIDAY" => "SESSION_CLOSE_HOLIDAY",
                 "NO_ELIGIBLE_SEGMENTS" => "SESSION_CLOSE_NO_ELIGIBLE_SEGMENTS",
                 "ITERATION_ERROR" => "SESSION_CLOSE_ITERATION_ERROR",
-                "EXCEPTION" => "SESSION_CLOSE_EXCEPTION",
-                _ => "SESSION_CLOSE_HOLIDAY" // Backward compat: unknown reason defaults to legacy event
+                "NO_BARS" or "EMPTY_BARS" or "TRADING_HOURS_MISSING" or "TIMEZONE_ERROR" or "SESSION_ITERATOR_ERROR" or "SESSION_CALCULATION_ERROR" or "UNHANDLED_EXCEPTION" => "SESSION_CLOSE_RESOLUTION_FAILURE",
+                _ => "SESSION_CLOSE_RESOLUTION_FAILURE"
             };
             var note = r.FailureReason switch
             {
                 "HOLIDAY" => "Exchange holiday per TradingHours template",
                 "NO_ELIGIBLE_SEGMENTS" => "Sessions exist but none overlap timetable window",
                 "ITERATION_ERROR" => "Date resolution failed",
-                "EXCEPTION" => "Resolver threw",
-                _ => "No eligible segments"
+                "NO_BARS" => "Bars collection is null",
+                "EMPTY_BARS" => "Bars collection is empty",
+                "TRADING_HOURS_MISSING" => "Bars.TradingHours is null",
+                "TIMEZONE_ERROR" => "Chicago timezone resolution failed",
+                "SESSION_ITERATOR_ERROR" => "SessionIterator creation failed",
+                "SESSION_CALCULATION_ERROR" => "Session iteration/calculation threw",
+                "UNHANDLED_EXCEPTION" => "Unexpected exception in resolver",
+                _ => "Resolution failed"
             };
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE",
-                new { trading_day = tradingDay, session_class = sessionClass, failure_reason = r.FailureReason, exception_message = r.ExceptionMessage, note }));
+            var failurePayload = new Dictionary<string, object?>
+            {
+                ["trading_day"] = tradingDay,
+                ["session_class"] = sessionClass,
+                ["failure_reason"] = r.FailureReason ?? "UNKNOWN",
+                ["exception_type"] = r.ExceptionType ?? (object?)"",
+                ["exception_message"] = r.ExceptionMessage ?? (object?)"",
+                ["stack_trace_truncated"] = r.StackTraceTruncated ?? (object?)"",
+                ["bars_count"] = r.BarsCount,
+                ["bars_instrument"] = r.BarsInstrument ?? "N/A",
+                ["trading_hours_name"] = r.TradingHoursName ?? "N/A",
+                ["strategy_instance_id"] = r.StrategyInstanceId ?? "N/A",
+                ["note"] = note
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE", failurePayload));
+            if (r.ExceptionType != null || !string.IsNullOrEmpty(r.ExceptionMessage) || !string.IsNullOrEmpty(r.StackTraceTruncated))
+            {
+                System.Diagnostics.Trace.TraceError($"[SessionClose] {r.FailureReason}: {r.ExceptionType ?? "N/A"} {r.ExceptionMessage ?? ""}\n{r.StackTraceTruncated ?? ""}");
+            }
         }
     }
 
