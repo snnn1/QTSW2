@@ -25,6 +25,21 @@ export interface WatchdogStatus {
   // PATTERN 1: Bars expected observability
   bars_expected_count?: number;
   worst_last_bar_age_seconds?: number | null;
+  // Fill health (execution logging hygiene)
+  fill_health?: FillHealthInfo | null;
+  trading_date?: string | null;
+}
+
+export interface FillHealthInfo {
+  trading_date: string;
+  total_fills: number;
+  mapped_fills: number;
+  unmapped_fills: number;
+  null_trading_date_fills: number;
+  fill_coverage_rate: number;
+  unmapped_rate: number;
+  null_trading_date_rate: number;
+  fill_health_ok: boolean;
 }
 
 export interface StreamStuckInfo {

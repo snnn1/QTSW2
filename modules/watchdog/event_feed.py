@@ -40,7 +40,11 @@ class EventFeedGenerator:
         # Rate limiting for BAR_RECEIVED_NO_STREAMS (very frequent, only write every 60 seconds)
         self._last_bar_received_no_streams_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
         self._BAR_RECEIVED_NO_STREAMS_RATE_LIMIT_SECONDS = 60  # Only write BAR_RECEIVED_NO_STREAMS every 60 seconds
-        
+        # Rate limiting for timetable events (TIMETABLE_VALIDATED, TIMETABLE_UPDATED, TIMETABLE_LOADED)
+        # Only write one timetable event per 30 min - trim verbose periodic validation
+        self._last_timetable_event_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
+        self._TIMETABLE_EVENT_RATE_LIMIT_MINUTES = 30
+
     def _convert_utc_to_chicago(self, utc_timestamp_str: str) -> str:
         """Convert UTC timestamp string to Chicago timezone."""
         try:
@@ -184,7 +188,31 @@ class EventFeedGenerator:
                 except Exception as e:
                     # If timestamp parsing fails, allow event through (better to log than miss)
                     logger.debug(f"Failed to parse timestamp for BAR_RECEIVED_NO_STREAMS rate limiting: {e}")
-        
+
+        # Rate limit timetable events (TIMETABLE_VALIDATED, TIMETABLE_UPDATED, TIMETABLE_LOADED)
+        # Only write one per 30 min - trim verbose periodic validation from feed
+        if event_type in ("TIMETABLE_VALIDATED", "TIMETABLE_UPDATED", "TIMETABLE_LOADED"):
+            timestamp_utc = self._extract_timestamp_utc(event)
+            if timestamp_utc:
+                try:
+                    event_time = datetime.fromisoformat(timestamp_utc.replace('Z', '+00:00'))
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+
+                    last_written = self._last_timetable_event_time.get(run_id)
+                    if last_written:
+                        elapsed_min = (event_time - last_written).total_seconds() / 60
+                        if elapsed_min < self._TIMETABLE_EVENT_RATE_LIMIT_MINUTES:
+                            logger.debug(
+                                f"Timetable event rate-limited: run_id={run_id}, type={event_type}, "
+                                f"elapsed={elapsed_min:.1f}min < {self._TIMETABLE_EVENT_RATE_LIMIT_MINUTES}min"
+                            )
+                            return None
+
+                    self._last_timetable_event_time[run_id] = event_time
+                except Exception as e:
+                    logger.debug(f"Failed to parse timestamp for timetable rate limiting: {e}")
+
         # Increment event_seq for this run_id (starts at 1, increments by 1)
         if run_id not in self._event_seq_by_run_id:
             self._event_seq_by_run_id[run_id] = 0  # Will be incremented to 1

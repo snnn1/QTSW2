@@ -6,15 +6,75 @@ in both Parquet and JSON formats.
 """
 
 import logging
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional, Tuple, Dict
-from datetime import datetime
+from datetime import datetime, timezone
+
 import pandas as pd
 
 from .utils import _enforce_trade_date_invariants
 
 logger = logging.getLogger(__name__)
+
+
+def _trigger_eligibility_builder_async(trading_date: str, output_dir: str) -> None:
+    """
+    Fire-and-forget: spawn background thread to run eligibility_builder.py.
+    Never blocks or raises. Logs success/failure.
+    Uses absolute paths so cwd does not affect file resolution.
+    """
+    def _run():
+        try:
+            project_root = Path(__file__).resolve().parent.parent.parent
+            script_path = project_root / "scripts" / "eligibility_builder.py"
+            if not script_path.exists():
+                logger.warning("ELIGIBILITY_BUILDER_SKIP: script not found at %s", script_path)
+                return
+            timetable_dir = (project_root / "data" / "timetable").resolve()
+            matrix_dir = (project_root / output_dir).resolve()
+            python_exe = sys.executable or "python"
+            cmd = [
+                python_exe, str(script_path),
+                "--date", trading_date,
+                "--output-dir", str(timetable_dir),
+                "--master-matrix-dir", str(matrix_dir),
+            ]
+            logger.info("ELIGIBILITY_BUILDER_TRIGGERED: trading_date=%s output=%s", trading_date, timetable_dir)
+            result = subprocess.run(
+                cmd,
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                logger.info("ELIGIBILITY_BUILDER_COMPLETED: exit_code=0")
+            else:
+                stderr_trunc = (result.stderr or "")[:500]
+                logger.warning(
+                    "ELIGIBILITY_BUILDER_FAILED: exit_code=%s stderr=%s",
+                    result.returncode,
+                    stderr_trunc,
+                )
+        except subprocess.TimeoutExpired:
+            logger.warning("ELIGIBILITY_BUILDER_FAILED: timeout")
+        except Exception as e:
+            logger.warning("ELIGIBILITY_BUILDER_FAILED: %s", e)
+
+
+def _trigger_eligibility_builder_after_save(output_dir: str = "data/master_matrix") -> None:
+    """Trigger eligibility builder in background using CME trading date."""
+    try:
+        from modules.timetable.cme_session import get_trading_date_cme
+        utc_now = datetime.now(timezone.utc)
+        trading_date = get_trading_date_cme(utc_now)
+        t = threading.Thread(target=_trigger_eligibility_builder_async, args=(trading_date, output_dir), daemon=True)
+        t.start()
+    except Exception as e:
+        logger.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP: %s", e)
 
 
 def save_master_matrix(
@@ -102,11 +162,13 @@ def save_master_matrix(
         
         engine = TimetableEngine(timetable_output_dir=timetable_output_dir) if timetable_output_dir else TimetableEngine()
         engine.write_execution_timetable_from_master_matrix(
-            df, 
+            df,
             trade_date=specific_date,
-            stream_filters=stream_filters
+            stream_filters=stream_filters,
+            execution_mode=True,  # Robot path: eligibility artifact only; never manual filters
         )
         logger.info("Execution timetable persisted from master matrix")
+        _trigger_eligibility_builder_after_save(output_dir=output_dir)
     except Exception as e:
         # Log but don't fail matrix save if timetable persistence fails
         logger.warning(f"Failed to persist execution timetable: {e}")
@@ -118,7 +180,11 @@ def save_master_matrix(
 
 def load_existing_matrix(output_dir: str) -> pd.DataFrame:
     """
-    Load the most recent existing master matrix file.
+    Load the master matrix file with the most rows (fullest history).
+    
+    Prefers files with more rows over the most recent file, so a truncated
+    resequence does not replace a full rebuild. Checks the 10 most recent
+    files to avoid loading too many.
     
     Args:
         output_dir: Directory containing master matrix files
@@ -132,18 +198,24 @@ def load_existing_matrix(output_dir: str) -> pd.DataFrame:
     if output_path.exists():
         parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
         if parquet_files:
-            try:
-                existing_df = pd.read_parquet(parquet_files[0])
-                logger.info(f"Loaded existing master matrix: {len(existing_df)} trades")
+            best_df = None
+            best_rows = 0
+            for pf in parquet_files[:10]:
+                try:
+                    df = pd.read_parquet(pf)
+                    if len(df) > best_rows:
+                        best_rows = len(df)
+                        best_df = df
+                except Exception as e:
+                    logger.debug(f"Could not load {pf.name}: {e}")
+            if best_df is not None:
+                existing_df = best_df
+                logger.info(f"Loaded existing master matrix: {len(existing_df)} trades (fullest of {min(10, len(parquet_files))} recent files)")
                 
                 # After parquet load: enforce invariants (fail-closed)
                 # trade_date canonical, Date derived for legacy compatibility only
-                # Must use pd.to_datetime(errors='raise') for any repair attempt; no errors='coerce'
-                # Always sync Date from trade_date if Date exists
                 if not existing_df.empty:
                     _enforce_trade_date_invariants(existing_df, "parquet_reload")
-            except Exception as e:
-                logger.warning(f"Could not load existing master matrix: {e}")
     
     return existing_df
 
@@ -164,6 +236,30 @@ def get_latest_matrix_file(output_dir: str) -> Optional[Path]:
     
     parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
     return parquet_files[0] if parquet_files else None
+
+
+def get_best_matrix_file(output_dir: str) -> Optional[Path]:
+    """
+    Get the path to the master matrix file with the most rows (fullest history).
+    Used by resequence and API so truncated resequences do not replace full rebuilds.
+    """
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+    parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
+    if not parquet_files:
+        return None
+    best_path = None
+    best_rows = 0
+    for pf in parquet_files[:10]:
+        try:
+            df = pd.read_parquet(pf)
+            if len(df) > best_rows:
+                best_rows = len(df)
+                best_path = pf
+        except Exception:
+            pass
+    return best_path
 
 
 

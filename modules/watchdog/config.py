@@ -120,6 +120,9 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "ORDER_CANCELLED",
     "EXECUTION_FILLED",
     "EXECUTION_PARTIAL_FILL",
+    "EXECUTION_EXIT_FILL",  # Migration: ledger converts to synthetic EXECUTION_FILLED; robot now emits EXECUTION_FILLED for exits
+    "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL",
+    "EXECUTION_FILL_UNMAPPED",
     # Protective Orders
     "PROTECTIVE_ORDERS_SUBMITTED",
     "PROTECTIVE_ORDERS_FAILED_FLATTENED",
@@ -134,6 +137,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Critical Events
     "CRITICAL_EVENT_REPORTED",
     "EXECUTION_GATE_INVARIANT_VIOLATION",
+    "LEDGER_INVARIANT_VIOLATION",  # Phase 2.3: execution_sequence, exit_side, exit_qty
     # Deployment and Configuration
     "DUPLICATE_INSTANCE_DETECTED",  # Critical for detecting invalid deployments
     "EXECUTION_POLICY_VALIDATION_FAILED",  # Important for execution monitoring

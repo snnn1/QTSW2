@@ -1155,6 +1155,34 @@ class WatchdogAggregator:
         try:
             status = self._state_manager.compute_watchdog_status()
             status["timestamp_chicago"] = datetime.now(CHICAGO_TZ).isoformat()
+            # Add fill_health from execution logging metrics (today's trading date)
+            try:
+                trading_date = self._state_manager.get_trading_date()
+                if not trading_date:
+                    trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+                from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
+                fill_metrics = compute_fill_metrics(trading_date)
+                status["fill_health"] = {
+                    "trading_date": fill_metrics["trading_date"],
+                    "total_fills": fill_metrics["total_fills"],
+                    "mapped_fills": fill_metrics["mapped_fills"],
+                    "unmapped_fills": fill_metrics["unmapped_fills"],
+                    "null_trading_date_fills": fill_metrics["null_trading_date_fills"],
+                    "fill_coverage_rate": fill_metrics["fill_coverage_rate"],
+                    "unmapped_rate": fill_metrics["unmapped_rate"],
+                    "null_trading_date_rate": fill_metrics["null_trading_date_rate"],
+                    "fill_health_ok": (
+                        fill_metrics.get("fill_coverage_rate", 1.0) >= 1.0
+                        and fill_metrics.get("unmapped_rate", 0) <= 0
+                        and fill_metrics.get("null_trading_date_rate", 0) <= 0
+                    ),
+                }
+                status["trading_date"] = trading_date
+            except Exception as e:
+                logger.debug(f"Could not compute fill_health: {e}")
+                status["fill_health"] = None
+                if "trading_date" not in status:
+                    status["trading_date"] = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -1330,10 +1358,10 @@ class WatchdogAggregator:
                             # Treat as if no watchdog state exists - use timetable defaults
                             watchdog_info = None
                         else:
-                            # CRITICAL: Also verify ranges are None if state is not RANGE_LOCKED
+                            # CRITICAL: Also verify ranges are None if state is not RANGE_LOCKED or OPEN
                             # This prevents showing stale ranges from previous sessions
                             watchdog_state = getattr(watchdog_info, 'state', '')
-                            if watchdog_state != "RANGE_LOCKED":
+                            if watchdog_state not in ("RANGE_LOCKED", "OPEN"):
                                 # If state is not RANGE_LOCKED, ranges should be None
                                 # Clear them defensively to prevent stale data
                                 if getattr(watchdog_info, 'range_high', None) is not None or \
@@ -1385,11 +1413,11 @@ class WatchdogAggregator:
                             "state_entry_time_utc": state_entry_time_utc.isoformat(),
                             "range_locked_time_utc": (
                                 state_entry_time_utc.isoformat()
-                                if getattr(watchdog_info, 'state', '') == "RANGE_LOCKED" else None
+                                if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
                             ),
                             "range_locked_time_chicago": (
                                 state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
-                                if getattr(watchdog_info, 'state', '') == "RANGE_LOCKED" else None
+                                if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
                             )
                         })
                     else:
@@ -1481,11 +1509,11 @@ class WatchdogAggregator:
                         "state_entry_time_utc": state_entry_time_utc.isoformat(),
                         "range_locked_time_utc": (
                             state_entry_time_utc.isoformat()
-                            if getattr(info, 'state', '') == "RANGE_LOCKED" else None
+                            if getattr(info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
                         ),
                         "range_locked_time_chicago": (
                             state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
-                            if getattr(info, 'state', '') == "RANGE_LOCKED" else None
+                            if getattr(info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
                         )
                     })
                 

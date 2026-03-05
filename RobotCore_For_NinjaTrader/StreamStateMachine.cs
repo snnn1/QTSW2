@@ -618,12 +618,13 @@ public sealed class StreamStateMachine
 
     public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
     {
-        // NQ2 FIX: Prevent slot_time changes after stream initialization if stream is past PRE_HYDRATION
-        // This prevents timetable updates from changing slot_time mid-session
-        if (State != StreamState.PRE_HYDRATION && SlotTimeChicago != newSlotTimeChicago)
+        // NQ2 FIX: Allow slot_time updates during PRE_HYDRATION and RANGE_BUILDING (before range lock).
+        // Reject once RANGE_LOCKED or beyond - prevents mid-session changes after commitment.
+        var allowUpdate = State == StreamState.PRE_HYDRATION || State == StreamState.RANGE_BUILDING;
+        if (!allowUpdate && SlotTimeChicago != newSlotTimeChicago)
         {
             var warningMsg = $"WARNING: Attempted to update slot_time from '{SlotTimeChicago}' to '{newSlotTimeChicago}' " +
-                           $"but stream is already in state '{State}'. Slot_time changes are only allowed during PRE_HYDRATION. " +
+                           $"but stream is already in state '{State}'. Slot_time changes are only allowed during PRE_HYDRATION or RANGE_BUILDING. " +
                            $"Ignoring update to prevent mid-session slot_time changes.";
             
             LogHealth("WARN", "SLOT_TIME_UPDATE_REJECTED", warningMsg, new

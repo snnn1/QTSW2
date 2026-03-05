@@ -329,8 +329,12 @@ public static class RobotEventTypes
         // Slot persistence
         ["FORCED_FLATTEN_MARKET_CLOSE"] = "WARN",
         ["FORCED_FLATTEN_TRIGGERED"] = "INFO",
+        ["FORCED_FLATTEN_SKIP_NO_CACHE"] = "WARN",
         ["SESSION_CLOSE_RESOLVED"] = "INFO",
         ["SESSION_CLOSE_HOLIDAY"] = "INFO",
+        ["SESSION_CLOSE_FALLBACK_USED"] = "WARN",
+        ["SESSION_CLOSE_FALLBACK_FAILED"] = "CRITICAL",
+        ["SESSION_CLOSE_CACHE_MISSING"] = "ERROR",
         ["REENTRY_SUBMITTED"] = "INFO",
         ["REENTRY_FILLED"] = "INFO",
         ["REENTRY_PROTECTION_ACCEPTED"] = "INFO",

@@ -132,7 +132,19 @@ function AppContent() {
     }
     return true // Default: show filtered days
   })
-  
+
+  // Show/Hide blocked rows in timetable (default: ON/show blocked)
+  const [showBlockedTimetableRows, setShowBlockedTimetableRows] = useState(() => {
+    const saved = localStorage.getItem('matrix_show_blocked_timetable')
+    if (saved !== null) {
+      return saved === 'true'
+    }
+    return true // Default: show blocked rows
+  })
+
+  // Session eligibility freeze status (for timetable tab notice)
+  const [eligibilityStatus, setEligibilityStatus] = useState(null)
+
   // Matrix controller hook - handles all matrix orchestration
   const {
     // Backend data state
@@ -197,7 +209,23 @@ function AppContent() {
   useEffect(() => {
     localStorage.setItem('matrix_auto_update_enabled', String(autoUpdateEnabled))
   }, [autoUpdateEnabled])
-  
+
+  // Fetch eligibility status when timetable tab is active; refresh every 60s
+  useEffect(() => {
+    if (activeTab !== 'timetable') return
+    const fetchEligibility = async () => {
+      try {
+        const status = await matrixApi.getEligibilityStatus()
+        setEligibilityStatus(status)
+      } catch {
+        setEligibilityStatus(null)
+      }
+    }
+    fetchEligibility()
+    const interval = setInterval(fetchEligibility, 60000)
+    return () => clearInterval(interval)
+  }, [activeTab])
+
   // Per-stream selected columns (persisted in localStorage)
   const [selectedColumns, setSelectedColumns] = useState(() => {
     const saved = localStorage.getItem('matrix_selected_columns')
@@ -218,6 +246,11 @@ function AppContent() {
   useEffect(() => {
     localStorage.setItem('matrix_show_filtered_days', String(showFilteredDays))
   }, [showFilteredDays])
+
+  // Save showBlockedTimetableRows to localStorage when it changes
+  useEffect(() => {
+    localStorage.setItem('matrix_show_blocked_timetable', String(showBlockedTimetableRows))
+  }, [showBlockedTimetableRows])
   
   // Stats visibility per stream
   // Full-dataset stats from backend (calculated from all rows, not just loaded subset)
@@ -3450,7 +3483,16 @@ function AppContent() {
           <div className="space-y-6">
             <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-6">
-                <h2 className="text-xl font-semibold">Trading Timetable</h2>
+                <div className="flex items-center gap-3">
+                  <h2 className="text-xl font-semibold">Trading Timetable</h2>
+                  <button
+                    onClick={() => setShowBlockedTimetableRows(!showBlockedTimetableRows)}
+                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700"
+                    title={showBlockedTimetableRows ? 'Hide blocked rows' : 'Show blocked rows'}
+                  >
+                    {showBlockedTimetableRows ? '✓' : ''} Blocked
+                  </button>
+                </div>
                 <div className="text-center">
                   <div className="text-lg font-semibold text-gray-300">
                     {currentTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
@@ -3508,6 +3550,33 @@ function AppContent() {
                   )}
                 </div>
               </div>
+
+              {/* Session eligibility freeze notice */}
+              <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm">
+                {eligibilityStatus ? (
+                  <span className="text-gray-300">
+                    Session eligibility frozen for <span className="font-semibold text-green-400">{eligibilityStatus.trading_date}</span> at{' '}
+                    <span className="font-mono">
+                      {eligibilityStatus.freeze_time_utc
+                        ? new Date(eligibilityStatus.freeze_time_utc).toLocaleString('en-US', {
+                            timeZone: 'America/Chicago',
+                            month: 'short',
+                            day: 'numeric',
+                            year: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                            second: '2-digit'
+                          }) + ' CT'
+                        : eligibilityStatus.freeze_time_utc}
+                    </span>
+                    {eligibilityStatus.eligible_stream_count != null && (
+                      <span className="text-gray-500 ml-2">({eligibilityStatus.eligible_stream_count} eligible)</span>
+                    )}
+                  </span>
+                ) : (
+                  <span className="text-gray-500">No eligibility file yet</span>
+                )}
+              </div>
               
               {masterLoading ? (
                 <div className="text-center py-8">Loading data...</div>
@@ -3537,6 +3606,7 @@ function AppContent() {
                       </thead>
                       <tbody>
                         {workerTimetable
+                          .filter(row => showBlockedTimetableRows || row.Enabled !== false)
                           .map((row, idx) => {
                             const isDisabled = row.Enabled === false
                             return (
@@ -3695,9 +3765,9 @@ function AppContent() {
                   <button
                     onClick={() => setShowFilteredDays(!showFilteredDays)}
                     className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
-                    title={showFilteredDays ? "Hide filtered days (DOW/DOM excluded)" : "Show filtered days"}
+                    title={showFilteredDays ? "Hide rows blocked by filters (DOW, DOM, Times)" : "Show rows blocked by filters (DOW, DOM, Times)"}
                   >
-                    {showFilteredDays ? '✓' : ''} Filtered Days
+                    {showFilteredDays ? '✓' : ''} Filtered Rows
                   </button>
                   <button
                     onClick={() => resequenceMasterMatrix(40)}
@@ -3939,9 +4009,9 @@ function AppContent() {
                   <button
                     onClick={() => setShowFilteredDays(!showFilteredDays)}
                     className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-800"
-                    title={showFilteredDays ? "Hide filtered days (DOW/DOM excluded)" : "Show filtered days"}
+                    title={showFilteredDays ? "Hide rows blocked by filters (DOW, DOM, Times)" : "Show rows blocked by filters (DOW, DOM, Times)"}
                   >
-                    {showFilteredDays ? '✓' : ''} Filtered Days
+                    {showFilteredDays ? '✓' : ''} Filtered Rows
                   </button>
                   <button
                     onClick={() => loadMasterMatrix(true, activeTab)}

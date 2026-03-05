@@ -19,4 +19,7 @@ public sealed class SessionCloseResult
 
     /// <summary>Buffer seconds before close (e.g., 300).</summary>
     public int BufferSeconds { get; set; }
+
+    /// <summary>Instrument name for logging (e.g., ES, NQ).</summary>
+    public string? BarsInstrument { get; set; }
 }

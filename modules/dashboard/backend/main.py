@@ -816,6 +816,13 @@ async def generate_timetable(request: TimetableRequest):
                 "allowed": 0
             }
         
+        # Trigger eligibility builder (matrix-derived); skips if generate had no_rs_data
+        try:
+            from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
+            _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
+        except Exception as e:
+            logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable generate: %s", e)
+        
         # Execution timetable (timetable_current.json) is automatically written by generate_timetable()
         # No need to call save_timetable() - canonical file is the single source of truth
         
@@ -851,13 +858,16 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         output_dir = QTSW2_ROOT / "data" / "timetable"
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Clean up old files
+        # Clean up old timetable files only (never delete eligibility_*.json — robot fails closed without them)
         for file_path in output_dir.iterdir():
-            if file_path.name != "timetable_current.json" and file_path.name != "timetable_current.tmp":
-                try:
-                    file_path.unlink()
-                except:
-                    pass
+            if file_path.name in ("timetable_current.json", "timetable_current.tmp"):
+                continue
+            if file_path.name.startswith("eligibility_"):
+                continue
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
         
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
@@ -924,6 +934,29 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             
             # Atomic rename
             temp_file.replace(final_file)
+
+            # Write eligibility from timetable (source of truth) — robot trades only enabled streams
+            try:
+                from modules.timetable.eligibility_writer import write_eligibility_file
+                streams_for_eligibility = [
+                    {"stream": s.stream, "enabled": s.enabled, "block_reason": None if s.enabled else "disabled_by_timetable"}
+                    for s in request.streams
+                ]
+                write_eligibility_file(
+                    streams_for_eligibility,
+                    trading_date=trading_date,
+                    output_dir=str(output_dir),
+                    overwrite=True,
+                )
+            except Exception as e:
+                logging.warning("ELIGIBILITY_WRITE_FROM_TIMETABLE_SKIP: %s", e)
+
+            # Trigger eligibility builder in background (will skip — file exists)
+            try:
+                from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
+                _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
+            except Exception as e:
+                logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable save: %s", e)
             
             return {
                 "status": "success",
@@ -982,6 +1015,39 @@ async def list_timetable_files():
         return {"files": files[:20]}  # Return last 20 files
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list timetable files: {str(e)}")
+
+
+@app.get("/api/timetable/eligibility/status")
+async def get_eligibility_status():
+    """Get latest session eligibility freeze status (most recent by file mtime)."""
+    logger = logging.getLogger(__name__)
+    try:
+        timetable_dir = QTSW2_ROOT / "data" / "timetable"
+        if not timetable_dir.exists():
+            return {"status": "none"}
+        eligibility_files = sorted(
+            timetable_dir.glob("eligibility_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not eligibility_files:
+            return {"status": "none"}
+        for file_path in eligibility_files:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return {
+                    "trading_date": data.get("trading_date", ""),
+                    "freeze_time_utc": data.get("freeze_time_utc", ""),
+                    "eligible_stream_count": data.get("eligible_stream_count", 0),
+                }
+            except Exception as e:
+                logger.warning("ELIGIBILITY_STATUS_READ_FAILED: file=%s error=%s", file_path.name, e)
+                continue
+        return {"status": "none"}
+    except Exception as e:
+        logger.warning("ELIGIBILITY_STATUS_ERROR: %s", e)
+        return {"status": "none"}
 
 
 if __name__ == "__main__":

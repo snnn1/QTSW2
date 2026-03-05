@@ -28,7 +28,33 @@ public sealed class ExecutionJournal
     {
         _journalDir = Path.Combine(projectRoot, "data", "execution_journals");
         Directory.CreateDirectory(_journalDir);
+        ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
         _log = log;
+    }
+    
+    /// <summary>
+    /// Phase 3.2: Startup self-check. Verifies journal dir exists and is writable.
+    /// Writes and reads .startup_check; throws on failure (fail closed).
+    /// </summary>
+    private void ValidateJournalDirectory()
+    {
+        if (!Directory.Exists(_journalDir))
+            throw new InvalidOperationException($"ExecutionJournal: journal directory does not exist: {_journalDir}");
+        
+        var checkPath = Path.Combine(_journalDir, ".startup_check");
+        try
+        {
+            var testContent = DateTimeOffset.UtcNow.ToString("o");
+            File.WriteAllText(checkPath, testContent);
+            var readBack = File.ReadAllText(checkPath);
+            if (readBack != testContent)
+                throw new InvalidOperationException($"ExecutionJournal: startup check read-back mismatch for {_journalDir}");
+            File.Delete(checkPath);
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            throw new InvalidOperationException($"ExecutionJournal: journal directory not writable: {_journalDir}", ex);
+        }
     }
     
     /// <summary>

@@ -1627,6 +1627,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>
     /// Resolve intent context or fail-closed.
     /// Returns true if context resolved successfully, false if orphan fill detected.
+    /// When order is provided and resolution fails, emits EXECUTION_FILLED(mapped=false) before fail-closed.
     /// </summary>
     private bool ResolveIntentContextOrFailClosed(
         string intentId, 
@@ -1636,12 +1637,14 @@ public sealed partial class NinjaTraderSimAdapter
         decimal fillPrice, 
         int fillQuantity, 
         DateTimeOffset utcNow, 
-        out IntentContext context)
+        out IntentContext context,
+        Order? order = null)
     {
         context = default;
         
         if (!IntentMap.TryGetValue(intentId, out var intent))
         {
+            EmitUnmappedFill(instrument, "INTENT_NOT_FOUND", fillPrice, fillQuantity, utcNow, order?.OrderId, order, tag: encodedTag);
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "INTENT_NOT_FOUND");
             
@@ -1941,6 +1944,7 @@ public sealed partial class NinjaTraderSimAdapter
         var order = record.Order as Order;
         var intentId = record.IntentId;
         var instrument = record.Instrument;
+        EmitUnmappedFill(instrument, "UNKNOWN_ORDER_AFTER_GRACE", record.FillPrice, record.FillQuantity, utcNow, order?.OrderId, order, tag: record.EncodedTag);
         LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
             new { error = "Order not found in map after 500ms grace", broker_order_id = order?.OrderId, intent_id = intentId, fill_price = record.FillPrice, fill_quantity = record.FillQuantity, account_name = _iea?.AccountName });
         if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
@@ -2035,27 +2039,20 @@ public sealed partial class NinjaTraderSimAdapter
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             
             // Broker flatten recognition: if we recently called Flatten for this instrument,
-            // this fill is likely our own flatten order - don't flatten again
+            // this fill is our own flatten order - route through canonical exit path (P0)
             lock (_flattenRecognitionLock)
             {
                 if (!string.IsNullOrEmpty(_lastFlattenInstrument) &&
-                    string.Equals(_lastFlattenInstrument, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    ExecutionInstrumentResolver.IsSameInstrument(_lastFlattenInstrument, instrument) &&
                     (utcNow - _lastFlattenUtc).TotalSeconds < FLATTEN_RECOGNITION_WINDOW_SECONDS)
                 {
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "BROKER_FLATTEN_FILL_RECOGNIZED",
-                        new
-                        {
-                            broker_order_id = order.OrderId,
-                            fill_price = fillPrice,
-                            fill_quantity = fillQuantity,
-                            seconds_since_flatten = (utcNow - _lastFlattenUtc).TotalSeconds,
-                            note = "Fill has no QTSW2 tag but we recently called Flatten for this instrument - treating as broker flatten order fill, skipping redundant flatten"
-                        }));
+                    ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order);
                     CheckAllInstrumentsForFlatPositions(utcNow);
                     return;
                 }
             }
             
+            EmitUnmappedFill(instrument, "UNTrackED_TAG", fillPrice, fillQuantity, utcNow, order.OrderId, order, tag: encodedTag);
             LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_UPDATE_UNTrackED_FILL_CRITICAL",
                 new 
                 { 
@@ -2241,6 +2238,14 @@ public sealed partial class NinjaTraderSimAdapter
         var order = record.Order as Order;
         var execution = record.Execution;
         var utcNow = DateTimeOffset.UtcNow;
+        var execInstKey = _iea?.ExecutionInstrumentKey ?? (order != null ? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument) : "");
+        var accountName = _iea?.AccountName ?? (order != null ? ExecutionUpdateRouter.GetAccountNameFromOrder(order) : "");
+        var brokerOrderId = order?.OrderId?.ToString() ?? "";
+        var orderIdInternal = brokerOrderId; // NT: use OrderId as internal correlation key
+        var executionSeq = GetNextExecutionSequence(execInstKey, accountName);
+        string? brokerExecId = null;
+        try { dynamic d = execution; brokerExecId = d.ExecutionId as string; } catch { }
+        var fillGroupId = ComputeFillGroupId(brokerExecId, orderIdInternal, brokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
 
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
@@ -2284,10 +2289,28 @@ public sealed partial class NinjaTraderSimAdapter
         var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
         IntentContext context;
         if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument, 
-            fillPrice, fillQuantity, utcNow, out context))
+            fillPrice, fillQuantity, utcNow, out context, order))
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings
+            return; // Fail-closed
+        }
+        
+        // UNIFY FILL EVENTS: trading_date must be non-null for PnL/accounting integrity
+        if (string.IsNullOrWhiteSpace(context.TradingDate))
+        {
+            EmitUnmappedFill(orderInfo.Instrument, "TRADING_DATE_NULL", fillPrice, fillQuantity, utcNow, order?.OrderId, order, tag: encodedTag);
+            LogCriticalWithIeaContext(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL",
+                new
+                {
+                    error = "trading_date cannot be null on fill events - PnL integrity broken",
+                    intent_id = intentId,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    order_type = orderTypeForContext,
+                    action = "BLOCKED",
+                    note = "Fail-closed: emit ERROR and block trading until trading_date is set"
+                });
             return; // Fail-closed
         }
         
@@ -2354,61 +2377,100 @@ public sealed partial class NinjaTraderSimAdapter
                         fill_qty = fillQuantity,
                         allocations = allocDict,
                         cumulative_qty_per_intent = cumulative,
-                        broker_order_id = order.OrderId,
+                        broker_order_id = order?.OrderId,
                         note = "Deterministic allocation in lexicographic order for partial fills"
                     }));
             }
             
-            // Log fill event
-            if (filledTotal < orderInfo.Quantity)
+            // P1: Emit one EXECUTION_FILLED/PARTIAL per intent when aggregated; single when not
+            var isPartial = filledTotal < orderInfo.Quantity;
+            var eventType = isPartial ? "EXECUTION_PARTIAL_FILL" : "EXECUTION_FILLED";
+            if (!isPartial) orderInfo.State = "FILLED";
+
+            void EmitEntryFill(string allocIntentId, int allocFillQty, int allocFilledTotal, string allocStream, string allocTradingDate, string allocDirection)
             {
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_PARTIAL_FILL",
+                var side = allocDirection.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL";
+                var sessionClass = DeriveSessionClass(allocStream);
+                var allocRemaining = isPartial ? orderInfo.Quantity - filledTotal : 0;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, allocIntentId, orderInfo.Instrument, eventType,
                     new
                     {
-                        fill_price = fillPrice,
-                        fill_quantity = fillQuantity,
-                        filled_total = filledTotal,
-                        order_quantity = orderInfo.Quantity,
-                        broker_order_id = order.OrderId,
+                        execution_sequence = executionSeq,
+                        fill_group_id = fillGroupId,
+                        order_id = orderIdInternal,
+                        broker_order_id = brokerOrderId,
+                        intent_id = allocIntentId,
+                        instrument = orderInfo.Instrument,
+                        execution_instrument_key = execInstKey,
+                        side = side,
                         order_type = orderInfo.OrderType,
-                        stream = context.Stream
+                        position_effect = "OPEN",
+                        fill_price = fillPrice,
+                        fill_quantity = allocFillQty,
+                        filled_total = allocFilledTotal,
+                        remaining_qty = allocRemaining,
+                        order_quantity = orderInfo.Quantity,
+                        stream = allocStream,
+                        stream_key = allocStream,
+                        trading_date = allocTradingDate,
+                        account = accountName,
+                        session_class = sessionClass,
+                        source = "robot",
+                        mapped = true
                     }));
+            }
+
+            if (isAggregated && allocations.Count > 0)
+            {
+                foreach (var alloc in allocations)
+                {
+                    var allocIntentId = alloc.Item1;
+                    var allocQty = alloc.Item2;
+                    if (allocQty <= 0) continue;
+                    if (!IntentMap.TryGetValue(allocIntentId, out var allocIntent) || allocIntent == null) continue;
+                    var cumulativeForIntent = (orderInfo.AggregatedFilledByIntent != null && orderInfo.AggregatedFilledByIntent.TryGetValue(allocIntentId, out var cum))
+                        ? cum : allocQty;
+                    EmitEntryFill(allocIntentId, allocQty, cumulativeForIntent, allocIntent.Stream ?? context.Stream, allocIntent.TradingDate ?? context.TradingDate ?? "", allocIntent.Direction ?? context.Direction ?? "");
+                }
             }
             else
             {
-                orderInfo.State = "FILLED";
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
-                    new
-                    {
-                        fill_price = fillPrice,
-                        fill_quantity = fillQuantity,
-                        filled_total = filledTotal,
-                        broker_order_id = order.OrderId,
-                        order_type = orderInfo.OrderType,
-                        stream = context.Stream
-                    }));
+                EmitEntryFill(intentId, fillQuantity, filledTotal, context.Stream ?? "", context.TradingDate ?? "", context.Direction ?? "");
             }
             
             // Register entry fill with coordinator and HandleEntryFill for protective orders
-            if (IntentMap.TryGetValue(intentId, out var entryIntent))
+            // CRITICAL FIX: For aggregated orders (CL1+CL2 same price), call HandleEntryFill for EACH intent
+            // with that intent's allocated cumulative. Passing filledTotal (order total) to primary only caused
+            // CanSubmitExit(primaryIntentId, 4) to fail WOULD_OVER_CLOSE when exposure had only 2 - protectives
+            // never submitted, BE had no stop to modify, BE_STOP_VISIBILITY_TIMEOUT → flatten.
+            if (isAggregated && allocations.Count > 0)
             {
-                // CRITICAL FIX: For aggregated orders, we already called OnEntryFill for each intent in the loop above.
-                // Do NOT call again for primary - that would double-count.
+                CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+                foreach (var alloc in allocations)
+                {
+                    var allocIntentId = alloc.Item1;
+                    var allocQty = alloc.Item2;
+                    if (allocQty <= 0) continue;
+                    if (!IntentMap.TryGetValue(allocIntentId, out var allocIntent) || allocIntent == null) continue;
+                    var cumulativeForIntent = (orderInfo.AggregatedFilledByIntent != null && orderInfo.AggregatedFilledByIntent.TryGetValue(allocIntentId, out var cum))
+                        ? cum
+                        : allocQty;
+                    if (_useInstrumentExecutionAuthority && _iea != null)
+                        _iea.HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
+                    else
+                        HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
+                }
+            }
+            else if (IntentMap.TryGetValue(intentId, out var entryIntent))
+            {
+                // Non-aggregated: single intent
                 if (!isAggregated)
                 {
                     _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
                 }
-                
-                // CRITICAL FIX: Check if position is now flat after entry fill - if so, cancel entry stop orders
-                // This handles manual position closures (user clicks "Flatten" in NinjaTrader UI) that happen
-                // immediately after entry fills (race condition where user flattens before protective orders submit)
+
                 CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
-                
-                // CRITICAL FIX: Pass filledTotal (cumulative) to HandleEntryFill for protective orders
-                // HandleEntryFill needs TOTAL filled quantity to submit protective orders that cover the ENTIRE position
-                // For incremental fills, protective orders must be updated to cover cumulative position, not just delta
-                // filledTotal is already updated: orderInfo.FilledQuantity += fillQuantity (line 1372)
-                // Phase 2: When IEA is enabled, IEA owns HandleEntryFill; otherwise adapter handles it
+
                 if (_useInstrumentExecutionAuthority && _iea != null)
                     _iea.HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
                 else
@@ -2417,7 +2479,8 @@ public sealed partial class NinjaTraderSimAdapter
             else
             {
                 // This should not happen - ResolveIntentContextOrFailClosed already checked
-                // But handle defensively
+                // But handle defensively - emit unmapped fill before flatten
+                EmitUnmappedFill(orderInfo.Instrument, "INTENT_NOT_FOUND", fillPrice, fillQuantity, utcNow, order?.OrderId, order, tag: encodedTag);
                 _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_ERROR", "ENGINE",
                     new 
                     { 
@@ -2492,17 +2555,41 @@ public sealed partial class NinjaTraderSimAdapter
                 orderTypeForContext, // Use tag-based order type (ground truth)
                 utcNow);
             
-            // Log exit fill event
-            // CRITICAL FIX: Use orderTypeForContext (from tag) for logging - it's the ground truth
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_EXIT_FILL",
+            // Log exit fill event - UNIFY FILL EVENTS: Use EXECUTION_FILLED (canonical) with order_type for ledger/PnL
+            // P1: Enriched payload with execution_instrument_key, side, account, session_class
+            // Canonical: execution_sequence, fill_group_id, order_id, broker_order_id, position_effect, mapped
+            var exitSide = (context.Direction ?? "").Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+            var exitSessionClass = DeriveSessionClass(context.Stream ?? "");
+            var exitBrokerOrderId = order?.OrderId?.ToString() ?? "";
+            var exitOrderIdInternal = exitBrokerOrderId;
+            var exitExecutionSeq = GetNextExecutionSequence(execInstKey, accountName);
+            string? exitBrokerExecId = null;
+            try { dynamic d = execution; exitBrokerExecId = d.ExecutionId as string; } catch { }
+            var exitFillGroupId = ComputeFillGroupId(exitBrokerExecId, exitOrderIdInternal, exitBrokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_FILLED",
                 new
                 {
+                    execution_sequence = exitExecutionSeq,
+                    fill_group_id = exitFillGroupId,
+                    order_id = exitOrderIdInternal,
+                    broker_order_id = exitBrokerOrderId,
+                    intent_id = intentId,
+                    instrument = orderInfo.Instrument,
+                    execution_instrument_key = execInstKey,
+                    side = exitSide,
+                    order_type = orderTypeForContext, // STOP or TARGET (tag-based ground truth)
+                    position_effect = "CLOSE",
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
                     filled_total = filledTotal,
-                    broker_order_id = order.OrderId,
-                    exit_order_type = orderTypeForContext, // Use tag-based order type (ground truth)
-                    stream = context.Stream
+                    remaining_qty = 0,
+                    stream = context.Stream,
+                    stream_key = context.Stream,
+                    trading_date = context.TradingDate ?? "",
+                    account = accountName,
+                    session_class = exitSessionClass,
+                    source = "robot",
+                    mapped = true
                 }));
             
             // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
@@ -2621,6 +2708,219 @@ public sealed partial class NinjaTraderSimAdapter
         // This detects manual position closures that bypass robot code
         // Called after both entry and exit fills to catch manual flattens quickly
         CheckAllInstrumentsForFlatPositions(utcNow);
+    }
+
+    /// <summary>
+    /// P0: Process broker flatten fill through canonical exit path.
+    /// Emits EXECUTION_FILLED per intent, RecordExitFill, OnExitFill.
+    /// If no intents can be mapped, emits EXECUTION_FILL_UNMAPPED (CRITICAL).
+    /// </summary>
+    private void ProcessBrokerFlattenFill(object execution, string instrument, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, object orderId, Order order)
+    {
+        var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(order);
+        var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument);
+        var brokerOrderId = orderId?.ToString() ?? "";
+        var orderIdInternal = brokerOrderId;
+        var executionSeq = GetNextExecutionSequence(execInstKey, accountName);
+        string? brokerExecId = null;
+        try { dynamic d = execution; brokerExecId = d.ExecutionId as string; } catch { }
+        var fillGroupId = ComputeFillGroupId(brokerExecId, orderIdInternal, brokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
+
+        // Try instrument and execInstKey - exposure.Instrument may be MES while order reports ES
+        var exposures = _coordinator?.GetActiveExposuresForInstrument(instrument) ?? new List<IntentExposure>();
+        if (exposures.Count == 0 && !string.IsNullOrEmpty(execInstKey))
+            exposures = _coordinator?.GetActiveExposuresForInstrument(execInstKey) ?? new List<IntentExposure>();
+        var matchingExposures = exposures.Where(e => ExecutionInstrumentResolver.IsSameInstrument(e.Instrument, instrument)).ToList();
+
+        if (matchingExposures.Count == 0)
+        {
+            EmitUnmappedFill(instrument, "NO_ACTIVE_EXPOSURES", fillPrice, fillQuantity, utcNow, orderId, order);
+            LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
+                new
+                {
+                    error = "Broker flatten fill cannot be mapped to any intent",
+                    broker_order_id = brokerOrderId,
+                    instrument = instrument,
+                    account = accountName,
+                    execution_instrument_key = execInstKey,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    timestamp_utc = utcNow.ToString("o"),
+                    note = "No active exposures for instrument - PnL gap"
+                });
+            return;
+        }
+
+        var totalRemaining = matchingExposures.Sum(e => e.RemainingExposure);
+        if (totalRemaining <= 0)
+        {
+            EmitUnmappedFill(instrument, "ZERO_REMAINING_EXPOSURE", fillPrice, fillQuantity, utcNow, orderId, order);
+            LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
+                new
+                {
+                    error = "Broker flatten fill but exposures have zero remaining",
+                    broker_order_id = brokerOrderId,
+                    instrument = instrument,
+                    account = accountName,
+                    execution_instrument_key = execInstKey,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    note = "Coordinator state inconsistent"
+                });
+            return;
+        }
+
+        var allocated = fillQuantity >= totalRemaining
+            ? matchingExposures.Select(e => (e.IntentId, e.RemainingExposure)).ToList()
+            : AllocateFlattenFillToExposures(matchingExposures, fillQuantity);
+
+        foreach (var (intentId, allocQty) in allocated)
+        {
+            if (allocQty <= 0) continue;
+            if (!IntentMap.TryGetValue(intentId, out var intent))
+            {
+                EmitUnmappedFill(instrument, "INTENT_NOT_FOUND", fillPrice, allocQty, utcNow, orderId, order);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILL_UNMAPPED",
+                    new { broker_order_id = brokerOrderId, intent_id = intentId, alloc_qty = allocQty, error = "Intent not in IntentMap" }));
+                continue;
+            }
+
+            var tradingDate = intent.TradingDate ?? "";
+            if (string.IsNullOrWhiteSpace(tradingDate))
+            {
+                EmitUnmappedFill(instrument, "TRADING_DATE_NULL", fillPrice, allocQty, utcNow, orderId, order);
+                LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL",
+                    new { intent_id = intentId, fill_price = fillPrice, fill_quantity = allocQty, order_type = "FLATTEN", note = "Broker flatten: trading_date null" });
+                continue;
+            }
+
+            var stream = intent.Stream ?? "";
+            var direction = intent.Direction ?? "";
+            var side = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+            var sessionClass = DeriveSessionClass(stream);
+
+            _executionJournal.RecordExitFill(intentId, tradingDate, stream, fillPrice, allocQty, "FLATTEN", utcNow);
+            _coordinator?.OnExitFill(intentId, allocQty, utcNow);
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILLED",
+                new
+                {
+                    execution_sequence = executionSeq,
+                    fill_group_id = fillGroupId,
+                    order_id = orderIdInternal,
+                    broker_order_id = brokerOrderId,
+                    intent_id = intentId,
+                    instrument = instrument,
+                    execution_instrument_key = execInstKey,
+                    side = side,
+                    order_type = "FLATTEN",
+                    position_effect = "CLOSE",
+                    fill_price = fillPrice,
+                    fill_quantity = allocQty,
+                    filled_total = allocQty,
+                    remaining_qty = 0,
+                    timestamp_utc = utcNow.ToString("o"),
+                    trading_date = tradingDate,
+                    account = accountName,
+                    stream_key = stream,
+                    session_class = sessionClass,
+                    source = "robot",
+                    mapped = true
+                }));
+        }
+    }
+
+    private static List<(string IntentId, int Qty)> AllocateFlattenFillToExposures(List<IntentExposure> exposures, int fillQuantity)
+    {
+        var total = exposures.Sum(e => e.RemainingExposure);
+        if (total <= 0) return new List<(string, int)>();
+        var result = new List<(string, int)>();
+        var remaining = fillQuantity;
+        foreach (var e in exposures.OrderBy(x => x.IntentId))
+        {
+            if (remaining <= 0) break;
+            var pct = (double)e.RemainingExposure / total;
+            var alloc = (int)Math.Round(fillQuantity * pct);
+            if (alloc > remaining) alloc = remaining;
+            if (alloc > e.RemainingExposure) alloc = e.RemainingExposure;
+            if (alloc > 0)
+            {
+                result.Add((e.IntentId, alloc));
+                remaining -= alloc;
+            }
+        }
+        if (remaining > 0 && result.Count > 0)
+        {
+            var last = result[result.Count - 1];
+            result[result.Count - 1] = (last.Item1, last.Item2 + remaining);
+        }
+        return result;
+    }
+
+    private static string DeriveSessionClass(string stream)
+    {
+        if (string.IsNullOrEmpty(stream)) return "";
+        var last = stream[stream.Length - 1];
+        return char.IsDigit(last) ? "S" + last : "";
+    }
+
+    /// <summary>
+    /// Canonical unmapped fill: emit EXECUTION_FILLED(mapped=false) before fail-closed.
+    /// Removes accounting hole; unmapped fills become actionable incidents.
+    /// unmappedReason: NO_ACTIVE_EXPOSURES, ZERO_REMAINING_EXPOSURE, UNTrackED_TAG, UNKNOWN_ORDER_AFTER_GRACE, INTENT_NOT_FOUND, TRADING_DATE_NULL, OTHER
+    /// </summary>
+    private void EmitUnmappedFill(
+        string instrument,
+        string unmappedReason,
+        decimal fillPrice,
+        int fillQuantity,
+        DateTimeOffset utcNow,
+        object? orderId,
+        Order? order,
+        string? ntOrderName = null,
+        string? tag = null,
+        string? ocoId = null)
+    {
+        var execInstKey = _iea?.ExecutionInstrumentKey ?? (order != null ? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument) : "");
+        var accountName = _iea?.AccountName ?? (order != null ? ExecutionUpdateRouter.GetAccountNameFromOrder(order) : "");
+        var brokerOrderId = orderId?.ToString() ?? "";
+        var orderIdInternal = brokerOrderId;
+        var seq = GetNextExecutionSequence(execInstKey, accountName);
+        var fillGroupId = ComputeFillGroupId(null, orderIdInternal, brokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
+        var side = "UNKNOWN";
+        if (order != null)
+        {
+            try
+            {
+                dynamic d = order;
+                var action = d.OrderAction;
+                if (action != null && action.ToString()?.Contains("Buy") == true) side = "BUY";
+                else if (action != null && action.ToString()?.Contains("Sell") == true) side = "SELL";
+            }
+            catch { }
+        }
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "EXECUTION_FILLED",
+            new
+            {
+                execution_sequence = seq,
+                fill_group_id = fillGroupId,
+                order_id = orderIdInternal,
+                broker_order_id = brokerOrderId,
+                execution_instrument_key = execInstKey,
+                side = side,
+                order_type = "UNMAPPED",
+                fill_price = fillPrice,
+                fill_quantity = fillQuantity,
+                trading_date = "",
+                account = accountName,
+                source = "robot",
+                mapped = false,
+                unmapped_reason = unmappedReason,
+                nt_order_name = ntOrderName,
+                tag = tag,
+                oco_id = ocoId
+            }));
     }
 
     /// <summary>
@@ -3545,8 +3845,8 @@ public sealed partial class NinjaTraderSimAdapter
             bool beTriggerReached = direction == "Long" ? tickPrice >= beTriggerPrice : direction == "Short" ? tickPrice <= beTriggerPrice : false;
             if (!beTriggerReached) continue;
 
-            // Use actual fill price when available (market orders, test inject) - more accurate than bar Close
-            var breakoutLevel = actualFillPrice ?? entryPrice;
+            // Use entry price only (the price it was supposed to be), not actual fill price
+            var breakoutLevel = entryPrice;
             var beStopPrice = direction == "Long" ? breakoutLevel - tickSize : breakoutLevel + tickSize;
 
             if ((utcNow - (_lastBeModifyAttemptUtcByIntent.TryGetValue(intentId, out var lastAttempt) ? lastAttempt : DateTimeOffset.MinValue)).TotalMilliseconds < BE_MODIFY_ATTEMPT_INTERVAL_MS)

@@ -76,8 +76,12 @@ def normalize_execution_filled(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     
     Returns canonical dict with fields:
     - intent_id, fill_price, fill_qty, order_type, timestamp_utc, stream, instrument
+    - order_id (broker_order_id), trading_date, filled_total, remaining_qty
+    - synthetic (True if converted from EXECUTION_EXIT_FILL for backfill)
     """
     data = raw_event.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
     
     canonical = {}
     canonical["intent_id"] = data.get("intent_id") or raw_event.get("intent_id") or ""
@@ -89,8 +93,27 @@ def normalize_execution_filled(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     canonical["fill_price"] = float(fill_price) if fill_price is not None else None
     canonical["fill_qty"] = int(fill_qty) if fill_qty is not None else None
     
-    # Order type/role (STOP, TARGET, ENTRY, etc.)
-    canonical["order_type"] = data.get("order_type") or data.get("OrderType") or data.get("order_role") or ""
+    # Order type/role (STOP, TARGET, ENTRY, FLATTEN, etc.)
+    # EXECUTION_EXIT_FILL backfill: exit_order_type -> order_type
+    # Fallback: infer from position_effect when order_type missing (OPEN -> ENTRY)
+    order_type = (
+        data.get("order_type") or data.get("OrderType") or data.get("order_role") or
+        data.get("exit_order_type") or ""
+    )
+    if not order_type and (data.get("position_effect") or "").upper() == "OPEN":
+        order_type = "ENTRY"
+    canonical["order_type"] = order_type
+    
+    # Order IDs (internal vs broker) - lenient for backfill
+    canonical["order_id"] = data.get("order_id") or data.get("broker_order_id") or ""
+    canonical["broker_order_id"] = data.get("broker_order_id") or data.get("order_id") or ""
+    
+    # Canonical fill: execution_sequence, fill_group_id, position_effect, mapped
+    canonical["execution_sequence"] = data.get("execution_sequence")
+    canonical["fill_group_id"] = data.get("fill_group_id") or ""
+    canonical["position_effect"] = data.get("position_effect") or ""
+    canonical["mapped"] = data.get("mapped", True)
+    canonical["unmapped_reason"] = data.get("unmapped_reason") or ""
     
     # Timestamp
     canonical["timestamp_utc"] = raw_event.get("timestamp_utc") or raw_event.get("ts_utc") or data.get("timestamp_utc")
@@ -98,6 +121,21 @@ def normalize_execution_filled(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     # Stream and instrument (may be at top level or in data)
     canonical["stream"] = raw_event.get("stream") or data.get("stream") or data.get("stream_id") or ""
     canonical["instrument"] = raw_event.get("instrument") or data.get("instrument") or ""
+    
+    # UNIFY FILL EVENTS: Required for PnL determinism
+    canonical["trading_date"] = raw_event.get("trading_date") or data.get("trading_date") or ""
+    canonical["filled_total"] = data.get("filled_total")
+    canonical["remaining_qty"] = data.get("remaining_qty")
+    
+    # P1: Mandatory fields for canonical fill
+    canonical["execution_instrument_key"] = data.get("execution_instrument_key") or raw_event.get("execution_instrument_key") or ""
+    canonical["side"] = data.get("side") or raw_event.get("side") or ""
+    canonical["account"] = data.get("account") or raw_event.get("account") or ""
+    canonical["stream_key"] = data.get("stream_key") or data.get("stream") or canonical.get("stream", "")
+    canonical["session_class"] = data.get("session_class") or raw_event.get("session_class") or ""
+    
+    # Backfill marker
+    canonical["synthetic"] = raw_event.get("synthetic", False)
     
     return canonical
 

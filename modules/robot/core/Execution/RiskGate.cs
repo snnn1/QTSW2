@@ -201,7 +201,7 @@ public sealed class RiskGate
         // Also log ENTRY_BLOCKED_RISK if risk-related
         if (isRiskRelated)
         {
-            var allowedSlots = _spec.sessions.ContainsKey(session) ? _spec.sessions[session].slot_end_times : new HashSet<string>();
+            var allowedSlots = _spec.sessions.ContainsKey(session) ? new HashSet<string>(_spec.sessions[session].slot_end_times) : new HashSet<string>();
             var slotTimeAllowed = !string.IsNullOrEmpty(slotTimeChicago) && allowedSlots.Contains(slotTimeChicago);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_BLOCKED_RISK", new

@@ -26,6 +26,12 @@ public sealed class TimetableContract
             throw new InvalidOperationException("Failed to parse timetable_current.json");
         return contract;
     }
+
+    public static TimetableContract? LoadFromBytes(byte[] bytes)
+    {
+        var json = System.Text.Encoding.UTF8.GetString(bytes);
+        return JsonUtil.Deserialize<TimetableContract>(json);
+    }
 }
 
 public sealed class TimetableStream

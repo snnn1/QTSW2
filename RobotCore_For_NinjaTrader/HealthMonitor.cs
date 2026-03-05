@@ -104,12 +104,12 @@ public sealed class HealthMonitor
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
     private const int CONNECTION_LOST_SUSTAINED_SECONDS = 60; // Must be disconnected for 60+ seconds before notifying
+    private const long TICKS_PER_60_SECONDS = 600_000_000L; // 60 seconds in 100-nanosecond ticks (for incident bucketing)
     
-    // CRITICAL FIX: Shared state across all HealthMonitor instances to prevent duplicate connection loss logging
+    // CRITICAL FIX: Shared state across all HealthMonitor instances to prevent duplicate connection loss logging.
     // When multiple strategy instances run (one per instrument), NinjaTrader calls OnConnectionStatusUpdate
-    // on all instances simultaneously. We only want to log CONNECTION_LOST once per actual disconnect.
-    // Shared state is keyed to incident ID (FirstDetectedUtc ticks) to prevent duplicate notifications
-    // if one instance clears booleans while another still thinks old incident is active.
+    // on each instance at slightly different times (ms apart), so each gets a different incidentId (UtcTicks).
+    // We bucket incident IDs by 60 seconds so all instances detecting the same disconnect share one key.
     private static readonly object _sharedConnectionLock = new object();
     private static readonly Dictionary<long, bool> _sharedConnectionLostLoggedByIncident = new(); // Key: incident ID (ticks)
     private static readonly Dictionary<long, bool> _sharedConnectionLostNotifiedByIncident = new(); // Key: incident ID (ticks)
@@ -249,14 +249,17 @@ public sealed class HealthMonitor
             if (!incidentId.HasValue)
                 return; // Should not happen, but guard
             
-            // CRITICAL FIX: Use shared state keyed to incident ID to prevent duplicate logging across multiple strategy instances
+            // Bucket incident ID by 60 seconds so multiple strategy instances (detecting at ms-apart) share the same key
+            var sharedIncidentKey = incidentId.Value / TICKS_PER_60_SECONDS;
+            
+            // CRITICAL FIX: Use shared state keyed to bucketed incident ID to prevent duplicate logging across multiple strategy instances
             lock (_sharedConnectionLock)
             {
-                if (!_sharedConnectionLostLoggedByIncident.TryGetValue(incidentId.Value, out var logged) || !logged)
+                if (!_sharedConnectionLostLoggedByIncident.TryGetValue(sharedIncidentKey, out var logged) || !logged)
                 {
                     // First instance to detect: emit CONNECTION_CONTEXT then log the event and initialize shared state
-                    _sharedConnectionLostLoggedByIncident[incidentId.Value] = true;
-                    _sharedConnectionLostInstanceCountByIncident[incidentId.Value] = 1;
+                    _sharedConnectionLostLoggedByIncident[sharedIncidentKey] = true;
+                    _sharedConnectionLostInstanceCountByIncident[sharedIncidentKey] = 1;
                     
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_CONTEXT", state: "ENGINE",
                         new
@@ -286,11 +289,11 @@ public sealed class HealthMonitor
                 else
                 {
                     // Another instance detected the same disconnect: increment counter but don't log
-                    if (!_sharedConnectionLostInstanceCountByIncident.TryGetValue(incidentId.Value, out var currentCount))
+                    if (!_sharedConnectionLostInstanceCountByIncident.TryGetValue(sharedIncidentKey, out var currentCount))
                     {
                         currentCount = 0;
                     }
-                    _sharedConnectionLostInstanceCountByIncident[incidentId.Value] = currentCount + 1;
+                    _sharedConnectionLostInstanceCountByIncident[sharedIncidentKey] = currentCount + 1;
                 }
             }
             
@@ -300,19 +303,19 @@ public sealed class HealthMonitor
                 var elapsed = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
                 if (elapsed >= CONNECTION_LOST_SUSTAINED_SECONDS)
                 {
-                    // CRITICAL FIX: Only send notification once per disconnect (use shared state keyed to incident ID)
+                    // CRITICAL FIX: Only send notification once per disconnect (use shared state keyed to bucketed incident ID)
                     lock (_sharedConnectionLock)
                     {
-                        if (!_sharedConnectionLostNotifiedByIncident.TryGetValue(incidentId.Value, out var notified) || !notified)
+                        if (!_sharedConnectionLostNotifiedByIncident.TryGetValue(sharedIncidentKey, out var notified) || !notified)
                         {
                             var sharedElapsed = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
                             if (sharedElapsed >= CONNECTION_LOST_SUSTAINED_SECONDS)
                             {
                                 // Mark as notified in shared state to prevent duplicate notifications
-                                _sharedConnectionLostNotifiedByIncident[incidentId.Value] = true;
+                                _sharedConnectionLostNotifiedByIncident[sharedIncidentKey] = true;
                                 _currentIncident.NotifiedUtc = utcNow;
                                 
-                                if (!_sharedConnectionLostInstanceCountByIncident.TryGetValue(incidentId.Value, out var instanceCount))
+                                if (!_sharedConnectionLostInstanceCountByIncident.TryGetValue(sharedIncidentKey, out var instanceCount))
                                 {
                                     instanceCount = 1;
                                 }
@@ -396,15 +399,16 @@ public sealed class HealthMonitor
                 }
                 
                 // Clear incident state (or mark resolved)
-                // Clean up shared state for this incident
+                // Clean up shared state for this incident (use same bucketed key as for add)
                 var incidentIdToClean = _currentIncident.GetIncidentId();
                 if (incidentIdToClean.HasValue)
                 {
+                    var sharedKeyToClean = incidentIdToClean.Value / TICKS_PER_60_SECONDS;
                     lock (_sharedConnectionLock)
                     {
-                        _sharedConnectionLostLoggedByIncident.Remove(incidentIdToClean.Value);
-                        _sharedConnectionLostNotifiedByIncident.Remove(incidentIdToClean.Value);
-                        _sharedConnectionLostInstanceCountByIncident.Remove(incidentIdToClean.Value);
+                        _sharedConnectionLostLoggedByIncident.Remove(sharedKeyToClean);
+                        _sharedConnectionLostNotifiedByIncident.Remove(sharedKeyToClean);
+                        _sharedConnectionLostInstanceCountByIncident.Remove(sharedKeyToClean);
                     }
                 }
                 

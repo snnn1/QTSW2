@@ -1,6 +1,7 @@
 using System.Text.Json;
 using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
+using QTSW2.Robot.Core.Tests;
 using QTSW2.Robot.Harness;
 using DateOnly = QTSW2.Robot.Core.DateOnly; // Use compat shim instead of System.DateOnly
 
@@ -35,6 +36,15 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 {
     PrintUsage();
     return;
+}
+
+// --test DST: run session close fallback timezone tests (DST boundary weeks)
+var testIndex = argsList.IndexOf("--test");
+if (testIndex >= 0 && testIndex + 1 < argsList.Count && argsList[testIndex + 1].Equals("DST", StringComparison.OrdinalIgnoreCase))
+{
+    var (pass, err) = SessionCloseFallbackTimeZoneTests.RunDstBoundaryTests();
+    Console.WriteLine(pass ? "PASS: DST boundary tests" : $"FAIL: {err}");
+    Environment.Exit(pass ? 0 : 1);
 }
 
 var root = ProjectRootResolver.ResolveProjectRoot();
@@ -172,6 +182,73 @@ if (argsList.Contains("--replay"))
     HistoricalReplay.Replay(engine, specLoaded, timeSvc, snapshotRoot, root, startDate, endDate);
     engine.Stop();
     Console.WriteLine($"Done. Inspect logs in: {logDir ?? "logs/robot/"}");
+    return;
+}
+
+// --validate-forced-flatten: simulate through session close to verify forced flatten triggers
+var validateForcedFlatten = argsList.Contains("--validate-forced-flatten");
+if (validateForcedFlatten)
+{
+    var testDate = new DateOnly(2026, 3, 4); // Wednesday, CST (before DST)
+    var testTimetablePath = Path.Combine(root, "data", "timetable", "timetable_validate_forced_flatten.json");
+    Directory.CreateDirectory(Path.GetDirectoryName(testTimetablePath)!);
+    var timetableJson = JsonSerializer.Serialize(new
+    {
+        as_of = timeSvc.ConvertUtcToChicago(DateTimeOffset.UtcNow).ToString("o"),
+        trading_date = testDate.ToString("yyyy-MM-dd"),
+        timezone = "America/Chicago",
+        source = "validate-forced-flatten",
+        streams = new[]
+        {
+            new { stream = "ES1", instrument = "MES", session = "S1", slot_time = "07:30", enabled = true },
+            new { stream = "ES2", instrument = "MES", session = "S2", slot_time = "09:30", enabled = true }
+        }
+    });
+    File.WriteAllText(testTimetablePath, timetableJson);
+    Console.WriteLine($"Validate forced flatten: test date {testDate:yyyy-MM-dd}, timetable: {testTimetablePath}");
+
+    var engine = new RobotEngine(root, TimeSpan.FromSeconds(1), executionMode, null, testTimetablePath, "MES");
+    engine.Start();
+    Thread.Sleep(800); // Allow initial timetable poll so trading date is locked
+
+    // Simulate from 15:50 CT to 16:05 CT (brackets flatten trigger at 15:55 CT)
+    var simStartChicago = timeSvc.ConstructChicagoTime(testDate, "15:50");
+    var simEndChicago = timeSvc.ConstructChicagoTime(testDate, "16:05");
+    var simStart = timeSvc.ConvertChicagoToUtc(simStartChicago);
+    var simEnd = timeSvc.ConvertChicagoToUtc(simEndChicago);
+
+    Console.WriteLine($"Simulating from {simStart:o} to {simEnd:o} (UTC) — flatten trigger at 15:55 CT");
+
+    var rng = new Random(1);
+    decimal px = 5000m;
+    for (var t = simStart; t <= simEnd; t = t.AddMinutes(1))
+    {
+        var delta = (decimal)(rng.NextDouble() - 0.5) * 2m;
+        var open = px;
+        var high = open + Math.Abs(delta) + 0.25m;
+        var low = open - Math.Abs(delta) - 0.25m;
+        var close = open + delta;
+        px = close;
+        engine.OnBar(t, "MES", open, high, low, close, t);
+        engine.Tick(t);
+    }
+
+    engine.Stop();
+
+    var logDir = Path.Combine(root, "logs", "robot");
+    var journalDir = Path.Combine(logDir, "journal");
+    var markersPath = Path.Combine(journalDir, "_forced_flatten_markers.json");
+    var hasTriggered = File.Exists(markersPath);
+    var markersContent = hasTriggered ? File.ReadAllText(markersPath) : "";
+
+    Console.WriteLine();
+    Console.WriteLine("=== Forced Flatten Validation ===");
+    Console.WriteLine($"  FORCED_FLATTEN_TRIGGERED in logs: check robot_skeleton.jsonl or robot_*.jsonl");
+    Console.WriteLine($"  _forced_flatten_markers.json: {(hasTriggered ? "EXISTS" : "MISSING")} at {markersPath}");
+    if (hasTriggered)
+        Console.WriteLine($"  Markers content: {markersContent.Trim()}");
+    Console.WriteLine($"  Slot journals (ForcedFlattenTimestamp): {journalDir}");
+    Console.WriteLine("Done. Run: python scripts/check_forced_flatten_today.py " + testDate.ToString("yyyy-MM-dd"));
     return;
 }
 

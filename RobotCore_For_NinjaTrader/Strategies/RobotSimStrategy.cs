@@ -1764,21 +1764,48 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
 #if NINJATRADER
+        // Rate-limit SESSION_CLOSE_RESOLVE_SKIPPED to once per 60 seconds per reason
+        private DateTimeOffset? _lastSessionCloseResolveSkippedLogUtc;
+        private string? _lastSessionCloseResolveSkippedReason;
+        private const double SESSION_CLOSE_RESOLVE_SKIP_LOG_INTERVAL_SECONDS = 60.0;
+
         /// <summary>
         /// Resolve session close for S1 and S2, call SetSessionCloseResolved. Defer to Realtime only.
         /// Called on Realtime transition and when trading date changes.
         /// </summary>
         private void ResolveAndSetSessionCloseIfNeeded()
         {
-            if (_engine == null || State != State.Realtime) return;
-            if (Bars == null || Bars.Count == 0) return;
+            var instrument = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            var barsCount = Bars?.Count ?? 0;
+
+            if (_engine == null || State != State.Realtime)
+            {
+                LogSessionCloseResolveSkipped("HISTORICAL_STATE", instrument, state: State.ToString(), barsCount: barsCount, tradingDay: null, lastResolved: _lastSessionCloseResolvedTradingDay);
+                return;
+            }
+            if (Bars == null || Bars.Count == 0)
+            {
+                LogSessionCloseResolveSkipped("NO_BARS", instrument, state: State.ToString(), barsCount: 0, tradingDay: null, lastResolved: _lastSessionCloseResolvedTradingDay);
+                return;
+            }
 
             var tradingDay = _engine.GetTradingDate();
-            if (string.IsNullOrWhiteSpace(tradingDay)) return;
-            if (tradingDay == _lastSessionCloseResolvedTradingDay) return;
+            if (string.IsNullOrWhiteSpace(tradingDay))
+            {
+                LogSessionCloseResolveSkipped("TRADING_DAY_EMPTY", instrument, state: State.ToString(), barsCount: barsCount, tradingDay: null, lastResolved: _lastSessionCloseResolvedTradingDay);
+                return;
+            }
+            if (tradingDay == _lastSessionCloseResolvedTradingDay)
+            {
+                return; // Already resolved for this day — no log (expected path)
+            }
 
             var spec = _engine.GetParitySpec();
-            if (spec == null) return;
+            if (spec == null)
+            {
+                LogSessionCloseResolveSkipped("SPEC_NOT_FOUND", instrument, state: State.ToString(), barsCount: barsCount, tradingDay: tradingDay, lastResolved: _lastSessionCloseResolvedTradingDay);
+                return;
+            }
 
             try
             {
@@ -1795,10 +1822,35 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "SESSION_CLOSE_RESOLVER_FAILED", new Dictionary<string, object>
                 {
                     { "error", ex.Message },
+                    { "exception_message", ex.Message },
+                    { "instrument", instrument },
+                    { "instrument_key", Instrument?.FullName ?? instrument },
                     { "trading_day", tradingDay },
                     { "note", "Resolver failed - forced flatten may not trigger; check logs" }
                 });
             }
+        }
+
+        private void LogSessionCloseResolveSkipped(string reason, string instrument, string state, int barsCount, string? tradingDay, string? lastResolved)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var shouldLog = !_lastSessionCloseResolveSkippedLogUtc.HasValue ||
+                _lastSessionCloseResolveSkippedReason != reason ||
+                (now - _lastSessionCloseResolveSkippedLogUtc.Value).TotalSeconds >= SESSION_CLOSE_RESOLVE_SKIP_LOG_INTERVAL_SECONDS;
+            if (!shouldLog) return;
+
+            _lastSessionCloseResolveSkippedLogUtc = now;
+            _lastSessionCloseResolveSkippedReason = reason;
+            _engine?.LogEngineEvent(now, "SESSION_CLOSE_RESOLVE_SKIPPED", new Dictionary<string, object>
+            {
+                { "reason", reason },
+                { "state", state },
+                { "bars_count", barsCount },
+                { "trading_day", tradingDay ?? "" },
+                { "last_resolved_trading_day", lastResolved ?? "" },
+                { "instrument", instrument },
+                { "instrument_key", Instrument?.FullName ?? instrument }
+            });
         }
 
         /// <summary>

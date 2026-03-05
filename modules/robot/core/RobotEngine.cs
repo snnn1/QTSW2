@@ -76,6 +76,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // SessionCloseResolver: cache per (tradingDay, sessionClass)
     private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _sessionCloseResults = new();
     private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseEmittedKeys = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseFallbackEmittedKeys = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseFallbackFailedEmittedKeys = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseCacheMissingEmittedKeys = new();
+    private DateTimeOffset? _firstSessionCloseCacheMissUtc;
+    private DateTimeOffset? _lastForcedFlattenSkipLogUtc;
+    private const double FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES = 5.0;
+    private const double SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES = 5.0;
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
@@ -1280,6 +1287,87 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
             }
 
+            // Forced flatten block (BEFORE stream.Tick) — per sessionClass
+            var tradingDateStr = TradingDateString;
+            if (!string.IsNullOrEmpty(tradingDateStr))
+            {
+                foreach (var sessionClass in new[] { "S1", "S2" })
+                {
+                    var closeResult = GetSessionCloseResultOrFallback(tradingDateStr, sessionClass, utcNow, out var usedFallback);
+                    if (closeResult == null)
+                    {
+                        var shouldLogSkip = !_lastForcedFlattenSkipLogUtc.HasValue ||
+                            (utcNow - _lastForcedFlattenSkipLogUtc.Value).TotalMinutes >= FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES;
+                        if (shouldLogSkip && _streams.Values.Any(s => s.Session == sessionClass && !s.Committed))
+                        {
+                            _lastForcedFlattenSkipLogUtc = utcNow;
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_SKIP_NO_CACHE", state: "ENGINE",
+                                new
+                                {
+                                    session_class = sessionClass,
+                                    trading_date = tradingDateStr,
+                                    note = "Session close not resolved and fallback unavailable — forced flatten will not trigger"
+                                }));
+                        }
+                        if (!_firstSessionCloseCacheMissUtc.HasValue)
+                            _firstSessionCloseCacheMissUtc = utcNow;
+                        var minutesMissing = (utcNow - _firstSessionCloseCacheMissUtc.Value).TotalMinutes;
+                        if (minutesMissing >= SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES)
+                        {
+                            var cacheMissKey = (tradingDateStr, sessionClass);
+                            bool shouldEmitCacheMiss;
+                            lock (_engineLock)
+                            {
+                                shouldEmitCacheMiss = _sessionCloseCacheMissingEmittedKeys.Add(cacheMissKey);
+                            }
+                            if (shouldEmitCacheMiss)
+                            {
+                                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_CLOSE_CACHE_MISSING", state: "ENGINE",
+                                    new
+                                    {
+                                        instrument = _executionInstrument ?? "N/A",
+                                        trading_date = tradingDateStr,
+                                        session_class = sessionClass,
+                                        minutes_missing = Math.Round(minutesMissing, 1),
+                                        note = "Session close cache empty for 5+ minutes — forced flatten cannot trigger; watchdog alert"
+                                    }));
+                            }
+                        }
+                        continue;
+                    }
+                    if (!closeResult.HasSession || !closeResult.FlattenTriggerUtc.HasValue)
+                        continue;
+                    if (utcNow < closeResult.FlattenTriggerUtc.Value)
+                        continue;
+
+                    _firstSessionCloseCacheMissUtc = null;
+
+                    if (!_journals.HasForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass))
+                    {
+                        _journals.MarkForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass);
+                        var streamsInSession = _streams.Values.Where(s => s.Session == sessionClass && !s.Committed).ToList();
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_TRIGGERED", state: "ENGINE",
+                            new
+                            {
+                                reason = "SESSION_CLOSE",
+                                session_class = sessionClass,
+                                source = usedFallback ? "FALLBACK_SPEC" : "LIVE_RESOLVER",
+                                resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
+                                buffer_seconds = closeResult.BufferSeconds,
+                                trading_date = tradingDateStr,
+                                streams_impacted = streamsInSession.Select(s => s.Stream).ToList(),
+                                used_fallback = usedFallback
+                            }));
+                    }
+
+                    foreach (var s in _streams.Values)
+                    {
+                        if (s.Session != sessionClass || s.Committed) continue;
+                        s.HandleForcedFlatten(utcNow);
+                    }
+                }
+            }
+
             foreach (var s in _streams.Values)
                 s.Tick(utcNow);
 
@@ -1890,6 +1978,126 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY", state: "ENGINE",
                 new { trading_day = tradingDay, session_class = sessionClass, source = source, note = "No eligible segments (holiday)" }));
+        }
+    }
+
+    /// <summary>
+    /// Try get cached session close result for (tradingDay, sessionClass).
+    /// </summary>
+    public bool TryGetSessionCloseResult(string tradingDay, string sessionClass, out SessionCloseResult? result)
+    {
+        result = null;
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return false;
+        lock (_engineLock)
+        {
+            if (_sessionCloseResults.TryGetValue((tradingDay, sessionClass), out var r))
+            {
+                result = r;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
+    private const string EMERGENCY_MARKET_CLOSE_DEFAULT = "16:00";
+
+    /// <summary>
+    /// Get session close from cache, or compute fallback. Ensures forced flatten can trigger even when
+    /// ResolveAndSetSessionCloseIfNeeded never ran.
+    /// TIMEZONE CONTRACT: spec.entry_cutoff.market_close_time is America/Chicago local time (DST-aware).
+    /// </summary>
+    private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
+    {
+        usedFallback = false;
+        if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
+            return cached;
+
+        if (!DateOnly.TryParse(tradingDay, out var tradingDate))
+            return null;
+
+        if (_spec != null && _time != null)
+        {
+            var marketCloseTime = _spec.entry_cutoff?.market_close_time;
+            if (!string.IsNullOrWhiteSpace(marketCloseTime))
+            {
+                var result = ComputeFallbackFromTime(tradingDate, marketCloseTime, tradingDay, sessionClass, utcNow, "SPEC", ref usedFallback);
+                if (result != null)
+                    return result;
+            }
+        }
+
+        if (_time != null)
+        {
+            var failKey = (tradingDay, sessionClass);
+            bool shouldLogFail;
+            lock (_engineLock)
+            {
+                shouldLogFail = _sessionCloseFallbackFailedEmittedKeys.Add(failKey);
+            }
+            if (shouldLogFail)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_FAILED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        reason = _spec == null ? "SPEC_NULL" : "MARKET_CLOSE_TIME_EMPTY",
+                        emergency_close_used = EMERGENCY_MARKET_CLOSE_DEFAULT,
+                        note = "Spec unavailable — using emergency 16:00 CT default (fail-closed)"
+                    }));
+            }
+            var emergency = ComputeFallbackFromTime(tradingDate, EMERGENCY_MARKET_CLOSE_DEFAULT, tradingDay, sessionClass, utcNow, "EMERGENCY", ref usedFallback);
+            if (emergency != null)
+                return emergency;
+        }
+
+        return null;
+    }
+
+    private SessionCloseResult? ComputeFallbackFromTime(DateOnly tradingDate, string hhmm, string tradingDay, string sessionClass, DateTimeOffset utcNow, string source, ref bool usedFallback)
+    {
+        try
+        {
+            var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
+            var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
+            var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
+            var fallback = new SessionCloseResult
+            {
+                HasSession = true,
+                FlattenTriggerUtc = flattenTriggerUtc,
+                ResolvedSessionCloseUtc = sessionEndUtc,
+                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BarsInstrument = _executionInstrument ?? "N/A"
+            };
+            var key = (tradingDay, sessionClass);
+            bool shouldLog;
+            lock (_engineLock)
+            {
+                shouldLog = _sessionCloseFallbackEmittedKeys.Add(key);
+            }
+            if (shouldLog)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_USED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        computed_session_close_utc = sessionEndUtc.ToString("o"),
+                        flatten_trigger_utc = flattenTriggerUtc.ToString("o"),
+                        resolution_source = source,
+                        timezone = "America/Chicago",
+                        note = "Session close from fallback — ResolveAndSetSessionCloseIfNeeded did not populate cache"
+                    }));
+            }
+            usedFallback = true;
+            return fallback;
+        }
+        catch
+        {
+            return null;
         }
     }
     
@@ -2977,9 +3185,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     skippedReasons[skipReason]++;
                     
                     // FAIL LOUDLY: Log per-stream skip with detailed context
-                    var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
-                    var slotTimeUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
-                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    var skipTradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+                    var skipSlotTimeUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
+                    LogEvent(RobotEvents.Base(_time, utcNow, skipTradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, skipSlotTimeUtc,
                         "STREAM_SKIPPED", "ENGINE", new 
                         { 
                             reason = "CANONICAL_MISMATCH", 
@@ -3579,10 +3787,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _healthMonitor?.SetTradingDate(TradingDateString);
             
             // Forward to health monitor
-            _healthMonitor?.OnConnectionStatusUpdate(status, connectionName, utcNow);
-            var isConnected = status == ConnectionStatus.Connected;
-
-            // Forward to health monitor first
             _healthMonitor?.OnConnectionStatusUpdate(status, connectionName, utcNow);
 
             // Handle recovery state transitions

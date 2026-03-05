@@ -389,9 +389,9 @@ class EventProcessor:
                     if slot_time_chicago:
                         info.slot_time_chicago = slot_time_chicago
                     
-                    # CRITICAL: Clear ranges when transitioning away from RANGE_LOCKED
+                    # CRITICAL: Clear ranges when transitioning away from RANGE_LOCKED or OPEN
                     # This prevents old ranges from persisting when streams restart or transition to new states
-                    if info.state == "RANGE_LOCKED" and new_state != "RANGE_LOCKED":
+                    if info.state in ("RANGE_LOCKED", "OPEN") and new_state not in ("RANGE_LOCKED", "OPEN"):
                         logger.debug(
                             f"Clearing ranges for stream {canonical_stream} ({trading_date}): "
                             f"transitioning from RANGE_LOCKED to {new_state}"
@@ -401,8 +401,8 @@ class EventProcessor:
                         info.freeze_close = None
                         info.range_invalidated = False
                     
-                    # Extract range values from data dict if transitioning to RANGE_LOCKED
-                    if new_state == "RANGE_LOCKED":
+                    # Extract range values from data dict if transitioning to RANGE_LOCKED or OPEN
+                    if new_state in ("RANGE_LOCKED", "OPEN"):
                         # Range data might be in data directly, or nested in extra_data (dict or string)
                         extra_data = data.get("extra_data", {})
                         range_high = data.get("range_high")

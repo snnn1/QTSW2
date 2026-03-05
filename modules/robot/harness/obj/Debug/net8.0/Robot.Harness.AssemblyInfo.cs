@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Robot.Harness")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+b0cc1887544ebd35af47875c10e34ce5a4d79925")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+28df4553b1bba1d9c24cb7fa39478cd7845d7eb7")]
 [assembly: System.Reflection.AssemblyProductAttribute("Robot.Harness")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Robot.Harness")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

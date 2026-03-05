@@ -16,7 +16,8 @@ BE_EVENTS = [
     "ONMARKETDATA_LAST_DIAG",  # Diagnostic: OnMarketData(Last) fired in Realtime (shows position state)
     "BE_PATH_ACTIVE",       # BE path running (rate-limited 1/min) - proves OnMarketData is firing
     "BE_EVALUATION_TICK",    # BE scan ran (rate-limited 1/sec) - proves CheckBreakEvenTriggersTickBased ran
-    "BE_TRIGGER_REACHED",   # Stop modified to BE successfully
+    "BE_TRIGGERED",         # Stop modified to BE successfully (IEA path)
+    "BE_TRIGGER_REACHED",   # Stop modified to BE successfully (legacy)
     "BE_TRIGGER_RETRY_NEEDED",  # Trigger reached, stop not found yet (retry)
     "BE_TRIGGER_FAILED",    # Modify failed (non-retryable)
     "BE_SKIP_STOP_ALREADY_TIGHTER",  # Only-tighten guard hit
@@ -39,10 +40,8 @@ def main():
         print("  - Logs are written to logs/robot/ when the strategy runs")
         sys.exit(1)
 
-    # Find all robot_*.jsonl files
+    # Find all robot_*.jsonl files (include date-specific ENGINE files like robot_ENGINE_20260302_161234.jsonl)
     log_files = list(LOG_DIR.glob("robot_*.jsonl"))
-    # Exclude rotated/archived (robot_X_timestamp.jsonl)
-    log_files = [f for f in log_files if "_" not in f.stem.split("robot_")[-1] or f.stem.count("_") == 1]
 
     if not log_files:
         print("No robot log files found.")
@@ -64,8 +63,8 @@ def main():
             print(f"  Skip {log_path.name}: {e}")
             continue
 
-        # Check last 2000 lines (recent activity)
-        recent = lines[-2000:] if len(lines) > 2000 else lines
+        # Check last 5000 lines (recent activity; ENGINE files can be large)
+        recent = lines[-5000:] if len(lines) > 5000 else lines
 
         for line in recent:
             line = line.strip()
@@ -89,7 +88,7 @@ def main():
                     samples[event_type].append({"file": log_path.name, "ts": ts, "data": e.get("data", e)})
 
     # Report
-    print("BE-RELATED EVENTS (last 2000 lines per file)")
+    print("BE-RELATED EVENTS (last 5000 lines per file)")
     print("-" * 70)
     if not counts:
         print("  NONE FOUND")
@@ -117,8 +116,8 @@ def main():
             print("  BE_PATH_ACTIVE present -> OnMarketData is firing when in position")
         if counts.get("BE_EVALUATION_TICK"):
             print("  BE_EVALUATION_TICK present -> BE scan is running")
-        if counts.get("BE_TRIGGER_REACHED"):
-            print("  BE_TRIGGER_REACHED present -> BE successfully modified a stop")
+        if counts.get("BE_TRIGGERED") or counts.get("BE_TRIGGER_REACHED"):
+            print("  BE_TRIGGERED/BE_TRIGGER_REACHED present -> BE successfully modified a stop")
         if counts.get("REALTIME_STATE_REACHED") and not counts.get("BE_PATH_ACTIVE"):
             print("  REALTIME reached but no BE_PATH_ACTIVE -> may be flat (no position)")
 
@@ -139,12 +138,12 @@ def main():
             print("  OK: REALTIME + BE_PATH_ACTIVE -> BE path was active when in position")
         elif counts.get("REALTIME_STATE_REACHED") and not counts.get("BE_PATH_ACTIVE"):
             print("  INFO: REALTIME reached but no BE_PATH_ACTIVE -> likely flat (no position) or blocked")
-        if counts.get("BE_TRIGGER_REACHED"):
-            print("  OK: BE_TRIGGER_REACHED -> BE successfully modified a stop")
+        if counts.get("BE_TRIGGERED") or counts.get("BE_TRIGGER_REACHED"):
+            print("  OK: BE_TRIGGERED/BE_TRIGGER_REACHED -> BE successfully modified a stop")
         if not counts.get("REALTIME_STATE_REACHED"):
             print("  WARN: No REALTIME_STATE_REACHED -> strategy may not have run to Realtime")
 
-        for evt in ["BE_PATH_ACTIVE", "BE_EVALUATION_TICK", "BE_TRIGGER_REACHED"]:
+        for evt in ["BE_PATH_ACTIVE", "BE_EVALUATION_TICK", "BE_TRIGGERED", "BE_TRIGGER_REACHED"]:
             if samples[evt]:
                 print()
                 print(f"  Sample {evt}:")

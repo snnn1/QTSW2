@@ -6,6 +6,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -90,6 +92,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     // Diagnostic: Track rate-limit diagnostic logs separately
     private readonly Dictionary<string, DateTimeOffset> _lastInstrumentMismatchDiagLogUtc = new();
+
+    // Canonical fill: monotonic sequence per execution_instrument_key (reproducible under replay)
+    private static readonly ConcurrentDictionary<string, int> _executionSequenceByKey = new();
+    private static readonly object _executionSequenceLock = new();
 
     // Broker flatten recognition: when we call Flatten(), the resulting close order has no QTSW2 tag.
     // Track recent flatten calls so we don't treat that fill as UNTrackED and trigger another flatten.
@@ -560,6 +566,42 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         dict["iea_instance_id"] = iea.InstanceId;
         dict["execution_instrument_key"] = iea.ExecutionInstrumentKey;
         return dict;
+    }
+
+    /// <summary>
+    /// Canonical fill: Get next monotonic execution_sequence.
+    /// Scope: Per execution_instrument_key (NOT per strategy instance, NOT per stream, NOT global across instruments).
+    /// Multi-account: key = account|execution_instrument_key to avoid cross-account collision.
+    /// Must be reproducible under replay.
+    /// </summary>
+    internal static int GetNextExecutionSequence(string executionInstrumentKey, string? accountName = null)
+    {
+        var key = string.IsNullOrEmpty(executionInstrumentKey) ? "_default" : executionInstrumentKey;
+        if (!string.IsNullOrEmpty(accountName))
+            key = accountName + "|" + key;
+        lock (_executionSequenceLock)
+        {
+            if (!_executionSequenceByKey.TryGetValue(key, out var seq))
+                seq = 0;
+            seq++;
+            _executionSequenceByKey[key] = seq;
+            return seq;
+        }
+    }
+
+    /// <summary>
+    /// Canonical fill: Deterministic fill_group_id. Use broker execution id when available; else hash.
+    /// Must be reproducible under replay (no random UUID).
+    /// </summary>
+    internal static string ComputeFillGroupId(string? brokerExecutionId, string orderId, string brokerOrderId, string timestampUtc, decimal fillPrice, int fillQty)
+    {
+        if (!string.IsNullOrWhiteSpace(brokerExecutionId))
+            return brokerExecutionId;
+        var input = $"{orderId}|{brokerOrderId}|{timestampUtc}|{fillPrice}|{fillQty}";
+        using var sha = SHA256.Create();
+        var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        var hex = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        return hex.Length >= 16 ? hex.Substring(0, 16) : hex;
     }
 
     /// <summary>

@@ -69,6 +69,8 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
         return 'bg-blue-500 text-white'
       case 'RANGE_LOCKED':
         return 'bg-green-600 text-white'
+      case 'OPEN':
+        return 'bg-emerald-600 text-white'  // Position open
       case 'DONE':
         return 'bg-gray-500 text-gray-300'
       default:

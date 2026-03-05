@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Security.Cryptography;
 
 namespace QTSW2.Robot.Core;
 
@@ -47,6 +49,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string? _lastTimetableHash;
     private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
     private DateOnly? _activeTradingDate; // PHASE 3: Store as DateOnly (authoritative), convert to string only for logging/journal
+    private HashSet<string>? _eligibleSet; // Session Eligibility Freeze: stream keys that may trade this session (loaded once per trading_date)
     
     /// <summary>
     /// Get trading date as string for logging/journal purposes.
@@ -223,6 +226,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Forced flatten skip diagnostic (rate-limited) — when session close not cached
     private DateTimeOffset? _lastForcedFlattenSkipLogUtc = null;
     private const double FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES = 5.0;
+
+    // Session close cache missing alert — first time we detect cache empty in forced flatten block
+    private DateTimeOffset? _firstSessionCloseCacheMissUtc = null;
+    private const double SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES = 5.0;
+
+    // One-shot: emit once per (tradingDay, sessionClass), suppress until next trading day
+    private readonly HashSet<(string, string)> _sessionCloseFallbackEmittedKeys = new();
+    private readonly HashSet<(string, string)> _sessionCloseCacheMissingEmittedKeys = new();
+    private readonly HashSet<(string, string)> _sessionCloseFallbackFailedEmittedKeys = new();
 
     // Event-driven snapshot (strict 60s rate limit, independent of periodic)
     private DateTimeOffset? _lastEventDrivenSnapshotUtc = null;
@@ -499,6 +511,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
         _executionPolicyPath = Path.Combine(_root, "configs", "execution_policy.json"); // PHASE 4: Execution policy path (standardized)
+        // Eligibility path built per trading_date: data/eligibility/eligibility_YYYY-MM-DD.json
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
@@ -1221,7 +1234,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return _streams.Values.Any(s => !s.Committed &&
                 (s.State == StreamState.ARMED ||
                  s.State == StreamState.RANGE_BUILDING ||
-                 s.State == StreamState.RANGE_LOCKED));
+                 s.State == StreamState.RANGE_LOCKED ||
+                 s.State == StreamState.OPEN));
         }
     }
     
@@ -1456,9 +1470,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 foreach (var sessionClass in new[] { "S1", "S2" })
                 {
-                    if (!TryGetSessionCloseResult(tradingDateStr, sessionClass, out var closeResult) || closeResult == null)
+                    var closeResult = GetSessionCloseResultOrFallback(tradingDateStr, sessionClass, utcNow, out var usedFallback);
+                    if (closeResult == null)
                     {
-                        // Diagnostic: session close not resolved/cached — forced flatten will not trigger (rate-limited)
+                        // No cache and fallback failed — log skip and SESSION_CLOSE_CACHE_MISSING if persistent
                         var shouldLogSkip = !_lastForcedFlattenSkipLogUtc.HasValue ||
                             (utcNow - _lastForcedFlattenSkipLogUtc.Value).TotalMinutes >= FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES;
                         if (shouldLogSkip && _streams.Values.Any(s => s.Session == sessionClass && !s.Committed))
@@ -1469,8 +1484,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                                 {
                                     session_class = sessionClass,
                                     trading_date = tradingDateStr,
-                                    note = "Session close not resolved — ResolveAndSetSessionCloseIfNeeded may not have run; forced flatten will not trigger"
+                                    note = "Session close not resolved and fallback unavailable — forced flatten will not trigger"
                                 }));
+                        }
+                        // SESSION_CLOSE_CACHE_MISSING: ERROR once per (tradingDay, sessionClass) when cache empty 5+ min
+                        if (!_firstSessionCloseCacheMissUtc.HasValue)
+                            _firstSessionCloseCacheMissUtc = utcNow;
+                        var minutesMissing = (utcNow - _firstSessionCloseCacheMissUtc.Value).TotalMinutes;
+                        if (minutesMissing >= SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES)
+                        {
+                            var cacheMissKey = (tradingDateStr, sessionClass);
+                            bool shouldEmitCacheMiss;
+                            lock (_engineLock)
+                            {
+                                shouldEmitCacheMiss = _sessionCloseCacheMissingEmittedKeys.Add(cacheMissKey);
+                            }
+                            if (shouldEmitCacheMiss)
+                            {
+                                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_CLOSE_CACHE_MISSING", state: "ENGINE",
+                                    new
+                                    {
+                                        instrument = _executionInstrument ?? "N/A",
+                                        trading_date = tradingDateStr,
+                                        session_class = sessionClass,
+                                        minutes_missing = Math.Round(minutesMissing, 1),
+                                        note = "Session close cache empty for 5+ minutes — forced flatten cannot trigger; watchdog alert"
+                                    }));
+                            }
                         }
                         continue;
                     }
@@ -1478,6 +1518,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         continue;
                     if (utcNow < closeResult.FlattenTriggerUtc.Value)
                         continue;
+
+                    // Cache populated (or fallback used) — reset missing timer
+                    _firstSessionCloseCacheMissUtc = null;
 
                     // Emit FORCED_FLATTEN_TRIGGERED once per (tradingDay, sessionClass)
                     if (!_journals.HasForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass))
@@ -1489,11 +1532,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             {
                                 reason = "SESSION_CLOSE",
                                 session_class = sessionClass,
-                                source = "LIVE_RESOLVER",
+                                source = usedFallback ? "FALLBACK_SPEC" : "LIVE_RESOLVER",
                                 resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
                                 buffer_seconds = closeResult.BufferSeconds,
                                 trading_date = tradingDateStr,
-                                streams_impacted = streamsInSession.Select(s => s.Stream).ToList()
+                                streams_impacted = streamsInSession.Select(s => s.Stream).ToList(),
+                                used_fallback = usedFallback
                             }));
                     }
 
@@ -2118,9 +2162,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 {
                     trading_day = tradingDay,
                     session_class = sessionClass,
+                    instrument = r.BarsInstrument ?? _executionInstrument ?? "N/A",
                     flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
                     resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
-                    buffer_seconds = r.BufferSeconds
+                    buffer_seconds = r.BufferSeconds,
+                    resolution_source = "LIVE_RESOLVER"
                 }));
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLUTION_SUCCESS", state: "ENGINE",
                 new { trading_day = tradingDay, session_class = sessionClass, bars_count = r.BarsCount, bars_instrument = r.BarsInstrument ?? "N/A" }));
@@ -2199,6 +2245,125 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         return false;
+    }
+
+    private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
+
+    /// <summary>
+    /// CME equity index default close. Used when spec is null (emergency fail-closed).
+    /// Spec market_close_time is America/Chicago local time (DST-aware via TimeService).
+    /// </summary>
+    private const string EMERGENCY_MARKET_CLOSE_DEFAULT = "16:00";
+
+    /// <summary>
+    /// Get session close from cache, or compute fallback. Ensures forced flatten can trigger even when
+    /// ResolveAndSetSessionCloseIfNeeded never ran.
+    ///
+    /// TIMEZONE CONTRACT (non-negotiable):
+    /// - spec.entry_cutoff.market_close_time is America/Chicago local time (DST-aware).
+    /// - TimeService.ConstructChicagoTime uses GetUtcOffset(localDateTime) for correct DST.
+    /// - ConvertChicagoToUtc produces UTC for comparison with utcNow.
+    /// - Never treat Chicago local as UTC.
+    /// </summary>
+    private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
+    {
+        usedFallback = false;
+        if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
+            return cached;
+
+        if (!DateOnly.TryParse(tradingDay, out var tradingDate))
+            return null;
+
+        // Path 1: Spec available — use spec.entry_cutoff.market_close_time (America/Chicago local)
+        if (_spec != null && _time != null)
+        {
+            var marketCloseTime = _spec.entry_cutoff?.market_close_time;
+            if (!string.IsNullOrWhiteSpace(marketCloseTime))
+            {
+                var result = ComputeFallbackFromTime(tradingDate, marketCloseTime, tradingDay, sessionClass, utcNow, "SPEC", ref usedFallback);
+                if (result != null)
+                    return result;
+            }
+        }
+
+        // Path 2: Spec null or market_close_time empty — emergency fail-closed (hard default 16:00 CT)
+        if (_time != null)
+        {
+            var failKey = (tradingDay, sessionClass);
+            bool shouldLogFail;
+            lock (_engineLock)
+            {
+                shouldLogFail = _sessionCloseFallbackFailedEmittedKeys.Add(failKey);
+            }
+            if (shouldLogFail)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_FAILED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        reason = _spec == null ? "SPEC_NULL" : "MARKET_CLOSE_TIME_EMPTY",
+                        emergency_close_used = EMERGENCY_MARKET_CLOSE_DEFAULT,
+                        note = "Spec unavailable — using emergency 16:00 CT default (fail-closed)"
+                    }));
+            }
+            var emergency = ComputeFallbackFromTime(tradingDate, EMERGENCY_MARKET_CLOSE_DEFAULT, tradingDay, sessionClass, utcNow, "EMERGENCY", ref usedFallback);
+            if (emergency != null)
+                return emergency;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Compute session close from (tradingDate, hhmm) in America/Chicago local time.
+    /// hhmm is interpreted as spec timezone (America/Chicago). DST-aware.
+    /// </summary>
+    private SessionCloseResult? ComputeFallbackFromTime(DateOnly tradingDate, string hhmm, string tradingDay, string sessionClass, DateTimeOffset utcNow, string source, ref bool usedFallback)
+    {
+        try
+        {
+            // America/Chicago local → UTC (deterministic, DST-aware)
+            var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
+            var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
+            var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
+            var fallback = new SessionCloseResult
+            {
+                HasSession = true,
+                FlattenTriggerUtc = flattenTriggerUtc,
+                ResolvedSessionCloseUtc = sessionEndUtc,
+                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BarsInstrument = _executionInstrument ?? "N/A"
+            };
+            var key = (tradingDay, sessionClass);
+            bool shouldLog;
+            lock (_engineLock)
+            {
+                shouldLog = _sessionCloseFallbackEmittedKeys.Add(key);
+            }
+            if (shouldLog)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_USED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        computed_session_close_utc = sessionEndUtc.ToString("o"),
+                        flatten_trigger_utc = flattenTriggerUtc.ToString("o"),
+                        resolution_source = source,
+                        timezone = "America/Chicago",
+                        note = "Session close from fallback — ResolveAndSetSessionCloseIfNeeded did not populate cache"
+                    }));
+            }
+            usedFallback = true;
+            return fallback;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -2506,7 +2671,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }));
                     
                     // HIGH-SIGNAL WARNING: Bars skipped during active range-building indicates state machine issue
-                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.DONE)
+                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.OPEN || stream.State == StreamState.DONE)
                     {
                         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_SKIPPED_ACTIVE_STREAM", state: "ENGINE",
                             new
@@ -3053,6 +3218,49 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
+        // Session Eligibility Freeze: load eligibility_<trading_date>.json — fail closed if missing
+        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{timetableTradingDate.Value:yyyy-MM-dd}.json");
+        EligibilityContract? eligibility = null;
+        try
+        {
+            eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
+                new { path = eligibilityPath, error = ex.Message, note = "Eligibility file load failed - engine will stand down" }));
+            StandDown();
+            return;
+        }
+
+        if (eligibility == null)
+        {
+            // Startup safety: machine may have been offline at 18:00 CT — try to generate eligibility
+            var tradingDateStr = timetableTradingDate.Value.ToString("yyyy-MM-dd");
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
+                new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found - attempting startup generation" }));
+
+            var generated = TryGenerateEligibilityAtStartup(timetableTradingDate.Value, utcNow);
+            if (generated)
+            {
+                eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
+            }
+
+            if (eligibility == null)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
+                    new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found after startup generation - fail closed" }));
+                StandDown();
+                return;
+            }
+        }
+
+        _eligibleSet = eligibility.GetEligibleStreamSet();
+        var eligibleCount = _eligibleSet.Count;
+        var eligibilityHash = ComputeFileHash(eligibilityPath);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
+            new { path = eligibilityPath, eligible_count = eligibleCount, eligibility_hash = eligibilityHash, matrix_hash = eligibility.source_matrix_hash }));
+
         var isReplayTimetable = timetable.metadata?.replay == true;
 
         // Only log timetable events when actually changed (or forced/initial load)
@@ -3100,9 +3308,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         else if (_activeTradingDate.HasValue && _streams.Count > 0)
         {
-            // If trading date is already locked and streams exist, apply timetable changes immediately
-            // This handles timetable updates after initial stream creation
-            ApplyTimetable(timetable, utcNow);
+            // Apply timetable updates (e.g. NG 09:30 -> 11:00 slot change) but block adding NEW streams.
+            // Matrix app auto-update can overwrite timetable mid-day; we allow slot-time updates for existing
+            // streams but prevent new stream creation. See docs/robot/incidents/2026-03-04_TIMETABLE_OVERRIDE_INVESTIGATION.md
+            ApplyTimetable(timetable, utcNow, allowNewStreams: false);
         }
         else
         {
@@ -3122,7 +3331,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // (simplified to only monitor connection loss and data loss)
     }
 
-    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow)
+    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow, bool allowNewStreams = true)
     {
         // Trading date must be locked before streams can be created
         if (_spec is null || _time is null || _lastTimetableHash is null || !_activeTradingDate.HasValue)
@@ -3359,6 +3568,32 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }
                 }
             }
+
+            // Session Eligibility Freeze: only process directives for streams in eligible_set
+            if (_eligibleSet != null && !string.IsNullOrWhiteSpace(streamId) && !_eligibleSet.Contains(streamId))
+            {
+                skippedCount++;
+                var skipReason = "NOT_ELIGIBLE";
+                if (!skippedReasons.ContainsKey(skipReason))
+                    skippedReasons[skipReason] = 0;
+                skippedReasons[skipReason]++;
+                var skipTradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+                DateTimeOffset? skipSlotTimeUtc = null;
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(slotTimeChicago))
+                        skipSlotTimeUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
+                }
+                catch { }
+                LogEvent(RobotEvents.Base(_time, utcNow, skipTradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, skipSlotTimeUtc,
+                    "DIRECTIVE_IGNORED_NOT_ELIGIBLE", "ENGINE", new
+                    {
+                        stream_key = streamId,
+                        slot_time = slotTimeChicago,
+                        note = "Stream not in session eligibility freeze - directive ignored"
+                    }));
+                continue;
+            }
             
             // Track stream ID occurrences for duplicate detection (using canonical stream ID)
             if (!string.IsNullOrWhiteSpace(streamId))
@@ -3505,8 +3740,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }));
                     continue;
                 }
-                
-                sm.ApplyDirectiveUpdate(directive.slot_time, _activeTradingDate.Value, utcNow);
+
+                var oldSlot = sm.SlotTimeChicago;
+                var applied = sm.ApplyDirectiveUpdate(directive.slot_time, _activeTradingDate.Value, utcNow);
+                if (applied)
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "DIRECTIVE_UPDATE_APPLIED", "ENGINE", new { old_slot = oldSlot, new_slot = directive.slot_time }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "DIRECTIVE_IGNORED_STATE_LOCKED", "ENGINE", new { stream_key = streamId, state = sm.State.ToString() }));
+                }
+            }
+            else if (!allowNewStreams)
+            {
+                // Mid-day update: block new stream creation (e.g. matrix auto-update added NQ2, GC2).
+                // Slot-time changes for existing streams are applied above. Only block additions.
+                // SESSION_FREEZE: eligibility frozen at 18:00 CT; no new streams mid-day.
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_ADDITION_BLOCKED", "ENGINE", new
+                    {
+                        reason = "SESSION_FREEZE",
+                        stream_id = streamId,
+                        slot_time = slotTimeChicago,
+                        note = "New stream blocked during mid-day timetable update (session eligibility frozen); slot-time changes for existing streams are applied"
+                    }));
             }
             else
             {
@@ -3721,6 +3981,81 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         // Any existing streams not present in timetable are left as-is; timetable is authoritative about enabled streams,
         // but the skeleton remains fail-closed (no orders) regardless.
+    }
+
+    /// <summary>
+    /// Startup safety: if machine was offline at 18:00 CT, generate eligibility now.
+    /// Returns true if file was created and can be loaded.
+    /// </summary>
+    private bool TryGenerateEligibilityAtStartup(DateOnly tradingDate, DateTimeOffset utcNow)
+    {
+        var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+        var scriptPath = Path.Combine(_root, "scripts", "eligibility_builder.py");
+        if (!File.Exists(scriptPath))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_SKIP", state: "ENGINE",
+                new { script_path = scriptPath, note = "Eligibility builder script not found - cannot generate at startup" }));
+            return false;
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python",
+            Arguments = $"\"{scriptPath}\" --date {tradingDateStr}",
+            WorkingDirectory = _root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        try
+        {
+            using var process = Process.Start(psi);
+            if (process == null)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                    new { note = "Failed to start eligibility builder process" }));
+                return false;
+            }
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(30000);
+
+            if (process.ExitCode != 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                    new { exit_code = process.ExitCode, stderr = stderr.Length > 500 ? stderr.Substring(0, 500) : stderr }));
+                return false;
+            }
+
+            var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{tradingDateStr}.json");
+            if (File.Exists(eligibilityPath))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_GENERATED_AT_STARTUP", state: "ENGINE",
+                    new { path = eligibilityPath, note = "Eligibility generated at startup (machine was offline at 18:00 CT)" }));
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                new { error = ex.Message }));
+        }
+        return false;
+    }
+
+    private static string? ComputeFileHash(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            using var sha = SHA256.Create();
+            using var stream = File.OpenRead(path);
+            var hash = sha.ComputeHash(stream);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant().Substring(0, 16);
+        }
+        catch { return null; }
     }
 
     private void StandDown()
@@ -4362,7 +4697,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var streamsReconciled = 0;
             foreach (var stream in _streams.Values)
             {
-                if (stream.Committed || stream.State != StreamState.RANGE_LOCKED)
+                if (stream.Committed || (stream.State != StreamState.RANGE_LOCKED && stream.State != StreamState.OPEN))
                 {
                     continue; // Skip committed or non-locked streams
                 }

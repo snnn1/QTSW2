@@ -7,11 +7,13 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Direct-call replay driver. Feeds events to IEA via *Core methods (no queue).
 /// Single-threaded, deterministic. Use with ReplayEventClock for event-time ordering.
+/// Assigns execution_sequence when missing for determinism (EXECUTION_LOGGING_IMPLEMENTATION_PLAN §3.3).
 /// </summary>
 public sealed class ReplayDriver
 {
     private readonly InstrumentExecutionAuthority _iea;
     private readonly ReplayEventClock _clock;
+    private readonly Dictionary<string, int> _executionSequenceByKey = new(StringComparer.Ordinal);
 
     public ReplayDriver(string accountName, string executionInstrumentKey)
     {
@@ -57,6 +59,8 @@ public sealed class ReplayDriver
                 var ticks = eu.ExecutionTime.UtcTicks;
                 if (TryMarkAndCheckDuplicateCore(execId, eu.OrderId, ticks, eu.FillQuantity, eu.MarketPosition))
                     return;
+                // Assign execution_sequence when missing for determinism (same order as live)
+                AssignExecutionSequenceIfMissing(eu);
                 _iea.ProcessExecutionUpdateCore(eu);
                 break;
 
@@ -110,5 +114,21 @@ public sealed class ReplayDriver
     private bool TryMarkAndCheckDuplicateCore(string? executionId, string orderId, long ticks, int quantity, string marketPosition)
     {
         return _iea.TryMarkAndCheckDuplicateCore(executionId, orderId, ticks, quantity, marketPosition);
+    }
+
+    /// <summary>
+    /// Assign execution_sequence when missing. Same order as live.
+    /// Scope: Monotonic per executionInstrumentKey (NOT per stream, NOT global across instruments).
+    /// Ensures replay produces deterministic sequence for ledger/audit.
+    /// </summary>
+    private void AssignExecutionSequenceIfMissing(ReplayExecutionUpdate eu)
+    {
+        if (eu.ExecutionSequence.HasValue) return;
+        var key = string.IsNullOrEmpty(eu.ExecutionInstrumentKey) ? "_" : eu.ExecutionInstrumentKey;
+        if (!_executionSequenceByKey.TryGetValue(key, out var next))
+            next = 0;
+        next++;
+        _executionSequenceByKey[key] = next;
+        eu.ExecutionSequence = next;
     }
 }

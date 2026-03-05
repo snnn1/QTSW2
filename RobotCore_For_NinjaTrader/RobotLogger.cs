@@ -308,6 +308,7 @@ public sealed class RobotLogger
         
         // Extract standardized top-level fields (per plan requirement #1)
         // Keep empty strings as-is (matching successful ENGINE events in logs)
+        // UNIFY FILL EVENTS: Promote trading_date from data when not at top level (ExecutionBase puts it in data payload)
         var tradingDateRaw = dict.TryGetValue("trading_date", out var td) ? td?.ToString() : null;
         var tradingDate = string.IsNullOrWhiteSpace(tradingDateRaw) ? "" : tradingDateRaw ?? "";
         var streamRaw = dict.TryGetValue("stream", out var str) ? str?.ToString() : null;
@@ -342,6 +343,14 @@ public sealed class RobotLogger
                     data["payload"] = dataObj;
                 }
             }
+        }
+
+        // UNIFY FILL EVENTS: Promote trading_date from data when not at top level (ExecutionBase puts it in data payload)
+        if (string.IsNullOrWhiteSpace(tradingDate) && data.TryGetValue("trading_date", out var tdFromData))
+        {
+            var tdStr = tdFromData?.ToString();
+            if (!string.IsNullOrWhiteSpace(tdStr))
+                tradingDate = tdStr;
         }
 
         // Include additional context fields in data (but exclude standardized top-level fields)

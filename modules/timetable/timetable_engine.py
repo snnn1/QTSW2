@@ -34,6 +34,7 @@ try:
         _validate_trade_date_dtype,
         _validate_trade_date_presence
     )
+    from modules.timetable.eligibility_writer import load_eligibility
 except ImportError:
     # Fallback: add parent directory to path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -41,6 +42,7 @@ except ImportError:
         _validate_trade_date_dtype,
         _validate_trade_date_presence
     )
+    from modules.timetable.eligibility_writer import load_eligibility
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -519,70 +521,170 @@ class TimetableEngine:
         
         return parquet_file, json_file
     
-    def write_execution_timetable_from_master_matrix(self, master_matrix_df: pd.DataFrame, 
-                                                      trade_date: Optional[str] = None,
-                                                      stream_filters: Optional[Dict] = None) -> None:
+    def write_execution_timetable_from_master_matrix(
+        self,
+        master_matrix_df: pd.DataFrame,
+        trade_date: Optional[str] = None,
+        stream_filters: Optional[Dict] = None,
+        execution_mode: bool = False,
+    ) -> None:
         """
         Write execution timetable from master matrix data.
-        
+
         This is the authoritative persistence point - called when master matrix is finalized.
         Generates timetable from latest date in master matrix, applying filters.
-        
+
         Args:
             master_matrix_df: Master matrix DataFrame
             trade_date: Optional trading date (YYYY-MM-DD). If None, uses latest date in matrix.
             stream_filters: Optional stream filters dict (for DOW/DOM filtering)
+            execution_mode: If True, load eligibility from file; never use manual filters (Path B).
         """
-        if master_matrix_df.empty:
-            logger.warning("Master matrix is empty, cannot generate execution timetable")
+        streams = self.build_streams_from_master_matrix(
+            master_matrix_df, trade_date, stream_filters, execution_mode
+        )
+        # When execution_mode=True and eligibility missing, fall back to matrix-derived streams
+        # so timetable is always written and eligibility builder can create the file
+        if not streams and execution_mode:
+            logger.info(
+                "SESSION_ELIGIBILITY_MISSING: falling back to execution_mode=False to build timetable; "
+                "eligibility builder will create file on next run"
+            )
+            streams = self.build_streams_from_master_matrix(
+                master_matrix_df, trade_date, stream_filters, execution_mode=False
+            )
+        if not streams:
             return
-        
-        # CONTRACT ENFORCEMENT: Require trade_date column
-        if 'trade_date' not in master_matrix_df.columns:
-            raise ValueError(
-                "Master matrix missing trade_date column - DataLoader must normalize dates before timetable generation. "
-                "This is a contract violation. Timetable Engine does not normalize dates."
-            )
-        
-        # Validate dtype/presence only (no normalization, no re-parsing)
-        _validate_trade_date_presence(master_matrix_df, "master_matrix")
-        _validate_trade_date_dtype(master_matrix_df, "master_matrix")
-        
-        # Ensure trade_date is datetime dtype before using .dt accessor
-        if not pd.api.types.is_datetime64_any_dtype(master_matrix_df['trade_date']):
-            raise ValueError(
-                f"Master matrix trade_date column is not datetime dtype after validation: {master_matrix_df['trade_date'].dtype}. "
-                f"This is a contract violation. DataLoader must normalize dates before timetable generation."
-            )
-        
+        self._write_execution_timetable_file(streams, trade_date)
+
+    def build_streams_from_master_matrix(
+        self,
+        master_matrix_df: pd.DataFrame,
+        trade_date: Optional[str] = None,
+        stream_filters: Optional[Dict] = None,
+        execution_mode: bool = False,
+    ) -> List[Dict]:
+        """
+        Build streams list (enabled/block_reason per stream) from master matrix.
+        Used by both timetable write and eligibility builder.
+        Returns empty list if matrix empty; all-disabled list if no data for trade_date (MATRIX_DATE_MISSING).
+
+        When execution_mode=True: Load eligibility from file; never use manual filters (Path B).
+        Robot fails closed if eligibility file is missing.
+        """
+        # Eligibility always loads from canonical data/timetable (not timetable_output_dir)
+        eligibility_dir = Path("data/timetable")
+        output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else eligibility_dir
+
+        if master_matrix_df.empty and not execution_mode:
+            logger.warning("Master matrix is empty, cannot build streams")
+            return []
+
+        # CONTRACT ENFORCEMENT: Require trade_date column when matrix is non-empty
+        if not master_matrix_df.empty:
+            if 'trade_date' not in master_matrix_df.columns:
+                raise ValueError(
+                    "Master matrix missing trade_date column - DataLoader must normalize dates before timetable generation. "
+                    "This is a contract violation. Timetable Engine does not normalize dates."
+                )
+            _validate_trade_date_presence(master_matrix_df, "master_matrix")
+            _validate_trade_date_dtype(master_matrix_df, "master_matrix")
+            if not pd.api.types.is_datetime64_any_dtype(master_matrix_df['trade_date']):
+                raise ValueError(
+                    f"Master matrix trade_date column is not datetime dtype after validation: {master_matrix_df['trade_date'].dtype}. "
+                    f"This is a contract violation. DataLoader must normalize dates before timetable generation."
+                )
+
         # Get latest date from master matrix if not provided
         if trade_date is None:
-            latest_date = master_matrix_df['trade_date'].max()
-            trade_date = latest_date.strftime('%Y-%m-%d')
-        
+            if master_matrix_df.empty:
+                chicago_tz = pytz.timezone("America/Chicago")
+                trade_date = datetime.now(chicago_tz).date().isoformat()
+            else:
+                latest_date = master_matrix_df['trade_date'].max()
+                trade_date = latest_date.strftime('%Y-%m-%d')
+
         trade_date_obj = pd.to_datetime(trade_date).date()
-        
-        # CRITICAL FIX: To determine the time slot for a given date, we need to look at the PREVIOUS day's row.
-        # The Time Change column in the previous day's row tells us what time to use today.
-        # If Time Change is empty, the time stays the same (use previous day's Time value).
-        # This ensures that time slots only change on losses, not on wins.
+
+        # EXECUTION_MODE: Load eligibility artifact; fail closed if missing
+        if execution_mode:
+            eligibility = load_eligibility(trade_date, str(eligibility_dir))
+            if eligibility is None:
+                logger.error(
+                    f"SESSION_ELIGIBILITY_MISSING: eligibility_{trade_date}.json not found. "
+                    "Robot must fail closed. Aborting timetable build."
+                )
+                return []
+            eligibility_lookup = {
+                es["stream_key"]: {"enabled": es.get("enabled", False), "reason": es.get("reason")}
+                for es in eligibility.get("eligible_streams", [])
+            }
+            eligibility_file = eligibility_dir / f"eligibility_{trade_date}.json"
+            eligibility_hash = None
+            if eligibility_file.exists():
+                try:
+                    import hashlib
+                    eligibility_hash = hashlib.sha256(eligibility_file.read_bytes()).hexdigest()[:16]
+                except Exception:
+                    pass
+            logger.info(
+                f"TIMETABLE_EXECUTION_MODE_ENABLED: trading_date={trade_date}, "
+                f"eligibility_file={eligibility_file.name}, eligibility_hash={eligibility_hash or 'none'}"
+            )
+            logger.info("PATH_B_BLOCKED_EXECUTION_MODE: Manual filters (DOW/DOM/exclude_times) skipped; eligibility artifact is sole source")
+            # Build streams from eligibility + matrix (slot_time from matrix or default)
+            return self._build_streams_execution_mode(
+                master_matrix_df, trade_date_obj, eligibility_lookup
+            )
+
+        if master_matrix_df.empty:
+            return []
+
+        # Check if we have data for target date or previous/most-recent date
+        # For future dates (no data yet), use previous day or most recent date in matrix
         from datetime import timedelta
         previous_date_obj = trade_date_obj - timedelta(days=1)
         previous_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == previous_date_obj].copy()
-        
-        # If no previous day data exists, fall back to using the current date's data
-        # (this handles the case where we're generating the first day's timetable)
-        if previous_df.empty:
-            logger.info(f"No data for previous date {previous_date_obj}, using current date {trade_date_obj} data")
-            source_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
-            use_previous_day_logic = False
+        latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
+
+        # No data for target date (future or not yet in matrix) — use previous day or most recent date
+        if latest_df.empty:
+            if not previous_df.empty:
+                logger.info(
+                    f"No data for date {trade_date_obj} (future/not yet traded); "
+                    f"using previous day {previous_date_obj} for eligibility and time slots"
+                )
+                source_df = previous_df
+                use_previous_day_logic = False  # source is previous, no "time change" semantics
+                latest_df = previous_df  # use for final_allowed
+            else:
+                # Use most recent date in matrix (any date before target)
+                before_target = master_matrix_df[master_matrix_df['trade_date'].dt.date < trade_date_obj]
+                if before_target.empty:
+                    logger.warning(
+                        f"No data before date {trade_date_obj}, returning all streams disabled (MATRIX_DATE_MISSING)"
+                    )
+                    return self._build_all_disabled_streams(trade_date_obj, "MATRIX_DATE_MISSING")
+                most_recent_date = before_target['trade_date'].max().date()
+                source_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == most_recent_date].copy()
+                latest_df = source_df.copy()
+                use_previous_day_logic = False
+                logger.info(
+                    f"No data for date {trade_date_obj}; using most recent {most_recent_date} for eligibility"
+                )
         else:
-            source_df = previous_df
-            use_previous_day_logic = True
-        
+            # Have data for target date
+            if previous_df.empty:
+                logger.info(f"No data for previous date {previous_date_obj}, using current date {trade_date_obj} data")
+                source_df = latest_df.copy()
+                use_previous_day_logic = False
+            else:
+                source_df = previous_df
+                use_previous_day_logic = True
+
         if source_df.empty:
-            logger.warning(f"No data for date {trade_date_obj}, cannot generate execution timetable")
-            return
+            logger.warning(f"No source data for date {trade_date_obj}, returning all streams disabled")
+            return self._build_all_disabled_streams(trade_date_obj, "MATRIX_DATE_MISSING")
         
         # Extract day-of-week and day-of-month for filtering (use target date, not source date)
         target_dow = trade_date_obj.weekday()  # 0=Monday, 6=Sunday
@@ -821,12 +923,95 @@ class TimetableEngine:
                     'block_reason': 'not_in_master_matrix'
                 }
         
-        # Convert dict to list (all 12 streams guaranteed)
-        streams = list(streams_dict.values())
-        
-        # Write execution timetable file
-        self._write_execution_timetable_file(streams, trade_date)
-    
+        # Convert dict to list (all 14 streams guaranteed)
+        return list(streams_dict.values())
+
+    def _build_streams_execution_mode(
+        self,
+        master_matrix_df: pd.DataFrame,
+        trade_date_obj: date,
+        eligibility_lookup: Dict[str, Dict],
+    ) -> List[Dict]:
+        """
+        Build streams from eligibility artifact + matrix (slot_time).
+        Used only when execution_mode=True. Eligibility is sole source for enabled/disabled.
+        """
+        from datetime import timedelta
+
+        streams_dict = {}
+        previous_date_obj = trade_date_obj - timedelta(days=1)
+        if not master_matrix_df.empty and 'trade_date' in master_matrix_df.columns:
+            previous_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == previous_date_obj].copy()
+            latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
+        else:
+            previous_df = pd.DataFrame()
+            latest_df = pd.DataFrame()
+        source_df = previous_df if not previous_df.empty else latest_df
+        use_previous_day_logic = not previous_df.empty and not latest_df.empty
+
+        for stream_id in self.streams:
+            instrument = stream_id[:-1] if len(stream_id) > 1 else ''
+            session = 'S1' if stream_id.endswith('1') else 'S2'
+            elig = eligibility_lookup.get(stream_id, {"enabled": False, "reason": "not_in_eligibility"})
+            enabled = elig.get("enabled", False)
+            block_reason = None if enabled else elig.get("reason", "eligibility_disabled")
+
+            # Get slot_time from matrix if available
+            time = ""
+            if not source_df.empty:
+                row = source_df[source_df['Stream'] == stream_id]
+                if not row.empty:
+                    r = row.iloc[0]
+                    time = r.get('Time', '')
+                    if use_previous_day_logic:
+                        time_change = r.get('Time Change', '')
+                        if time_change and str(time_change).strip():
+                            tc = str(time_change).strip()
+                            time = tc.split('->')[-1].strip() if '->' in tc else tc
+                    if time:
+                        from modules.matrix.utils import normalize_time
+                        norm = normalize_time(str(time))
+                        available_norm = [normalize_time(str(t)) for t in self.session_time_slots.get(session, [])]
+                        if norm not in available_norm:
+                            time = ""
+            if not time:
+                available_times = self.session_time_slots.get(session, [])
+                time = available_times[0] if available_times else ""
+
+            streams_dict[stream_id] = {
+                'stream': stream_id,
+                'instrument': instrument,
+                'session': session,
+                'slot_time': time,
+                'decision_time': time,
+                'enabled': enabled,
+            }
+            if block_reason:
+                streams_dict[stream_id]['block_reason'] = block_reason
+
+        return list(streams_dict.values())
+
+    def _build_all_disabled_streams(
+        self, trade_date_obj: date, block_reason: str
+    ) -> List[Dict]:
+        """Build streams list with all streams disabled (e.g. MATRIX_DATE_MISSING)."""
+        streams = []
+        for stream_id in self.streams:
+            instrument = stream_id[:-1] if len(stream_id) > 1 else ''
+            session = 'S1' if stream_id.endswith('1') else 'S2'
+            available_times = self.session_time_slots.get(session, [])
+            default_time = available_times[0] if available_times else ""
+            streams.append({
+                'stream': stream_id,
+                'instrument': instrument,
+                'session': session,
+                'slot_time': default_time,
+                'decision_time': default_time,
+                'enabled': False,
+                'block_reason': block_reason,
+            })
+        return streams
+
     def _write_execution_timetable_file(self, streams: List[Dict], trade_date: str) -> None:
         """
         Internal method to write execution timetable file.
@@ -919,6 +1104,27 @@ class TimetableEngine:
             temp_file.replace(final_file)
             
             logger.info(f"Execution timetable written: {final_file} ({len(streams)} streams)")
+
+            # Session Eligibility Freeze: write eligibility_<trading_date>.json (never overwrite)
+            # Skip when all streams have no_rs_data — generate_timetable had no analyzer data;
+            # eligibility builder (matrix-derived) will create correct file when triggered
+            no_rs_count = sum(1 for s in streams if s.get("block_reason") == "no_rs_data")
+            if no_rs_count < len(streams):
+                try:
+                    from modules.timetable.eligibility_writer import write_eligibility_file
+                    write_eligibility_file(
+                        streams=streams,
+                        trading_date=trading_date,
+                        output_dir=str(output_dir),
+                        source_matrix_hash=None,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to write eligibility file: {e}")
+            else:
+                logger.info(
+                    "ELIGIBILITY_SKIP: all streams no_rs_data (no analyzer data); "
+                    "eligibility builder will create from matrix when triggered"
+                )
         except Exception as e:
             logger.error(f"Failed to write execution timetable: {e}")
             # Clean up temp file on error
@@ -1004,6 +1210,9 @@ class TimetableEngine:
             if file_path.name == f"{keep_filename}.json":
                 continue
             if file_path.name == f"{keep_filename}.tmp":
+                continue
+            # Never delete eligibility files (immutable per trading_date; robot fails closed without them)
+            if file_path.name.startswith("eligibility_"):
                 continue
             
             try:

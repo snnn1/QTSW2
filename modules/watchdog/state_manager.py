@@ -253,9 +253,9 @@ class WatchdogStateManager:
                 info.state = state
                 info.state_entry_time_utc = state_entry_time_utc or datetime.now(timezone.utc)
                 
-                # CRITICAL: Clear ranges when transitioning away from RANGE_LOCKED
+                # CRITICAL: Clear ranges when transitioning away from RANGE_LOCKED or OPEN
                 # This prevents old ranges from persisting across state transitions
-                if previous_state == "RANGE_LOCKED" and state != "RANGE_LOCKED":
+                if previous_state in ("RANGE_LOCKED", "OPEN") and state not in ("RANGE_LOCKED", "OPEN"):
                     logger.debug(
                         f"Clearing ranges for stream {stream} ({trading_date}): "
                         f"transitioning from RANGE_LOCKED to {state}"
@@ -507,7 +507,7 @@ class WatchdogStateManager:
                             continue
                         key = (current_td, stream_id)
                         info = self._stream_states.get(key)
-                        if not info or info.state != "RANGE_LOCKED":
+                        if not info or info.state not in ("RANGE_LOCKED", "OPEN"):
                             continue
                         if info.range_high is not None and info.range_low is not None:
                             continue
@@ -829,7 +829,7 @@ class WatchdogStateManager:
         - market_open == True, AND
         - at least one stream for that execution instrument is in a bar-dependent state.
         
-        Bar-dependent states: PRE_HYDRATION, ARMED, RANGE_BUILDING, RANGE_LOCKED
+        Bar-dependent states: PRE_HYDRATION, ARMED, RANGE_BUILDING, RANGE_LOCKED, OPEN
         Excluded states: DONE, COMMITTED, NO_TRADE, INVALIDATED
         
         Args:
@@ -841,7 +841,7 @@ class WatchdogStateManager:
         
         # Check if any stream for this execution instrument is in a bar-dependent state
         # CRITICAL: Also check if the stream is enabled on the timetable
-        bar_dependent_states = {"PRE_HYDRATION", "ARMED", "RANGE_BUILDING", "RANGE_LOCKED"}
+        bar_dependent_states = {"PRE_HYDRATION", "ARMED", "RANGE_BUILDING", "RANGE_LOCKED", "OPEN"}
         excluded_states = {"DONE", "COMMITTED", "NO_TRADE", "INVALIDATED"}
         
         for (trading_date, stream), info in self._stream_states.items():

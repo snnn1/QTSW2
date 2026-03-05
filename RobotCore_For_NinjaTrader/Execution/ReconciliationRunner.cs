@@ -122,6 +122,7 @@ public sealed class ReconciliationRunner
                     }
                 }
                 var taxonomy = journalQty > accountQty ? "journal_ahead" : (accountQty > journalQty ? "broker_ahead" : "unknown");
+                var openInstSummary = openByInstrument.ToDictionary(k => k.Key, v => v.Value.Sum(e => e.Entry.EntryFilledQuantityTotal));
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_CONTEXT", "ENGINE",
                     new
                     {
@@ -131,6 +132,8 @@ public sealed class ReconciliationRunner
                         intent_ids = intentIds,
                         last_fills = lastFills,
                         mismatch_taxonomy = taxonomy,
+                        journal_dir = _journal.JournalDirectory,
+                        open_instruments_qty = openInstSummary,
                         note = "Context for RECONCILIATION_QTY_MISMATCH"
                     }));
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_QTY_MISMATCH", "ENGINE",

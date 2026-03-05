@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using QTSW2.Robot.Core;
@@ -28,7 +29,33 @@ public sealed class ExecutionJournal
     {
         _journalDir = Path.Combine(projectRoot, "data", "execution_journals");
         Directory.CreateDirectory(_journalDir);
+        ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
         _log = log;
+    }
+    
+    /// <summary>
+    /// Phase 3.2: Startup self-check. Verifies journal dir exists and is writable.
+    /// Writes and reads .startup_check; throws on failure (fail closed).
+    /// </summary>
+    private void ValidateJournalDirectory()
+    {
+        if (!Directory.Exists(_journalDir))
+            throw new InvalidOperationException($"ExecutionJournal: journal directory does not exist: {_journalDir}");
+        
+        var checkPath = Path.Combine(_journalDir, ".startup_check");
+        try
+        {
+            var testContent = DateTimeOffset.UtcNow.ToString("o");
+            File.WriteAllText(checkPath, testContent);
+            var readBack = File.ReadAllText(checkPath);
+            if (readBack != testContent)
+                throw new InvalidOperationException($"ExecutionJournal: startup check read-back mismatch for {_journalDir}");
+            File.Delete(checkPath);
+        }
+        catch (Exception ex) when (ex is not InvalidOperationException)
+        {
+            throw new InvalidOperationException($"ExecutionJournal: journal directory not writable: {_journalDir}", ex);
+        }
     }
     
     /// <summary>
@@ -1325,6 +1352,136 @@ public sealed class ExecutionJournal
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 
+    private static string GetInstrumentRoot(string instrumentKey)
+    {
+        if (string.IsNullOrWhiteSpace(instrumentKey)) return "";
+        var s = instrumentKey.Trim();
+        var idx = s.IndexOf(' ');
+        return idx >= 0 ? s.Substring(0, idx) : s;
+    }
+
+    /// <summary>
+    /// Get all open journal entries (EntryFilled && !TradeCompleted) grouped by execution instrument.
+    /// </summary>
+    public Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> GetOpenJournalEntriesByInstrument()
+    {
+        var result = new Dictionary<string, List<(string, string, string, ExecutionJournalEntry)>>(StringComparer.OrdinalIgnoreCase);
+        string[] files;
+        try { files = Directory.GetFiles(_journalDir, "*.json"); }
+        catch { return result; }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+
+                var tradingDate = parts[0];
+                var intentId = parts[parts.Length - 1];
+                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    if (_cache.TryGetValue(fileName, out var cached))
+                        entry = cached;
+                    else
+                    {
+                        var json = File.ReadAllText(path);
+                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                        if (entry != null) _cache[fileName] = entry;
+                    }
+                }
+
+                if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;
+                if (entry.EntryFilledQuantityTotal <= 0) continue;
+
+                var instrument = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!result.TryGetValue(instrument, out var list))
+                {
+                    list = new List<(string, string, string, ExecutionJournalEntry)>();
+                    result[instrument] = list;
+                }
+                list.Add((tradingDate, stream, intentId, entry));
+            }
+            catch { /* Skip corrupt files */ }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Get sum of EntryFilledQuantityTotal for open journal entries matching an instrument.
+    /// </summary>
+    public int GetOpenJournalQuantitySumForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var sum = 0;
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (string.Equals(key, executionInstrument, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+            {
+                foreach (var (_, _, _, entry) in kvp.Value)
+                    sum += entry.EntryFilledQuantityTotal;
+            }
+        }
+        return sum;
+    }
+
+    /// <summary>
+    /// Record trade completion via reconciliation (broker flat, no exit fill received).
+    /// </summary>
+    public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            ExecutionJournalEntry? entry;
+            if (_cache.TryGetValue(key, out var existing))
+                entry = existing;
+            else if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null) _cache[key] = entry;
+                    else return false;
+                }
+                catch { return false; }
+            }
+            else return false;
+
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted) return false;
+            if (entry.EntryFilledQuantityTotal <= 0) return false;
+
+            entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+            entry.ExitAvgFillPrice = null;
+            entry.ExitFillNotional = null;
+            entry.ExitFilledAtUtc = utcNow.ToString("o");
+            entry.ExitOrderType = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+            entry.TradeCompleted = true;
+            entry.CompletedAtUtc = utcNow.ToString("o");
+            entry.CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+            entry.RealizedPnLPoints = null;
+            entry.RealizedPnLGross = null;
+            entry.RealizedPnLNet = null;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+            return true;
+        }
+    }
+
     private void SaveJournal(string path, ExecutionJournalEntry entry)
     {
         try
@@ -1438,4 +1595,13 @@ public class ExecutionJournalEntry
     public decimal? RealizedPnLPoints { get; set; } // Gross points before multiplier
     public string? CompletionReason { get; set; } // Exit order type that completed the trade
     public string? CompletedAtUtc { get; set; } // Trade completion timestamp (ISO-8601 UTC)
+}
+
+/// <summary>
+/// Canonical completion reason strings for trade closure.
+/// </summary>
+public static class CompletionReasons
+{
+    public const string RECONCILIATION_BROKER_FLAT = "RECONCILIATION_BROKER_FLAT";
+    public const string RECONCILIATION_MANUAL_OVERRIDE = "RECONCILIATION_MANUAL_OVERRIDE";
 }

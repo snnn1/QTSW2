@@ -197,60 +197,15 @@ async def reload_latest_matrix():
                 detail=f"Master matrix directory not found: {root_matrix_dir.resolve()}. Please build the matrix first."
             )
         
-        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        from modules.matrix.file_manager import get_best_matrix_file
+        file_to_load = get_best_matrix_file(str(root_matrix_dir))
         
-        if not parquet_files:
+        if file_to_load is None:
             logger.warning(f"No matrix files found in: {root_matrix_dir}")
             raise HTTPException(
                 status_code=404, 
                 detail=f"No master matrix files found in {root_matrix_dir.resolve()}. Please build the matrix first using 'Rebuild Matrix' button."
             )
-        
-        # Find most recent file by parsing timestamp from filename
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        max_future_tolerance = timedelta(days=1)
-        
-        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
-            """Parse timestamp from filename like master_matrix_YYYYMMDD_HHMMSS.parquet"""
-            import re
-            pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
-            match = pattern.search(file_path.name)
-            if match:
-                try:
-                    date_str = match.group(1) + match.group(2)  # YYYYMMDDHHMMSS
-                    return datetime.strptime(date_str, '%Y%m%d%H%M%S')
-                except ValueError:
-                    return None
-            return None
-        
-        # Separate files with valid timestamps from those without
-        files_with_timestamp = []
-        files_without_timestamp = []
-        
-        for f in parquet_files:
-            ts = parse_timestamp_from_filename(f)
-            if ts:
-                # Reject files dated more than 1 day in the future
-                if ts <= now + max_future_tolerance:
-                    files_with_timestamp.append((ts, f))
-                else:
-                    logger.warning(f"Rejecting future-dated file: {f.name} (timestamp: {ts})")
-            else:
-                files_without_timestamp.append(f)
-        
-        if files_with_timestamp:
-            # Sort by timestamp descending (newest first)
-            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
-            file_to_load = files_with_timestamp[0][1]
-            logger.info(f"Selected latest file by timestamp: {file_to_load.name}")
-        elif files_without_timestamp:
-            # Fallback to mtime if no valid timestamps found
-            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            file_to_load = files_without_timestamp[0]
-            logger.warning(f"No valid timestamped files found, using mtime fallback: {file_to_load.name}")
-        else:
-            raise HTTPException(status_code=404, detail=f"No valid master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
         
         file_mtime = file_to_load.stat().st_mtime
         matrix_file_id = file_to_load.name
@@ -387,65 +342,18 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         if not root_matrix_dir.exists():
             raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
         
-        parquet_files = []
-        if root_matrix_dir.exists():
-            parquet_files.extend(root_matrix_dir.glob("master_matrix_*.parquet"))
-        
         if file_path:
             # Use specified file
             file_to_load = Path(file_path)
             if not file_to_load.exists():
                 raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
         else:
-            # Find most recent file by parsing timestamp from filename
-            # Reject future-dated files (beyond 1 day tolerance) to avoid selecting invalid files
-            if parquet_files:
-                from datetime import datetime, timedelta
-                now = datetime.now()
-                max_future_tolerance = timedelta(days=1)
-                
-                def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
-                    """Parse timestamp from filename like master_matrix_YYYYMMDD_HHMMSS.parquet"""
-                    import re
-                    pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
-                    match = pattern.search(file_path.name)
-                    if match:
-                        try:
-                            date_str = match.group(1) + match.group(2)  # YYYYMMDDHHMMSS
-                            return datetime.strptime(date_str, '%Y%m%d%H%M%S')
-                        except ValueError:
-                            return None
-                    return None
-                
-                # Separate files with valid timestamps from those without
-                files_with_timestamp = []
-                files_without_timestamp = []
-                
-                for f in parquet_files:
-                    ts = parse_timestamp_from_filename(f)
-                    if ts:
-                        # Reject files dated more than 1 day in the future
-                        if ts <= now + max_future_tolerance:
-                            files_with_timestamp.append((ts, f))
-                        else:
-                            logger.warning(f"Rejecting future-dated file: {f.name} (timestamp: {ts})")
-                    else:
-                        files_without_timestamp.append(f)
-                
-                if files_with_timestamp:
-                    # Sort by timestamp descending (newest first)
-                    files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
-                    file_to_load = files_with_timestamp[0][1]
-                    logger.info(f"Selected latest file by timestamp: {file_to_load.name}")
-                elif files_without_timestamp:
-                    # Fallback to mtime if no valid timestamps found
-                    files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                    file_to_load = files_without_timestamp[0]
-                    logger.warning(f"No valid timestamped files found, using mtime fallback: {file_to_load.name}")
-                else:
-                    raise HTTPException(status_code=404, detail=f"No valid master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
-            else:
+            # Prefer fullest file (most rows) so truncated resequences don't replace full rebuilds
+            from modules.matrix.file_manager import get_best_matrix_file
+            file_to_load = get_best_matrix_file(str(root_matrix_dir))
+            if file_to_load is None:
                 raise HTTPException(status_code=404, detail=f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
+            logger.info(f"Selected fullest file: {file_to_load.name}")
         
         # Load parquet file in thread pool to avoid blocking (large files)
         def _load_parquet_sync():
@@ -699,52 +607,17 @@ async def calculate_profit_breakdown(request: BreakdownRequest):
                         f"DOY is analysis-only - day filters will be ignored."
                     )
         
-        # Find latest matrix file (same logic as /data endpoint)
+        # Find fullest matrix file (same logic as /data endpoint)
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
         
         if not root_matrix_dir.exists():
             raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
         
-        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        from modules.matrix.file_manager import get_best_matrix_file
+        file_to_load = get_best_matrix_file(str(root_matrix_dir))
         
-        if not parquet_files:
+        if file_to_load is None:
             raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
-        
-        # Find latest file by timestamp or mtime
-        from datetime import datetime, timedelta
-        import re
-        now = datetime.now()
-        max_future_tolerance = timedelta(days=1)
-        
-        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
-            pattern = re.compile(r'master_matrix_(\d{8})_(\d{6})\.parquet$')
-            match = pattern.search(file_path.name)
-            if match:
-                try:
-                    date_str = match.group(1) + match.group(2)
-                    return datetime.strptime(date_str, '%Y%m%d%H%M%S')
-                except ValueError:
-                    return None
-            return None
-        
-        files_with_timestamp = []
-        files_without_timestamp = []
-        
-        for f in parquet_files:
-            ts = parse_timestamp_from_filename(f)
-            if ts and ts <= now + max_future_tolerance:
-                files_with_timestamp.append((ts, f))
-            else:
-                files_without_timestamp.append(f)
-        
-        if files_with_timestamp:
-            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
-            file_to_load = files_with_timestamp[0][1]
-        elif files_without_timestamp:
-            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            file_to_load = files_without_timestamp[0]
-        else:
-            raise HTTPException(status_code=404, detail="No valid master matrix files found")
         
         # Load full dataset
         def _load_parquet_sync():
@@ -991,55 +864,17 @@ async def get_stream_stats(request: StreamStatsRequest):
         import pandas as pd
         from modules.matrix import statistics
         
-        # Find latest matrix file (same logic as /data endpoint)
+        # Find fullest matrix file (same logic as /data endpoint)
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
         
         if not root_matrix_dir.exists():
             raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
         
-        parquet_files = list(root_matrix_dir.glob("master_matrix_*.parquet"))
+        from modules.matrix.file_manager import get_best_matrix_file
+        file_to_load = get_best_matrix_file(str(root_matrix_dir))
         
-        if not parquet_files:
+        if file_to_load is None:
             raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
-        
-        # Use same file selection logic as /data endpoint
-        from datetime import datetime, timedelta
-        now = datetime.now()
-        max_future_tolerance = timedelta(days=1)
-        
-        def parse_timestamp_from_filename(file_path: Path) -> Optional[datetime]:
-            try:
-                # Extract timestamp from filename: master_matrix_YYYYMMDD_HHMMSS.parquet
-                name = file_path.stem
-                if '_' in name:
-                    parts = name.split('_')
-                    if len(parts) >= 3:
-                        date_str = parts[2]  # YYYYMMDD
-                        time_str = parts[3] if len(parts) > 3 else "000000"  # HHMMSS
-                        timestamp_str = f"{date_str}_{time_str}"
-                        return datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
-            except Exception:
-                pass
-            return None
-        
-        files_with_timestamp = []
-        files_without_timestamp = []
-        
-        for f in parquet_files:
-            ts = parse_timestamp_from_filename(f)
-            if ts and ts <= now + max_future_tolerance:
-                files_with_timestamp.append((ts, f))
-            else:
-                files_without_timestamp.append(f)
-        
-        if files_with_timestamp:
-            files_with_timestamp.sort(key=lambda x: x[0], reverse=True)
-            file_to_load = files_with_timestamp[0][1]
-        elif files_without_timestamp:
-            files_without_timestamp.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            file_to_load = files_without_timestamp[0]
-        else:
-            raise HTTPException(status_code=404, detail="No valid master matrix files found")
         
         # Load full dataset (no limit, no column filtering - get everything)
         def _load_parquet_sync():

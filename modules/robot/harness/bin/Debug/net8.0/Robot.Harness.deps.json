@@ -27,7 +27,7 @@
         "runtime": {
           "Robot.Core.dll": {
             "assemblyVersion": "1.0.0",
-            "fileVersion": "1.0.0.0"
+            "fileVersion": "0.0.0.0"
           }
         }
       }

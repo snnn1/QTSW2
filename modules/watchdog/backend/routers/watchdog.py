@@ -379,6 +379,35 @@ async def reprocess_identity():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to reprocess identity: {str(e)}")
 
+@router.get("/fill-metrics")
+async def get_fill_metrics(
+    date: Optional[str] = Query(None, description="Trading date (YYYY-MM-DD). Default: today (Chicago)"),
+    stream: Optional[str] = Query(None, description="Optional stream filter")
+):
+    """
+    Get fill metrics for execution logging hygiene.
+    
+    Returns: fill_coverage_rate, unmapped_rate, null_trading_date_rate, total_fills, etc.
+    Targets: coverage=100%, unmapped=0, null_td=0.
+    """
+    try:
+        import pytz
+        if not date:
+            chicago_tz = pytz.timezone("America/Chicago")
+            date = datetime.now(chicago_tz).strftime("%Y-%m-%d")
+        from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
+        metrics = compute_fill_metrics(date, stream)
+        metrics["fill_health_ok"] = (
+            metrics.get("fill_coverage_rate", 1.0) >= 1.0
+            and metrics.get("unmapped_rate", 0) <= 0
+            and metrics.get("null_trading_date_rate", 0) <= 0
+        )
+        return metrics
+    except Exception as e:
+        logger.error(f"Error computing fill metrics: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/stream-pnl")
 async def get_stream_pnl(
     trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),

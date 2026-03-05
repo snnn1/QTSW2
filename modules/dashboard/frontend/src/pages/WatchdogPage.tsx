@@ -7,6 +7,7 @@ import { CriticalAlertBanner } from '../components/watchdog/CriticalAlertBanner'
 import { StreamStatusTable } from '../components/watchdog/StreamStatusTable'
 import { RiskGatesPanel } from '../components/watchdog/RiskGatesPanel'
 import { ActiveIntentPanel } from '../components/watchdog/ActiveIntentPanel'
+import { FillHealthCard } from '../components/watchdog/FillHealthCard'
 import { LiveEventFeed } from '../components/watchdog/LiveEventFeed'
 import { StreamDetailDrawer } from '../components/watchdog/StreamDetailDrawer'
 import { useWatchdogStatus } from '../hooks/useWatchdogStatus'
@@ -282,7 +283,10 @@ export function WatchdogPage() {
                 {Object.keys(pnl).length} stream(s)
               </div>
             </div>
-            
+
+            {/* Fill Health (execution logging hygiene) */}
+            <FillHealthCard fillHealth={status?.fill_health} />
+
             <div id="risk-gates-panel">
               <RiskGatesPanel gates={gates} loading={!gates} />
             </div>
