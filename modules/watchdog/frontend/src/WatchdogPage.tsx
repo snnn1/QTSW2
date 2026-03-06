@@ -8,6 +8,8 @@ import { StreamStatusTable } from './components/watchdog/StreamStatusTable'
 import { RiskGatesPanel } from './components/watchdog/RiskGatesPanel'
 import { ActiveIntentPanel } from './components/watchdog/ActiveIntentPanel'
 import { FillHealthCard } from './components/watchdog/FillHealthCard'
+import { ActiveAlertsCard } from './components/watchdog/ActiveAlertsCard'
+import { AlertsHistoryCard } from './components/watchdog/AlertsHistoryCard'
 import { LiveEventFeed } from './components/watchdog/LiveEventFeed'
 import { StreamDetailDrawer } from './components/watchdog/StreamDetailDrawer'
 import { useWatchdogStatus } from './hooks/useWatchdogStatus'
@@ -16,6 +18,7 @@ import { useRiskGates } from './hooks/useRiskGates'
 import { useUnprotectedPositions } from './hooks/useUnprotectedPositions'
 import { useStreamStates } from './hooks/useStreamStates'
 import { useActiveIntents } from './hooks/useActiveIntents'
+import { useWatchdogAlerts } from './hooks/useWatchdogAlerts'
 import { useStreamPnl } from './hooks/useStreamPnl'
 import { getCurrentChicagoTime } from './utils/timeUtils.ts'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
@@ -41,6 +44,7 @@ export function WatchdogPage() {
   const { positions: unprotectedPositions, loading: positionsLoading, error: positionsError, lastSuccessfulPollTimestamp: positionsPollTime } = useUnprotectedPositions()
   const { streams, loading: streamsLoading, error: streamsError, lastSuccessfulPollTimestamp: streamsPollTime } = useStreamStates()
   const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents()
+  const { recentAlerts, loading: alertsHistoryLoading } = useWatchdogAlerts(24, 30)
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
@@ -172,11 +176,22 @@ export function WatchdogPage() {
     return 'FLOWING'
   }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago]) // Only depend on fields that affect result
   
-  // Build critical alerts
+  // Build critical alerts (includes Phase 1 push alerts)
   const alerts = useMemo(() => {
     const result: Array<{ type: 'critical' | 'degraded'; message: string; scrollTo?: string }> = []
     
     if (!status) return result
+
+    // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
+    const activeAlerts = status.active_alerts ?? []
+    for (const a of activeAlerts) {
+      const label = a.alert_type.replace(/_/g, ' ')
+      result.push({
+        type: (a.severity === 'critical' ? 'critical' : 'degraded') as 'critical' | 'degraded',
+        message: `[Watchdog] ${label}`,
+        scrollTo: 'active-alerts-panel',
+      })
+    }
     
     if (unprotectedPositions.length > 0) {
       result.push({
@@ -321,6 +336,12 @@ export function WatchdogPage() {
                 {Object.keys(pnl).length} stream(s)
               </div>
             </div>
+
+            {/* Phase 1: Active push alerts */}
+            <ActiveAlertsCard alerts={status?.active_alerts ?? []} />
+
+            {/* Phase 1: Alert history (24h) */}
+            <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
 
             {/* Fill Health (execution logging hygiene) */}
             <FillHealthCard fillHealth={status?.fill_health} />

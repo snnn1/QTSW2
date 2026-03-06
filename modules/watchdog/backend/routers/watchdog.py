@@ -71,6 +71,24 @@ async def get_watchdog_status():
         raise HTTPException(status_code=500, detail=f"Error getting watchdog status: {str(e)}")
 
 
+@router.get("/alerts")
+async def get_alerts(
+    active_only: bool = Query(False, description="Return only active alerts"),
+    since_hours: Optional[float] = Query(None, description="Filter to alerts since N hours ago"),
+    limit: int = Query(200, ge=1, le=500, description="Max records to return"),
+):
+    """Get active alerts and recent alert history from Phase 1 ledger."""
+    try:
+        aggregator = get_aggregator()
+        result = aggregator.get_alerts(active_only=active_only, since_hours=since_hours, limit=limit)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting alerts: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting alerts: {str(e)}")
+
+
 @router.get("/events")
 async def get_events(
     run_id: Optional[str] = Query(None, description="Current engine run_id (optional, will use current if not provided)"),

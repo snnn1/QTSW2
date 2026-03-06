@@ -45,7 +45,8 @@ export function useWatchdogStatus() {
               prevStatus.engine_alive === data.engine_alive &&
               prevStatus.last_engine_tick_chicago === data.last_engine_tick_chicago &&
               JSON.stringify(prevStatus.data_stall_detected) === JSON.stringify(data.data_stall_detected) &&
-              JSON.stringify(prevStatus.stuck_streams) === JSON.stringify(data.stuck_streams)
+              JSON.stringify(prevStatus.stuck_streams) === JSON.stringify(data.stuck_streams) &&
+              JSON.stringify(prevStatus.active_alerts) === JSON.stringify(data.active_alerts)
             ) {
               return prevStatus // Return previous reference if unchanged
             }

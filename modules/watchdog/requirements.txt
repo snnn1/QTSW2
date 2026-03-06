@@ -1,0 +1,3 @@
+# Optional dependencies for Watchdog Phase 1
+# Process monitor uses psutil; degrades gracefully if not installed
+psutil>=5.9.0

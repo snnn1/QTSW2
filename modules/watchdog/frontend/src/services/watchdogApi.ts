@@ -302,6 +302,57 @@ export interface StreamPnlResponse {
 }
 
 /**
+ * Alert record from Phase 1 ledger
+ */
+export interface AlertRecord {
+  alert_id?: string
+  alert_type?: string
+  severity?: string
+  first_seen_utc?: string
+  last_seen_utc?: string
+  dedupe_key?: string
+  context?: Record<string, unknown>
+  event?: string
+  resolved_utc?: string
+}
+
+export interface AlertsResponse {
+  active_alerts: AlertRecord[]
+  recent: AlertRecord[]
+}
+
+/**
+ * Fetch alerts (active + recent history)
+ */
+export async function fetchWatchdogAlerts(
+  activeOnly = false,
+  sinceHours?: number,
+  limit = 50
+): Promise<ApiResponse<AlertsResponse>> {
+  try {
+    const params = new URLSearchParams()
+    params.append('active_only', String(activeOnly))
+    if (sinceHours != null) params.append('since_hours', String(sinceHours))
+    params.append('limit', String(limit))
+    const response = await fetchWithTimeout(`${API_BASE}/alerts?${params.toString()}`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
  * Fetch stream P&L
  */
 export async function fetchStreamPnl(

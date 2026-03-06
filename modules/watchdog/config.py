@@ -17,6 +17,27 @@ FRONTEND_CURSOR_FILE = QTSW2_ROOT / "data" / "frontend_cursor.json"
 # Persisted read positions for robot log files (survives watchdog restarts)
 ROBOT_LOG_READ_POSITIONS_FILE = QTSW2_ROOT / "data" / "robot_log_read_positions.json"
 
+# Phase 1: Alert ledger and notification config
+ALERT_LEDGER_PATH = QTSW2_ROOT / "data" / "watchdog" / "alert_ledger.jsonl"
+NOTIFICATIONS_CONFIG_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.json"
+NOTIFICATIONS_SECRETS_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.secrets.json"
+
+# Process monitor
+PROCESS_MONITOR_INTERVAL_SECONDS = 30
+PROCESS_MONITOR_PROCESS_NAME = "NinjaTrader.exe"
+
+# Supervision and alert safeguards
+SUPERVISION_WINDOW_RECENT_ACTIVITY_SECONDS = 7200  # 2 hours
+ALERT_STARTUP_GRACE_SECONDS = 90  # No alerts in first 90s after watchdog start (avoids false alerts during deploys)
+PROCESS_MONITOR_GRACE_SECONDS = 60  # No process-down alert in first 60s
+
+# Log-growth monitoring: detect feed file not growing (logging deadlock, file handle lost, NT not flushing)
+LOG_GROWTH_MONITOR_FILE = FRONTEND_FEED_FILE  # Monitor our ingest source
+LOG_GROWTH_STALL_THRESHOLD_SECONDS = 60  # File size unchanged for 60s → alert candidate
+
+# Orphan detection: confirmed orphan requires heartbeat lost for this long with no recovery
+CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS = 120  # 2 minutes
+
 # Thresholds (from specification)
 # ENGINE_TICK_STALL_THRESHOLD_SECONDS: Threshold for detecting engine tick stalls
 # ENGINE_TICK_CALLSITE is rate-limited in feed to every 5 seconds

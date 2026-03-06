@@ -28,6 +28,19 @@ export interface WatchdogStatus {
   // Fill health (execution logging hygiene)
   fill_health?: FillHealthInfo | null;
   trading_date?: string | null;
+  // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
+  active_alerts?: ActiveAlert[];
+}
+
+export interface ActiveAlert {
+  alert_id: string;
+  alert_type: string;
+  severity: string;
+  first_seen_utc: string;
+  last_seen_utc: string;
+  dedupe_key: string;
+  context?: Record<string, unknown>;
+  delivery_status?: string;
 }
 
 export interface FillHealthInfo {

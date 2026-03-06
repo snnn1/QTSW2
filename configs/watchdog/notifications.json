@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "restored_notifications": {
+    "enabled": true
+  },
+  "channels": {
+    "pushover": {
+      "enabled": true,
+      "priority_default": 1,
+      "priority_critical": 2,
+      "retry_count": 2,
+      "retry_delay_seconds": 5,
+      "timeout_seconds": 12
+    }
+  },
+  "rate_limits": {
+    "min_resend_interval_seconds": 300,
+    "max_alerts_per_hour": 20
+  }
+}

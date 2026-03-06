@@ -25,8 +25,15 @@ from .event_processor import EventProcessor
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
 from .config import (
+    ALERT_STARTUP_GRACE_SECONDS,
+    CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS,
     EXECUTION_JOURNALS_DIR,
     FRONTEND_FEED_FILE,
+    LOG_GROWTH_MONITOR_FILE,
+    LOG_GROWTH_STALL_THRESHOLD_SECONDS,
+    PROCESS_MONITOR_GRACE_SECONDS,
+    PROCESS_MONITOR_INTERVAL_SECONDS,
+    PROCESS_MONITOR_PROCESS_NAME,
     TAIL_LINE_COUNT,
     ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS,
     DEGRADATION_LOOP_THRESHOLD_MS,
@@ -263,6 +270,16 @@ class WatchdogAggregator:
 
         # INGESTION: /events cache - (events, cached_at_utc) to avoid linear disk scaling
         self._events_cache: Optional[Tuple[List[Dict], datetime]] = None
+
+        # Phase 1: Notification service and process monitor
+        self._notification_service: Optional[Any] = None
+        self._process_monitor: Optional[Any] = None
+        self._watchdog_started_utc: Optional[datetime] = None
+        self._process_monitor_polls_since_start: int = 0
+        self._last_ledger_trim_utc: Optional[datetime] = None
+        # Log-growth monitoring
+        self._log_file_size_last: Optional[int] = None
+        self._log_file_stall_started_utc: Optional[datetime] = None
     
     async def start(self):
         """Start the aggregator service."""
@@ -355,15 +372,78 @@ class WatchdogAggregator:
         except Exception as e:
             logger.warning(f"Failed to initialize identity status on startup: {e}", exc_info=True)
         
+        # Phase 1: Initialize notification service and process monitor
+        self._watchdog_started_utc = datetime.now(timezone.utc)
+        try:
+            from .alert_ledger import AlertLedger
+            from .notifications.notification_service import NotificationService
+            from .process_monitor import ProcessMonitor
+
+            ledger = AlertLedger()
+            self._notification_service = NotificationService(ledger=ledger)
+            await self._notification_service.start()
+
+            def on_process_down(ctx: dict) -> None:
+                if self._notification_service:
+                    self._notification_service.raise_alert(
+                        alert_type="NINJATRADER_PROCESS_STOPPED",
+                        severity="critical",
+                        context=ctx,
+                        dedupe_key="NINJATRADER_PROCESS_STOPPED",
+                        min_resend_interval_seconds=300,
+                    )
+                    if ctx.get("active_intent_count", 0) > 0:
+                        self._notification_service.raise_alert(
+                            alert_type="POTENTIAL_ORPHAN_POSITION",
+                            severity="critical",
+                            context={
+                                "market_open": ctx.get("market_open"),
+                                "active_intent_count": ctx.get("active_intent_count", 0),
+                                "trigger": "process_missing",
+                            },
+                            dedupe_key="POTENTIAL_ORPHAN_POSITION",
+                            min_resend_interval_seconds=300,
+                        )
+
+            def on_process_restored(dedupe_key: str) -> None:
+                if self._notification_service:
+                    if dedupe_key == "NINJATRADER_PROCESS_STOPPED" and self._notification_service.is_alert_active(dedupe_key):
+                        self._notification_service.send_restored_notification(
+                            "[Watchdog] NinjaTrader Process Restored",
+                            "NinjaTrader process is running again.",
+                        )
+                    self._notification_service.resolve_alert(dedupe_key)
+                    if dedupe_key == "NINJATRADER_PROCESS_STOPPED":
+                        self._notification_service.resolve_alert("POTENTIAL_ORPHAN_POSITION")
+                        self._notification_service.resolve_alert("CONFIRMED_ORPHAN_POSITION")
+
+            self._process_monitor = ProcessMonitor(
+                process_name=PROCESS_MONITOR_PROCESS_NAME,
+                on_process_down=on_process_down,
+                on_process_restored=on_process_restored,
+            )
+        except Exception as e:
+            logger.warning(f"Phase 1 notification/process monitor init failed: {e}", exc_info=True)
+            self._notification_service = None
+            self._process_monitor = None
+
         # Start background task for processing events
         asyncio.create_task(self._process_events_loop())
-        
+
         # Start background task for polling timetable
         asyncio.create_task(self._poll_timetable_loop())
+
+        # Start background task for process monitor
+        asyncio.create_task(self._process_monitor_loop())
     
     async def stop(self):
         """Stop the aggregator service."""
         self._running = False
+        if self._notification_service:
+            try:
+                await self._notification_service.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping notification service: {e}")
         logger.info("Watchdog aggregator stopped")
     
     def get_stream_pnl(
@@ -476,9 +556,12 @@ class WatchdogAggregator:
                     cleanup_counter = 0
                     self._cleanup_stale_streams_periodic()
                 
+                # Phase 1: Check alert conditions (heartbeat, connection)
+                self._check_alert_conditions()
+
                 # Sleep before next iteration
                 await asyncio.sleep(1)  # Process every second
-                
+
             except Exception as e:
                 logger.error(f"Error in event processing loop: {e}", exc_info=True)
                 await asyncio.sleep(5)  # Wait longer on error
@@ -547,7 +630,176 @@ class WatchdogAggregator:
                 logger.error(f"TIMETABLE_POLL_FAIL: Unexpected error: {e}", exc_info=True)
             
             await asyncio.sleep(60)
-    
+
+    async def _process_monitor_loop(self):
+        """Poll NinjaTrader process every 30 seconds. Raise/resolve process alerts."""
+        from .market_session import is_market_open
+
+        while self._running:
+            try:
+                if self._process_monitor and self._notification_service:
+                    self._process_monitor_polls_since_start += 1
+                    now = datetime.now(CHICAGO_TZ)
+                    market_open = is_market_open(now)
+                    now_utc = datetime.now(timezone.utc)
+                    active_intent_count = len([
+                        e for e in self._state_manager._intent_exposures.values()
+                        if getattr(e, "state", "") == "ACTIVE"
+                    ])
+                    last_tick = self._state_manager._last_engine_tick_utc
+                    self._process_monitor.check(market_open, active_intent_count, last_tick)
+
+                    # Grace: no process-down alert in first 60s
+                    if self._process_monitor_polls_since_start * PROCESS_MONITOR_INTERVAL_SECONDS < PROCESS_MONITOR_GRACE_SECONDS:
+                        pass  # Skip alert for first poll(s)
+
+                    # Ledger retention: trim old records once per day
+                    ledger = self._notification_service.get_ledger()
+                    if self._last_ledger_trim_utc is None or (now_utc - self._last_ledger_trim_utc).total_seconds() >= 86400:
+                        try:
+                            removed = ledger.trim_old_records()
+                            if removed > 0:
+                                logger.info(f"Alert ledger trim: removed {removed} old record(s)")
+                            self._last_ledger_trim_utc = now_utc
+                        except Exception as trim_err:
+                            logger.warning(f"Alert ledger trim failed: {trim_err}")
+            except Exception as e:
+                logger.error(f"Process monitor loop error: {e}", exc_info=True)
+            await asyncio.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
+
+    def _check_alert_conditions(self):
+        """Check heartbeat and connection status; raise alerts when conditions met."""
+        if not self._notification_service:
+            return
+        now_utc = datetime.now(timezone.utc)
+        if self._watchdog_started_utc and (now_utc - self._watchdog_started_utc).total_seconds() < ALERT_STARTUP_GRACE_SECONDS:
+            return
+
+        # Supervision window
+        from .market_session import is_market_open
+        from .process_monitor import is_supervision_window_open
+
+        chicago_now = datetime.now(CHICAGO_TZ)
+        market_open = is_market_open(chicago_now)
+        active_intent_count = len([
+            e for e in self._state_manager._intent_exposures.values()
+            if getattr(e, "state", "") == "ACTIVE"
+        ])
+        last_tick = self._state_manager._last_engine_tick_utc
+        window_open = is_supervision_window_open(market_open, active_intent_count, last_tick, now_utc)
+
+        if not window_open:
+            return
+
+        # ROBOT_HEARTBEAT_LOST: engine_alive=False, severity HIGH, suppress if process-down already active
+        status = self._state_manager.compute_watchdog_status()
+        engine_alive = status.get("engine_alive", True)
+        last_tick_utc = self._state_manager._last_engine_tick_utc
+        heartbeat_lost_seconds = (
+            (now_utc - last_tick_utc).total_seconds()
+            if last_tick_utc else 0
+        )
+        if not engine_alive:
+            if not self._notification_service.is_alert_active("NINJATRADER_PROCESS_STOPPED"):
+                self._notification_service.raise_alert(
+                    alert_type="ROBOT_HEARTBEAT_LOST",
+                    severity="high",
+                    context={
+                        "market_open": market_open,
+                        "last_tick_utc": status.get("last_engine_tick_chicago"),
+                    },
+                    dedupe_key="ROBOT_HEARTBEAT_LOST",
+                    min_resend_interval_seconds=300,
+                )
+            # POTENTIAL_ORPHAN: heartbeat lost + active intents (allows short restart windows)
+            if active_intent_count > 0:
+                self._notification_service.raise_alert(
+                    alert_type="POTENTIAL_ORPHAN_POSITION",
+                    severity="critical",
+                    context={
+                        "market_open": market_open,
+                        "active_intent_count": active_intent_count,
+                        "trigger": "heartbeat_lost",
+                    },
+                    dedupe_key="POTENTIAL_ORPHAN_POSITION",
+                    min_resend_interval_seconds=300,
+                )
+            # CONFIRMED_ORPHAN: heartbeat lost for > N seconds + active intents
+            if active_intent_count > 0 and heartbeat_lost_seconds >= CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS:
+                self._notification_service.raise_alert(
+                    alert_type="CONFIRMED_ORPHAN_POSITION",
+                    severity="critical",
+                    context={
+                        "market_open": market_open,
+                        "active_intent_count": active_intent_count,
+                        "heartbeat_lost_seconds": int(heartbeat_lost_seconds),
+                    },
+                    dedupe_key="CONFIRMED_ORPHAN_POSITION",
+                    min_resend_interval_seconds=300,
+                )
+        else:
+            if self._notification_service.is_alert_active("ROBOT_HEARTBEAT_LOST"):
+                self._notification_service.send_restored_notification(
+                    "[Watchdog] Heartbeat Restored",
+                    "Robot heartbeat restored. Engine ticks are flowing again.",
+                )
+            self._notification_service.resolve_alert("ROBOT_HEARTBEAT_LOST")
+            self._notification_service.resolve_alert("CONFIRMED_ORPHAN_POSITION")
+            self._notification_service.resolve_alert("POTENTIAL_ORPHAN_POSITION")
+
+        # CONNECTION_LOST_SUSTAINED: connection_status=ConnectionLost for >= 60s, severity HIGH
+        connection_status = getattr(self._state_manager, "_connection_status", "").lower()
+        last_conn_utc = getattr(self._state_manager, "_last_connection_event_utc", None)
+        if "connectionlost" in connection_status or "lost" in connection_status:
+            if last_conn_utc and (now_utc - last_conn_utc).total_seconds() >= 60:
+                self._notification_service.raise_alert(
+                    alert_type="CONNECTION_LOST_SUSTAINED",
+                    severity="high",
+                    context={
+                        "market_open": market_open,
+                        "elapsed_seconds": int((now_utc - last_conn_utc).total_seconds()),
+                    },
+                    dedupe_key="CONNECTION_LOST_SUSTAINED",
+                    min_resend_interval_seconds=300,
+                )
+        else:
+            if self._notification_service.is_alert_active("CONNECTION_LOST_SUSTAINED"):
+                self._notification_service.send_restored_notification(
+                    "[Watchdog] Connection Restored",
+                    "Connection to broker restored.",
+                )
+            self._notification_service.resolve_alert("CONNECTION_LOST_SUSTAINED")
+
+        # LOG_FILE_STALLED: feed file size unchanged for 60s (logging deadlock, file handle lost, NT not flushing)
+        if LOG_GROWTH_MONITOR_FILE.exists():
+            try:
+                size_now = LOG_GROWTH_MONITOR_FILE.stat().st_size
+                if self._log_file_size_last is not None and size_now == self._log_file_size_last:
+                    if self._log_file_stall_started_utc is None:
+                        self._log_file_stall_started_utc = now_utc
+                    elif (now_utc - self._log_file_stall_started_utc).total_seconds() >= LOG_GROWTH_STALL_THRESHOLD_SECONDS:
+                        self._notification_service.raise_alert(
+                            alert_type="LOG_FILE_STALLED",
+                            severity="high",
+                            context={
+                                "file": str(LOG_GROWTH_MONITOR_FILE),
+                                "size_bytes": size_now,
+                                "stall_seconds": int((now_utc - self._log_file_stall_started_utc).total_seconds()),
+                            },
+                            dedupe_key="LOG_FILE_STALLED",
+                            min_resend_interval_seconds=300,
+                        )
+                else:
+                    self._log_file_stall_started_utc = None
+                    self._notification_service.resolve_alert("LOG_FILE_STALLED")
+                self._log_file_size_last = size_now
+            except Exception as e:
+                logger.debug(f"Log growth check failed: {e}")
+        else:
+            self._log_file_size_last = None
+            self._log_file_stall_started_utc = None
+            self._notification_service.resolve_alert("LOG_FILE_STALLED")
+
     def _cleanup_stale_streams_periodic(self):
         """Periodically clean up stale streams (runs every 60 seconds)."""
         try:
@@ -1183,6 +1435,16 @@ class WatchdogAggregator:
                 status["fill_health"] = None
                 if "trading_date" not in status:
                     status["trading_date"] = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+            # Phase 1: include active alerts for UI
+            if self._notification_service:
+                try:
+                    ledger = self._notification_service.get_ledger()
+                    status["active_alerts"] = ledger.get_active_alerts()
+                except Exception as e:
+                    logger.debug(f"Could not get active alerts: {e}")
+                    status["active_alerts"] = []
+            else:
+                status["active_alerts"] = []
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -1209,12 +1471,25 @@ class WatchdogAggregator:
                 "execution_blocked_count": 0,
                 "protective_failures_count": 0,
                 "data_stall_detected": {},
-                "market_open": market_open
+                "market_open": market_open,
+                "active_alerts": [],
             }
     
     def get_ingestion_stats(self) -> Dict:
         """Get latest ingestion telemetry (tail read duration, loop duration, etc.)."""
         return self._ingestion_telemetry.get_latest_stats()
+
+    def get_alerts(self, active_only: bool = False, since_hours: Optional[float] = None, limit: int = 200) -> Dict:
+        """Get alerts from ledger for API. Phase 1."""
+        if not self._notification_service:
+            return {"active_alerts": [], "recent": []}
+        ledger = self._notification_service.get_ledger()
+        active = ledger.get_active_alerts()
+        recent = ledger.read_recent(active_only=active_only, since_hours=since_hours, limit=limit)
+        return {
+            "active_alerts": active,
+            "recent": recent,
+        }
 
     def get_risk_gate_status(self) -> Dict:
         """Get current risk gate status."""
