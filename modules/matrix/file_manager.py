@@ -5,10 +5,12 @@ This module handles saving and loading master matrix files
 in both Parquet and JSON formats.
 """
 
+import re
 import logging
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 from datetime import datetime, timezone
@@ -16,8 +18,32 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from .utils import _enforce_trade_date_invariants
+from .config import SAVE_JSON_ON_BUILD
 
 logger = logging.getLogger(__name__)
+
+# Regex to extract row count from filename: master_matrix_YYYYMMDD_HHMMSS_Nn.parquet
+_ROW_COUNT_RE = re.compile(r"_(\d+)n\.parquet$", re.IGNORECASE)
+
+
+def _parse_row_count_from_path(path: Path) -> Optional[int]:
+    """Parse row count from filename. Returns None for legacy files without _Nn suffix."""
+    m = _ROW_COUNT_RE.search(path.name)
+    return int(m.group(1)) if m else None
+
+
+def _get_best_matrix_path_by_row_count(parquet_files: list) -> Optional[Path]:
+    """
+    Select best parquet file by row count. Uses filename suffix when available (no disk read).
+    Fallback: read up to 10 files when no files have row count in filename (legacy).
+    """
+    files_with_count = [(pf, _parse_row_count_from_path(pf)) for pf in parquet_files]
+    has_any_count = any(c is not None for _, c in files_with_count)
+    if has_any_count:
+        # Sort by row count descending; files without count go last (treat as 0)
+        best = max(files_with_count, key=lambda x: (x[1] or 0, x[0].name))
+        return best[0]
+    return None  # Fallback: caller will read files
 
 
 def _trigger_eligibility_builder_async(trading_date: str, output_dir: str) -> None:
@@ -100,15 +126,16 @@ def save_master_matrix(
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
+    row_count = len(df)
     if specific_date:
-        # Save as "today" file
+        # Save as "today" file (no row count in filename - small, one per date)
         date_str = specific_date.replace('-', '')
         parquet_file = output_path / f"master_matrix_today_{date_str}.parquet"
         json_file = output_path / f"master_matrix_today_{date_str}.json"
     else:
-        # Save as full backtest file
-        parquet_file = output_path / f"master_matrix_{timestamp}.parquet"
-        json_file = output_path / f"master_matrix_{timestamp}.json"
+        # Save as full backtest file with row count for fast best-file selection
+        parquet_file = output_path / f"master_matrix_{timestamp}_{row_count}n.parquet"
+        json_file = output_path / f"master_matrix_{timestamp}_{row_count}n.json"
     
     # SL column should already exist from schema_normalizer (NaN if missing from analyzer)
     
@@ -137,43 +164,81 @@ def save_master_matrix(
             if df['Date'].dtype == 'object':
                 df['Date'] = df['Date'].astype(str)
     
-    # Save as Parquet
-    df.to_parquet(parquet_file, index=False, compression='snappy')
-    logger.info(f"Saved: {parquet_file} (columns: {list(df.columns)})")
+    # Save as Parquet and JSON in parallel when both are needed (df is already a copy)
+    import time
+    from .instrumentation import log_timing_event
+    t_save_start = time.perf_counter()
+    save_json = specific_date is not None or SAVE_JSON_ON_BUILD
+    if save_json:
+        df_for_json = df.copy()
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fut_parquet = ex.submit(
+                lambda: df.to_parquet(parquet_file, index=False, compression='snappy')
+            )
+            fut_json = ex.submit(
+                lambda: df_for_json.to_json(json_file, orient='records', date_format='iso', indent=2)
+            )
+            for fut in as_completed([fut_parquet, fut_json]):
+                fut.result()
+        logger.info(f"Saved: {parquet_file} (columns: {list(df.columns)})")
+        logger.info(f"Saved: {json_file}")
+    else:
+        df.to_parquet(parquet_file, index=False, compression='snappy')
+        logger.info(f"Saved: {parquet_file} (columns: {list(df.columns)})")
     
-    # Save as JSON (for easy inspection)
-    df.to_json(json_file, orient='records', date_format='iso', indent=2)
-    logger.info(f"Saved: {json_file}")
+    duration_ms = int((time.perf_counter() - t_save_start) * 1000)
+    log_timing_event(
+        phase="matrix_save",
+        duration_ms=duration_ms,
+        row_count=len(df),
+        stream_count=len(df["Stream"].unique()) if "Stream" in df.columns else 0,
+        file_path=str(parquet_file),
+        mode="today" if specific_date else "full",
+    )
+    from .build_journal import journal_event
+    journal_event(
+        event_type="matrix_saved",
+        mode="today" if specific_date else "full",
+        rows_written=len(df),
+        matrix_file_path=str(parquet_file),
+        duration_ms=duration_ms,
+    )
     
-    # Persist execution timetable from master matrix (authoritative persistence point)
-    try:
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from modules.timetable.timetable_engine import TimetableEngine
-        
-        # Ensure trade_date is datetime dtype before passing to timetable engine
-        # Parquet save/load or DataFrame operations can sometimes change dtype
-        if 'trade_date' in df.columns:
-            if not pd.api.types.is_datetime64_any_dtype(df['trade_date']):
-                logger.warning(
-                    f"trade_date column is {df['trade_date'].dtype} before timetable generation, "
-                    f"converting to datetime64. This should not happen - check data processing pipeline."
-                )
-                df['trade_date'] = pd.to_datetime(df['trade_date'], errors='raise')
-        
-        engine = TimetableEngine(timetable_output_dir=timetable_output_dir) if timetable_output_dir else TimetableEngine()
-        engine.write_execution_timetable_from_master_matrix(
-            df,
-            trade_date=specific_date,
-            stream_filters=stream_filters,
-            execution_mode=True,  # Robot path: eligibility artifact only; never manual filters
-        )
-        logger.info("Execution timetable persisted from master matrix")
-        _trigger_eligibility_builder_after_save(output_dir=output_dir)
-    except Exception as e:
-        # Log but don't fail matrix save if timetable persistence fails
-        logger.warning(f"Failed to persist execution timetable: {e}")
-        import traceback
-        logger.debug(f"Timetable persistence traceback: {traceback.format_exc()}")
+    # Persist execution timetable and trigger eligibility builder in background (non-blocking)
+    def _run_timetable_and_eligibility():
+        try:
+            import time
+            from .build_journal import journal_event
+            journal_event(event_type="timetable_start", mode="from_matrix")
+            t_timetable = time.perf_counter()
+            time.sleep(0.1)  # Brief delay to let filesystem settle
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from modules.timetable.timetable_engine import TimetableEngine
+            df_copy = df.copy()
+            if 'trade_date' in df_copy.columns and not pd.api.types.is_datetime64_any_dtype(df_copy['trade_date']):
+                df_copy['trade_date'] = pd.to_datetime(df_copy['trade_date'], errors='raise')
+            engine = TimetableEngine(timetable_output_dir=timetable_output_dir) if timetable_output_dir else TimetableEngine()
+            engine.write_execution_timetable_from_master_matrix(
+                df_copy,
+                trade_date=specific_date,
+                stream_filters=stream_filters,
+                execution_mode=True,
+            )
+            logger.info("Execution timetable persisted from master matrix")
+            duration_ms = int((time.perf_counter() - t_timetable) * 1000)
+            from .instrumentation import log_timing_event
+            log_timing_event(phase="timetable_generation", duration_ms=duration_ms, mode="from_matrix")
+            journal_event(event_type="timetable_complete", mode="from_matrix", duration_ms=duration_ms)
+            _trigger_eligibility_builder_after_save(output_dir=output_dir)
+        except Exception as e:
+            from .build_journal import journal_event
+            journal_event(event_type="failure", mode="timetable", error=str(e))
+            logger.warning(f"Failed to persist execution timetable: {e}")
+            import traceback
+            logger.debug(f"Timetable persistence traceback: {traceback.format_exc()}")
+    
+    t = threading.Thread(target=_run_timetable_and_eligibility, daemon=True)
+    t.start()
     
     return parquet_file, json_file
 
@@ -182,9 +247,8 @@ def load_existing_matrix(output_dir: str) -> pd.DataFrame:
     """
     Load the master matrix file with the most rows (fullest history).
     
-    Prefers files with more rows over the most recent file, so a truncated
-    resequence does not replace a full rebuild. Checks the 10 most recent
-    files to avoid loading too many.
+    Uses row count in filename when available (no disk read). Falls back to
+    reading up to 10 files for legacy filenames without _Nn suffix.
     
     Args:
         output_dir: Directory containing master matrix files
@@ -192,31 +256,64 @@ def load_existing_matrix(output_dir: str) -> pd.DataFrame:
     Returns:
         DataFrame with existing matrix data, or empty DataFrame if not found
     """
+    import time
+    from .instrumentation import log_timing_event
+    t0 = time.perf_counter()
     output_path = Path(output_dir)
     existing_df = pd.DataFrame()
     
     if output_path.exists():
         parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
         if parquet_files:
-            best_df = None
-            best_rows = 0
-            for pf in parquet_files[:10]:
+            best_path = _get_best_matrix_path_by_row_count(parquet_files[:20])
+            if best_path is not None:
+                # Fast path: row count in filename, load single file
                 try:
-                    df = pd.read_parquet(pf)
-                    if len(df) > best_rows:
-                        best_rows = len(df)
-                        best_df = df
+                    existing_df = pd.read_parquet(best_path)
+                    logger.info(f"Loaded existing master matrix: {len(existing_df)} trades (from {best_path.name})")
                 except Exception as e:
-                    logger.debug(f"Could not load {pf.name}: {e}")
-            if best_df is not None:
-                existing_df = best_df
-                logger.info(f"Loaded existing master matrix: {len(existing_df)} trades (fullest of {min(10, len(parquet_files))} recent files)")
-                
-                # After parquet load: enforce invariants (fail-closed)
-                # trade_date canonical, Date derived for legacy compatibility only
-                if not existing_df.empty:
-                    _enforce_trade_date_invariants(existing_df, "parquet_reload")
+                    logger.debug(f"Could not load {best_path.name}: {e}")
+            else:
+                # Fallback: legacy files, read up to 10 to find fullest
+                best_df = None
+                best_rows = 0
+                for pf in parquet_files[:10]:
+                    try:
+                        df = pd.read_parquet(pf)
+                        if len(df) > best_rows:
+                            best_rows = len(df)
+                            best_df = df
+                    except Exception as e:
+                        logger.debug(f"Could not load {pf.name}: {e}")
+                if best_df is not None:
+                    existing_df = best_df
+                    logger.info(f"Loaded existing master matrix: {len(existing_df)} trades (fullest of {min(10, len(parquet_files))} recent files)")
+            
+            if not existing_df.empty:
+                _enforce_trade_date_invariants(existing_df, "parquet_reload")
+                try:
+                    from .integrity import validate_matrix_integrity
+                    ok, issues = validate_matrix_integrity(existing_df)
+                    if issues:
+                        for msg in issues:
+                            logger.warning(f"Matrix integrity: {msg}")
+                except Exception as e:
+                    logger.debug(f"Integrity validation skipped: {e}")
     
+    duration_ms = int((time.perf_counter() - t0) * 1000)
+    dmin, dmax = None, None
+    if not existing_df.empty and "trade_date" in existing_df.columns:
+        mn, mx = existing_df["trade_date"].min(), existing_df["trade_date"].max()
+        dmin = mn.strftime("%Y-%m-%d") if pd.notna(mn) and hasattr(mn, "strftime") else None
+        dmax = mx.strftime("%Y-%m-%d") if pd.notna(mx) and hasattr(mx, "strftime") else None
+    log_timing_event(
+        phase="matrix_load",
+        duration_ms=duration_ms,
+        row_count=len(existing_df) if not existing_df.empty else 0,
+        stream_count=len(existing_df["Stream"].unique()) if not existing_df.empty and "Stream" in existing_df.columns else 0,
+        date_min=dmin,
+        date_max=dmax,
+    )
     return existing_df
 
 
@@ -241,7 +338,8 @@ def get_latest_matrix_file(output_dir: str) -> Optional[Path]:
 def get_best_matrix_file(output_dir: str) -> Optional[Path]:
     """
     Get the path to the master matrix file with the most rows (fullest history).
-    Used by resequence and API so truncated resequences do not replace full rebuilds.
+    Uses row count in filename when available (no disk read). Falls back to
+    reading up to 10 files for legacy filenames.
     """
     output_path = Path(output_dir)
     if not output_path.exists():
@@ -249,6 +347,10 @@ def get_best_matrix_file(output_dir: str) -> Optional[Path]:
     parquet_files = sorted(output_path.glob("master_matrix_*.parquet"), reverse=True)
     if not parquet_files:
         return None
+    best_path = _get_best_matrix_path_by_row_count(parquet_files[:20])
+    if best_path is not None:
+        return best_path
+    # Fallback: legacy files
     best_path = None
     best_rows = 0
     for pf in parquet_files[:10]:

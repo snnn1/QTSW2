@@ -4,7 +4,7 @@
 
 ## Summary
 
-**Total Active Notifications**: **2**  
+**Total Active Notifications**: **3**  
 **Total Disabled Notifications**: **2**
 
 ## ✅ Active Notifications (Currently Working)
@@ -53,9 +53,33 @@
 
 ---
 
+### 3. Mid-Session Restart
+
+**Trigger**: NinjaTrader/robot restarted while a stream was active (mid-session restart detected on next startup)
+
+**Conditions**:
+- Journal exists for stream (stream was initialized before)
+- Journal is not committed (stream was active when process exited)
+- Current time is after range start (session had begun)
+- HealthMonitor is enabled
+
+**Why Needed**: When NinjaTrader crashes or restarts, `OnConnectionStatusUpdate` never fires because the process exits. This notification is sent on the *next* startup when the robot detects it was restarted mid-session.
+
+**Notification**:
+- **Title**: "NinjaTrader Mid-Session Restart"
+- **Message**: "Robot restarted mid-session. Stream: {streamId}, trading date: {tradingDate}. Previous state: {previousState}. Restart at {time} UTC."
+- **Priority**: 2 (Emergency - bypasses rate limiting)
+- **Rate Limit**: None (skipPerKeyRateLimit: true)
+
+**Code Location**: `HealthMonitor.cs` `OnMidSessionRestartDetected()`, called from `StreamStateMachine` when `isMidSessionRestart` is true
+
+**Event Logged**: `MID_SESSION_RESTART_NOTIFICATION`
+
+---
+
 ## ❌ Disabled Notifications (Not Currently Sent)
 
-### 3. Data Loss Detected
+### 4. Data Loss Detected
 
 **Status**: **DISABLED** (Log only)
 
@@ -71,7 +95,7 @@
 
 ---
 
-### 4. Timetable Poll Stall
+### 5. Timetable Poll Stall
 
 **Status**: **DISABLED** (Log only)
 
@@ -91,25 +115,25 @@
 
 These critical events are **NOT** wired to send notifications:
 
-### 5. EXECUTION_GATE_INVARIANT_VIOLATION
+### 6. EXECUTION_GATE_INVARIANT_VIOLATION
 - **Status**: Logged but no notification
 - **Impact**: High - indicates execution logic bug
 - **Occurrences**: 58 events on Jan 22
 
-### 6. DISCONNECT_FAIL_CLOSED_ENTERED
+### 7. DISCONNECT_FAIL_CLOSED_ENTERED
 - **Status**: Logged but no notification
 - **Impact**: Critical - robot entered fail-closed mode
 - **Occurrences**: 1 event on Jan 22
 
-### 7. RANGE_COMPUTE_FAILED (Actionable)
+### 8. RANGE_COMPUTE_FAILED (Actionable)
 - **Status**: Logged but no notification
 - **Impact**: Medium - range computation failed with actionable reason
 - **Occurrences**: 2337 events on Jan 22 (most are benign)
 
-### 8. Complete System Crash
+### 9. Complete System Crash (Now Partially Addressed)
 - **Status**: Cannot detect
 - **Impact**: Critical - NinjaTrader crashed completely
-- **Problem**: Requires external monitoring (process watchdog)
+- **Partial Fix**: Mid-session restart notification (#3 above) fires when NinjaTrader restarts and robot comes back up - you get notified on the *next* startup. For immediate detection during crash, external process watchdog still needed.
 
 ---
 

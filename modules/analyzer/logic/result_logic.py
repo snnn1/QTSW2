@@ -3,6 +3,7 @@ Result Processing Logic Module
 Handles trade result classification and output formatting
 """
 
+import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -251,10 +252,15 @@ class ResultProcessor:
         # Convert Date to datetime for proper sorting
         out["Date"] = pd.to_datetime(out["Date"])
         
-        # Filter out rows with empty/invalid Time values before deduplication
+        # Filter out rows with empty/invalid Time values before deduplication (vectorized)
         if "Time" in out.columns:
-            # Keep rows where Time is not empty and is valid format
-            valid_time_mask = out["Time"].apply(lambda x: self._validate_time_label(str(x)) if pd.notna(x) and str(x) else False)
+            # Keep rows where Time is not empty and is valid HH:MM format
+            time_str = out["Time"].astype(str)
+            has_value = out["Time"].notna() & (time_str != "") & (time_str != "nan")
+            parts = time_str.str.split(":", expand=True)
+            h = pd.to_numeric(parts[0], errors="coerce") if 0 in parts.columns else pd.Series(index=out.index)
+            m = pd.to_numeric(parts[1], errors="coerce") if 1 in parts.columns else pd.Series(index=out.index)
+            valid_time_mask = has_value & (h >= 0) & (h <= 23) & (m >= 0) & (m <= 59)
             invalid_count = (~valid_time_mask).sum()
             if invalid_count > 0:
                 # Log warning but don't fail - just filter out invalid rows
@@ -266,45 +272,31 @@ class ResultProcessor:
         rank = {"Win":5,"BE":4,"Loss":3,"TIME":2,"OPEN":1}
         out["_rank"] = out["Result"].map(rank).fillna(-1)
         
-        # Ensure _sortTime is valid for all rows before sorting
+        # Ensure _sortTime is valid for all rows before sorting (vectorized)
         if "_sortTime" in out.columns and "Time" in out.columns:
-            # Recalculate _sortTime for any invalid values
             invalid_sort_mask = (out["_sortTime"] == 0) | out["_sortTime"].isna()
             if invalid_sort_mask.any():
-                out.loc[invalid_sort_mask, "_sortTime"] = out.loc[invalid_sort_mask, "Time"].apply(
-                    lambda x: hhmm_to_sort_int(str(x)) if self._validate_time_label(str(x)) else 0
-                )
+                inv_idx = out.index[invalid_sort_mask]
+                time_parts = out.loc[invalid_sort_mask, "Time"].astype(str).str.split(":", expand=True)
+                h = pd.to_numeric(time_parts[0], errors="coerce").fillna(-1).astype(int)
+                m = pd.to_numeric(time_parts[1], errors="coerce").fillna(-1).astype(int) if 1 in time_parts.columns else pd.Series(0, index=inv_idx)
+                valid = (h >= 0) & (h <= 23) & (m >= 0) & (m <= 59)
+                out.loc[invalid_sort_mask, "_sortTime"] = np.where(valid.values, h.values * 100 + m.values, 0)
         
         # Sort and deduplicate - earliest first by Date and Time
         out = (out.sort_values(["Date","_sortTime","Target","_rank","Peak"], ascending=[True,True,True,False,False])
                   .drop_duplicates(subset=["Date","Time","Target","Direction","Session","Instrument"], keep="first"))
         
-        # Round numeric columns based on instrument tick size
-        # Apply rounding per row since different instruments may be in same DataFrame
+        # Round numeric columns based on instrument tick size (vectorized by instrument)
         if self.instrument_manager and not out.empty and "Instrument" in out.columns:
-            # Price columns (EntryPrice, ExitPrice) - round based on instrument tick size
-            price_columns = ["EntryPrice", "ExitPrice"]
-            for col in price_columns:
-                if col in out.columns:
-                    out[col] = out.apply(
-                        lambda row: self.instrument_manager.round_for_instrument(
-                            row["Instrument"].upper(), 
-                            row[col]
-                        ) if pd.notna(row[col]) else row[col],
-                        axis=1
-                    )
-            
-            # Point columns (StopLoss, Target, Peak, Profit) - round based on instrument tick size
-            point_columns = ["StopLoss", "Target", "Peak", "Profit"]
-            for col in point_columns:
-                if col in out.columns:
-                    out[col] = out.apply(
-                        lambda row: self.instrument_manager.round_for_instrument(
-                            row["Instrument"].upper(), 
-                            row[col]
-                        ) if pd.notna(row[col]) else row[col],
-                        axis=1
-                    )
+            round_columns = ["EntryPrice", "ExitPrice", "StopLoss", "Target", "Peak", "Profit"]
+            for col in round_columns:
+                if col not in out.columns:
+                    continue
+                for inst in out["Instrument"].str.upper().unique():
+                    mask = out["Instrument"].str.upper() == inst
+                    dec = self.instrument_manager.get_decimal_places(inst)
+                    out.loc[mask, col] = out.loc[mask, col].round(dec)
         
         # Final sort by Date and Time (earliest first) and cleanup
         out = out.sort_values(["Date","_sortTime"], ascending=[True,True]).drop(columns=["_sortTime","_rank"]).reset_index(drop=True)

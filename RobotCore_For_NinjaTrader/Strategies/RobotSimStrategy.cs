@@ -797,6 +797,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Terminated)
             {
                 TraceLifecycle("Terminated_ENTER", Instrument?.MasterInstrument?.Name, "Terminated", _instanceId);
+                // Log to robot JSONL for ops: NinjaTrader disabled strategy (common cause: lost price connection 4+ times in 5 min)
+                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_DISABLED_BY_NINJATRADER", new Dictionary<string, object>
+                {
+                    { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
+                    { "instance_id", _instanceId },
+                    { "account", Account?.Name ?? "UNKNOWN" },
+                    { "note", "NinjaTrader disabled strategy. Common cause: 'lost price connection more than 4 times in the past 5 minutes'." }
+                });
                 _engine?.Stop();
 
                 // FUTURE HARDENING: Unregister instance on termination
@@ -1968,6 +1976,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (hasExposure) TryEmitBeGateBlocked("STATE_NOT_REALTIME", instrumentName, accountPositionCount, executionInstrument);
                 return;
             }
+
+            // CRITICAL FIX: Drain NtActions on every Last tick (before hasExposure check).
+            // Protective commands are enqueued on fill; Account.Positions may lag, so hasExposure can be false
+            // when the fill just arrived. Draining here ensures SUBMIT_PROTECTIVES runs on the next tick
+            // instead of waiting for the next bar (OnBarUpdate) which can be 55+ seconds with 1-min bars.
+            // See docs/robot/incidents/2026-03-06_ES2_MISSING_LIMIT_ORDER_INVESTIGATION.md
+            if (_adapter is IIEAOrderExecutor ieaExecutorTick)
+            {
+                ieaExecutorTick.EnterStrategyThreadContext();
+                try
+                {
+                    var lockObj = ieaExecutorTick.GetEntrySubmissionLock();
+                    if (lockObj != null)
+                    {
+                        lock (lockObj)
+                        {
+                            ieaExecutorTick.DrainNtActions();
+                        }
+                    }
+                    _adapter?.ProcessPendingUnresolvedExecutions();
+                }
+                finally
+                {
+                    ieaExecutorTick.ExitStrategyThreadContext();
+                }
+            }
+
             if (!hasExposure)
             {
                 if (accountPositionCount > 0 && !string.IsNullOrEmpty(mismatchedInstrumentName))
@@ -2025,22 +2060,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 
-            // NT THREADING FIX: Drain NT action queue before BE. All account.Change/Cancel/Flatten must run on strategy thread.
-            if (_adapter is IIEAOrderExecutor ieaExecutor)
+            // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path).
+            // DrainNtActions already ran above (before hasExposure check) so protectives are processed on every tick.
+            // EvaluateBreakEven may call account.Change - must run in strategy thread context.
+            if (_adapter is IIEAOrderExecutor ieaExecutorBe)
             {
-                ieaExecutor.EnterStrategyThreadContext();
+                ieaExecutorBe.EnterStrategyThreadContext();
                 try
                 {
-                    var lockObj = ieaExecutor.GetEntrySubmissionLock();
-                    if (lockObj != null)
-                    {
-                        lock (lockObj)
-                        {
-                            ieaExecutor.DrainNtActions();
-                        }
-                    }
-                    _adapter.ProcessPendingUnresolvedExecutions();
-                    // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path)
                     DateTimeOffset? tickTimeFromEvent = null;
                     try
                     {
@@ -2052,7 +2079,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 finally
                 {
-                    ieaExecutor.ExitStrategyThreadContext();
+                    ieaExecutorBe.ExitStrategyThreadContext();
                 }
             }
             else

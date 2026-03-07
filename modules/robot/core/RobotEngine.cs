@@ -3775,6 +3775,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Permitted operations (bypass RiskGate):
     /// - Emergency flatten operations (call adapter's Flatten() directly)
     /// </summary>
+    public void OnMidSessionRestartDetected(string streamId, string tradingDate, string previousState, DateTimeOffset previousUpdateUtc, DateTimeOffset restartUtc)
+    {
+        _healthMonitor?.OnMidSessionRestartDetected(streamId, tradingDate, previousState, previousUpdateUtc, restartUtc);
+    }
+
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
     {
         lock (_engineLock)

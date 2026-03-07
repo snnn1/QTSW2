@@ -8,11 +8,17 @@ IMPORTANT: This module READS the Time column but NEVER mutates it.
 The Time column is OWNED by sequencer_logic.py and represents the sequencer's
 intended trading slot. This module uses 'actual_trade_time' (if available) or
 Time column for filtering, but never changes Time.
+
+SCF filter: When scf_s1 or scf_s2 >= threshold for the trade's session,
+the trade is blocked. Matrix contract requires SCF in final_allowed so
+downstream timetable need not re-read analyzer.
 """
 
 import logging
 from typing import Dict
 import pandas as pd
+
+from .config import SCF_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,9 @@ def add_global_columns(
     df['filter_reasons'] = ''
     df['final_allowed'] = True
     
+    # Apply SCF filter (matrix contract: downstream timetable uses final_allowed, no analyzer reads)
+    df = _apply_scf_filter(df, SCF_THRESHOLD)
+    
     # Apply per-stream filters
     df = apply_stream_filters(df, stream_filters)
     
@@ -119,6 +128,37 @@ def add_global_columns(
     
     logger.info(f"Global columns added. Final allowed trades: {df['final_allowed'].sum()} / {len(df)}")
     
+    return df
+
+
+def _apply_scf_filter(df: pd.DataFrame, scf_threshold: float) -> pd.DataFrame:
+    """
+    Apply SCF (Session Correlation Factor) filter.
+    When scf_s1 >= threshold (S1 trades) or scf_s2 >= threshold (S2 trades), block the trade.
+    Matrix contract: final_allowed includes SCF so timetable need not re-read analyzer.
+    """
+    if df.empty:
+        return df
+    if 'Session' not in df.columns:
+        return df
+    # S1: block when scf_s1 >= threshold
+    if 'scf_s1' in df.columns:
+        s1_mask = (df['Session'].astype(str).str.upper() == 'S1') & (df['scf_s1'].notna()) & (df['scf_s1'] >= scf_threshold)
+        if s1_mask.any():
+            df.loc[s1_mask, 'final_allowed'] = False
+            reason = f"scf_s1_blocked(>={scf_threshold})"
+            empty_reasons = df.loc[s1_mask, 'filter_reasons'].str.strip() == ''
+            df.loc[s1_mask & empty_reasons, 'filter_reasons'] = reason
+            df.loc[s1_mask & ~empty_reasons, 'filter_reasons'] = df.loc[s1_mask & ~empty_reasons, 'filter_reasons'] + ', ' + reason
+    # S2: block when scf_s2 >= threshold
+    if 'scf_s2' in df.columns:
+        s2_mask = (df['Session'].astype(str).str.upper() == 'S2') & (df['scf_s2'].notna()) & (df['scf_s2'] >= scf_threshold)
+        if s2_mask.any():
+            df.loc[s2_mask, 'final_allowed'] = False
+            reason = f"scf_s2_blocked(>={scf_threshold})"
+            empty_reasons = df.loc[s2_mask, 'filter_reasons'].str.strip() == ''
+            df.loc[s2_mask & empty_reasons, 'filter_reasons'] = reason
+            df.loc[s2_mask & ~empty_reasons, 'filter_reasons'] = df.loc[s2_mask & ~empty_reasons, 'filter_reasons'] + ', ' + reason
     return df
 
 

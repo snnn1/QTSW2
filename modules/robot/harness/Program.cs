@@ -241,13 +241,40 @@ if (validateForcedFlatten)
     var hasTriggered = File.Exists(markersPath);
     var markersContent = hasTriggered ? File.ReadAllText(markersPath) : "";
 
+    // Parse log files for forced flatten events (Test 1: Pre-close flatten trigger)
+    var logFiles = Directory.Exists(logDir) ? Directory.GetFiles(logDir, "*.jsonl") : Array.Empty<string>();
+    var hasForcedFlattenTriggered = false;
+    var hasForcedFlattenPositionClosed = false;
+    var hasForcedFlattenOrdersCancelled = false;
+    var hasNoTradeForcedFlatten = false;
+    foreach (var logFile in logFiles)
+    {
+        try
+        {
+            var lines = File.ReadAllLines(logFile);
+            foreach (var line in lines)
+            {
+                if (line.Contains("FORCED_FLATTEN_TRIGGERED")) hasForcedFlattenTriggered = true;
+                if (line.Contains("FORCED_FLATTEN_POSITION_CLOSED")) hasForcedFlattenPositionClosed = true;
+                if (line.Contains("FORCED_FLATTEN_ORDERS_CANCELLED")) hasForcedFlattenOrdersCancelled = true;
+                if (line.Contains("NO_TRADE_FORCED_FLATTEN_PRE_ENTRY")) hasNoTradeForcedFlatten = true;
+            }
+        }
+        catch { /* skip */ }
+    }
+
     Console.WriteLine();
     Console.WriteLine("=== Forced Flatten Validation ===");
-    Console.WriteLine($"  FORCED_FLATTEN_TRIGGERED in logs: check robot_skeleton.jsonl or robot_*.jsonl");
+    Console.WriteLine($"  FORCED_FLATTEN_TRIGGERED: {(hasForcedFlattenTriggered ? "FOUND" : "MISSING")}");
+    Console.WriteLine($"  FORCED_FLATTEN_POSITION_CLOSED: {(hasForcedFlattenPositionClosed ? "FOUND" : "MISSING (expected in DRYRUN - no execution adapter)")}");
+    Console.WriteLine($"  FORCED_FLATTEN_ORDERS_CANCELLED: {(hasForcedFlattenOrdersCancelled ? "FOUND" : "MISSING (expected in DRYRUN)")}");
+    Console.WriteLine($"  NO_TRADE_FORCED_FLATTEN_PRE_ENTRY: {(hasNoTradeForcedFlatten ? "FOUND" : "MISSING")}");
     Console.WriteLine($"  _forced_flatten_markers.json: {(hasTriggered ? "EXISTS" : "MISSING")} at {markersPath}");
     if (hasTriggered)
         Console.WriteLine($"  Markers content: {markersContent.Trim()}");
     Console.WriteLine($"  Slot journals (ForcedFlattenTimestamp): {journalDir}");
+    Console.WriteLine();
+    Console.WriteLine("Note: DRYRUN mode has no execution adapter. For full post-entry flatten validation (position closed, orders cancelled), run in SIM mode with NinjaTrader.");
     Console.WriteLine("Done. Run: python scripts/check_forced_flatten_today.py " + testDate.ToString("yyyy-MM-dd"));
     return;
 }

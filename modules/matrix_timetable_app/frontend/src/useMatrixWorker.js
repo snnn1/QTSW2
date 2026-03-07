@@ -1,6 +1,7 @@
 // Hook for managing Matrix Web Worker
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { WORKER_MESSAGE_TYPES, WORKER_RESPONSE_TYPES, CONTRACT_VALUES, createWorkerMessage } from './worker/contract'
+import { devWarn } from './utils/logger'
 import { useWorkerRequestManager } from './worker/requestManager'
 import { dateToYYYYMMDD } from './utils/dateUtils'
 
@@ -88,7 +89,7 @@ export function useMatrixWorker() {
             
             // Debug logging when filter results in 0 rows
             if (payload.length === 0) {
-              console.warn('[Worker] Filter resulted in 0 rows. Check filters:', {
+              devWarn('[Worker] Filter resulted in 0 rows. Check filters:', {
                 streamId: payload.requestId ? 'unknown' : 'check console',
                 indicesLength: payload.indices?.length || 0,
                 hasRows: !!payload.rows
@@ -359,7 +360,7 @@ export function useMatrixWorker() {
       // #region agent log
       logDebug('useMatrixWorker.js:182', 'CalculateTimetable skipped - data not initialized', {hypothesisId: 'C'});
       // #endregion
-      console.warn('Cannot calculate timetable: worker data not initialized yet')
+      devWarn('Cannot calculate timetable: worker data not initialized yet')
       return
     }
     

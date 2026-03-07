@@ -100,8 +100,8 @@ class AnalyzerIntentExtractor:
             "errors": []
         })
         
-        # Process each row
-        for _, row in combined_df.iterrows():
+        # Process each row (use to_dict("records") to avoid slow iterrows)
+        for row in combined_df.to_dict("records"):
             self._process_row(row, intent_groups)
         
         # Build intents from groups

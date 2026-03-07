@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, asdict
@@ -88,8 +89,13 @@ def _process_single_range(
             print(f"WARNING: Invalid time_label format '{time_label}' for range {R.date} {R.session}, skipping")
         return None
     
-    # Get data for trade execution (24 hours) and MFE calculation (until next day same slot)
-    day_df = df[(df["timestamp"] >= R.end_ts) & (df["timestamp"] < R.end_ts + pd.Timedelta(hours=24))].copy()
+    # Get data for trade execution (24 hours) and MFE calculation (O(log n) via searchsorted)
+    ts_values = pd.to_datetime(df["timestamp"]).values.astype("datetime64[ns]")
+    end_ts_ns = np.datetime64(R.end_ts)
+    start_idx = int(np.searchsorted(ts_values, end_ts_ns, side="left"))
+    end_24h = R.end_ts + pd.Timedelta(hours=24)
+    end_idx_24h = int(np.searchsorted(ts_values, np.datetime64(end_24h), side="left"))
+    day_df = df.iloc[start_idx:end_idx_24h]
     
     # For MFE calculation, we need data until next day same slot (or 02:00/08:00 for time mode)
     # Calculate MFE end time
@@ -124,10 +130,11 @@ def _process_single_range(
                 second=0
             )
         
-        # Get extended data for MFE calculation
-        mfe_df = df[(df["timestamp"] >= R.end_ts) & (df["timestamp"] < mfe_end_time)].copy()
+        # Get extended data for MFE calculation (O(log n) via searchsorted)
+        end_idx_mfe = int(np.searchsorted(ts_values, np.datetime64(mfe_end_time), side="left"))
+        mfe_df = df.iloc[start_idx:end_idx_mfe]
     else:
-        mfe_df = day_df.copy()
+        mfe_df = day_df
     
     # Use base target only (no levels)
     target_pts = instrument_manager.get_base_target(inst)
@@ -255,7 +262,8 @@ def _process_single_range_dict(
     )
 
 
-def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: bool) -> pd.DataFrame:
+def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: bool,
+                                  instrument_manager: InstrumentManager) -> pd.DataFrame:
     """
     Add NoTrade entries for days with no entries by market close
     
@@ -276,15 +284,11 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
     for R in ranges:
         range_combinations.add((R.date.date(), R.session, R.end_label))
     
-    # Get all result combinations (date + session + time)
+    # Get all result combinations (date + session + time) - vectorized
     result_combinations = set()
     if 'Date' in results_df.columns and 'Session' in results_df.columns and 'Time' in results_df.columns:
-        for _, row in results_df.iterrows():
-            result_combinations.add((
-                pd.to_datetime(row['Date']).date(),
-                row['Session'],
-                row['Time']
-            ))
+        dates = pd.to_datetime(results_df['Date']).dt.date
+        result_combinations = set(zip(dates, results_df['Session'], results_df['Time']))
     
     # Find range combinations that have no corresponding results
     no_trade_combinations = range_combinations - result_combinations
@@ -310,7 +314,6 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
             time_label = R.end_label
             
             # Use base target only (no levels)
-            config_manager = ConfigManager()
             target_pts = instrument_manager.get_base_target(rp.instrument)
             
             if rp.write_no_trade_rows:
@@ -343,8 +346,11 @@ def _add_no_trade_by_market_close(results_df: pd.DataFrame, ranges, rp, debug: b
         if not results_df.empty:
             results_df["Date"] = pd.to_datetime(results_df["Date"])
             if "_sortTime" not in results_df.columns and "Time" in results_df.columns:
-                from breakout_core.utils import hhmm_to_sort_int
-                results_df["_sortTime"] = results_df["Time"].apply(hhmm_to_sort_int)
+                time_parts = results_df["Time"].astype(str).str.split(":", expand=True)
+                h = pd.to_numeric(time_parts[0], errors="coerce").fillna(-1).astype(int)
+                m = pd.to_numeric(time_parts[1], errors="coerce").fillna(-1).astype(int) if 1 in time_parts.columns else 0
+                valid = (h >= 0) & (h <= 23) & (m >= 0) & (m <= 59)
+                results_df["_sortTime"] = np.where(valid, h * 100 + m, 0)
         
         no_trade_df["Date"] = pd.to_datetime(no_trade_df["Date"])
         
@@ -381,20 +387,20 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
         - Uses base target only (first level of target ladder)
     """
     import sys
-    # Print to stderr so it shows immediately even when stdout is redirected
     def log(msg):
         print(msg, file=sys.stderr, flush=True)
     
-    log(f"\n{'='*70}")
-    log(f"RUN_STRATEGY CALLED")
-    log(f"{'='*70}")
-    log(f"Instrument: {rp.instrument}")
-    log(f"Input DataFrame shape: {df.shape}")
-    log(f"Input DataFrame columns: {list(df.columns)}")
-    log(f"{'='*70}\n")
+    if debug:
+        log(f"\n{'='*70}")
+        log(f"RUN_STRATEGY CALLED")
+        log(f"{'='*70}")
+        log(f"Instrument: {rp.instrument}")
+        log(f"Input DataFrame shape: {df.shape}")
+        log(f"Input DataFrame columns: {list(df.columns)}")
+        log(f"{'='*70}\n")
     
-    # Initialize logic components
-    log("Initializing components...")
+    if debug:
+        log("Initializing components...")
     config_manager = ConfigManager()
     utility_manager = UtilityManager()
     validation_manager = ValidationManager()
@@ -402,21 +408,24 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
     time_manager = TimeManager()
     debug_manager = DebugManager(debug)
     range_detector = RangeDetector(config_manager.get_slot_config())
-    log("Components initialized.")
+    if debug:
+        log("Components initialized.")
     
-    # Initialize components
-    log("Initializing entry detector, price tracker, result processor...")
+    if debug:
+        log("Initializing entry detector, price tracker, result processor...")
     entry_detector = EntryDetector(config_manager=config_manager, instrument_manager=instrument_manager)
     price_tracker = PriceTracker(debug_manager=debug_manager, 
                                  instrument_manager=instrument_manager,
                                  config_manager=config_manager)
     result_processor = ResultProcessor(instrument_manager=instrument_manager)
-    log("Components initialized.")
+    if debug:
+        log("Components initialized.")
     
-    # Validate inputs
-    log("Validating DataFrame...")
+    if debug:
+        log("Validating DataFrame...")
     validation_result = validation_manager.validate_dataframe(df)
-    log(f"Validation result: Valid={validation_result.is_valid}, Errors={validation_result.errors}")
+    if debug:
+        log(f"Validation result: Valid={validation_result.is_valid}, Errors={validation_result.errors}")
     if not validation_result.is_valid:
         raise ValueError(f"Data validation failed: {validation_result.errors}")
     
@@ -434,24 +443,26 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
     # Start performance monitoring
     debug_manager.start_timer()
 
-    # Filter data for the specific instrument
-    log(f"\n{'='*70}")
-    log(f"FILTERING DATA FOR INSTRUMENT: {inst.upper()}")
-    log(f"{'='*70}")
+    if debug:
+        log(f"\n{'='*70}")
+        log(f"FILTERING DATA FOR INSTRUMENT: {inst.upper()}")
+        log(f"{'='*70}")
     
-    # Check available instruments BEFORE filtering
     if 'instrument' in df.columns:
         available_instruments = sorted(df['instrument'].str.upper().unique().tolist())
-        log(f"Available instruments in data: {available_instruments}")
-        log(f"Rows before filtering: {len(df):,}")
+        if debug:
+            log(f"Available instruments in data: {available_instruments}")
+            log(f"Rows before filtering: {len(df):,}")
     else:
         log(f"ERROR: 'instrument' column not found in data!")
         log(f"Columns in data: {list(df.columns)}")
         return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
     
     df = df[df["instrument"].str.upper() == inst.upper()].copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
     
-    log(f"Rows after filtering for {inst.upper()}: {len(df):,}")
+    if debug:
+        log(f"Rows after filtering for {inst.upper()}: {len(df):,}")
     
     if df.empty:
         log(f"\n{'='*70}")
@@ -463,8 +474,9 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
         log(f"{'='*70}\n")
         return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
     
-    log(f"Date range in filtered data: {df['timestamp'].min()} to {df['timestamp'].max()}")
-    log(f"{'='*70}\n")
+    if debug:
+        log(f"Date range in filtered data: {df['timestamp'].min()} to {df['timestamp'].max()}")
+        log(f"{'='*70}\n")
 
     # Data is already in correct timezone (America/Chicago) - handled by translator
 
@@ -476,21 +488,22 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
         print(f"DEBUG: Enabled slots: {rp.enabled_slots}")
         print(f"DEBUG: Trade days: {rp.trade_days}")
 
-    log("Building slot ranges...")
+    if debug:
+        log("Building slot ranges...")
     ranges = range_detector.build_slot_ranges(df, rp, debug)
     
-    log(f"\n{'='*70}")
-    log(f"RANGE DETECTION COMPLETE")
-    log(f"{'='*70}")
-    log(f"Found {len(ranges)} slot ranges")
+    if debug:
+        log(f"\n{'='*70}")
+        log(f"RANGE DETECTION COMPLETE")
+        log(f"{'='*70}")
+        log(f"Found {len(ranges)} slot ranges")
     
     if len(ranges) == 0:
         log(f"\nERROR: No ranges found - this is why no results will be generated")
         log(f"  Check if data contains valid trading days and session times")
         return pd.DataFrame(columns=["Date","Time","EntryTime","ExitTime","EntryPrice","ExitPrice","StopLoss","Target","Peak","Direction","Result","Range","Stream","Instrument","Session","Profit"])
     
-    # Show date range that will be processed
-    if ranges:
+    if debug and ranges:
         dates = sorted(set(r.date.date() for r in ranges))
         print(f"Date range: {dates[0]} to {dates[-1]} ({len(dates)} trading days)")
         print(f"Unique dates: {len(dates)}")
@@ -500,16 +513,17 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
             print(f"First 5 dates: {', '.join(str(d) for d in dates[:5])} ...")
             print(f"Last 5 dates: {', '.join(str(d) for d in dates[-5:])}")
     
-    log(f"\n{'='*70}")
-    log(f"STARTING TRADE EXECUTION")
-    log(f"{'='*70}")
-    log(f"Processing {len(ranges)} ranges...")
-    log(f"{'='*70}\n")
+    if debug:
+        log(f"\n{'='*70}")
+        log(f"STARTING TRADE EXECUTION")
+        log(f"{'='*70}")
+        log(f"Processing {len(ranges)} ranges...")
+        log(f"{'='*70}\n")
     
     # Determine if we should use parallel processing
-    # Use parallel for large datasets (> 100 ranges) and when not in debug mode
+    # Use parallel for datasets (> 25 ranges) and when not in debug mode
     # (debug mode has interleaved output issues with parallel processing)
-    use_parallel = len(ranges) > 100 and not debug
+    use_parallel = len(ranges) > 25 and not debug
     
     if use_parallel:
         try:
@@ -522,8 +536,10 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
                 sys.path.insert(0, str(analyzer_root))
             from parallel_processor import ParallelProcessor
             
-            print(f"Using parallel processing for {len(ranges)} ranges...")
-            processor = ParallelProcessor(enable_parallel=True)
+            if debug:
+                print(f"Using parallel processing for {len(ranges)} ranges...")
+            use_shm = os.environ.get("ANALYZER_USE_SHARED_MEMORY", "").lower() in ("1", "true", "yes")
+            processor = ParallelProcessor(enable_parallel=True, use_shared_memory=use_shm)
             
             # Convert SlotRange objects to dicts for parallel processor
             # Convert timestamps to ISO strings for serialization
@@ -555,7 +571,8 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
             
         except ImportError:
             # Fall back to sequential if parallel processor not available
-            print("Parallel processor not available, using sequential processing")
+            if debug:
+                print("Parallel processor not available, using sequential processing")
             use_parallel = False
     
     if not use_parallel:
@@ -694,20 +711,20 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
     # Process and return results
     results_df = result_processor.process_results(rows)
     
-    # Recreate _sortTime from Time column for proper sorting (process_results drops it)
+    # Recreate _sortTime from Time column for proper sorting (process_results drops it, vectorized)
     if not results_df.empty and "Time" in results_df.columns:
-        from breakout_core.utils import hhmm_to_sort_int
-        # Only calculate _sortTime for valid Time values, use 0 for invalid/empty
-        results_df["_sortTime"] = results_df["Time"].apply(
-            lambda x: hhmm_to_sort_int(str(x)) if pd.notna(x) and str(x) and ":" in str(x) else 0
-        )
+        time_parts = results_df["Time"].astype(str).str.split(":", expand=True)
+        h = pd.to_numeric(time_parts[0], errors="coerce").fillna(-1).astype(int)
+        m = pd.to_numeric(time_parts[1], errors="coerce").fillna(-1).astype(int) if 1 in time_parts.columns else 0
+        valid = (h >= 0) & (h <= 23) & (m >= 0) & (m <= 59)
+        results_df["_sortTime"] = np.where(valid, h * 100 + m, 0)
     
     # Ensure Date is datetime for proper sorting (process_results converts it back to string)
     if not results_df.empty and "Date" in results_df.columns:
         results_df["Date"] = pd.to_datetime(results_df["Date"])
     
     # Add no-trade entries for days with no entries by market close
-    results_df = _add_no_trade_by_market_close(results_df, ranges, rp, debug)
+    results_df = _add_no_trade_by_market_close(results_df, ranges, rp, debug, instrument_manager)
     
     # Final sort by Date and Time (earliest first)
     if not results_df.empty and "Date" in results_df.columns and "_sortTime" in results_df.columns:
@@ -729,6 +746,7 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
     if debug:
         debug_manager.print_performance_summary()
     
-    print(f"Trade execution completed: {len(results_df)} trades generated from {len(ranges)} ranges")
+    if debug:
+        print(f"Trade execution completed: {len(results_df)} trades generated from {len(ranges)} ranges")
     
     return results_df

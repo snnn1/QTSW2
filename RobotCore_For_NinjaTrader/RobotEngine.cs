@@ -1235,7 +1235,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 (s.State == StreamState.ARMED ||
                  s.State == StreamState.RANGE_BUILDING ||
                  s.State == StreamState.RANGE_LOCKED ||
-                 s.State == StreamState.OPEN));
+                 s.State == StreamState.RANGE_LOCKED));
         }
     }
     
@@ -2671,7 +2671,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }));
                     
                     // HIGH-SIGNAL WARNING: Bars skipped during active range-building indicates state machine issue
-                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.OPEN || stream.State == StreamState.DONE)
+                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.DONE)
                     {
                         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_SKIPPED_ACTIVE_STREAM", state: "ENGINE",
                             new
@@ -4247,6 +4247,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Permitted operations (bypass RiskGate):
     /// - Emergency flatten operations (call adapter's Flatten() directly)
     /// </summary>
+    public void OnMidSessionRestartDetected(string streamId, string tradingDate, string previousState, DateTimeOffset previousUpdateUtc, DateTimeOffset restartUtc)
+    {
+        _healthMonitor?.OnMidSessionRestartDetected(streamId, tradingDate, previousState, previousUpdateUtc, restartUtc);
+    }
+
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
     {
         lock (_engineLock)
@@ -4697,7 +4702,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var streamsReconciled = 0;
             foreach (var stream in _streams.Values)
             {
-                if (stream.Committed || (stream.State != StreamState.RANGE_LOCKED && stream.State != StreamState.OPEN))
+                if (stream.Committed || (stream.State != StreamState.RANGE_LOCKED && stream.State != StreamState.RANGE_LOCKED))
                 {
                     continue; // Skip committed or non-locked streams
                 }

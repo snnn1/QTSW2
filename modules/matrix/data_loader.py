@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from .config import ALLOW_INVALID_DATES_SALVAGE
+from .cache import get_cached_parquet_files
 
 logger = logging.getLogger(__name__)
 
@@ -259,15 +260,8 @@ def load_stream_data(
             error_msg += f" (analyzer_runs_dir also missing: {analyzer_runs_dir})"
         return (False, None, stream_id)
     
-    # Find parquet files - force fresh discovery to see newly written files
-    # Clear any file system caches by refreshing the directory
-    try:
-        # Force directory refresh by accessing it
-        stream_dir.stat()
-    except:
-        pass
-    
-    parquet_files = find_parquet_files(stream_dir, stream_id)
+    # Find parquet files (cached by stream_dir + stream_id, invalidated on mtime change)
+    parquet_files = get_cached_parquet_files(stream_dir, stream_id, find_parquet_files)
     
     if not parquet_files:
         # Provide more diagnostic info

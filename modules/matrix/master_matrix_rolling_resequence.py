@@ -50,7 +50,9 @@ def build_master_matrix_rolling_resequence(
         Tuple of (updated DataFrame, run_summary dict)
     """
     import time
+    from .build_journal import journal_event
     start_time = time.time()
+    journal_event(event_type="resequence_start", mode="rolling_resequence")
     
     try:
         logger.info("=" * 80)
@@ -335,6 +337,33 @@ def build_master_matrix_rolling_resequence(
         
         total_rows = len(final_df)
         duration = time.time() - start_time
+        duration_ms = int(duration * 1000)
+        
+        from .instrumentation import log_timing_event
+        dmin = final_df["trade_date"].min()
+        dmax = final_df["trade_date"].max()
+        journal_event(
+            event_type="resequence_complete",
+            mode="rolling_resequence",
+            rows_written=total_rows,
+            streams_processed=len(final_df["Stream"].unique()) if "Stream" in final_df.columns else 0,
+            date_window_min=dmin.strftime("%Y-%m-%d") if pd.notna(dmin) and hasattr(dmin, "strftime") else None,
+            date_window_max=dmax.strftime("%Y-%m-%d") if pd.notna(dmax) and hasattr(dmax, "strftime") else None,
+            duration_ms=duration_ms,
+            rows_preserved=rows_preserved,
+            rows_resequenced=rows_resequenced,
+        )
+        log_timing_event(
+            phase="rolling_resequence",
+            duration_ms=duration_ms,
+            row_count=total_rows,
+            stream_count=len(final_df["Stream"].unique()) if "Stream" in final_df.columns else 0,
+            date_min=dmin.strftime("%Y-%m-%d") if pd.notna(dmin) and hasattr(dmin, "strftime") else None,
+            date_max=dmax.strftime("%Y-%m-%d") if pd.notna(dmax) and hasattr(dmax, "strftime") else None,
+            mode="rolling_resequence",
+            rows_preserved=rows_preserved,
+            rows_resequenced=rows_resequenced,
+        )
         
         logger.info("=" * 80)
         logger.info(f"ROLLING RESEQUENCE COMPLETE: {total_rows} total rows ({rows_preserved} preserved + {rows_resequenced} resequenced)")
@@ -352,5 +381,9 @@ def build_master_matrix_rolling_resequence(
         }
         
     except Exception as e:
+        from .instrumentation import log_timing_event
+        duration_ms = int((time.time() - start_time) * 1000)
+        journal_event(event_type="failure", mode="rolling_resequence", error=str(e), duration_ms=duration_ms)
+        log_timing_event(phase="rolling_resequence", duration_ms=duration_ms, error=str(type(e).__name__))
         logger.error(f"Error in rolling resequence: {e}", exc_info=True)
         return pd.DataFrame(), {"error": str(e)}

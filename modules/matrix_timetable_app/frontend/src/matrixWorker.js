@@ -1,6 +1,8 @@
 // Web Worker for Matrix Data Processing
 // Handles all heavy computations: filtering, stats, aggregations
 
+import { devLog, devWarn } from './utils/logger'
+
 // Import message contract (note: workers can't use ES6 imports directly, so we'll use string matching)
 // The contract file defines constants that we'll match against
 
@@ -1077,7 +1079,7 @@ self.onmessage = function(e) {
             const masterFilters = streamFilters?.['master'] || {}
             const masterIncludeStreams = masterFilters.include_streams || []
             const masterIncludeYears = masterFilters.include_years || []
-            console.warn('[Worker] Filter resulted in 0 rows:', {
+            devWarn('[Worker] Filter resulted in 0 rows:', {
               streamId,
               totalRows: self.columnarData.length,
               showFilteredDays,
@@ -1326,7 +1328,7 @@ self.onmessage = function(e) {
           return
         }
         
-        console.log('[Worker] Timetable filtering:', {
+        devLog('[Worker] Timetable filtering:', {
           latestDateStr,
           tradingDateStr,
           filterDateStr,
@@ -1350,6 +1352,68 @@ self.onmessage = function(e) {
             return `${hours}:${minutes}`
           }
           return str
+        }
+
+        // Centralized filter helpers - apply DOW/DOM/time filters (used in multiple timetable branches)
+        const applyDayFilters = (streamFilter, masterFilter, targetDOWName, targetDOWJS, targetDOM, enabled, blockReason) => {
+          let e = enabled
+          let br = blockReason
+          if (e && streamFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = streamFilter.exclude_days_of_week
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              return filterVal === targetDOWName || filterNum === targetDOWJS
+            })
+            if (isFiltered) {
+              e = false
+              br = `dow_filter_${targetDOWName.toLowerCase()}`
+            }
+          }
+          if (e && streamFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              e = false
+              br = `dom_filter_${targetDOM}`
+            }
+          }
+          if (e && masterFilter?.exclude_days_of_week?.length > 0) {
+            const excludedDOW = masterFilter.exclude_days_of_week
+            const isFiltered = excludedDOW.some(d => {
+              const filterVal = typeof d === 'string' ? d : String(d)
+              const filterNum = parseInt(filterVal)
+              return filterVal === targetDOWName || filterNum === targetDOWJS
+            })
+            if (isFiltered) {
+              e = false
+              br = `master_dow_filter_${targetDOWName.toLowerCase()}`
+            }
+          }
+          if (e && masterFilter?.exclude_days_of_month?.length > 0) {
+            const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
+            if (excludedDOM.includes(targetDOM)) {
+              e = false
+              br = `master_dom_filter_${targetDOM}`
+            }
+          }
+          return { enabled: e, blockReason: br }
+        }
+        const applyTimeFilter = (streamFilter, masterFilter, displayTime, suffix = '') => {
+          if (!displayTime) return { enabled: true, blockReason: null }
+          const normalizedDisplayTime = normalizeTime(displayTime)
+          if (streamFilter?.exclude_times?.length > 0) {
+            const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
+            if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+              return { enabled: false, blockReason: `time_filter(${streamFilter.exclude_times.join(',')})` }
+            }
+          }
+          if (masterFilter?.exclude_times?.length > 0) {
+            const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
+            if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
+              return { enabled: false, blockReason: `master_time_filter(${masterFilter.exclude_times.join(',')})` }
+            }
+          }
+          return { enabled: true, blockReason: null }
         }
         
         // CRITICAL: If displayed date doesn't exist in matrix, we can't determine enabled status from matrix data
@@ -1383,9 +1447,9 @@ self.onmessage = function(e) {
           }
         }
         if (es1RowsForDate.length > 0) {
-          console.log(`[Worker] ES1 rows for date ${dataDateToUse}:`, es1RowsForDate)
+          devLog(`[Worker] ES1 rows for date ${dataDateToUse}:`, es1RowsForDate)
         } else {
-          console.log(`[Worker] No ES1 rows found for date ${dataDateToUse}`)
+          devLog(`[Worker] No ES1 rows found for date ${dataDateToUse}`)
         }
         
         // CRITICAL FIX: To determine the time slot for a given date, we need to look at the PREVIOUS day's row.
@@ -1404,7 +1468,7 @@ self.onmessage = function(e) {
         
         // First pass: Collect previous day's rows for time slot determination
         const previousDayRows = new Map() // stream -> {time, timeChange}
-        console.log('[Worker] Collecting previous day rows:', {
+        devLog('[Worker] Collecting previous day rows:', {
           filterDate: filterDate ? dateToYYYYMMDD(filterDate) : null,
           previousDateStr,
           currentTradingDayStr,
@@ -1427,7 +1491,7 @@ self.onmessage = function(e) {
             if (stream && time && !previousDayRows.has(stream)) {
               previousDayRows.set(stream, { time, timeChange })
               if (stream === 'NQ2') {
-                console.log(`[Worker] Found NQ2 previous day row:`, {
+                devLog(`[Worker] Found NQ2 previous day row:`, {
                   date: dayKey,
                   time,
                   timeChange: timeChange || '(empty)'
@@ -1436,7 +1500,7 @@ self.onmessage = function(e) {
             }
           }
         }
-        console.log('[Worker] Previous day rows collected:', Array.from(previousDayRows.keys()))
+        devLog('[Worker] Previous day rows collected:', Array.from(previousDayRows.keys()))
         
         // Second pass: Process current day's rows (for filters) but use previous day's time slot
         for (let i = 0; i < self.columnarData.length; i++) {
@@ -1461,7 +1525,7 @@ self.onmessage = function(e) {
           // Skip if we've already seen this stream (one row per stream per date)
           if (seenStreams.has(stream)) {
             if (stream === 'ES1') {
-              console.log(`[Worker] ES1 skipped - already seen`)
+              devLog(`[Worker] ES1 skipped - already seen`)
             }
             continue
           }
@@ -1502,7 +1566,7 @@ self.onmessage = function(e) {
           
           // Debug logging for NQ2 and ES1 to understand what's being read
           if (stream === 'NQ2' || stream === 'ES1') {
-            console.log(`[Worker] ${stream} timetable processing:`, {
+            devLog(`[Worker] ${stream} timetable processing:`, {
               date: dayKey,
               currentTime: time,
               currentTimeChange: timeChange,
@@ -1538,74 +1602,15 @@ self.onmessage = function(e) {
           // Keep enabled=true initially, filters below will determine final status
           // Note: Backend-generated timetable_current.json should be used for accurate RS-based selection
           
-          // Check if this stream has the target DOW filtered out (for displayed date)
           const streamFilter = streamFilters[stream]
-          if (enabled && streamFilter?.exclude_days_of_week?.length > 0) {
-            const excludedDOW = streamFilter.exclude_days_of_week
-            const isFiltered = excludedDOW.some(d => {
-              const filterVal = typeof d === 'string' ? d : String(d)
-              const filterNum = parseInt(filterVal)
-              return filterVal === targetDOWName || filterNum === targetDOWJS
-            })
-            if (isFiltered) {
-              enabled = false
-              blockReason = `dow_filter_${targetDOWName.toLowerCase()}`
-            }
-          }
-          
-          // Check if this stream has the target DOM filtered out
-          if (enabled && streamFilter?.exclude_days_of_month?.length > 0) {
-            const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
-            if (excludedDOM.includes(targetDOM)) {
-              enabled = false
-              blockReason = `dom_filter_${targetDOM}`
-            }
-          }
-          
-          // Check master stream filters
           const masterFilter = streamFilters['master']
-          if (enabled && masterFilter?.exclude_days_of_week?.length > 0) {
-            const excludedDOW = masterFilter.exclude_days_of_week
-            const isFiltered = excludedDOW.some(d => {
-              const filterVal = typeof d === 'string' ? d : String(d)
-              const filterNum = parseInt(filterVal)
-              return filterVal === targetDOWName || filterNum === targetDOWJS
-            })
-            if (isFiltered) {
-              enabled = false
-              blockReason = `master_dow_filter_${targetDOWName.toLowerCase()}`
-            }
-          }
-          if (enabled && masterFilter?.exclude_days_of_month?.length > 0) {
-            const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
-            if (excludedDOM.includes(targetDOM)) {
-              enabled = false
-              blockReason = `master_dom_filter_${targetDOM}`
-            }
-          }
-          
-          // CRITICAL: Check if the selected time is in exclude_times filter
-          // If the time is filtered, block the stream
-          if (enabled && displayTime) {
-            const normalizedDisplayTime = normalizeTime(displayTime)
-            
-            // Check stream-specific exclude_times
-            if (streamFilter?.exclude_times?.length > 0) {
-              const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
-              if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
-                enabled = false
-                blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
-              }
-            }
-            
-            // Check master exclude_times if stream filter didn't block it
-            if (enabled && masterFilter?.exclude_times?.length > 0) {
-              const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
-              if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
-                enabled = false
-                blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
-              }
-            }
+          let dayResult = applyDayFilters(streamFilter, masterFilter, targetDOWName, targetDOWJS, targetDOM, enabled, blockReason)
+          enabled = dayResult.enabled
+          blockReason = dayResult.blockReason
+          const timeResult = applyTimeFilter(streamFilter, masterFilter, displayTime)
+          if (!timeResult.enabled) {
+            enabled = false
+            blockReason = timeResult.blockReason
           }
           
           // ALWAYS include stream (enabled or blocked)
@@ -1661,7 +1666,7 @@ self.onmessage = function(e) {
               }
               
               if (streamId === 'NQ2') {
-                console.log(`[Worker] NQ2 missing from current day, using previous day:`, {
+                devLog(`[Worker] NQ2 missing from current day, using previous day:`, {
                   prevTime,
                   prevTimeChange: prevTimeChange || '(empty)',
                   displayTime
@@ -1709,69 +1714,15 @@ self.onmessage = function(e) {
             // Backend-generated timetable_current.json should be used for accurate RS-based selection
             let enabled = true
             let blockReason = null
-            if (streamFilter?.exclude_days_of_week?.length > 0) {
-              const excludedDOW = streamFilter.exclude_days_of_week
-              const isFiltered = excludedDOW.some(d => {
-                const filterVal = typeof d === 'string' ? d : String(d)
-                const filterNum = parseInt(filterVal)
-                return filterVal === targetDOWName || filterNum === targetDOWJS
-              })
-              if (isFiltered) {
+            if (streamFilter && masterFilter) {
+              const dayResult = applyDayFilters(streamFilter, masterFilter, targetDOWName, targetDOWJS, targetDOM, enabled, blockReason)
+              enabled = dayResult.enabled
+              blockReason = dayResult.blockReason
+              const timeToCheck = displayTime || defaultTime
+              const timeResult = applyTimeFilter(streamFilter, masterFilter, timeToCheck)
+              if (!timeResult.enabled) {
                 enabled = false
-                blockReason = `dow_filter_${targetDOWName.toLowerCase()}`
-              }
-            }
-            
-            if (enabled && streamFilter?.exclude_days_of_month?.length > 0) {
-              const excludedDOM = streamFilter.exclude_days_of_month.map(d => parseInt(d))
-              if (excludedDOM.includes(targetDOM)) {
-                enabled = false
-                blockReason = `dom_filter_${targetDOM}`
-              }
-            }
-            
-            if (enabled && masterFilter?.exclude_days_of_week?.length > 0) {
-              const excludedDOW = masterFilter.exclude_days_of_week
-              const isFiltered = excludedDOW.some(d => {
-                const filterVal = typeof d === 'string' ? d : String(d)
-                const filterNum = parseInt(filterVal)
-                return filterVal === targetDOWName || filterNum === targetDOWJS
-              })
-              if (isFiltered) {
-                enabled = false
-                blockReason = `master_dow_filter_${targetDOWName.toLowerCase()}`
-              }
-            }
-            
-            if (enabled && masterFilter?.exclude_days_of_month?.length > 0) {
-              const excludedDOM = masterFilter.exclude_days_of_month.map(d => parseInt(d))
-              if (excludedDOM.includes(targetDOM)) {
-                enabled = false
-                blockReason = `master_dom_filter_${targetDOM}`
-              }
-            }
-            
-            // CRITICAL: Check if the default time is in exclude_times filter
-            // If the time is filtered, block the stream
-            if (enabled && defaultTime) {
-              const normalizedDefaultTime = normalizeTime(defaultTime)
-              
-              // Check stream-specific exclude_times
-              if (streamFilter?.exclude_times?.length > 0) {
-                const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
-                if (excludeTimesNormalized.includes(normalizedDefaultTime)) {
-                  enabled = false
-                  blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
-                }
-              }
-              
-              // Check master exclude_times if stream filter didn't block it
-              if (enabled && masterFilter?.exclude_times?.length > 0) {
-                const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
-                if (excludeTimesNormalized.includes(normalizedDefaultTime)) {
-                  enabled = false
-                  blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
-                }
+                blockReason = timeResult.blockReason
               }
             }
             
@@ -1782,7 +1733,7 @@ self.onmessage = function(e) {
             if (!finalTime) {
               finalTime = sessionTimeSlots[session]?.[0] || ''
               if (streamId === 'NQ2') {
-                console.warn(`[Worker] NQ2 finalTime was empty, using fallback: ${finalTime}`)
+                devWarn(`[Worker] NQ2 finalTime was empty, using fallback: ${finalTime}`)
               }
             }
             
@@ -1791,31 +1742,8 @@ self.onmessage = function(e) {
               blockReason = 'requires_backend_rs_calculation'
             }
             
-            // CRITICAL: Check if the final time is in exclude_times filter (if we're using previous day's time)
-            if (enabled && displayTime && displayTime !== defaultTime) {
-              const normalizedDisplayTime = normalizeTime(displayTime)
-              
-              // Check stream-specific exclude_times
-              if (streamFilter?.exclude_times?.length > 0) {
-                const excludeTimesNormalized = streamFilter.exclude_times.map(t => normalizeTime(t))
-                if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
-                  enabled = false
-                  blockReason = `time_filter(${streamFilter.exclude_times.join(',')})`
-                }
-              }
-              
-              // Check master exclude_times if stream filter didn't block it
-              if (enabled && masterFilter?.exclude_times?.length > 0) {
-                const excludeTimesNormalized = masterFilter.exclude_times.map(t => normalizeTime(t))
-                if (excludeTimesNormalized.includes(normalizedDisplayTime)) {
-                  enabled = false
-                  blockReason = `master_time_filter(${masterFilter.exclude_times.join(',')})`
-                }
-              }
-            }
-            
             if (streamId === 'NQ2') {
-              console.log(`[Worker] NQ2 second pass result:`, {
+              devLog(`[Worker] NQ2 second pass result:`, {
                 previousDayRow: previousDayRow ? { time: previousDayRow.time, timeChange: previousDayRow.timeChange || '(empty)' } : null,
                 displayTime,
                 defaultTime,
@@ -1839,7 +1767,7 @@ self.onmessage = function(e) {
         
         // Debug: Log ES1 result and all streams with their times
         const es1Result = timetableRows.find(r => r.Stream === 'ES1')
-        console.log('[Worker] Timetable result:', {
+        devLog('[Worker] Timetable result:', {
           totalRows: timetableRows.length,
           streams: timetableRows.map(r => ({ Stream: r.Stream, Time: r.Time, Enabled: r.Enabled })),
           es1Result: es1Result ? { Stream: es1Result.Stream, Time: es1Result.Time, Enabled: es1Result.Enabled, BlockReason: es1Result.BlockReason } : 'NOT_FOUND',

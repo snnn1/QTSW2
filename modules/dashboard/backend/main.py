@@ -789,11 +789,12 @@ class ExecutionTimetableRequest(BaseModel):
 
 @app.post("/api/timetable/generate")
 async def generate_timetable(request: TimetableRequest):
-    """Generate timetable for a trading day."""
+    """Generate timetable for a trading day. Matrix-first: no analyzer reads when matrix exists."""
     try:
         import sys
         sys.path.insert(0, str(QTSW2_ROOT))
         from modules.timetable.timetable_engine import TimetableEngine
+        from modules.matrix.file_manager import load_existing_matrix
         
         engine = TimetableEngine(
             master_matrix_dir="data/master_matrix",
@@ -801,9 +802,17 @@ async def generate_timetable(request: TimetableRequest):
         )
         engine.scf_threshold = request.scf_threshold
         
-        # Run heavy timetable generation in thread pool to avoid blocking FastAPI
         def _generate_timetable_sync():
-            """Synchronous timetable generation to run in thread"""
+            """Matrix-first: use matrix when available (no analyzer reads for RS/SCF)"""
+            matrix_df = load_existing_matrix("data/master_matrix")
+            if not matrix_df.empty:
+                engine.write_execution_timetable_from_master_matrix(
+                    matrix_df, trade_date=request.date, execution_mode=True
+                )
+                return engine.build_timetable_dataframe_from_master_matrix(
+                    matrix_df, trade_date=request.date, execution_mode=True
+                )
+            # Fallback: no matrix, use analyzer (legacy path)
             return engine.generate_timetable(trade_date=request.date)
         
         timetable_df = await asyncio.to_thread(_generate_timetable_sync)

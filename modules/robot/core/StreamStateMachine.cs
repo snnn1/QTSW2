@@ -381,6 +381,10 @@ public sealed class StreamStateMachine
                         note = "Mid-session restart detected - will reconstruct range from historical + live bars. Result may differ from uninterrupted operation."
                     }));
                 
+                // Notify HealthMonitor to send push notification (OnConnectionStatusUpdate never fires when process crashes)
+                var prevUpdateUtc = DateTimeOffset.TryParse(existing.LastUpdateUtc, out var parsed) ? parsed : DateTimeOffset.MinValue;
+                _engine?.OnMidSessionRestartDetected(Stream, tradingDateStr, existing.LastState ?? "", prevUpdateUtc, nowUtc);
+                
                 // Signal that BarsRequest should be called for restart
                 // Strategy will check for restart state after Realtime transition
                 // Log event for diagnostics
@@ -616,7 +620,7 @@ public sealed class StreamStateMachine
         _reportCriticalCallback = callback;
     }
 
-    public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
+    public bool ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
     {
         // NQ2 FIX: Allow slot_time updates during PRE_HYDRATION and RANGE_BUILDING (before range lock).
         // Reject once RANGE_LOCKED or beyond - prevents mid-session changes after commitment.
@@ -649,7 +653,7 @@ public sealed class StreamStateMachine
                 }, TradingDate);
             }
             
-            return; // Reject the update
+            return false; // Reject the update
         }
         
         // Allowed only if not committed
@@ -663,6 +667,7 @@ public sealed class StreamStateMachine
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, "UPDATE_APPLIED", State.ToString(),
             new { slot_time_chicago = SlotTimeChicago, slot_time_chicago_time = SlotTimeChicagoTime.ToString("o"), slot_time_utc = SlotTimeUtc.ToString("o") }));
+        return true;
     }
 
     public void UpdateTradingDate(DateOnly newTradingDate, DateTimeOffset utcNow)
@@ -5631,8 +5636,9 @@ public sealed class StreamStateMachine
     }
     
     /// <summary>
-    /// Handle forced flatten at market close (execution interruption, not slot completion).
-    /// CRITICAL: Must NEVER call Commit() or set Committed=true or State=DONE.
+    /// Handle forced flatten at market close (true pre-close flatten + market-open reentry).
+    /// Flattens position immediately, cancels protective orders, persists state for reentry.
+    /// CRITICAL: Must NEVER call Commit() or set Committed=true or State=DONE for post-entry case.
     /// </summary>
     public void HandleForcedFlatten(DateTimeOffset utcNow)
     {
@@ -5673,17 +5679,11 @@ public sealed class StreamStateMachine
             return;
         }
         
-        // Post-entry forced flatten: Set interruption flag, do NOT commit
-        _journal.ExecutionInterruptedByClose = true;
-        _journal.ForcedFlattenTimestamp = utcNow;
-        
-        // Store OriginalIntentId if not already stored (reference only, not duplication)
+        // Resolve OriginalIntentId if not already stored (needed for flatten + reentry)
         if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && _executionJournal != null)
         {
-            // Find the intent ID for this stream's entry fill
             var pattern = $"{TradingDate}_{Stream}_*.json";
             var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
-            
             try
             {
                 if (Directory.Exists(journalDir))
@@ -5701,21 +5701,89 @@ public sealed class StreamStateMachine
                                 break;
                             }
                         }
-                        catch
-                        {
-                            // Skip corrupted files
-                        }
+                        catch { /* Skip corrupted files */ }
                     }
                 }
             }
-            catch
+            catch { /* Fail-safe: continue without OriginalIntentId */ }
+        }
+        
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+        {
+            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Cannot flatten: OriginalIntentId not found for stream {Stream}",
+                new { stream = Stream, trading_date = TradingDate });
+            return;
+        }
+        
+        // Phase 1: Flatten position immediately (retry on failure)
+        const int MAX_FLATTEN_RETRIES = 3;
+        FlattenResult? flattenResult = null;
+        for (var attempt = 1; attempt <= MAX_FLATTEN_RETRIES && _executionAdapter != null; attempt++)
+        {
+            flattenResult = _executionAdapter.Flatten(_journal.OriginalIntentId, ExecutionInstrument, utcNow);
+            if (flattenResult.Success)
+                break;
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "FORCED_FLATTEN_RETRY", State.ToString(),
+                new { attempt, max_retries = MAX_FLATTEN_RETRIES, error = flattenResult.ErrorMessage }));
+        }
+        
+        if (flattenResult == null || !flattenResult.Success)
+        {
+            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Flatten failed after {MAX_FLATTEN_RETRIES} attempts: {flattenResult?.ErrorMessage ?? "Unknown"}",
+                new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument });
+            return;
+        }
+        
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "FORCED_FLATTEN_POSITION_CLOSED", State.ToString(),
+            new { original_intent_id = _journal.OriginalIntentId, note = "Position closed before market close" }));
+        
+        // Phase 2: Cancel protective orders (stop and target)
+        var ordersCancelled = false;
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+        {
+            try
             {
-                // Fail-safe: continue without OriginalIntentId
+                ordersCancelled = simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow);
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "FORCED_FLATTEN_ORDERS_CANCEL_ERROR", State.ToString(),
+                    new { error = ex.Message, exception_type = ex.GetType().Name }));
             }
         }
         
-        // Persist journal (do NOT commit)
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "FORCED_FLATTEN_ORDERS_CANCELLED", State.ToString(),
+            new { original_intent_id = _journal.OriginalIntentId, cancelled = ordersCancelled, note = "Protective orders cancelled" }));
+        
+        // Phase 3: Persist state for reentry
+        _journal.ExecutionInterruptedByClose = true;
+        _journal.ForcedFlattenTimestamp = utcNow;
         _journals.Save(_journal);
+        
+        // Phase 4: Verify no exposure remains (risk guarantee)
+        try
+        {
+            var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+            var posQty = snap?.Positions?
+                .Where(p => string.Equals(p.Instrument, ExecutionInstrument, StringComparison.OrdinalIgnoreCase))
+                .Sum(p => p.Quantity) ?? 0;
+            if (posQty != 0)
+            {
+                LogHealth("CRITICAL", "FORCED_FLATTEN_EXPOSURE_REMAINING",
+                    $"Position still open after flatten: {ExecutionInstrument} qty={posQty}",
+                    new { instrument = ExecutionInstrument, quantity = posQty, original_intent_id = _journal.OriginalIntentId });
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "FORCED_FLATTEN_VERIFY_ERROR", State.ToString(),
+                new { error = ex.Message, note = "Exposure verification failed" }));
+        }
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "FORCED_FLATTEN_MARKET_CLOSE", State.ToString(),
@@ -5723,14 +5791,16 @@ public sealed class StreamStateMachine
             {
                 execution_interrupted = true,
                 forced_flatten_timestamp = utcNow.ToString("o"),
-                original_intent_id = _journal.OriginalIntentId ?? "NULL",
+                original_intent_id = _journal.OriginalIntentId,
                 slot_status = _journal.SlotStatus.ToString(),
-                note = "Forced flatten at market close - execution interrupted, slot remains ACTIVE for re-entry"
+                note = "Pre-close flatten complete - slot remains ACTIVE for market-open reentry"
             }));
     }
     
     /// <summary>
     /// Handle slot expiry (next slot time reached).
+    /// Only flattens positions that are still open. If ExecutionInterruptedByClose, original position
+    /// was already flattened at FlattenTriggerUtc; only reentry position (if filled) may need flatten.
     /// </summary>
     private void HandleSlotExpiry(DateTimeOffset utcNow)
     {
@@ -5740,11 +5810,12 @@ public sealed class StreamStateMachine
         }
         
         // Exit position at market if open (via execution adapter)
-        // Handle both original entry and re-entry positions
+        // Original entry: only flatten if NOT already closed by forced flatten (ExecutionInterruptedByClose)
+        // Reentry: always flatten if reentry filled (reentry position may still be open at slot expiry)
         if (_executionAdapter != null)
         {
-            // Flatten original entry position if OriginalIntentId exists
-            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            // Flatten original entry only if it was NOT already flattened by HandleForcedFlatten
+            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && !_journal.ExecutionInterruptedByClose)
             {
                 try
                 {
@@ -5756,7 +5827,7 @@ public sealed class StreamStateMachine
                 }
             }
             
-            // Flatten re-entry position if re-entry happened
+            // Flatten re-entry position if re-entry happened (reentry is never flattened at session close)
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {
                 try
@@ -5770,39 +5841,18 @@ public sealed class StreamStateMachine
             }
         }
         
-        // Cancel orders for both intents
-        if (_executionAdapter != null)
+        // Cancel orders for both intents (idempotent - orders may already be cancelled)
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
         {
-            // Cancel original entry orders
             if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
             {
-                try
-                {
-                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-                    {
-                        simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow);
-                    }
-                }
-                catch
-                {
-                    // Log error but continue with expiry
-                }
+                try { simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow); }
+                catch { /* Log error but continue */ }
             }
-            
-            // Cancel re-entry orders if re-entry happened
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {
-                try
-                {
-                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-                    {
-                        simAdapter.CancelIntentOrders(_journal.ReentryIntentId, utcNow);
-                    }
-                }
-                catch
-                {
-                    // Log error but continue with expiry
-                }
+                try { simAdapter.CancelIntentOrders(_journal.ReentryIntentId, utcNow); }
+                catch { /* Log error but continue */ }
             }
         }
         

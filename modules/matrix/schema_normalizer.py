@@ -180,9 +180,33 @@ def create_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         _ensure_profit_dollars_column_inplace(df, contract_multiplier=1.0)
         logger.debug("ProfitDollars column created by schema_normalizer (derived column)")
     
-    # rs_value (Rolling Sum value - would need to calculate from sequential processor)
+    # rs_value and points: materialize from sequencer's {Time} Rolling / {Time} Points
+    # Downstream contract: matrix must contain these so timetable/API need not read analyzer
+    from .config import SLOT_ENDS
+    from .utils import normalize_time
+    all_times = []
+    for tlist in SLOT_ENDS.values():
+        all_times.extend(tlist)
     if 'rs_value' not in df.columns:
         df['rs_value'] = np.nan
+    if 'points' not in df.columns:
+        df['points'] = np.nan
+    if 'Time' in df.columns:
+        time_str = df['Time'].astype(str).str.strip()
+        parts = time_str.str.split(':', expand=True)
+        if parts.shape[1] >= 2:
+            time_norm = parts[0].fillna('').astype(str).str.zfill(2) + ':' + parts[1].fillna('').astype(str).str.zfill(2)
+        else:
+            time_norm = time_str
+        for t in all_times:
+            tn = normalize_time(t)
+            roll_col = f"{t} Rolling"
+            pts_col = f"{t} Points"
+            mask = time_norm == tn
+            if roll_col in df.columns and mask.any():
+                df.loc[mask, 'rs_value'] = df.loc[mask, roll_col].values
+            if pts_col in df.columns and mask.any():
+                df.loc[mask, 'points'] = df.loc[mask, pts_col].values
     
     # selected_time (same as Time for now)
     if 'selected_time' not in df.columns:

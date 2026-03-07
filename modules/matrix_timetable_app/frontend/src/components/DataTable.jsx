@@ -3,6 +3,7 @@ import { List } from 'react-window'
 import { getFilteredColumns } from '../utils/columnUtils'
 import { DEFAULT_COLUMNS } from '../utils/constants'
 import { sortColumnsByDefaultOrder } from '../utils/columnUtils'
+import { getContractValue } from '../utils/profitCalculations'
 
 // Memoized formatters to avoid per-cell allocations
 const currencyFormatter = new Intl.NumberFormat('en-US', {
@@ -117,14 +118,7 @@ function TableRow({ index, style, rows, columnsToShow, streamId, getColumnWidth,
         // Format dollar columns (use memoized formatter)
         if (col === 'Profit ($)') {
           const profitValue = parseFloat(row.Profit) || 0
-          const symbol = row.Symbol || row.Instrument || 'ES'
-          const baseSymbol = symbol.replace(/\d+$/, '').toUpperCase() // Remove trailing numbers
-          // NOTE: Contract values must match modules/matrix/statistics.py
-          const contractValues = {
-            'ES': 50, 'MES': 5, 'NQ': 10, 'MNQ': 2, 'YM': 5, 'MYM': 0.5,
-            'CL': 1000, 'NG': 10000, 'GC': 100, 'RTY': 50
-          }
-          const contractValue = contractValues[baseSymbol] || 50
+          const contractValue = getContractValue(row)
           const dollarValue = profitValue * contractValue
           value = currencyFormatter.format(dollarValue)
         }

@@ -14,6 +14,28 @@ Custom hooks are a way to extract component logic into reusable functions. They 
 
 ## Available Hooks
 
+### `useMatrixController`
+Central orchestration hook for matrix data and worker coordination:
+- Backend data lifecycle (load, rebuild, resequence, reload)
+- Worker lifecycle (initData, compute triggers)
+- Derived state: masterData, masterLoading, masterError, availableYearsFromAPI
+- File change detection, matrix freshness, auto-update
+
+**Usage:**
+```javascript
+const {
+  masterData,
+  masterLoading,
+  masterError,
+  loadMasterMatrix,
+  reloadLatestMatrix,
+  resequenceMasterMatrix,
+  availableYearsFromAPI,
+  streamFilters,
+  ...
+} = useMatrixController({ streamFilters, masterContractMultiplier, ... })
+```
+
 ### `useMatrixFilters`
 Manages filter state and operations:
 - Loads/saves filters from localStorage
@@ -23,18 +45,6 @@ Manages filter state and operations:
 **Usage:**
 ```javascript
 const { streamFilters, updateStreamFilter, getFiltersForStream } = useMatrixFilters()
-```
-
-### `useMatrixData`
-Manages data loading and state:
-- Loads data from API
-- Manages loading and error states
-- Handles retry logic
-- Extracts available years
-
-**Usage:**
-```javascript
-const { masterData, masterLoading, masterError, loadMasterMatrix, retryLoad } = useMatrixData()
 ```
 
 ### `useColumnSelection`
@@ -48,35 +58,14 @@ Manages column visibility:
 const { selectedColumns, showColumnSelector, setShowColumnSelector, toggleColumn } = useColumnSelection()
 ```
 
-## Example: Before vs After
+## Hook Structure
 
-### Before (in App.jsx):
-```javascript
-// 200+ lines of state management, useEffect hooks, and helper functions
-const [streamFilters, setStreamFilters] = useState(() => loadAllFilters())
-const [masterData, setMasterData] = useState([])
-const [masterLoading, setMasterLoading] = useState(false)
-// ... many more state declarations and useEffect hooks
-```
+- **useMatrixController** – Single source for data loading; depends on `useMatrixWorker`
+- **useMatrixFilters** – Filter state and persistence (used by Controller)
+- **useColumnSelection** – Column visibility
+- **useMatrixWorker** – Worker lifecycle and message handling (used internally by Controller)
 
-### After (using hooks):
-```javascript
-// Clean, declarative, and easy to understand
-const { streamFilters, updateStreamFilter } = useMatrixFilters()
-const { masterData, masterLoading, loadMasterMatrix } = useMatrixData()
-const { selectedColumns, toggleColumn } = useColumnSelection()
-```
-
-## Implementation Status
-
-These hooks are **optional** and **not yet integrated**. The app works perfectly fine without them. They would be a nice-to-have improvement for:
-
-- Further code organization
-- Easier testing
-- Better code reusability
-- Cleaner App.jsx file
-
-You can integrate them later if you want to further refactor the codebase.
+See `docs/matrix/MATRIX_ARCHITECTURE.md` for data flow and module boundaries.
 
 
 

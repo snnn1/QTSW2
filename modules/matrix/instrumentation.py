@@ -1,10 +1,11 @@
 """
-Matrix Feature Usage Instrumentation
+Matrix Feature Usage and Timing Instrumentation
 
-Emits structured JSONL events to logs/matrix_feature_usage.jsonl for tracking
-which features, modes, and subsystems are actually used.
+Emits structured JSONL events for:
+- Feature usage: logs/matrix_feature_usage.jsonl
+- Timing/telemetry: logs/matrix_timing.jsonl (Phase 2 - cold vs warm, resequence vs rebuild)
 
-This instrumentation is designed to be lightweight and non-intrusive.
+Designed to be lightweight and non-intrusive. Safe in production.
 """
 
 import json
@@ -18,6 +19,7 @@ import threading
 # Thread-safe logging
 _log_lock = threading.Lock()
 LOG_FILE = Path("logs/matrix_feature_usage.jsonl")
+TIMING_LOG_FILE = Path("logs/matrix_timing.jsonl")
 
 
 def log_feature_usage(
@@ -160,3 +162,55 @@ class InstrumentationContext:
         """Set a metric value."""
         if isinstance(value, (int, float, bool, str)):
             self.metrics[key] = value
+
+
+def log_timing_event(
+    phase: str,
+    duration_ms: int,
+    row_count: Optional[int] = None,
+    stream_count: Optional[int] = None,
+    date_min: Optional[str] = None,
+    date_max: Optional[str] = None,
+    mode: Optional[str] = None,
+    cache_hit: Optional[bool] = None,
+    file_path: Optional[str] = None,
+    error: Optional[str] = None,
+    **extra: Any,
+):
+    """
+    Emit structured JSONL timing event for matrix/timetable phases.
+    Used for cold vs warm load, resequence vs rebuild, API cache analysis.
+
+    Phases: matrix_load, sequencer_processing, matrix_save, timetable_generation,
+            api_matrix_load, rolling_resequence, full_rebuild
+    """
+    event = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "phase": phase,
+        "duration_ms": duration_ms,
+    }
+    if row_count is not None:
+        event["row_count"] = row_count
+    if stream_count is not None:
+        event["stream_count"] = stream_count
+    if date_min is not None:
+        event["date_min"] = date_min
+    if date_max is not None:
+        event["date_max"] = date_max
+    if mode is not None:
+        event["mode"] = mode
+    if cache_hit is not None:
+        event["cache_hit"] = cache_hit
+    if file_path is not None:
+        event["file_path"] = file_path
+    if error is not None:
+        event["error"] = error
+    event.update({k: v for k, v in extra.items() if v is not None and isinstance(v, (str, int, float, bool))})
+
+    with _log_lock:
+        TIMING_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(TIMING_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception:
+            pass

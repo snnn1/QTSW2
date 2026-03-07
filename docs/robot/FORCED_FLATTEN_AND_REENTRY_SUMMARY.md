@@ -1,13 +1,13 @@
 # Forced Flatten and Reentry — Full Summary
 
-**Last updated:** 2026-03-04  
+**Last updated:** 2026-03-05  
 **Scope:** Current behavior, recent changes, and reentry flow.
 
 ---
 
-## 1. Forced Flatten — What It Actually Does
+## 1. Forced Flatten — True Pre-Close Flatten
 
-**Important:** The name is misleading. `HandleForcedFlatten` does **not** flatten positions. It marks the slot as *execution interrupted by close* and leaves the position open for re-entry.
+**HandleForcedFlatten** performs a **true pre-close flatten**: it closes positions immediately, cancels protective orders, and persists state for market-open reentry. The system is **flat before the exchange closes**.
 
 ### 1.1 Three-Phase Flow
 
@@ -24,30 +24,29 @@
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 2: HandleForcedFlatten (StreamStateMachine) — NO FLATTEN CALL          │
+│ PHASE 2: HandleForcedFlatten (StreamStateMachine) — TRUE FLATTEN             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ Pre-entry (no entry fill):                                                   │
 │   → Commit with NO_TRADE_FORCED_FLATTEN_PRE_ENTRY                            │
 │   → Slot ends for the day                                                    │
 │                                                                              │
 │ Post-entry (has entry fill):                                                 │
-│   → Set ExecutionInterruptedByClose = true                                  │
-│   → Set ForcedFlattenTimestamp                                               │
-│   → Store OriginalIntentId if missing                                       │
-│   → Persist journal                                                          │
-│   → Log FORCED_FLATTEN_MARKET_CLOSE                                          │
-│   → Slot stays ACTIVE (for re-entry)                                        │
-│   → Position REMAINS OPEN                                                   │
+│   → Flatten position via adapter (retry up to 3x)                            │
+│   → Cancel stop and target orders                                           │
+│   → Set ExecutionInterruptedByClose = true, ForcedFlattenTimestamp          │
+│   → Persist journal (bracket levels for reentry)                              │
+│   → Verify no exposure (FORCED_FLATTEN_EXPOSURE_REMAINING if any)            │
+│   → Log FORCED_FLATTEN_POSITION_CLOSED, FORCED_FLATTEN_ORDERS_CANCELLED      │
+│   → Position state: FLAT                                                    │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ PHASE 3: Actual Flatten — HandleSlotExpiry (when utcNow >= NextSlotTimeUtc)  │
+│ PHASE 3: Slot Expiry — HandleSlotExpiry (when utcNow >= NextSlotTimeUtc)    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ • Called from stream.Tick() when next slot time reached                      │
-│ • Flatten(OriginalIntentId) + Flatten(ReentryIntentId) if re-entry filled    │
-│ • Cancel orders for both intents                                            │
-│ • SlotStatus = EXPIRED, Commit                                              │
+│ • Original: skip if ExecutionInterruptedByClose (already flattened)         │
+│ • Reentry: flatten if ReentryFilled (may still be open at expiry)            │
+│ • Cancel orders (idempotent), SlotStatus = EXPIRED, Commit                  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,10 +55,11 @@
 | Event | When |
 |-------|------|
 | `FlattenTriggerUtc` | Session close minus 300s (e.g. 15:55 CT for 16:00 close) |
-| `HandleForcedFlatten` | First engine Tick after `utcNow >= FlattenTriggerUtc` |
-| `HandleSlotExpiry` | First stream Tick after `utcNow >= NextSlotTimeUtc` (next slot occurrence) |
+| `HandleForcedFlatten` | First engine Tick after `utcNow >= FlattenTriggerUtc` — flattens immediately |
+| `CheckMarketOpenReentry` | At session reopen when conditions met |
+| `HandleSlotExpiry` | First stream Tick after `utcNow >= NextSlotTimeUtc` — only flattens reentry if still open |
 
-**Position stays open** from session close until `NextSlotTimeUtc` (e.g. next day 07:30 or 09:30 for that slot).
+**Position is flat** before market close. Reentry restores the trade at market open if slot is still valid.
 
 ---
 
@@ -163,6 +163,7 @@ python scripts/check_forced_flatten_today.py 2026-03-04
 ### 4.3 Expected Outputs
 
 - `FORCED_FLATTEN_TRIGGERED` in logs
+- `FORCED_FLATTEN_POSITION_CLOSED`, `FORCED_FLATTEN_ORDERS_CANCELLED` (post-entry)
 - `_forced_flatten_markers.json` in `logs/robot/journal/`
 - `ForcedFlattenTimestamp` in slot journals (`tradingDate_stream.json`)
 
@@ -173,7 +174,7 @@ python scripts/check_forced_flatten_today.py 2026-03-04
 | Limitation | Notes |
 |------------|-------|
 | **Early close days** | Spec uses fixed 16:00 CT; early-close days (e.g. day after Thanksgiving) not encoded |
-| **HandleSlotExpiry bypasses IEA** | Direct `adapter.Flatten()`; no retries; potential race with IEA worker |
+| **HandleSlotExpiry bypasses IEA** | Direct `adapter.Flatten()`; potential race with IEA worker (HandleForcedFlatten has retries) |
 | **NinjaTrader instrument-level flatten** | `account.Flatten(instrument)` flattens entire instrument; no per-intent flatten |
 | **Holiday** | `SessionCloseResolver` returns `HasSession=false` → no forced flatten (SESSION_CLOSE_HOLIDAY) |
 

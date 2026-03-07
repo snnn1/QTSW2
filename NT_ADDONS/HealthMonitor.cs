@@ -109,6 +109,11 @@ public sealed class HealthMonitor
     private static readonly Dictionary<long, bool> _sharedConnectionLostLoggedByIncident = new(); // Key: incident ID (ticks)
     private static readonly Dictionary<long, bool> _sharedConnectionLostNotifiedByIncident = new(); // Key: incident ID (ticks)
     private static readonly Dictionary<long, int> _sharedConnectionLostInstanceCountByIncident = new(); // Key: incident ID (ticks)
+    // NinjaTrader disables strategy after "lost price connection more than 4 times in 5 minutes"
+    private static readonly List<DateTimeOffset> _connectionLossTimestamps = new();
+    private static DateTimeOffset _lastPriceConnectionLossRepeatedLogUtc = DateTimeOffset.MinValue;
+    private const int PRICE_CONNECTION_LOSS_WINDOW_SECONDS = 300; // 5 minutes
+    private const int PRICE_CONNECTION_LOSS_THRESHOLD = 4;
     
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
@@ -222,6 +227,26 @@ public sealed class HealthMonitor
                     TradingDateAtDetection = _currentTradingDate,
                     ConnectionNameAtDetection = connectionName
                 };
+                // Track for "4+ losses in 5 min" - mirrors NinjaTrader's strategy disable condition
+                lock (_sharedConnectionLock)
+                {
+                    _connectionLossTimestamps.Add(utcNow);
+                    var cutoff = utcNow.AddSeconds(-PRICE_CONNECTION_LOSS_WINDOW_SECONDS);
+                    _connectionLossTimestamps.RemoveAll(t => t < cutoff);
+                    if (_connectionLossTimestamps.Count >= PRICE_CONNECTION_LOSS_THRESHOLD &&
+                        (utcNow - _lastPriceConnectionLossRepeatedLogUtc).TotalSeconds >= PRICE_CONNECTION_LOSS_WINDOW_SECONDS)
+                    {
+                        _lastPriceConnectionLossRepeatedLogUtc = utcNow;
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "PRICE_CONNECTION_LOSS_REPEATED", state: "ENGINE",
+                            new
+                            {
+                                connection_name = connectionName,
+                                loss_count_in_window = _connectionLossTimestamps.Count,
+                                window_seconds = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
+                                note = "Connection lost 4+ times in 5 minutes. NinjaTrader may disable strategy with 'lost price connection more than 4 times in the past 5 minutes'."
+                            }));
+                    }
+                }
             }
             else
             {
@@ -392,6 +417,33 @@ public sealed class HealthMonitor
                 _currentIncident = null; // Clear incident - if it flaps again, it becomes a new incident
             }
         }
+    }
+    
+    /// <summary>
+    /// Called when a mid-session restart is detected (NinjaTrader/robot restarted while stream was active).
+    /// Sends push notification because OnConnectionStatusUpdate never fires when the process crashes.
+    /// </summary>
+    public void OnMidSessionRestartDetected(string streamId, string tradingDate, string previousState, DateTimeOffset previousUpdateUtc, DateTimeOffset restartUtc)
+    {
+        if (!_config.enabled || _notificationService == null)
+            return;
+        
+        var title = "NinjaTrader Mid-Session Restart";
+        var message = $"Robot restarted mid-session. Stream: {streamId}, trading date: {tradingDate}. " +
+                      $"Previous state: {previousState}. Restart at {restartUtc:HH:mm} UTC.";
+        
+        _log.Write(RobotEvents.EngineBase(restartUtc, tradingDate: tradingDate ?? "", eventType: "MID_SESSION_RESTART_NOTIFICATION", state: "ENGINE",
+            new
+            {
+                stream_id = streamId,
+                trading_date = tradingDate,
+                previous_state = previousState,
+                previous_update_utc = previousUpdateUtc.ToString("o"),
+                restart_utc = restartUtc.ToString("o"),
+                note = "Push notification sent - OnConnectionStatusUpdate does not fire when process crashes"
+            }));
+        
+        SendNotification("MID_SESSION_RESTART", title, message, priority: 2, skipPerKeyRateLimit: true);
     }
     
     /// <summary>

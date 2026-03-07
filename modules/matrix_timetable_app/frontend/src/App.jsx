@@ -18,12 +18,15 @@ import {
   calculateYearlyProfit
 } from './utils/profitCalculations'
 import { calculateStats as calculateStatsUtil } from './utils/statsCalculations'
+import { devLog, devWarn } from './utils/logger'
 // Use existing hooks
 import { useMatrixFilters } from './hooks/useMatrixFilters'
-import { useMatrixData } from './hooks/useMatrixData'
 import { useColumnSelection } from './hooks/useColumnSelection'
 import { useMatrixController } from './hooks/useMatrixController'
 import DataTable from './components/DataTable'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import StatsContent from './components/StatsContent'
+import MatrixMetricsDashboard from './components/MatrixMetricsDashboard'
 import * as matrixApi from './api/matrixApi'
 
 // API base URL - can be overridden via environment variable
@@ -31,19 +34,11 @@ const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 const API_BASE = `http://localhost:${API_PORT}/api`
 
 function App() {
-  // Error boundary - catch any initialization errors
-  try {
-    return <AppContent />
-  } catch (error) {
-    console.error('App initialization error:', error)
-    return (
-      <div className="min-h-screen bg-black text-white p-8">
-        <h1 className="text-2xl font-bold mb-4 text-red-400">Error Loading App</h1>
-        <p className="text-gray-300 mb-2">Error: {error.message}</p>
-        <pre className="bg-gray-900 p-4 rounded text-sm overflow-auto">{error.stack}</pre>
-      </div>
-    )
-  }
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  )
 }
 
 function AppContent() {
@@ -495,10 +490,10 @@ function AppContent() {
     
     // Only refetch if the value actually changed (not on initial mount) and we have data loaded
     if (prevValue !== undefined && prevValue !== includeFilteredExecuted && masterData.length > 0 && refetchMasterStats) {
-      console.log(`[Master Stats] Toggle changed: ${prevValue} -> ${includeFilteredExecuted}, clearing old stats and refetching...`)
+      devLog(`[Master Stats] Toggle changed: ${prevValue} -> ${includeFilteredExecuted}, clearing old stats and refetching...`)
       // Clear backend stats first to force refresh and prevent showing stale data
       setBackendStatsFull(null)
-      console.log(`[Master Stats] Cleared backendStatsFull, will refetch with includeFilteredExecuted=${includeFilteredExecuted}`)
+      devLog(`[Master Stats] Cleared backendStatsFull, will refetch with includeFilteredExecuted=${includeFilteredExecuted}`)
       // Clear individual stream stats (they need to be refetched with new setting)
       setBackendStreamStats({})
       setBackendStreamStatsLoading({})
@@ -519,7 +514,7 @@ function AppContent() {
     
     // Refetch stats when stream filter changes (if we have data loaded)
     if (masterData.length > 0 && refetchMasterStats) {
-      console.log(`[Master Stats] Stream filter changed, refetching stats... (include_streams: ${masterIncludeStreams.length > 0 ? masterIncludeStreams.join(',') : 'all'})`)
+      devLog(`[Master Stats] Stream filter changed, refetching stats... (include_streams: ${masterIncludeStreams.length > 0 ? masterIncludeStreams.join(',') : 'all'})`)
       refetchMasterStats(includeFilteredExecuted)
     }
   }, [streamFilters['master']?.include_streams, masterData.length, refetchMasterStats, includeFilteredExecuted])
@@ -527,8 +522,8 @@ function AppContent() {
   // Fetch backend stats for individual streams (full dataset)
   // CRITICAL: Always fetch backend stats for individual streams to ensure stats cover ALL data
   useEffect(() => {
-    // Breakdown tabs that are NOT streams: timetable, master, time, day, dom, doy, date, month, year, stats
-    const breakdownTabs = ['timetable', 'master', 'time', 'day', 'dom', 'doy', 'date', 'month', 'year', 'stats']
+    // Breakdown tabs that are NOT streams: timetable, master, time, day, dom, doy, date, month, year, stats, performance
+    const breakdownTabs = ['timetable', 'master', 'time', 'day', 'dom', 'doy', 'date', 'month', 'year', 'stats', 'performance']
     
     // Only fetch for individual stream tabs (not breakdown tabs)
     if (deferredActiveTab && !breakdownTabs.includes(deferredActiveTab)) {
@@ -540,17 +535,17 @@ function AppContent() {
       // Check if we already have stats for this stream with the current settings
       // But don't skip if includeFilteredExecuted just changed (cache was cleared)
       if (backendStreamStats[streamId] && !backendStreamStatsLoading[streamId] && !includeFilteredJustChanged) {
-        console.log(`[Stream Stats] Already have stats for ${streamId}, skipping fetch`)
+        devLog(`[Stream Stats] Already have stats for ${streamId}, skipping fetch`)
         return // Already fetched
       }
       
       // Don't refetch if already loading
       if (backendStreamStatsLoading[streamId]) {
-        console.log(`[Stream Stats] Already fetching stats for ${streamId}, waiting...`)
+        devLog(`[Stream Stats] Already fetching stats for ${streamId}, waiting...`)
         return
       }
       
-      console.log(`[Stream Stats] Fetching backend stats for stream ${streamId} (includeFilteredExecuted=${includeFilteredExecuted})`)
+      devLog(`[Stream Stats] Fetching backend stats for stream ${streamId} (includeFilteredExecuted=${includeFilteredExecuted})`)
       
       // Set loading state
       setBackendStreamStatsLoading(prev => ({ ...prev, [streamId]: true }))
@@ -570,18 +565,18 @@ function AppContent() {
           
           if (response.ok) {
             const data = await response.json()
-            console.log(`[Stream Stats] Received stats for ${streamId}:`, data.stats ? 'present' : 'missing')
+            devLog(`[Stream Stats] Received stats for ${streamId}:`, data.stats ? 'present' : 'missing')
             if (data.stats) {
               setBackendStreamStats(prev => ({
                 ...prev,
                 [streamId]: data.stats
               }))
-              console.log(`[Stream Stats] Updated backendStreamStats for ${streamId}`, {
+              devLog(`[Stream Stats] Updated backendStreamStats for ${streamId}`, {
                 totalTrades: data.stats?.sample_counts?.executed_trades_total,
                 totalProfit: data.stats?.performance_trade_metrics?.total_profit
               })
             } else {
-              console.warn(`[Stream Stats] No stats in response for ${streamId}`)
+              devWarn(`[Stream Stats] No stats in response for ${streamId}`)
             }
           } else {
             const errorText = await response.text()
@@ -1172,8 +1167,8 @@ function AppContent() {
       // backendStatsFull is now computed with the correct includeFilteredExecuted setting
       if (streamId === 'master' && backendStatsFull && formatWorkerStats) {
         // Use backendStatsFull - it contains full-history stats with correct includeFilteredExecuted setting
-        console.log(`[Master Stats] Using backendStatsFull (full-history) with includeFilteredExecuted=${includeFilteredExecuted}`)
-        console.log(`[Master Stats] Stats sample counts:`, {
+        devLog(`[Master Stats] Using backendStatsFull (full-history) with includeFilteredExecuted=${includeFilteredExecuted}`)
+        devLog(`[Master Stats] Stats sample counts:`, {
           total: backendStatsFull?.sample_counts?.executed_trades_total,
           allowed: backendStatsFull?.sample_counts?.executed_trades_allowed,
           filtered: backendStatsFull?.sample_counts?.executed_trades_filtered
@@ -1195,14 +1190,14 @@ function AppContent() {
             const tradesDiff = Math.abs(backendTrades - workerTrades)
             
             if (profitDiffPercent > 5 || tradesDiff > 100) {
-              console.warn(`[Stats Sanity Check] ${streamId}: Backend (full-history) vs Worker (10k rows) stats differ`, {
+              devWarn(`[Stats Sanity Check] ${streamId}: Backend (full-history) vs Worker (10k rows) stats differ`, {
                 backend: { profit: backendProfit, trades: backendTrades },
                 worker: { profit: workerProfit, trades: workerTrades },
                 diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
                 note: 'Using backendStatsFull (full-history) - worker stats are from partial loaded data (10k rows)'
               })
             } else {
-              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+              devLog(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
                 profitDiff: profitDiff.toFixed(2),
                 tradesDiff
               })
@@ -1215,7 +1210,7 @@ function AppContent() {
       } else if (streamId !== 'master' && backendStreamStats[streamId] && formatWorkerStats) {
         // For individual streams, ALWAYS prefer backend stats (full dataset) over precomputed worker stats
         const backendStats = backendStreamStats[streamId]
-        console.log(`[Stream Stats] Using backend stats for ${streamId} (full dataset) - overriding precomputed worker stats`)
+        devLog(`[Stream Stats] Using backend stats for ${streamId} (full dataset) - overriding precomputed worker stats`)
         stats = formatWorkerStats(backendStats, streamId)
         
         // Dev-only sanity check: Compare backend vs worker stats when both available
@@ -1231,7 +1226,7 @@ function AppContent() {
             const tradesDiff = Math.abs(backendTrades - workerTrades)
             
             if (profitDiffPercent > 5 || tradesDiff > 100) {
-              console.warn(`[Stats Sanity Check] ${streamId}: Backend vs Worker stats differ`, {
+              devWarn(`[Stats Sanity Check] ${streamId}: Backend vs Worker stats differ`, {
                 backend: { profit: backendProfit, trades: backendTrades },
                 worker: { profit: workerProfit, trades: workerTrades },
                 diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
@@ -1245,7 +1240,7 @@ function AppContent() {
       } else if (precomputedStats && streamId === 'master') {
         // Fallback for master: Use worker stats only if backendStatsFull not available yet
         // This should rarely happen since backendStatsFull is fetched on initial load
-        console.warn(`[Master Stats] Falling back to worker stats - backendStatsFull not available yet`)
+        devWarn(`[Master Stats] Falling back to worker stats - backendStatsFull not available yet`)
         stats = precomputedStats
       } else if (precomputedStats && streamId !== 'master') {
         // Use precomputed stats only for non-master streams if no backend stats available
@@ -1266,14 +1261,14 @@ function AppContent() {
             const tradesDiff = Math.abs(backendTrades - workerTrades)
             
             if (profitDiffPercent > 5 || tradesDiff > 100) {
-              console.warn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
+              devWarn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
                 backend: { profit: backendProfit, trades: backendTrades },
                 worker: { profit: workerProfit, trades: workerTrades },
                 diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
                 note: 'Worker stats may be from partial dataset (filtered view)'
               })
             } else {
-              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+              devLog(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
                 profitDiff: profitDiff.toFixed(2),
                 tradesDiff
               })
@@ -1287,15 +1282,15 @@ function AppContent() {
         // Use backend stats (full dataset) for individual streams
         // CRITICAL: Backend stats cover ALL data in the parquet file, not just loaded rows
         const backendStats = backendStreamStats[streamId]
-        console.log(`[Stream Stats] Using backend stats for ${streamId} (full dataset)`)
-        console.log(`[Stream Stats] Backend stats structure:`, {
+        devLog(`[Stream Stats] Using backend stats for ${streamId} (full dataset)`)
+        devLog(`[Stream Stats] Backend stats structure:`, {
           has_sample_counts: !!backendStats.sample_counts,
           has_performance_trade_metrics: !!backendStats.performance_trade_metrics,
           total_profit: backendStats.performance_trade_metrics?.total_profit,
           executed_trades: backendStats.sample_counts?.executed_trades_total
         })
         stats = formatWorkerStats(backendStats, streamId)
-        console.log(`[Stream Stats] Formatted stats:`, {
+        devLog(`[Stream Stats] Formatted stats:`, {
           totalTrades: stats?.totalTrades,
           totalProfitDollars: stats?.totalProfitDollars,
           winRate: stats?.winRate
@@ -1316,14 +1311,14 @@ function AppContent() {
             const tradesDiff = Math.abs(backendTrades - workerTrades)
             
             if (profitDiffPercent > 5 || tradesDiff > 100) {
-              console.warn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
+              devWarn(`[Stats Sanity Check] ${streamId}: Potential drift detected`, {
                 backend: { profit: backendProfit, trades: backendTrades },
                 worker: { profit: workerProfit, trades: workerTrades },
                 diff: { profit: profitDiff, profitPercent: profitDiffPercent.toFixed(2) + '%', trades: tradesDiff },
                 note: 'Worker stats may be from partial dataset (filtered view)'
               })
             } else {
-              console.log(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
+              devLog(`[Stats Sanity Check] ${streamId}: Stats aligned`, {
                 profitDiff: profitDiff.toFixed(2),
                 tradesDiff
               })
@@ -1344,8 +1339,8 @@ function AppContent() {
         // Use worker stats (computed from loaded rows - filtered view) ONLY if backend stats aren't available
         // For individual streams, backend stats should always be used - worker stats are incomplete
         if (streamId !== 'master') {
-          console.warn(`[Stream Stats] WARNING: Using worker stats for ${streamId} - backend stats not available. Stats may be incomplete (only showing ${workerStats?.sample_counts?.executed_trades_total || 'unknown'} trades from loaded data).`)
-          console.warn(`[Stream Stats] Backend stats state:`, {
+          devWarn(`[Stream Stats] WARNING: Using worker stats for ${streamId} - backend stats not available. Stats may be incomplete (only showing ${workerStats?.sample_counts?.executed_trades_total || 'unknown'} trades from loaded data).`)
+          devWarn(`[Stream Stats] Backend stats state:`, {
             hasBackendStats: !!backendStreamStats[streamId],
             isLoading: !!backendStreamStatsLoading[streamId],
             streamId
@@ -1439,317 +1434,15 @@ function AppContent() {
       )
     }
     
-    // Render different stats for master vs individual streams
-    if (streamId === 'master') {
-      // Master stream - show all 4 sections
-      return (
-        <div className="bg-gray-900 rounded-lg p-4 mb-4 border border-gray-700">
-          {/* Toggle for including filtered executed trades */}
-          <div className="mb-4 pb-3 border-b border-gray-700 flex items-center justify-between">
-            <div>
-              <h4 className="text-sm font-semibold text-gray-300 mb-1">Statistics Settings</h4>
-              <p className="text-xs text-gray-500">Performance stats are computed on executed trades only (Win, Loss, BE, TIME)</p>
-            </div>
-            <div className="flex items-center">
-              <span className="text-sm text-gray-400 mr-3">Include filtered executed trades</span>
-              <div 
-                className="relative cursor-pointer"
-                onClick={() => {
-                  const newValue = !includeFilteredExecuted
-                  console.log(`[Toggle] Button clicked: ${includeFilteredExecuted} -> ${newValue}`)
-                  setIncludeFilteredExecuted(newValue)
-                }}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault()
-                    const newValue = !includeFilteredExecuted
-                    console.log(`[Toggle] Keyboard activated: ${includeFilteredExecuted} -> ${newValue}`)
-                    setIncludeFilteredExecuted(newValue)
-                  }
-                }}
-              >
-                <input
-                  type="checkbox"
-                  className="sr-only"
-                  checked={includeFilteredExecuted}
-                  onChange={(e) => {
-                    console.log(`[Toggle] Checkbox changed: ${includeFilteredExecuted} -> ${e.target.checked}`)
-                    setIncludeFilteredExecuted(e.target.checked)
-                  }}
-                  readOnly
-                />
-                <div className={`block w-14 h-8 rounded-full ${includeFilteredExecuted ? 'bg-green-500' : 'bg-gray-600'}`}></div>
-                <div className={`absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition transform ${includeFilteredExecuted ? 'translate-x-6' : ''}`}></div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Section 1: Core Performance */}
-          <div className="mb-4">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Core Performance</h4>
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Total Profit ($)</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.totalProfitDollars}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Executed Trades</div>
-                <div className="text-lg font-semibold">{stats.executedTradesTotal !== undefined ? stats.executedTradesTotal : (stats.allowedTrades || stats.totalTrades)}</div>
-                {stats.executedTradesAllowed !== undefined && stats.executedTradesFiltered !== undefined && (
-                  <div className="text-xs text-gray-500 mt-1">
-                    Allowed: {stats.executedTradesAllowed} | Filtered: {stats.executedTradesFiltered}
-                  </div>
-                )}
-                {stats.totalRows !== undefined && stats.filteredRows !== undefined && (
-                  <div className="text-xs text-gray-400 mt-1">
-                    Total Rows: {stats.totalRows} | Filtered Rows: {stats.filteredRows}
-                  </div>
-                )}
-                {stats.notradeTotal !== undefined && (
-                  <div className="text-xs text-gray-500 mt-1">
-                    NoTrade: {stats.notradeTotal}
-                  </div>
-                )}
-              </div>
-              {stats.executedTradingDays !== undefined && stats.allowedTradingDays !== undefined && (
-                <div>
-                  <div className="text-xs text-gray-400 mb-1">Trading Days</div>
-                  <div className="text-lg font-semibold">
-                    Executed: {stats.executedTradingDays}
-                    <span className="text-xs text-gray-500 ml-2">Allowed: {stats.allowedTradingDays}</span>
-                  </div>
-                </div>
-              )}
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Avg Trades per Active Day</div>
-                <div className="text-lg font-semibold">{stats.avgTradesPerDay}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Active Day</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerDay?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerDay || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Week</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerWeek?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerWeek || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Month</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerMonth?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerMonth || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Year</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerYear?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerYear || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Trade (Mean PnL)</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerTrade || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Win Rate</div>
-                <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Wins</div>
-                <div className="text-lg font-semibold text-green-400">{stats.wins}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Losses</div>
-                <div className="text-lg font-semibold text-red-400">{stats.losses}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Break-Even</div>
-                <div className="text-lg font-semibold">{stats.breakEven}</div>
-              </div>
-              {stats.time !== undefined && (
-                <div>
-                  <div className="text-xs text-gray-400 mb-1">TIME</div>
-                  <div className="text-lg font-semibold">{stats.time}</div>
-                </div>
-              )}
-            </div>
-          </div>
-          
-          {/* Section 2: Risk-Adjusted Performance */}
-          <div className="mb-4 pt-4 border-t border-gray-700">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Risk-Adjusted Performance</h4>
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Sharpe Ratio</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.sharpeRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.sharpeRatio}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Sortino Ratio</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.sortinoRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.sortinoRatio}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Calmar Ratio</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.calmarRatio) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.calmarRatio}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit Factor</div>
-                <div className="text-lg font-semibold">{stats.profitFactor}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Risk-Reward</div>
-                <div className="text-lg font-semibold">{stats.rrRatio}</div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Section 3: Drawdowns & Stability */}
-          <div className="mb-4 pt-4 border-t border-gray-700">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Drawdowns & Stability</h4>
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Max Drawdown ($)</div>
-                <div className="text-lg font-semibold text-red-400">{stats.maxDrawdownDollars}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Time-to-Recovery (Days)</div>
-                <div className="text-lg font-semibold">{stats.timeToRecoveryDays ?? 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Average Drawdown ($)</div>
-                <div className="text-lg font-semibold text-red-400">{stats.avgDrawdownDollars || 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Avg Drawdown Duration (Days)</div>
-                <div className="text-lg font-semibold">{stats.avgDrawdownDurationDays ?? 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Drawdown Frequency (per Year)</div>
-                <div className="text-lg font-semibold">{stats.drawdownEpisodesPerYear ?? 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
-                <div className="text-lg font-semibold text-red-400">{stats.maxConsecutiveLosses ?? 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Monthly Return Std Dev</div>
-                <div className="text-lg font-semibold">{stats.monthlyReturnStdDev || 'N/A'}</div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Section 4: PnL Distribution & Tail Risk */}
-          <div className="pt-4 border-t border-gray-700">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">PnL Distribution & Tail Risk</h4>
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Median PnL per Trade</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.medianPnLPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.medianPnLPerTrade || 'N/A'}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Std Dev of PnL</div>
-                <div className="text-lg font-semibold">{stats.stdDevPnL || 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">95% VaR (per trade)</div>
-                <div className="text-lg font-semibold text-red-400">{stats.var95 || 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Expected Shortfall (CVaR 95%)</div>
-                <div className="text-lg font-semibold text-red-400">{stats.cvar95 || 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Skewness</div>
-                <div className="text-lg font-semibold">{stats.skewness ?? 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Kurtosis</div>
-                <div className="text-lg font-semibold">{stats.kurtosis ?? 'N/A'}</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )
-    } else {
-      // Individual streams - show 3 sections with 8 stats total
-      return (
-        <div className="bg-gray-900 rounded-lg p-4 mb-4 border border-gray-700">
-          {/* Section 1: Core Performance */}
-          <div className="mb-4">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Core Performance</h4>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Trades</div>
-                <div className="text-lg font-semibold">{stats.totalTrades}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit ($)</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.totalProfit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.totalProfitDollars}
-                </div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Win Rate</div>
-                <div className="text-lg font-semibold text-green-400">{stats.winRate}%</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit per Trade</div>
-                <div className={`text-lg font-semibold ${parseFloat(stats.profitPerTrade?.replace(/[^0-9.-]/g, '') || 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                  {stats.profitPerTrade || 'N/A'}
-                </div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Section 2: Risk & Volatility */}
-          <div className="mb-4 pt-4 border-t border-gray-700">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Risk & Volatility</h4>
-            <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Std Dev of PnL</div>
-                <div className="text-lg font-semibold">{stats.stdDevPnL || 'N/A'}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Max Consecutive Losses</div>
-                <div className="text-lg font-semibold text-red-400">{stats.maxConsecutiveLosses ?? 'N/A'}</div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Section 3: Efficiency */}
-          <div className="pt-4 border-t border-gray-700">
-            <h4 className="text-sm font-semibold mb-3 text-gray-300">Efficiency</h4>
-            <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Profit Factor</div>
-                <div className="text-lg font-semibold">{stats.profitFactor}</div>
-              </div>
-              <div>
-                <div className="text-xs text-gray-400 mb-1">Rolling 30-Day Win Rate</div>
-                <div className="text-lg font-semibold text-green-400">
-                  {stats.rolling30DayWinRate !== null ? `${stats.rolling30DayWinRate}%` : 'N/A'}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )
-    }
+    // Render stats using StatsContent component
+    return (
+      <StatsContent
+        stats={stats}
+        streamId={streamId}
+        includeFilteredExecuted={includeFilteredExecuted}
+        setIncludeFilteredExecuted={setIncludeFilteredExecuted}
+      />
+    )
   }
   
   const renderFilters = (streamId) => {
@@ -2474,7 +2167,7 @@ function AppContent() {
     // Check if we need to fetch more data from backend
     // If we have fewer rows than total available, fetch more from backend first
     if (totalRowsInFile !== null && masterData.length < totalRowsInFile && !loadingMoreRows) {
-      console.log(`[LoadMore] Fetching more data from backend: ${masterData.length} < ${totalRowsInFile}`)
+      devLog(`[LoadMore] Fetching more data from backend: ${masterData.length} < ${totalRowsInFile}`)
       setLoadingMoreRows(true)
       try {
         // Get master stream inclusion filter
@@ -2495,7 +2188,7 @@ function AppContent() {
         
         const newTrades = data.data || []
         if (newTrades.length > masterData.length) {
-          console.log(`[LoadMore] Fetched ${newTrades.length} rows from backend (had ${masterData.length})`)
+          devLog(`[LoadMore] Fetched ${newTrades.length} rows from backend (had ${masterData.length})`)
           // Update masterData with all rows
           setMasterData(newTrades)
           // Reinitialize worker with new data
@@ -2522,7 +2215,7 @@ function AppContent() {
       
       // Set a timeout to reset loading flag if it gets stuck (safety measure)
       const loadingTimeout = setTimeout(() => {
-        console.warn('loadMoreRows: Loading timeout - resetting loadingMoreRows flag')
+        devWarn('loadMoreRows: Loading timeout - resetting loadingMoreRows flag')
         setLoadingMoreRows(false)
       }, 10000) // 10 second timeout
       
@@ -2913,7 +2606,7 @@ function AppContent() {
           const masterIncludeStreams = masterFilters.include_streams || []
           const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
           
-          console.log(`[Breakdown] Fetching ${breakdownType} breakdown from backend (useFiltered=${useFiltered}, streamInclude=${streamIncludeParam})`)
+          devLog(`[Breakdown] Fetching ${breakdownType} breakdown from backend (useFiltered=${useFiltered}, streamInclude=${streamIncludeParam})`)
           const data = await matrixApi.getProfitBreakdown({
             breakdownType,
             streamFilters,
@@ -2923,7 +2616,7 @@ function AppContent() {
           })
           
           
-          console.log(`[Breakdown] Received response for ${breakdownType}:`, {
+          devLog(`[Breakdown] Received response for ${breakdownType}:`, {
             hasData: !!data,
             hasBreakdown: !!(data && data.breakdown),
             breakdownKeys: data && data.breakdown ? Object.keys(data.breakdown).length : 0,
@@ -2934,7 +2627,7 @@ function AppContent() {
             // Check if breakdown has any data
             const breakdownKeys = Object.keys(data.breakdown)
             if (breakdownKeys.length === 0) {
-              console.warn(`[Breakdown] Empty breakdown received for ${activeTab} (${useFiltered ? 'after' : 'before'})`)
+              devWarn(`[Breakdown] Empty breakdown received for ${activeTab} (${useFiltered ? 'after' : 'before'})`)
             }
             
             const suffix = useFiltered ? 'after' : 'before'
@@ -2947,26 +2640,26 @@ function AppContent() {
                 if (!hasStreamKeys) {
                   console.error(`[Breakdown] ERROR: Time breakdown has wrong format. Expected {time: {stream: profit}}, got:`, sampleValue)
                 } else {
-                  console.log(`[Breakdown] Time breakdown format verified: ${sampleKey} has streams:`, Object.keys(sampleValue))
+                  devLog(`[Breakdown] Time breakdown format verified: ${sampleKey} has streams:`, Object.keys(sampleValue))
                 }
               }
             }
             // Verify month breakdown format
             if (activeTab === 'month') {
               const sampleKeys = Object.keys(data.breakdown).slice(0, 3)
-              console.log(`[Breakdown] Month breakdown sample keys:`, sampleKeys)
+              devLog(`[Breakdown] Month breakdown sample keys:`, sampleKeys)
               sampleKeys.forEach(key => {
                 const value = data.breakdown[key]
-                console.log(`[Breakdown] Month ${key}:`, typeof value === 'object' ? Object.keys(value) : value)
+                devLog(`[Breakdown] Month ${key}:`, typeof value === 'object' ? Object.keys(value) : value)
               })
             }
             setProfitBreakdowns(prev => ({
               ...prev,
               [`${activeTab}_${suffix}`]: data.breakdown
             }))
-            console.log(`[Breakdown] Updated ${activeTab}_${suffix} breakdown from backend (${Object.keys(data.breakdown).length} entries)`)
+            devLog(`[Breakdown] Updated ${activeTab}_${suffix} breakdown from backend (${Object.keys(data.breakdown).length} entries)`)
           } else {
-            console.warn(`[Breakdown] No breakdown data in response for ${activeTab}`, {
+            devWarn(`[Breakdown] No breakdown data in response for ${activeTab}`, {
               data,
               hasData: !!data,
               hasBreakdown: !!(data && data.breakdown),
@@ -3046,24 +2739,24 @@ function AppContent() {
   const memoizedDOYProfitBefore = useMemo(() => {
     const data = profitBreakdowns['doy_before']
     if (data) {
-      console.log(`[DOY] Using doy_before data: ${Object.keys(data).length} days`)
+      devLog(`[DOY] Using doy_before data: ${Object.keys(data).length} days`)
       return data
     }
     // DOY uses backend API (full dataset) - don't fall back to worker data
     // Return empty object to wait for backend data
-    console.log(`[DOY] No doy_before data yet, waiting for backend...`)
+    devLog(`[DOY] No doy_before data yet, waiting for backend...`)
     return {}
   }, [profitBreakdowns])
   
   const memoizedDOYProfitAfter = useMemo(() => {
     const data = profitBreakdowns['doy_after']
     if (data) {
-      console.log(`[DOY] Using doy_after data: ${Object.keys(data).length} days`)
+      devLog(`[DOY] Using doy_after data: ${Object.keys(data).length} days`)
       return data
     }
     // DOY uses backend API (full dataset) - don't fall back to worker data
     // Return empty object to wait for backend data
-    console.log(`[DOY] No doy_after data yet, waiting for backend...`)
+    devLog(`[DOY] No doy_after data yet, waiting for backend...`)
     return {}
   }, [profitBreakdowns])
   
@@ -3154,7 +2847,7 @@ function AppContent() {
     // Check matrix freshness - refuse to calculate timetable if matrix is stale
     const checkFreshnessAndCalculate = async () => {
       if (matrixFreshness && matrixFreshness.is_stale) {
-        console.warn('[Timetable] Matrix is stale, reloading before calculating timetable')
+        devWarn('[Timetable] Matrix is stale, reloading before calculating timetable')
         // Reload latest matrix first
         try {
           await reloadLatestMatrix()
@@ -3181,7 +2874,7 @@ function AppContent() {
       // If date doesn't exist in matrix, try to read from backend-generated timetable_current.json
       // This file is generated with RS calculation and contains all streams
       if (!dateExistsInMatrix && workerReady) {
-        console.log('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
+        devLog('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
         try {
           const timetable = await matrixApi.getCurrentTimetable()
           if (timetable && timetable.trading_date === displayedDateStr && timetable.streams) {
@@ -3216,7 +2909,7 @@ function AppContent() {
                   }))
                 // Note: We can't directly set worker state here, so we'll let the worker
                 // recalculate after the file is updated. The worker should read from the file.
-                console.log('[Timetable] Generated via backend, triggering worker recalculation')
+                devLog('[Timetable] Generated via backend, triggering worker recalculation')
                 if (workerCalculateTimetable) {
                   // Small delay to ensure file is written
                   setTimeout(() => {
@@ -3227,7 +2920,7 @@ function AppContent() {
             }
           } else if (timetable && timetable.trading_date !== displayedDateStr) {
             // File exists but for different date - generate for displayed date
-            console.log('[Timetable] File exists for different date, generating for:', displayedDateStr)
+            devLog('[Timetable] File exists for different date, generating for:', displayedDateStr)
             await fetch(`http://localhost:8000/api/timetable/generate`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -3240,7 +2933,7 @@ function AppContent() {
             }
           }
         } catch (error) {
-          console.warn('[Timetable] Backend read failed, using worker:', error)
+          devWarn('[Timetable] Backend read failed, using worker:', error)
           // Fall through to worker calculation
           if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
             workerCalculateTimetable(streamFilters, currentTradingDay)
@@ -3268,7 +2961,7 @@ function AppContent() {
             tradingDate: workerExecutionTimetable.trading_date,
             streams: workerExecutionTimetable.streams
           })
-          console.log('Execution timetable saved successfully')
+          devLog('Execution timetable saved successfully')
         } catch (error) {
           console.error('Error saving execution timetable:', error.message)
         }
@@ -3475,6 +3168,18 @@ function AppContent() {
           >
             Stats
           </button>
+          <button
+            onClick={() => {
+              handleTabChange('performance');
+            }}
+            className={`px-4 py-2 font-medium whitespace-nowrap ${
+              activeTab === 'performance'
+                ? 'border-b-2 border-blue-500 text-blue-400'
+                : 'text-gray-400 hover:text-gray-300'
+            }`}
+          >
+            Performance
+          </button>
           </div>
         </div>
         
@@ -3655,6 +3360,10 @@ function AppContent() {
                 <WorstDaysTable contractMultiplier={masterContractMultiplier} />
               )}
             </div>
+          </div>
+        ) : activeTab === 'performance' ? (
+          <div className="space-y-6">
+            <MatrixMetricsDashboard />
           </div>
         ) : activeTab === 'time' || activeTab === 'day' || activeTab === 'dom' || activeTab === 'doy' || activeTab === 'date' || activeTab === 'month' || activeTab === 'year' ? (
           <div className="space-y-6">
@@ -3883,7 +3592,7 @@ function AppContent() {
                         setBackendStatsFull(null)
                         try {
                           setMasterLoading(true)
-                          console.log(`Reloading stats with contract_multiplier=${clamped}`)
+                          devLog(`Reloading stats with contract_multiplier=${clamped}`)
                           const data = await matrixApi.getMatrixData({
                             limit: 10000,
                             order: 'newest',
@@ -3892,18 +3601,18 @@ function AppContent() {
                             contractMultiplier: clamped
                           })
                           if (data) {
-                            console.log('Received stats_full:', data.stats_full ? 'present' : 'missing')
+                            devLog('Received stats_full:', data.stats_full ? 'present' : 'missing')
                             if (data.stats_full) {
                               // Check if total profit changed to verify multiplier was applied
                               const oldTotalProfit = backendStatsFull?.performance_trade_metrics?.total_profit || 0
                               const newTotalProfit = data.stats_full?.performance_trade_metrics?.total_profit || 0
-                              console.log(`Total profit: ${oldTotalProfit} -> ${newTotalProfit} (expected ratio: ${clamped / (masterContractMultiplier || 1)})`)
+                              devLog(`Total profit: ${oldTotalProfit} -> ${newTotalProfit} (expected ratio: ${clamped / (masterContractMultiplier || 1)})`)
                               
                               setBackendStatsFull(data.stats_full)
                               setBackendStatsMultiplier(clamped)
-                              console.log('Updated backendStatsFull with new multiplier')
+                              devLog('Updated backendStatsFull with new multiplier')
                             } else {
-                              console.warn('No stats_full in response')
+                              devWarn('No stats_full in response')
                             }
                           } else {
                             const errorData = await dataResponse.json().catch(() => ({ detail: 'Unknown error' }))

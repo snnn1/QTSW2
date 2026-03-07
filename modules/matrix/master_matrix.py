@@ -350,7 +350,9 @@ class MasterMatrix:
                            stream_filters: Optional[Dict[str, Dict]] = None,
                            analyzer_runs_dir: Optional[str] = None,
                            streams: Optional[List[str]] = None,
-                           timetable_output_dir: Optional[str] = None) -> pd.DataFrame:
+                           timetable_output_dir: Optional[str] = None,
+                           warmup_months: Optional[int] = None,
+                           visible_years: Optional[List[int]] = None) -> pd.DataFrame:
         """
         Build the master matrix by loading, normalizing, and merging all streams.
         Works like sequencer: reads from analyzer_runs and applies time change logic
@@ -363,12 +365,18 @@ class MasterMatrix:
             output_dir: Directory to save master matrix files
             stream_filters: Per-stream filter configuration
             analyzer_runs_dir: Override analyzer runs directory (optional)
+            warmup_months: Reserved for future use (e.g. warmup period filtering)
+            visible_years: Reserved for future use (e.g. year filtering)
             
         Returns:
             Master matrix DataFrame sorted by trade_date, entry_time, Instrument, Stream
             (ascending order). This is the CANONICAL sort order - API and UI layers must
             NOT re-sort this data, they should assume it is already correctly sorted.
         """
+        import time
+        from .build_journal import journal_event
+        t_build_start = time.perf_counter()
+        journal_event(event_type="build_start", mode="full_rebuild")
         # Force output to stderr immediately AND log file
         import sys
         debug_start = "=" * 80 + "\nMASTER MATRIX: build_master_matrix() called\n"
@@ -382,6 +390,10 @@ class MasterMatrix:
         logger.info("MASTER MATRIX: build_master_matrix() called")
         logger.info(f"Streams: {streams}")
         logger.info(f"Output dir: {output_dir}")
+        if warmup_months is not None:
+            logger.info(f"Warmup months: {warmup_months}")
+        if visible_years:
+            logger.info(f"Visible years: {visible_years}")
         logger.info("BUILDING MASTER MATRIX (Applying Sequencer Logic)")
         logger.info("=" * 80)
         # Stream filters details moved to DEBUG (diagnostic, not high-signal)
@@ -621,6 +633,29 @@ class MasterMatrix:
         file_manager.save_master_matrix(
             df, output_dir, specific_date, stream_filters=self.stream_filters,
             timetable_output_dir=timetable_output_dir
+        )
+        
+        duration_ms = int((time.perf_counter() - t_build_start) * 1000)
+        from .instrumentation import log_timing_event
+        dmin = df["trade_date"].min() if not df.empty and "trade_date" in df.columns else None
+        dmax = df["trade_date"].max() if not df.empty and "trade_date" in df.columns else None
+        log_timing_event(
+            phase="full_rebuild",
+            duration_ms=duration_ms,
+            row_count=len(df) if not df.empty else 0,
+            stream_count=len(df["Stream"].unique()) if not df.empty and "Stream" in df.columns else 0,
+            date_min=dmin.strftime("%Y-%m-%d") if dmin is not None and pd.notna(dmin) and hasattr(dmin, "strftime") else None,
+            date_max=dmax.strftime("%Y-%m-%d") if dmax is not None and pd.notna(dmax) and hasattr(dmax, "strftime") else None,
+            mode="full_rebuild",
+        )
+        journal_event(
+            event_type="build_complete",
+            mode="full_rebuild",
+            rows_written=len(df) if not df.empty else 0,
+            streams_processed=len(df["Stream"].unique()) if not df.empty and "Stream" in df.columns else 0,
+            date_window_min=dmin.strftime("%Y-%m-%d") if dmin is not None and pd.notna(dmin) and hasattr(dmin, "strftime") else None,
+            date_window_max=dmax.strftime("%Y-%m-%d") if dmax is not None and pd.notna(dmax) and hasattr(dmax, "strftime") else None,
+            duration_ms=duration_ms,
         )
         
         # Create checkpoint after successful build (for window updates)

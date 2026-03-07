@@ -436,8 +436,9 @@ class WatchdogStateManager:
                         continue
                     key = (trading_date, stream)
                     existing = self._stream_states.get(key)
-                    if existing and existing.state:
-                        continue
+                    # Always overwrite from slot journal when it matches current_trading_date - journal is
+                    # authoritative (robot-persisted). Stale event-derived state (e.g. RANGE_LOCKED from Feb 27
+                    # bleeding into Mar 6) must be corrected. Previously we skipped when existing had state.
                     state_entry_utc = datetime.now(timezone.utc)
                     if last_update_str:
                         try:
@@ -448,14 +449,25 @@ class WatchdogStateManager:
                                 state_entry_utc = state_entry_utc.replace(tzinfo=timezone.utc)
                         except Exception:
                             pass
+                    # Enrich with slot_time from timetable if available (for stuck detection)
+                    slot_time_chicago = None
+                    if self._timetable_streams and stream in self._timetable_streams:
+                        slot_time_chicago = self._timetable_streams[stream].get("slot_time") or None
                     if existing:
                         existing.state = last_state
                         existing.committed = committed
                         if commit_reason:
                             existing.commit_reason = commit_reason
                         existing.state_entry_time_utc = state_entry_utc
+                        if slot_time_chicago:
+                            existing.slot_time_chicago = slot_time_chicago
+                        # Clear stale ranges when overwriting with non-RANGE_LOCKED state
+                        if last_state not in ("RANGE_LOCKED", "OPEN"):
+                            existing.range_high = None
+                            existing.range_low = None
+                            existing.freeze_close = None
                     else:
-                        self._stream_states[key] = StreamStateInfo(
+                        new_info = StreamStateInfo(
                             trading_date=trading_date,
                             stream=stream,
                             state=last_state,
@@ -464,6 +476,9 @@ class WatchdogStateManager:
                             state_entry_time_utc=state_entry_utc,
                             execution_instrument=None,
                         )
+                        if slot_time_chicago:
+                            new_info.slot_time_chicago = slot_time_chicago
+                        self._stream_states[key] = new_info
                     hydrated += 1
                 except Exception as e:
                     logger.debug(f"Skip slot journal {journal_file.name}: {e}")
@@ -958,6 +973,49 @@ class WatchdogStateManager:
                             "state_entry_time_chicago": info.state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat(),
                             "issue": "STUCK_IN_ARMED"
                         })
+            # RANGE_BUILDING: Only flag as stuck if now >= slot_time (range lock time)
+            # Streams legitimately stay in RANGE_BUILDING from range_start (e.g. 02:00) until slot_time (e.g. 09:00)
+            elif info.state == "RANGE_BUILDING":
+                slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
+                if slot_time_chicago:
+                    try:
+                        # Parse slot_time (HH:MM or HH:MM:SS) with trading_date
+                        slot_str = slot_time_chicago.strip()
+                        if 'T' in slot_str:
+                            slot_dt = datetime.fromisoformat(slot_str.replace('Z', '+00:00'))
+                            if slot_dt.tzinfo is None:
+                                slot_dt = CHICAGO_TZ.localize(slot_dt)
+                            if slot_dt.date().isoformat() != trading_date:
+                                slot_dt = None  # Wrong date, skip
+                        else:
+                            for fmt in ("%H:%M", "%H:%M:%S"):
+                                try:
+                                    slot_dt = datetime.strptime(slot_str, fmt).time()
+                                    slot_dt = datetime.combine(
+                                        datetime.strptime(trading_date, "%Y-%m-%d").date(),
+                                        slot_dt
+                                    )
+                                    slot_dt = CHICAGO_TZ.localize(slot_dt)
+                                    break
+                                except ValueError:
+                                    continue
+                            else:
+                                slot_dt = None
+                        if slot_dt:
+                            slot_utc = slot_dt.astimezone(timezone.utc)
+                            if now < slot_utc:
+                                continue  # Before slot_time - RANGE_BUILDING is expected, not stuck
+                    except Exception as e:
+                        logger.debug(f"Failed to parse slot_time for {stream}: {slot_time_chicago}, {e}")
+                # After slot_time (or no slot_time): use normal threshold
+                if stuck_duration > STUCK_STREAM_THRESHOLD_SECONDS:
+                    stuck_streams.append({
+                        "stream": stream,
+                        "instrument": info.instrument if hasattr(info, 'instrument') else "",
+                        "state": info.state,
+                        "stuck_duration_seconds": int(stuck_duration),
+                        "state_entry_time_chicago": info.state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                    })
             elif stuck_duration > STUCK_STREAM_THRESHOLD_SECONDS:
                 stuck_streams.append({
                     "stream": stream,

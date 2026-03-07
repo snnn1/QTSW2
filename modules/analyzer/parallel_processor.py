@@ -5,10 +5,10 @@ This module provides parallel processing capabilities for the breakout analyzer
 to utilize multiple CPU cores for faster range processing.
 
 Key features:
-1. ThreadPoolExecutor: Multi-threaded processing for independent range calculations
+1. ProcessPoolExecutor: Multi-process processing for CPU-bound work (bypasses GIL)
 2. Chunk Processing: Split ranges into chunks for parallel execution
-3. CPU Core Utilization: Automatically detect and use available CPU cores
-4. Load Balancing: Distribute work evenly across threads
+3. Shared memory: Optional shared-memory path to avoid DataFrame pickling overhead
+4. Load Balancing: Distribute work evenly across processes
 """
 
 import pandas as pd
@@ -17,10 +17,67 @@ from typing import List, Dict, Optional, Tuple, Callable, Any
 from dataclasses import dataclass
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
 import os
+import uuid
 from functools import partial
+
+try:
+    from multiprocessing import shared_memory
+    SHARED_MEMORY_AVAILABLE = True
+except ImportError:
+    SHARED_MEMORY_AVAILABLE = False
+
+
+def _build_df_from_shared_memory(shm_name: str, n_rows: int, instrument: str) -> pd.DataFrame:
+    """
+    Build DataFrame from shared memory block. Module-level for picklability.
+    Worker keeps shm attached for the duration of chunk processing.
+    """
+    shm = shared_memory.SharedMemory(name=shm_name, create=False)
+    try:
+        # Layout: timestamp (int64) + open, high, low, close (float64 each) = 40 bytes/row
+        ts_arr = np.ndarray((n_rows,), dtype=np.int64, buffer=shm.buf)
+        offset = n_rows * 8
+        o_arr = np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)
+        offset += n_rows * 8
+        h_arr = np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)
+        offset += n_rows * 8
+        l_arr = np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)
+        offset += n_rows * 8
+        c_arr = np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)
+        timestamp = pd.to_datetime(ts_arr.copy(), unit="ns")
+        df = pd.DataFrame({
+            "timestamp": timestamp,
+            "open": o_arr.copy(),
+            "high": h_arr.copy(),
+            "low": l_arr.copy(),
+            "close": c_arr.copy(),
+            "instrument": [instrument] * n_rows,
+        })
+        return df
+    finally:
+        shm.close()
+
+
+def _process_chunk_with_shm(shm_metadata: Dict, process_func: Callable, chunk: List[Dict],
+                            *args, **kwargs) -> List[Any]:
+    """Process chunk using DataFrame built from shared memory. Module-level for picklability."""
+    df = _build_df_from_shared_memory(
+        shm_metadata["shm_name"],
+        shm_metadata["n_rows"],
+        shm_metadata["instrument"],
+    )
+    chunk_results = []
+    for range_data in chunk:
+        try:
+            result = process_func(df, range_data, *args, **kwargs)
+            chunk_results.append(result)
+        except Exception as exc:
+            print(f"[WARNING] Range processing failed: {exc}")
+            chunk_results.append(None)
+    return chunk_results
 
 
 @dataclass
@@ -37,20 +94,21 @@ class ParallelStats:
 class ParallelProcessor:
     """Parallel processing engine for breakout analyzer"""
     
-    def __init__(self, max_workers: Optional[int] = None, enable_parallel: bool = True):
+    def __init__(self, max_workers: Optional[int] = None, enable_parallel: bool = True,
+                 use_shared_memory: bool = False):
         """
         Initialize the parallel processor
         
         Args:
-            max_workers: Maximum number of worker threads (None = auto-detect)
+            max_workers: Maximum number of worker processes (None = auto-detect)
             enable_parallel: Whether to enable parallel processing
+            use_shared_memory: Use shared memory to avoid DataFrame pickling (experimental)
         """
         self.enable_parallel = enable_parallel
+        self.use_shared_memory = use_shared_memory and SHARED_MEMORY_AVAILABLE
         self.max_workers = max_workers or self._detect_optimal_workers()
         self.cpu_cores = multiprocessing.cpu_count()
         self.stats = {}
-        
-        # Parallel processor initialized
     
     def _detect_optimal_workers(self) -> int:
         """
@@ -88,7 +146,7 @@ class ParallelProcessor:
             # Fall back to sequential processing for small datasets
             return self._process_ranges_sequential(ranges, process_func, *args, **kwargs)
         
-        print(f"[PARALLEL] Starting parallel processing of {len(ranges)} ranges using {self.max_workers} threads")
+        print(f"[PARALLEL] Starting parallel processing of {len(ranges)} ranges using {self.max_workers} processes")
         
         start_time = time.time()
         results = []
@@ -99,8 +157,8 @@ class ParallelProcessor:
         
         print(f"[CHUNK] Split into {len(range_chunks)} chunks (avg {chunk_size} ranges per chunk)")
         
-        # Process chunks in parallel
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Process chunks in parallel (ProcessPoolExecutor bypasses GIL for CPU-bound work)
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all chunks
             future_to_chunk = {
                 executor.submit(self._process_chunk, chunk, process_func, *args, **kwargs): chunk
@@ -133,7 +191,7 @@ class ParallelProcessor:
         
         print(f"[SUCCESS] Parallel processing completed:")
         print(f"   Processed {len(results)} ranges in {processing_time:.2f} seconds")
-        print(f"   Used {self.max_workers} threads")
+        print(f"   Used {self.max_workers} processes")
         
         return results
     
@@ -221,7 +279,7 @@ class ParallelProcessor:
         Args:
             df: DataFrame to process
             ranges: List of ranges to process
-            process_func: Function to process each range
+            process_func: Function (df, range_dict, *args) to process each range
             *args: Additional arguments for process_func
             **kwargs: Additional keyword arguments for process_func
             
@@ -235,17 +293,67 @@ class ParallelProcessor:
         
         start_time = time.time()
         
-        # Pre-process DataFrame for parallel access
-        df_processed = self._prepare_dataframe_for_parallel(df)
-        
-        # Create partial function with DataFrame
-        process_func_with_df = partial(process_func, df_processed)
-        
-        # Process ranges in parallel
-        results = self.process_ranges_parallel(ranges, process_func_with_df, *args, **kwargs)
+        if self.use_shared_memory:
+            results = self._process_dataframe_parallel_shm(df, ranges, process_func, *args, **kwargs)
+        else:
+            df_processed = self._prepare_dataframe_for_parallel(df)
+            process_func_with_df = partial(process_func, df_processed)
+            results = self.process_ranges_parallel(ranges, process_func_with_df, *args, **kwargs)
         
         processing_time = time.time() - start_time
         print(f"[SUCCESS] Parallel DataFrame processing completed in {processing_time:.2f} seconds")
+        
+        return results
+    
+    def _process_dataframe_parallel_shm(self, df: pd.DataFrame, ranges: List[Dict],
+                                        process_func: Callable, *args, **kwargs) -> List[Any]:
+        """Process using shared memory to avoid pickling DataFrame to each worker."""
+        df_prep = self._prepare_dataframe_for_parallel(df)
+        n_rows = len(df_prep)
+        instrument = str(df_prep["instrument"].iloc[0]) if "instrument" in df_prep.columns and n_rows > 0 else "ES"
+        
+        # Layout: timestamp (int64) + open, high, low, close (float64) = 40 bytes/row
+        shm_size = n_rows * 40
+        shm_name = f"analyzer_{uuid.uuid4().hex[:12]}"
+        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=shm_size)
+        
+        try:
+            ts = pd.to_datetime(df_prep["timestamp"]).astype(np.int64)
+            np.ndarray((n_rows,), dtype=np.int64, buffer=shm.buf)[:] = ts.values
+            offset = n_rows * 8
+            np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)[:] = df_prep["open"].values
+            offset += n_rows * 8
+            np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)[:] = df_prep["high"].values
+            offset += n_rows * 8
+            np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)[:] = df_prep["low"].values
+            offset += n_rows * 8
+            np.ndarray((n_rows,), dtype=np.float64, buffer=shm.buf, offset=offset)[:] = df_prep["close"].values
+            
+            shm_metadata = {"shm_name": shm_name, "n_rows": n_rows, "instrument": instrument}
+            
+            chunk_size = max(1, len(ranges) // self.max_workers)
+            range_chunks = self._split_into_chunks(ranges, chunk_size)
+            
+            print(f"[SHARED-MEM] Using shared memory ({n_rows:,} rows, {shm_size/1024/1024:.1f} MB)")
+            
+            results = []
+            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                future_to_chunk = {
+                    executor.submit(_process_chunk_with_shm, shm_metadata, process_func, chunk, *args, **kwargs): chunk
+                    for chunk in range_chunks
+                }
+                for future in as_completed(future_to_chunk):
+                    try:
+                        chunk_results = future.result()
+                        results.extend(chunk_results)
+                    except Exception as exc:
+                        print(f"[ERROR] Chunk processing failed: {exc}")
+                        chunk = future_to_chunk[future]
+                        chunk_results = _process_chunk_with_shm(shm_metadata, process_func, chunk, *args, **kwargs)
+                        results.extend(chunk_results)
+        finally:
+            shm.close()
+            shm.unlink()
         
         return results
     

@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -1437,7 +1438,13 @@ public sealed class ExecutionJournal
                     }
                     else
                     {
-                        var json = File.ReadAllText(path);
+                        var json = ReadJournalFileWithRetry(path);
+                        if (json == null)
+                        {
+                            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_READ_SKIPPED", "ENGINE",
+                                new { path, error = "Read failed after retries (file lock?)" }));
+                            continue;
+                        }
                         entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                         if (entry != null)
                             _cache[fileName] = entry;
@@ -1728,15 +1735,20 @@ public sealed class ExecutionJournal
             try
             {
                 var json = JsonUtil.Serialize(entry);
-                File.WriteAllText(path, json);
+                // FileShare.Read allows concurrent reads during write (avoids RECONCILIATION_QTY_MISMATCH from file lock)
+                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+                using (var sw = new StreamWriter(fs))
+                {
+                    sw.Write(json);
+                }
                 return;
             }
             catch (Exception ex)
             {
-                var isRetryable = ex is System.IO.IOException;
+                var isRetryable = ex is IOException;
                 if (attempt < maxRetries && isRetryable)
                 {
-                    System.Threading.Thread.Sleep(retryDelayMs * attempt);
+                    Thread.Sleep(retryDelayMs * attempt);
                     continue;
                 }
                 _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "EXECUTION_JOURNAL_ERROR", "ENGINE",
@@ -1744,6 +1756,29 @@ public sealed class ExecutionJournal
                 return;
             }
         }
+    }
+
+    /// <summary>Read journal file with FileShare.ReadWrite and retry to avoid RECONCILIATION_QTY_MISMATCH from file lock.</summary>
+    private string? ReadJournalFileWithRetry(string path)
+    {
+        const int maxRetries = 3;
+        const int retryDelayMs = 50;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs))
+                {
+                    return sr.ReadToEnd();
+                }
+            }
+            catch (IOException) when (attempt < maxRetries)
+            {
+                Thread.Sleep(retryDelayMs * attempt);
+            }
+        }
+        return null;
     }
 }
 

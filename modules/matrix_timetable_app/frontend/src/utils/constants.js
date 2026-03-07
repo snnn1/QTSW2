@@ -22,6 +22,21 @@ export const DEFAULT_COLUMNS = [
   'Profit', 'Time Change', 'Profit ($)'
 ]
 
+// Contract values (dollars per point) - must match modules/matrix/statistics.py
+export const CONTRACT_VALUES = {
+  ES: 50,
+  MES: 5,
+  NQ: 10,
+  MNQ: 2,
+  YM: 5,
+  MYM: 0.5,
+  CL: 1000,
+  NG: 10000,
+  GC: 100,
+  RTY: 50
+}
+export const DEFAULT_CONTRACT_VALUE = 50
+
 // Storage keys
 export const STORAGE_KEYS = {
   SELECTED_COLUMNS: 'matrix_selected_columns',

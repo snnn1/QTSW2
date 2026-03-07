@@ -87,6 +87,16 @@ class TimetableEngine:
         
         # File list cache to avoid repeated rglob() calls
         self._file_list_cache = {}
+        # SCF lookup cache: (stream_id, trade_date) -> (scf_s1, scf_s2), max 1000 entries
+        self._scf_cache: Dict[tuple, Tuple[Optional[float], Optional[float]]] = {}
+        self._scf_cache_max_size = 1000
+    
+    def _maybe_evict_scf_cache(self) -> None:
+        """Evict oldest entries if cache exceeds max size."""
+        if len(self._scf_cache) > self._scf_cache_max_size:
+            keys_to_remove = list(self._scf_cache.keys())[: len(self._scf_cache) - self._scf_cache_max_size]
+            for k in keys_to_remove:
+                del self._scf_cache[k]
     
     def _get_parquet_files(self, stream_dir: Path) -> List[Path]:
         """
@@ -206,38 +216,19 @@ class TimetableEngine:
         # Sort by trade_date (already datetime dtype)
         df = df.sort_values('trade_date').reset_index(drop=True)
         
-        # Get last N trades per time slot
-        time_slot_rs = {}
+        # Vectorized score mapping: WIN=+1, LOSS=-2, else 0
+        result_clean = df['Result'].fillna('').astype(str).str.strip().str.upper()
+        df = df.copy()
+        df['_score'] = result_clean.map({'WIN': 1, 'LOSS': -2}).fillna(0)
         
+        # Get last N trades per time slot and sum scores (vectorized)
+        time_slot_rs = {}
         for time_slot in self.session_time_slots.get(session, []):
             time_trades = df[df['Time'] == time_slot].tail(lookback_days)
-            
             if time_trades.empty:
                 time_slot_rs[time_slot] = 0.0
-                continue
-            
-            # Calculate RS score for each trade
-            scores = []
-            for _, trade in time_trades.iterrows():
-                result_value = trade.get('Result', '')
-                # Handle NaN/None values
-                if pd.isna(result_value) or result_value is None:
-                    result = ''
-                else:
-                    result = str(result_value).strip().upper()
-                
-                if result == 'WIN':
-                    scores.append(1)
-                elif result == 'LOSS':
-                    scores.append(-2)
-                else:  # BE, TIME, NO TRADE, etc.
-                    scores.append(0)
-            
-            # Rolling sum (limit to lookback_days)
-            if len(scores) > lookback_days:
-                scores = scores[-lookback_days:]  # Take last N scores
-            rs_value = sum(scores)
-            time_slot_rs[time_slot] = float(rs_value)
+            else:
+                time_slot_rs[time_slot] = float(time_trades['_score'].sum())
         
         return time_slot_rs
     
@@ -308,6 +299,7 @@ class TimetableEngine:
     def get_scf_values(self, stream_id: str, trade_date: date) -> Tuple[Optional[float], Optional[float]]:
         """
         Get SCF values for a stream on a specific date.
+        Uses instance cache to avoid repeated parquet reads for same (stream_id, trade_date).
         
         Args:
             stream_id: Stream identifier
@@ -316,9 +308,15 @@ class TimetableEngine:
         Returns:
             Tuple of (scf_s1, scf_s2) or (None, None) if not found
         """
+        cache_key = (stream_id, trade_date)
+        if cache_key in self._scf_cache:
+            return self._scf_cache[cache_key]
+        
         stream_dir = self.analyzer_runs_dir / stream_id
         
         if not stream_dir.exists():
+            self._scf_cache[cache_key] = (None, None)
+            self._maybe_evict_scf_cache()
             return None, None
         
         # Find parquet files for this date
@@ -350,6 +348,8 @@ class TimetableEngine:
                     continue
         
         if not file_path.exists():
+            self._scf_cache[cache_key] = (None, None)
+            self._maybe_evict_scf_cache()
             return None, None
         
         try:
@@ -375,15 +375,18 @@ class TimetableEngine:
             day_data = df[df['trade_date'].dt.date == trade_date]
             
             if day_data.empty:
-                return None, None
-            
-            # Get SCF values (use first row if multiple)
-            scf_s1 = day_data['scf_s1'].iloc[0] if 'scf_s1' in day_data.columns else None
-            scf_s2 = day_data['scf_s2'].iloc[0] if 'scf_s2' in day_data.columns else None
-            
-            return scf_s1, scf_s2
+                result = (None, None)
+            else:
+                scf_s1 = day_data['scf_s1'].iloc[0] if 'scf_s1' in day_data.columns else None
+                scf_s2 = day_data['scf_s2'].iloc[0] if 'scf_s2' in day_data.columns else None
+                result = (scf_s1, scf_s2)
+            self._scf_cache[cache_key] = result
+            self._maybe_evict_scf_cache()
+            return result
         except Exception as e:
             logger.debug(f"Error reading SCF values from {file_path}: {e}")
+            self._scf_cache[cache_key] = (None, None)
+            self._maybe_evict_scf_cache()
             return None, None
     
     def generate_timetable(self, trade_date: Optional[str] = None) -> pd.DataFrame:
@@ -557,6 +560,75 @@ class TimetableEngine:
             return
         self._write_execution_timetable_file(streams, trade_date)
 
+    def build_timetable_dataframe_from_master_matrix(
+        self,
+        master_matrix_df: pd.DataFrame,
+        trade_date: Optional[str] = None,
+        stream_filters: Optional[Dict] = None,
+        execution_mode: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Build timetable DataFrame from master matrix (no analyzer reads).
+        Matrix is the authoritative source; RS/SCF/points come from matrix.
+
+        Returns DataFrame with columns matching generate_timetable for display/API parity.
+        """
+        streams = self.build_streams_from_master_matrix(
+            master_matrix_df, trade_date, stream_filters, execution_mode
+        )
+        if not streams:
+            return pd.DataFrame()
+
+        trade_date_str = trade_date
+        if not trade_date_str:
+            if not master_matrix_df.empty and 'trade_date' in master_matrix_df.columns:
+                latest = master_matrix_df['trade_date'].max()
+                trade_date_str = latest.strftime('%Y-%m-%d') if hasattr(latest, 'strftime') else str(latest)[:10]
+            else:
+                chicago_tz = pytz.timezone("America/Chicago")
+                trade_date_str = datetime.now(chicago_tz).date().isoformat()
+        trade_date_obj = pd.to_datetime(trade_date_str).date()
+
+        # Build scf lookup from matrix (stream -> (scf_s1, scf_s2) for trade_date)
+        scf_lookup = {}
+        if not master_matrix_df.empty and 'trade_date' in master_matrix_df.columns:
+            date_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj]
+            for stream_id in self.streams:
+                row = date_df[date_df['Stream'] == stream_id]
+                if not row.empty:
+                    r = row.iloc[0]
+                    scf_s1 = r.get('scf_s1') if 'scf_s1' in r.index else None
+                    scf_s2 = r.get('scf_s2') if 'scf_s2' in r.index else None
+                    if pd.notna(scf_s1) or pd.notna(scf_s2):
+                        scf_lookup[stream_id] = (float(scf_s1) if pd.notna(scf_s1) else None, float(scf_s2) if pd.notna(scf_s2) else None)
+                    else:
+                        scf_lookup[stream_id] = (None, None)
+                else:
+                    scf_lookup[stream_id] = (None, None)
+        else:
+            scf_lookup = {s: (None, None) for s in self.streams}
+
+        rows = []
+        for s in streams:
+            stream_id = s['stream']
+            scf_s1, scf_s2 = scf_lookup.get(stream_id, (None, None))
+            reason = s.get('block_reason') or 'matrix_derived'
+            rows.append({
+                'trade_date': trade_date_str,
+                'symbol': s['instrument'],
+                'stream_id': stream_id,
+                'session': s['session'],
+                'selected_time': s['slot_time'],
+                'reason': reason,
+                'allowed': s['enabled'],
+                'block_reason': s.get('block_reason'),
+                'scf_s1': scf_s1,
+                'scf_s2': scf_s2,
+                'day_of_month': trade_date_obj.day,
+                'dow': trade_date_obj.strftime('%a'),
+            })
+        return pd.DataFrame(rows)
+
     def build_streams_from_master_matrix(
         self,
         master_matrix_df: pd.DataFrame,
@@ -705,10 +777,12 @@ class TimetableEngine:
         latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == trade_date_obj].copy()
         has_final_allowed = 'final_allowed' in latest_df.columns if not latest_df.empty else False
         
-        # First pass: Process streams that exist in master matrix
+        # First pass: Process streams that exist in master matrix (vectorized - use itertuples)
         # Use previous day's data to determine time slot, but current day's data for filters
-        for _, row in source_df.iterrows():
-            stream = row.get('Stream', '')
+        # Drop duplicates by Stream (keep last) - source_df should have at most one per stream
+        source_unique = source_df.drop_duplicates(subset=['Stream'], keep='last')
+        for row in source_unique.itertuples(index=False):
+            stream = getattr(row, 'Stream', '') or ''
             if not stream or stream in seen_streams:
                 continue
             
@@ -717,42 +791,32 @@ class TimetableEngine:
             # Extract instrument and session from stream
             instrument = stream[:-1] if len(stream) > 1 else ''
             
-            # Use Session column from master matrix if available
-            if 'Session' in row and pd.notna(row.get('Session')):
-                session = str(row['Session']).strip()
+            # Use Session column from master matrix if available (itertuples: spaces -> underscores)
+            sess = getattr(row, 'Session', None)
+            if sess is not None and pd.notna(sess):
+                session = str(sess).strip()
                 if session not in ['S1', 'S2']:
                     logger.warning(f"Stream {stream}: Invalid session '{session}', using stream_id pattern")
                     session = 'S1' if stream.endswith('1') else 'S2'
             else:
-                # Fall back to stream_id pattern
                 session = 'S1' if stream.endswith('1') else 'S2'
             
             # CRITICAL FIX: Get time from PREVIOUS day's row
             # The sequencer sets Time Change only when there's a LOSS (decide_time_change returns non-None)
             # Time Change in previous day's row tells us what time to use TODAY
-            # If Time Change is empty (WIN/BE/NoTrade), time stays the same (use previous day's Time value)
-            # This ensures time slots only change on losses, not on wins
-            # Example: Monday WIN at 11:00 → Time Change is empty → Tuesday uses 11:00 (same as Monday)
-            # Example: Monday LOSS at 11:00 → Time Change is 09:30 → Tuesday uses 09:30 (changed)
             if use_previous_day_logic:
-                # Use previous day's Time Change if it exists (this is the time for today)
-                time = row.get('Time', '')
-                time_change = row.get('Time Change', '')
+                time = getattr(row, 'Time', '') or ''
+                time_change = getattr(row, 'Time_Change', '') or ''
                 if time_change and str(time_change).strip():
                     time_change_str = str(time_change).strip()
                     if '->' in time_change_str:
-                        # Backward compatibility: parse "old -> new" format
                         parts = time_change_str.split('->')
                         if len(parts) == 2:
                             time = parts[1].strip()
                     else:
-                        # Current format: Time Change is just the new time
                         time = time_change_str
-                # If Time Change is empty, time stays the same (use previous day's Time value)
-                # This is already set above, so no change needed
             else:
-                # Fallback: No previous day data, use current day's Time
-                time = row.get('Time', '')
+                time = getattr(row, 'Time', '') or ''
             
             # Validate that parsed time is in session_time_slots
             if time:
@@ -1159,19 +1223,20 @@ class TimetableEngine:
         streams = []
         
         # Create a lookup dict from timetable_df: stream_id -> (session, slot_time, enabled, block_reason)
+        # Use itertuples (faster than iterrows) for small timetable
         all_streams = {}
-        for _, row in timetable_df.iterrows():
-            stream_id = row['stream_id']
-            session = row['session']
+        for row in timetable_df.itertuples(index=False):
+            stream_id = getattr(row, 'stream_id', None)
+            session = getattr(row, 'session', None)
             # Only store if this stream_id matches its natural session
             # ES1 should only have S1 entries, ES2 should only have S2 entries
             expected_session = "S1" if stream_id.endswith("1") else "S2"
             if session == expected_session:
                 all_streams[stream_id] = {
                     'session': session,
-                    'slot_time': row['selected_time'],
-                    'enabled': row['allowed'],
-                    'block_reason': row.get('block_reason')  # May be None if enabled
+                    'slot_time': getattr(row, 'selected_time', ''),
+                    'enabled': getattr(row, 'allowed', False),
+                    'block_reason': getattr(row, 'block_reason', None)
                 }
         
         # Include ALL streams - enabled and blocked (complete execution contract)

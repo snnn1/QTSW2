@@ -767,6 +767,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Terminated)
             {
                 TraceLifecycle("Terminated_ENTER", Instrument?.MasterInstrument?.Name, "Terminated", _instanceId);
+                // Log to robot JSONL for ops: NinjaTrader disabled strategy (common cause: lost price connection 4+ times in 5 min)
+                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_DISABLED_BY_NINJATRADER", new Dictionary<string, object>
+                {
+                    { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
+                    { "instance_id", _instanceId },
+                    { "account", Account?.Name ?? "UNKNOWN" },
+                    { "note", "NinjaTrader disabled strategy. Common cause: 'lost price connection more than 4 times in the past 5 minutes'." }
+                });
                 _engine?.Stop();
 
                 // FUTURE HARDENING: Unregister instance on termination

@@ -8,7 +8,7 @@ from datetime import date, datetime
 import argparse
 
 # Add project root to path
-project_root = Path(__file__).parent
+project_root = Path(__file__).resolve().parents[2]  # maintenance -> scripts -> repo root
 sys.path.insert(0, str(project_root))
 
 from modules.matrix.master_matrix import MasterMatrix
@@ -21,7 +21,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Build master matrix for all data
+  # Rolling resequence (default for daily updates - fast)
+  python run_matrix_and_timetable.py --resequence
+  
+  # Build master matrix for all data (full rebuild)
   python run_matrix_and_timetable.py --matrix-only
   
   # Build master matrix for specific date range
@@ -56,27 +59,47 @@ Examples:
                        help='Output directory for timetable files')
     parser.add_argument('--scf-threshold', type=float, default=0.5,
                        help='SCF threshold for blocking trades')
+    parser.add_argument('--resequence', action='store_true',
+                       help='Use rolling resequence instead of full rebuild (faster for daily updates)')
+    parser.add_argument('--resequence-days', type=int, default=40,
+                       help='Number of trading days to resequence when --resequence is used (default 40)')
     
     args = parser.parse_args()
     
     # Determine what to run
     run_matrix = not args.timetable_only
     run_timetable = not args.matrix_only
+    master_df = None  # Set when run_matrix; used for matrix-first timetable path
     
-    # Build master matrix
+    # Build master matrix (resequence by default for incremental, full rebuild with --matrix-only)
     if run_matrix:
         print("=" * 80)
-        print("BUILDING MASTER MATRIX")
+        if args.resequence:
+            print("ROLLING RESEQUENCE (last %d trading days)" % args.resequence_days)
+        else:
+            print("BUILDING MASTER MATRIX")
         print("=" * 80)
         
         matrix = MasterMatrix(analyzer_runs_dir=args.analyzer_runs_dir)
-        master_df = matrix.build_master_matrix(
-            start_date=args.start_date,
-            end_date=args.end_date,
-            specific_date=args.date,
-            output_dir=args.matrix_output_dir,
-            analyzer_runs_dir=args.analyzer_runs_dir
-        )
+        if args.resequence:
+            master_df, summary = matrix.build_master_matrix_rolling_resequence(
+                resequence_days=args.resequence_days,
+                output_dir=args.matrix_output_dir,
+                stream_filters=None,
+                analyzer_runs_dir=args.analyzer_runs_dir
+            )
+            if "error" in summary:
+                print("ERROR:", summary["error"])
+                sys.exit(1)
+            print(f"  Preserved: {summary.get('rows_preserved', 0)}, Resequenced: {summary.get('rows_resequenced', 0)}")
+        else:
+            master_df = matrix.build_master_matrix(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                specific_date=args.date,
+                output_dir=args.matrix_output_dir,
+                analyzer_runs_dir=args.analyzer_runs_dir
+            )
         
         if master_df.empty:
             print("WARNING: Master matrix is empty!")
@@ -100,7 +123,31 @@ Examples:
         )
         engine.scf_threshold = args.scf_threshold
         
-        timetable_df = engine.generate_timetable(trade_date=args.date)
+        # Matrix-first: use matrix when available (no analyzer reads for RS/SCF)
+        if run_matrix and master_df is not None and not master_df.empty:
+            engine.write_execution_timetable_from_master_matrix(
+                master_df, trade_date=args.date, execution_mode=True
+            )
+            timetable_df = engine.build_timetable_dataframe_from_master_matrix(
+                master_df, trade_date=args.date, execution_mode=True
+            )
+        elif not run_matrix:
+            # Timetable-only: try to load matrix from disk first
+            from modules.matrix.file_manager import load_existing_matrix
+            loaded_df = load_existing_matrix(args.matrix_output_dir)
+            if not loaded_df.empty:
+                # Use execution_mode=False for matrix-derived timetable (no eligibility file required)
+                engine.write_execution_timetable_from_master_matrix(
+                    loaded_df, trade_date=args.date, execution_mode=False
+                )
+                timetable_df = engine.build_timetable_dataframe_from_master_matrix(
+                    loaded_df, trade_date=args.date, execution_mode=False
+                )
+            else:
+                # Fallback: no matrix, use analyzer (legacy path)
+                timetable_df = engine.generate_timetable(trade_date=args.date)
+        else:
+            timetable_df = engine.generate_timetable(trade_date=args.date)
         
         if timetable_df.empty:
             print("WARNING: Timetable is empty!")

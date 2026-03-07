@@ -4,28 +4,16 @@
  */
 
 import { getProfit } from './numberUtils'
+import { CONTRACT_VALUES, DEFAULT_CONTRACT_VALUE } from './constants'
 
 /**
  * Get contract value for a trade
  * NOTE: These must match the canonical values in modules/matrix/statistics.py (_ensure_profit_dollars_column)
- * Canonical source: modules/matrix/statistics.py line ~144
  */
 export const getContractValue = (trade) => {
   const symbol = trade.Symbol || trade.Instrument || 'ES'
-  const baseSymbol = symbol.replace(/\d+$/, '') // Remove trailing numbers
-  const contractValues = {
-    'ES': 50,
-    'MES': 5,
-    'NQ': 10,
-    'MNQ': 2,
-    'YM': 5,
-    'MYM': 0.5,
-    'CL': 1000,
-    'NG': 10000,
-    'GC': 100,
-    'RTY': 50
-  }
-  return contractValues[baseSymbol] || 50 // Default to ES if unknown
+  const baseSymbol = (symbol || '').toString().replace(/\d+$/, '') || 'ES'
+  return CONTRACT_VALUES[baseSymbol] ?? DEFAULT_CONTRACT_VALUE
 }
 
 /**

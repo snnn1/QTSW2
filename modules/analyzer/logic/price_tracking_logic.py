@@ -146,7 +146,7 @@ class PriceTracker:
                 
             
             # Get bars after entry time (including after market close for detection)
-            after = df[df["timestamp"] >= entry_time].copy()
+            after = df[df["timestamp"] >= entry_time]
             
             # Define market close time (configurable via ConfigManager)
             # CRITICAL: Create market_close timestamp properly preserving timezone
@@ -197,7 +197,7 @@ class PriceTracker:
                 if data_end_time < mfe_end_time:
                     # Data doesn't extend to MFE end time - use all available data
                     # This is expected behavior when data doesn't extend to exact minute boundaries
-                    mfe_bars = df[(df["timestamp"] >= entry_time)].copy()
+                    mfe_bars = df[(df["timestamp"] >= entry_time)]
                     # Log MFE data gap warnings to stderr for immediate visibility
                     import sys
                     time_diff = (mfe_end_time - data_end_time).total_seconds() / 60
@@ -212,7 +212,7 @@ class PriceTracker:
                         print(f"WARNING: MFE: Data ends {time_diff:.1f} min before expected end time (using available data)", file=sys.stderr, flush=True)
                 else:
                     # Data extends to MFE end time - use normal filtering
-                    mfe_bars = df[(df["timestamp"] >= entry_time) & (df["timestamp"] < mfe_end_time)].copy()
+                    mfe_bars = df[(df["timestamp"] >= entry_time) & (df["timestamp"] < mfe_end_time)]
                 
                 debug_info.mfe_end_time = mfe_end_time
                 debug_info.mfe_bars_count = len(mfe_bars)
@@ -237,50 +237,27 @@ class PriceTracker:
                     except Exception:
                         pass
             else:
-                mfe_bars = after.copy()
+                mfe_bars = after
                 debug_info.mfe_bars_count = len(mfe_bars)
             
-            # Track MFE through all bars until next day same slot or original stop loss hit
-            mfe_stopped = False
-            for _, bar in mfe_bars.iterrows():
-                high, low = float(bar["high"]), float(bar["low"])
-                
-                # Check if original stop loss was hit (stops MFE tracking)
-                original_stop_hit = False
-                if direction == "Long":
-                    original_stop_hit = low <= stop_loss
-                else:
-                    original_stop_hit = high >= stop_loss
-                
-                if original_stop_hit and not mfe_stopped:
-                    # Original stop loss hit - stop MFE tracking but continue trade execution
-                    mfe_stopped = True
-                
-                # Continue MFE tracking until stop loss hit
-                if not mfe_stopped:
-                    # Calculate current favorable movement
-                    current_favorable = self._calculate_favorable_movement(
-                        high, low, entry_price, direction
-                    )
-                    
-                    # Update MFE if we have a new peak
-                    if current_favorable > max_favorable:
-                        max_favorable = current_favorable
-                        peak_time = bar["timestamp"]
-                        peak_price = high if direction == "Long" else low
-                    
-                # MFE tracking only - T1 triggers will be detected in price tracking logic
+            # Track MFE through all bars until next day same slot or original stop loss hit (vectorized)
+            mfe_highs = mfe_bars["high"].values
+            mfe_lows = mfe_bars["low"].values
+            mfe_timestamps = mfe_bars["timestamp"].values
+            max_favorable, peak_time, peak_price = self._vectorized_mfe(
+                mfe_highs, mfe_lows, mfe_timestamps, entry_price, direction, stop_loss, entry_time
+            )
             
             # Track T1 triggers in previous bar for stop logic
             t1_triggered_previous_bar = False
             
-            # Calculate maximum favorable movement across all bars first
-            max_favorable_execution = 0.0
-            for _, bar in after.iterrows():
-                high, low = float(bar["high"]), float(bar["low"])
-                current_favorable = self._calculate_favorable_movement(high, low, entry_price, direction)
-                if current_favorable > max_favorable_execution:
-                    max_favorable_execution = current_favorable
+            # Calculate maximum favorable movement across after bars (vectorized)
+            after_highs = after["high"].values.astype(float)
+            after_lows = after["low"].values.astype(float)
+            if direction == "Long":
+                max_favorable_execution = float(np.max(after_highs - entry_price)) if len(after_highs) > 0 else 0.0
+            else:
+                max_favorable_execution = float(np.max(entry_price - after_lows)) if len(after_lows) > 0 else 0.0
             
             if self.debug_manager.is_debug_enabled():
                 try:
@@ -289,10 +266,16 @@ class PriceTracker:
                     pass
                 print(f"   Target Hit: {max_favorable_execution >= target_pts}")
             
-            # Now process trade execution using the regular after bars
-            for _, bar in after.iterrows():
-                high, low = float(bar["high"]), float(bar["low"])
-                open_price = float(bar["open"])
+            # Pre-extract arrays for main execution loop (avoid iterrows overhead)
+            after_opens = after["open"].values.astype(float)
+            after_closes = after["close"].values.astype(float)
+            after_timestamps = after["timestamp"].values
+            
+            # Now process trade execution using the regular after bars (index-based loop)
+            for i in range(len(after)):
+                bar = after.iloc[i]
+                high, low = after_highs[i], after_lows[i]
+                open_price = after_opens[i]
                 
                 # Use price tracking logic to detect T1 triggers
                 # This is more accurate than peak-based detection
@@ -494,26 +477,11 @@ class PriceTracker:
                     # Before exiting with TIME, check if break-even stop loss was hit in any bar before or at expiry
                     # This handles cases where break-even stop was hit but execution_result was None
                     if t1_triggered and stop_loss_adjusted:
-                        # Check all bars at or before expiry time to see if break-even stop loss was hit
-                        # Include current bar in case break-even stop was hit exactly at expiry
+                        # Check all bars at or before expiry time to see if break-even stop loss was hit (vectorized)
                         bars_at_or_before_expiry = after[after["timestamp"] <= expiry_time]
-                        be_stop_hit = False
-                        be_stop_hit_time = None
-                        
-                        for _, prev_bar in bars_at_or_before_expiry.iterrows():
-                            prev_low = float(prev_bar["low"])
-                            prev_high = float(prev_bar["high"])
-                            
-                            if direction == "Long":
-                                if prev_low <= current_stop_loss:
-                                    be_stop_hit = True
-                                    be_stop_hit_time = prev_bar["timestamp"]
-                                    break
-                            else:
-                                if prev_high >= current_stop_loss:
-                                    be_stop_hit = True
-                                    be_stop_hit_time = prev_bar["timestamp"]
-                                    break
+                        be_stop_hit, be_stop_hit_time = self._vectorized_be_stop_check(
+                            bars_at_or_before_expiry, current_stop_loss, direction
+                        )
                         
                         if be_stop_hit:
                             # Break-even stop loss was hit before expiry - exit with BE instead of TIME
@@ -693,25 +661,11 @@ class PriceTracker:
             # Before exiting with TIME, check if break-even stop loss was hit in any bar before expiry
             # This handles cases where break-even stop was hit but execution_result was None
             if t1_triggered and stop_loss_adjusted:
-                # Check all bars at or before expiry time to see if break-even stop loss was hit
+                # Check all bars at or before expiry time to see if break-even stop loss was hit (vectorized)
                 bars_at_or_before_expiry = after[after["timestamp"] <= expiry_time]
-                be_stop_hit = False
-                be_stop_hit_time = None
-                
-                for _, prev_bar in bars_at_or_before_expiry.iterrows():
-                    prev_low = float(prev_bar["low"])
-                    prev_high = float(prev_bar["high"])
-                    
-                    if direction == "Long":
-                        if prev_low <= current_stop_loss:
-                            be_stop_hit = True
-                            be_stop_hit_time = prev_bar["timestamp"]
-                            break
-                    else:
-                        if prev_high >= current_stop_loss:
-                            be_stop_hit = True
-                            be_stop_hit_time = prev_bar["timestamp"]
-                            break
+                be_stop_hit, be_stop_hit_time = self._vectorized_be_stop_check(
+                    bars_at_or_before_expiry, current_stop_loss, direction
+                )
                 
                 if be_stop_hit:
                     # Break-even stop loss was hit before expiry - exit with BE instead of TIME
@@ -1035,52 +989,34 @@ class PriceTracker:
             except Exception:
                 pass
         
-        for _, bar in mfe_bars.iterrows():
-            high, low = float(bar["high"]), float(bar["low"])
-            
-            # Check if original stop loss was hit (stops MFE tracking)
+        # Vectorized MFE calculation
+        if len(mfe_bars) > 0:
+            mfe_highs = mfe_bars["high"].values
+            mfe_lows = mfe_bars["low"].values
+            mfe_timestamps = mfe_bars["timestamp"].values
+            max_favorable, peak_time, peak_price = self._vectorized_mfe(
+                mfe_highs, mfe_lows, mfe_timestamps, entry_price, direction, original_stop_loss, entry_time
+            )
+            # Update debug_info if stop was hit (first bar that hit stop)
             if direction == "Long":
-                if low <= original_stop_loss:
-                    if debug_info:
-                        debug_info.stop_loss_hit = True
-                        debug_info.stop_loss_hit_time = bar['timestamp']
-                    if debug_info and self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"   STOP LOSS HIT: {bar['timestamp']}, low: ${low:.2f}")
-                        except Exception:
-                            pass
-                    break  # Stop MFE tracking when original stop loss hit
+                stop_hit_mask = mfe_lows.astype(float) <= original_stop_loss
             else:
-                if high >= original_stop_loss:
-                    if debug_info:
-                        debug_info.stop_loss_hit = True
-                        debug_info.stop_loss_hit_time = bar['timestamp']
-                    if debug_info and self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"   STOP LOSS HIT: {bar['timestamp']}, high: ${high:.2f}")
-                        except Exception:
-                            pass
-                    break  # Stop MFE tracking when original stop loss hit
-            
-            # Calculate favorable movement for this bar
-            if direction == "Long":
-                current_favorable = high - entry_price
-                if current_favorable > max_favorable:
-                    max_favorable = current_favorable
-                    peak_time = bar["timestamp"]
-                    peak_price = high
-                    if debug_info and self.debug_manager.is_debug_enabled():
-                        self.debug_manager.print_peak_debug(entry_price, direction, original_stop_loss, 
-                                                          current_favorable, max_favorable, peak_time, peak_price)
-            else:
-                current_favorable = entry_price - low
-                if current_favorable > max_favorable:
-                    max_favorable = current_favorable
-                    peak_time = bar["timestamp"]
-                    peak_price = low
-                    if debug_info and self.debug_manager.is_debug_enabled():
-                        self.debug_manager.print_peak_debug(entry_price, direction, original_stop_loss, 
-                                                          current_favorable, max_favorable, peak_time, peak_price)
+                stop_hit_mask = mfe_highs.astype(float) >= original_stop_loss
+            stop_hit_indices = np.where(stop_hit_mask)[0]
+            if len(stop_hit_indices) > 0 and debug_info:
+                first_stop_idx = int(stop_hit_indices[0])
+                debug_info.stop_loss_hit = True
+                debug_info.stop_loss_hit_time = pd.Timestamp(mfe_timestamps[first_stop_idx])
+                if self.debug_manager.is_debug_enabled():
+                    try:
+                        bar_val = mfe_lows[first_stop_idx] if direction == "Long" else mfe_highs[first_stop_idx]
+                        print(f"   STOP LOSS HIT: {debug_info.stop_loss_hit_time}, value: ${float(bar_val):.2f}")
+                    except Exception:
+                        pass
+        else:
+            max_favorable = 0.0
+            peak_time = entry_time
+            peak_price = entry_price
         
         # T1 triggers are now handled by price tracking logic, not MFE calculation
         # Use the trigger passed as parameter
@@ -1103,6 +1039,65 @@ class PriceTracker:
             return high - entry_price
         else:
             return entry_price - low
+    
+    def _vectorized_mfe(self, highs: np.ndarray, lows: np.ndarray, timestamps: np.ndarray,
+                        entry_price: float, direction: str, stop_loss: float,
+                        entry_time: pd.Timestamp
+                        ) -> Tuple[float, pd.Timestamp, float]:
+        """
+        Vectorized MFE calculation. Returns (max_favorable, peak_time, peak_price).
+        Stops MFE tracking when original stop loss is hit.
+        """
+        if len(highs) == 0:
+            return 0.0, entry_time, entry_price
+        peak_time = entry_time
+        peak_price = entry_price
+        
+        if direction == "Long":
+            stop_hit_mask = lows.astype(float) <= stop_loss
+            favorable = highs.astype(float) - entry_price
+            peak_prices = highs.astype(float)
+        else:
+            stop_hit_mask = highs.astype(float) >= stop_loss
+            favorable = entry_price - lows.astype(float)
+            peak_prices = lows.astype(float)
+        
+        # Find first stop hit
+        stop_hit_indices = np.where(stop_hit_mask)[0]
+        first_stop_idx = int(stop_hit_indices[0]) if len(stop_hit_indices) > 0 else len(highs)
+        
+        # Compute max favorable up to (but not including) first stop hit
+        if first_stop_idx == 0:
+            return 0.0, entry_time, entry_price
+        
+        favorable_slice = favorable[:first_stop_idx]
+        max_idx = np.argmax(favorable_slice)
+        max_favorable = float(favorable_slice[max_idx])
+        if max_favorable > 0:
+            peak_time = pd.Timestamp(timestamps[max_idx])
+            peak_price = float(peak_prices[max_idx])
+        
+        return max_favorable, peak_time, peak_price
+    
+    def _vectorized_be_stop_check(self, bars_df: pd.DataFrame, current_stop_loss: float,
+                                  direction: str) -> Tuple[bool, Optional[pd.Timestamp]]:
+        """Vectorized check: did BE stop get hit? Returns (hit, first_hit_time)."""
+        if bars_df.empty:
+            return False, None
+        lows = bars_df["low"].values.astype(float)
+        highs = bars_df["high"].values.astype(float)
+        timestamps = bars_df["timestamp"].values
+        
+        if direction == "Long":
+            hit_mask = lows <= current_stop_loss
+        else:
+            hit_mask = highs >= current_stop_loss
+        
+        hit_indices = np.where(hit_mask)[0]
+        if len(hit_indices) == 0:
+            return False, None
+        first_idx = hit_indices[0]
+        return True, pd.Timestamp(timestamps[first_idx])
     
     def _simulate_intra_bar_execution(self, bar: pd.Series, entry_price: float, 
                                     direction: str, target_level: float, 
@@ -1411,103 +1406,63 @@ class PriceTracker:
             except Exception:
                 pass
         
-        # Track price movement after exit
-        for _, bar in post_exit_data.iterrows():
-            high = bar['high']
-            low = bar['low']
-            
-            if direction == "Long":
-                # Check if both conditions are possible in this bar
-                target_hit = high >= target_price
-                be_hit = low <= be_price
-                
-                if target_hit and be_hit:
-                    # Both hit in same bar - use deterministic close-distance rule
-                    # Tie-break favors BE (conservative bias, same as STOP in main execution)
-                    close = bar['close']
-                    target_distance = abs(close - target_price)
-                    be_distance = abs(close - be_price)
-                    
-                    if target_distance < be_distance:
-                        # Target is closer - target hits first
-                        if self.debug_manager.is_debug_enabled():
-                            try:
-                                print(f"  WIN: Both hit, close closer to target at {close}")
-                            except Exception:
-                                pass
-                        return "Win"
-                    else:
-                        # BE is closer OR equal (tie-break favors BE) - BE hits first
-                        if self.debug_manager.is_debug_enabled():
-                            try:
-                                print(f"  BE: Both hit, close closer to BE (or tie) at {close}")
-                            except Exception:
-                                pass
-                        return "BE"
-                elif target_hit:
-                    if self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"  WIN: Price reached 10.0 target at {high}")
-                        except Exception:
-                            pass
-                    return "Win"
-                elif be_hit:
-                    if self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"  BE: Price went to -1 tick under entry at {low}")
-                        except Exception:
-                            pass
-                    return "BE"
-            else:  # Short
-                # Check if both conditions are possible in this bar
-                target_hit = low <= target_price
-                be_hit = high >= be_price
-                
-                if target_hit and be_hit:
-                    # Both hit in same bar - use deterministic close-distance rule
-                    # Tie-break favors BE (conservative bias, same as STOP in main execution)
-                    close = bar['close']
-                    target_distance = abs(close - target_price)
-                    be_distance = abs(close - be_price)
-                    
-                    if target_distance < be_distance:
-                        # Target is closer - target hits first
-                        if self.debug_manager.is_debug_enabled():
-                            try:
-                                print(f"  WIN: Both hit, close closer to target at {close}")
-                            except Exception:
-                                pass
-                        return "Win"
-                    else:
-                        # BE is closer OR equal (tie-break favors BE) - BE hits first
-                        if self.debug_manager.is_debug_enabled():
-                            try:
-                                print(f"  BE: Both hit, close closer to BE (or tie) at {close}")
-                            except Exception:
-                                pass
-                        return "BE"
-                elif target_hit:
-                    if self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"  WIN: Price reached 10.0 target at {low}")
-                        except Exception:
-                            pass
-                    return "Win"
-                elif be_hit:
-                    if self.debug_manager.is_debug_enabled():
-                        try:
-                            print(f"  BE: Price went to -1 tick under entry at {high}")
-                        except Exception:
-                            pass
-                    return "BE"
+        # Vectorized: extract arrays and compute masks
+        highs = post_exit_data["high"].values
+        lows = post_exit_data["low"].values
+        closes = post_exit_data["close"].values
         
-        if self.debug_manager.is_debug_enabled():
-            try:
-                print(f"  No 10.0 or -1 tick reached, defaulting to Win")
-            except Exception:
-                pass
+        if direction == "Long":
+            target_hit_mask = highs >= target_price
+            be_hit_mask = lows <= be_price
+        else:
+            target_hit_mask = lows <= target_price
+            be_hit_mask = highs >= be_price
         
-        return "Win"  # Default to Win if neither level reached
+        bars_with_any = target_hit_mask | be_hit_mask
+        if not np.any(bars_with_any):
+            if self.debug_manager.is_debug_enabled():
+                try:
+                    print(f"  No 10.0 or -1 tick reached, defaulting to Win")
+                except Exception:
+                    pass
+            return "Win"
+        
+        first_bar_idx = int(np.argmax(bars_with_any))
+        target_hit_this_bar = target_hit_mask[first_bar_idx]
+        be_hit_this_bar = be_hit_mask[first_bar_idx]
+        
+        if target_hit_this_bar and be_hit_this_bar:
+            close = closes[first_bar_idx]
+            target_distance = abs(close - target_price)
+            be_distance = abs(close - be_price)
+            if target_distance < be_distance:
+                if self.debug_manager.is_debug_enabled():
+                    try:
+                        print(f"  WIN: Both hit, close closer to target at {close}")
+                    except Exception:
+                        pass
+                return "Win"
+            else:
+                if self.debug_manager.is_debug_enabled():
+                    try:
+                        print(f"  BE: Both hit, close closer to BE (or tie) at {close}")
+                    except Exception:
+                        pass
+                return "BE"
+        elif target_hit_this_bar:
+            if self.debug_manager.is_debug_enabled():
+                try:
+                    print(f"  WIN: Price reached 10.0 target")
+                except Exception:
+                    pass
+            return "Win"
+        else:
+            if self.debug_manager.is_debug_enabled():
+                try:
+                    print(f"  BE: Price went to -1 tick under entry")
+                except Exception:
+                    pass
+            return "BE"
     
     def _create_trade_execution(self, exit_price: float, exit_time: pd.Timestamp,
                               exit_reason: str, target_hit: bool, stop_hit: bool,
@@ -1614,36 +1569,34 @@ class PriceTracker:
                 "profit": target_pts * self.config_manager.T1_TRIGGER_THRESHOLD  # 6.5 points profit (65% of target)
             }
         
-        # Track what happens after 6.5 stop loss
-        hit_10_after_6_5 = False
-        hit_10_time = None
-        hit_below_entry_after_6_5 = False
-        hit_below_entry_time = None
-        hit_below_entry_value = None
+        # Vectorized: compute favorable movement and first-hit indices
+        highs = post_stop_bars["high"].values
+        lows = post_stop_bars["low"].values
+        timestamps = post_stop_bars["timestamp"].values
         
-        for _, bar in post_stop_bars.iterrows():
-            high, low = float(bar["high"]), float(bar["low"])
-            
-            # Calculate favorable movement from entry
-            if direction == "Long":
-                current_favorable = high - entry_price
-            else:
-                current_favorable = entry_price - low
-            
-            # Check for 10 hit after 6.5 stop loss
-            if not hit_10_after_6_5 and current_favorable >= target:
-                hit_10_after_6_5 = True
-                hit_10_time = bar["timestamp"]
-                if self.debug_manager.is_debug_enabled():
-                    print(f"  Hit 10 at: {hit_10_time}")
-            
-            # Check for 1 tick below entry hit after 6.5 stop loss
-            if not hit_below_entry_after_6_5 and current_favorable <= below_entry_1_tick:
-                hit_below_entry_after_6_5 = True
-                hit_below_entry_time = bar["timestamp"]
-                hit_below_entry_value = current_favorable
-                if self.debug_manager.is_debug_enabled():
-                    print(f"  Hit below entry (1 tick) at: {hit_below_entry_time}, value: {hit_below_entry_value:.2f}")
+        if direction == "Long":
+            favorable = highs - entry_price
+        else:
+            favorable = entry_price - lows
+        
+        hit_10_mask = favorable >= target
+        hit_below_mask = favorable <= below_entry_1_tick
+        
+        n_bars = len(post_stop_bars)
+        hit_10_first_idx = int(np.argmax(hit_10_mask)) if np.any(hit_10_mask) else n_bars
+        hit_below_first_idx = int(np.argmax(hit_below_mask)) if np.any(hit_below_mask) else n_bars
+        
+        hit_10_after_6_5 = np.any(hit_10_mask)
+        hit_below_entry_after_6_5 = np.any(hit_below_mask)
+        hit_10_time = timestamps[hit_10_first_idx] if hit_10_after_6_5 else None
+        hit_below_entry_time = timestamps[hit_below_first_idx] if hit_below_entry_after_6_5 else None
+        hit_below_entry_value = favorable[hit_below_first_idx] if hit_below_entry_after_6_5 else None
+        
+        if self.debug_manager.is_debug_enabled():
+            if hit_10_after_6_5:
+                print(f"  Hit 10 at: {hit_10_time}")
+            if hit_below_entry_after_6_5:
+                print(f"  Hit below entry (1 tick) at: {hit_below_entry_time}, value: {hit_below_entry_value:.2f}")
         
         # Determine what was hit first
         if hit_10_after_6_5 and hit_below_entry_after_6_5:

@@ -1,6 +1,19 @@
 # Forced Flatten Fix — Root Cause & Implementation Summary
 
-## Root Cause
+## 2026-03-05: True Pre-Close Flatten
+
+**HandleForcedFlatten** was updated to perform a **true pre-close flatten** instead of only marking trades as interrupted:
+
+- **Before:** Set `ExecutionInterruptedByClose = true`, persist journal, leave position open until HandleSlotExpiry
+- **After:** Flatten position via adapter (retry up to 3x), cancel stop/target orders, persist state, verify no exposure
+
+HandleSlotExpiry now skips flattening the original intent when `ExecutionInterruptedByClose` is true (already flattened at close). It only flattens the reentry position if still open at slot expiry.
+
+New events: `FORCED_FLATTEN_POSITION_CLOSED`, `FORCED_FLATTEN_ORDERS_CANCELLED`, `FORCED_FLATTEN_EXPOSURE_REMAINING` (CRITICAL if exposure remains).
+
+---
+
+## Root Cause (2026-03-04)
 
 **Session close cache was never populated** because `ResolveAndSetSessionCloseIfNeeded()` returned early before calling `SessionCloseResolver.Resolve()` and `SetSessionCloseResolved()`. Early return guards include:
 

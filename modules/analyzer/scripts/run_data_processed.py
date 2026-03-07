@@ -4,6 +4,7 @@
 import argparse
 import pandas as pd
 import pathlib
+import re
 import sys
 import os
 import datetime
@@ -51,7 +52,37 @@ def parse_slots(args_slots, sessions):
         enabled[sess] = [e for e in enabled[sess] if e in valid_slots]
     return enabled
 
-def load_folder(folder: str, instrument: str = None) -> pd.DataFrame:
+# Required columns for analyzer (column-selective reads reduce memory)
+REQUIRED_COLUMNS = ["timestamp", "open", "high", "low", "close", "instrument"]
+
+# Filename pattern for date extraction: {instrument}_1m_YYYY-MM-DD.parquet
+_DATE_FROM_FILENAME = re.compile(r"_(\d{4})-(\d{2})-(\d{2})\.parquet$")
+
+def _parse_date_from_filename(file_path: pathlib.Path):
+    """Extract date from parquet filename if pattern matches. Returns (y, m, d) or None."""
+    m = _DATE_FROM_FILENAME.search(file_path.name)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return None
+
+def _file_in_date_range(file_path: pathlib.Path, start_date, end_date) -> bool:
+    """Return True if file's date (from filename) falls within [start_date, end_date]."""
+    parsed = _parse_date_from_filename(file_path)
+    if not parsed or not start_date or not end_date:
+        return True
+    y, m, d = parsed
+    try:
+        file_date = datetime.date(y, m, d)
+        if start_date and file_date < start_date:
+            return False
+        if end_date and file_date > end_date:
+            return False
+        return True
+    except ValueError:
+        return True
+
+def load_folder(folder: str, instrument: str = None, years: list = None,
+                start_date: datetime.date = None, end_date: datetime.date = None) -> pd.DataFrame:
     p = pathlib.Path(folder)
     if not p.exists() or not p.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
@@ -73,7 +104,11 @@ def load_folder(folder: str, instrument: str = None) -> pd.DataFrame:
             # Structure: {instrument}/1m/{year}/{month}/{file}.parquet
             parquet_files = []
             year_dirs = sorted([d for d in instrument_dir.iterdir() if d.is_dir() and d.name.isdigit() and len(d.name) == 4])
-            print(f"[LOAD] Found {len(year_dirs)} year directories", file=sys.stderr, flush=True)
+            if years:
+                year_dirs = [d for d in year_dirs if int(d.name) in years]
+                print(f"[LOAD] Filtered to years {years}: {len(year_dirs)} year directories", file=sys.stderr, flush=True)
+            else:
+                print(f"[LOAD] Found {len(year_dirs)} year directories", file=sys.stderr, flush=True)
             for year_dir in year_dirs:
                 month_dirs = sorted([d for d in year_dir.iterdir() if d.is_dir()])
                 for month_dir in month_dirs:
@@ -95,6 +130,14 @@ def load_folder(folder: str, instrument: str = None) -> pd.DataFrame:
         parquet_files = list(p.rglob("*.parquet"))
         parquet_files.sort()
     
+    # Filter by date range (from filename) when start_date/end_date provided
+    if start_date or end_date:
+        before = len(parquet_files)
+        parquet_files = [f for f in parquet_files if _file_in_date_range(f, start_date, end_date)]
+        skipped = before - len(parquet_files)
+        if skipped > 0:
+            print(f"[LOAD] Filtered by date range: {len(parquet_files)} files (skipped {skipped})", file=sys.stderr, flush=True)
+    
     if not parquet_files:
         raise SystemExit(f"No CSV/Parquet files found under {folder}")
     
@@ -113,7 +156,11 @@ def load_folder(folder: str, instrument: str = None) -> pd.DataFrame:
             print(f"Loading file {i}/{len(parquet_files)} ({i*100//len(parquet_files)}%): {f.name} ({file_size_mb:.1f} MB)", flush=True)
         
         try:
-            df = pd.read_parquet(f)
+            try:
+                df = pd.read_parquet(f, columns=REQUIRED_COLUMNS)
+            except (KeyError, ValueError):
+                df = pd.read_parquet(f)
+                df = df[[c for c in REQUIRED_COLUMNS if c in df.columns]].copy()
             if i % progress_interval == 0 or i == 1 or i == len(parquet_files):
                 print(f"  Loaded {len(df):,} rows from {f.name}", flush=True)
             parts.append(df)
@@ -157,9 +204,26 @@ def main():
     ap.add_argument("--no-write-notrade", action="store_true", help="Disable NoTrade entries (default: enabled)")
     ap.add_argument("--out", default=None, help="Output parquet path (default data/analyzer_runs/breakout_<instrument>_<details>.parquet)")
     ap.add_argument("--debug", action="store_true", help="Enable debug output")
+    ap.add_argument("--years", nargs="*", type=int, default=None, help="Filter to specific years (e.g. 2023 2024)")
+    ap.add_argument("--start-date", type=str, default=None, help="Start date YYYY-MM-DD (skip files before)")
+    ap.add_argument("--end-date", type=str, default=None, help="End date YYYY-MM-DD (skip files after)")
     args = ap.parse_args()
 
-    df = load_folder(args.folder, instrument=args.instrument)
+    start_date = None
+    end_date = None
+    if args.start_date:
+        try:
+            start_date = datetime.datetime.strptime(args.start_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise SystemExit(f"Invalid --start-date: {args.start_date} (use YYYY-MM-DD)")
+    if args.end_date:
+        try:
+            end_date = datetime.datetime.strptime(args.end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise SystemExit(f"Invalid --end-date: {args.end_date} (use YYYY-MM-DD)")
+
+    df = load_folder(args.folder, instrument=args.instrument, years=args.years,
+                     start_date=start_date, end_date=end_date)
     
     # Debug output
     if args.debug:

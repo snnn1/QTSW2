@@ -20,6 +20,9 @@ _time_normalization_cache: Dict[str, str] = {}
 # Using Tuple for Python 3.8+ compatibility (instead of tuple[])
 _stream_discovery_cache: Dict[str, Tuple[List[str], float]] = {}  # path -> (streams, mtime)
 
+# Global cache for parquet file discovery per stream (keyed by stream_dir + stream_id)
+_parquet_files_cache: Dict[Tuple[str, str], Tuple[List[Path], float]] = {}  # (dir, stream_id) -> (files, mtime)
+
 
 def normalize_time_cached(time_str: str) -> str:
     """
@@ -102,8 +105,49 @@ def clear_stream_cache():
     _stream_discovery_cache.clear()
 
 
+def get_cached_parquet_files(
+    stream_dir: Path,
+    stream_id: str,
+    discover_func: Callable[[Path, str], List[Path]],
+) -> List[Path]:
+    """
+    Get cached parquet file list for a stream, or discover if cache is invalid.
+    
+    Args:
+        stream_dir: Directory for the stream (e.g., analyzer_runs/ES1)
+        stream_id: Stream ID (e.g., "ES1")
+        discover_func: Function to call if cache is invalid (stream_dir, stream_id) -> List[Path]
+        
+    Returns:
+        List of parquet file paths
+    """
+    cache_key = (str(stream_dir.resolve()), stream_id)
+    
+    try:
+        current_mtime = stream_dir.stat().st_mtime
+    except (OSError, FileNotFoundError):
+        return discover_func(stream_dir, stream_id)
+    
+    if cache_key in _parquet_files_cache:
+        cached_files, cached_mtime = _parquet_files_cache[cache_key]
+        if cached_mtime == current_mtime:
+            logger.debug(f"Using cached parquet files for {stream_id}")
+            return cached_files
+    
+    files = discover_func(stream_dir, stream_id)
+    _parquet_files_cache[cache_key] = (files, current_mtime)
+    return files
+
+
+def clear_parquet_files_cache():
+    """Clear the parquet file discovery cache."""
+    global _parquet_files_cache
+    _parquet_files_cache.clear()
+
+
 def clear_all_caches():
     """Clear all caches."""
     clear_time_cache()
     clear_stream_cache()
+    clear_parquet_files_cache()
 

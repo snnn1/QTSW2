@@ -5,6 +5,8 @@
  * and centralized API configuration.
  */
 
+import { devLog } from '../utils/logger'
+
 // API base URL - can be overridden via environment variable
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 const API_BASE = `http://localhost:${API_PORT}/api`
@@ -90,9 +92,13 @@ export async function getMatrixData({
   skipCleaning = false,
   contractMultiplier = 1.0,
   includeFilteredExecuted = false,
-  streamInclude = null
+  streamInclude = null,
+  startDate = null,
+  endDate = null,
+  includeStats = true,
+  nocache = false
 }) {
-  console.log(`[API] getMatrixData called with includeFilteredExecuted=${includeFilteredExecuted} (type: ${typeof includeFilteredExecuted})`)
+  devLog(`[API] getMatrixData called with includeFilteredExecuted=${includeFilteredExecuted} (type: ${typeof includeFilteredExecuted}), nocache=${nocache}`)
   const params = new URLSearchParams({
     limit: limit.toString(),
     order,
@@ -101,12 +107,15 @@ export async function getMatrixData({
     contract_multiplier: contractMultiplier.toString(),
     include_filtered_executed: includeFilteredExecuted.toString()
   })
-  console.log(`[API] Query params: include_filtered_executed=${params.get('include_filtered_executed')}`)
+  devLog(`[API] Query params: include_filtered_executed=${params.get('include_filtered_executed')}`)
   
-  // Add stream_include if specified
   if (streamInclude && Array.isArray(streamInclude) && streamInclude.length > 0) {
     params.append('stream_include', streamInclude.join(','))
   }
+  if (startDate) params.append('start_date', startDate)
+  if (endDate) params.append('end_date', endDate)
+  if (!includeStats) params.append('include_stats', 'false')
+  if (nocache) params.append('nocache', 'true')
 
   const response = await fetch(`${API_BASE}/matrix/data?${params}`)
 
@@ -306,6 +315,63 @@ export async function reloadLatestMatrix() {
       errorMessage = `${errorMessage}: ${response.status} ${response.statusText}`
     }
     throw new Error(errorMessage)
+  }
+
+  return await response.json()
+}
+
+/**
+ * List available matrix files
+ */
+export async function listMatrixFiles() {
+  const response = await fetch(`${API_BASE}/matrix/files`)
+  if (!response.ok) {
+    throw new Error('Failed to list matrix files')
+  }
+  return await response.json()
+}
+
+/**
+ * Get matrix performance metrics for the dashboard
+ */
+export async function getPerformanceMetrics() {
+  const response = await fetch(`${API_BASE}/matrix/performance`)
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to get performance metrics')
+  }
+
+  return await response.json()
+}
+
+/**
+ * Compare two matrix files
+ */
+export async function diffMatrices(fileA, fileB) {
+  const response = await fetch(`${API_BASE}/matrix/diff`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_a: fileA, file_b: fileB })
+  })
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to diff matrices')
+  }
+
+  return await response.json()
+}
+
+/**
+ * Get stream health metrics
+ */
+export async function getStreamHealth() {
+  const response = await fetch(`${API_BASE}/matrix/stream-health`)
+
+  if (!response.ok) {
+    const errorData = await response.json()
+    throw new Error(errorData.detail || 'Failed to get stream health')
   }
 
   return await response.json()

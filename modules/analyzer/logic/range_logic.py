@@ -3,6 +3,7 @@ Range Detection Logic Module
 Handles calculation of trading ranges for different time slots and sessions
 """
 
+import numpy as np
 import pandas as pd
 import pytz
 from typing import Dict, List, Tuple, Optional
@@ -45,7 +46,7 @@ class RangeDetector:
         self.slot_ends = slot_config.get("SLOT_ENDS", {})
     
     def calculate_range(self, df: pd.DataFrame, date: pd.Timestamp, 
-                       time_label: str, session: str) -> Optional[RangeResult]:
+                       time_label: str, session: str, debug: bool = False) -> Optional[RangeResult]:
         """
         Calculate range for a specific date and time slot
         
@@ -54,6 +55,7 @@ class RangeDetector:
             date: Trading date
             time_label: Time slot (e.g., "08:00")
             session: Session (S1 or S2)
+            debug: If True, print range details to stderr
             
         Returns:
             RangeResult object with range details or None if no data
@@ -155,19 +157,18 @@ class RangeDetector:
             # Freeze close should be the last bar of the range period
             freeze_close = float(range_data.iloc[-1]["close"])
             
-            # Debug: Print range information to stderr so it shows immediately
-            import sys
-            try:
-                print(f"  RANGE CALCULATION:", file=sys.stderr, flush=True)
-                print(f"     Period: {start_ts.strftime('%Y-%m-%d %H:%M')} to {end_ts.strftime('%Y-%m-%d %H:%M')} Chicago", file=sys.stderr, flush=True)
-                print(f"     Bars: {len(range_data)}", file=sys.stderr, flush=True)
-                print(f"     High: {range_high:.2f}", file=sys.stderr, flush=True)
-                print(f"     Low: {range_low:.2f}", file=sys.stderr, flush=True)
-                print(f"     Size: {range_size:.2f}", file=sys.stderr, flush=True)
-                print(f"     Freeze Close: {freeze_close:.2f}", file=sys.stderr, flush=True)
-            except Exception as e:
+            if debug:
                 import sys
-                print(f"  Error printing range info: {e}", file=sys.stderr, flush=True)
+                try:
+                    print(f"  RANGE CALCULATION:", file=sys.stderr, flush=True)
+                    print(f"     Period: {start_ts.strftime('%Y-%m-%d %H:%M')} to {end_ts.strftime('%Y-%m-%d %H:%M')} Chicago", file=sys.stderr, flush=True)
+                    print(f"     Bars: {len(range_data)}", file=sys.stderr, flush=True)
+                    print(f"     High: {range_high:.2f}", file=sys.stderr, flush=True)
+                    print(f"     Low: {range_low:.2f}", file=sys.stderr, flush=True)
+                    print(f"     Size: {range_size:.2f}", file=sys.stderr, flush=True)
+                    print(f"     Freeze Close: {freeze_close:.2f}", file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"  Error printing range info: {e}", file=sys.stderr, flush=True)
             
             return RangeResult(
                 range_high=range_high,
@@ -243,12 +244,13 @@ class RangeDetector:
         # Timestamps from 00:00-01:59 are still part of the current day's overnight session
         if df["timestamp"].dt.tz is not None:
             tz = df["timestamp"].dt.tz
-            # Shift timestamps from 23:00 onwards to the next day for date extraction
+            # Shift timestamps from 23:00 onwards to the next day for date extraction (vectorized)
             # This ensures overnight data (23:00-02:00) is assigned to the correct trading day
             # Note: 00:00-01:59 stay on current day (they're part of current day's overnight session)
-            df["date_ct"] = df["timestamp"].apply(
-                lambda ts: (ts.date() + pd.Timedelta(days=1) if ts.hour >= 23 else ts.date())
-            )
+            dates = df["timestamp"].dt.date
+            hour_23 = df["timestamp"].dt.hour >= 23
+            next_dates = (pd.to_datetime(dates) + pd.Timedelta(days=1)).dt.date
+            df["date_ct"] = np.where(hour_23, next_dates, dates)
         else:
             # Data is naive - use calendar date
             df["date_ct"] = df["timestamp"].dt.date
@@ -269,15 +271,16 @@ class RangeDetector:
         def log(msg):
             print(msg, file=sys.stderr, flush=True)
         
-        log(f"\n{'='*70}")
-        log(f"RANGE DETECTION: Processing {total_dates} unique dates")
-        log(f"{'='*70}")
-        if total_dates > 0:
-            log(f"Date range: {min(unique_dates)} to {max(unique_dates)}")
-        log(f"Enabled sessions: {rp.enabled_sessions}")
-        log(f"Enabled slots: {rp.enabled_slots}")
-        log(f"Trade days: {rp.trade_days} (0=Mon, 4=Fri)")
-        log(f"{'='*70}\n")
+        if debug:
+            log(f"\n{'='*70}")
+            log(f"RANGE DETECTION: Processing {total_dates} unique dates")
+            log(f"{'='*70}")
+            if total_dates > 0:
+                log(f"Date range: {min(unique_dates)} to {max(unique_dates)}")
+            log(f"Enabled sessions: {rp.enabled_sessions}")
+            log(f"Enabled slots: {rp.enabled_slots}")
+            log(f"Trade days: {rp.trade_days} (0=Mon, 4=Fri)")
+            log(f"{'='*70}\n")
         
         for date_str in unique_dates:
             # Convert date string back to timestamp (preserve timezone from original data)
@@ -298,60 +301,47 @@ class RangeDetector:
             
             if weekday not in rp.trade_days:
                 dates_skipped_not_trading_day += 1
-                if dates_skipped_not_trading_day <= 5:  # Log first few skips
-                    import sys
+                if debug and dates_skipped_not_trading_day <= 5:
                     print(f"Skipping {date_str} ({day_name}) - not a trading day", file=sys.stderr, flush=True)
                 continue
             
             dates_processed += 1
             
-            # Show progress every 100 dates or on first/last
-            if dates_processed == 1 or dates_processed % 100 == 0 or dates_processed == total_dates:
-                import sys
-                print(f"Processing date {dates_processed}/{total_dates}: {date_str} ({day_name})", file=sys.stderr, flush=True)
+            if debug:
+                if dates_processed == 1 or dates_processed % 100 == 0 or dates_processed == total_dates:
+                    print(f"Processing date {dates_processed}/{total_dates}: {date_str} ({day_name})", file=sys.stderr, flush=True)
+                if dates_processed <= 3:
+                    print(f"  Processing {len(rp.enabled_sessions)} sessions for {date_str}...", file=sys.stderr, flush=True)
             
-            # Log that we're starting to process this date
-            if dates_processed <= 3:
-                import sys
-                print(f"  Processing {len(rp.enabled_sessions)} sessions for {date_str}...", file=sys.stderr, flush=True)
-            
-            # Process each enabled session
             slots_processed_this_date = 0
             for sess in rp.enabled_sessions:
-                if dates_processed <= 3:
-                    import sys
+                if debug and dates_processed <= 3:
                     print(f"  Processing session {sess}...", file=sys.stderr, flush=True)
                 
                 if sess not in self.slot_ends:
-                    import sys
-                    print(f"  WARNING: Session {sess} not in slot_ends", file=sys.stderr, flush=True)
+                    if debug:
+                        print(f"  WARNING: Session {sess} not in slot_ends", file=sys.stderr, flush=True)
                     continue
                 
-                # Process each time slot in the session
                 for time_label in self.slot_ends[sess]:
-                    # Check if this slot is enabled
                     if sess in rp.enabled_slots and rp.enabled_slots[sess] and time_label not in rp.enabled_slots[sess]:
-                        if dates_processed <= 3:
-                            import sys
+                        if debug and dates_processed <= 3:
                             print(f"    Skipping slot {time_label} (not enabled)", file=sys.stderr, flush=True)
                         continue
                     
-                    # Calculate range for this slot
-                    if dates_processed <= 3:  # Log first few range calculations
-                        import sys
+                    if debug and dates_processed <= 3:
                         print(f"    Calculating range for {date_str} {sess} {time_label}...", file=sys.stderr, flush=True)
                     
                     try:
-                        range_result = self.calculate_range(df, date, time_label, sess)
+                        range_result = self.calculate_range(df, date, time_label, sess, debug)
                     except Exception as e:
-                        import sys
                         import traceback
                         print(f"    ERROR in calculate_range: {e}", file=sys.stderr, flush=True)
-                        print(f"    Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+                        if debug:
+                            print(f"    Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
                         range_result = None
                     
-                    if dates_processed <= 3:
-                        import sys
+                    if debug and dates_processed <= 3:
                         if range_result:
                             print(f"      Range found: {range_result.range_low:.2f}-{range_result.range_high:.2f}", file=sys.stderr, flush=True)
                             slots_processed_this_date += 1
@@ -378,34 +368,29 @@ class RangeDetector:
                     
                     # Range calculated
         
-        # Always print summary, not just in debug mode
-        import sys
-        def log(msg):
+        def _log(msg):
             print(msg, file=sys.stderr, flush=True)
-        
-        log(f"\n{'='*70}")
-        log(f"RANGE BUILDING SUMMARY")
-        log(f"{'='*70}")
-        log(f"Total unique dates in data: {len(unique_dates)}")
-        log(f"Dates skipped (not trading day): {dates_skipped_not_trading_day}")
-        log(f"Dates processed: {dates_processed}")
-        log(f"Total ranges found: {len(ranges)}")
-        
+        if debug or len(ranges) == 0:
+            _log(f"\n{'='*70}")
+            _log(f"RANGE BUILDING SUMMARY")
+            _log(f"{'='*70}")
+            _log(f"Total unique dates in data: {len(unique_dates)}")
+            _log(f"Dates skipped (not trading day): {dates_skipped_not_trading_day}")
+            _log(f"Dates processed: {dates_processed}")
+            _log(f"Total ranges found: {len(ranges)}")
         if len(ranges) == 0:
-            log(f"\nWARNING: No ranges found!")
-            log(f"  Possible reasons:")
-            log(f"    - Data doesn't contain dates matching trade_days: {rp.trade_days}")
-            log(f"    - Data doesn't contain times matching enabled sessions: {rp.enabled_sessions}")
-            log(f"    - Data doesn't contain times matching enabled slots: {rp.enabled_slots}")
-            log(f"    - calculate_range() returning None for all slots")
-            log(f"    - Data timezone issues (data should be in America/Chicago)")
-        
+            _log(f"\nWARNING: No ranges found!")
+            _log(f"  Possible reasons:")
+            _log(f"    - Data doesn't contain dates matching trade_days: {rp.trade_days}")
+            _log(f"    - Data doesn't contain times matching enabled sessions: {rp.enabled_sessions}")
+            _log(f"    - Data doesn't contain times matching enabled slots: {rp.enabled_slots}")
+            _log(f"    - calculate_range() returning None for all slots")
+            _log(f"    - Data timezone issues (data should be in America/Chicago)")
         if debug and len(ranges) > 0:
-            # Show sample of first few ranges
-            log(f"\nSample ranges (first 5):")
+            _log(f"\nSample ranges (first 5):")
             for i, r in enumerate(ranges[:5]):
-                log(f"  {i+1}. Date: {r.date.date()}, Session: {r.session}, Slot: {r.end_label}, Range: {r.range_low:.2f}-{r.range_high:.2f}")
-        
-        log(f"{'='*70}\n")
+                _log(f"  {i+1}. Date: {r.date.date()}, Session: {r.session}, Slot: {r.end_label}, Range: {r.range_low:.2f}-{r.range_high:.2f}")
+        if debug or len(ranges) == 0:
+            _log(f"{'='*70}\n")
         
         return ranges

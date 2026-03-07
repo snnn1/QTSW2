@@ -82,7 +82,7 @@ class EntryDetector:
             if len(df) > 0 and 'timestamp' in df.columns:
                 # Convert timestamp column to pandas Timestamp if needed
                 df_timestamps = pd.to_datetime(df["timestamp"])
-                post = df[df_timestamps >= end_ts_pd].copy()
+                post = df[df_timestamps >= end_ts_pd]
             else:
                 post = pd.DataFrame(columns=df.columns if not df.empty else ['timestamp', 'open', 'high', 'low', 'close'])
             

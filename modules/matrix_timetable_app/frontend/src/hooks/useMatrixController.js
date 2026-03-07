@@ -13,6 +13,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useMatrixWorker } from '../useMatrixWorker'
 import * as matrixApi from '../api/matrixApi'
 import { DEFAULT_COLUMNS } from '../utils/constants'
+import { devLog, devWarn } from '../utils/logger'
 
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 
@@ -160,7 +161,7 @@ export function useMatrixController({
       if (trades.length > 0) {
         // Log if we didn't get all available rows
         if (loadedRows < totalRowsInFile) {
-          console.log(`[Matrix] Loaded ${loadedRows} of ${totalRowsInFile} total rows. More data available.`)
+          devLog(`[Matrix] Loaded ${loadedRows} of ${totalRowsInFile} total rows. More data available.`)
         }
         // Detect file change
         const currentFileId = data.matrix_file_id || data.file || null
@@ -168,7 +169,7 @@ export function useMatrixController({
                             lastMatrixFileIdRef.current !== currentFileId
         
         if (fileChanged) {
-          console.log(`[Matrix] File changed during load: ${lastMatrixFileIdRef.current} -> ${currentFileId}`)
+          devLog(`[Matrix] File changed during load: ${lastMatrixFileIdRef.current} -> ${currentFileId}`)
         }
         
         setMasterData(trades)
@@ -260,12 +261,12 @@ export function useMatrixController({
       // Check if backend is reachable
       const healthCheck = await matrixApi.checkBackendHealth(3000)
       if (!healthCheck.success) {
-        console.warn('Backend not available for stats refetch')
+        devWarn('Backend not available for stats refetch')
         setMasterStatsLoading(false)
         return
       }
       
-      console.log(`[Master Stats] Refetching with includeFilteredExecuted=${valueToUse}`)
+      devLog(`[Master Stats] Refetching with includeFilteredExecuted=${valueToUse}`)
       
       // Get master stream inclusion filter
       const masterFilters = streamFilters['master'] || {}
@@ -273,6 +274,7 @@ export function useMatrixController({
       const streamIncludeParam = masterIncludeStreams.length > 0 ? masterIncludeStreams : null
       
       // Fetch only stats (with same 10k limit to avoid loading full table)
+      // Use nocache=true to ensure we get fresh stats for the new includeFilteredExecuted setting
       const data = await matrixApi.getMatrixData({
         limit: 10000,
         order: 'newest',
@@ -280,21 +282,22 @@ export function useMatrixController({
         skipCleaning: true,
         contractMultiplier: masterContractMultiplier,
         includeFilteredExecuted: valueToUse,
-        streamInclude: streamIncludeParam
+        streamInclude: streamIncludeParam,
+        nocache: true
       })
       
       // Update stats only (don't touch masterData)
       if (data.stats_full) {
         setBackendStatsFull(data.stats_full)
         setBackendStatsMultiplier(masterContractMultiplier)
-        console.log(`[Master Stats] Successfully refetched stats with includeFilteredExecuted=${valueToUse}`)
-        console.log(`[Master Stats] Sample counts:`, {
+        devLog(`[Master Stats] Successfully refetched stats with includeFilteredExecuted=${valueToUse}`)
+        devLog(`[Master Stats] Sample counts:`, {
           total: data.stats_full?.sample_counts?.executed_trades_total,
           allowed: data.stats_full?.sample_counts?.executed_trades_allowed,
           filtered: data.stats_full?.sample_counts?.executed_trades_filtered
         })
       } else {
-        console.warn('[Master Stats] No stats_full in response')
+        devWarn('[Master Stats] No stats_full in response')
       }
     } catch (error) {
       console.error('Failed to refetch master stats:', error)
@@ -380,9 +383,9 @@ export function useMatrixController({
                           lastMatrixFileIdRef.current !== reloadInfo.matrix_file_id
       
       if (fileChanged) {
-        console.log(`[Matrix] File changed: ${lastMatrixFileIdRef.current} -> ${reloadInfo.matrix_file_id}`)
+        devLog(`[Matrix] File changed: ${lastMatrixFileIdRef.current} -> ${reloadInfo.matrix_file_id}`)
       } else {
-        console.log(`[Matrix] Reloading data from same file: ${reloadInfo.matrix_file_id}`)
+        devLog(`[Matrix] Reloading data from same file: ${reloadInfo.matrix_file_id}`)
       }
       
       // ALWAYS reload data when user clicks refresh, regardless of file change
@@ -409,7 +412,7 @@ export function useMatrixController({
           // Load enough rows to cover last 60 days (approximately 3000-4000 rows)
           // This ensures we see changes in the affected window
           limit = 5000
-          console.log(`[Matrix] File changed, loading ${limit} rows to show affected date window`)
+          devLog(`[Matrix] File changed, loading ${limit} rows to show affected date window`)
         }
       }
       
@@ -442,7 +445,7 @@ export function useMatrixController({
       }
       
       setMasterError(null)
-      console.log(`[Matrix] Successfully reloaded ${trades.length} rows from file: ${data.matrix_file_id || data.file}`)
+      devLog(`[Matrix] Successfully reloaded ${trades.length} rows from file: ${data.matrix_file_id || data.file}`)
       
       // Increment matrix generation to invalidate UI and force worker reinitialization
       setMatrixGeneration(prev => prev + 1)
@@ -474,7 +477,7 @@ export function useMatrixController({
         resequenceDays
       })
       
-      console.log(`[Matrix] Rolling resequence complete:`, resequenceInfo.summary)
+      devLog(`[Matrix] Rolling resequence complete:`, resequenceInfo.summary)
       
       // CRITICAL: Force reload from disk to get fresh data
       // reloadLatestMatrix() handles data loading, stats, and worker reinit
@@ -524,7 +527,7 @@ export function useMatrixController({
         warmupMonths: 1
       })
       
-      console.log(`[Matrix] Full rebuild complete`)
+      devLog(`[Matrix] Full rebuild complete`)
       
       // CRITICAL: Force reload from disk to get fresh data
       await reloadLatestMatrix()
@@ -544,7 +547,7 @@ export function useMatrixController({
         const freshness = await matrixApi.getMatrixFreshness()
         setMatrixFreshness(freshness)
       } catch (error) {
-        console.warn('[Matrix] Failed to check freshness:', error)
+        devWarn('[Matrix] Failed to check freshness:', error)
       }
     }
     
@@ -556,7 +559,8 @@ export function useMatrixController({
     return () => clearInterval(interval)
   }, [])
   
-  // Auto-update interval - automatically resequence then refresh page every 20 minutes
+  // Auto-update interval - automatically resequence then incremental refresh every 20 minutes
+  // resequenceMasterMatrix() already calls reloadLatestMatrix() internally, so no full page reload needed
   useEffect(() => {
     if (!autoUpdateEnabled) {
       return
@@ -564,13 +568,12 @@ export function useMatrixController({
     
     const interval = setInterval(async () => {
       try {
-        console.log('[Matrix] Auto-update: Triggering resequence...')
+        devLog('[Matrix] Auto-update: Triggering resequence...')
         await resequenceMasterMatrix()
-        console.log('[Matrix] Auto-update: Resequence complete, refreshing page...')
-        window.location.reload()
+        devLog('[Matrix] Auto-update: Resequence complete, data refreshed incrementally')
       } catch (error) {
         console.error('[Matrix] Auto-update error:', error)
-        // Still refresh even if resequence fails
+        // Fallback: full reload only if resequence fails (recovery)
         window.location.reload()
       }
     }, 20 * 60 * 1000) // 20 minutes

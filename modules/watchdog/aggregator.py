@@ -427,6 +427,13 @@ class WatchdogAggregator:
             self._notification_service = None
             self._process_monitor = None
 
+        # Run cleanup immediately at startup to clear stale streams from previous runs
+        # (avoids showing Feb 27, Mar 1, etc. streams for 60s until first periodic cleanup)
+        try:
+            self._cleanup_stale_streams_periodic()
+        except Exception as e:
+            logger.warning(f"Startup cleanup failed: {e}")
+
         # Start background task for processing events
         asyncio.create_task(self._process_events_loop())
 
@@ -1653,23 +1660,12 @@ class WatchdogAggregator:
                     if watchdog_info:
                         # Watchdog state exists - merge with timetable data
                         state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
-                        watchdog_slot_time = getattr(watchdog_info, 'slot_time_chicago', None) or ""
-                        
-                        # Prefer watchdog slot_time if available (more recent), otherwise use timetable
-                        if watchdog_slot_time and watchdog_slot_time != "":
-                            if 'T' in watchdog_slot_time:
-                                try:
-                                    slot_dt = datetime.fromisoformat(watchdog_slot_time.replace('Z', '+00:00'))
-                                    if slot_dt.tzinfo:
-                                        slot_dt = slot_dt.astimezone(CHICAGO_TZ)
-                                    slot_time_chicago = slot_dt.strftime("%H:%M")
-                                except Exception:
-                                    pass
-                            else:
-                                slot_time_chicago = watchdog_slot_time
+                        # CRITICAL: slot_time_chicago comes from timetable (set above) - never overwrite with watchdog.
+                        # Watchdog's slot_time can be stale from old events (e.g. ES1 showing 07:30 from YM1's slot).
                         
                         canonical = getattr(watchdog_info, 'instrument', None) or instrument
-                        exec_instr = getattr(watchdog_info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
+                        # Prefer execution policy over watchdog's stored value (can be stale, e.g. ES instead of MES)
+                        exec_instr = _get_execution_instrument_for_canonical(canonical) or getattr(watchdog_info, 'execution_instrument', None)
                         streams.append({
                             "trading_date": current_trading_date,
                             "stream": stream_id,
