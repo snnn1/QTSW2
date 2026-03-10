@@ -251,8 +251,8 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
     # Auto-detect max_workers if not specified
     if max_workers is None:
         cpu_count = multiprocessing.cpu_count()
-        # Use 75% of CPU cores, but at least 2 and at most number of instruments
-        max_workers = max(2, min(int(cpu_count * 0.75), len(instruments)))
+        # Use 50% of CPU cores, but at least 2 and at most number of instruments
+        max_workers = max(2, min(int(cpu_count * 0.5), len(instruments)))
     
     logger.info("=" * 60)
     logger.info(f"Parallel Analyzer Runner")

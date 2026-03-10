@@ -118,6 +118,9 @@ def translate_file(
     # Filter timestamps to match the filename date (trading day)
     # UTC timestamps can span midnight and convert to different dates after UTC->Chicago conversion
     # We keep only data that belongs to the trading day specified in the filename
+    filename_date = trade_date  # Original date from filename
+    date_was_auto_corrected = False
+
     if not df.empty:
         timestamp_dates = df["timestamp"].dt.date
         mismatched = timestamp_dates != trade_date
@@ -127,32 +130,25 @@ def translate_file(
             mismatched_dates = timestamp_dates[mismatched].unique()
             
             # Special case: If ALL rows are mismatched, this indicates a filename date error
-            # Auto-detect the correct trading date from the data (most common date)
+            # Exporter uses UTC date in filename, but data converts to previous Chicago date
+            # (e.g. ES_1m_2026-03-10.csv has 00:00-02:20 UTC = 19:00-21:20 CT Mar 9)
             if mismatched_count == total_count:
                 # Find the most common date in the data
                 date_counts = timestamp_dates.value_counts()
                 actual_trade_date = date_counts.index[0]  # Most common date
                 
-                logger.error(
-                    f"CRITICAL: Filename indicates {trade_date}, but ALL {total_count} timestamp(s) "
+                logger.warning(
+                    f"Filename indicates {filename_date}, but ALL {total_count} timestamp(s) "
                     f"after UTC->Chicago conversion have date {actual_trade_date}. "
-                    f"This indicates the filename date is incorrect. "
-                    f"Expected filename: {instrument}_1m_{actual_trade_date.isoformat()}.csv"
+                    f"Exporter uses UTC date; data belongs to Chicago date. Merging into {actual_trade_date}."
                 )
                 
-                # Use the actual trading date from the data instead of filename
-                # This prevents data loss when exporter creates files with wrong date
                 trade_date = actual_trade_date
-                logger.warning(
-                    f"Auto-correcting trading date from filename ({trade_date}) to actual data date ({actual_trade_date}). "
-                    f"All {total_count} row(s) will be kept."
-                )
-                # Don't filter - keep all rows since we've corrected the date
+                date_was_auto_corrected = True
             else:
                 # Partial mismatch - filter out rows that don't match filename date
                 df = df[~mismatched].copy()
                 
-                # Log warning for observability (but don't fail - this is expected in trading data)
                 logger.warning(
                     f"Date filter: Filename indicates {trade_date}, but {mismatched_count}/{total_count} "
                     f"timestamp(s) after UTC->Chicago conversion had date(s) {sorted(mismatched_dates)}. "
@@ -175,6 +171,24 @@ def translate_file(
         ) from e
 
     out_path = out_dir / f"{instrument}_1m_{date_str}.parquet"
+
+    # When auto-correcting (filename UTC date -> data Chicago date), the output file may already
+    # exist from the "real" raw file for that date. MERGE instead of overwrite to avoid data loss.
+    if date_was_auto_corrected and out_path.exists():
+        try:
+            df_existing = pd.read_parquet(out_path)
+            df = pd.concat([df_existing, df], ignore_index=True)
+            df = df.drop_duplicates(subset=["timestamp"], keep="last")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            logger.info(
+                f"Merged {len(df) - len(df_existing)} new row(s) into existing {out_path.name} "
+                f"(total {len(df)} rows)"
+            )
+        except Exception as e:
+            raise IOError(
+                f"Failed to merge into existing Parquet {out_path}: {e}. "
+                f"Cannot safely append data from {raw_csv_path.name}."
+            ) from e
 
     # Write Parquet file with explicit error handling
     # Translator SHALL fail loudly on write failure, never silently skip
