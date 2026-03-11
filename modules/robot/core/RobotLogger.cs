@@ -100,15 +100,13 @@ public sealed class RobotLogger
                 }
                 else
                 {
-                    // CRITICAL: Conversion returned null - log diagnostic info for ENGINE events
+                    // CRITICAL: Conversion returned null - ENGINE events must never be dropped
                     if (evt is Dictionary<string, object?> evtDict)
                     {
                         var streamVal = evtDict.TryGetValue("stream", out var s) ? s?.ToString() : "UNKNOWN";
                         var eventTypeVal = evtDict.TryGetValue("event_type", out var et) ? et?.ToString() : "UNKNOWN";
                         if (streamVal == "__engine__")
                         {
-                            // ENGINE events being dropped - this is a critical issue
-                            // Log to fallback path so we can see what's happening
                             var diagnosticEvent = new Dictionary<string, object?>
                             {
                                 ["ts_utc"] = DateTimeOffset.UtcNow.ToString("o"),
@@ -126,8 +124,8 @@ public sealed class RobotLogger
                                     }
                                 }
                             };
-                            // Try to log diagnostic via fallback (but ENGINE events are dropped, so this won't work)
-                            // This is a last-ditch attempt - the real fix is in ConvertToRobotLogEvent()
+                            EmergencyLogger.WriteEngineFallback(_projectRoot, _customLogDir, diagnosticEvent);
+                            return;
                         }
                     }
                 }
@@ -184,8 +182,8 @@ public sealed class RobotLogger
 
         if (isEngineEvent)
         {
-            // Service unavailable - DROP ENGINE log (never write to shared files)
-            // This prevents file lock contention when multiple engines run simultaneously
+            // Layer 1: Emergency fallback - ENGINE events must NEVER be dropped
+            EmergencyLogger.WriteEngineFallback(_projectRoot, _customLogDir, evt);
             return;
         }
 

@@ -2,27 +2,31 @@
  * SummaryPage - Daily Summary page
  */
 import { useState, useMemo } from 'react'
-import { useExecutionSummary } from './hooks/useJournalData'
+import { Link } from 'react-router-dom'
+import { useExecutionSummary, useStreamJournal } from './hooks/useJournalData'
 import { useStreamPnl } from './hooks/useStreamPnl'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
 
 export function SummaryPage() {
-  const [tradingDate, setTradingDate] = useState('')
+  const [tradingDate, setTradingDate] = useState(() => new Date().toISOString().slice(0, 10))
   const { summary, loading, error } = useExecutionSummary(tradingDate)
   const { pnl } = useStreamPnl(tradingDate)
+  const { streams: allStreams, loading: streamsLoading } = useStreamJournal(tradingDate)
   
-  // Calculate total P&L
   const totalPnl = useMemo(() => {
-    return Object.values(pnl).reduce((sum, s) => {
-      return sum + (s.realized_pnl || 0)
-    }, 0)
+    return Object.values(pnl).reduce((sum, s) => sum + (s.realized_pnl || 0), 0)
   }, [pnl])
   
   return (
     <div className="min-h-screen bg-black text-white">
       <WatchdogNavigationBar />
       <div className="p-8 pt-14">
-        <h1 className="text-2xl font-bold mb-6">Daily Summary</h1>
+        <div className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">Daily Summary</h1>
+          <Link to="/daily" className="text-sm text-blue-400 hover:text-blue-300">
+            View Daily Journal →
+          </Link>
+        </div>
       
       {/* Date Picker */}
       <div className="bg-gray-800 rounded-lg p-4 mb-6">
@@ -73,6 +77,57 @@ export function SummaryPage() {
               </div>
             </div>
           </div>
+
+          {/* All Streams (includes no-trade streams) */}
+          {!streamsLoading && (
+            <div className="bg-gray-800 rounded-lg p-4 mb-6">
+              <h2 className="text-lg font-semibold mb-4">All Streams</h2>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-700">
+                    <tr>
+                      <th className="px-4 py-2 text-left">Stream</th>
+                      <th className="px-4 py-2 text-left">P&L</th>
+                      <th className="px-4 py-2 text-left">Trades</th>
+                      <th className="px-4 py-2 text-left">Closed</th>
+                      <th className="px-4 py-2 text-left">Costs</th>
+                      <th className="px-4 py-2 text-left">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {allStreams.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-4 text-gray-500 text-center">No streams for this date</td>
+                      </tr>
+                    ) : (
+                      allStreams
+                        .sort((a, b) => (a.stream || '').localeCompare(b.stream || ''))
+                        .map((s) => {
+                          const streamPnl = pnl[s.stream]
+                          const realizedPnl = streamPnl?.realized_pnl ?? 0
+                          const tradeCount = streamPnl ? (streamPnl.closed_count ?? 0) + (streamPnl.partial_count ?? 0) : 0
+                          const status = s.commit_reason || s.state || (tradeCount > 0 ? 'CLOSED' : '-')
+                          return (
+                            <tr key={s.stream} className="border-b border-gray-700">
+                              <td className="px-4 py-2 font-mono">{s.stream}</td>
+                              <td className="px-4 py-2 font-mono">
+                                <span className={realizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                                  ${realizedPnl.toFixed(2)}
+                                </span>
+                              </td>
+                              <td className="px-4 py-2 font-mono">{tradeCount}</td>
+                              <td className="px-4 py-2 font-mono">{streamPnl?.closed_count ?? 0}</td>
+                              <td className="px-4 py-2 font-mono">${(streamPnl?.total_costs_realized ?? 0).toFixed(2)}</td>
+                              <td className="px-4 py-2 text-gray-400">{status}</td>
+                            </tr>
+                          )
+                        })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           
           {/* Intent Breakdown Table */}
           <div className="bg-gray-800 rounded-lg p-4 mb-6">
@@ -140,6 +195,53 @@ export function SummaryPage() {
       
       {!loading && !error && !summary && tradingDate && (
         <div className="text-gray-500 text-center py-8">No summary data for selected date</div>
+      )}
+
+      {/* All Streams - show even when summary fails */}
+      {!streamsLoading && tradingDate && (
+        <div className="bg-gray-800 rounded-lg p-4 mt-6">
+          <h2 className="text-lg font-semibold mb-4">All Streams</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-700">
+                <tr>
+                  <th className="px-4 py-2 text-left">Stream</th>
+                  <th className="px-4 py-2 text-left">P&L</th>
+                  <th className="px-4 py-2 text-left">Trades</th>
+                  <th className="px-4 py-2 text-left">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allStreams.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-4 text-gray-500 text-center">No streams for this date</td>
+                  </tr>
+                ) : (
+                  allStreams
+                    .sort((a, b) => (a.stream || '').localeCompare(b.stream || ''))
+                    .map((s) => {
+                      const streamPnl = pnl[s.stream]
+                      const realizedPnl = streamPnl?.realized_pnl ?? 0
+                      const tradeCount = streamPnl ? (streamPnl.closed_count ?? 0) + (streamPnl.partial_count ?? 0) : 0
+                      const status = s.commit_reason || s.state || (tradeCount > 0 ? 'CLOSED' : '-')
+                      return (
+                        <tr key={s.stream} className="border-b border-gray-700">
+                          <td className="px-4 py-2 font-mono">{s.stream}</td>
+                          <td className="px-4 py-2 font-mono">
+                            <span className={realizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                              ${realizedPnl.toFixed(2)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 font-mono">{tradeCount}</td>
+                          <td className="px-4 py-2 text-gray-400">{status}</td>
+                        </tr>
+                      )
+                    })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
       </div>
     </div>

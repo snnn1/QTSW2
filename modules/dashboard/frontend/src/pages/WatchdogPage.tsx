@@ -8,6 +8,7 @@ import { StreamStatusTable } from '../components/watchdog/StreamStatusTable'
 import { RiskGatesPanel } from '../components/watchdog/RiskGatesPanel'
 import { ActiveIntentPanel } from '../components/watchdog/ActiveIntentPanel'
 import { FillHealthCard } from '../components/watchdog/FillHealthCard'
+import { DisconnectFeedCard } from '../components/watchdog/DisconnectFeedCard'
 import { LiveEventFeed } from '../components/watchdog/LiveEventFeed'
 import { StreamDetailDrawer } from '../components/watchdog/StreamDetailDrawer'
 import { useWatchdogStatus } from '../hooks/useWatchdogStatus'
@@ -286,6 +287,12 @@ export function WatchdogPage() {
 
             {/* Fill Health (execution logging hygiene) */}
             <FillHealthCard fillHealth={status?.fill_health} />
+
+            {/* Disconnect feed - all CONNECTION_* events for current session */}
+            <DisconnectFeedCard
+              events={events}
+              tradingDate={status?.trading_date ?? null}
+            />
 
             <div id="risk-gates-panel">
               <RiskGatesPanel gates={gates} loading={!gates} />

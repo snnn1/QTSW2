@@ -56,6 +56,25 @@ export function FillHealthCard({ fillHealth }: FillHealthCardProps) {
             {fillHealth.null_trading_date_fills} ({nullTdPct}%)
           </span>
         </div>
+        {(fillHealth.broker_flatten_fill_count ?? 0) > 0 ||
+         (fillHealth.execution_update_unknown_order_critical_count ?? 0) > 0 ||
+         (fillHealth.execution_fill_blocked_count ?? 0) > 0 ||
+         (fillHealth.execution_fill_unmapped_count ?? 0) > 0 ? (
+          <div className="text-xs text-amber-400 mt-2 pt-2 border-t border-gray-700 space-y-0.5">
+            {(fillHealth.broker_flatten_fill_count ?? 0) > 0 && (
+              <div>Broker flatten: {fillHealth.broker_flatten_fill_count}</div>
+            )}
+            {(fillHealth.execution_update_unknown_order_critical_count ?? 0) > 0 && (
+              <div>Unknown order critical: {fillHealth.execution_update_unknown_order_critical_count}</div>
+            )}
+            {(fillHealth.execution_fill_blocked_count ?? 0) > 0 && (
+              <div>Fill blocked: {fillHealth.execution_fill_blocked_count}</div>
+            )}
+            {(fillHealth.execution_fill_unmapped_count ?? 0) > 0 && (
+              <div>Fill unmapped: {fillHealth.execution_fill_unmapped_count}</div>
+            )}
+          </div>
+        ) : null}
         <div className="text-xs text-gray-500 mt-2 pt-2 border-t border-gray-700">
           {fillHealth.total_fills} total fills ({fillHealth.trading_date})
         </div>

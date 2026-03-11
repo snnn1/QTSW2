@@ -64,7 +64,18 @@ def normalize_journal_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
     # Timestamps
     canonical["entry_filled_at"] = raw.get("EntryFilledAt") or raw.get("entry_filled_at")
     canonical["entry_submitted_at"] = raw.get("EntrySubmittedAt") or raw.get("entry_submitted_at")
-    
+    canonical["exit_filled_at"] = raw.get("ExitFilledAtUtc") or raw.get("CompletedAtUtc") or raw.get("exit_filled_at") or raw.get("completed_at_utc")
+
+    # Trade completion (authoritative P&L source when TradeCompleted)
+    canonical["trade_completed"] = raw.get("TradeCompleted", False) or raw.get("trade_completed", False)
+    canonical["realized_pnl_gross"] = raw.get("RealizedPnLGross") or raw.get("realized_pnl_gross")
+    canonical["realized_pnl_net"] = raw.get("RealizedPnLNet") or raw.get("realized_pnl_net")
+    canonical["contract_multiplier"] = raw.get("ContractMultiplier") or raw.get("contract_multiplier")
+    canonical["completion_reason"] = raw.get("CompletionReason") or raw.get("completion_reason")
+    canonical["exit_order_type"] = raw.get("ExitOrderType") or raw.get("exit_order_type")
+    canonical["exit_avg_fill_price"] = raw.get("ExitAvgFillPrice") or raw.get("exit_avg_fill_price")
+    canonical["be_modified"] = raw.get("BEModified", False) or raw.get("be_modified", False)
+
     return canonical
 
 
@@ -96,11 +107,14 @@ def normalize_execution_filled(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     # Order type/role (STOP, TARGET, ENTRY, FLATTEN, etc.)
     # EXECUTION_EXIT_FILL backfill: exit_order_type -> order_type
     # Fallback: infer from position_effect when order_type missing (OPEN -> ENTRY)
+    # Normalize ENTRY_STOP, ENTRY_LIMIT, etc. -> ENTRY for ledger consistency
     order_type = (
         data.get("order_type") or data.get("OrderType") or data.get("order_role") or
         data.get("exit_order_type") or ""
     )
     if not order_type and (data.get("position_effect") or "").upper() == "OPEN":
+        order_type = "ENTRY"
+    if order_type and str(order_type).upper().startswith("ENTRY"):
         order_type = "ENTRY"
     canonical["order_type"] = order_type
     

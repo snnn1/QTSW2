@@ -81,6 +81,12 @@ public interface IIEAOrderExecutor
     /// <summary>Fail-closed: flatten, stand down, alert, persist incident.</summary>
     void FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow);
 
+    /// <summary>
+    /// Stage 1: Queue protective submission when entry fill detected during recovery.
+    /// Returns true if queued (caller should not FailClosed). Returns false if not in recovery (caller should proceed or FailClosed).
+    /// </summary>
+    bool TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow);
+
     /// <summary>Process execution update (called by IEA worker when queue serialization enabled).</summary>
     void ProcessExecutionUpdate(object execution, object order);
 

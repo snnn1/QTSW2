@@ -28,12 +28,16 @@ from .config import (
     ALERT_STARTUP_GRACE_SECONDS,
     CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS,
     EXECUTION_JOURNALS_DIR,
+    EXECUTION_SUMMARIES_DIR,
     FRONTEND_FEED_FILE,
+    ROBOT_JOURNAL_DIR,
     LOG_GROWTH_MONITOR_FILE,
     LOG_GROWTH_STALL_THRESHOLD_SECONDS,
     PROCESS_MONITOR_GRACE_SECONDS,
     PROCESS_MONITOR_INTERVAL_SECONDS,
     PROCESS_MONITOR_PROCESS_NAME,
+    STATUS_SNAPSHOTS_FILE,
+    STATUS_SNAPSHOTS_MAX_ENTRIES,
     TAIL_LINE_COUNT,
     ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS,
     DEGRADATION_LOOP_THRESHOLD_MS,
@@ -173,6 +177,49 @@ def _read_last_lines_with_metrics(
         logger.warning(f"Error reading last {n} lines from {path}: {e}")
     duration_ms = (time.perf_counter() - start) * 1000
     return lines, total_bytes, duration_ms
+
+
+def _maybe_persist_status_snapshot(status: Dict[str, Any]) -> None:
+    """
+    Persist critical status snapshots for post-incident analysis.
+    Writes when: engine_alive=False, fill_health_ok=False, or invariant/fill anomaly counts > 0.
+    Keeps last STATUS_SNAPSHOTS_MAX_ENTRIES entries.
+    """
+    try:
+        critical = (
+            not status.get("engine_alive", True)
+            or (status.get("fill_health") and not status["fill_health"].get("fill_health_ok", True))
+            or status.get("ledger_invariant_violation_count", 0) > 0
+            or status.get("execution_gate_invariant_violation_count", 0) > 0
+            or status.get("broker_flatten_fill_count", 0) > 0
+            or status.get("execution_update_unknown_order_critical_count", 0) > 0
+            or status.get("execution_fill_blocked_count", 0) > 0
+            or status.get("execution_fill_unmapped_count", 0) > 0
+        )
+        if not critical:
+            return
+        STATUS_SNAPSHOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "engine_alive": status.get("engine_alive"),
+            "fill_health_ok": status.get("fill_health", {}).get("fill_health_ok"),
+            "ledger_invariant_violation_count": status.get("ledger_invariant_violation_count", 0),
+            "execution_gate_invariant_violation_count": status.get("execution_gate_invariant_violation_count", 0),
+            "broker_flatten_fill_count": status.get("broker_flatten_fill_count", 0),
+            "execution_update_unknown_order_critical_count": status.get("execution_update_unknown_order_critical_count", 0),
+            "execution_fill_blocked_count": status.get("execution_fill_blocked_count", 0),
+            "execution_fill_unmapped_count": status.get("execution_fill_unmapped_count", 0),
+        }
+        with open(STATUS_SNAPSHOTS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(snapshot) + "\n")
+        # Trim if over max (read all, keep last N, rewrite)
+        if STATUS_SNAPSHOTS_FILE.exists():
+            lines = STATUS_SNAPSHOTS_FILE.read_text(encoding="utf-8").strip().split("\n")
+            if len(lines) > STATUS_SNAPSHOTS_MAX_ENTRIES:
+                kept = lines[-STATUS_SNAPSHOTS_MAX_ENTRIES:]
+                STATUS_SNAPSHOTS_FILE.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    except Exception as e:
+        logger.debug(f"Could not persist status snapshot: {e}")
 
 
 class IngestionTelemetry:
@@ -535,7 +582,147 @@ class WatchdogAggregator:
                     "trading_date": trading_date,
                     "streams": []
                 }
-    
+
+    def get_daily_journal(self, trading_date: str) -> Dict[str, Any]:
+        """
+        Unified daily journal: streams with trades, total PnL, and summary.
+        Combines execution journals, slot journals, ledger builder, and execution summary.
+        """
+        try:
+            from .pnl.ledger_builder import LedgerBuilder
+            from .pnl.pnl_calculator import compute_intent_realized_pnl, aggregate_stream_pnl
+
+            ledger_builder = LedgerBuilder()
+            ledger_rows = ledger_builder.build_ledger_rows(trading_date)
+            for row in ledger_rows:
+                compute_intent_realized_pnl(row)
+
+            # Aggregate by stream
+            streams_dict: Dict[str, List[Dict]] = defaultdict(list)
+            for row in ledger_rows:
+                stream_id = row.get("stream", "")
+                if stream_id:
+                    streams_dict[stream_id].append(row)
+
+            # Load slot journals for stream metadata (PascalCase)
+            slot_journals: Dict[str, Dict] = {}
+            if ROBOT_JOURNAL_DIR.exists():
+                for jf in ROBOT_JOURNAL_DIR.glob(f"{trading_date}_*.json"):
+                    try:
+                        with open(jf, "r") as f:
+                            sj = json.load(f)
+                        stream = sj.get("Stream") or sj.get("stream")
+                        if stream:
+                            slot_journals[stream] = {
+                                "committed": sj.get("Committed", sj.get("committed", False)),
+                                "commit_reason": sj.get("CommitReason") or sj.get("commit_reason"),
+                                "state": sj.get("LastState") or sj.get("last_state", ""),
+                            }
+                    except Exception as e:
+                        logger.debug(f"Skip slot journal {jf.name}: {e}")
+
+            # Build stream entries: include streams with trades AND streams from slot journals (no-trade)
+            stream_entries = []
+            total_pnl = 0.0
+            all_stream_ids = set(streams_dict.keys()) | set(slot_journals.keys())
+            for stream_id in sorted(all_stream_ids):
+                rows = streams_dict.get(stream_id, [])
+                agg = aggregate_stream_pnl(rows, stream_id)
+                total_pnl += agg.get("realized_pnl", 0) or 0
+                slot = slot_journals.get(stream_id, {})
+                trades = []
+                for r in rows:
+                    exit_type = (r.get("exit_order_type") or r.get("completion_reason") or "").upper()
+                    be_modified = r.get("be_modified", False)
+                    entry_price = r.get("entry_price")
+                    exit_price = r.get("avg_exit_price")
+                    # Result from exit order type: TARGET/limit = Win, STOP = Loss or BE
+                    if exit_type in ("TARGET", "PROTECTIVE_TARGET"):
+                        result = "Win"
+                    elif exit_type in ("STOP", "PROTECTIVE_STOP"):
+                        # STOP + BEModified = break-even stop hit; else loss stop
+                        if be_modified:
+                            result = "BE"
+                        elif entry_price is not None and exit_price is not None:
+                            # Fallback: exit near entry = BE (within 0.5 points)
+                            diff = abs(float(exit_price) - float(entry_price))
+                            result = "BE" if diff < 0.5 else "Loss"
+                        else:
+                            result = "Loss"
+                    elif exit_type == "FLATTEN":
+                        # FLATTEN: infer from P&L
+                        pnl_val = float(r.get("realized_pnl") or r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        result = "Win" if pnl_val > 2 else ("Loss" if pnl_val < -2 else "BE")
+                    else:
+                        pnl_val = float(r.get("realized_pnl") or r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        result = "Win" if pnl_val > 2 else ("Loss" if pnl_val < -2 else "BE")
+                    trades.append({
+                        "intent_id": r.get("intent_id"),
+                        "direction": r.get("direction"),
+                        "entry_price": r.get("entry_price"),
+                        "exit_price": r.get("avg_exit_price"),
+                        "entry_qty": r.get("entry_qty"),
+                        "exit_qty": r.get("exit_qty", 0),
+                        "realized_pnl": r.get("realized_pnl"),
+                        "costs_allocated": r.get("costs_allocated", 0),
+                        "status": r.get("status"),
+                        "exit_order_type": exit_type,
+                        "result": result,
+                        "exit_filled_at": r.get("exit_filled_at"),
+                    })
+                # When stream has trades, don't show NO_TRADE_MARKET_CLOSE - slot journal can be
+                # from a different slot or overwritten; ledger is authoritative for trade presence
+                commit_reason = slot.get("commit_reason")
+                if len(rows) > 0 and commit_reason in ("NO_TRADE_MARKET_CLOSE", "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY"):
+                    commit_reason = slot.get("state") or "CLOSED"
+                # Instrument: from ledger rows if available, else derive from stream (e.g. GC2 -> MGC)
+                instrument = rows[0].get("instrument", "") if rows else ""
+                if not instrument and stream_id:
+                    exec_instr = _get_execution_instrument_for_canonical(
+                        _canonical_instrument_root(stream_id)
+                    )
+                    instrument = exec_instr or _canonical_instrument_root(stream_id)
+                stream_entries.append({
+                    "stream": stream_id,
+                    "instrument": instrument,
+                    "committed": slot.get("committed", False),
+                    "commit_reason": commit_reason,
+                    "state": slot.get("state", ""),
+                    "realized_pnl": agg.get("realized_pnl", 0) if rows else 0,
+                    "trade_count": len(rows),
+                    "intent_count": agg.get("intent_count", 0) if rows else 0,
+                    "closed_count": agg.get("closed_count", 0) if rows else 0,
+                    "partial_count": agg.get("partial_count", 0) if rows else 0,
+                    "open_count": agg.get("open_count", 0) if rows else 0,
+                    "total_costs_realized": agg.get("total_costs_realized", 0) if rows else 0,
+                    "trades": trades,
+                })
+
+            # Load execution summary if exists
+            summary = None
+            summary_file = EXECUTION_SUMMARIES_DIR / f"{trading_date}.json"
+            if summary_file.exists():
+                try:
+                    with open(summary_file, "r") as f:
+                        summary = json.load(f)
+                except Exception as e:
+                    logger.debug(f"Could not load execution summary: {e}")
+
+            return {
+                "trading_date": trading_date,
+                "total_pnl": round(total_pnl, 2),
+                "streams": stream_entries,
+                "summary": summary,
+            }
+        except Exception as e:
+            logger.error(f"Error building daily journal: {e}", exc_info=True)
+            return {
+                "trading_date": trading_date,
+                "total_pnl": 0.0,
+                "streams": [],
+                "summary": None,
+            }
+
     async def _process_events_loop(self):
         """Background loop to process new events."""
         cleanup_counter = 0
@@ -1421,6 +1608,12 @@ class WatchdogAggregator:
                     trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
                 from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
                 fill_metrics = compute_fill_metrics(trading_date)
+                # Event-based counts from state (last 1 hour)
+                broker_flatten = status.get("broker_flatten_fill_count", 0)
+                unknown_order = status.get("execution_update_unknown_order_critical_count", 0)
+                fill_blocked = status.get("execution_fill_blocked_count", 0)
+                fill_unmapped = status.get("execution_fill_unmapped_count", 0)
+                fill_anomaly_count = broker_flatten + unknown_order + fill_blocked + fill_unmapped
                 status["fill_health"] = {
                     "trading_date": fill_metrics["trading_date"],
                     "total_fills": fill_metrics["total_fills"],
@@ -1430,10 +1623,17 @@ class WatchdogAggregator:
                     "fill_coverage_rate": fill_metrics["fill_coverage_rate"],
                     "unmapped_rate": fill_metrics["unmapped_rate"],
                     "null_trading_date_rate": fill_metrics["null_trading_date_rate"],
+                    "missing_execution_sequence_count": fill_metrics.get("missing_execution_sequence_count", 0),
+                    "missing_fill_group_id_count": fill_metrics.get("missing_fill_group_id_count", 0),
+                    "broker_flatten_fill_count": broker_flatten,
+                    "execution_update_unknown_order_critical_count": unknown_order,
+                    "execution_fill_blocked_count": fill_blocked,
+                    "execution_fill_unmapped_count": fill_unmapped,
                     "fill_health_ok": (
                         fill_metrics.get("fill_coverage_rate", 1.0) >= 1.0
                         and fill_metrics.get("unmapped_rate", 0) <= 0
                         and fill_metrics.get("null_trading_date_rate", 0) <= 0
+                        and fill_anomaly_count <= 0
                     ),
                 }
                 status["trading_date"] = trading_date
@@ -1452,6 +1652,8 @@ class WatchdogAggregator:
                     status["active_alerts"] = []
             else:
                 status["active_alerts"] = []
+            # Persist critical status snapshots for post-incident analysis
+            _maybe_persist_status_snapshot(status)
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -1573,11 +1775,11 @@ class WatchdogAggregator:
         timetable_unavailable = False
         
         try:
-            # Hydrate stream states from slot journals when event-derived state is missing (throttled 60s)
+            # Hydrate stream states from slot journals when event-derived state is missing (throttled 30s)
             # Also hydrate range data from ranges_{date}.jsonl for RANGE_LOCKED streams missing range_high/low
             now_utc = datetime.now(timezone.utc)
             if self._last_slot_journal_hydrate_utc is None or \
-                    (now_utc - self._last_slot_journal_hydrate_utc).total_seconds() >= 60:
+                    (now_utc - self._last_slot_journal_hydrate_utc).total_seconds() >= 30:
                 self._state_manager.hydrate_stream_states_from_slot_journals()
                 self._state_manager.hydrate_range_data_from_ranges_file()
                 self._last_slot_journal_hydrate_utc = now_utc
@@ -1689,7 +1891,9 @@ class WatchdogAggregator:
                             "range_locked_time_chicago": (
                                 state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
                                 if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                            )
+                            ),
+                            "trade_executed": getattr(watchdog_info, 'trade_executed', None),
+                            "slot_reason": getattr(watchdog_info, 'slot_reason', None),
                         })
                     else:
                         # No watchdog state - use timetable data with defaults for watchdog fields
@@ -1785,7 +1989,9 @@ class WatchdogAggregator:
                         "range_locked_time_chicago": (
                             state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
                             if getattr(info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                        )
+                        ),
+                        "trade_executed": getattr(info, 'trade_executed', None),
+                        "slot_reason": getattr(info, 'slot_reason', None),
                     })
                 
                 logger.info(
@@ -1835,7 +2041,9 @@ class WatchdogAggregator:
                         "range_invalidated": getattr(info, 'range_invalidated', False),
                         "state_entry_time_utc": state_entry_time_utc.isoformat(),
                         "range_locked_time_utc": state_entry_time_utc.isoformat(),
-                        "range_locked_time_chicago": state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                        "range_locked_time_chicago": state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat(),
+                        "trade_executed": getattr(info, 'trade_executed', None),
+                        "slot_reason": getattr(info, 'slot_reason', None),
                     })
                     logger.debug(f"get_stream_states: Added carry-over stream {stream} ({trading_date})")
             
@@ -1880,6 +2088,8 @@ class WatchdogAggregator:
             "CONNECTION_LOST_SUSTAINED",
             "CONNECTION_RECOVERED",
             "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification after sustained disconnect
+            "CONNECTIVITY_DAILY_SUMMARY",  # Daily disconnect metrics
+            "CONNECTIVITY_INCIDENT",  # 5+ disconnects in 1h or single disconnect >120s
             "ENGINE_TICK_STALL_DETECTED",
             "ENGINE_TICK_STALL_RECOVERED",
             "STREAM_STATE_TRANSITION",
@@ -1935,6 +2145,7 @@ class WatchdogAggregator:
         """Determine severity level for event type."""
         critical_types = {
             "CONNECTION_LOST",
+            "CONNECTIVITY_INCIDENT",
             "ENGINE_TICK_STALL_DETECTED",
             "IDENTITY_INVARIANT_VIOLATION",
             "KILL_SWITCH_ACTIVE",

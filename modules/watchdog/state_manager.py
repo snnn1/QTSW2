@@ -7,8 +7,8 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
-from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, time, timezone, timedelta
 from collections import defaultdict
 import pytz
 
@@ -38,6 +38,19 @@ SLOT_ENDS = {
 }
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+
+def _infer_session_from_chicago(chicago_dt: datetime) -> str:
+    """
+    Infer CME session from Chicago time.
+    S1 = before 09:30 CT (overnight/early), S2 = 09:30+ CT (regular trading).
+    """
+    t = chicago_dt.time() if hasattr(chicago_dt, 'time') else chicago_dt
+    if isinstance(t, datetime):
+        t = t.time()
+    if t < time(9, 30):
+        return "S1"
+    return "S2"
 
 
 def _is_trading_date_within_max_age(
@@ -76,6 +89,14 @@ class WatchdogStateManager:
         self._connection_status: str = "Unknown"  # Default until we receive a connection event
         self._last_connection_event_utc: Optional[datetime] = None
         
+        # Session-based disconnect metrics (S1 = before 09:30 CT, S2 = 09:30+ CT)
+        self._session_connectivity_key: Optional[tuple] = None  # (trading_date, "S1"|"S2")
+        self._session_disconnect_count: int = 0
+        self._session_disconnect_start_utc: Optional[datetime] = None  # When current disconnect started
+        self._session_last_disconnect_utc: Optional[datetime] = None  # When last disconnect started
+        self._session_total_downtime_seconds: float = 0.0
+        self._last_connectivity_daily_summary: Optional[Dict[str, Any]] = None  # Last CONNECTIVITY_DAILY_SUMMARY payload
+        
         # Stream states: (trading_date, stream) -> StreamStateInfo
         self._stream_states: Dict[tuple, 'StreamStateInfo'] = {}
         
@@ -88,6 +109,14 @@ class WatchdogStateManager:
         # Event counts (last 1 hour window)
         self._execution_blocked_events: List[datetime] = []
         self._protective_failure_events: List[datetime] = []
+        # Invariant violation counts (last 1 hour)
+        self._ledger_invariant_violation_events: List[datetime] = []
+        self._execution_gate_invariant_violation_events: List[datetime] = []
+        # Critical fill anomaly counts (last 1 hour) - no EXECUTION_FILLED emitted
+        self._broker_flatten_fill_events: List[datetime] = []
+        self._execution_update_unknown_order_critical_events: List[datetime] = []
+        self._execution_fill_blocked_events: List[datetime] = []  # EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL
+        self._execution_fill_unmapped_events: List[datetime] = []
         
         # Data stall tracking: execution instrument full name -> last_bar_utc
         # CRITICAL: Track by execution instrument contract (e.g., "MES 03-26"), not canonical (e.g., "ES")
@@ -180,9 +209,36 @@ class WatchdogStateManager:
         self._kill_switch_active = active
     
     def update_connection_status(self, status: str, timestamp_utc: datetime):
-        """Update connection status."""
+        """Update connection status and session-based disconnect metrics."""
         self._connection_status = status
         self._last_connection_event_utc = timestamp_utc
+        
+        try:
+            chicago_dt = timestamp_utc.astimezone(CHICAGO_TZ)
+            session = _infer_session_from_chicago(chicago_dt)
+            trading_date = self.get_trading_date() or chicago_dt.strftime("%Y-%m-%d")
+            key = (trading_date, session)
+            
+            if status == "ConnectionLost":
+                if key != self._session_connectivity_key:
+                    self._session_connectivity_key = key
+                    self._session_disconnect_count = 0
+                    self._session_total_downtime_seconds = 0.0
+                self._session_disconnect_count += 1
+                self._session_disconnect_start_utc = timestamp_utc
+                self._session_last_disconnect_utc = timestamp_utc
+            else:
+                # Connected / Recovered
+                if self._session_disconnect_start_utc:
+                    duration = (timestamp_utc - self._session_disconnect_start_utc).total_seconds()
+                    self._session_total_downtime_seconds += duration
+                self._session_disconnect_start_utc = None
+        except Exception as e:
+            logger.debug(f"Session connectivity update failed: {e}")
+    
+    def update_connectivity_daily_summary(self, data: Dict[str, Any]) -> None:
+        """Store last CONNECTIVITY_DAILY_SUMMARY payload for status API."""
+        self._last_connectivity_daily_summary = dict(data) if data else None
     
     def _effective_identity_pass(self, now: datetime) -> Optional[bool]:
         """Return identity pass value, or None if last identity event is older than IDENTITY_EXPIRY_SECONDS."""
@@ -574,6 +630,44 @@ class WatchdogStateManager:
         # Keep only last 1 hour
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         self._protective_failure_events = [e for e in self._protective_failure_events if e > cutoff]
+
+    def record_ledger_invariant_violation(self, timestamp_utc: datetime):
+        """Record LEDGER_INVARIANT_VIOLATION event."""
+        self._ledger_invariant_violation_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._ledger_invariant_violation_events = [e for e in self._ledger_invariant_violation_events if e > cutoff]
+
+    def record_execution_gate_invariant_violation(self, timestamp_utc: datetime):
+        """Record EXECUTION_GATE_INVARIANT_VIOLATION event."""
+        self._execution_gate_invariant_violation_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._execution_gate_invariant_violation_events = [e for e in self._execution_gate_invariant_violation_events if e > cutoff]
+
+    def record_broker_flatten_fill(self, timestamp_utc: datetime):
+        """Record BROKER_FLATTEN_FILL_RECOGNIZED (fill not in ledger)."""
+        self._broker_flatten_fill_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._broker_flatten_fill_events = [e for e in self._broker_flatten_fill_events if e > cutoff]
+
+    def record_execution_update_unknown_order_critical(self, timestamp_utc: datetime):
+        """Record EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL (fill not tracked)."""
+        self._execution_update_unknown_order_critical_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._execution_update_unknown_order_critical_events = [
+            e for e in self._execution_update_unknown_order_critical_events if e > cutoff
+        ]
+
+    def record_execution_fill_blocked(self, timestamp_utc: datetime):
+        """Record EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL."""
+        self._execution_fill_blocked_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._execution_fill_blocked_events = [e for e in self._execution_fill_blocked_events if e > cutoff]
+
+    def record_execution_fill_unmapped(self, timestamp_utc: datetime):
+        """Record EXECUTION_FILL_UNMAPPED."""
+        self._execution_fill_unmapped_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._execution_fill_unmapped_events = [e for e in self._execution_fill_unmapped_events if e > cutoff]
     
     def record_duplicate_instance(
         self,
@@ -1094,6 +1188,36 @@ class WatchdogStateManager:
             "trading_date_set": self._trading_date is not None and self._trading_date != ""
         }
     
+    def _compute_session_connectivity(self, now: datetime) -> Dict[str, Any]:
+        """Compute session-based disconnect metrics for real-time display."""
+        chicago_now = now.astimezone(CHICAGO_TZ)
+        session = _infer_session_from_chicago(chicago_now)
+        trading_date = self.get_trading_date() or chicago_now.strftime("%Y-%m-%d")
+        key = (trading_date, session)
+        
+        # Only return session metrics if we're in the same session we've been tracking
+        if self._session_connectivity_key != key:
+            return {
+                "session": session,
+                "trading_date": trading_date,
+                "disconnect_count": 0,
+                "total_downtime_seconds": 0.0,
+                "last_disconnect_chicago": None,
+                "currently_disconnected": self._connection_status == "ConnectionLost",
+            }
+        
+        return {
+            "session": session,
+            "trading_date": trading_date,
+            "disconnect_count": self._session_disconnect_count,
+            "total_downtime_seconds": round(self._session_total_downtime_seconds, 2),
+            "last_disconnect_chicago": (
+                self._session_last_disconnect_utc.astimezone(CHICAGO_TZ).isoformat()
+                if self._session_last_disconnect_utc else None
+            ),
+            "currently_disconnected": self._connection_status == "ConnectionLost",
+        }
+    
     def compute_watchdog_status(self) -> Dict:
         """Compute watchdog status derived field."""
         engine_alive = self.compute_engine_alive()
@@ -1488,9 +1612,19 @@ class WatchdogStateManager:
                 self._last_connection_event_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_connection_event_utc else None
             ),
+            "session_connectivity": self._compute_session_connectivity(now),
+            "last_connectivity_daily_summary": self._last_connectivity_daily_summary,
             "stuck_streams": stuck_streams,
             "execution_blocked_count": len(self._execution_blocked_events),
             "protective_failures_count": len(self._protective_failure_events),
+            # Invariant violation counts (last 1 hour)
+            "ledger_invariant_violation_count": len(self._ledger_invariant_violation_events),
+            "execution_gate_invariant_violation_count": len(self._execution_gate_invariant_violation_events),
+            # Critical fill anomaly counts (last 1 hour)
+            "broker_flatten_fill_count": len(self._broker_flatten_fill_events),
+            "execution_update_unknown_order_critical_count": len(self._execution_update_unknown_order_critical_events),
+            "execution_fill_blocked_count": len(self._execution_fill_blocked_events),
+            "execution_fill_unmapped_count": len(self._execution_fill_unmapped_events),
             "data_stall_detected": smoothed_data_stall_detected,  # Smoothed to prevent flickering
             "data_status": smoothed_data_status,  # FLOWING | STALLED | ACCEPTABLE_SILENCE | UNKNOWN
             "market_open": market_open,  # Always included, even if error occurred
@@ -1578,6 +1712,9 @@ class StreamStateInfo:
         self.range_low: Optional[float] = None
         self.freeze_close: Optional[float] = None
         self.range_invalidated: bool = False
+        # SLOT_END_SUMMARY fields
+        self.trade_executed: Optional[bool] = None
+        self.slot_reason: Optional[str] = None
 
 
 class IntentExposureInfo:

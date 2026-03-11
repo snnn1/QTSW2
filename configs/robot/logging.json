@@ -14,5 +14,14 @@
   "flush_interval_ms": 500,
   "rotate_daily": false,
   "enable_sensitive_data_filter": true,
-  "archive_cleanup_days": 30
+  "archive_cleanup_days": 30,
+  "event_rate_limits": {
+    "BAR_ACCEPTED": 12,
+    "BAR_DELIVERY_TO_STREAM": 12,
+    "BAR_ROUTING_DIAGNOSTIC": 1,
+    "RISK_CHECK_EVALUATED": 60,
+    "SLOT_GATE_DIAGNOSTIC": 1,
+    "IEA_HEARTBEAT": 12,
+    "BE_INTENTS_SCANNED": 60
+  }
 }

@@ -521,9 +521,9 @@ def run_strategy(df: pd.DataFrame, rp: RunParams, debug: bool = False, show_prog
         log(f"{'='*70}\n")
     
     # Determine if we should use parallel processing
-    # Use parallel for datasets (> 25 ranges) and when not in debug mode
-    # (debug mode has interleaved output issues with parallel processing)
-    use_parallel = len(ranges) > 25 and not debug
+    # Disabled: inner parallelism causes high CPU/memory (N instruments × M workers).
+    # Sequential processing uses 1 process per instrument (outer level only).
+    use_parallel = False  # was: len(ranges) > 25 and not debug
     
     if use_parallel:
         try:

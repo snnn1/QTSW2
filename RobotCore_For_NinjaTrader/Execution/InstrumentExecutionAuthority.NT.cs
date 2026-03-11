@@ -95,20 +95,6 @@ public sealed partial class InstrumentExecutionAuthority
         var qtyPerIntent = new List<object> { new { id = intentId, qty = quantity } };
         foreach (var (id, _, q, _) in toAggregate)
             qtyPerIntent.Add(new { id, qty = q });
-        Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENTRY_AGGREGATION_ATTEMPT", state: "ENGINE",
-            new
-            {
-                execution_instrument = instrument,
-                current_intent = intentId,
-                existing_intents = toAggregate.Select(x => x.intentId).ToList(),
-                intent_ids = allIntentIds,
-                qty_per_intent = qtyPerIntent,
-                total_quantity = totalQty,
-                stop_price = stopPrice,
-                direction,
-                iea_instance_id = InstanceId,
-                note = "IEA: Multiple streams at same price - aggregating into one broker order"
-            }));
 
         string? failedStep = null;
         var replacedOrderIds = new List<string>();
@@ -420,8 +406,15 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         }
 
+        // Stage 1: Entry fill during recovery — queue protective submission (three-stage safety model)
         if (!Executor.IsExecutionAllowed())
         {
+            if (Executor.TryQueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow))
+            {
+                Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_QUEUED_RECOVERY",
+                    new { intent_id = intentId, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
+                return;
+            }
             var error = "Execution blocked - recovery state guard active.";
             Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_BLOCKED_RECOVERY",
                 new { error, intent_id = intentId, iea_instance_id = InstanceId }));

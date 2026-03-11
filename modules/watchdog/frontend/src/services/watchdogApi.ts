@@ -10,6 +10,7 @@ import type {
   ExecutionJournalEntry,
   StreamJournal,
   ExecutionSummary,
+  DailyJournal,
   WatchdogEvent,
   StreamState,
   IntentExposure,
@@ -17,7 +18,7 @@ import type {
 } from '../types/watchdog'
 
 const API_BASE = '/api/watchdog'
-const FETCH_TIMEOUT_MS = 10000 // 10 second timeout
+const FETCH_TIMEOUT_MS = 30000 // 30 seconds - backend aggregator can be slow to start
 
 /**
  * Fetch with timeout
@@ -223,6 +224,22 @@ export async function fetchExecutionSummary(tradingDate: string): Promise<ApiRes
 }
 
 /**
+ * Fetch unified daily journal (streams, trades, total PnL, summary)
+ */
+export async function fetchDailyJournal(tradingDate: string): Promise<ApiResponse<DailyJournal>> {
+  try {
+    const response = await fetch(`${API_BASE}/journal/daily?trading_date=${encodeURIComponent(tradingDate)}`)
+    if (!response.ok) {
+      return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
  * Fetch current stream states
  */
 export async function fetchStreamStates(): Promise<ApiResponse<{ timestamp_chicago: string; streams: StreamState[] }>> {
@@ -285,6 +302,9 @@ export interface StreamPnl {
   partial_count: number
   open_count: number
   pnl_confidence: 'HIGH' | 'MEDIUM' | 'LOW'
+  exit_type?: string | null
+  entry_price?: number | null
+  exit_price?: number | null
 }
 
 export interface StreamPnlResponse {

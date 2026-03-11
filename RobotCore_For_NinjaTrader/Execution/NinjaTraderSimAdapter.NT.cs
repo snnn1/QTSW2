@@ -1145,17 +1145,6 @@ public sealed partial class NinjaTraderSimAdapter
                 order_state = submitResult.OrderState.ToString()
             }));
 
-            // Alias event for easier grepping (user-facing)
-            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMITTED", new
-            {
-                broker_order_id = order.OrderId,
-                order_type = "ENTRY",
-                direction,
-                entry_price = entryPrice,
-                quantity,
-                account = "SIM"
-            }));
-
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }
         catch (Exception ex)
@@ -5193,20 +5182,6 @@ public sealed partial class NinjaTraderSimAdapter
         var qtyPerIntent = new List<object> { new { id = intentId, qty = quantity } };
         foreach (var (id, _, q, _) in toAggregate)
             qtyPerIntent.Add(new { id, qty = q });
-        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_AGGREGATION_ATTEMPT",
-            new
-            {
-                execution_instrument = instrument,
-                current_intent = intentId,
-                existing_intents = toAggregate.Select(x => x.intentId).ToList(),
-                intent_ids = allIntentIds,
-                qty_per_intent = qtyPerIntent,
-                total_quantity = totalQty,
-                stop_price = stopPrice,
-                direction,
-                eligibility_passed = true,
-                note = "Multiple streams at same price - aggregating into one broker order"
-            }));
 
         string? failedStep = null;
         var replacedOrderIds = new List<string>();
@@ -6091,18 +6066,6 @@ public sealed partial class NinjaTraderSimAdapter
                 order_action = orderAction.ToString(),
                 order_type_nt = OrderType.StopMarket.ToString(),
                 order_state = submitResult.OrderState.ToString()
-            }));
-
-            // Alias event for easier grepping (user-facing)
-            _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMITTED", new
-            {
-                broker_order_id = order.OrderId,
-                order_type = "ENTRY_STOP",
-                direction,
-                stop_price = stopPrice,
-                quantity,
-                oco_group = ocoGroup,
-                account = "SIM"
             }));
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);

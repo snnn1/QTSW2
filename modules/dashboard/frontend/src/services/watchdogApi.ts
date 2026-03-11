@@ -10,6 +10,7 @@ import type {
   ExecutionJournalEntry,
   StreamJournal,
   ExecutionSummary,
+  DailyJournal,
   WatchdogEvent,
   StreamState,
   IntentExposure,
@@ -187,6 +188,22 @@ export async function fetchStreamJournal(tradingDate: string): Promise<ApiRespon
 export async function fetchExecutionSummary(tradingDate: string): Promise<ApiResponse<ExecutionSummary>> {
   try {
     const response = await fetch(`${API_BASE}/journal/summary?trading_date=${encodeURIComponent(tradingDate)}`)
+    if (!response.ok) {
+      return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Fetch unified daily journal (streams, trades, total PnL, summary)
+ */
+export async function fetchDailyJournal(tradingDate: string): Promise<ApiResponse<DailyJournal>> {
+  try {
+    const response = await fetch(`${API_BASE}/journal/daily?trading_date=${encodeURIComponent(tradingDate)}`)
     if (!response.ok) {
       return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
     }

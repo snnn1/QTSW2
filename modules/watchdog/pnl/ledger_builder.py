@@ -233,7 +233,7 @@ class LedgerBuilder:
         LONG -> entry BUY, exit SELL. SHORT -> entry SELL, exit BUY.
         """
         for intent_id, fills in execution_fills.items():
-            entry_fills = [e for e in fills if (e.get("order_type") or "").upper() == self.ENTRY_ORDER_TYPE]
+            entry_fills = [e for e in fills if (e.get("order_type") or "").upper().startswith(self.ENTRY_ORDER_TYPE)]
             exit_fills = [e for e in fills if (e.get("order_type") or "").upper() in self.EXIT_ORDER_TYPES]
             if not exit_fills:
                 continue
@@ -323,7 +323,8 @@ class LedgerBuilder:
                 if not trading_date or (isinstance(trading_date, str) and not trading_date.strip()):
                     violations.append("trading_date null or empty")
                 valid_order_types = (self.ENTRY_ORDER_TYPE,) + tuple(self.EXIT_ORDER_TYPES)
-                if order_type and order_type not in valid_order_types:
+                is_valid = order_type in valid_order_types or (order_type and order_type.startswith(self.ENTRY_ORDER_TYPE))
+                if order_type and not is_valid:
                     violations.append(f"order_type must be ENTRY or in {self.EXIT_ORDER_TYPES} (got {order_type})")
                 if fill_qty < 0:
                     violations.append("fill_qty negative")
@@ -482,9 +483,10 @@ class LedgerBuilder:
         canonical_instrument_from_journal = get_canonical_instrument(execution_instrument_from_journal) if execution_instrument_from_journal else execution_instrument_from_journal
         
         # Phase 2 fallback: entry from EXECUTION_FILLED when present, else journal
+        # Treat order_type starting with "ENTRY" (e.g. ENTRY_STOP) as entry
         entry_fills = [
             e for e in execution_fill_events
-            if (e.get("order_type") or "").upper() == self.ENTRY_ORDER_TYPE
+            if (e.get("order_type") or "").upper().startswith(self.ENTRY_ORDER_TYPE)
         ]
         if entry_fills:
             entry_qty_from_fills = sum(e.get("fill_qty", 0) or 0 for e in entry_fills)
@@ -512,6 +514,16 @@ class LedgerBuilder:
             "total_costs": journal.get("costs_dollars", 0),
             "stop_price": journal.get("stop_price"),
             "target_price": journal.get("target_price"),
+            # Journal authoritative fields (use when TradeCompleted)
+            "contract_multiplier": journal.get("contract_multiplier"),
+            "trade_completed": journal.get("trade_completed", False),
+            "realized_pnl_gross": journal.get("realized_pnl_gross"),
+            "realized_pnl_net": journal.get("realized_pnl_net"),
+            "completion_reason": journal.get("completion_reason"),
+            "exit_order_type": journal.get("exit_order_type"),
+            "exit_avg_fill_price": journal.get("exit_avg_fill_price"),
+            "exit_filled_at": journal.get("exit_filled_at"),
+            "be_modified": journal.get("be_modified", False),
         }
         
         # Validate required fields; if neither EXECUTION_FILLED nor journal has entry, mark incomplete
@@ -560,6 +572,7 @@ class LedgerBuilder:
             e.get("fill_qty", 0) or 0
             for e in execution_fill_events
             if (e.get("order_type") or "").upper() in self.EXIT_ORDER_TYPES
+            and not (e.get("order_type") or "").upper().startswith(self.ENTRY_ORDER_TYPE)
         )
         if exit_qty_from_fills > entry_qty:
             payload = {

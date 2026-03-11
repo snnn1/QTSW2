@@ -75,37 +75,51 @@ export function JournalPage() {
                 </tr>
               </thead>
               <tbody>
-                {entries.map((entry) => (
-                  <tr key={entry.intent_id} className="border-b border-gray-700">
+                {entries.map((entry) => {
+                  const e = entry as Record<string, unknown>
+                  const direction = e.direction ?? e.Direction
+                  const entryPrice = e.entry_price ?? e.EntryPrice ?? e.actual_fill_price ?? e.ActualFillPrice ?? e.FillPrice
+                  const exitPrice = e.exit_avg_fill_price ?? e.ExitAvgFillPrice
+                  const slippagePts = e.slippage_points ?? e.SlippagePoints
+                  const slippageDollars = e.slippage_dollars ?? e.SlippageDollars
+                  const commission = e.commission ?? e.Commission
+                  const fees = e.fees ?? e.Fees
+                  const totalCost = e.total_cost ?? e.TotalCost
+                  const entryFilled = e.entry_filled ?? e.EntryFilled
+                  const rejected = e.rejected ?? e.Rejected
+                  const entrySubmitted = e.entry_submitted ?? e.EntrySubmitted
+                  const intentId = e.intent_id ?? e.IntentId
+                  return (
+                  <tr key={String(intentId)} className="border-b border-gray-700">
                     <td className="px-4 py-2">
-                      {entry.direction ? (
+                      {direction ? (
                         <span className={`px-2 py-1 rounded text-xs ${
-                          entry.direction === 'Long' ? 'bg-green-700' : 'bg-red-700'
+                          direction === 'Long' ? 'bg-green-700' : 'bg-red-700'
                         }`}>
-                          {entry.direction}
+                          {String(direction)}
                         </span>
                       ) : '-'}
                     </td>
                     <td className="px-4 py-2 font-mono">
-                      {entry.expected_entry_price || '-'} → {entry.actual_fill_price || '-'}
+                      {entryPrice ?? '-'} → {exitPrice ?? '-'}
                     </td>
                     <td className="px-4 py-2 font-mono">
-                      {entry.slippage_points !== null ? `${entry.slippage_points} pts` : '-'}
-                      {entry.slippage_dollars !== null && ` ($${entry.slippage_dollars.toFixed(2)})`}
+                      {slippagePts != null ? `${slippagePts} pts` : '-'}
+                      {slippageDollars != null && ` ($${Number(slippageDollars).toFixed(2)})`}
                     </td>
                     <td className="px-4 py-2 font-mono">
-                      {entry.commission !== null && `Comm: $${entry.commission.toFixed(2)}`}
-                      {entry.fees !== null && ` Fees: $${entry.fees.toFixed(2)}`}
-                      {entry.commission === null && entry.fees === null && '-'}
+                      {commission != null && `Comm: $${Number(commission).toFixed(2)}`}
+                      {fees != null && ` Fees: $${Number(fees).toFixed(2)}`}
+                      {commission == null && fees == null && '-'}
                     </td>
                     <td className="px-4 py-2 font-mono">
-                      {entry.total_cost !== null ? `$${entry.total_cost.toFixed(2)}` : '-'}
+                      {totalCost != null ? `$${Number(totalCost).toFixed(2)}` : '-'}
                     </td>
                     <td className="px-4 py-2">
-                      {entry.entry_filled ? 'Filled' : entry.rejected ? 'Rejected' : entry.entry_submitted ? 'Submitted' : 'Pending'}
+                      {entryFilled ? 'Filled' : rejected ? 'Rejected' : entrySubmitted ? 'Submitted' : 'Pending'}
                     </td>
                   </tr>
-                ))}
+                )})}
               </tbody>
             </table>
           </div>

@@ -63,6 +63,7 @@ public sealed class HealthMonitor
     private const int DATA_LOSS_LOG_RATE_LIMIT_MINUTES = 15; // Log at most once per 15 minutes per instrument
     private ConnectionIncident? _currentIncident = null; // Single source of truth for connection tracking
     private bool _engineTickStallActive = false;
+    private int _engineTickStallConsecutiveCount = 0; // Hysteresis: require N consecutive evaluations before notifying
     private bool _timetablePollStallActive = false;
     
     // Session awareness: callback to check if any streams are in active trading state
@@ -99,7 +100,8 @@ public sealed class HealthMonitor
     private const int EVALUATION_INTERVAL_SECONDS = 5; // Evaluate every 5 seconds
     
     // PHASE 3: Stall detection thresholds
-    private const int ENGINE_TICK_STALL_SECONDS = 120; // Engine tick should occur at least every 120 seconds (increased for noise reduction)
+    private const int ENGINE_TICK_STALL_SECONDS = 180; // Engine tick should occur at least every 180 seconds (reduced false positives for low-volume instruments)
+    private const int ENGINE_TICK_STALL_HYSTERESIS_COUNT = 2; // Require stall for 2 consecutive evaluations before notifying (filters brief spikes)
     private const int ENGINE_START_GRACE_PERIOD_SECONDS = 180; // Suppress stall detection for 3 min after engine start (hydration/startup)
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
@@ -119,6 +121,27 @@ public sealed class HealthMonitor
     private static DateTimeOffset _lastPriceConnectionLossRepeatedLogUtc = DateTimeOffset.MinValue;
     private const int PRICE_CONNECTION_LOSS_WINDOW_SECONDS = 300; // 5 minutes
     private const int PRICE_CONNECTION_LOSS_THRESHOLD = 4;
+
+    // CONNECTIVITY_DAILY_SUMMARY: per-trading-day aggregation (shared across instances to avoid double-count)
+    private static readonly object _connectivityMetricsLock = new();
+    private static string? _connectivityTradingDate;
+    private static int _connectivityDisconnectCount;
+    private static double _connectivityTotalDowntimeSeconds;
+    private static double _connectivityMaxDowntimeSeconds;
+    private static DateTimeOffset? _connectivityDisconnectStartUtc;
+    private static readonly HashSet<long> _connectivityRecoveredIncidentIds = new();
+    private static int _connectivityShortDisconnects;  // <10s
+    private static int _connectivityLongDisconnects;  // >60s
+    private const int SHORT_DISCONNECT_THRESHOLD_SECONDS = 10;
+    private const int LONG_DISCONNECT_THRESHOLD_SECONDS = 60;
+
+    // CONNECTIVITY_INCIDENT: institutional-style alerts (5+ disconnects in 1h, or single disconnect >120s)
+    private static readonly List<DateTimeOffset> _connectivityDisconnectTimestampsLastHour = new();
+    private static DateTimeOffset? _lastConnectivityIncidentEmittedUtc;
+    private const int CONNECTIVITY_INCIDENT_WINDOW_SECONDS = 3600;  // 1 hour
+    private const int CONNECTIVITY_INCIDENT_COUNT_THRESHOLD = 5;
+    private const int CONNECTIVITY_INCIDENT_DURATION_THRESHOLD_SECONDS = 120;
+    private const int CONNECTIVITY_INCIDENT_COOLDOWN_SECONDS = 1800;  // 30 min between alerts
     
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
@@ -159,34 +182,123 @@ public sealed class HealthMonitor
     /// <summary>
     /// Set current trading date. Normalizes empty/whitespace to null, validates format.
     /// Called on every connection status update to prevent regression to empty string.
+    /// When trading date changes, emits CONNECTIVITY_DAILY_SUMMARY for the previous day.
     /// </summary>
     public void SetTradingDate(string? tradingDate)
     {
-        if (tradingDate == null)
+        string? newTradingDate = null;
+        if (tradingDate != null)
         {
-            _currentTradingDate = null;
-            return;
+            var trimmed = tradingDate.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed) && trimmed.Length == 10 && trimmed[4] == '-' && trimmed[7] == '-')
+            {
+                newTradingDate = trimmed;
+            }
         }
-        
-        var trimmed = tradingDate.Trim();
-        if (string.IsNullOrWhiteSpace(trimmed))
+
+        var previousTradingDate = _currentTradingDate;
+        _currentTradingDate = newTradingDate;
+
+        // Emit CONNECTIVITY_DAILY_SUMMARY when trading date changes and we had a previous date
+        if (!string.IsNullOrEmpty(previousTradingDate) && previousTradingDate != newTradingDate)
         {
-            _currentTradingDate = null;
-            return;
+            EmitConnectivityDailySummary(previousTradingDate);
         }
-        
-        // Optionally validate yyyy-MM-dd format
-        if (trimmed.Length == 10 && trimmed[4] == '-' && trimmed[7] == '-')
+
+        // Initialize metrics for new trading date if we have one
+        if (!string.IsNullOrEmpty(newTradingDate))
         {
-            // Basic format check passed, store trimmed value
-            _currentTradingDate = trimmed;
+            lock (_connectivityMetricsLock)
+            {
+                if (_connectivityTradingDate != newTradingDate)
+                {
+                    _connectivityTradingDate = newTradingDate;
+                    _connectivityDisconnectCount = 0;
+                    _connectivityTotalDowntimeSeconds = 0;
+                    _connectivityMaxDowntimeSeconds = 0;
+                    _connectivityDisconnectStartUtc = null;
+                    _connectivityRecoveredIncidentIds.Clear();
+                    _connectivityShortDisconnects = 0;
+                    _connectivityLongDisconnects = 0;
+                }
+            }
         }
-        else
+    }
+
+    /// <summary>
+    /// Emit CONNECTIVITY_DAILY_SUMMARY and reset metrics for the given trading date.
+    /// </summary>
+    private void EmitConnectivityDailySummary(string tradingDate)
+    {
+        int count;
+        double total;
+        double max;
+        int shortCount;
+        int longCount;
+        lock (_connectivityMetricsLock)
         {
-            // Invalid format - set null and log WARN once
-            _currentTradingDate = null;
-            // Note: We could add a rate-limited warning here, but for now just set null
+            if (_connectivityTradingDate != tradingDate)
+                return; // Metrics already emitted or belong to different date
+            count = _connectivityDisconnectCount;
+            total = _connectivityTotalDowntimeSeconds;
+            max = _connectivityMaxDowntimeSeconds;
+            shortCount = _connectivityShortDisconnects;
+            longCount = _connectivityLongDisconnects;
+            _connectivityTradingDate = null;
+            _connectivityDisconnectCount = 0;
+            _connectivityTotalDowntimeSeconds = 0;
+            _connectivityMaxDowntimeSeconds = 0;
+            _connectivityDisconnectStartUtc = null;
+            _connectivityRecoveredIncidentIds.Clear();
+            _connectivityShortDisconnects = 0;
+            _connectivityLongDisconnects = 0;
         }
+
+        var avg = count == 0 ? 0.0 : total / count;
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: tradingDate, eventType: "CONNECTIVITY_DAILY_SUMMARY", state: "ENGINE",
+            new
+            {
+                disconnect_count = count,
+                avg_duration_seconds = Math.Round(avg, 2),
+                max_duration_seconds = Math.Round(max, 2),
+                total_downtime_seconds = Math.Round(total, 2),
+                short_disconnects = shortCount,
+                long_disconnects = longCount
+            }));
+    }
+
+    /// <summary>
+    /// Emit CONNECTIVITY_INCIDENT when disconnect_count >= 5 in 1h or single disconnect >120s.
+    /// Institutional-style alert with Pushover notification. Cooldown 30 min to avoid spam.
+    /// </summary>
+    private void TryEmitConnectivityIncident(DateTimeOffset utcNow, string trigger, int? disconnectCountInWindow = null, double? durationSeconds = null)
+    {
+        lock (_connectivityMetricsLock)
+        {
+            if (_lastConnectivityIncidentEmittedUtc.HasValue &&
+                (utcNow - _lastConnectivityIncidentEmittedUtc.Value).TotalSeconds < CONNECTIVITY_INCIDENT_COOLDOWN_SECONDS)
+                return;
+            _lastConnectivityIncidentEmittedUtc = utcNow;
+        }
+
+        var payload = new Dictionary<string, object>
+        {
+            ["trigger"] = trigger,
+            ["trading_date"] = _currentTradingDate ?? "",
+            ["timestamp_utc"] = utcNow.ToString("o")
+        };
+        if (disconnectCountInWindow.HasValue)
+            payload["disconnect_count_in_window"] = disconnectCountInWindow.Value;
+        if (durationSeconds.HasValue)
+            payload["disconnect_duration_seconds"] = Math.Round(durationSeconds.Value, 2);
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTIVITY_INCIDENT", state: "ENGINE", payload));
+
+        var title = "Connectivity Incident";
+        var message = trigger == "disconnect_count_5_in_hour"
+            ? $"5+ disconnects in 1 hour ({disconnectCountInWindow} detected). Check network/broker stability."
+            : $"Single disconnect exceeded 120s ({durationSeconds:F0}s). Serious connectivity failure.";
+        SendNotification("CONNECTIVITY_INCIDENT", title, message, priority: 2, skipPerKeyRateLimit: true);
     }
     
     /// <summary>
@@ -285,6 +397,38 @@ public sealed class HealthMonitor
                     // First instance to detect: emit CONNECTION_CONTEXT then log the event and initialize shared state
                     _sharedConnectionLostLoggedByIncident[sharedIncidentKey] = true;
                     _sharedConnectionLostInstanceCountByIncident[sharedIncidentKey] = 1;
+
+                    // CONNECTIVITY_DAILY_SUMMARY: record disconnect start and count (first instance only)
+                    var metricsTradingDate = _currentTradingDate ?? "UNKNOWN";
+                    lock (_connectivityMetricsLock)
+                    {
+                        if (_connectivityTradingDate != metricsTradingDate)
+                        {
+                            _connectivityTradingDate = metricsTradingDate;
+                            _connectivityDisconnectCount = 0;
+                            _connectivityTotalDowntimeSeconds = 0;
+                            _connectivityMaxDowntimeSeconds = 0;
+                            _connectivityRecoveredIncidentIds.Clear();
+                            _connectivityShortDisconnects = 0;
+                            _connectivityLongDisconnects = 0;
+                        }
+                        _connectivityDisconnectStartUtc = _currentIncident?.FirstDetectedUtc ?? utcNow;
+                        _connectivityDisconnectCount++;
+                    }
+
+                    // CONNECTIVITY_INCIDENT: 5+ disconnects in 1 hour
+                    int countInWindow = 0;
+                    lock (_connectivityMetricsLock)
+                    {
+                        _connectivityDisconnectTimestampsLastHour.Add(utcNow);
+                        var cutoff = utcNow.AddSeconds(-CONNECTIVITY_INCIDENT_WINDOW_SECONDS);
+                        _connectivityDisconnectTimestampsLastHour.RemoveAll(t => t < cutoff);
+                        countInWindow = _connectivityDisconnectTimestampsLastHour.Count;
+                    }
+                    if (countInWindow >= CONNECTIVITY_INCIDENT_COUNT_THRESHOLD)
+                    {
+                        TryEmitConnectivityIncident(utcNow, "disconnect_count_5_in_hour", countInWindow);
+                    }
                     
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_CONTEXT", state: "ENGINE",
                         new
@@ -445,6 +589,33 @@ public sealed class HealthMonitor
                         timestamp_utc = utcNow.ToString("o"),
                         trading_date = _currentTradingDate
                     }));
+
+                // CONNECTIVITY_DAILY_SUMMARY: record duration (once per incident via shared recovere set)
+                var incidentIdForRecovery = _currentIncident?.GetIncidentId();
+                if (incidentIdForRecovery.HasValue && _currentIncident?.FirstDetectedUtc != null)
+                {
+                    var durationSeconds = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
+                    lock (_connectivityMetricsLock)
+                    {
+                        if (!_connectivityRecoveredIncidentIds.Contains(incidentIdForRecovery.Value))
+                        {
+                            _connectivityRecoveredIncidentIds.Add(incidentIdForRecovery.Value);
+                            _connectivityTotalDowntimeSeconds += durationSeconds;
+                            _connectivityMaxDowntimeSeconds = Math.Max(_connectivityMaxDowntimeSeconds, durationSeconds);
+                            if (durationSeconds < SHORT_DISCONNECT_THRESHOLD_SECONDS)
+                                _connectivityShortDisconnects++;
+                            else if (durationSeconds > LONG_DISCONNECT_THRESHOLD_SECONDS)
+                                _connectivityLongDisconnects++;
+                        }
+                        _connectivityDisconnectStartUtc = null;
+                    }
+
+                    // CONNECTIVITY_INCIDENT: single disconnect >120s
+                    if (durationSeconds > CONNECTIVITY_INCIDENT_DURATION_THRESHOLD_SECONDS)
+                    {
+                        TryEmitConnectivityIncident(utcNow, "disconnect_duration_120s", durationSeconds: durationSeconds);
+                    }
+                }
                 
                 _currentIncident = null; // Clear incident - if it flaps again, it becomes a new incident
             }
@@ -513,10 +684,11 @@ public sealed class HealthMonitor
     {
         _lastEngineTickUtc = tickUtc;
         
-        // Clear engine tick stall flag if it was active (recovery)
+        // Clear engine tick stall flag and hysteresis if it was active (recovery)
         if (_engineTickStallActive)
         {
             _engineTickStallActive = false;
+            _engineTickStallConsecutiveCount = 0;
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "ENGINE_TICK_STALL_RECOVERED", state: "ENGINE",
                 new { last_tick_utc = tickUtc.ToString("o") }));
         }
@@ -587,6 +759,14 @@ public sealed class HealthMonitor
         
         var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
         if (elapsed < ENGINE_TICK_STALL_SECONDS)
+        {
+            _engineTickStallConsecutiveCount = 0; // Reset hysteresis when not in stall
+            return;
+        }
+        
+        // Hysteresis: require stall for N consecutive evaluations before notifying (reduces false positives from brief spikes)
+        _engineTickStallConsecutiveCount++;
+        if (_engineTickStallConsecutiveCount < ENGINE_TICK_STALL_HYSTERESIS_COUNT)
             return;
         
         var inStartupGrace = _engineStartUtc != DateTimeOffset.MinValue &&
@@ -604,6 +784,7 @@ public sealed class HealthMonitor
                     last_tick_utc = _lastEngineTickUtc.ToString("o"),
                     elapsed_seconds = elapsed,
                     threshold_seconds = ENGINE_TICK_STALL_SECONDS,
+                    consecutive_count = _engineTickStallConsecutiveCount,
                     cause_hint = causeHint,
                     in_startup_grace = inStartupGrace
                 }));
@@ -1011,9 +1192,17 @@ public sealed class HealthMonitor
     
     /// <summary>
     /// Stop the notification service and evaluation thread.
+    /// Emits CONNECTIVITY_DAILY_SUMMARY for current trading date on shutdown.
     /// </summary>
     public void Stop()
     {
+        // Emit connectivity summary for current trading date before shutdown
+        var tradingDateToEmit = _currentTradingDate;
+        if (!string.IsNullOrEmpty(tradingDateToEmit))
+        {
+            EmitConnectivityDailySummary(tradingDateToEmit);
+        }
+
         _notificationService?.Stop();
         
         // Stop evaluation thread

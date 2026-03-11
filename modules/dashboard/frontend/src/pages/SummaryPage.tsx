@@ -2,7 +2,7 @@
  * SummaryPage - Daily Summary page
  */
 import { useState, useMemo } from 'react'
-import { useExecutionSummary } from '../hooks/useJournalData'
+import { useExecutionSummary, useStreamJournal } from '../hooks/useJournalData'
 import { useStreamPnl } from '../hooks/useStreamPnl'
 import { WatchdogNavigationBar } from '../components/shared/WatchdogNavigationBar'
 
@@ -10,6 +10,7 @@ export function SummaryPage() {
   const [tradingDate, setTradingDate] = useState('')
   const { summary, loading, error } = useExecutionSummary(tradingDate)
   const { pnl } = useStreamPnl(tradingDate)
+  const { streams: allStreams, loading: streamsLoading } = useStreamJournal(tradingDate)
   
   // Calculate total P&L
   const totalPnl = useMemo(() => {
@@ -60,11 +61,11 @@ export function SummaryPage() {
             </div>
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="text-sm text-gray-400">Total Slippage</div>
-              <div className="text-2xl font-bold">${summary.total_slippage_dollars.toFixed(2)}</div>
+              <div className="text-2xl font-bold">${(summary.total_slippage_dollars ?? 0).toFixed(2)}</div>
             </div>
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="text-sm text-gray-400">Total Execution Cost</div>
-              <div className="text-2xl font-bold">${summary.total_execution_cost.toFixed(2)}</div>
+              <div className="text-2xl font-bold">${(summary.total_execution_cost ?? 0).toFixed(2)}</div>
             </div>
             <div className="bg-gray-800 rounded-lg p-4">
               <div className="text-sm text-gray-400">Total Realized P&L</div>
@@ -99,10 +100,10 @@ export function SummaryPage() {
                       <td className="px-4 py-2">{intent.orders_rejected}</td>
                       <td className="px-4 py-2">{intent.blocked ? '⚠️' : '-'}</td>
                       <td className="px-4 py-2 font-mono">
-                        {intent.slippage_dollars !== null ? `$${intent.slippage_dollars.toFixed(2)}` : '-'}
+                        {intent.slippage_dollars != null ? `$${Number(intent.slippage_dollars).toFixed(2)}` : '-'}
                       </td>
                       <td className="px-4 py-2 font-mono">
-                        {intent.total_cost !== null ? `$${intent.total_cost.toFixed(2)}` : '-'}
+                        {intent.total_cost != null ? `$${Number(intent.total_cost).toFixed(2)}` : '-'}
                       </td>
                     </tr>
                   ))}
@@ -113,7 +114,7 @@ export function SummaryPage() {
           
           {/* Blocked by Reason Table */}
           {Object.keys(summary.blocked_by_reason).length > 0 && (
-            <div className="bg-gray-800 rounded-lg p-4">
+            <div className="bg-gray-800 rounded-lg p-4 mb-6">
               <h2 className="text-lg font-semibold mb-4">Blocked by Reason</h2>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
@@ -135,11 +136,61 @@ export function SummaryPage() {
               </div>
             </div>
           )}
+
         </>
       )}
       
       {!loading && !error && !summary && tradingDate && (
         <div className="text-gray-500 text-center py-8">No summary data for selected date</div>
+      )}
+
+      {/* All Streams - show even when summary fails (e.g. no execution summary file) */}
+      {!streamsLoading && tradingDate && (
+        <div className="bg-gray-800 rounded-lg p-4 mt-6">
+          <h2 className="text-lg font-semibold mb-4">All Streams</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-700">
+                <tr>
+                  <th className="px-4 py-2 text-left">Stream</th>
+                  <th className="px-4 py-2 text-left">P&L</th>
+                  <th className="px-4 py-2 text-left">Trades</th>
+                  <th className="px-4 py-2 text-left">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allStreams.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-4 text-gray-500 text-center">
+                      No streams for this date
+                    </td>
+                  </tr>
+                ) : (
+                  allStreams
+                    .sort((a, b) => (a.stream || '').localeCompare(b.stream || ''))
+                    .map((s) => {
+                      const streamPnl = pnl[s.stream]
+                      const realizedPnl = streamPnl?.realized_pnl ?? 0
+                      const tradeCount = streamPnl ? (streamPnl.closed_count ?? 0) + (streamPnl.partial_count ?? 0) : 0
+                      const status = s.commit_reason || s.state || (tradeCount > 0 ? 'CLOSED' : '-')
+                      return (
+                        <tr key={s.stream} className="border-b border-gray-700">
+                          <td className="px-4 py-2 font-mono">{s.stream}</td>
+                          <td className="px-4 py-2 font-mono">
+                            <span className={realizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                              ${realizedPnl.toFixed(2)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 font-mono">{tradeCount}</td>
+                          <td className="px-4 py-2 text-gray-400">{status}</td>
+                        </tr>
+                      )
+                    })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
       </div>
     </div>

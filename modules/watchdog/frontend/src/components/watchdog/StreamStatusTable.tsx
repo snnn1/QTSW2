@@ -17,7 +17,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
   // Get current trading date (today) for PnL and carry-over styling
   const todayStr = new Date().toISOString().split('T')[0]
   const currentTradingDate = streams[0]?.trading_date || todayStr
-  const { pnl } = useStreamPnl(currentTradingDate)
+  const { pnl } = useStreamPnl(currentTradingDate, undefined, marketOpen)
   const [, forceUpdate] = useState(0)
   
   // Force re-render every second for live timers
@@ -145,6 +145,8 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
               <th className="px-2 py-1 text-left">Slot</th>
               <th className="px-2 py-1 text-left">Range</th>
               <th className="px-2 py-1 text-left">PnL</th>
+              <th className="px-2 py-1 text-left" title="Target or Stop">Outcome</th>
+              <th className="px-2 py-1 text-left" title="Entry / Exit price">Entry/Exit</th>
               <th className="px-2 py-1 text-left">Commit</th>
               <th className="px-2 py-1 text-left">Issues</th>
             </tr>
@@ -245,6 +247,14 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                         </span>
                       )
                     })()}
+                  </td>
+                  <td className="px-2 py-1 font-mono text-xs">
+                    {streamPnl?.exit_type ?? stream.slot_reason ?? '-'}
+                  </td>
+                  <td className="px-2 py-1 font-mono text-xs whitespace-nowrap">
+                    {streamPnl?.entry_price != null || streamPnl?.exit_price != null
+                      ? `${streamPnl?.entry_price?.toFixed(2) ?? '-'} / ${streamPnl?.exit_price?.toFixed(2) ?? '-'}`
+                      : '-'}
                   </td>
                   <td className="px-2 py-1">
                     {stream.committed && stream.commit_reason 

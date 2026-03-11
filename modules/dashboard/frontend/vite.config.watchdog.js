@@ -6,7 +6,7 @@ import { resolve } from 'path'
 // Simple plugin to serve index-watchdog.html for all watchdog routes
 // CRITICAL: Must use transformIndexHtml so React refresh preamble gets injected (fixes "can't detect preamble" error)
 // CRITICAL: Must catch /watchdog, /journal, /summary etc. so refresh on those routes serves watchdog app (not dashboard)
-const WATCHDOG_ROUTES = ['/', '/index.html', '/index-watchdog.html', '/watchdog', '/journal', '/summary']
+const WATCHDOG_ROUTES = ['/', '/index.html', '/index-watchdog.html', '/watchdog', '/daily', '/journal', '/summary']
 
 const watchdogHtmlPlugin = () => ({
   name: 'watchdog-html',

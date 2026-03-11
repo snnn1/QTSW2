@@ -286,6 +286,9 @@ class EventProcessor:
             connection_status = "ConnectionLost" if "LOST" in event_type else "Connected"
             self._state_manager.update_connection_status(connection_status, timestamp_utc)
         
+        elif event_type == "CONNECTIVITY_DAILY_SUMMARY":
+            self._state_manager.update_connectivity_daily_summary(data or {})
+        
         elif event_type == "KILL_SWITCH_ACTIVE":
             self._state_manager.update_kill_switch(True)
         
@@ -446,6 +449,40 @@ class EventProcessor:
                         if freeze_close is not None:
                             info.freeze_close = float(freeze_close) if freeze_close is not None else None
         
+        elif event_type == "SLOT_END_SUMMARY":
+            # Update stream state with slot summary: trade_executed, reason
+            trading_date = (
+                self._state_manager.get_trading_date()
+                or event.get("trading_date")
+                or data.get("trading_date")
+            )
+            stream = event.get("stream")
+            if not trading_date or not stream:
+                # Fallback: parse from slot_instance_key (format: YM1_07:30_2026-03-11)
+                slot_key = data.get("slot_instance_key", "")
+                if slot_key and "_" in slot_key:
+                    parts = slot_key.split("_")
+                    if len(parts) >= 3:
+                        stream = stream or parts[0]
+                        trading_date = trading_date or parts[-1]
+            if not trading_date or not stream:
+                logger.debug(f"SLOT_END_SUMMARY skipped: no trading_date or stream")
+                return
+            canonical_stream = canonicalize_stream(stream, event.get("execution_instrument") or event.get("instrument") or "")
+            key = (trading_date, canonical_stream)
+            if key in self._state_manager._stream_states:
+                info = self._state_manager._stream_states[key]
+                trade_executed = data.get("trade_executed")
+                if trade_executed is not None:
+                    info.trade_executed = bool(trade_executed) if not isinstance(trade_executed, bool) else trade_executed
+                reason = data.get("reason")
+                if reason is not None:
+                    info.slot_reason = str(reason).strip()
+                if data.get("range_high") is not None and info.range_high is None:
+                    info.range_high = float(data["range_high"])
+                if data.get("range_low") is not None and info.range_low is None:
+                    info.range_low = float(data["range_low"])
+
         elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
             # MARKET_CLOSE_NO_TRADE is treated the same as STREAM_STAND_DOWN
@@ -986,6 +1023,24 @@ class EventProcessor:
                 error_message=error_msg
             )
         
+        elif event_type == "LEDGER_INVARIANT_VIOLATION":
+            self._state_manager.record_ledger_invariant_violation(timestamp_utc)
+
+        elif event_type == "EXECUTION_GATE_INVARIANT_VIOLATION":
+            self._state_manager.record_execution_gate_invariant_violation(timestamp_utc)
+
+        elif event_type == "BROKER_FLATTEN_FILL_RECOGNIZED":
+            self._state_manager.record_broker_flatten_fill(timestamp_utc)
+
+        elif event_type == "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL":
+            self._state_manager.record_execution_update_unknown_order_critical(timestamp_utc)
+
+        elif event_type == "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL":
+            self._state_manager.record_execution_fill_blocked(timestamp_utc)
+
+        elif event_type == "EXECUTION_FILL_UNMAPPED":
+            self._state_manager.record_execution_fill_unmapped(timestamp_utc)
+
         elif event_type == "EXECUTION_POLICY_VALIDATION_FAILED":
             # Extract execution policy validation failure information
             errors = data.get("errors", [])

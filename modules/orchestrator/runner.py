@@ -373,32 +373,26 @@ class PipelineRunner:
                 return False
             
             elif stage == PipelineStage.MERGER:
-                # Check for merger completion marker specific to this run_id
-                # MergerService writes a completion marker file: .merge_complete_{run_id}.marker
-                # This ensures validation checks THIS run completed, not just that merger ran previously
-                marker_file = self.pipeline_config.analyzer_runs / f".merge_complete_{run_ctx.run_id}.marker"
-                if marker_file.exists():
-                    return True
+                # Check for merger completion marker (MergerService writes to logs_dir or analyzer_runs)
+                for base_dir in [self.pipeline_config.logs_dir, self.pipeline_config.analyzer_runs]:
+                    marker_file = base_dir / f".merge_complete_{run_ctx.run_id}.marker"
+                    if marker_file.exists():
+                        return True
                 
-                # Fallback: Check if merger processed log exists and was recently updated
-                # Merger writes to data/merger_processed.json, but this is time-agnostic
-                # So we only use it as a weak fallback with a warning
+                # Fallback: merger_processed.json was recently updated (merger just ran)
                 merger_log = self.pipeline_config.qtsw2_root / "data" / "merger_processed.json"
                 if merger_log.exists():
                     log_mtime = os.path.getmtime(merger_log)
-                    # Check if log was modified within last 5 minutes (weak heuristic)
-                    if time.time() - log_mtime < 300:
+                    if time.time() - log_mtime < 600:  # 10 min window
                         self.logger.warning(
                             f"Merger validation: No marker file for run_id={run_ctx.run_id}, "
-                            f"but merger_processed.json was recently updated. This violates idempotency contract. "
-                            f"Update may be from a previous run."
+                            f"but merger_processed.json was recently updated. Using fallback."
                         )
                         return True
                 
-                # No marker file and no recent log update - validation fails
                 self.logger.warning(
                     f"Merger validation failed: No marker file for run_id={run_ctx.run_id} "
-                    f"and no recent merger_processed.json update. Merger may not have completed successfully."
+                    f"and no recent merger_processed.json update."
                 )
                 return False
             

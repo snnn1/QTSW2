@@ -7,6 +7,7 @@ const ALERT_TYPE_LABELS: Record<string, string> = {
   NINJATRADER_PROCESS_STOPPED: 'NinjaTrader Process Stopped',
   ROBOT_HEARTBEAT_LOST: 'Robot Heartbeat Lost',
   CONNECTION_LOST_SUSTAINED: 'Connection Lost Sustained',
+  CONNECTIVITY_INCIDENT: 'Connectivity Incident (5+ disconnects or >120s)',
   POTENTIAL_ORPHAN_POSITION: 'Potential Orphan Position',
   CONFIRMED_ORPHAN_POSITION: 'Confirmed Orphan Position',
   LOG_FILE_STALLED: 'Log File Stalled',

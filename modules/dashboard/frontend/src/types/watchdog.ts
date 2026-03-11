@@ -40,6 +40,11 @@ export interface FillHealthInfo {
   unmapped_rate: number;
   null_trading_date_rate: number;
   fill_health_ok: boolean;
+  /** Event-based counts (last 1h): fills not in ledger */
+  broker_flatten_fill_count?: number;
+  execution_update_unknown_order_critical_count?: number;
+  execution_fill_blocked_count?: number;
+  execution_fill_unmapped_count?: number;
 }
 
 export interface StreamStuckInfo {
@@ -215,6 +220,46 @@ export interface IntentSummary {
   commission: number | null;
   fees: number | null;
   total_cost: number | null;
+}
+
+export interface DailyJournalTrade {
+  intent_id: string;
+  direction: string;
+  entry_price: number | null;
+  exit_price: number | null;
+  entry_qty: number | null;
+  exit_qty: number;
+  realized_pnl: number | null;
+  costs_allocated: number;
+  status: string;
+  exit_order_type: string | null;
+  /** Win | Loss | BE */
+  result?: string;
+  /** Exit fill timestamp (UTC ISO string) */
+  exit_filled_at?: string | null;
+}
+
+export interface DailyJournalStream {
+  stream: string;
+  instrument: string;
+  committed: boolean;
+  commit_reason: string | null;
+  state: string;
+  realized_pnl: number;
+  trade_count: number;
+  intent_count: number;
+  closed_count: number;
+  partial_count: number;
+  open_count: number;
+  total_costs_realized: number;
+  trades: DailyJournalTrade[];
+}
+
+export interface DailyJournal {
+  trading_date: string;
+  total_pnl: number;
+  streams: DailyJournalStream[];
+  summary: ExecutionSummary | null;
 }
 
 export interface ApiResponse<T> {

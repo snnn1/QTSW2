@@ -102,6 +102,7 @@ So YM2 can compute its range even during a mismatch; only order submission is bl
 
 ---
 
-## 6. Incident Reference
+## 6. Incident References
 
-See `docs/robot/incidents/2026-02-17_YM2_RANGE_FAILURE_POSTMORTEM.md` for the 2026-02-17 YM2 range failure caused by MYM RECONCILIATION_QTY_MISMATCH.
+- `docs/robot/incidents/2026-02-17_YM2_RANGE_FAILURE_POSTMORTEM.md` — 2026-02-17 YM2 range failure caused by MYM RECONCILIATION_QTY_MISMATCH
+- `docs/robot/incidents/2026-03-11_MYM_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.md` — Root cause: per-instance ExecutionJournal cache serving stale data across multiple NinjaTrader strategy instances. Fix: always read from disk in GetOpenJournalEntriesByInstrument.

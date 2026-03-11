@@ -305,6 +305,12 @@ async def websocket_events(websocket: WebSocket, run_id: Optional[str] = None):
                 f"events_sent={events_sent_str} duration_seconds={duration_seconds_str} "
                 f"close_code={close_code_str} close_reason={close_reason_str}"
             )
+            # 1006 = Abnormal Closure (connection closed without close frame) - log at WARNING for visibility
+            if close_code == 1006:
+                logger.warning(
+                    f"WS_CLOSED_1006_ABNORMAL connection_id={connection_id_str} client={client_info_str} "
+                    f"events_sent={events_sent_str} - connection closed without close frame (browser/tab close, network drop)"
+                )
             logger.info(close_log_msg)
         except Exception as log_err:
             # Exception-safe logging - never crash the handler

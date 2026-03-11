@@ -5,12 +5,14 @@ import { useState, useEffect } from 'react'
 import {
   fetchExecutionJournal,
   fetchStreamJournal,
-  fetchExecutionSummary
+  fetchExecutionSummary,
+  fetchDailyJournal
 } from '../services/watchdogApi'
 import type {
   ExecutionJournalEntry,
   StreamJournal,
-  ExecutionSummary
+  ExecutionSummary,
+  DailyJournal
 } from '../types/watchdog'
 
 /**
@@ -105,4 +107,34 @@ export function useExecutionSummary(tradingDate: string) {
   }, [tradingDate])
   
   return { summary, loading, error }
+}
+
+/**
+ * Hook for fetching unified daily journal
+ */
+export function useDailyJournal(tradingDate: string) {
+  const [journal, setJournal] = useState<DailyJournal | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!tradingDate) {
+      setJournal(null)
+      return
+    }
+
+    setLoading(true)
+    fetchDailyJournal(tradingDate).then(({ data, error: apiError }) => {
+      if (apiError) {
+        setError(apiError)
+        setJournal(null)
+      } else if (data) {
+        setJournal(data)
+        setError(null)
+      }
+      setLoading(false)
+    })
+  }, [tradingDate])
+
+  return { journal, loading, error }
 }

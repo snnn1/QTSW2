@@ -19,6 +19,9 @@ ROBOT_LOG_READ_POSITIONS_FILE = QTSW2_ROOT / "data" / "robot_log_read_positions.
 
 # Phase 1: Alert ledger and notification config
 ALERT_LEDGER_PATH = QTSW2_ROOT / "data" / "watchdog" / "alert_ledger.jsonl"
+# Status snapshot persistence for post-incident analysis (last 500 critical snapshots)
+STATUS_SNAPSHOTS_FILE = QTSW2_ROOT / "data" / "watchdog" / "status_snapshots.jsonl"
+STATUS_SNAPSHOTS_MAX_ENTRIES = 500
 NOTIFICATIONS_CONFIG_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.json"
 NOTIFICATIONS_SECRETS_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.secrets.json"
 
@@ -134,8 +137,8 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Execution Blocking
     "EXECUTION_BLOCKED",
     "EXECUTION_ALLOWED",
-    # Order Lifecycle
-    "ORDER_SUBMITTED",
+    # Order Lifecycle (robot emits ORDER_SUBMIT_SUCCESS; ORDER_SUBMITTED deprecated)
+    "ORDER_SUBMIT_SUCCESS",
     "ORDER_ACKNOWLEDGED",
     "ORDER_REJECTED",
     "ORDER_CANCELLED",
@@ -144,6 +147,9 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "EXECUTION_EXIT_FILL",  # Migration: ledger converts to synthetic EXECUTION_FILLED; robot now emits EXECUTION_FILLED for exits
     "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL",
     "EXECUTION_FILL_UNMAPPED",
+    # Critical fill anomalies (no EXECUTION_FILLED emitted; track counts for fill_health)
+    "BROKER_FLATTEN_FILL_RECOGNIZED",
+    "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
     # Protective Orders
     "PROTECTIVE_ORDERS_SUBMITTED",
     "PROTECTIVE_ORDERS_FAILED_FLATTENED",
@@ -170,6 +176,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "TIMETABLE_VALIDATED",
     # Stream State Machine transitions (plan requirement #2)
     "STREAM_STATE_TRANSITION",
+    "SLOT_END_SUMMARY",  # Slot summary with trade_executed, reason, range data
     # Diagnostic events (for troubleshooting OnBarUpdate and bar routing)
     "ONBARUPDATE_CALLED",
     "ONBARUPDATE_DIAGNOSTIC",

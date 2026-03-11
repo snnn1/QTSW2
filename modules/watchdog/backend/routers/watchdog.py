@@ -297,16 +297,21 @@ async def get_stream_journal(
         try:
             with open(journal_file, 'r') as f:
                 journal = json.load(f)
-                stream = journal.get("stream")
-                
-                # Convert UTC timestamps to Chicago
+                # Slot journals use PascalCase (Stream, Committed, LastState, LastUpdateUtc)
+                stream = journal.get("Stream") or journal.get("stream")
+                trading_date_val = journal.get("TradingDate") or journal.get("trading_date")
+                committed = journal.get("Committed", journal.get("committed", False))
+                commit_reason = journal.get("CommitReason") or journal.get("commit_reason")
+                last_state = journal.get("LastState") or journal.get("last_state", "")
+                last_update_utc = journal.get("LastUpdateUtc") or journal.get("last_update_utc", "")
+
                 stream_state = {
                     "stream": stream,
-                    "trading_date": journal.get("trading_date"),
-                    "committed": journal.get("committed", False),
-                    "commit_reason": journal.get("commit_reason"),
-                    "state": journal.get("last_state", ""),
-                    "last_update_chicago": _convert_utc_to_chicago(journal.get("last_update_utc", ""))
+                    "trading_date": trading_date_val,
+                    "committed": committed,
+                    "commit_reason": commit_reason,
+                    "state": last_state,
+                    "last_update_chicago": _convert_utc_to_chicago(last_update_utc)
                 }
                 streams.append(stream_state)
         
@@ -317,6 +322,24 @@ async def get_stream_journal(
         "trading_date": trading_date,
         "streams": streams
     }
+
+
+@router.get("/journal/daily")
+async def get_daily_journal(
+    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)")
+):
+    """
+    Unified daily journal: streams, trades, total PnL, and summary.
+    Combines execution journals, slot journals, ledger builder, and execution summary.
+    """
+    try:
+        aggregator = get_aggregator()
+        return aggregator.get_daily_journal(trading_date)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting daily journal: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/journal/summary")

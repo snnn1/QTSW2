@@ -107,6 +107,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Non-IEA path dedup: key (orderId, executionId or composite) -> first-seen UTC. TTL ~5 min.</summary>
     private readonly ConcurrentDictionary<string, DateTimeOffset> _nonIeaExecutionDedup = new();
 
+    /// <summary>Stage 1: Pending protective submissions during recovery. Processed when broker ready or fail-safe timeout.</summary>
+    private readonly List<PendingRecoveryProtective> _pendingRecoveryProtectives = new();
+    private readonly object _pendingRecoveryLock = new();
+    private const double RECOVERY_PROTECTIVE_TIMEOUT_SECONDS = 12.0;
+
     /// <summary>Non-IEA path: pending unresolved executions for deferred retry (no Thread.Sleep).</summary>
     private readonly List<UnresolvedExecutionRecord> _pendingUnresolvedExecutions = new();
     private readonly object _pendingUnresolvedLock = new();
@@ -287,9 +292,116 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     void IIEAOrderExecutor.DrainNtActions()
     {
+        ProcessRecoveryQueue();
         if (_ntActionQueue != null && this is INtActionExecutor executor)
             _ntActionQueue.DrainNtActions(executor);
         OnVerifyPendingFlattens();
+    }
+
+    bool IIEAOrderExecutor.TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
+    {
+        if (_isExecutionAllowedCallback == null || _isExecutionAllowedCallback())
+            return false;
+        QueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
+        return true;
+    }
+
+    /// <summary>
+    /// Stage 1: Add to queue. Stage 2/3: ProcessRecoveryQueue submits or fail-safe flattens.
+    /// </summary>
+    private void QueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
+    {
+        lock (_pendingRecoveryLock)
+        {
+            _pendingRecoveryProtectives.Add(new PendingRecoveryProtective(intentId, intent, totalFilledQuantity, utcNow));
+        }
+    }
+
+    /// <summary>
+    /// Stage 2: Submit queued protectives when broker ready. Stage 3: Fail-safe flatten if timeout exceeded.
+    /// Called at start of DrainNtActions (strategy thread).
+    /// </summary>
+    private void ProcessRecoveryQueue()
+    {
+        List<PendingRecoveryProtective> snapshot;
+        lock (_pendingRecoveryLock)
+        {
+            if (_pendingRecoveryProtectives.Count == 0) return;
+            snapshot = new List<PendingRecoveryProtective>(_pendingRecoveryProtectives);
+            _pendingRecoveryProtectives.Clear();
+        }
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var executionAllowed = _isExecutionAllowedCallback == null || _isExecutionAllowedCallback();
+
+        foreach (var pending in snapshot)
+        {
+            var elapsed = (utcNow - pending.QueuedAtUtc).TotalSeconds;
+
+            // Stage 3: Fail-safe timer — flatten if protectives cannot be placed within timeout
+            if (elapsed > RECOVERY_PROTECTIVE_TIMEOUT_SECONDS)
+            {
+                var failureReason = $"Recovery protective timeout ({RECOVERY_PROTECTIVE_TIMEOUT_SECONDS}s) - protective orders not placed in time";
+                _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Intent.Instrument, "RECOVERY_PROTECTIVE_TIMEOUT_FLATTENED",
+                    new
+                    {
+                        intent_id = pending.IntentId,
+                        elapsed_seconds = elapsed,
+                        timeout_seconds = RECOVERY_PROTECTIVE_TIMEOUT_SECONDS,
+                        note = "Fail-safe: position flattened after recovery protective timeout"
+                    }));
+                FailClosed(
+                    pending.IntentId,
+                    pending.Intent,
+                    failureReason,
+                    "RECOVERY_PROTECTIVE_TIMEOUT_FLATTENED",
+                    $"RECOVERY_PROTECTIVE_TIMEOUT:{pending.IntentId}",
+                    $"CRITICAL: Recovery Protective Timeout - {pending.Intent.Instrument}",
+                    $"Protective orders not placed within {RECOVERY_PROTECTIVE_TIMEOUT_SECONDS}s during recovery. Position flattened. Stream: {pending.Intent.Stream}, Intent: {pending.IntentId}.",
+                    null, null, new { elapsed_seconds = elapsed, timeout_seconds = RECOVERY_PROTECTIVE_TIMEOUT_SECONDS }, utcNow);
+                continue;
+            }
+
+            // Stage 2: Broker ready — submit protectives
+            if (executionAllowed)
+            {
+                if (_coordinator != null && !_coordinator.CanSubmitExit(pending.IntentId, pending.TotalFilledQuantity))
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Intent.Instrument, "EXECUTION_ERROR",
+                        new { error = "Exit validation failed for recovery queued protective", intent_id = pending.IntentId, total_filled_quantity = pending.TotalFilledQuantity }));
+                    continue;
+                }
+                var correlationId = $"PROTECTIVES_RECOVERY:{pending.IntentId}:{utcNow:yyyyMMddHHmmssfff}";
+                var cmd = new NtSubmitProtectivesCommand(
+                    correlationId,
+                    pending.IntentId,
+                    pending.Intent.Instrument ?? "",
+                    pending.Intent.Direction!,
+                    pending.Intent.StopPrice!.Value,
+                    pending.Intent.TargetPrice!.Value,
+                    pending.TotalFilledQuantity,
+                    null,
+                    "RECOVERY_QUEUE",
+                    utcNow);
+                EnqueueNtActionInternal(cmd);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Intent.Instrument, "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE",
+                    new { intent_id = pending.IntentId, elapsed_seconds = elapsed }));
+            }
+            else
+            {
+                // Still in recovery — put back in queue for next drain
+                lock (_pendingRecoveryLock)
+                {
+                    _pendingRecoveryProtectives.Add(pending);
+                }
+            }
+        }
+    }
+
+    private void EnqueueNtActionInternal(INtAction action)
+    {
+        if (_ntActionQueue != null)
+            _ntActionQueue.EnqueueNtAction(action, out _);
     }
 
     partial void OnVerifyPendingFlattens();
@@ -986,38 +1098,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return;
         }
         
-        // CRITICAL FIX: Check recovery state before submitting protective orders
-        // This prevents protective orders from being attempted during disconnect recovery
-        // when the broker API may be unavailable
+        // Stage 1: Entry fill during recovery — queue protective submission (three-stage safety model)
         if (_isExecutionAllowedCallback != null && !_isExecutionAllowedCallback())
         {
-            var error = "Execution blocked - recovery state guard active. Protective orders will be queued for submission after recovery completes.";
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_BLOCKED_RECOVERY",
-                new 
-                { 
-                    error = error, 
-                    intent_id = intentId, 
+            QueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_QUEUED_RECOVERY",
+                new
+                {
+                    intent_id = intentId,
                     fill_quantity = fillQuantity,
                     fill_price = fillPrice,
-                    note = "Protective orders blocked during recovery state - position unprotected until recovery completes"
+                    total_filled_quantity = totalFilledQuantity,
+                    timeout_seconds = RECOVERY_PROTECTIVE_TIMEOUT_SECONDS,
+                    note = "Protective orders queued for submission after recovery; fail-safe flatten if not placed within timeout"
                 }));
-            
-            // SIMPLIFICATION: Use centralized fail-closed pattern
-            // CRITICAL: Queue protective orders for submission after recovery completes
-            // For now, flatten immediately (fail-closed) - TODO: Implement queue mechanism
-            FailClosed(
-                intentId,
-                intent,
-                error,
-                "PROTECTIVE_ORDERS_BLOCKED_RECOVERY_FLATTENED",
-                $"PROTECTIVE_BLOCKED_RECOVERY:{intentId}",
-                $"CRITICAL: Protective Orders Blocked - Recovery State - {intent.Instrument}",
-                $"Entry filled but protective orders blocked due to recovery state. Position flattened. Stream: {intent.Stream}, Intent: {intentId}.",
-                null, // stopResult
-                null, // targetResult
-                new { error }, // additionalData
-                utcNow);
-            
             return;
         }
         

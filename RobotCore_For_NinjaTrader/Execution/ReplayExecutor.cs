@@ -37,6 +37,8 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow) => FlattenResult.SuccessResult(utcNow);
     public void StandDownStream(string streamId, DateTimeOffset utcNow, string reason) { }
     public void FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) { }
+
+    public bool TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow) => false;
     public void ProcessExecutionUpdate(object execution, object order) { }
     public void ProcessOrderUpdate(object order, object orderUpdate) { }
     public bool EnqueueNtAction(INtAction action) => false;

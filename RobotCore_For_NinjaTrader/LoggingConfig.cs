@@ -110,7 +110,6 @@ public sealed class LoggingConfig
         var configPath = Path.Combine(projectRoot, "configs", "robot", "logging.json");
         if (!File.Exists(configPath))
         {
-            // Return defaults if config doesn't exist
             return new LoggingConfig();
         }
 
@@ -120,9 +119,9 @@ public sealed class LoggingConfig
             var config = JsonUtil.Deserialize<LoggingConfig>(json);
             return config ?? new LoggingConfig();
         }
-        catch
+        catch (Exception ex)
         {
-            // Return defaults on error (fail-open)
+            EmergencyLogger.WriteConfigFailure(projectRoot, "LOGGING_CONFIG_LOAD_FAILED", configPath, $"{ex.GetType().Name}: {ex.Message}");
             return new LoggingConfig();
         }
     }

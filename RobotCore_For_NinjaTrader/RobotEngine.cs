@@ -1234,7 +1234,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return _streams.Values.Any(s => !s.Committed &&
                 (s.State == StreamState.ARMED ||
                  s.State == StreamState.RANGE_BUILDING ||
-                 s.State == StreamState.RANGE_LOCKED ||
                  s.State == StreamState.RANGE_LOCKED));
         }
     }
@@ -1983,19 +1982,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        // 🔴 Diagnostic Point #2: Log bar routing summary (every bar, diagnostic-only)
+        // 🔴 Diagnostic Point #2: Log bar routing summary (rate-limited: once per 5 min per instrument)
         if (_loggingConfig.DiagnosticsEnabled)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    raw_instrument = rawInstrument,
-                    canonical_instrument = canonicalInstrument,
-                    streams_checked = streamsChecked,
-                    streams_matched = streamsReceivingBar.Count,
-                    streams_receiving_bar = streamsReceivingBar,
-                    note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
-                }));
+            var shouldLogRouting = !_lastBarRoutingDiagnosticUtc.TryGetValue(instrument, out var lastRouting) ||
+                                   (utcNow - lastRouting).TotalMinutes >= 5.0;
+            if (shouldLogRouting)
+            {
+                _lastBarRoutingDiagnosticUtc[instrument] = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
+                    new
+                    {
+                        raw_instrument = rawInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        streams_checked = streamsChecked,
+                        streams_matched = streamsReceivingBar.Count,
+                        streams_receiving_bar = streamsReceivingBar,
+                        note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
+                    }));
+            }
         }
         
         // Log bar delivery summary periodically (rate-limited)
@@ -2070,6 +2075,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Rate-limiting for bar delivery logging (per stream)
     private readonly Dictionary<string, DateTimeOffset> _lastBarDeliveryLogUtc = new Dictionary<string, DateTimeOffset>();
+    private readonly Dictionary<string, DateTimeOffset> _lastBarRoutingDiagnosticUtc = new Dictionary<string, DateTimeOffset>();
     private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
     
     // Bar acceptance heartbeat tracking (rate-limited)
@@ -4664,27 +4670,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
             
-            // Step C: Cancel robot-owned working orders only
-            try
-            {
-                _executionAdapter.CancelRobotOwnedWorkingOrders(snap, utcNow);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_CANCELLED_ROBOT_ORDERS", state: "ENGINE",
-                    new
-                    {
-                        robot_owned_orders_cancelled = snap.WorkingOrders?.Count(o => IsRobotOwnedOrder(o)) ?? 0,
-                        note = "Robot-owned working orders cancelled"
-                    }));
-            }
-            catch (Exception ex)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_CANCELLED_ROBOT_ORDERS_FAILED", state: "ENGINE",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        note = "Failed to cancel robot-owned orders - recovery continues"
-                    }));
-            }
+            // Step C: Preserve robot-owned working orders during recovery (user preference: do not cancel)
+            // Previously: CancelRobotOwnedWorkingOrders was called here to avoid orphaned orders.
+            // Now: Working orders are left in place so they can fill after reconnect.
+            var robotOrderCount = snap.WorkingOrders?.Count(o => IsRobotOwnedOrder(o)) ?? 0;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_ORDERS_PRESERVED", state: "ENGINE",
+                new
+                {
+                    robot_owned_orders_preserved = robotOrderCount,
+                    note = "Robot-owned working orders preserved during recovery (no cancellation)"
+                }));
             
             // Step D: Protective re-establishment (for reconciled positions only)
             // This would require more detailed implementation - for now, log placeholder

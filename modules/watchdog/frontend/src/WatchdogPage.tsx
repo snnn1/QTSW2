@@ -9,6 +9,8 @@ import { RiskGatesPanel } from './components/watchdog/RiskGatesPanel'
 import { ActiveIntentPanel } from './components/watchdog/ActiveIntentPanel'
 import { FillHealthCard } from './components/watchdog/FillHealthCard'
 import { ActiveAlertsCard } from './components/watchdog/ActiveAlertsCard'
+import { SessionConnectivityCard } from './components/watchdog/SessionConnectivityCard'
+import { DisconnectFeedCard } from './components/watchdog/DisconnectFeedCard'
 import { AlertsHistoryCard } from './components/watchdog/AlertsHistoryCard'
 import { LiveEventFeed } from './components/watchdog/LiveEventFeed'
 import { StreamDetailDrawer } from './components/watchdog/StreamDetailDrawer'
@@ -48,7 +50,7 @@ export function WatchdogPage() {
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
-  const { pnl } = useStreamPnl(currentTradingDate)
+  const { pnl } = useStreamPnl(currentTradingDate, undefined, status?.market_open ?? null)
   
   // Calculate total P&L
   const totalPnl = useMemo(() => {
@@ -339,6 +341,18 @@ export function WatchdogPage() {
 
             {/* Phase 1: Active push alerts */}
             <ActiveAlertsCard alerts={status?.active_alerts ?? []} />
+
+            {/* Session-based disconnect metrics (real-time) */}
+            <SessionConnectivityCard
+              sessionConnectivity={status?.session_connectivity}
+              dailySummary={status?.last_connectivity_daily_summary}
+            />
+
+            {/* Disconnect feed - all CONNECTION_* events for current session */}
+            <DisconnectFeedCard
+              events={events}
+              tradingDate={status?.trading_date ?? null}
+            />
 
             {/* Phase 1: Alert history (24h) */}
             <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />

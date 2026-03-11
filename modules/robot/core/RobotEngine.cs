@@ -1789,19 +1789,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        // 🔴 Diagnostic Point #2: Log bar routing summary (every bar, diagnostic-only)
+        // 🔴 Diagnostic Point #2: Log bar routing summary (rate-limited: once per 5 min per instrument)
         if (_loggingConfig.enable_diagnostic_logs)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    raw_instrument = rawInstrument,
-                    canonical_instrument = canonicalInstrument,
-                    streams_checked = streamsChecked,
-                    streams_matched = streamsReceivingBar.Count,
-                    streams_receiving_bar = streamsReceivingBar,
-                    note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
-                }));
+            var shouldLogRouting = !_lastBarRoutingDiagnosticUtc.TryGetValue(instrument, out var lastRouting) ||
+                                   (utcNow - lastRouting).TotalMinutes >= 5.0;
+            if (shouldLogRouting)
+            {
+                _lastBarRoutingDiagnosticUtc[instrument] = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
+                    new
+                    {
+                        raw_instrument = rawInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        streams_checked = streamsChecked,
+                        streams_matched = streamsReceivingBar.Count,
+                        streams_receiving_bar = streamsReceivingBar,
+                        note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
+                    }));
+            }
         }
         
         // Log bar delivery summary periodically (rate-limited)
@@ -1876,6 +1882,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Rate-limiting for bar delivery logging (per stream)
     private readonly Dictionary<string, DateTimeOffset> _lastBarDeliveryLogUtc = new Dictionary<string, DateTimeOffset>();
+    private readonly Dictionary<string, DateTimeOffset> _lastBarRoutingDiagnosticUtc = new Dictionary<string, DateTimeOffset>();
     private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
     
     // Bar acceptance heartbeat tracking (rate-limited)

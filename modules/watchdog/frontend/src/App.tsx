@@ -5,6 +5,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { WebSocketProvider } from './contexts/WebSocketContext'
 import { WatchdogPage } from './WatchdogPage'
+import { DailyJournalPage } from './DailyJournalPage'
 import { JournalPage } from './JournalPage'
 import { SummaryPage } from './SummaryPage'
 import './App.css'
@@ -16,6 +17,7 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/watchdog" replace />} />
           <Route path="/watchdog" element={<WatchdogPage />} />
+          <Route path="/daily" element={<DailyJournalPage />} />
           <Route path="/journal" element={<JournalPage />} />
           <Route path="/summary" element={<SummaryPage />} />
         </Routes>

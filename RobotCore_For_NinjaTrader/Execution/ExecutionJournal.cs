@@ -1429,26 +1429,22 @@ public sealed class ExecutionJournal
                 var intentId = parts[parts.Length - 1];
                 var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
 
+                // Always read from disk for reconciliation - bypass cache to avoid stale data across
+                // multiple RobotEngine instances (each has its own ExecutionJournal cache). See
+                // docs/robot/incidents/2026-03-11_MYM_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.md
                 ExecutionJournalEntry? entry;
                 lock (_lock)
                 {
-                    if (_cache.TryGetValue(fileName, out var cached))
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null)
                     {
-                        entry = cached;
+                        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_READ_SKIPPED", "ENGINE",
+                            new { path, error = "Read failed after retries (file lock?)" }));
+                        continue;
                     }
-                    else
-                    {
-                        var json = ReadJournalFileWithRetry(path);
-                        if (json == null)
-                        {
-                            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_READ_SKIPPED", "ENGINE",
-                                new { path, error = "Read failed after retries (file lock?)" }));
-                            continue;
-                        }
-                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                        if (entry != null)
-                            _cache[fileName] = entry;
-                    }
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                        _cache[fileName] = entry; // Update cache for consistency with disk
                 }
 
                 if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;

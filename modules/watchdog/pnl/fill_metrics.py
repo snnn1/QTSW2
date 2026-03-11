@@ -5,7 +5,12 @@ Daily metrics for execution logging hygiene:
 - fill_coverage_rate (must be 100%)
 - unmapped_rate (target 0)
 - null_trading_date_rate (target 0)
-- invariant_violation_count (target 0)
+
+Data source: Raw robot logs (robot_*.jsonl in ROBOT_LOGS_DIR).
+Scans for EXECUTION_FILLED and EXECUTION_PARTIAL_FILL events.
+Event-based anomaly counts (BROKER_FLATTEN_FILL_RECOGNIZED, EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL,
+EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL, EXECUTION_FILL_UNMAPPED) are aggregated separately
+by EventProcessor and merged into fill_health in the aggregator.
 """
 import json
 from pathlib import Path
@@ -34,9 +39,11 @@ def compute_fill_metrics(trading_date: str, stream: Optional[str] = None) -> Dic
     mapped = 0
     unmapped = 0
     null_td = 0
+    missing_execution_sequence = 0
+    missing_fill_group_id = 0
 
     if not ROBOT_LOGS_DIR.exists():
-        return _metrics_result(trading_date, 0, 0, 0, 0)
+        return _metrics_result(trading_date, 0, 0, 0, 0, 0, 0)
 
     for log_file in sorted(ROBOT_LOGS_DIR.glob("robot_*.jsonl")):
         with open(log_file, "r", encoding="utf-8-sig") as f:
@@ -77,10 +84,15 @@ def compute_fill_metrics(trading_date: str, stream: Optional[str] = None) -> Dic
                     td_val = data.get("trading_date") or event.get("trading_date")
                     if not td_val or (isinstance(td_val, str) and not td_val.strip()):
                         null_td += 1
+                    # P3: Validate execution_sequence and fill_group_id (Phase 4.3)
+                    if data.get("execution_sequence") is None:
+                        missing_execution_sequence += 1
+                    if not data.get("fill_group_id"):
+                        missing_fill_group_id += 1
                 except Exception:
                     continue
 
-    return _metrics_result(trading_date, total, mapped, unmapped, null_td)
+    return _metrics_result(trading_date, total, mapped, unmapped, null_td, missing_execution_sequence, missing_fill_group_id)
 
 
 def _metrics_result(
@@ -89,6 +101,8 @@ def _metrics_result(
     mapped: int,
     unmapped: int,
     null_td: int,
+    missing_execution_sequence: int = 0,
+    missing_fill_group_id: int = 0,
 ) -> Dict[str, Any]:
     if total == 0:
         fill_coverage_rate = 1.0
@@ -107,4 +121,6 @@ def _metrics_result(
         "fill_coverage_rate": fill_coverage_rate,
         "unmapped_rate": unmapped_rate,
         "null_trading_date_rate": null_trading_date_rate,
+        "missing_execution_sequence_count": missing_execution_sequence,
+        "missing_fill_group_id_count": missing_fill_group_id,
     }

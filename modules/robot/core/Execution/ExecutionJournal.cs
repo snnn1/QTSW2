@@ -1382,17 +1382,14 @@ public sealed class ExecutionJournal
                 var intentId = parts[parts.Length - 1];
                 var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
 
+                // Always read from disk for reconciliation - bypass cache to avoid stale data across
+                // multiple RobotEngine instances. See 2026-03-11_MYM_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.
                 ExecutionJournalEntry? entry;
                 lock (_lock)
                 {
-                    if (_cache.TryGetValue(fileName, out var cached))
-                        entry = cached;
-                    else
-                    {
-                        var json = File.ReadAllText(path);
-                        entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                        if (entry != null) _cache[fileName] = entry;
-                    }
+                    var json = File.ReadAllText(path);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null) _cache[fileName] = entry;
                 }
 
                 if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;

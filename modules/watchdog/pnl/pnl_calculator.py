@@ -10,6 +10,7 @@ from typing import Dict, Optional, Any, List
 logger = logging.getLogger(__name__)
 
 # Single source of truth for contract multipliers
+# Full-size contracts
 INSTRUMENT_MULTIPLIERS = {
     "ES": 50,
     "NQ": 20,
@@ -17,6 +18,14 @@ INSTRUMENT_MULTIPLIERS = {
     "YM": 5,
     "GC": 100,
     "NG": 10000,
+    # Micro futures (execution instruments)
+    "MES": 5,
+    "MNQ": 2,
+    "M2K": 5,
+    "MYM": 0.5,
+    "MGC": 10,
+    "MNG": 1000,
+    "MCL": 100,
 }
 
 
@@ -84,20 +93,23 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
     total_costs = ledger_row.get("total_costs", 0)
     direction = ledger_row.get("direction")
     
-    # Get instrument multiplier
-    instrument = ledger_row.get("instrument")
-    if not instrument:
-        # Try to derive from stream
-        stream = ledger_row.get("stream", "")
-        instrument = get_instrument_from_stream(stream)
-    
-    if not instrument:
-        logger.warning(f"Cannot determine instrument for stream {ledger_row.get('stream')}, using multiplier 1")
-        multiplier = 1
+    # Get instrument multiplier: prefer journal ContractMultiplier when available
+    journal_multiplier = ledger_row.get("contract_multiplier")
+    if journal_multiplier is not None and float(journal_multiplier) > 0:
+        multiplier = float(journal_multiplier)
     else:
-        multiplier = INSTRUMENT_MULTIPLIERS.get(instrument, 1)
-        if multiplier == 1 and instrument:
-            logger.warning(f"Unknown instrument {instrument}, using multiplier 1")
+        instrument = ledger_row.get("instrument")
+        if not instrument:
+            # Try to derive from stream
+            stream = ledger_row.get("stream", "")
+            instrument = get_instrument_from_stream(stream)
+        if not instrument:
+            logger.warning(f"Cannot determine instrument for stream {ledger_row.get('stream')}, using multiplier 1")
+            multiplier = 1
+        else:
+            multiplier = INSTRUMENT_MULTIPLIERS.get(instrument, 1)
+            if multiplier == 1 and instrument:
+                logger.warning(f"Unknown instrument {instrument}, using multiplier 1")
     
     # Determine status if not already set
     if not ledger_row.get("status"):
@@ -110,7 +122,12 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
         ledger_row["status"] = status
     
     status = ledger_row["status"]
-    
+
+    # Use journal RealizedPnL when TradeCompleted and available (authoritative source)
+    trade_completed = ledger_row.get("trade_completed", False)
+    journal_realized_gross = ledger_row.get("realized_pnl_gross")
+    journal_realized_net = ledger_row.get("realized_pnl_net")
+
     # Only calculate realized P&L if exits exist
     if status == "OPEN" or avg_exit_price is None or exit_qty == 0:
         ledger_row["gross_pnl"] = None
@@ -120,33 +137,39 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
         if "pnl_confidence" not in ledger_row:
             ledger_row["pnl_confidence"] = "LOW"
         return ledger_row
-    
-    # Calculate gross P&L
-    price_diff = avg_exit_price - entry_price
-    if direction == "Short":
-        price_diff = -price_diff
-    
-    # Use exit_qty (may be partial)
-    gross_pnl = price_diff * exit_qty * multiplier
-    ledger_row["gross_pnl"] = gross_pnl
-    
-    # Allocate costs
-    if status == "CLOSED":
-        costs_allocated = total_costs
-    elif status == "PARTIAL":
-        # Proportional allocation
-        if entry_qty and entry_qty > 0:
-            costs_allocated = total_costs * (exit_qty / entry_qty)
+
+    # Prefer journal RealizedPnL when TradeCompleted and present
+    if trade_completed and journal_realized_net is not None:
+        ledger_row["gross_pnl"] = float(journal_realized_gross) if journal_realized_gross is not None else None
+        ledger_row["costs_allocated"] = total_costs  # Journal net = gross - costs
+        ledger_row["realized_pnl"] = float(journal_realized_net)
+    else:
+        # Calculate gross P&L
+        price_diff = avg_exit_price - entry_price
+        if direction == "Short":
+            price_diff = -price_diff
+
+        # Use exit_qty (may be partial)
+        gross_pnl = price_diff * exit_qty * multiplier
+        ledger_row["gross_pnl"] = gross_pnl
+
+        # Allocate costs
+        if status == "CLOSED":
+            costs_allocated = total_costs
+        elif status == "PARTIAL":
+            # Proportional allocation
+            if entry_qty and entry_qty > 0:
+                costs_allocated = total_costs * (exit_qty / entry_qty)
+            else:
+                costs_allocated = 0.0
         else:
             costs_allocated = 0.0
-    else:
-        costs_allocated = 0.0
-    
-    ledger_row["costs_allocated"] = costs_allocated
-    
-    # Calculate realized P&L
-    realized_pnl = gross_pnl - costs_allocated
-    ledger_row["realized_pnl"] = realized_pnl
+
+        ledger_row["costs_allocated"] = costs_allocated
+
+        # Calculate realized P&L
+        realized_pnl = gross_pnl - costs_allocated
+        ledger_row["realized_pnl"] = realized_pnl
     
     # Set pnl_confidence if not already set (ledger builder may have set it)
     if "pnl_confidence" not in ledger_row:
@@ -198,6 +221,18 @@ def aggregate_stream_pnl(ledger_rows: List[Dict[str, Any]], stream: str) -> Dict
     else:
         pnl_confidence = "LOW"
     
+    # Aggregate exit type and prices from closed/partial intents (for UI display)
+    exit_type = None
+    entry_price = None
+    exit_price = None
+    for r in ledger_rows:
+        if r.get("status") in ("CLOSED", "PARTIAL"):
+            if exit_type is None:
+                exit_type = r.get("exit_order_type") or r.get("completion_reason")
+                entry_price = r.get("entry_price")
+                exit_price = r.get("avg_exit_price")
+            break  # Use first closed/partial intent
+
     return {
         "stream": stream,
         "realized_pnl": closed_pnl,
@@ -207,5 +242,8 @@ def aggregate_stream_pnl(ledger_rows: List[Dict[str, Any]], stream: str) -> Dict
         "closed_count": closed_count,
         "partial_count": partial_count,
         "open_count": open_count,
-        "pnl_confidence": pnl_confidence
+        "pnl_confidence": pnl_confidence,
+        "exit_type": exit_type,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
     }
