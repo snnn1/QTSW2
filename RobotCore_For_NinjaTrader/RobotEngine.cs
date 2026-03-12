@@ -1463,7 +1463,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
             }
 
-            // Forced flatten block (BEFORE stream.Tick) — per sessionClass
+            // SLOT EXPIRY: Run stream.Tick BEFORE forced flatten so slot expiry (at NextSlotTimeUtc)
+            // can run and commit streams before forced flatten. Otherwise forced flatten would
+            // commit pre-entry streams first, and reentry streams would never reach slot expiry.
+            foreach (var s in _streams.Values)
+                s.Tick(utcNow);
+
+            // Forced flatten block — per sessionClass (runs after slot expiry so both can work)
             var tradingDateStr = TradingDateString;
             if (!string.IsNullOrEmpty(tradingDateStr))
             {
@@ -1547,9 +1553,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }
                 }
             }
-
-            foreach (var s in _streams.Values)
-                s.Tick(utcNow);
 
             // Periodic stream status summary (diagnostic only, rate-limited to every 5 minutes)
             if (_loggingConfig.DiagnosticsEnabled && _streams.Count > 0)

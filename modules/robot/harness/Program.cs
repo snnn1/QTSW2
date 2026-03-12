@@ -11,6 +11,8 @@ static void PrintUsage()
     Console.WriteLine();
     Console.WriteLine("Usage:");
     Console.WriteLine("  dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --write-sample-timetable");
+    Console.WriteLine("  dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --validate-forced-flatten");
+    Console.WriteLine("  dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --validate-slot-expiry");
     Console.WriteLine("  dotnet run --project modules/robot/harness/Robot.Harness.csproj [--mode DRYRUN|SIM|LIVE] [--test SCENARIO]");
     Console.WriteLine("  dotnet run --project modules/robot/harness/Robot.Harness.csproj --mode DRYRUN --replay --start YYYY-MM-DD --end YYYY-MM-DD [--log-dir DIR] [--timetable-path PATH]");
     Console.WriteLine();
@@ -276,6 +278,113 @@ if (validateForcedFlatten)
     Console.WriteLine();
     Console.WriteLine("Note: DRYRUN mode has no execution adapter. For full post-entry flatten validation (position closed, orders cancelled), run in SIM mode with NinjaTrader.");
     Console.WriteLine("Done. Run: python scripts/check_forced_flatten_today.py " + testDate.ToString("yyyy-MM-dd"));
+    return;
+}
+
+// --validate-slot-expiry: simulate across two days to verify slot expiry triggers at next slot time
+// Timetable stays at day1 (trading date locked). Forced flatten runs first (15:55 CT), then slot expiry.
+// Slot expiry fires for streams still ACTIVE at NextSlotTimeUtc (e.g. reentry at 09:30 for ES2).
+var validateSlotExpiry = argsList.Contains("--validate-slot-expiry");
+if (validateSlotExpiry)
+{
+    var day1 = new DateOnly(2026, 3, 18); // Wednesday (fresh date to avoid stale journals)
+    var day2 = new DateOnly(2026, 3, 19); // Thursday
+    var testTimetablePath = Path.Combine(root, "data", "timetable", "timetable_validate_slot_expiry.json");
+    Directory.CreateDirectory(Path.GetDirectoryName(testTimetablePath)!);
+
+    var timetableJson = JsonSerializer.Serialize(new
+    {
+        as_of = timeSvc.ConvertUtcToChicago(DateTimeOffset.UtcNow).ToString("o"),
+        trading_date = day1.ToString("yyyy-MM-dd"),
+        timezone = "America/Chicago",
+        source = "validate-slot-expiry",
+        streams = new[]
+        {
+            new { stream = "ES1", instrument = "MES", session = "S1", slot_time = "07:30", enabled = true },
+            new { stream = "ES2", instrument = "MES", session = "S2", slot_time = "09:30", enabled = true }
+        }
+    });
+    File.WriteAllText(testTimetablePath, timetableJson);
+    Console.WriteLine($"Validate slot expiry: day1={day1:yyyy-MM-dd}, NextSlotTimeUtc for ES1=day2 07:30 CT");
+
+    var engine = new RobotEngine(root, TimeSpan.FromSeconds(1), executionMode, null, testTimetablePath, "MES");
+    engine.Start();
+    Thread.Sleep(800);
+
+    // Day 1: 07:00–08:00 CT (streams created, NextSlotTimeUtc = day2 07:30 CT)
+    var day1StartUtc = timeSvc.ConvertChicagoToUtc(timeSvc.ConstructChicagoTime(day1, "07:00"));
+    var day1EndUtc = timeSvc.ConvertChicagoToUtc(timeSvc.ConstructChicagoTime(day1, "08:00"));
+    Console.WriteLine($"Day 1: 07:00–08:00 CT (streams stay ACTIVE, no forced flatten)");
+
+    var rng = new Random(1);
+    decimal px = 5000m;
+    for (var t = day1StartUtc; t <= day1EndUtc; t = t.AddMinutes(1))
+    {
+        var delta = (decimal)(rng.NextDouble() - 0.5) * 2m;
+        var open = px;
+        var high = open + Math.Abs(delta) + 0.25m;
+        var low = open - Math.Abs(delta) - 0.25m;
+        var close = open + delta;
+        px = close;
+        engine.OnBar(t, "MES", open, high, low, close, t);
+        engine.Tick(t);
+    }
+
+    // Day 2: Tick only (no bars - they'd be rejected as future).
+    // Forced flatten runs first (15:55 CT day1). Then slot expiry: ES1 at 07:30, ES2 at 09:30.
+    // Simulate to 10:00 CT to hit ES2's slot expiry (reentry case).
+    var day2StartUtc = timeSvc.ConvertChicagoToUtc(timeSvc.ConstructChicagoTime(day2, "07:30"));
+    var day2EndUtc = timeSvc.ConvertChicagoToUtc(timeSvc.ConstructChicagoTime(day2, "10:00"));
+    Console.WriteLine($"Day 2: Tick from 07:30–10:00 CT (forced flatten first, then slot expiry for ES2 at 09:30)");
+
+    for (var t = day2StartUtc; t <= day2EndUtc; t = t.AddMinutes(1))
+    {
+        engine.Tick(t); // No OnBar - day2 bars would be rejected; Tick alone triggers forced flatten then slot expiry
+    }
+
+    engine.Stop();
+
+    var logDir = Path.Combine(root, "logs", "robot");
+    var journalDir = Path.Combine(logDir, "journal");
+
+    var logFiles = Directory.Exists(logDir) ? Directory.GetFiles(logDir, "*.jsonl") : Array.Empty<string>();
+    var hasSlotExpired = false;
+    var hasSlotStatusChanged = false;
+    foreach (var logFile in logFiles)
+    {
+        try
+        {
+            foreach (var line in File.ReadAllLines(logFile))
+            {
+                if (line.Contains("SLOT_EXPIRED")) hasSlotExpired = true;
+                if (line.Contains("SLOT_STATUS_CHANGED") && line.Contains("EXPIRED")) hasSlotStatusChanged = true;
+            }
+        }
+        catch { /* skip */ }
+    }
+
+    var slotExpiredJournals = new List<string>();
+    if (Directory.Exists(journalDir))
+    {
+        foreach (var f in Directory.GetFiles(journalDir, $"{day1:yyyy-MM-dd}_*.json"))
+        {
+            try
+            {
+                var json = File.ReadAllText(f);
+                if (json.Contains("\"CommitReason\":\"SLOT_EXPIRED\"") || json.Contains("\"SlotStatus\":4"))
+                    slotExpiredJournals.Add(Path.GetFileName(f));
+            }
+            catch { /* skip */ }
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("=== Slot Expiry Validation ===");
+    Console.WriteLine($"  SLOT_EXPIRED in logs: {(hasSlotExpired ? "FOUND" : "MISSING")}");
+    Console.WriteLine($"  SLOT_STATUS_CHANGED -> EXPIRED: {(hasSlotStatusChanged ? "FOUND" : "MISSING")}");
+    Console.WriteLine($"  Journals with SLOT_EXPIRED: {(slotExpiredJournals.Count > 0 ? string.Join(", ", slotExpiredJournals) : "NONE")}");
+    Console.WriteLine();
+    Console.WriteLine("Note: stream.Tick runs before forced flatten so slot expiry can commit at NextSlotTimeUtc.");
     return;
 }
 
