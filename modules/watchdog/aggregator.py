@@ -894,7 +894,8 @@ class WatchdogAggregator:
             if last_tick_utc else 0
         )
         if not engine_alive:
-            if not self._notification_service.is_alert_active("NINJATRADER_PROCESS_STOPPED"):
+            if (not self._notification_service.is_alert_active("NINJATRADER_PROCESS_STOPPED")
+                    and not self._notification_service.is_alert_suppressed("ROBOT_HEARTBEAT_LOST")):
                 self._notification_service.raise_alert(
                     alert_type="ROBOT_HEARTBEAT_LOST",
                     severity="high",
@@ -942,10 +943,12 @@ class WatchdogAggregator:
             self._notification_service.resolve_alert("POTENTIAL_ORPHAN_POSITION")
 
         # CONNECTION_LOST_SUSTAINED: connection_status=ConnectionLost for >= 60s, severity HIGH
+        # Suppressed when suppress_robot_overlap.CONNECTION_LOST_SUSTAINED=true (Robot sends CONNECTION_LOST)
         connection_status = getattr(self._state_manager, "_connection_status", "").lower()
         last_conn_utc = getattr(self._state_manager, "_last_connection_event_utc", None)
         if "connectionlost" in connection_status or "lost" in connection_status:
-            if last_conn_utc and (now_utc - last_conn_utc).total_seconds() >= 60:
+            if (last_conn_utc and (now_utc - last_conn_utc).total_seconds() >= 60
+                    and not self._notification_service.is_alert_suppressed("CONNECTION_LOST_SUSTAINED")):
                 self._notification_service.raise_alert(
                     alert_type="CONNECTION_LOST_SUSTAINED",
                     severity="high",

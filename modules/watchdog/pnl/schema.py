@@ -74,6 +74,7 @@ def normalize_journal_entry(raw: Dict[str, Any]) -> Dict[str, Any]:
     canonical["completion_reason"] = raw.get("CompletionReason") or raw.get("completion_reason")
     canonical["exit_order_type"] = raw.get("ExitOrderType") or raw.get("exit_order_type")
     canonical["exit_avg_fill_price"] = raw.get("ExitAvgFillPrice") or raw.get("exit_avg_fill_price")
+    canonical["exit_filled_quantity_total"] = raw.get("ExitFilledQuantityTotal") or raw.get("exit_filled_quantity_total")
     canonical["be_modified"] = raw.get("BEModified", False) or raw.get("be_modified", False)
 
     return canonical

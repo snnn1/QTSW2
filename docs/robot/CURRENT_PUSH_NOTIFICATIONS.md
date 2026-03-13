@@ -1,11 +1,18 @@
 # Current Push Notifications
 
-**Last Updated**: 2026-01-22
+**Last Updated**: 2026-03-12
 
 ## Summary
 
-**Total Active Notifications**: **3**  
-**Total Disabled Notifications**: **2**
+**Robot (HealthMonitor)**: 3 active notifications  
+**Watchdog**: 6 alert types (2 overlap with Robot, suppressible via config)  
+**Total Disabled**: 2 (Robot only)
+
+### Credential Unification
+
+Robot and Watchdog should use the **same Pushover credentials** to avoid duplicate devices:
+- Robot: `configs/robot/health_monitor.secrets.json`
+- Watchdog: `configs/watchdog/notifications.secrets.json`
 
 ## ✅ Active Notifications (Currently Working)
 
@@ -74,6 +81,42 @@
 **Code Location**: `HealthMonitor.cs` `OnMidSessionRestartDetected()`, called from `StreamStateMachine` when `isMidSessionRestart` is true
 
 **Event Logged**: `MID_SESSION_RESTART_NOTIFICATION`
+
+---
+
+## Watchdog Notifications (External Monitor)
+
+Watchdog runs as a separate Python service and sends alerts when Robot/NinjaTrader are unreachable or when log feeds stall.
+
+### Alert Types
+
+| Alert Type | Trigger | Suppressible |
+|------------|---------|--------------|
+| NINJATRADER_PROCESS_STOPPED | NinjaTrader.exe not running | No |
+| ROBOT_HEARTBEAT_LOST | No engine ticks for 120s | Yes (Robot sends ENGINE_TICK_STALL) |
+| CONNECTION_LOST_SUSTAINED | Connection lost 60+s | Yes (Robot sends CONNECTION_LOST) |
+| POTENTIAL_ORPHAN_POSITION | Process down or heartbeat lost with active intents | No |
+| CONFIRMED_ORPHAN_POSITION | Engine dead, no ticks, market open | No |
+| LOG_FILE_STALLED | Log file not updated for threshold | No |
+
+### suppress_robot_overlap
+
+When Robot is running and sends its own CONNECTION_LOST / ENGINE_TICK_STALL notifications, Watchdog can suppress the equivalent alerts to avoid duplicates. Configure in `configs/watchdog/notifications.json`:
+
+```json
+"suppress_robot_overlap": {
+  "CONNECTION_LOST_SUSTAINED": true,
+  "ROBOT_HEARTBEAT_LOST": true
+}
+```
+
+- **When Robot is running**: Robot sends first; Watchdog skips CONNECTION_LOST_SUSTAINED and ROBOT_HEARTBEAT_LOST.
+- **When Robot/NinjaTrader crashed**: Watchdog still sends NINJATRADER_PROCESS_STOPPED, POTENTIAL_ORPHAN_POSITION, CONFIRMED_ORPHAN_POSITION.
+
+### Rate Limits (Watchdog)
+
+- `min_resend_interval_seconds`: 300 (5 min between resends for same alert)
+- `max_alerts_per_hour`: 30
 
 ---
 
@@ -222,8 +265,14 @@ To test if notifications work:
 
 ## Related Files
 
-- `modules/robot/core/HealthMonitor.cs` - Notification logic
-- `modules/robot/core/Notifications/NotificationService.cs` - Background worker
+- `modules/robot/core/HealthMonitor.cs` - Robot notification logic
+- `modules/robot/core/Notifications/NotificationService.cs` - Robot background worker
 - `modules/robot/core/Notifications/PushoverClient.cs` - Pushover API client
-- `configs/robot/health_monitor.secrets.json` - Pushover credentials
-- `configs/robot/health_monitor.json` - Health monitor configuration
+- `modules/watchdog/notifications/notification_service.py` - Watchdog notification service
+- `modules/watchdog/aggregator.py` - Watchdog alert raising logic
+- `configs/robot/health_monitor.secrets.json` - Robot Pushover credentials
+- `configs/robot/health_monitor.json` - Robot health monitor configuration
+- `configs/watchdog/notifications.json` - Watchdog notification config (suppress_robot_overlap, rate_limits)
+- `configs/watchdog/notifications.secrets.json` - Watchdog Pushover credentials
+
+**Credential unification**: Use the same Pushover `user_key` and `app_token` in both Robot and Watchdog secrets so all alerts go to the same device.

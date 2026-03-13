@@ -93,6 +93,11 @@ class NotificationService:
         if not self._enabled:
             logger.info("Watchdog notifications disabled (config or secrets missing)")
 
+    def is_alert_suppressed(self, alert_type: str) -> bool:
+        """Check if alert is suppressed (Robot sends equivalent; avoid duplicates)."""
+        suppress = self._config.get("suppress_robot_overlap", {})
+        return bool(suppress.get(alert_type, False))
+
     def raise_alert(
         self,
         alert_type: str,

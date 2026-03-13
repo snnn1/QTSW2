@@ -534,16 +534,38 @@ class LedgerBuilder:
             )
             return None
         
-        # Step 1: Determine exit quantity from EXECUTION_FILLED only (no INTENT_EXIT_FILL)
+        # Step 1: Determine exit quantity from EXECUTION_FILLED; fallback to journal when trade_completed
         exit_qty = self._determine_exit_qty(execution_fill_events, row["entry_qty"], intent_id)
+        if exit_qty == 0 and journal.get("trade_completed"):
+            # Journal is authoritative when trade completed but no EXECUTION_FILLED for exit
+            # (e.g. RECONCILIATION_BROKER_FLAT, or exit fill not in logs)
+            journal_exit_qty = journal.get("exit_filled_quantity_total")
+            if journal_exit_qty is not None and journal_exit_qty > 0:
+                exit_qty = min(int(journal_exit_qty), row["entry_qty"])
+            else:
+                exit_qty = row["entry_qty"]  # trade_completed implies full exit
         row["exit_qty"] = exit_qty
-        
-        # Step 2: Determine exit price (weighted average)
+
+        # Step 2: Determine exit price (weighted average from fills; fallback to journal or stop/target)
         avg_exit_price, price_confidence = self._determine_exit_price(
             execution_fill_events, exit_qty, row.get("stop_price"), row.get("target_price")
         )
+        if avg_exit_price is None and exit_qty > 0 and journal.get("trade_completed"):
+            # Use journal exit price when trade completed but no fill events (e.g. RECONCILIATION_BROKER_FLAT)
+            journal_exit_price = journal.get("exit_avg_fill_price")
+            if journal_exit_price is not None:
+                avg_exit_price = float(journal_exit_price)
+                price_confidence = "MEDIUM"
+            elif row.get("stop_price") or row.get("target_price"):
+                # RECONCILIATION_BROKER_FLAT: exit price unknown; infer from stop/target for display
+                avg_exit_price = row.get("target_price") or row.get("stop_price")
+                price_confidence = "LOW"
+            elif row.get("entry_price"):
+                # Last resort: use entry price so status shows CLOSED (P&L will show ~0)
+                avg_exit_price = float(row["entry_price"])
+                price_confidence = "LOW"
         row["avg_exit_price"] = avg_exit_price
-        
+
         # Step 3: Determine status
         status = self._determine_status(exit_qty, row["entry_qty"], avg_exit_price)
         row["status"] = status

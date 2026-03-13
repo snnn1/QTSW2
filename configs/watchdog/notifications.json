@@ -3,6 +3,10 @@
   "restored_notifications": {
     "enabled": true
   },
+  "suppress_robot_overlap": {
+    "CONNECTION_LOST_SUSTAINED": true,
+    "ROBOT_HEARTBEAT_LOST": true
+  },
   "channels": {
     "pushover": {
       "enabled": true,
@@ -15,6 +19,6 @@
   },
   "rate_limits": {
     "min_resend_interval_seconds": 300,
-    "max_alerts_per_hour": 20
+    "max_alerts_per_hour": 30
   }
 }
