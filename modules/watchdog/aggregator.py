@@ -1602,12 +1602,22 @@ class WatchdogAggregator:
             status = self._state_manager.compute_watchdog_status()
             status["timestamp_chicago"] = datetime.now(CHICAGO_TZ).isoformat()
             # Add fill_health from execution logging metrics (today's trading date)
+            # Run compute_fill_metrics with 8s timeout to avoid blocking status API on large log scans
             try:
                 trading_date = self._state_manager.get_trading_date()
                 if not trading_date:
                     trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
                 from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
-                fill_metrics = compute_fill_metrics(trading_date)
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(compute_fill_metrics, trading_date)
+                    try:
+                        fill_metrics = fut.result(timeout=8)
+                    except concurrent.futures.TimeoutError:
+                        fill_metrics = {"trading_date": trading_date, "total_fills": 0, "mapped_fills": 0,
+                            "unmapped_fills": 0, "null_trading_date_fills": 0, "fill_coverage_rate": 1.0,
+                            "unmapped_rate": 0.0, "null_trading_date_rate": 0.0,
+                            "missing_execution_sequence_count": 0, "missing_fill_group_id_count": 0}
                 # Event-based counts from state (last 1 hour)
                 broker_flatten = status.get("broker_flatten_fill_count", 0)
                 unknown_order = status.get("execution_update_unknown_order_critical_count", 0)

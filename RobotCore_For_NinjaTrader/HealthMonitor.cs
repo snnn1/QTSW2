@@ -102,6 +102,7 @@ public sealed class HealthMonitor
     // PHASE 3: Stall detection thresholds
     private const int ENGINE_TICK_STALL_SECONDS = 180; // Engine tick should occur at least every 180 seconds (reduced false positives for low-volume instruments)
     private const int ENGINE_TICK_STALL_HYSTERESIS_COUNT = 2; // Require stall for 2 consecutive evaluations before notifying (filters brief spikes)
+    private const int ENGINE_TICK_STALL_NOTIFY_COOLDOWN_MINUTES = 30; // Max 1 push per 30 min per process
     private const int ENGINE_START_GRACE_PERIOD_SECONDS = 180; // Suppress stall detection for 3 min after engine start (hydration/startup)
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
@@ -142,6 +143,12 @@ public sealed class HealthMonitor
     private const int CONNECTIVITY_INCIDENT_COUNT_THRESHOLD = 5;
     private const int CONNECTIVITY_INCIDENT_DURATION_THRESHOLD_SECONDS = 120;
     private const int CONNECTIVITY_INCIDENT_COOLDOWN_SECONDS = 1800;  // 30 min between alerts
+
+    // CRITICAL FIX: Shared engine tick across all HealthMonitor instances to prevent false stall notifications.
+    // Each strategy instance only gets Tick() when its instrument's bars arrive. Low-volume instruments can have 3+ min gaps.
+    private static readonly object _sharedEngineTickLock = new object();
+    private static DateTimeOffset _sharedLastEngineTickUtc = DateTimeOffset.MinValue;
+    private static DateTimeOffset _sharedLastEngineTickStallNotifyUtc = DateTimeOffset.MinValue;
     
     public HealthMonitor(string projectRoot, HealthMonitorConfig config, RobotLogger log)
     {
@@ -354,26 +361,6 @@ public sealed class HealthMonitor
                     TradingDateAtDetection = _currentTradingDate,
                     ConnectionNameAtDetection = connectionName
                 };
-                // Track for "4+ losses in 5 min" - mirrors NinjaTrader's strategy disable condition
-                lock (_sharedConnectionLock)
-                {
-                    _connectionLossTimestamps.Add(utcNow);
-                    var cutoff = utcNow.AddSeconds(-PRICE_CONNECTION_LOSS_WINDOW_SECONDS);
-                    _connectionLossTimestamps.RemoveAll(t => t < cutoff);
-                    if (_connectionLossTimestamps.Count >= PRICE_CONNECTION_LOSS_THRESHOLD &&
-                        (utcNow - _lastPriceConnectionLossRepeatedLogUtc).TotalSeconds >= PRICE_CONNECTION_LOSS_WINDOW_SECONDS)
-                    {
-                        _lastPriceConnectionLossRepeatedLogUtc = utcNow;
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "PRICE_CONNECTION_LOSS_REPEATED", state: "ENGINE",
-                            new
-                            {
-                                connection_name = connectionName,
-                                loss_count_in_window = _connectionLossTimestamps.Count,
-                                window_seconds = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
-                                note = "Connection lost 4+ times in 5 minutes. NinjaTrader may disable strategy with 'lost price connection more than 4 times in the past 5 minutes'."
-                            }));
-                    }
-                }
             }
             else
             {
@@ -397,6 +384,24 @@ public sealed class HealthMonitor
                     // First instance to detect: emit CONNECTION_CONTEXT then log the event and initialize shared state
                     _sharedConnectionLostLoggedByIncident[sharedIncidentKey] = true;
                     _sharedConnectionLostInstanceCountByIncident[sharedIncidentKey] = 1;
+
+                    // PRICE_CONNECTION_LOSS_REPEATED: one timestamp per incident (deduplicated across instances)
+                    _connectionLossTimestamps.Add(utcNow);
+                    var lossCutoff = utcNow.AddSeconds(-PRICE_CONNECTION_LOSS_WINDOW_SECONDS);
+                    _connectionLossTimestamps.RemoveAll(t => t < lossCutoff);
+                    if (_connectionLossTimestamps.Count >= PRICE_CONNECTION_LOSS_THRESHOLD &&
+                        (utcNow - _lastPriceConnectionLossRepeatedLogUtc).TotalSeconds >= PRICE_CONNECTION_LOSS_WINDOW_SECONDS)
+                    {
+                        _lastPriceConnectionLossRepeatedLogUtc = utcNow;
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "PRICE_CONNECTION_LOSS_REPEATED", state: "ENGINE",
+                            new
+                            {
+                                connection_name = connectionName,
+                                loss_count_in_window = _connectionLossTimestamps.Count,
+                                window_seconds = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
+                                note = "Connection lost 4+ times in 5 minutes. NinjaTrader may disable strategy with 'lost price connection more than 4 times in the past 5 minutes'."
+                            }));
+                    }
 
                     // CONNECTIVITY_DAILY_SUMMARY: record disconnect start and count (first instance only)
                     var metricsTradingDate = _currentTradingDate ?? "UNKNOWN";
@@ -619,6 +624,19 @@ public sealed class HealthMonitor
                 
                 _currentIncident = null; // Clear incident - if it flaps again, it becomes a new incident
             }
+            else
+            {
+                // Connected from start (no prior incident): emit so Watchdog shows Connected instead of Unknown
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_CONFIRMED", state: "ENGINE",
+                    new
+                    {
+                        connection_name = connectionName,
+                        connection_status = status.ToString(),
+                        timestamp_utc = utcNow.ToString("o"),
+                        trading_date = _currentTradingDate,
+                        note = "Broker connected at startup or status refresh"
+                    }));
+            }
         }
     }
     
@@ -684,6 +702,13 @@ public sealed class HealthMonitor
     {
         _lastEngineTickUtc = tickUtc;
         
+        // Update shared state: any instance ticking = engine alive (prevents false stalls for low-volume instruments)
+        lock (_sharedEngineTickLock)
+        {
+            if (tickUtc > _sharedLastEngineTickUtc)
+                _sharedLastEngineTickUtc = tickUtc;
+        }
+        
         // Clear engine tick stall flag and hysteresis if it was active (recovery)
         if (_engineTickStallActive)
         {
@@ -746,7 +771,12 @@ public sealed class HealthMonitor
     /// </summary>
     private void EvaluateEngineTickStall(DateTimeOffset utcNow)
     {
-        if (_lastEngineTickUtc == DateTimeOffset.MinValue)
+        DateTimeOffset lastTick;
+        lock (_sharedEngineTickLock)
+        {
+            lastTick = _sharedLastEngineTickUtc;
+        }
+        if (lastTick == DateTimeOffset.MinValue)
             return; // Engine not started yet
         
         // Session awareness: only check during active trading
@@ -757,7 +787,7 @@ public sealed class HealthMonitor
         if (_isMarketOpenCallback != null && !_isMarketOpenCallback())
             return;
         
-        var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
+        var elapsed = (utcNow - lastTick).TotalSeconds;
         if (elapsed < ENGINE_TICK_STALL_SECONDS)
         {
             _engineTickStallConsecutiveCount = 0; // Reset hysteresis when not in stall
@@ -781,7 +811,7 @@ public sealed class HealthMonitor
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE",
                 new
                 {
-                    last_tick_utc = _lastEngineTickUtc.ToString("o"),
+                    last_tick_utc = lastTick.ToString("o"),
                     elapsed_seconds = elapsed,
                     threshold_seconds = ENGINE_TICK_STALL_SECONDS,
                     consecutive_count = _engineTickStallConsecutiveCount,
@@ -790,10 +820,18 @@ public sealed class HealthMonitor
                 }));
             
             // Only notify for runtime stall (critical); startup stall is info-only
+            // Cooldown: max 1 push per 30 min per process to avoid spam
             if (!inStartupGrace)
             {
+                lock (_sharedEngineTickLock)
+                {
+                    var cooldownElapsed = (utcNow - _sharedLastEngineTickStallNotifyUtc).TotalMinutes;
+                    if (_sharedLastEngineTickStallNotifyUtc != DateTimeOffset.MinValue && cooldownElapsed < ENGINE_TICK_STALL_NOTIFY_COOLDOWN_MINUTES)
+                        return;
+                    _sharedLastEngineTickStallNotifyUtc = utcNow;
+                }
                 var title = "Engine Tick Stall Detected (Runtime)";
-                var message = $"Engine Tick() has not been called for {elapsed:F0}s. Last tick: {_lastEngineTickUtc:o} UTC. Threshold: {ENGINE_TICK_STALL_SECONDS}s";
+                var message = $"Engine Tick() has not been called for {elapsed:F0}s. Last tick: {lastTick:o} UTC. Threshold: {ENGINE_TICK_STALL_SECONDS}s";
                 SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipPerKeyRateLimit: true);
             }
         }

@@ -7,9 +7,6 @@ export function NavigationBar() {
   const location = useLocation()
   
   const navItems = [
-    { path: '/watchdog', label: 'Watchdog' },
-    { path: '/journal', label: 'Journal' },
-    { path: '/summary', label: 'Summary' },
     { path: '/pipeline', label: 'Pipeline' },
   ]
   

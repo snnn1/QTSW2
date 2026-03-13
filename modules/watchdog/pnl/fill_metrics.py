@@ -45,7 +45,10 @@ def compute_fill_metrics(trading_date: str, stream: Optional[str] = None) -> Dic
     if not ROBOT_LOGS_DIR.exists():
         return _metrics_result(trading_date, 0, 0, 0, 0, 0, 0)
 
-    for log_file in sorted(ROBOT_LOGS_DIR.glob("robot_*.jsonl")):
+    # Scan only 15 most recent log files (by mtime) to reduce I/O on large deployments
+    all_logs = list(ROBOT_LOGS_DIR.glob("robot_*.jsonl"))
+    log_files = sorted(all_logs, key=lambda p: p.stat().st_mtime, reverse=True)[:15]
+    for log_file in log_files:
         with open(log_file, "r", encoding="utf-8-sig") as f:
             for line in f:
                 if not line.strip():

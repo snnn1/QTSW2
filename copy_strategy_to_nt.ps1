@@ -3,6 +3,9 @@
 
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD }
+if (-not (Test-Path (Join-Path $projectRoot "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs"))) {
+    $projectRoot = Split-Path $projectRoot -Parent
+}
 $source = Join-Path $projectRoot "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs"
 
 # Resolve NinjaTrader Strategies path (OneDrive or Documents)

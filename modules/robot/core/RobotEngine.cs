@@ -1170,10 +1170,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>Tick with explicit Historical flag. Use when caller knows State (e.g. strategy). Skips timetable poll during Historical.</summary>
+    public void Tick(DateTimeOffset utcNow, bool isHistorical)
+    {
+        TickInternal(utcNow, isHistorical);
+    }
+
+    /// <summary>Tick with inferred Historical. Prefer Tick(utcNow, isHistorical) when caller has State.</summary>
     public void Tick(DateTimeOffset utcNow)
     {
-        // PHASE 3.1: Periodic identity invariants check (rate-limited)
-        CheckIdentityInvariantsIfNeeded(utcNow);
+        Tick(utcNow, false);
+    }
+
+    private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
+    {
+        // PHASE 3.1: Periodic identity invariants check (rate-limited). Skip during Historical - Realtime-only.
+        if (!isHistorical)
+            CheckIdentityInvariantsIfNeeded(utcNow);
         
         // Check for test notification trigger file (outside lock for performance)
         var triggerFile = Path.Combine(_root, "data", "test_notification_trigger.txt");
@@ -1192,7 +1205,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        var shouldPoll = _timetablePoller.ShouldPoll(utcNow);
+        // CRITICAL: During Historical, skip timetable poll - we're replaying bars, no config changes.
+        var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(utcNow);
         var parsed = shouldPoll ? PollAndParseTimetable(utcNow) : default;
 
         lock (_engineLock)

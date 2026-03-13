@@ -10,10 +10,10 @@ echo   Building Watchdog UI Frontend (Production)
 echo ============================================================
 echo.
 
-cd modules\dashboard\frontend
+cd modules\watchdog\frontend
 
 if not exist "package.json" (
-    echo ERROR: Frontend not found at %CD%
+    echo ERROR: Standalone watchdog frontend not found at %CD%
     pause
     exit /b 1
 )
@@ -40,9 +40,8 @@ echo ============================================================
 echo   Build Complete!
 echo ============================================================
 echo.
-echo Frontend built to: modules\dashboard\frontend\dist\
+echo Frontend built to: modules\watchdog\frontend\dist\
 echo.
-echo The backend will serve the frontend automatically.
-echo Start the backend and navigate to: http://localhost:8001/watchdog
+echo Start watchdog backend (8002) and navigate to: http://localhost:5175
 echo.
 pause

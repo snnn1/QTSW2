@@ -1599,7 +1599,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
             }
 #endif
-            _engine.Tick(tickTimeUtc);
+            _engine.Tick(tickTimeUtc, State == State.Historical);
             if (logTiming) TraceLifecycle("OnBarUpdate_AFTER_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
             LogBarProfileIfSlow("tick", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
             }

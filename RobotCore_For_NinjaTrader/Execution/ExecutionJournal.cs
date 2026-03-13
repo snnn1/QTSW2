@@ -37,14 +37,14 @@ public sealed class ExecutionJournal
     
     /// <summary>
     /// Phase 3.2: Startup self-check. Verifies journal dir exists and is writable.
-    /// Writes and reads .startup_check; throws on failure (fail closed).
+    /// Uses unique temp file per instance to avoid race when multiple strategies start concurrently.
     /// </summary>
     private void ValidateJournalDirectory()
     {
         if (!Directory.Exists(_journalDir))
             throw new InvalidOperationException($"ExecutionJournal: journal directory does not exist: {_journalDir}");
         
-        var checkPath = Path.Combine(_journalDir, ".startup_check");
+        var checkPath = Path.Combine(_journalDir, $".startup_check_{Guid.NewGuid():N}");
         try
         {
             var testContent = DateTimeOffset.UtcNow.ToString("o");

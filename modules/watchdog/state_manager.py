@@ -1597,6 +1597,12 @@ class WatchdogStateManager:
                     smoothed_data_stall_detected = {}
                 # If previous was STALLED, this might be real - keep stalls
         
+        # Optimistic Connected: when status is Unknown and engine is alive, infer Connected
+        # (avoids showing Unknown when robot is running but no connection events yet)
+        connection_status = self._connection_status
+        if connection_status == "Unknown" and engine_alive:
+            connection_status = "Connected"
+        
         return {
             "engine_alive": engine_alive,
             "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values (smoothed)
@@ -1607,7 +1613,7 @@ class WatchdogStateManager:
             "engine_tick_stall_detected": not engine_alive,
             "recovery_state": recovery_state,  # Use computed recovery_state (may be auto-cleared)
             "kill_switch_active": self._kill_switch_active,
-            "connection_status": self._connection_status,
+            "connection_status": connection_status,
             "last_connection_event_chicago": (
                 self._last_connection_event_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_connection_event_utc else None

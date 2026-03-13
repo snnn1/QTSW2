@@ -281,8 +281,8 @@ class EventProcessor:
                            "DISCONNECT_RECOVERY_COMPLETE", "DISCONNECT_RECOVERY_ABORTED"):
             self._state_manager.update_recovery_state(event_type, timestamp_utc)
         
-        elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION"):
-            # CONNECTION_RECOVERED_NOTIFICATION is also a recovery signal
+        elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION", "CONNECTION_CONFIRMED"):
+            # CONNECTION_RECOVERED_NOTIFICATION and CONNECTION_CONFIRMED are connection-ok signals
             connection_status = "ConnectionLost" if "LOST" in event_type else "Connected"
             self._state_manager.update_connection_status(connection_status, timestamp_utc)
         

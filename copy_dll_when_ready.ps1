@@ -5,6 +5,9 @@
 param([switch]$NoPause)
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD }
+if (-not (Test-Path (Join-Path $projectRoot "RobotCore_For_NinjaTrader"))) {
+    $projectRoot = Split-Path $projectRoot -Parent
+}
 $sourceDir = Join-Path $projectRoot "RobotCore_For_NinjaTrader\bin\Release\net48"
 
 # Resolve NinjaTrader Custom path (Documents or OneDrive\Documents)

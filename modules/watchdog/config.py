@@ -128,6 +128,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "CONNECTION_LOST_SUSTAINED",
     "CONNECTION_RECOVERED",
     "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification after sustained disconnect
+    "CONNECTION_CONFIRMED",  # Robot emits at startup and periodically when connected (Watchdog shows Connected vs Unknown)
     # Kill Switch
     "KILL_SWITCH_ACTIVE",
     # Stream State

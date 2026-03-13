@@ -29,12 +29,12 @@ start "Watchdog Backend" cmd /k "cd /d %CD% && python -m uvicorn modules.watchdo
 REM Wait for backend
 timeout /t 3 /nobreak >nul
 
-REM Start frontend (uses dashboard frontend with watchdog config - proven working)
+REM Start standalone watchdog frontend (modules/watchdog/frontend)
 echo [2/2] Starting frontend...
-cd /d "%CD%\modules\dashboard\frontend"
+cd /d "%CD%\modules\watchdog\frontend"
 
 if not exist "package.json" (
-    echo ERROR: Frontend not found at %CD%
+    echo ERROR: Standalone watchdog frontend not found at %CD%
     pause
     exit /b 1
 )
@@ -58,4 +58,4 @@ echo Press Ctrl+C to stop frontend
 echo ============================================================
 echo.
 
-call npm run dev:watchdog
+call npm run dev

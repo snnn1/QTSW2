@@ -272,6 +272,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _reconnectUtc;
     private DateTimeOffset? _lastSyncWaitLogUtc; // Rate-limiting for DISCONNECT_RECOVERY_WAITING_FOR_SYNC
     
+    // ENGINE_TICK_CALLSITE rate limit: log at most once per 5 seconds to prevent log flooding during Historical
+    // (Watchdog uses this for liveness; 5s is sufficient. During Historical, thousands of ticks would otherwise flood queue.)
+    private DateTimeOffset? _lastEngineTickCallsiteLogUtc = null;
+    private const double ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5.0;
+    
+    // Diagnostic: one-time log when we skip timetable poll during Historical (confirms fix is deployed)
+    private bool _loggedHistoricalPollSkip = false;
+    
     // Recovery runner guard (prevent re-entrancy)
     private bool _recoveryRunnerActive = false;
     private readonly object _recoveryLock = new object();
@@ -1343,10 +1351,26 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>Tick with explicit Historical flag. Use this when caller knows State (e.g. strategy).</summary>
+    public void Tick(DateTimeOffset utcNow, bool isHistorical)
+    {
+        TickInternal(utcNow, isHistorical);
+    }
+
+    /// <summary>Tick with inferred Historical (bar time lag). Prefer Tick(utcNow, isHistorical) when caller has State.</summary>
     public void Tick(DateTimeOffset utcNow)
     {
-        // PHASE 3.1: Periodic identity invariants check (rate-limited)
-        CheckIdentityInvariantsIfNeeded(utcNow);
+        var nowWall = DateTimeOffset.UtcNow;
+        var barTimeLagMinutes = (nowWall - utcNow).TotalMinutes;
+        var inferredHistorical = barTimeLagMinutes > 2.0;
+        TickInternal(utcNow, inferredHistorical);
+    }
+
+    private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
+    {
+        // PHASE 3.1: Periodic identity invariants check (rate-limited). Skip during Historical - Realtime-only.
+        if (!isHistorical)
+            CheckIdentityInvariantsIfNeeded(utcNow);
         
         // Check for test notification trigger file (outside lock for performance)
         var triggerFile = Path.Combine(_root, "data", "test_notification_trigger.txt");
@@ -1365,8 +1389,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        var shouldPoll = _timetablePoller.ShouldPoll(utcNow);
-        var parsed = shouldPoll ? PollAndParseTimetable(utcNow) : default;
+        // CRITICAL: During Historical, skip timetable poll entirely - we're replaying bars, no config changes.
+        // This avoids ~400 file reads + SHA256 + JSON parse per strategy during Historical.
+        var nowWall = DateTimeOffset.UtcNow;
+        var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(nowWall);
+        var parsed = shouldPoll ? PollAndParseTimetable(nowWall) : default;
+        
+        // Diagnostic: log once per engine when we skip poll during Historical (confirms fix is deployed)
+        if (isHistorical && !_loggedHistoricalPollSkip)
+        {
+            _loggedHistoricalPollSkip = true;
+            LogEvent(RobotEvents.EngineBase(nowWall, tradingDate: TradingDateString, eventType: "HISTORICAL_POLL_SKIP_ACTIVE", state: "ENGINE",
+                new { note = "Timetable poll skipped during Historical - fix deployed" }));
+        }
 
         lock (_engineLock)
         {
@@ -1374,14 +1409,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
             
             // WATCHDOG: Log ENGINE_TICK_CALLSITE for watchdog liveness monitoring
-            // This is the primary heartbeat indicator for engine liveness
-            // Rate-limited in event feed to every 5 seconds, but log every call here
-            // Watchdog uses this to detect engine stalls (threshold: 15 seconds)
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
-                new
-                {
-                    note = "Tick() called - watchdog liveness signal. Rate-limited in feed to every 5 seconds."
-                }));
+            // Rate-limited to once per 5 seconds of REAL time, not bar time.
+            // During Historical, utcNow is bar time (1 min/bar) so (utcNow - last) would fire every bar.
+            // Use wall-clock (nowWall from outer scope) for rate limit so we log at most every 5s.
+            var shouldLogTickCallsite = !_lastEngineTickCallsiteLogUtc.HasValue ||
+                (nowWall - _lastEngineTickCallsiteLogUtc.Value).TotalSeconds >= ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS;
+            if (shouldLogTickCallsite)
+            {
+                _lastEngineTickCallsiteLogUtc = nowWall;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
+                    new
+                    {
+                        note = "Tick() called - watchdog liveness signal. Rate-limited to every 5 seconds."
+                    }));
+            }
             
             // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
             _lastTickUtc = utcNow;
@@ -1451,8 +1492,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 RunRecovery(utcNow);
             }
 
-            // Reconciliation: periodic orphaned journal cleanup (throttled)
-            RunReconciliationPeriodicThrottle(utcNow);
+            // Reconciliation: periodic orphaned journal cleanup (throttled). Skip during Historical - no live account.
+            if (!isHistorical)
+                RunReconciliationPeriodicThrottle(utcNow);
 
             // Timetable reactivity (disk I/O already completed outside lock)
             if (shouldPoll)

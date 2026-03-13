@@ -17,10 +17,10 @@ echo Press Ctrl+C to stop the frontend.
 echo ============================================================
 echo.
 
-cd modules\dashboard\frontend
+cd modules\watchdog\frontend
 
 if not exist "package.json" (
-    echo ERROR: Frontend not found at %CD%
+    echo ERROR: Standalone watchdog frontend not found at %CD%
     pause
     exit /b 1
 )
@@ -41,12 +41,10 @@ REM Start frontend dev server (will run in this window)
 echo Starting watchdog frontend dev server...
 echo Frontend will be available at: http://localhost:5175
 echo.
-echo IMPORTANT: This will open ONLY the Watchdog UI at http://localhost:5175
+echo IMPORTANT: Uses standalone watchdog (modules/watchdog/frontend)
 echo Do NOT open dashboard (5173) or matrix (5174) - those are separate apps
 echo.
 
-REM Open ONLY watchdog URL after a delay (frontend needs time to start)
-REM Wait 8 seconds for frontend to fully start, then open ONLY watchdog URL
 echo Waiting 8 seconds for frontend to start, then opening watchdog...
 timeout /t 8 /nobreak >nul
 echo Opening watchdog UI at http://localhost:5175...
@@ -60,9 +58,8 @@ echo.
 echo Watchdog Frontend: http://localhost:5175
 echo Watchdog Backend:  http://localhost:8002
 echo.
-echo Browser will open ONLY watchdog at http://localhost:5175 in 5 seconds
 echo Press Ctrl+C to stop frontend
 echo ============================================================
 echo.
 
-call npm run dev:watchdog
+call npm run dev
