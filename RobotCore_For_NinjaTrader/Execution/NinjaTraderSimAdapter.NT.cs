@@ -615,6 +615,45 @@ public sealed partial class NinjaTraderSimAdapter
             new { long_success = longRes.Success, short_success = shortRes.Success }));
     }
 
+    void INtActionExecutor.ExecuteSubmitMarketReentry(NtSubmitMarketReentryCommand ntCmd)
+    {
+        var cmd = ntCmd.Command;
+        var utcNow = cmd.TimestampUtc;
+        var instrument = cmd.ExecutionInstrument ?? cmd.Instrument ?? "";
+        var execInst = string.IsNullOrEmpty(instrument) ? "" : instrument.Trim().ToUpperInvariant();
+        var reentryIntentId = cmd.ReentryIntentId ?? "";
+        var direction = cmd.Direction ?? "";
+        var quantity = cmd.Quantity;
+
+        if (string.IsNullOrEmpty(reentryIntentId) || string.IsNullOrEmpty(execInst) || string.IsNullOrEmpty(direction) || quantity <= 0)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, reentryIntentId, execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
+                new { reason = "Missing required fields", reentryIntentId, execInst, direction, quantity }));
+            return;
+        }
+
+        var reentryIntent = new Intent(
+            cmd.TradingDate ?? "",
+            cmd.Stream ?? "",
+            instrument,
+            execInst,
+            cmd.Session ?? "",
+            cmd.SlotTimeChicago ?? "",
+            direction,
+            null,
+            null,
+            null,
+            null,
+            utcNow,
+            "SUBMIT_MARKET_REENTRY");
+        RegisterIntent(reentryIntent);
+        RegisterIntentPolicy(reentryIntentId, quantity, quantity, instrument, execInst, "EXECUTION_COMMAND");
+
+        var result = SubmitEntryOrder(reentryIntentId, execInst, direction, null, quantity, "MARKET", utcNow);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, reentryIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
+            new { success = result.Success, error = result.ErrorMessage }));
+    }
+
     private void RegisterPendingFlattenVerification(string instrumentKey, string correlationId, DateTimeOffset utcNow)
     {
         var deadline = utcNow.AddSeconds(FLATTEN_VERIFY_WINDOW_SEC);

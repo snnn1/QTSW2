@@ -48,6 +48,9 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Gap 5: Instrument blocked after EnqueueAndWait failure (timeout/overflow). Fail-closed policy: no new work until restart.</summary>
     private volatile bool _instrumentBlocked;
 
+    /// <summary>Queue health: true if instrument is blocked (queue poison, timeout, overflow). Used for flatten fallback.</summary>
+    internal bool IsInstrumentBlocked => _instrumentBlocked;
+
     /// <summary>Queue health: current command tracking.</summary>
     private DateTimeOffset _currentWorkStartedUtc = DateTimeOffset.MinValue;
     private volatile string _currentWorkType = "";

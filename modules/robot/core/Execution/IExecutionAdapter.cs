@@ -137,6 +137,13 @@ public interface IExecutionAdapter
     /// adapter.Flatten/SubmitOrders/CancelOrders directly. Adapters with IEA forward to IEA; others no-op.
     /// </summary>
     void EnqueueExecutionCommand(ExecutionCommandBase command);
+
+    /// <summary>
+    /// Session-close immediate flatten: enqueue cancel+flatten and drain in same cycle.
+    /// Guarantees same-cycle execution before session close. Use for forced flatten when next-bar delay is unacceptable.
+    /// Returns null if not supported (caller should use EmergencyFlatten fallback).
+    /// </summary>
+    FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
 }
 
 /// <summary>

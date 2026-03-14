@@ -1302,6 +1302,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         // Harness build: No IEA; no-op. NT build uses RobotCore_For_NinjaTrader with full IEA.
     }
 
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        // Harness build: No IEA/NT action queue; return null so caller uses EmergencyFlatten fallback.
+        // NT build (RobotCore_For_NinjaTrader) has full implementation with same-cycle drain.
+        return null;
+    }
+
     /// <summary>
     /// Check all instruments for flat positions and cancel entry stops.
     /// Called on every execution update to detect manual position closures.

@@ -691,6 +691,26 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// Enqueue execution command. Forwards to IEA when bound; no-op when IEA not enabled.
     /// Strategy layers should use this instead of calling adapter.Flatten/SubmitOrders/CancelOrders directly.
     /// </summary>
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntActionQueue == null || !(this is INtActionExecutor executor)) return null;
+        var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+        var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
+        _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow), out _);
+        var lockObj = _iea?.EntrySubmissionLock;
+        if (lockObj != null)
+        {
+            lock (lockObj)
+            {
+                _ntActionQueue.DrainNtActions(executor);
+                return FlattenResult.SuccessResult(utcNow);
+            }
+        }
+        _ntActionQueue.DrainNtActions(executor);
+        return FlattenResult.SuccessResult(utcNow);
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         if (command == null) return;

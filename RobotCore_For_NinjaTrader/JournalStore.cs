@@ -297,6 +297,12 @@ public sealed class StreamJournal
     public DateTimeOffset? ForcedFlattenTimestamp { get; set; }
 
     /// <summary>
+    /// When queued forced flatten was requested (IEA command path). Used for two-phase completion.
+    /// Cleared when flatten completes and ExecutionInterruptedByClose is set.
+    /// </summary>
+    public DateTimeOffset? ForcedFlattenEnqueuedAtUtc { get; set; }
+
+    /// <summary>
     /// Trading day when forced flatten ran (for re-entry gate).
     /// </summary>
     public string? TradingDayAtFlatten { get; set; }

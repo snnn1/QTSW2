@@ -122,6 +122,15 @@ public sealed class StreamStateMachine
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
     private readonly RobotEngine? _engine; // Optional: engine reference for BarsRequest status checks
+
+    // IEA alignment: block checks and fallbacks for forced flatten, slot expiry, reentry
+    private readonly Func<string, bool>? _isInstrumentBlockedForReentry;
+    private readonly Func<string, DateTimeOffset, FlattenResult>? _emergencyFlatten;
+    private readonly Func<string, bool>? _isIeaQueueHealthyForInstrument;
+
+    // Canonical event writer for replay reconstruction (forced flatten, slot expiry)
+    private readonly ExecutionEventWriter? _eventWriter;
+
     private readonly int _orderQuantity; // PHASE 3.2: Fixed order quantity for all intents (code-controlled)
     private readonly int _maxQuantity; // Policy max_size
     private bool _stopBracketsSubmittedAtLock = false;
@@ -254,7 +263,11 @@ public sealed class StreamStateMachine
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
         LoggingConfig? loggingConfig = null, // Optional: logging configuration for diagnostic control
-        RobotEngine? engine = null // Optional: engine reference for BarsRequest status checks
+        RobotEngine? engine = null, // Optional: engine reference for BarsRequest status checks
+        Func<string, bool>? isInstrumentBlockedForReentry = null,
+        Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
+        Func<string, bool>? isIeaQueueHealthyForInstrument = null,
+        ExecutionEventWriter? eventWriter = null
     )
     {
         _time = time;
@@ -268,7 +281,11 @@ public sealed class StreamStateMachine
         _riskGate = riskGate;
         _executionJournal = executionJournal;
         _engine = engine;
-        
+        _isInstrumentBlockedForReentry = isInstrumentBlockedForReentry;
+        _emergencyFlatten = emergencyFlatten;
+        _isIeaQueueHealthyForInstrument = isIeaQueueHealthyForInstrument;
+        _eventWriter = eventWriter;
+
         // Initialize range event persister (singleton)
         _rangePersister = RangeLockedEventPersister.GetInstance(_projectRoot);
         

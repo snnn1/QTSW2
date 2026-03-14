@@ -74,13 +74,27 @@ public static class ExecutionCommandTests
             return (false, $"NullExecutionAdapter.EnqueueExecutionCommand threw: {ex.Message}");
         }
 
-        // 5. Command types are ExecutionCommandBase
-        if (!(flattenCmd is ExecutionCommandBase))
-            return (false, "FlattenIntentCommand should inherit ExecutionCommandBase");
-        if (!(cancelCmd is ExecutionCommandBase))
-            return (false, "CancelIntentOrdersCommand should inherit ExecutionCommandBase");
-        if (!(submitCmd is ExecutionCommandBase))
-            return (false, "SubmitEntryIntentCommand should inherit ExecutionCommandBase");
+        // 5. SubmitMarketReentryCommand can be created (IEA alignment)
+        var reentryCmd = new SubmitMarketReentryCommand
+        {
+            Instrument = "MNQ",
+            ExecutionInstrument = "MNQ",
+            ReentryIntentId = "slot1_REENTRY",
+            OriginalIntentId = "original-1",
+            Direction = "Long",
+            Quantity = 1,
+            Stream = "NQ1",
+            Session = "RTH",
+            SlotTimeChicago = "09:30",
+            TradingDate = "2026-03-12",
+            Reason = "MARKET_REENTRY",
+            CallerContext = "CheckMarketOpenReentry",
+            TimestampUtc = utcNow
+        };
+        if (reentryCmd.ReentryIntentId != "slot1_REENTRY" || reentryCmd.Direction != "Long" || reentryCmd.Quantity != 1)
+            return (false, "SubmitMarketReentryCommand fields not set correctly");
+        if (!(reentryCmd is ExecutionCommandBase))
+            return (false, "SubmitMarketReentryCommand should inherit ExecutionCommandBase");
 
         return (true, null);
     }

@@ -4017,7 +4017,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     riskGate: _riskGate, 
                     executionJournal: _executionJournal, 
                     loggingConfig: _loggingConfig,
-                    engine: this); // Pass engine reference for BarsRequest status checks
+                    engine: this, // Pass engine reference for BarsRequest status checks
+                    isInstrumentBlockedForReentry: inst => IsInstrumentBlockedForReentry(inst),
+                    emergencyFlatten: (inst, utcNow) =>
+                    {
+                        if (_executionAdapter is IIEAOrderExecutor iea)
+                            return iea.EmergencyFlatten(inst, utcNow);
+                        return _executionAdapter?.FlattenEmergency(inst, utcNow) ?? FlattenResult.FailureResult("No adapter", utcNow);
+                    },
+                    isIeaQueueHealthyForInstrument: inst => IsIeaQueueHealthyForInstrument(inst),
+                    eventWriter: _eventWriter);
                 
                 // PHASE 3: Post-creation assertion - verify stream properties match expectations
                 if (newSm.ExecutionInstrument != executionInstrument)
@@ -4534,6 +4543,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// IEA alignment: Check if instrument is blocked for reentry (protective, mismatch, frozen, supervisory, queue poison).
+    /// </summary>
+    private bool IsInstrumentBlockedForReentry(string instrument)
+    {
+        if (IsInstrumentFrozenOrSupervisorilyBlocked(instrument)) return true;
+        var account = _accountName ?? "";
+        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, instrument) && iea.IsInstrumentBlocked)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// IEA alignment: Check if IEA queue is healthy for instrument (not blocked by timeout/overflow).
+    /// Used to decide queued flatten vs emergency flatten fallback.
+    /// </summary>
+    private bool IsIeaQueueHealthyForInstrument(string instrument)
+    {
+        var account = _accountName ?? "";
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, instrument, null);
+        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
+        if (InstrumentExecutionAuthorityRegistry.TryGet(account, execKey, out var iea))
+            return !iea.IsInstrumentBlocked;
+        return true;
     }
 
     /// <summary>

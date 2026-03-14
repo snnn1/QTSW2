@@ -31,6 +31,7 @@ public interface INtActionExecutor
     void ExecuteCancelOrders(NtCancelOrdersCommand cmd);
     void ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd);
     void ExecuteSubmitEntryIntent(NtSubmitEntryIntentCommand cmd);
+    void ExecuteSubmitMarketReentry(NtSubmitMarketReentryCommand cmd);
 }
 
 /// <summary>
@@ -162,6 +163,27 @@ public sealed class NtSubmitEntryIntentCommand : INtAction
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteSubmitEntryIntent(this);
+}
+
+/// <summary>
+/// Command: submit market reentry (post-forced-flatten at market open). Single-direction market order.
+/// </summary>
+public sealed class NtSubmitMarketReentryCommand : INtAction
+{
+    public string CorrelationId { get; }
+    public string ActionType => "SUBMIT_MARKET_REENTRY";
+    public string? IntentId => Command.ReentryIntentId;
+    public string? InstrumentKey => Command.ExecutionInstrument ?? Command.Instrument;
+    public string Reason => Command.Reason ?? "MARKET_REENTRY";
+    public SubmitMarketReentryCommand Command { get; }
+
+    public NtSubmitMarketReentryCommand(string correlationId, SubmitMarketReentryCommand command)
+    {
+        CorrelationId = correlationId;
+        Command = command ?? throw new ArgumentNullException(nameof(command));
+    }
+
+    public void Execute(INtActionExecutor executor) => executor.ExecuteSubmitMarketReentry(this);
 }
 
 /// <summary>

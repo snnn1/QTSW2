@@ -1848,12 +1848,16 @@ class WatchdogAggregator:
                 if not ninja_running:
                     status["engine_alive"] = False
                     status["engine_activity_state"] = "STALLED"
+                    status["engine_activity_classification"] = "STALLED"
                     status["engine_tick_stall_detected"] = True
                     # Invalidate heartbeat so we don't show ENGINE ALIVE at login (stale heartbeat)
                     self._state_manager.invalidate_engine_liveness()
                     # Don't show Connected when process is down (stale ticks may have set it)
                     if status.get("connection_status") == "Connected":
                         status["connection_status"] = "Unknown"
+                    # Don't show DATA FLOWING when engine/NinjaTrader is off (stale bar/tick data in tail)
+                    status["feed_health_classification"] = "DATA_STALLED"
+                    status["data_status"] = "STALLED"
             except Exception as e:
                 logger.debug(f"Process check during status: {e}")
             # Add fill_health from cached metrics (Phase 3: populated by _fill_metrics_loop, no blocking)

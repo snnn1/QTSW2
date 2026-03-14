@@ -221,4 +221,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
     {
         // LIVE adapter stub: No-op (IEA not yet bound)
     }
+
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        // LIVE adapter: Not supported; caller should use EmergencyFlatten fallback
+        return null;
+    }
 }

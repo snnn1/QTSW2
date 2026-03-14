@@ -75,6 +75,9 @@ public sealed partial class InstrumentExecutionAuthority
                 case SubmitEntryIntentCommand submit:
                     HandleSubmitEntryIntentCommand(submit);
                     break;
+                case SubmitMarketReentryCommand reentry:
+                    HandleSubmitMarketReentryCommand(reentry);
+                    break;
                 default:
                     Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_COMMAND_UNKNOWN",
                         new { commandId = command.CommandId, commandType }));
@@ -223,6 +226,49 @@ public sealed partial class InstrumentExecutionAuthority
 
         Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, longIntentId, instrument, "EXECUTION_COMMAND_COMPLETED",
             new { commandId = cmd.CommandId, commandType = nameof(SubmitEntryIntentCommand) }));
+    }
+
+    private void HandleSubmitMarketReentryCommand(SubmitMarketReentryCommand cmd)
+    {
+        if (Executor == null) return;
+        var reentryIntentId = cmd.ReentryIntentId ?? "";
+        var instrument = (cmd.ExecutionInstrument ?? cmd.Instrument ?? "").Trim();
+        var direction = cmd.Direction ?? "";
+        var quantity = cmd.Quantity;
+        if (string.IsNullOrEmpty(reentryIntentId) || string.IsNullOrEmpty(instrument) || string.IsNullOrEmpty(direction) || quantity <= 0)
+        {
+            Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, reentryIntentId, instrument, "EXECUTION_COMMAND_REJECTED",
+                new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), reason = "Missing required fields" }));
+            return;
+        }
+
+        EnsureIntentLifecycleCreated(reentryIntentId);
+        var state = GetIntentLifecycleState(reentryIntentId);
+        if (!IntentLifecycleValidator.IsSubmitEntryIntentAllowed(state))
+        {
+            Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, reentryIntentId, instrument, "EXECUTION_COMMAND_REJECTED",
+                new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), reason = "Intent not in CREATED state", currentState = state.ToString() }));
+            return;
+        }
+
+        var correlationId = $"REENTRY:{reentryIntentId}:{cmd.TimestampUtc:yyyyMMddHHmmssfff}";
+        var ntCmd = new NtSubmitMarketReentryCommand(correlationId, cmd);
+        Executor.EnqueueNtAction(ntCmd);
+
+        TryTransitionIntentLifecycle(reentryIntentId, IntentLifecycleTransition.SUBMIT_ENTRY, cmd.CommandId, cmd.TimestampUtc);
+
+        Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, reentryIntentId, instrument, "EXECUTION_COMMAND_COMPLETED",
+            new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand) }));
+        _eventWriter?.Emit(new CanonicalExecutionEvent
+        {
+            TimestampUtc = cmd.TimestampUtc.ToString("o"),
+            Instrument = instrument,
+            IntentId = reentryIntentId,
+            CommandId = cmd.CommandId,
+            EventType = ExecutionEventTypes.COMMAND_COMPLETED,
+            Source = "IEA",
+            Payload = new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), direction, quantity }
+        });
     }
 }
 #endif

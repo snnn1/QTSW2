@@ -106,6 +106,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Execution command tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("IEA_ALIGNMENT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ForcedFlattenSlotExpiryReentryAlignmentTests.RunIeaAlignmentTests();
+        Console.WriteLine(pass ? "PASS: IEA alignment tests (forced flatten, slot expiry, reentry)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("INTENT_LIFECYCLE", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = IntentLifecycleTests.RunIntentLifecycleTests();

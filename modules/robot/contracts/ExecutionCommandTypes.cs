@@ -42,6 +42,20 @@ public sealed class CancelIntentOrdersCommand : ExecutionCommandBase
 {
 }
 
+/// <summary>Request to submit market reentry (post-forced-flatten at market open). Single-direction market order.</summary>
+public sealed class SubmitMarketReentryCommand : ExecutionCommandBase
+{
+    public string? Stream { get; set; }
+    public string? Session { get; set; }
+    public string? SlotTimeChicago { get; set; }
+    public string? TradingDate { get; set; }
+    public string? ExecutionInstrument { get; set; }
+    public string? ReentryIntentId { get; set; }
+    public string? OriginalIntentId { get; set; }
+    public string? Direction { get; set; }
+    public int Quantity { get; set; }
+}
+
 /// <summary>Request to submit entry intent (stop brackets at range lock). Strategy layer emits this; IEA routes to entry submission.</summary>
 public sealed class SubmitEntryIntentCommand : ExecutionCommandBase
 {

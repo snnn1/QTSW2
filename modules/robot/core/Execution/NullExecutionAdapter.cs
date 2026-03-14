@@ -164,4 +164,13 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
     {
         // DRYRUN: No-op
     }
+
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "SESSION_CLOSE_FLATTEN_IMMEDIATE_DRYRUN", new
+        {
+            note = "DRYRUN mode - same-cycle flatten simulated"
+        }));
+        return FlattenResult.SuccessResult(utcNow);
+    }
 }
