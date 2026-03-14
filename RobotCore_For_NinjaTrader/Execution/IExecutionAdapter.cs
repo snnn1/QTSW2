@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -7,6 +8,10 @@ namespace QTSW2.Robot.Core.Execution;
 /// Execution adapter interface for broker-agnostic order placement.
 /// RobotEngine calls adapters when it wants to place/modify orders.
 /// Adapters handle broker-specific details.
+///
+/// AUDIT RULE: Strategy layers should NOT call adapter.Flatten, adapter.SubmitEntryOrders,
+/// or adapter.CancelOrders directly. Use EnqueueExecutionCommand instead so execution flows
+/// through the IEA as the single authority. The adapter is transport-only; IEA orchestrates.
 /// </summary>
 public interface IExecutionAdapter
 {
@@ -153,6 +158,22 @@ public interface IExecutionAdapter
     /// Non-IEA path only; IEA uses queue-based retry.
     /// </summary>
     void ProcessPendingUnresolvedExecutions();
+
+    /// <summary>
+    /// Phase 3: Request recovery for instrument. Routes to IEA when bound. No-op for adapters without IEA.
+    /// </summary>
+    void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Phase 5: Request supervisory action for instrument. Routes to IEA when bound. No-op for adapters without IEA.
+    /// </summary>
+    void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Enqueue execution command for IEA processing. Strategy layers should use this instead of calling
+    /// adapter.Flatten/SubmitOrders/CancelOrders directly. Adapters with IEA forward to IEA; others no-op.
+    /// </summary>
+    void EnqueueExecutionCommand(ExecutionCommandBase command);
 }
 
 /// <summary>

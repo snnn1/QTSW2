@@ -16,7 +16,7 @@ import asyncio
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 import pytz
 
@@ -40,10 +40,17 @@ from .config import (
     STATUS_SNAPSHOTS_MAX_ENTRIES,
     TAIL_LINE_COUNT,
     ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS,
+    ENGINE_TICK_STALL_THRESHOLD_SECONDS,
+    RECOVERY_LOOP_COUNT_THRESHOLD,
+    RECOVERY_LOOP_WINDOW_SECONDS,
     DEGRADATION_LOOP_THRESHOLD_MS,
     DEGRADATION_CONSECUTIVE_CYCLES,
     INGESTION_STATS_INTERVAL_SECONDS,
     EVENTS_CACHE_TTL_SECONDS,
+    FEED_INGESTION_DELAY_THRESHOLD_SECONDS,
+    WATCHDOG_LOOP_SLOW_THRESHOLD_MS,
+    ANOMALY_RATE_THRESHOLD,
+    ANOMALY_RATE_WINDOW_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -304,8 +311,8 @@ class WatchdogAggregator:
         self._running = False
         
         # In-memory ring buffer for important WebSocket events
-        # Buffer size: 200 events (configurable)
-        self._important_events_buffer: deque = deque(maxlen=200)
+        # Buffer size: 1000 events (was 200; increase to reduce overflow under anomaly spikes)
+        self._important_events_buffer: deque = deque(maxlen=1000)
         self._event_seq_counter: int = 0  # Monotonic sequence ID counter
         self._last_hydrate_utc: Optional[datetime] = None  # Throttle journal hydrate in get_active_intents
         self._last_slot_journal_hydrate_utc: Optional[datetime] = None  # Throttle slot journal hydrate in get_stream_states
@@ -327,12 +334,34 @@ class WatchdogAggregator:
         # Log-growth monitoring
         self._log_file_size_last: Optional[int] = None
         self._log_file_stall_started_utc: Optional[datetime] = None
+
+        # Phase 3: fill_metrics cache - populated by background loop, avoids blocking /status
+        self._fill_metrics_cache: Optional[Dict] = None
+
+        # Phase 9: Recovery loop - edge-triggered, avoid repeat alerts
+        self._recovery_loop_alerted: bool = False
+
+        # Feed/ingestion health - store latest for alert checks
+        self._last_ingestion_lag_seconds: Optional[float] = None
+        self._last_loop_duration_ms: Optional[float] = None
+
+        # Anomaly rate guardrail - timestamps of anomaly events in window
+        self._anomaly_timestamps: deque = deque(maxlen=500)
+        # Dedupe (event_type, ts_iso_second) to avoid double-count on reprocess
+        self._anomaly_dedupe_queue: deque = deque(maxlen=500)
+        # When cursor save fails, skip anomaly counting next cycle to avoid double-count on reprocess
+        self._skip_anomaly_counting: bool = False
     
     async def start(self):
         """Start the aggregator service."""
         self._running = True
         logger.info("Watchdog aggregator started")
-        
+
+        # CRITICAL: Invalidate liveness at startup so we never trust ticks from the tail.
+        # Ticks in the tail are from before we started; accepting them causes false ENGINE ALIVE
+        # when NinjaTrader is open at login (strategy disabled). Sets _last_invalidate_utc = now.
+        self._state_manager.invalidate_engine_liveness()
+
         # Load cursor state
         cursor = self._cursor_manager.load_cursor()
         logger.info(f"Loaded cursor state: {cursor}")
@@ -359,7 +388,8 @@ class WatchdogAggregator:
         self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
 
         # Init engine tick from snapshot
-        ticks = [e for e in reversed(startup_snapshot) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE")]
+        # Reject ticks that predate startup (_last_invalidate_utc) - tail has old events only.
+        ticks = [e for e in reversed(startup_snapshot) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT")]
         if ticks:
             most_recent_tick = ticks[0]
             ts_str = most_recent_tick.get("timestamp_utc")
@@ -369,7 +399,10 @@ class WatchdogAggregator:
                     if tick_ts.tzinfo is None:
                         tick_ts = tick_ts.replace(tzinfo=timezone.utc)
                     age_sec = (datetime.now(timezone.utc) - tick_ts).total_seconds()
-                    if age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
+                    last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
+                    if last_inv and tick_ts <= last_inv:
+                        logger.info(f"Skipped tick on init: tick predates startup (tick_ts <= _last_invalidate_utc)")
+                    elif age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
                         self._event_processor.process_event(most_recent_tick)
                         logger.info(f"Initialized engine tick from snapshot: age={age_sec:.0f}s")
                     else:
@@ -489,6 +522,9 @@ class WatchdogAggregator:
 
         # Start background task for process monitor
         asyncio.create_task(self._process_monitor_loop())
+
+        # Phase 3: Start fill_metrics background refresh (60s) - avoids blocking /status
+        asyncio.create_task(self._fill_metrics_loop())
     
     async def stop(self):
         """Stop the aggregator service."""
@@ -556,6 +592,24 @@ class WatchdogAggregator:
                     aggregate_stream_pnl(rows, stream_id)
                     for stream_id, rows in streams_dict.items()
                 ]
+                # Include enabled streams with $0 PnL so frontend shows all streams (not just those with trades)
+                enabled = self._state_manager.get_enabled_streams() or []
+                if enabled:
+                    seen = {s["stream"] for s in aggregated_streams}
+                    for stream_id in enabled:
+                        if stream_id not in seen:
+                            aggregated_streams.append({
+                                "stream": stream_id,
+                                "realized_pnl": 0.0,
+                                "open_positions": 0,
+                                "total_costs_realized": 0.0,
+                                "intent_count": 0,
+                                "closed_count": 0,
+                                "partial_count": 0,
+                                "open_count": 0,
+                                "pnl_confidence": "LOW",
+                            })
+                            seen.add(stream_id)
                 
                 return {
                     "trading_date": trading_date,
@@ -593,7 +647,9 @@ class WatchdogAggregator:
             from .pnl.pnl_calculator import compute_intent_realized_pnl, aggregate_stream_pnl
 
             ledger_builder = LedgerBuilder()
-            ledger_rows = ledger_builder.build_ledger_rows(trading_date)
+            # skip_invalid_intents=True: show partial journal when some intents have invariant
+            # violations (e.g. exit_qty > entry_qty from overfill/corruption) so user sees other streams
+            ledger_rows = ledger_builder.build_ledger_rows(trading_date, skip_invalid_intents=True)
             for row in ledger_rows:
                 compute_intent_realized_pnl(row)
 
@@ -840,7 +896,7 @@ class WatchdogAggregator:
                         e for e in self._state_manager._intent_exposures.values()
                         if getattr(e, "state", "") == "ACTIVE"
                     ])
-                    last_tick = self._state_manager._last_engine_tick_utc
+                    last_tick = getattr(self._state_manager, "_last_engine_heartbeat", None) or self._state_manager._last_engine_tick_utc
                     self._process_monitor.check(market_open, active_intent_count, last_tick)
 
                     # Grace: no process-down alert in first 60s
@@ -861,6 +917,37 @@ class WatchdogAggregator:
                 logger.error(f"Process monitor loop error: {e}", exc_info=True)
             await asyncio.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
 
+    async def _fill_metrics_loop(self):
+        """Background refresh of fill_metrics every 60s. Avoids blocking GET /status."""
+        from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
+
+        while self._running:
+            try:
+                trading_date = self._state_manager.get_trading_date()
+                if not trading_date:
+                    trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+                loop = asyncio.get_event_loop()
+                metrics = await loop.run_in_executor(
+                    None, lambda: compute_fill_metrics(trading_date)
+                )
+                self._fill_metrics_cache = metrics
+            except Exception as e:
+                logger.debug(f"Fill metrics refresh failed: {e}")
+                # Keep previous cache; on first run use placeholder
+                if self._fill_metrics_cache is None:
+                    try:
+                        td = self._state_manager.get_trading_date() or compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+                    except Exception:
+                        td = ""
+                    self._fill_metrics_cache = {
+                        "trading_date": td,
+                        "total_fills": 0, "mapped_fills": 0, "unmapped_fills": 0,
+                        "null_trading_date_fills": 0, "fill_coverage_rate": 1.0,
+                        "unmapped_rate": 0.0, "null_trading_date_rate": 0.0,
+                        "missing_execution_sequence_count": 0, "missing_fill_group_id_count": 0,
+                    }
+            await asyncio.sleep(60)
+
     def _check_alert_conditions(self):
         """Check heartbeat and connection status; raise alerts when conditions met."""
         if not self._notification_service:
@@ -879,7 +966,7 @@ class WatchdogAggregator:
             e for e in self._state_manager._intent_exposures.values()
             if getattr(e, "state", "") == "ACTIVE"
         ])
-        last_tick = self._state_manager._last_engine_tick_utc
+        last_tick = getattr(self._state_manager, "_last_engine_heartbeat", None) or self._state_manager._last_engine_tick_utc
         window_open = is_supervision_window_open(market_open, active_intent_count, last_tick, now_utc)
 
         if not window_open:
@@ -966,6 +1053,71 @@ class WatchdogAggregator:
                     "Connection to broker restored.",
                 )
             self._notification_service.resolve_alert("CONNECTION_LOST_SUSTAINED")
+
+        # Phase 9: RECOVERY_LOOP_DETECTED - derived from DISCONNECT_RECOVERY_STARTED count in window
+        loop_info = self._state_manager.check_recovery_loop(now_utc)
+        if loop_info and not self._recovery_loop_alerted:
+            self._recovery_loop_alerted = True
+            self._add_derived_event_to_buffer("RECOVERY_LOOP_DETECTED", loop_info)
+            self._notification_service.raise_alert(
+                alert_type="RECOVERY_LOOP_DETECTED",
+                severity="high",
+                context=loop_info,
+                dedupe_key="RECOVERY_LOOP_DETECTED",
+                min_resend_interval_seconds=300,
+            )
+        elif not loop_info:
+            self._recovery_loop_alerted = False
+            self._notification_service.resolve_alert("RECOVERY_LOOP_DETECTED")
+
+        # Feed/Ingestion health: FEED_INGESTION_DELAY, WATCHDOG_LOOP_SLOW
+        if self._last_ingestion_lag_seconds is not None and self._last_ingestion_lag_seconds > FEED_INGESTION_DELAY_THRESHOLD_SECONDS:
+            self._notification_service.raise_alert(
+                alert_type="FEED_INGESTION_DELAY",
+                severity="high",
+                context={"lag_seconds": round(self._last_ingestion_lag_seconds, 1), "threshold_seconds": FEED_INGESTION_DELAY_THRESHOLD_SECONDS},
+                dedupe_key="FEED_INGESTION_DELAY",
+                min_resend_interval_seconds=120,
+            )
+        else:
+            self._notification_service.resolve_alert("FEED_INGESTION_DELAY")
+
+        if self._last_loop_duration_ms is not None and self._last_loop_duration_ms > WATCHDOG_LOOP_SLOW_THRESHOLD_MS:
+            self._notification_service.raise_alert(
+                alert_type="WATCHDOG_LOOP_SLOW",
+                severity="medium",
+                context={"loop_duration_ms": round(self._last_loop_duration_ms, 1), "threshold_ms": WATCHDOG_LOOP_SLOW_THRESHOLD_MS},
+                dedupe_key="WATCHDOG_LOOP_SLOW",
+                min_resend_interval_seconds=120,
+            )
+        else:
+            self._notification_service.resolve_alert("WATCHDOG_LOOP_SLOW")
+
+        # Anomaly rate guardrail: ANOMALY_RATE_EXCEEDED
+        cutoff = now_utc - timedelta(seconds=ANOMALY_RATE_WINDOW_SECONDS)
+        self._prune_anomaly_window(cutoff)
+        if len(self._anomaly_timestamps) >= ANOMALY_RATE_THRESHOLD:
+            self._notification_service.raise_alert(
+                alert_type="ANOMALY_RATE_EXCEEDED",
+                severity="high",
+                context={"count": len(self._anomaly_timestamps), "window_seconds": ANOMALY_RATE_WINDOW_SECONDS, "threshold": ANOMALY_RATE_THRESHOLD},
+                dedupe_key="ANOMALY_RATE_EXCEEDED",
+                min_resend_interval_seconds=300,
+            )
+        else:
+            self._notification_service.resolve_alert("ANOMALY_RATE_EXCEEDED")
+
+        # Phase 7: ORDER_STUCK_DETECTED - derived from ORDER_SUBMIT_SUCCESS without fill/cancel within threshold
+        stuck_orders = self._state_manager.check_stuck_orders(now_utc)
+        for stuck in stuck_orders:
+            self._add_derived_event_to_buffer("ORDER_STUCK_DETECTED", stuck)
+            self._notification_service.raise_alert(
+                alert_type="ORDER_STUCK_DETECTED",
+                severity="medium",
+                context=stuck,
+                dedupe_key=f"ORDER_STUCK_DETECTED:{stuck.get('broker_order_id', '')}",
+                min_resend_interval_seconds=120,
+            )
 
         # LOG_FILE_STALLED: feed file size unchanged for 60s (logging deadlock, file handle lost, NT not flushing)
         if LOG_GROWTH_MONITOR_FILE.exists():
@@ -1070,18 +1222,21 @@ class WatchdogAggregator:
                 self._rebuild_stream_states_from_snapshot(parsed_events)
             
             # Check if connection status needs initialization - rebuild from recent events
-            # This handles initialization or state loss scenarios
-            # Note: connection_status defaults to "Unknown" until we receive a connection event
-            # We rebuild if status is Unknown OR if we've never seen a connection event
+            # Skip when we've invalidated (no heartbeat): tail has stale CONNECTION_LOST that would
+            # overwrite Unknown with ConnectionLost, causing false BROKER DISCONNECTED at login.
+            last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
+            has_heartbeat = self._state_manager._last_engine_heartbeat is not None
             if (
-                self._state_manager._connection_status == "Unknown"
-                or self._state_manager._last_connection_event_utc is None
+                (self._state_manager._connection_status == "Unknown"
+                 or self._state_manager._last_connection_event_utc is None)
+                and not (last_inv and not has_heartbeat)
             ):
                 logger.info("Connection status needs initialization - rebuilding from snapshot")
                 self._rebuild_connection_status_from_snapshot(parsed_events)
             
-            # Extract ticks from snapshot (no second read)
-            ticks = [e for e in reversed(parsed_events) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE")]
+            # CRITICAL: Always update liveness from most recent tick in tail (runs every cycle, even when degraded).
+            # This prevents false ENGINE STALLED when degraded mode skips full event processing.
+            ticks = [e for e in reversed(parsed_events) if e.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT")]
             if ticks:
                 most_recent_tick = ticks[0]
                 tick_ts_str = most_recent_tick.get("timestamp_utc")
@@ -1091,11 +1246,23 @@ class WatchdogAggregator:
                         if tick_ts.tzinfo is None:
                             tick_ts = tick_ts.replace(tzinfo=timezone.utc)
                         tick_age_sec = (cycle_start_utc - tick_ts).total_seconds()
-                        if tick_age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
-                            current_tick_utc = self._state_manager._last_engine_tick_utc
-                            if not current_tick_utc or tick_ts > current_tick_utc:
-                                self._event_processor.process_event(most_recent_tick)
-                                logger.info(f"✅ Updated liveness from snapshot: tick_age={tick_age_sec:.1f}s")
+                        current_tick_utc = self._state_manager._last_engine_tick_utc
+                        # Update when: (a) no tick yet, or (b) this tick is newer than current
+                        # For init: also require tick_age <= 15s to avoid stale ticks from previous run
+                        # For ongoing: require tick_age <= 60s so stale ticks don't refresh heartbeat at login
+                        # After invalidate: reject ticks that predate invalidation (tail has old events)
+                        should_update = (not current_tick_utc or tick_ts > current_tick_utc)
+                        if not current_tick_utc and tick_age_sec > ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
+                            should_update = False  # Init: reject stale ticks
+                        if current_tick_utc and tick_age_sec > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
+                            should_update = False  # Ongoing: reject stale ticks (prevents green at login)
+                        last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
+                        if last_inv and tick_ts <= last_inv:
+                            should_update = False  # Reject ticks from before we invalidated (user was at login)
+                        if should_update:
+                            self._event_processor.process_event(most_recent_tick)
+                            if tick_age_sec <= 30 or (current_tick_utc and (tick_ts - current_tick_utc).total_seconds() > 60):
+                                logger.debug(f"Updated liveness from tail: tick_age={tick_age_sec:.1f}s")
                     except Exception as e:
                         logger.warning(f"Failed to parse tick timestamp: {e}")
 
@@ -1134,9 +1301,28 @@ class WatchdogAggregator:
                         cursor_events.append(ev)
                 cursor_events.sort(key=lambda e: e.get("timestamp_utc", ""))
 
+                # Ticks (ENGINE_TICK_CALLSITE, ENGINE_ALIVE) are handled ONLY by the snapshot path above.
+                # When invalidated (no heartbeat): also skip recovery/connection-lost events - they would
+                # set FAIL-CLOSED and BROKER DISCONNECTED from stale tail (bug at login).
+                tick_types = ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT")
+                stale_state_types = (
+                    "DISCONNECT_FAIL_CLOSED_ENTERED", "DISCONNECT_RECOVERY_ABORTED",
+                    "CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED",
+                )
                 for ev in cursor_events:
+                    if ev.get("event_type") in tick_types:
+                        continue  # Skip - snapshot path handles with proper checks
+                    if last_inv and not has_heartbeat and ev.get("event_type") in stale_state_types:
+                        continue  # Skip stale recovery/connection-lost when invalidated
                     self._event_processor.process_event(ev)
                     self._add_to_ring_buffer_if_important(ev)
+
+                # Phase 8: Drain latency spike events (derived from EXECUTION_FILLED processing)
+                for derived in self._state_manager.drain_pending_derived_events():
+                    event_type = derived.get("event_type")
+                    data = derived.get("data", derived)
+                    if event_type:
+                        self._add_derived_event_to_buffer(event_type, data if isinstance(data, dict) else {})
 
                 if cursor_events:
                     run_ids_seen = {}
@@ -1146,7 +1332,8 @@ class WatchdogAggregator:
                             run_ids_seen[rid] = seq
                     for rid, seq in run_ids_seen.items():
                         cursor[rid] = seq
-                    self._cursor_manager.save_cursor(cursor)
+                    cursor_saved = self._cursor_manager.save_cursor(cursor)
+                    self._skip_anomaly_counting = not cursor_saved
 
             loop_duration_ms = (time.perf_counter() - cycle_start) * 1000
             ingestion_lag_seconds = (cycle_start_utc - newest_event_ts).total_seconds() if newest_event_ts else None
@@ -1160,10 +1347,23 @@ class WatchdogAggregator:
                 newest_event_ts=newest_event_ts,
                 loop_duration_ms=loop_duration_ms,
             )
+            self._last_ingestion_lag_seconds = ingestion_lag_seconds
+            self._last_loop_duration_ms = loop_duration_ms
 
             now_utc = datetime.now(timezone.utc)
             if self._ingestion_telemetry.should_emit_stats(now_utc):
                 stats = self._ingestion_telemetry.emit_stats(now_utc, ingestion_lag_seconds)
+                # Phase 8: Add status latency for observability
+                status_start = time.perf_counter()
+                try:
+                    self.get_watchdog_status()
+                except Exception:
+                    pass
+                stats["status_latency_ms"] = round((time.perf_counter() - status_start) * 1000, 2)
+                stats["WATCHDOG_LOOP_DURATION"] = stats.get("avg_loop_duration_ms")
+                stats["WATCHDOG_EVENT_INGEST_RATE"] = stats.get("lines_parsed_per_second")
+                stats["WATCHDOG_FEED_LAG"] = stats.get("ingestion_lag_seconds")
+                stats["WATCHDOG_STATUS_LATENCY"] = stats.get("status_latency_ms")
                 logger.info(f"WATCHDOG_INGESTION_STATS: {stats}")
         
         except Exception as e:
@@ -1246,7 +1446,7 @@ class WatchdogAggregator:
                             
                             event = json.loads(line)
                             event_type = event.get("event_type")
-                            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
+                            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT"):
                                 ticks.append(event)
                                 if len(ticks) >= max_events:
                                     break
@@ -1260,7 +1460,7 @@ class WatchdogAggregator:
                         line = buffer.decode('utf-8-sig').strip()
                         if line:
                             event = json.loads(line)
-                            if event.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
+                            if event.get("event_type") in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT"):
                                 ticks.append(event)
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         logger.debug(f"Skipping malformed JSON in buffer: {e}")
@@ -1560,6 +1760,10 @@ class WatchdogAggregator:
         INGESTION: Cached for EVENTS_CACHE_TTL_SECONDS. Multiple clients within TTL
         share one disk read to avoid linear I/O scaling.
         
+        Merges feed tail + ring buffer so derived anomalies (ORDER_STUCK_DETECTED,
+        EXECUTION_LATENCY_SPIKE_DETECTED, RECOVERY_LOOP_DETECTED) appear in REST
+        for CLI tools, debugging scripts, and fallback clients.
+        
         Filters out noisy event types (tick heartbeats, bar heartbeats, diagnostics)
         to reduce verbosity - same philosophy as WebSocket important_events buffer.
         """
@@ -1578,8 +1782,38 @@ class WatchdogAggregator:
 
         # Filter out noisy event types for Live Event Feed
         filtered = self._filter_events_for_live_feed(all_events)
-        filtered.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("timestamp_chicago", ""))
-        return filtered[-200:] if len(filtered) > 200 else filtered
+        # Filter by run_id to prevent feed swapping when multiple instances write - show only
+        # events from the primary run (most recent by timestamp)
+        if run_id:
+            filtered = [e for e in filtered if e.get("run_id") == run_id]
+
+        # Merge ring buffer (derived anomalies) so REST clients see ORDER_STUCK_DETECTED,
+        # EXECUTION_LATENCY_SPIKE_DETECTED, RECOVERY_LOOP_DETECTED
+        ring_events = self._ring_buffer_events_for_rest()
+        merged = filtered + ring_events
+        merged.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("ts_utc", "") or e.get("timestamp_chicago", ""))
+        return merged[-300:] if len(merged) > 300 else merged
+
+    def _ring_buffer_events_for_rest(self) -> List[Dict]:
+        """Convert ring buffer DERIVED events only to REST-compatible format.
+        Excludes feed events (already in feed tail) to avoid duplicates."""
+        out = []
+        for ev in self._important_events_buffer:
+            # Only include derived events: run_id is None or event_id starts with "watchdog:"
+            event_id = ev.get("event_id") or ""
+            run_id = ev.get("run_id")
+            if run_id is not None and not event_id.startswith("watchdog:"):
+                continue  # Feed event, already in filtered
+            out.append({
+                "event_id": ev.get("event_id"),
+                "event_seq": ev.get("event_seq", ev.get("seq", 0)),
+                "event_type": ev.get("type", ""),
+                "timestamp_utc": ev.get("ts_utc", ""),
+                "run_id": ev.get("run_id"),
+                "stream_id": ev.get("stream_id"),
+                "data": ev.get("data", {}),
+            })
+        return out
 
     def _read_events_tail(self, n: int) -> List[Dict]:
         """Read last N lines from feed and parse to events. No cache."""
@@ -1604,23 +1838,35 @@ class WatchdogAggregator:
         try:
             status = self._state_manager.compute_watchdog_status()
             status["timestamp_chicago"] = datetime.now(CHICAGO_TZ).isoformat()
-            # Add fill_health from execution logging metrics (today's trading date)
-            # Run compute_fill_metrics with 8s timeout to avoid blocking status API on large log scans
+
+            # Process check: when NinjaTrader is not running, override engine_alive and connection
+            # to prevent false ENGINE ALIVE / BROKER CONNECTED from stale feed ticks
+            try:
+                from .process_monitor import check_ninjatrader_running
+                from .config import PROCESS_MONITOR_PROCESS_NAME
+                ninja_running, _ = check_ninjatrader_running(PROCESS_MONITOR_PROCESS_NAME)
+                if not ninja_running:
+                    status["engine_alive"] = False
+                    status["engine_activity_state"] = "STALLED"
+                    status["engine_tick_stall_detected"] = True
+                    # Invalidate heartbeat so we don't show ENGINE ALIVE at login (stale heartbeat)
+                    self._state_manager.invalidate_engine_liveness()
+                    # Don't show Connected when process is down (stale ticks may have set it)
+                    if status.get("connection_status") == "Connected":
+                        status["connection_status"] = "Unknown"
+            except Exception as e:
+                logger.debug(f"Process check during status: {e}")
+            # Add fill_health from cached metrics (Phase 3: populated by _fill_metrics_loop, no blocking)
             try:
                 trading_date = self._state_manager.get_trading_date()
                 if not trading_date:
                     trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
-                from modules.watchdog.pnl.fill_metrics import compute_fill_metrics
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(compute_fill_metrics, trading_date)
-                    try:
-                        fill_metrics = fut.result(timeout=8)
-                    except concurrent.futures.TimeoutError:
-                        fill_metrics = {"trading_date": trading_date, "total_fills": 0, "mapped_fills": 0,
-                            "unmapped_fills": 0, "null_trading_date_fills": 0, "fill_coverage_rate": 1.0,
-                            "unmapped_rate": 0.0, "null_trading_date_rate": 0.0,
-                            "missing_execution_sequence_count": 0, "missing_fill_group_id_count": 0}
+                fill_metrics = self._fill_metrics_cache
+                if fill_metrics is None:
+                    fill_metrics = {"trading_date": trading_date, "total_fills": 0, "mapped_fills": 0,
+                        "unmapped_fills": 0, "null_trading_date_fills": 0, "fill_coverage_rate": 1.0,
+                        "unmapped_rate": 0.0, "null_trading_date_rate": 0.0,
+                        "missing_execution_sequence_count": 0, "missing_fill_group_id_count": 0}
                 # Event-based counts from state (last 1 hour)
                 broker_flatten = status.get("broker_flatten_fill_count", 0)
                 unknown_order = status.get("execution_update_unknown_order_critical_count", 0)
@@ -1655,6 +1901,33 @@ class WatchdogAggregator:
                 status["fill_health"] = None
                 if "trading_date" not in status:
                     status["trading_date"] = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+            # Execution Integrity panel: anomaly counts from ring buffer (last 200 events)
+            anomaly_counts = {
+                "ghost_fills": 0,
+                "protective_drift": 0,
+                "orphan_orders": 0,
+                "duplicate_orders": 0,
+                "position_drift": 0,
+                "exposure_integrity": 0,
+                "stuck_orders": 0,
+                "latency_spikes": 0,
+                "recovery_loops": 0,
+                "order_lifecycle_invalid": 0,
+            }
+            for ev in self._important_events_buffer:
+                t = ev.get("type", "")
+                if t == "EXECUTION_GHOST_FILL_DETECTED": anomaly_counts["ghost_fills"] += 1
+                elif t == "PROTECTIVE_DRIFT_DETECTED": anomaly_counts["protective_drift"] += 1
+                elif t in ("ORPHAN_ORDER_DETECTED", "MANUAL_OR_EXTERNAL_ORDER_DETECTED", "UNOWNED_LIVE_ORDER_DETECTED"): anomaly_counts["orphan_orders"] += 1
+                elif t == "DUPLICATE_ORDER_SUBMISSION_DETECTED": anomaly_counts["duplicate_orders"] += 1
+                elif t == "POSITION_DRIFT_DETECTED": anomaly_counts["position_drift"] += 1
+                elif t == "EXPOSURE_INTEGRITY_VIOLATION": anomaly_counts["exposure_integrity"] += 1
+                elif t == "ORDER_STUCK_DETECTED": anomaly_counts["stuck_orders"] += 1
+                elif t == "EXECUTION_LATENCY_SPIKE_DETECTED": anomaly_counts["latency_spikes"] += 1
+                elif t == "RECOVERY_LOOP_DETECTED": anomaly_counts["recovery_loops"] += 1
+                elif t == "ORDER_LIFECYCLE_TRANSITION_INVALID": anomaly_counts["order_lifecycle_invalid"] += 1
+            status["execution_integrity"] = anomaly_counts
+
             # Phase 1: include active alerts for UI
             if self._notification_service:
                 try:
@@ -1764,15 +2037,32 @@ class WatchdogAggregator:
         return run_id
 
     def _get_run_id_from_most_recent_feed_event(self) -> Optional[str]:
-        """Get run_id from the last event in frontend_feed.jsonl (most recent by time)."""
-        import json
+        """
+        Get run_id from the event with the most recent timestamp in the feed tail.
+        Uses last 100 lines (not just last line) to avoid flip-flopping when multiple
+        NinjaTrader instances write interleaved events - the last line can alternate
+        between run_ids; picking by timestamp stabilizes the feed.
+        """
         if not FRONTEND_FEED_FILE.exists():
             return None
         try:
-            lines = _read_last_lines(FRONTEND_FEED_FILE, 1)
-            if lines:
-                event = json.loads(lines[-1])
-                return event.get("run_id")
+            lines = _read_last_lines(FRONTEND_FEED_FILE, 100)
+            best_run_id = None
+            best_ts = ""
+            for line_str in lines:
+                line = line_str.strip() if isinstance(line_str, str) else str(line_str)
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    run_id = event.get("run_id")
+                    ts = event.get("timestamp_utc") or event.get("timestamp_chicago") or ""
+                    if run_id and ts and ts > best_ts:
+                        best_run_id = run_id
+                        best_ts = ts
+                except json.JSONDecodeError:
+                    continue
+            return best_run_id
         except Exception as e:
             logger.debug(f"Could not get run_id from feed tail: {e}")
         return None
@@ -2087,6 +2377,56 @@ class WatchdogAggregator:
             "timetable_unavailable": timetable_unavailable  # Flag for UI warning banner
         }
     
+    def _add_derived_event_to_buffer(self, event_type: str, data: Dict) -> None:
+        """Phase 9: Add watchdog-derived event to ring buffer (e.g. RECOVERY_LOOP_DETECTED)."""
+        if event_type in (
+            "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "RECOVERY_LOOP_DETECTED",
+        ) and not self._skip_anomaly_counting:
+            self._record_anomaly_timestamp(event_type, datetime.now(timezone.utc))
+        self._event_seq_counter += 1
+        now = datetime.now(timezone.utc)
+        ws_event = {
+            "seq": self._event_seq_counter,
+            "event_id": f"watchdog:{event_type}:{now.timestamp()}",
+            "event_seq": self._event_seq_counter,
+            "type": event_type,
+            "ts_utc": now.isoformat(),
+            "run_id": None,
+            "stream_id": None,
+            "severity": self._determine_severity(event_type),
+            "data": data,
+        }
+        self._append_to_ring_buffer(ws_event)
+
+    def _append_to_ring_buffer(self, ws_event: Dict) -> None:
+        """Append to ring buffer; log when buffer is full and evicting oldest event."""
+        buf = self._important_events_buffer
+        if len(buf) == buf.maxlen:
+            evicted = buf[0]
+            logger.warning(
+                f"WATCHDOG_RING_BUFFER_OVERFLOW: evicting event type={evicted.get('type', '')} "
+                f"seq={evicted.get('seq', 0)} (buffer_size={buf.maxlen})"
+            )
+        buf.append(ws_event)
+
+    def _record_anomaly_timestamp(self, event_type: str, ts: datetime) -> None:
+        """Record anomaly for rate guardrail with dedupe. Skips if _skip_anomaly_counting or duplicate."""
+        if self._skip_anomaly_counting:
+            return
+        key = (event_type, ts.strftime("%Y-%m-%dT%H:%M:%S"))
+        seen = {k for (_, k) in self._anomaly_dedupe_queue}
+        if key in seen:
+            return
+        self._anomaly_timestamps.append(ts)
+        self._anomaly_dedupe_queue.append((ts, key))
+
+    def _prune_anomaly_window(self, cutoff: datetime) -> None:
+        """Remove timestamps and dedupe keys older than cutoff."""
+        while self._anomaly_timestamps and self._anomaly_timestamps[0] < cutoff:
+            self._anomaly_timestamps.popleft()
+            if self._anomaly_dedupe_queue:
+                self._anomaly_dedupe_queue.popleft()
+
     def _add_to_ring_buffer_if_important(self, event: Dict) -> None:
         """
         Add event to ring buffer if it's an important event type.
@@ -2111,6 +2451,20 @@ class WatchdogAggregator:
             "KILL_SWITCH_ACTIVE",
             "EXECUTION_BLOCKED",
             "EXECUTION_ALLOWED",
+            # Execution anomaly monitoring (Phase 10)
+            "EXECUTION_GHOST_FILL_DETECTED",
+            "PROTECTIVE_DRIFT_DETECTED",
+            "ORPHAN_ORDER_DETECTED",
+            "MANUAL_OR_EXTERNAL_ORDER_DETECTED",  # Maps to orphan anomaly
+            "UNOWNED_LIVE_ORDER_DETECTED",  # Maps to orphan anomaly
+            "DUPLICATE_ORDER_SUBMISSION_DETECTED",
+            "POSITION_DRIFT_DETECTED",
+            "ORDER_STUCK_DETECTED",
+            "EXECUTION_LATENCY_SPIKE_DETECTED",
+            "RECOVERY_LOOP_DETECTED",
+            "RECONCILIATION_QTY_MISMATCH",
+            "EXPOSURE_INTEGRITY_VIOLATION",
+            "ORDER_LIFECYCLE_TRANSITION_INVALID",
             # Note: DATA_STALL_DETECTED, UNPROTECTED_POSITION_DETECTED are computed, not feed events
             # Note: RISK_GATE_CHANGED, TRADING_ALLOWED_CHANGED are derived, can be added later
         }
@@ -2134,25 +2488,40 @@ class WatchdogAggregator:
                 return  # No violations, skip
         
         if event_type in important_types:
+            # Record anomaly for rate guardrail (subset of important types)
+            anomaly_types = {
+                "EXECUTION_GHOST_FILL_DETECTED", "PROTECTIVE_DRIFT_DETECTED", "ORPHAN_ORDER_DETECTED",
+                "MANUAL_OR_EXTERNAL_ORDER_DETECTED", "UNOWNED_LIVE_ORDER_DETECTED",
+                "DUPLICATE_ORDER_SUBMISSION_DETECTED", "POSITION_DRIFT_DETECTED", "EXPOSURE_INTEGRITY_VIOLATION",
+                "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "RECOVERY_LOOP_DETECTED",
+                "RECONCILIATION_QTY_MISMATCH", "ORDER_LIFECYCLE_TRANSITION_INVALID",
+            }
+            if event_type in anomaly_types and not self._skip_anomaly_counting:
+                self._record_anomaly_timestamp(event_type, datetime.now(timezone.utc))
             # Increment sequence counter
             self._event_seq_counter += 1
-            
+            run_id = event.get("run_id") or ""
+            event_seq = event.get("event_seq", 0)
+            event_id = f"{run_id}:{event_seq}"  # Phase 4: canonical ID for REST/WS dedupe
+
             # Build standardized event payload
             ws_event = {
                 "seq": self._event_seq_counter,
+                "event_id": event_id,
+                "event_seq": event_seq,
                 "type": event_type,
                 "ts_utc": event.get("timestamp_utc", datetime.now(timezone.utc).isoformat()),
-                "run_id": event.get("run_id"),
+                "run_id": run_id,
                 "stream_id": event.get("stream_id") or event.get("stream"),
                 "severity": self._determine_severity(event_type),
             }
-            
+
             # Add event data if present
             if event.get("data"):
                 ws_event["data"] = event["data"]
-            
+
             # Add to ring buffer
-            self._important_events_buffer.append(ws_event)
+            self._append_to_ring_buffer(ws_event)
     
     def _determine_severity(self, event_type: str) -> Optional[str]:
         """Determine severity level for event type."""
@@ -2165,6 +2534,13 @@ class WatchdogAggregator:
             "EXECUTION_BLOCKED",
             "UNPROTECTED_POSITION_DETECTED",
             "DATA_STALL_DETECTED",
+            # Execution anomalies (Phase 10)
+            "EXECUTION_GHOST_FILL_DETECTED",
+            "PROTECTIVE_DRIFT_DETECTED",
+            "POSITION_DRIFT_DETECTED",
+            "EXPOSURE_INTEGRITY_VIOLATION",
+            "RECONCILIATION_QTY_MISMATCH",
+            "ORDER_LIFECYCLE_TRANSITION_INVALID",
         }
         
         warning_types = {
@@ -2172,6 +2548,11 @@ class WatchdogAggregator:
             "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification (informational)
             "RISK_GATE_CHANGED",
             "TRADING_ALLOWED_CHANGED",
+            # Execution anomalies
+            "ORPHAN_ORDER_DETECTED",
+            "DUPLICATE_ORDER_SUBMISSION_DETECTED",
+            "ORDER_STUCK_DETECTED",
+            "RECOVERY_LOOP_DETECTED",
         }
         
         if event_type in critical_types:

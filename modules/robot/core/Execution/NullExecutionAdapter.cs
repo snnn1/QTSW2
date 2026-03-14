@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -157,5 +158,10 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
                 robot_owned_order_ids = robotOwnedOrders.Select(o => o.OrderId).ToList(),
                 note = "DRYRUN mode - would cancel robot-owned orders but not executing"
             }));
+    }
+
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
+    {
+        // DRYRUN: No-op
     }
 }

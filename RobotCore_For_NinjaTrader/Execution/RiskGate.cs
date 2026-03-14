@@ -25,6 +25,9 @@ public sealed class RiskGate
     private readonly KillSwitch _killSwitch;
     private readonly IExecutionRecoveryGuard? _guard;
     private readonly Func<string, bool>? _isInstrumentFrozen;
+    private DateTimeOffset _lastGlobalKillSwitchLogUtc = DateTimeOffset.MinValue;
+    private const double GLOBAL_KILL_SWITCH_LOG_INTERVAL_SECONDS = 60;
+    private Action<string, string, string>? _onGlobalKillSwitchBlocked;
 
     public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch, IExecutionRecoveryGuard? guard = null, Func<string, bool>? isInstrumentFrozen = null)
     {
@@ -35,6 +38,11 @@ public sealed class RiskGate
         _guard = guard;
         _isInstrumentFrozen = isInstrumentFrozen;
     }
+
+    /// <summary>
+    /// Phase 5: Set callback when execution is blocked due to global kill switch. Invoked with (eventType, instrument, stream).
+    /// </summary>
+    public void SetOnGlobalKillSwitchBlocked(Action<string, string, string>? callback) => _onGlobalKillSwitchBlocked = callback;
 
     /// <summary>
     /// Check all risk gates. Returns (allowed, reason, failedGates) tuple.
@@ -53,12 +61,12 @@ public sealed class RiskGate
     {
         var failedGates = new List<string>();
 
-        // Gate -1: Instrument frozen (RECONCILIATION_QTY_MISMATCH - block execution but allow range building)
+        // Gate -1: Instrument frozen (RECONCILIATION_QTY_MISMATCH, Phase 5 supervisory block - block execution but allow range building)
         if (_isInstrumentFrozen != null && _isInstrumentFrozen(instrument))
         {
             failedGates.Add("INSTRUMENT_FROZEN");
             LogRiskCheck(stream, instrument, session, slotTimeChicago, tradingDate, false, failedGates, utcNow);
-            return (false, "INSTRUMENT_FROZEN_RECONCILIATION_MISMATCH", failedGates);
+            return (false, "INSTRUMENT_FROZEN", failedGates);
         }
         
         // Gate 0: Recovery state guard (blocks execution during disconnect recovery)
@@ -74,6 +82,12 @@ public sealed class RiskGate
         if (!killSwitchOk)
         {
             failedGates.Add("KILL_SWITCH");
+            if ((utcNow - _lastGlobalKillSwitchLogUtc).TotalSeconds >= GLOBAL_KILL_SWITCH_LOG_INTERVAL_SECONDS)
+            {
+                _lastGlobalKillSwitchLogUtc = utcNow;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate ?? "", "GLOBAL_KILL_SWITCH_ACTIVATED", "ENGINE",
+                    new { instrument, stream, note = "Global kill switch blocks all execution" }));
+            }
             LogRiskCheck(stream, instrument, session, slotTimeChicago, tradingDate, false, failedGates, utcNow);
             return (false, "KILL_SWITCH_ACTIVE", failedGates);
         }

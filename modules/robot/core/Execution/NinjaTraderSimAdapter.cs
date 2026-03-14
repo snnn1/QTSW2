@@ -6,6 +6,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -1296,6 +1297,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
     }
 
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
+    {
+        // Harness build: No IEA; no-op. NT build uses RobotCore_For_NinjaTrader with full IEA.
+    }
+
     /// <summary>
     /// Check all instruments for flat positions and cancel entry stops.
     /// Called on every execution update to detect manual position closures.
@@ -1478,6 +1484,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             
             // Only check intents with filled entries
             if (journalEntry == null || !journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal <= 0)
+                continue;
+            
+            // ZOMBIE_STOP FIX: Never place or modify BE for completed trades - prevents zombie stop orders
+            // that can fill after target/stop hit, creating extra positions not in journal (QTY_MISMATCH)
+            if (journalEntry.TradeCompleted)
+                continue;
+            
+            // TERMINAL_INTENT HARDENING: Only include intents with remaining open quantity
+            // If exit qty >= entry qty, position is closed - no BE management
+            if (journalEntry.ExitFilledQuantityTotal >= journalEntry.EntryFilledQuantityTotal)
                 continue;
             
             // Check if BE has already been triggered (idempotency check)

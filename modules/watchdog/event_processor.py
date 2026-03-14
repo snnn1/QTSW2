@@ -11,10 +11,21 @@ from typing import Dict, List, Optional
 from datetime import datetime, timezone
 import pytz
 
-from .config import FRONTEND_FEED_FILE
+from .config import FRONTEND_FEED_FILE, SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS
 from .state_manager import WatchdogStateManager
+from .timetable_poller import compute_timetable_trading_date
 
 logger = logging.getLogger(__name__)
+
+CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+
+def _trading_date_from_timestamp(timestamp_utc: datetime) -> str:
+    """Derive trading_date from event timestamp using CME rollover (17:00 Chicago)."""
+    if timestamp_utc.tzinfo is None:
+        timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
+    chicago_dt = timestamp_utc.astimezone(CHICAGO_TZ)
+    return compute_timetable_trading_date(chicago_dt)
 
 
 def get_canonical_instrument(instrument: str) -> str:
@@ -88,8 +99,11 @@ class EventProcessor:
         
         # Process event by type
         if event_type == "ENGINE_START":
-            # Initialize engine tick timestamp on start so watchdog knows engine is alive from the beginning
-            self._state_manager.update_engine_tick(timestamp_utc)
+            # Engine liveness: ENGINE_TICK_CALLSITE, ENGINE_ALIVE, ENGINE_TIMER_HEARTBEAT drive _last_engine_heartbeat.
+            # Do NOT update_engine_tick here - avoids false ENGINE ALIVE from stale ENGINE_START in tail.
+            # Phase 7-8: Clear pending orders on new run (avoids stale stuck detection)
+            if hasattr(self._state_manager, "_pending_orders"):
+                self._state_manager._pending_orders.clear()
             # Clear ALL streams on engine start (new run) - they will be re-initialized
             # This prevents showing stale ARMED/RANGE_BUILDING states from previous runs
             # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
@@ -106,17 +120,12 @@ class EventProcessor:
                 self._state_manager.cleanup_stale_streams(trading_date, timestamp_utc, clear_all_for_date=True)
         
         elif event_type == "ENGINE_HEARTBEAT":
-            # DEPRECATED: ENGINE_HEARTBEAT removed from critical events (only works if AddOn/Strategy installed)
-            # Keep handler for backward compatibility with old events, but new events won't reach here
-            # Use ENGINE_TICK_CALLSITE (rate-limited) instead for reliable liveness monitoring
-            self._state_manager.update_engine_tick(timestamp_utc)
+            # DEPRECATED: Do not drive engine liveness - canonical sources are ENGINE_TICK_CALLSITE and ENGINE_ALIVE.
+            pass
         
         elif event_type == "ENGINE_TICK_HEARTBEAT":
-            # PATTERN 1: Update engine tick timestamp AND track last bar time per instrument
-            # Note: ENGINE_TICK_HEARTBEAT is bar-driven and tracks bar processing
-            # Use ENGINE_TICK_CALLSITE (rate-limited) for primary Tick() liveness signal
-            self._state_manager.update_engine_tick(timestamp_utc)
-            
+            # Bar-driven: do NOT update_engine_tick - canonical liveness is ENGINE_TICK_CALLSITE and ENGINE_ALIVE.
+            # Keep bar tracking only (update_last_bar).
             # Extract execution_instrument_full_name and bar_time_utc from heartbeat payload
             execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = data.get("instrument") or event.get("instrument")  # Fallback for backward compatibility
@@ -133,11 +142,8 @@ class EventProcessor:
                         self._state_manager.update_last_bar(instrument, bar_time_utc)
         
         elif event_type == "ONBARUPDATE_CALLED":
-            # OnBarUpdate is called constantly while engine is running (when bars arrive)
-            # Use this as a reliable heartbeat indicator for engine liveness
-            # Confirms NinjaTrader is calling OnBarUpdate (bar-dependent)
-            self._state_manager.update_engine_tick(timestamp_utc)
-            
+            # Bar event: do NOT update_engine_tick - canonical liveness is ENGINE_TICK_CALLSITE and ENGINE_ALIVE.
+            # Bar events are data-flow only; stale bar events in tail must not resurrect engine_alive.
             # Track last bar time per execution instrument contract (authoritative)
             # CRITICAL: Use execution_instrument_full_name for bar tracking (e.g., "MES 03-26")
             execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
@@ -171,6 +177,11 @@ class EventProcessor:
         elif event_type == "ENGINE_ALIVE":
             # ENGINE_ALIVE: Strategy heartbeat (every N bars in Realtime)
             # Fallback liveness when ENGINE_TICK_CALLSITE not emitted (e.g. older DLL)
+            self._state_manager.update_engine_tick(timestamp_utc)
+
+        elif event_type == "ENGINE_TIMER_HEARTBEAT":
+            # ENGINE_TIMER_HEARTBEAT: Timer-based heartbeat when market closed (no ticks)
+            # Ensures ENGINE ALIVE persists on weekends / no bars
             self._state_manager.update_engine_tick(timestamp_utc)
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
@@ -275,7 +286,9 @@ class EventProcessor:
             pass
         
         elif event_type == "ENGINE_TICK_STALL_RECOVERED":
-            self._state_manager.update_engine_tick(timestamp_utc)
+            # Do not drive liveness - canonical sources are ENGINE_TICK_CALLSITE and ENGINE_ALIVE.
+            # Recovery will be reflected by the next tick/heartbeat.
+            pass
         
         elif event_type in ("DISCONNECT_FAIL_CLOSED_ENTERED", "DISCONNECT_RECOVERY_STARTED",
                            "DISCONNECT_RECOVERY_COMPLETE", "DISCONNECT_RECOVERY_ABORTED"):
@@ -284,7 +297,10 @@ class EventProcessor:
         elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION", "CONNECTION_CONFIRMED"):
             # CONNECTION_RECOVERED_NOTIFICATION and CONNECTION_CONFIRMED are connection-ok signals
             connection_status = "ConnectionLost" if "LOST" in event_type else "Connected"
-            self._state_manager.update_connection_status(connection_status, timestamp_utc)
+            # Skip session metrics (disconnect count, downtime) for old events from tail replay
+            age_sec = (datetime.now(timezone.utc) - timestamp_utc).total_seconds()
+            skip_session_metrics = age_sec > SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS
+            self._state_manager.update_connection_status(connection_status, timestamp_utc, skip_session_metrics=skip_session_metrics)
         
         elif event_type == "CONNECTIVITY_DAILY_SUMMARY":
             self._state_manager.update_connectivity_daily_summary(data or {})
@@ -293,14 +309,19 @@ class EventProcessor:
             self._state_manager.update_kill_switch(True)
         
         elif event_type == "STREAM_STATE_TRANSITION":
-            # Prefer timetable's trading_date (authoritative when loaded); fallback to event's for startup
-            # Without fallback, events are skipped when timetable poll hasn't run yet (first ~60s),
-            # and they're never re-processed, so stream states never appear on the Watchdog streams tab
+            # Priority: 1) timetable, 2) event.trading_date, 3) data.trading_date, 4) derive from event timestamp (CME rollover)
+            # Without fallback 4, events are skipped when timetable poll hasn't run yet (first ~60s)
             trading_date = (
                 self._state_manager.get_trading_date()
                 or event.get("trading_date")
                 or data.get("trading_date")
             )
+            if not trading_date and timestamp_utc:
+                trading_date = _trading_date_from_timestamp(timestamp_utc)
+                logger.debug(
+                    f"STREAM_STATE_TRANSITION: derived trading_date={trading_date} from event timestamp "
+                    f"(timetable not yet loaded)"
+                )
             if not trading_date:
                 logger.debug(
                     f"STREAM_STATE_TRANSITION skipped: no trading_date "
@@ -1040,6 +1061,48 @@ class EventProcessor:
 
         elif event_type == "EXECUTION_FILL_UNMAPPED":
             self._state_manager.record_execution_fill_unmapped(timestamp_utc)
+
+        elif event_type == "RECONCILIATION_QTY_MISMATCH":
+            self._state_manager.record_reconciliation_qty_mismatch(timestamp_utc)
+
+        elif event_type == "ORDER_SUBMIT_SUCCESS":
+            # Phase 7-8: Track for stuck order and latency spike detection
+            broker_order_id = data.get("broker_order_id") or event.get("broker_order_id")
+            if broker_order_id:
+                order_type = str(data.get("order_type", "entry") or "entry").upper()
+                if "PROTECTIVE" in order_type and "TARGET" in order_type:
+                    role = "target"
+                elif "PROTECTIVE" in order_type and "STOP" in order_type:
+                    role = "stop"
+                else:
+                    role = "entry"
+                self._state_manager.record_order_submitted(
+                    broker_order_id=broker_order_id,
+                    submitted_at=timestamp_utc,
+                    intent_id=data.get("intent_id", "") or event.get("intent_id", ""),
+                    instrument=data.get("instrument", "") or event.get("instrument", ""),
+                    role=role,
+                    stream_key=data.get("stream_key", "") or data.get("stream", "") or event.get("stream_id", ""),
+                )
+
+        elif event_type == "EXECUTION_FILLED":
+            # Phase 8: Check latency spike on fill
+            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
+            if broker_order_id:
+                qty = data.get("quantity") or data.get("qty") or data.get("fill_quantity")
+                price = data.get("price") or data.get("fill_price") or data.get("avg_fill_price")
+                self._state_manager.record_order_filled(
+                    broker_order_id=broker_order_id,
+                    filled_at=timestamp_utc,
+                    qty=qty,
+                    price=float(price) if price is not None else None,
+                )
+
+        elif event_type == "ORDER_CANCELLED":
+            # Phase 7-8: Remove from pending
+            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
+            if broker_order_id:
+                self._state_manager.record_order_cancelled(broker_order_id)
 
         elif event_type == "EXECUTION_POLICY_VALIDATION_FAILED":
             # Extract execution policy validation failure information

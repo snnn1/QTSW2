@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -155,6 +156,21 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
     }
 
     public void ProcessPendingUnresolvedExecutions()
+    {
+        // DRYRUN: No-op
+    }
+
+    public void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow)
+    {
+        // DRYRUN: No-op
+    }
+
+    public void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow)
+    {
+        // DRYRUN: No-op
+    }
+
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         // DRYRUN: No-op
     }

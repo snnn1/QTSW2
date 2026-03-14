@@ -75,6 +75,27 @@ public interface IIEAOrderExecutor
     /// <summary>Phase 3: Flatten position for intent (BE failure recovery).</summary>
     FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow);
 
+    /// <summary>
+    /// Gap 2: Emergency flatten bypass. Bypasses IEA queue. MUST be called from strategy thread.
+    /// Use when instrument is blocked (timeout/overflow/poison) and position must be closed.
+    /// </summary>
+    FlattenResult EmergencyFlatten(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// IEA Flatten Authority: Get account position for instrument.
+    /// Returns (quantity, direction) where direction is "Long", "Short", or "" when flat.
+    /// THREAD/SERIALIZATION: Must be called on strategy thread. Position query + flatten decision + order submission
+    /// must run as one critical section (same EnqueueAndWait callback or strategy-thread action).
+    /// </summary>
+    (int quantity, string direction) GetAccountPositionForInstrument(string instrument);
+
+    /// <summary>
+    /// IEA Flatten Authority: Submit position-derived market close order.
+    /// Side and quantity must be derived from account position at decision time.
+    /// Snapshot is included in FLATTEN_SENT event payload for forensic analysis.
+    /// </summary>
+    OrderSubmissionResult SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow);
+
     /// <summary>Phase 3: Stand down stream (BE failure recovery).</summary>
     void StandDownStream(string streamId, DateTimeOffset utcNow, string reason);
 

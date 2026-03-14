@@ -725,6 +725,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Reconciliation: close orphaned journals when broker flat (NT context ready)
                     _engine.RunReconciliationOnRealtimeStart();
 
+                    // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
+                    _engine.StartEngineHeartbeatTimer();
+
                     // SessionCloseResolver: resolve S1 and S2 on Realtime transition (defer to Realtime only)
                     ResolveAndSetSessionCloseIfNeeded();
 

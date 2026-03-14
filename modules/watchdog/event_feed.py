@@ -529,7 +529,7 @@ class EventFeedGenerator:
         tick_or_alive_in_raw = False
         for event in all_events:
             event_type = self._extract_event_type(event)
-            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE"):
+            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT"):
                 tick_or_alive_in_raw = True
                 break
         
@@ -539,7 +539,7 @@ class EventFeedGenerator:
             # Only warn if we processed events but no liveness signal
             if processed_count > 0:
                 logger.warning(
-                    f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE or ENGINE_ALIVE found. "
+                    f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE, ENGINE_ALIVE, or ENGINE_TIMER_HEARTBEAT found. "
                     f"This may indicate the robot is not emitting liveness events."
                 )
         

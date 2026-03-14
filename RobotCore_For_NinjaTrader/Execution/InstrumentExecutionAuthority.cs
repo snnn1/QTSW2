@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
@@ -34,13 +35,29 @@ public sealed partial class InstrumentExecutionAuthority
     private readonly ConcurrentDictionary<string, DateTimeOffset> _processedExecutionIds = new();
     private int _dedupInsertCount;
     private const int DEDUP_EVICTION_INTERVAL = 100;
-    private const double DEDUP_MAX_AGE_MINUTES = 5.0;
+    private const double DEDUP_MAX_AGE_MINUTES = 12.0;
+
+    /// <summary>Execution ordering hardening metrics.</summary>
+    private int _deferredExecutionCount;
+    private int _duplicateExecutionCount;
+    private int _executionResolutionRetries;
 
     /// <summary>Gap 1: Max queue depth before EnqueueAndWait fails closed.</summary>
     private const int MAX_QUEUE_DEPTH_FOR_ENQUEUE = 500;
 
     /// <summary>Gap 5: Instrument blocked after EnqueueAndWait failure (timeout/overflow). Fail-closed policy: no new work until restart.</summary>
     private volatile bool _instrumentBlocked;
+
+    /// <summary>Queue health: current command tracking.</summary>
+    private DateTimeOffset _currentWorkStartedUtc = DateTimeOffset.MinValue;
+    private volatile string _currentWorkType = "";
+    private DateTimeOffset _lastSuccessfulCompletionUtc = DateTimeOffset.MinValue;
+    private int _consecutiveFailures;
+    private const int COMMAND_STALL_WARN_MS = 3000;
+    private const int COMMAND_STALL_CRITICAL_MS = 8000;
+    private const int POISON_THRESHOLD = 3;
+    private DateTimeOffset _lastStallEmittedForStartUtc = DateTimeOffset.MinValue;
+    private readonly Timer? _stallCheckTimer;
 
     /// <summary>Gap 5: Callback when instrument is blocked (notify engine to stand down streams, freeze instrument).</summary>
     private Action<string, DateTimeOffset, string>? _onEnqueueFailureCallback;
@@ -62,6 +79,11 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>Logger for audit events.</summary>
     internal readonly RobotLogger? Log;
+
+    /// <summary>Gap 5: Canonical event writer for replay. Set by adapter when binding.</summary>
+    private ExecutionEventWriter? _eventWriter;
+
+    internal void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;
 
     /// <summary>Order tracking: intentId -> OrderInfo. Shared across all instances.</summary>
     internal readonly ConcurrentDictionary<string, OrderInfo> OrderMap = new();
@@ -101,6 +123,29 @@ public sealed partial class InstrumentExecutionAuthority
 
         _workerThread = new Thread(WorkerLoop) { IsBackground = true, Name = $"IEA-{ExecutionInstrumentKey}-{_instanceId}" };
         _workerThread.Start();
+        _stallCheckTimer = new Timer(CheckCommandStall, null, 2000, 2000);
+    }
+
+    private void CheckCommandStall(object? _)
+    {
+        var started = _currentWorkStartedUtc;
+        if (started == DateTimeOffset.MinValue) return;
+        var elapsed = (DateTimeOffset.UtcNow - started).TotalMilliseconds;
+        if (elapsed < COMMAND_STALL_CRITICAL_MS) return;
+        if (started == _lastStallEmittedForStartUtc) return;
+        _lastStallEmittedForStartUtc = started;
+        var now = DateTimeOffset.UtcNow;
+        Log?.Write(RobotEvents.EngineBase(now, tradingDate: "", eventType: "EXECUTION_COMMAND_STALLED", state: "ENGINE",
+            new
+            {
+                iea_instance_id = InstanceId,
+                execution_instrument_key = ExecutionInstrumentKey,
+                current_command_type = _currentWorkType,
+                runtime_ms = (long)elapsed,
+                threshold_ms = COMMAND_STALL_CRITICAL_MS,
+                policy = "IEA_COMMAND_STALL_SUPERVISOR_REQUIRED"
+            }));
+        _onEnqueueFailureCallback?.Invoke(ExecutionInstrumentKey, now, "EXECUTION_COMMAND_STALLED");
     }
 
     private void WorkerLoop()
@@ -111,13 +156,26 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 if (_executionQueue.TryTake(out var work, 1000))
                 {
-                    work();
-                    _lastMutationUtc = DateTimeOffset.UtcNow;
+                    _currentWorkStartedUtc = DateTimeOffset.UtcNow;
+                    _currentWorkType = "QueueWork";
+                    try
+                    {
+                        work();
+                        _lastMutationUtc = DateTimeOffset.UtcNow;
+                        _lastSuccessfulCompletionUtc = _lastMutationUtc;
+                        _consecutiveFailures = 0;
+                    }
+                    finally
+                    {
+                        _currentWorkStartedUtc = DateTimeOffset.MinValue;
+                        _currentWorkType = "";
+                    }
                     EmitHeartbeatIfDue();
                 }
             }
             catch (Exception ex)
             {
+                var cf = Interlocked.Increment(ref _consecutiveFailures);
                 Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "IEA_QUEUE_WORKER_ERROR", state: "ENGINE",
                     new
                     {
@@ -125,25 +183,61 @@ public sealed partial class InstrumentExecutionAuthority
                         iea_instance_id = InstanceId,
                         execution_instrument_key = ExecutionInstrumentKey,
                         enqueue_sequence = Interlocked.Read(ref _enqueueSequence),
-                        last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence)
+                        last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence),
+                        consecutive_failures = cf
                     }));
+                if (cf >= POISON_THRESHOLD)
+                {
+                    _instrumentBlocked = true;
+                    var utcNow = DateTimeOffset.UtcNow;
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_QUEUE_POISON_DETECTED", state: "ENGINE",
+                        new
+                        {
+                            iea_instance_id = InstanceId,
+                            execution_instrument_key = ExecutionInstrumentKey,
+                            consecutive_failures = cf,
+                            threshold = POISON_THRESHOLD,
+                            policy = "IEA_POISON_BLOCK_INSTRUMENT"
+                        }));
+                    _onEnqueueFailureCallback?.Invoke(ExecutionInstrumentKey, utcNow, "EXECUTION_QUEUE_POISON_DETECTED");
+                }
             }
         }
     }
 
-    /// <summary>Gap 2: Enqueue order update for serialized processing. OrderMap mutations run on worker.</summary>
+    /// <summary>Gap 2: Enqueue order update for serialized processing. Uses EnqueueRecoveryEssential so order state changes are processed during recovery (registry lifecycle).</summary>
     internal void EnqueueOrderUpdate(object order, object orderUpdate)
     {
         if (Executor == null) return;
         var o = order;
         var ou = orderUpdate;
-        Enqueue(() => Executor.ProcessOrderUpdate(o, ou));
+        EnqueueRecoveryEssential(() => Executor.ProcessOrderUpdate(o, ou));
     }
 
-    /// <summary>Enqueue work for serialized processing. Used for execution updates and BE evaluation.</summary>
+    /// <summary>Enqueue recovery-essential work (execution/order updates). Always allowed; needed for flatten fills, stale snapshot detection, registry lifecycle.</summary>
+    internal void EnqueueRecoveryEssential(Action work)
+    {
+        if (Executor == null) return;
+        EnqueueCore(work);
+    }
+
+    /// <summary>Enqueue work for serialized processing. Blocks when IsInRecovery (normal management). Used for BE evaluation.</summary>
     internal void Enqueue(Action work)
     {
         if (Executor == null) return;
+#if NINJATRADER
+        if (IsInRecovery)
+        {
+            Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RECOVERY_GUARD_BLOCKED_NORMAL_MANAGEMENT", state: "ENGINE",
+                new { operation = "Enqueue", recovery_state = CurrentRecoveryState.ToString(), iea_instance_id = InstanceId, execution_instrument_key = ExecutionInstrumentKey }));
+            return;
+        }
+#endif
+        EnqueueCore(work);
+    }
+
+    private void EnqueueCore(Action work)
+    {
         try
         {
             var seq = Interlocked.Increment(ref _enqueueSequence);
@@ -180,6 +274,15 @@ public sealed partial class InstrumentExecutionAuthority
         if (Executor == null) return (false, default);
         if (!_workerRunning) return (false, default);
 
+#if NINJATRADER
+        // Phase 3: Block normal management during recovery
+        if (IsInRecovery)
+        {
+            Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RECOVERY_GUARD_BLOCKED_NORMAL_MANAGEMENT", state: "ENGINE",
+                new { operation = "EnqueueAndWait", recovery_state = CurrentRecoveryState.ToString(), iea_instance_id = InstanceId, execution_instrument_key = ExecutionInstrumentKey }));
+            return (false, default);
+        }
+#endif
         // Gap 5: Fail-closed policy — once blocked, reject all new work until restart.
         if (_instrumentBlocked)
         {
@@ -275,6 +378,24 @@ public sealed partial class InstrumentExecutionAuthority
         var now = DateTimeOffset.UtcNow;
         if ((now - _lastHeartbeatUtc).TotalSeconds < HEARTBEAT_INTERVAL_SECONDS) return;
         _lastHeartbeatUtc = now;
+        CheckFlattenLatchTimeouts();
+#if NINJATRADER
+        EmitRecoveryMetrics(now);
+        TryExpireCooldown(ExecutionInstrumentKey, now);
+        EmitSupervisoryMetrics(now);
+#endif
+        // Phase 2: Registry cleanup and integrity verification
+        var activeIntentIds = Executor != null
+            ? new HashSet<string>(Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey).Select(x => x.intentId), StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        RunRegistryCleanup(now, id => activeIntentIds.Contains(id));
+        VerifyRegistryIntegrity(now);
+        EmitRegistryMetrics(now);
+        EmitExecutionOrderingMetrics(now);
+        var currentStarted = _currentWorkStartedUtc;
+        var runtimeMs = currentStarted != DateTimeOffset.MinValue
+            ? (long)(now - currentStarted).TotalMilliseconds
+            : (long?)null;
         Log?.Write(RobotEvents.EngineBase(now, tradingDate: "", eventType: "IEA_HEARTBEAT", state: "ENGINE",
             new
             {
@@ -284,7 +405,11 @@ public sealed partial class InstrumentExecutionAuthority
                 queue_depth = QueueDepth,
                 last_mutation_utc = _lastMutationUtc.ToString("o"),
                 enqueue_sequence = Interlocked.Read(ref _enqueueSequence),
-                last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence)
+                last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence),
+                current_command_type = string.IsNullOrEmpty(_currentWorkType) ? null : _currentWorkType,
+                current_command_runtime_ms = runtimeMs,
+                consecutive_failures = _consecutiveFailures,
+                last_successful_completion_utc = _lastSuccessfulCompletionUtc != DateTimeOffset.MinValue ? _lastSuccessfulCompletionUtc.ToString("o") : null
             }));
     }
 
@@ -368,8 +493,15 @@ public sealed partial class InstrumentExecutionAuthority
                 EvictDedupEntries();
             return false;
         }
+        Interlocked.Increment(ref _duplicateExecutionCount);
         return true;
     }
+
+    /// <summary>Increment deferred execution count (adapter calls when deferring for registry resolution).</summary>
+    internal void IncrementDeferredExecutionCount() => Interlocked.Increment(ref _deferredExecutionCount);
+
+    /// <summary>Increment execution resolution retries (adapter calls when ProcessUnresolvedRetry re-enqueues).</summary>
+    internal void IncrementExecutionResolutionRetries() => Interlocked.Increment(ref _executionResolutionRetries);
 
     /// <summary>
     /// Canonical ledger: position state. Net filled qty by execution instrument.

@@ -58,12 +58,12 @@ export function sortEventsByTimestamp(events: WatchdogEvent[]): WatchdogEvent[] 
 }
 
 /**
- * Deduplicate events by (run_id, event_seq) tuple
+ * Deduplicate events by event_id (Phase 4: run_id:event_seq for REST/WS consistency)
  */
 export function deduplicateEvents(events: WatchdogEvent[]): WatchdogEvent[] {
   const seen = new Set<string>()
   return events.filter(event => {
-    const key = `${event.run_id}:${event.event_seq}`
+    const key = event.event_id ?? `${event.run_id}:${event.event_seq}`
     if (seen.has(key)) {
       return false
     }

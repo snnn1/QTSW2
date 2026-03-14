@@ -1471,6 +1471,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
             if (journalEntry == null || !journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal <= 0)
                 continue;
             
+            // ZOMBIE_STOP FIX: Never place or modify BE for completed trades - prevents zombie stop orders
+            // that can fill after target/stop hit, creating extra positions not in journal (QTY_MISMATCH)
+            if (journalEntry.TradeCompleted)
+                continue;
+            
+            // TERMINAL_INTENT HARDENING: Only include intents with remaining open quantity
+            if (journalEntry.ExitFilledQuantityTotal >= journalEntry.EntryFilledQuantityTotal)
+                continue;
+            
             // Check if BE has already been triggered (idempotency check)
             if (_executionJournal.IsBEModified(intentId, tradingDate, stream))
                 continue;

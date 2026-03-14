@@ -941,6 +941,24 @@ public sealed partial class NinjaTraderSimAdapter
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
 
+        // ORPHAN DETECTION: Order update for protective order whose intent is already completed
+        var isProtective = !string.IsNullOrEmpty(encodedTag) &&
+            (encodedTag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || encodedTag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase));
+        if (isProtective && _intentMap.TryGetValue(intentId, out var orderUpdateIntent) &&
+            _executionJournal.IsIntentCompleted(intentId, orderUpdateIntent.TradingDate ?? "", orderUpdateIntent.Stream ?? ""))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "COMPLETED_INTENT_ORDER_UPDATE", new
+            {
+                error = "Order update received for protective order whose intent is already TradeCompleted",
+                intent_id = intentId,
+                broker_order_id = order.OrderId,
+                order_state = orderState.ToString(),
+                stream = orderUpdateIntent.Stream,
+                action = "ORPHAN_DETECTED",
+                note = "Protective order for completed intent - route to reconciliation"
+            }));
+        }
+
         if (!_orderMap.TryGetValue(intentId, out var orderInfo))
         {
             // CRITICAL FIX: Handle execution updates for untracked orders gracefully
@@ -2007,7 +2025,41 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
-            // Exit fill
+            // LATE-FILL PROTECTION: If intent already completed, this is a stale/late fill (race with sibling cancel).
+            // Do NOT process as normal - emit critical event and route to anomaly path.
+            var tradingDate = context.TradingDate ?? "";
+            var stream = context.Stream ?? "";
+            if (_executionJournal.IsIntentCompleted(intentId, tradingDate, stream))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_RECEIVED_FILL", "ENGINE",
+                    new
+                    {
+                        error = "Fill received for intent already TradeCompleted - stale/late fill on terminal intent",
+                        intent_id = intentId,
+                        broker_order_id = order.OrderId,
+                        instrument = orderInfo.Instrument,
+                        stream = stream,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        side = orderInfo.Direction,
+                        exit_order_type = orderTypeForContext,
+                        execution_timestamp_utc = utcNow.ToString("o"),
+                        mapped = true,
+                        action = "ANOMALY_LOGGED",
+                        note = "CRITICAL: Late fill on completed intent - route to reconciliation. Do not process as normal exit."
+                    }));
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    notificationService.EnqueueNotification($"COMPLETED_INTENT_RECEIVED_FILL:{intentId}",
+                        "CRITICAL: Late Fill on Completed Intent",
+                        $"Fill received for intent {intentId} already TradeCompleted. Broker Order: {order.OrderId}, Qty: {fillQuantity}, Price: {fillPrice}. Route to reconciliation.",
+                        priority: 2);
+                }
+                return; // Fail-closed: do not process as normal fill
+            }
+
+            // Exit fill - intent is not yet completed
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
             // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
             _executionJournal.RecordExitFill(
@@ -2120,6 +2172,10 @@ public sealed partial class NinjaTraderSimAdapter
                             }));
                     }
                 }
+                
+                // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
+                // Single canonical path for making intent terminal - prevents zombie stops.
+                TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
             }
         }
         else
@@ -3200,6 +3256,75 @@ public sealed partial class NinjaTraderSimAdapter
         };
     }
     
+    /// <summary>
+    /// Terminalize an intent: cancel all protective orders, verify invariant, remove from management.
+    /// Single canonical path for target fill, stop fill, flatten, and reconciliation completion.
+    /// Completed intent = terminal object - no further order management allowed.
+    /// </summary>
+    private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
+        // 1. Cancel all remaining protective orders
+        CancelProtectiveOrdersForIntent(intentId, utcNow);
+
+        // 2. Verify terminal invariant: no working stop/target orders remain
+        var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
+        if (workingOrders.Count > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
+                new
+                {
+                    error = "Completed intent still has working protective orders - invariant violated",
+                    intent_id = intentId,
+                    stream = stream,
+                    completion_reason = completionReason,
+                    working_order_ids = workingOrders.Select(o => o.OrderId).ToList(),
+                    working_order_types = workingOrders.Select(o => GetOrderTag(o)).ToList(),
+                    count = workingOrders.Count,
+                    action = "CRITICAL_ANOMALY",
+                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                }));
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                notificationService.EnqueueNotification($"TERMINAL_INTENT_HAS_WORKING_ORDERS:{intentId}",
+                    "CRITICAL: Terminal Intent Has Working Orders",
+                    $"Intent {intentId} completed ({completionReason}) but {workingOrders.Count} protective order(s) still Working. Order IDs: {string.Join(", ", workingOrders.Select(o => o.OrderId))}.",
+                    priority: 2);
+            }
+            // Attempt cancel again (defense in depth)
+            CancelProtectiveOrdersForIntent(intentId, utcNow);
+        }
+        else
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "TERMINAL_INTENT_VERIFIED",
+                new { intent_id = intentId, stream = stream, completion_reason = completionReason }));
+        }
+    }
+
+    /// <summary>
+    /// Get working (Accepted/Working) protective orders for an intent.
+    /// </summary>
+    private List<Order> GetWorkingProtectiveOrdersForIntent(string intentId)
+    {
+        var result = new List<Order>();
+        if (_ntAccount == null) return result;
+        var account = _ntAccount as Account;
+        if (account == null) return result;
+
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+
+        foreach (var order in account.Orders)
+        {
+            if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                continue;
+            var tag = GetOrderTag(order) ?? "";
+            if (tag == stopTag || tag == targetTag)
+                result.Add(order);
+        }
+        return result;
+    }
+
     /// <summary>
     /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
     /// This is used when updating existing protective orders fails - we cancel and recreate them.

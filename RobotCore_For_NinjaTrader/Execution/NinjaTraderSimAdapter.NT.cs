@@ -14,6 +14,7 @@ using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -219,6 +220,121 @@ public sealed partial class NinjaTraderSimAdapter
     FlattenResult IIEAOrderExecutor.Flatten(string intentId, string instrument, DateTimeOffset utcNow) =>
         Flatten(intentId, instrument, utcNow);
 
+    /// <summary>
+    /// IEA Flatten Authority: Get account position. THREAD: Must be called on strategy thread.
+    /// Position query + flatten decision + order submission run as one critical section.
+    /// </summary>
+    (int quantity, string direction) IIEAOrderExecutor.GetAccountPositionForInstrument(string instrument)
+    {
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        if (account == null || ntInstrument == null)
+            return (0, "");
+
+        try
+        {
+            dynamic dynAccount = account;
+            Position? position = null;
+            try
+            {
+                position = dynAccount.GetPosition(ntInstrument);
+            }
+            catch
+            {
+                var name = ntInstrument.MasterInstrument?.Name ?? ntInstrument.ToString() ?? instrument;
+                try { position = dynAccount.GetPosition(name); }
+                catch { }
+            }
+            if (position == null || position.MarketPosition == MarketPosition.Flat)
+                return (0, "");
+            var qty = position.Quantity;
+            var dir = position.MarketPosition == MarketPosition.Long ? "Long" : "Short";
+            return (qty, dir);
+        }
+        catch
+        {
+            return (0, "");
+        }
+    }
+
+    /// <summary>
+    /// IEA Flatten Authority: Submit position-derived market close order.
+    /// Side is "SELL" (close long) or "BUY" (close short). THREAD: Must run on strategy thread.
+    /// </summary>
+    OrderSubmissionResult IIEAOrderExecutor.SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow)
+    {
+        var account = _ntAccount as Account;
+        var ntInstrument = _ntInstrument as Instrument;
+        if (account == null || ntInstrument == null)
+            return OrderSubmissionResult.FailureResult("NT context not set", utcNow);
+
+        var orderAction = side.Equals("SELL", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.BuyToCover;
+        try
+        {
+            var order = account.CreateOrder(
+                ntInstrument,
+                orderAction,
+                OrderType.Market,
+                OrderEntry.Manual,
+                TimeInForce.Day,
+                quantity,
+                0.0,
+                0.0,
+                null,
+                $"QTSW2:FLATTEN:{snapshot.LatchRequestId}",
+                DateTime.MinValue,
+                null);
+            SetOrderTag(order, $"QTSW2:FLATTEN:{snapshot.LatchRequestId}");
+            account.Submit(new[] { order });
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "FLATTEN_SENT", snapshot.ToLogPayload()));
+
+            lock (_flattenRecognitionLock)
+            {
+                _lastFlattenInstrument = ntInstrument?.MasterInstrument?.Name ?? instrument;
+                _lastFlattenUtc = utcNow;
+            }
+
+            return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "FLATTEN_ORDER_REJECTED", new
+            {
+                instrument,
+                error = ex.Message,
+                snapshot = snapshot.ToLogPayload()
+            }));
+            return OrderSubmissionResult.FailureResult($"Flatten order failed: {ex.Message}", utcNow);
+        }
+    }
+
+    /// <summary>Gap 2: Emergency flatten bypass. Bypasses IEA queue. MUST be called from strategy thread.</summary>
+    FlattenResult IIEAOrderExecutor.EmergencyFlatten(string instrument, DateTimeOffset utcNow)
+    {
+        var (quantity, direction) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(instrument);
+        if (quantity == 0 || string.IsNullOrEmpty(direction))
+            return FlattenResult.SuccessResult(utcNow);
+        var absQty = Math.Abs(quantity);
+        var chosenSide = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+        var requestId = $"EMERGENCY:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+        var snapshot = new FlattenDecisionSnapshot
+        {
+            Instrument = instrument,
+            AccountQuantityAtDecision = quantity,
+            AccountDirectionAtDecision = direction,
+            RequestedReason = "EMERGENCY_FLATTEN_BYPASS",
+            CallerContext = "IIEAOrderExecutor.EmergencyFlatten",
+            ChosenSide = chosenSide,
+            ChosenQuantity = absQty,
+            LatchRequestId = requestId,
+            LatchState = "EmergencyBypass",
+            DecisionUtc = utcNow
+        };
+        var submitResult = ((IIEAOrderExecutor)this).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow);
+        return submitResult.Success ? FlattenResult.SuccessResult(utcNow) : FlattenResult.FailureResult(submitResult.ErrorMessage ?? "Emergency flatten failed", utcNow);
+    }
+
     void IIEAOrderExecutor.StandDownStream(string streamId, DateTimeOffset utcNow, string reason) =>
         _standDownStreamCallback?.Invoke(streamId, utcNow, reason);
 
@@ -266,7 +382,10 @@ public sealed partial class NinjaTraderSimAdapter
             if (targetResult.Success)
             {
                 if (!string.IsNullOrEmpty(intentId))
+                {
                     SetProtectionState(intentId, ProtectionState.Submitted);
+                    _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.PROTECTIVES_PLACED, null, cmd.UtcNow);
+                }
                 return;
             }
         }
@@ -289,15 +408,211 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    /// <summary>Compute protective status from broker orders. Broker-truth based.</summary>
+    private ProtectiveStatus ComputeProtectiveStatusFromBroker(Account? account, string instrument, int brokerPositionQty)
+    {
+        if (account?.Orders == null || brokerPositionQty == 0) return ProtectiveStatus.NONE;
+        var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
+        int stopCount = 0, targetCount = 0, totalProtectiveQty = 0;
+        foreach (var o in account.Orders)
+        {
+            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot)) continue;
+            var tag = GetOrderTag(o);
+            if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+            if (tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase)) { stopCount++; totalProtectiveQty += o.Quantity; }
+            else if (tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase)) { targetCount++; totalProtectiveQty += o.Quantity; }
+        }
+        if (stopCount == 0 && targetCount == 0) return ProtectiveStatus.NONE;
+        if (stopCount > 0 && targetCount == 0) return ProtectiveStatus.STOP_ONLY;
+        if (stopCount == 0 && targetCount > 0) return ProtectiveStatus.TARGET_ONLY;
+        if (totalProtectiveQty < brokerPositionQty) return ProtectiveStatus.QTY_MISMATCH;
+        return ProtectiveStatus.BOTH_PRESENT;
+    }
+
+    /// <summary>Phase 4: Bootstrap snapshot callback. Gathers four views, builds BootstrapSnapshot, classifies, processes result.</summary>
+    private void OnBootstrapSnapshotRequested(string instrument, BootstrapReason reason, DateTimeOffset utcNow)
+    {
+        if (_iea == null) return;
+        var execInst = _iea.ExecutionInstrumentKey;
+        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
+        int brokerQty = 0, brokerWorkingCount = 0;
+        Account? account = null;
+        try
+        {
+            if (!_iea.TryTransitionToSnapshooting(utcNow)) return;
+            var (qty, _) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(instrument);
+            brokerQty = Math.Abs(qty);
+            account = _ntAccount as Account;
+            if (account?.Orders != null)
+            {
+                var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
+                brokerWorkingCount = account.Orders.Count(o =>
+                    (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
+                    ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_ERROR", new { error = ex.Message, iea_instance_id = _iea.InstanceId }));
+            _iea.ProcessBootstrapResult(new BootstrapSnapshot { Instrument = instrument, UnownedLiveOrderCount = 999 }, utcNow);
+            return;
+        }
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var registry = _iea.GetRegistrySnapshotForRecovery();
+        var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
+        var protectiveStatus = ComputeProtectiveStatusFromBroker(account, instrument, brokerQty);
+        var snapshot = new BootstrapSnapshot
+        {
+            Instrument = instrument,
+            BrokerPositionQty = brokerQty,
+            BrokerWorkingOrderCount = brokerWorkingCount,
+            JournalQty = journalQty,
+            UnownedLiveOrderCount = registry.UnownedLiveCount,
+            RegistrySnapshot = registry,
+            JournalSnapshot = null,
+            RuntimeIntentSnapshot = runtime,
+            CaptureUtc = utcNow,
+            SnapshotEpoch = 0,
+            ProtectiveStatus = protectiveStatus
+        };
+        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_SNAPSHOT_CAPTURED", new
+        {
+            instrument,
+            broker_position_qty = brokerQty,
+            broker_working_count = brokerWorkingCount,
+            journal_qty = journalQty,
+            unowned_live_count = registry.UnownedLiveCount,
+            iea_instance_id = _iea.InstanceId
+        }));
+        var decision = _iea.ProcessBootstrapResult(snapshot, utcNow);
+        if (decision == BootstrapDecision.ADOPT)
+            _iea.RunBootstrapAdoption(instrument, utcNow);
+    }
+
+    /// <summary>Phase 3: Recovery callback. Gathers broker/journal/registry/runtime data, runs reconstruction, processes result.</summary>
+    private void OnRecoveryRequested(string instrument, string reason, object context, DateTimeOffset utcNow)
+    {
+        if (_iea == null) return;
+        var execInst = _iea.ExecutionInstrumentKey;
+        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
+        int brokerQty = 0, brokerWorkingCount = 0;
+        try
+        {
+            var (qty, _) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(instrument);
+            brokerQty = Math.Abs(qty);
+            var account = _ntAccount as Account;
+            if (account?.Orders != null)
+            {
+                var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
+                brokerWorkingCount = account.Orders.Count(o =>
+                    (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
+                    ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_ERROR", new { error = ex.Message, iea_instance_id = _iea.InstanceId }));
+            _iea.ProcessReconstructionResult(new ReconstructionResult { Instrument = instrument, Classification = ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE }, utcNow);
+            return;
+        }
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var registry = _iea.GetRegistrySnapshotForRecovery();
+        var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
+        var result = RecoveryReconstructor.Reconstruct(instrument, brokerQty, brokerWorkingCount, journalQty, registry, runtime, reason);
+        var decision = _iea.ProcessReconstructionResult(result, utcNow);
+        if (decision == InstrumentExecutionAuthority.RecoveryDecision.FLATTEN)
+            OnRecoveryFlattenRequested(instrument, reason, "RECOVERY_PHASE3", utcNow);
+    }
+
+    /// <summary>Phase 3: Execute recovery flatten via canonical path (enqueue NtFlattenInstrumentCommand).</summary>
+    private void OnRecoveryFlattenRequested(string instrument, string reason, string callerContext, DateTimeOffset utcNow)
+    {
+        var cid = $"RECOVERY:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+        _ntActionQueue?.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, null, instrument, reason, utcNow), out _);
+    }
+
     void INtActionExecutor.ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd)
     {
         _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_REQUESTED", new { correlation_id = cmd.CorrelationId, reason = cmd.Reason }));
         // Cancel-then-flatten: cancel robot-owned working orders first to prevent refills/reopens
         CancelRobotOwnedWorkingOrdersReal(default, cmd.UtcNow);
-        var result = FlattenIntentReal(cmd.IntentId ?? "NT_FLATTEN", cmd.Instrument, cmd.UtcNow);
+        FlattenResult result;
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            result = _iea.RequestFlatten(cmd.Instrument, cmd.Reason, cmd.IntentId ?? "NT_FLATTEN", cmd.UtcNow);
+        }
+        else
+        {
+            result = FlattenIntentReal(cmd.IntentId ?? "NT_FLATTEN", cmd.Instrument, cmd.UtcNow);
+        }
         _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_SUBMITTED", new { correlation_id = cmd.CorrelationId, success = result.Success }));
         if (!result.Success) throw new InvalidOperationException($"Flatten failed: {result.ErrorMessage}");
         RegisterPendingFlattenVerification(cmd.Instrument, cmd.CorrelationId, cmd.UtcNow);
+    }
+
+    void INtActionExecutor.ExecuteSubmitEntryIntent(NtSubmitEntryIntentCommand ntCmd)
+    {
+        var cmd = ntCmd.Command;
+        var utcNow = cmd.TimestampUtc;
+        var instrument = cmd.Instrument ?? cmd.ExecutionInstrument ?? "";
+        var execInst = cmd.ExecutionInstrument ?? instrument;
+        var longIntentId = cmd.LongIntentId;
+        var shortIntentId = cmd.ShortIntentId;
+        var qty = cmd.Quantity ?? 1;
+        var maxQty = cmd.MaxQuantity ?? qty;
+        var canonical = cmd.CanonicalInstrument ?? instrument;
+        var ocoGroup = cmd.OcoGroup;
+
+        if (string.IsNullOrEmpty(longIntentId) || string.IsNullOrEmpty(shortIntentId) ||
+            !cmd.BreakLong.HasValue || !cmd.BreakShort.HasValue ||
+            !cmd.LongStopPrice.HasValue || !cmd.ShortStopPrice.HasValue)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "SUBMIT_ENTRY_INTENT_SKIPPED",
+                new { reason = "Missing required fields", longIntentId, shortIntentId }));
+            return;
+        }
+
+        var longIntent = new Intent(
+            cmd.TradingDate ?? "",
+            cmd.Stream ?? "",
+            instrument,
+            execInst,
+            cmd.Session ?? "",
+            cmd.SlotTimeChicago ?? "",
+            "Long",
+            cmd.BreakLong.Value,
+            cmd.LongStopPrice.Value,
+            cmd.LongTargetPrice ?? cmd.LongStopPrice.Value,
+            cmd.LongBeTrigger ?? cmd.LongStopPrice.Value,
+            utcNow,
+            "SUBMIT_ENTRY_INTENT_LONG");
+
+        var shortIntent = new Intent(
+            cmd.TradingDate ?? "",
+            cmd.Stream ?? "",
+            instrument,
+            execInst,
+            cmd.Session ?? "",
+            cmd.SlotTimeChicago ?? "",
+            "Short",
+            cmd.BreakShort.Value,
+            cmd.ShortStopPrice.Value,
+            cmd.ShortTargetPrice ?? cmd.ShortStopPrice.Value,
+            cmd.ShortBeTrigger ?? cmd.ShortStopPrice.Value,
+            utcNow,
+            "SUBMIT_ENTRY_INTENT_SHORT");
+
+        RegisterIntent(longIntent);
+        RegisterIntent(shortIntent);
+        RegisterIntentPolicy(longIntentId, qty, maxQty, canonical, execInst, "EXECUTION_COMMAND");
+        RegisterIntentPolicy(shortIntentId, qty, maxQty, canonical, execInst, "EXECUTION_COMMAND");
+
+        var longRes = SubmitStopEntryOrder(longIntentId, execInst, "Long", cmd.BreakLong.Value, qty, ocoGroup, utcNow);
+        var shortRes = SubmitStopEntryOrder(shortIntentId, execInst, "Short", cmd.BreakShort.Value, qty, ocoGroup, utcNow);
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, longIntentId, execInst, "SUBMIT_ENTRY_INTENT_COMPLETED",
+            new { long_success = longRes.Success, short_success = shortRes.Success }));
     }
 
     private void RegisterPendingFlattenVerification(string instrumentKey, string correlationId, DateTimeOffset utcNow)
@@ -514,6 +829,19 @@ public sealed partial class NinjaTraderSimAdapter
                     existing_order_state = existingOrder.State,
                     error = error,
                     note = "Multiple entry orders prevented - only one entry order allowed per intent"
+                }));
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "DUPLICATE_ORDER_SUBMISSION_DETECTED", new
+                {
+                    intent_id = intentId,
+                    instrument = instrument,
+                    role = "entry",
+                    side = existingOrder.Direction ?? "unknown",
+                    qty = existingOrder.Quantity,
+                    price = existingOrder.Price,
+                    first_order_id = existingOrder.OrderId,
+                    second_order_id = (string?)null,
+                    window_ms = 5000,
+                    reason = "Entry order already exists for intent"
                 }));
                 
                 return OrderSubmissionResult.FailureResult(error, utcNow);
@@ -1131,6 +1459,9 @@ public sealed partial class NinjaTraderSimAdapter
                 expectedEntryPrice: entryPrice, entryPrice: finalEntryPrice, stopPrice: intentStopPrice, 
                 targetPrice: intentTargetPrice, direction: finalDirection, ocoGroup: null);
 
+            orderInfo.OrderId = order.OrderId ?? orderInfo.OrderId;
+            _iea?.RegisterOrder(order.OrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
+
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
                 broker_order_id = order.OrderId,
@@ -1181,6 +1512,36 @@ public sealed partial class NinjaTraderSimAdapter
 
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
+
+        // Phase 1 Execution Ownership: Resolve via registry and update lifecycle
+        if (_useInstrumentExecutionAuthority && _iea != null && _iea.TryResolveByBrokerOrderId(order.OrderId, out var regEntry))
+        {
+            var lifecycleState = orderState == OrderState.Filled ? OrderLifecycleState.FILLED
+                : orderState == OrderState.Cancelled || orderState == OrderState.CancelPending ? OrderLifecycleState.CANCELED
+                : orderState == OrderState.Rejected ? OrderLifecycleState.REJECTED
+                : orderState == OrderState.Working || orderState == OrderState.Accepted ? OrderLifecycleState.WORKING
+                : (OrderLifecycleState?)null;
+            if (lifecycleState.HasValue && lifecycleState.Value != regEntry!.LifecycleState)
+                _iea.UpdateOrderLifecycle(order.OrderId, lifecycleState.Value, utcNow);
+        }
+
+        // ORPHAN DETECTION: Order update for protective order whose intent is already completed
+        if ((parsed.Leg == "STOP" || parsed.Leg == "TARGET") &&
+            IntentMap.TryGetValue(intentId, out var orderUpdateIntent) &&
+            _executionJournal.IsIntentCompleted(intentId, orderUpdateIntent.TradingDate ?? "", orderUpdateIntent.Stream ?? ""))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "COMPLETED_INTENT_ORDER_UPDATE", new
+            {
+                error = "Order update received for protective order whose intent is already TradeCompleted",
+                intent_id = intentId,
+                broker_order_id = order.OrderId,
+                order_leg = parsed.Leg,
+                order_state = orderState.ToString(),
+                stream = orderUpdateIntent.Stream,
+                action = "ORPHAN_DETECTED",
+                note = "Protective order for completed intent - route to reconciliation"
+            }));
+        }
 
         // Pre-flight diagnostic: when tag indicates STOP, log for BE confirmation verification
         if (parsed.Leg == "STOP")
@@ -1257,22 +1618,39 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (!OrderMap.TryGetValue(intentId, out var orderInfo))
         {
-            // CRITICAL FIX: Handle execution updates for untracked orders gracefully
-            // This can happen if:
-            // 1. Order was rejected before being tracked
-            // 2. Order tracking failed but execution update arrived
-            // 3. Multiple execution updates for same order (race condition)
-            // Log as INFO (not WARN) since this is often expected for rejected orders
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_UPDATE_UNKNOWN_ORDER",
-                new 
-                { 
-                    error = "Order not found in tracking map", 
-                    broker_order_id = order.OrderId, 
-                    tag = encodedTag,
+            var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            // Phase 2: Order update for order not in registry or OrderMap - manual/external order policy
+            if (_useInstrumentExecutionAuthority && _iea != null && !_iea.TryResolveByBrokerOrderId(order.OrderId, out _))
+            {
+                _iea.RegisterUnownedOrder(order.OrderId, intentId, instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", new
+                {
+                    broker_order_id = order.OrderId,
+                    intent_id = intentId,
+                    instrument,
                     order_state = orderState.ToString(),
-                    note = "Execution update received for untracked order - may indicate order was rejected before tracking or tracking race condition",
-                    severity = "INFO" // Not an error - often expected for rejected orders
+                    note = "Order update for order not in registry - fail-closed flatten",
+                    policy = "FAIL_CLOSED_FLATTEN"
                 }));
+                if (orderState == OrderState.Working || orderState == OrderState.Accepted)
+                {
+                    _iea.RequestRecovery(instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", new { broker_order_id = order.OrderId, intent_id = intentId }, utcNow);
+                    _iea.RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = order.OrderId, intent_id = intentId }, utcNow);
+                }
+            }
+            else
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER",
+                    new
+                    {
+                        error = "Order not found in tracking map",
+                        broker_order_id = order.OrderId,
+                        tag = encodedTag,
+                        order_state = orderState.ToString(),
+                        note = "Order update for untracked order - may indicate rejected before tracking or race condition",
+                        severity = "INFO"
+                    }));
+            }
             return;
         }
 
@@ -1282,6 +1660,10 @@ public sealed partial class NinjaTraderSimAdapter
             var orderTypeFromTag = parsed.Leg ?? orderInfo.OrderType;
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_ACKNOWLEDGED",
                 new { broker_order_id = order.OrderId, order_type = orderTypeFromTag }));
+            
+            // Intent lifecycle: entry order accepted -> ENTRY_WORKING
+            if (parsed.Leg != "STOP" && parsed.Leg != "TARGET")
+                _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.ENTRY_ACCEPTED, null, utcNow);
             
             // Mark protective orders as acknowledged for watchdog tracking
             if (parsed.Leg == "STOP")
@@ -1641,13 +2023,11 @@ public sealed partial class NinjaTraderSimAdapter
             // Try to get stream from orderInfo if available, but likely unknown
             _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:INTENT_NOT_FOUND:{intentId}");
             
-            // CRITICAL FIX: Flatten position immediately (fail-closed)
-            // NT THREADING FIX: Worker MUST NOT call account.Flatten. Enqueue for strategy thread.
-            if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+            // CRITICAL FIX: Flatten position immediately (fail-closed) - Phase 3: route through RequestRecovery
+            if (_useInstrumentExecutionAuthority)
             {
-                var cid = $"ORPHAN_FILL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-                _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "ORPHAN_FILL_INTENT_NOT_FOUND", utcNow), out _);
-                LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_ENQUEUED", "ENGINE",
+                RequestRecoveryForInstrument(instrument, "ORPHAN_FILL_INTENT_NOT_FOUND", new { intent_id = intentId, tag = encodedTag, order_type = orderType, fill_price = fillPrice, fill_quantity = fillQuantity }, utcNow);
+                LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_RECOVERY_REQUESTED", "ENGINE",
                     new
                     {
                         intent_id = intentId,
@@ -1657,8 +2037,7 @@ public sealed partial class NinjaTraderSimAdapter
                         fill_price = fillPrice,
                         fill_quantity = fillQuantity,
                         reason = "INTENT_NOT_FOUND",
-                        correlation_id = cid,
-                        note = "Flatten enqueued for strategy thread (orphan fill)"
+                        note = "Phase 3: RequestRecovery for orphan fill"
                     });
             }
             else
@@ -1888,11 +2267,11 @@ public sealed partial class NinjaTraderSimAdapter
         catch { return ""; }
     }
 
-    /// <summary>Defer unresolved execution for non-blocking retry. IEA: enqueue to worker. Non-IEA: add to pending list.</summary>
+    /// <summary>Defer unresolved execution for non-blocking retry. IEA: enqueue to worker (recovery-essential). Non-IEA: add to pending list.</summary>
     private void DeferUnresolvedExecution(UnresolvedExecutionRecord record)
     {
         if (_useInstrumentExecutionAuthority && _iea != null)
-            _iea.Enqueue(() => ProcessUnresolvedRetry(record));
+            _iea.EnqueueRecoveryEssential(() => ProcessUnresolvedRetry(record));
         else
         {
             lock (_pendingUnresolvedLock)
@@ -1900,30 +2279,45 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
-    /// <summary>Process unresolved retry: try lookup, if found continue; if elapsed >= 500ms flatten; else re-enqueue.</summary>
+    /// <summary>Process unresolved retry: try OrderMap and registry; if found continue; if retries left re-enqueue; else flatten.</summary>
     private void ProcessUnresolvedRetry(UnresolvedExecutionRecord record)
     {
         var utcNow = DateTimeOffset.UtcNow;
         var elapsed = record.ElapsedMs;
         var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(record.Order);
         var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder((record.Order as Order)?.Instrument);
+        OrderInfo? orderInfo = null;
 
-        if (OrderMap.TryGetValue(record.IntentId, out var orderInfo))
+        if (OrderMap.TryGetValue(record.IntentId, out orderInfo))
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_RESOLVED",
-                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_DEFERRED_RESOLVED",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, elapsed_ms = elapsed, retry_count = record.RetryCount }));
             HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
             return;
         }
-        if (elapsed < UNRESOLVED_GRACE_MS)
+        if (_useInstrumentExecutionAuthority && _iea != null && !string.IsNullOrEmpty(record.BrokerOrderId))
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_RETRY",
-                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+            var parsedTag = RobotOrderIds.ParseTag(record.EncodedTag);
+            if (_iea.TryResolveForExecutionUpdate(record.BrokerOrderId, record.IntentId, parsedTag.Leg, out var regEntry, out var resolutionPath))
+            {
+                orderInfo = regEntry!.OrderInfo;
+                _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_DEFERRED_RESOLVED",
+                    new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, elapsed_ms = elapsed, retry_count = record.RetryCount, resolution_path = resolutionPath }));
+                HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+                return;
+            }
+        }
+        if (record.RetryCount < UNRESOLVED_MAX_RETRIES && elapsed < UNRESOLVED_GRACE_MS)
+        {
+            record.RetryCount++;
+            _iea?.IncrementExecutionResolutionRetries();
+            _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_DEFERRED_RETRY",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, retry_count = record.RetryCount, elapsed_ms = elapsed }));
             DeferUnresolvedExecution(record);
             return;
         }
-        _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_UPDATE_GRACE_EXPIRED",
-            new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, elapsed_ms = elapsed }));
+        _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_RESOLUTION_TIMEOUT",
+            new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, elapsed_ms = elapsed, retry_count = record.RetryCount }));
         TriggerUnknownOrderFlatten(record);
     }
 
@@ -1987,14 +2381,23 @@ public sealed partial class NinjaTraderSimAdapter
         }
         if (isDuplicate)
         {
-            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_SKIPPED",
-                new { broker_order_id = order.OrderId, note = "Duplicate execution callback skipped (dedup)" }));
+            string? execId = null;
+            try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
+            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_DETECTED",
+                new { broker_order_id = order.OrderId, execution_id = execId, note = "Duplicate execution callback skipped (dedup)" }));
             return;
         }
 
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
+
+        if (_useInstrumentExecutionAuthority && _iea != null &&
+            !string.IsNullOrEmpty(encodedTag) && encodedTag.StartsWith("QTSW2:FLATTEN:", StringComparison.OrdinalIgnoreCase))
+        {
+            var instrumentKey = order.Instrument?.MasterInstrument?.Name ?? _iea.ExecutionInstrumentKey;
+            _iea.OnFlattenFillReceived(instrumentKey, order.OrderId, utcNow);
+        }
         
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
@@ -2113,14 +2516,26 @@ public sealed partial class NinjaTraderSimAdapter
             return; // Fail-closed: don't process untracked fill
         }
 
-        // CRITICAL FIX: Handle race condition where fill arrives before order is fully added to OrderMap
-        // This can happen when order state is "Initialized" - order is being submitted but fill arrives immediately
-        // CRITICAL FIX: Handle protective orders that aren't in OrderMap
-        // Protective orders (STOP/TARGET) are not always added to OrderMap, but we can create OrderInfo from tag
+        // Phase 1 Execution Ownership: Try registry first (broker order id, then alias)
+        var parsedTag = RobotOrderIds.ParseTag(encodedTag);
         OrderInfo? orderInfo = null;
         bool orderInfoCreatedFromTag = false;
-        
-        if (!OrderMap.TryGetValue(intentId, out orderInfo))
+
+        if (_useInstrumentExecutionAuthority && _iea != null &&
+            _iea.TryResolveForExecutionUpdate(order.OrderId, intentId, parsedTag.Leg, out var regEntry, out var resolutionPath))
+        {
+            orderInfo = regEntry!.OrderInfo;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_REGISTRY_EXEC_RESOLVED", new
+            {
+                broker_order_id = order.OrderId,
+                intent_id = intentId,
+                resolution_path = resolutionPath,
+                order_role = regEntry.OrderRole.ToString(),
+                ownership_status = regEntry.OwnershipStatus.ToString()
+            }));
+        }
+
+        if (orderInfo == null && !OrderMap.TryGetValue(intentId, out orderInfo))
         {
             // If this is a protective order (detected from tag), create OrderInfo on the fly
             if (isProtectiveOrder && !string.IsNullOrEmpty(orderTypeFromTag) && !string.IsNullOrEmpty(intentId))
@@ -2165,6 +2580,22 @@ public sealed partial class NinjaTraderSimAdapter
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             var orderState = order.OrderState;
 
+            // Phase 2: Emit EXECUTION_UNOWNED when registry resolve failed (ownership-aware path)
+            if (_useInstrumentExecutionAuthority && _iea != null)
+            {
+                _iea.IncrementUnownedDetected();
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "EXECUTION_UNOWNED", new
+                {
+                    broker_order_id = order.OrderId,
+                    intent_id = intentId,
+                    instrument,
+                    fill_price = fillPrice,
+                    fill_quantity = fillQuantity,
+                    note = "Execution update for order not in registry - fail-closed recovery",
+                    iea_instance_id = _iea.InstanceId
+                }));
+            }
+
             // MULTI-INSTANCE FIX: When multiple strategy instances run for same instrument (e.g. two MNQ charts),
             // all receive execution callbacks. Only the instance that submitted has the order in OrderMap.
             // If we have NO orders for this instrument, we're the wrong instance - skip (don't flatten).
@@ -2194,15 +2625,17 @@ public sealed partial class NinjaTraderSimAdapter
                     return;
             }
 
-            // Phase 1: Non-blocking deferred retry (no Thread.Sleep). Enqueue for retry; expire after 500ms.
+            // Phase 1: Non-blocking deferred retry (no Thread.Sleep). Enqueue for retry; max retries with 50-100ms interval.
             string? execId = null;
             try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
+            var brokerOrderId = order.OrderId?.ToString();
             var record = new UnresolvedExecutionRecord(execution, order, intentId, instrument, encodedTag,
-                fillPrice, fillQuantity, orderState.ToString(), isProtectiveOrder, orderTypeFromTag, utcNow, execId);
+                fillPrice, fillQuantity, orderState.ToString(), isProtectiveOrder, orderTypeFromTag, utcNow, execId, brokerOrderId);
             var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(order);
             var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument);
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_UPDATE_GRACE_STARTED",
-                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = intentId, execution_id = execId, elapsed_ms = 0 }));
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_DEFERRED_FOR_REGISTRY_RESOLUTION",
+                new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = intentId, execution_id = execId, broker_order_id = order.OrderId, elapsed_ms = 0, retry_count = 0 }));
+            _iea?.IncrementDeferredExecutionCount();
             DeferUnresolvedExecution(record);
             return;
         }
@@ -2374,10 +2807,18 @@ public sealed partial class NinjaTraderSimAdapter
             // P1: Emit one EXECUTION_FILLED/PARTIAL per intent when aggregated; single when not
             var isPartial = filledTotal < orderInfo.Quantity;
             var eventType = isPartial ? "EXECUTION_PARTIAL_FILL" : "EXECUTION_FILLED";
-            if (!isPartial) orderInfo.State = "FILLED";
+            if (!isPartial)
+            {
+                orderInfo.State = "FILLED";
+                _iea?.UpdateOrderLifecycle(orderInfo.OrderId, OrderLifecycleState.FILLED, utcNow);
+            }
+
+            // Intent lifecycle: entry fill transitions
+            var entryTransition = isPartial ? IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED : IntentLifecycleTransition.ENTRY_FILLED;
 
             void EmitEntryFill(string allocIntentId, int allocFillQty, int allocFilledTotal, string allocStream, string allocTradingDate, string allocDirection)
             {
+                _iea?.TryTransitionIntentLifecycle(allocIntentId, entryTransition, null, utcNow);
                 var side = allocDirection.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "BUY" : "SELL";
                 var sessionClass = DeriveSessionClass(allocStream);
                 var allocRemaining = isPartial ? orderInfo.Quantity - filledTotal : 0;
@@ -2529,9 +2970,44 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            // LATE-FILL PROTECTION: If intent already completed, this is a stale/late fill (race with sibling cancel).
+            var tradingDate = context.TradingDate ?? "";
+            var stream = context.Stream ?? "";
+            if (_executionJournal.IsIntentCompleted(intentId, tradingDate, stream))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_RECEIVED_FILL", "ENGINE",
+                    new
+                    {
+                        error = "Fill received for intent already TradeCompleted - stale/late fill on terminal intent",
+                        intent_id = intentId,
+                        broker_order_id = order.OrderId,
+                        instrument = orderInfo.Instrument,
+                        stream = stream,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        side = orderInfo.Direction,
+                        exit_order_type = orderTypeForContext,
+                        execution_timestamp_utc = utcNow.ToString("o"),
+                        mapped = true,
+                        action = "ANOMALY_LOGGED",
+                        note = "CRITICAL: Late fill on completed intent - route to reconciliation. Do not process as normal exit."
+                    }));
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    notificationService.EnqueueNotification($"COMPLETED_INTENT_RECEIVED_FILL:{intentId}",
+                        "CRITICAL: Late Fill on Completed Intent",
+                        $"Fill received for intent {intentId} already TradeCompleted. Broker Order: {order.OrderId}, Qty: {fillQuantity}, Price: {fillPrice}. Route to reconciliation.",
+                        priority: 2);
+                }
+                return; // Fail-closed: do not process as normal fill
+            }
+
             PruneIntentState(intentId, "exit_fill");
             // Intent exit: purge pending BE (target/stop fill)
             PurgePendingBEForIntent(intentId, utcNow, orderInfo.Instrument, "exit_fill");
+            _iea?.UpdateOrderLifecycle(order.OrderId, OrderLifecycleState.FILLED, utcNow);
+            _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
             // Exit fill
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
             // orderInfo might be from entry order if protective order wasn't added to OrderMap yet
@@ -2669,6 +3145,9 @@ public sealed partial class NinjaTraderSimAdapter
                             }));
                     }
                 }
+                
+                // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
+                TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
             }
         }
         else
@@ -2789,6 +3268,7 @@ public sealed partial class NinjaTraderSimAdapter
             var sessionClass = DeriveSessionClass(stream);
 
             _executionJournal.RecordExitFill(intentId, tradingDate, stream, fillPrice, allocQty, "FLATTEN", utcNow);
+            _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
             _coordinator?.OnExitFill(intentId, allocQty, utcNow);
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILLED",
@@ -2909,6 +3389,23 @@ public sealed partial class NinjaTraderSimAdapter
                 nt_order_name = ntOrderName,
                 tag = tag,
                 oco_id = ocoId
+            }));
+
+        // Phase 2: Emit EXECUTION_GHOST_FILL_DETECTED for institutional anomaly monitoring
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "EXECUTION_GHOST_FILL_DETECTED",
+            new
+            {
+                account = accountName,
+                instrument = instrument,
+                broker_order_id = brokerOrderId,
+                order_id = orderIdInternal,
+                quantity = fillQuantity,
+                price = fillPrice,
+                side = side,
+                mapped = false,
+                reason = unmappedReason,
+                stream_key = (string?)null,
+                intent_id = (string?)null
             }));
     }
 
@@ -3330,6 +3827,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
+            _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var si) ? si.Stream : null, OrderRole.STOP, OrderOwnershipStatus.OWNED, "SubmitProtectiveStop", stopOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -3739,6 +4237,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
+            _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var ti) ? ti.Stream : null, OrderRole.TARGET, OrderOwnershipStatus.OWNED, "SubmitTargetOrder", targetOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -3907,6 +4406,30 @@ public sealed partial class NinjaTraderSimAdapter
                         }));
                         _firstMissingStopUtcByIntent.TryRemove(intentId, out _);
                         _lastBeModifyAttemptUtcByIntent.Remove(intentId);
+
+                        // Guard: If account is flat for this instrument, skip flatten to prevent opening a wrong
+                        // position (e.g. SELL when flat would open short). See 2026-03-13_MES_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.md
+                        var account = _ntAccount as Account;
+                        var hasPosition = false;
+                        if (account != null && !string.IsNullOrWhiteSpace(intent.Instrument))
+                        {
+                            try
+                            {
+                                hasPosition = account.Positions.Any(p => p.Quantity != 0 &&
+                                    ExecutionInstrumentResolver.IsSameInstrument(p.Instrument?.MasterInstrument?.Name, intent.Instrument));
+                            }
+                            catch { /* fall through to flatten if check fails */ }
+                        }
+                        if (!hasPosition)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument ?? "", "BE_STOP_VISIBILITY_TIMEOUT_SKIP_ACCOUNT_FLAT", new
+                            {
+                                intent_id = intentId,
+                                execution_instrument_key = execInstKey,
+                                note = "Account flat for instrument - skip flatten; stop likely cancelled from prior flatten"
+                            }));
+                            continue;
+                        }
                         Flatten(intentId, intent.Instrument ?? "", utcNow);
                     }
                 }
@@ -4340,6 +4863,67 @@ public sealed partial class NinjaTraderSimAdapter
     
     /// <summary>
     /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
+    /// <summary>
+    /// Terminalize an intent: cancel all protective orders, verify invariant, remove from management.
+    /// Single canonical path for target fill, stop fill, flatten, and reconciliation completion.
+    /// </summary>
+    private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
+        CancelProtectiveOrdersForIntent(intentId, utcNow);
+        var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
+        if (workingOrders.Count > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
+                new
+                {
+                    error = "Completed intent still has working protective orders - invariant violated",
+                    intent_id = intentId,
+                    stream = stream,
+                    completion_reason = completionReason,
+                    working_order_ids = workingOrders.Select(o => o.OrderId).ToList(),
+                    working_order_types = workingOrders.Select(o => GetOrderTag(o)).ToList(),
+                    count = workingOrders.Count,
+                    action = "CRITICAL_ANOMALY",
+                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                }));
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                notificationService.EnqueueNotification($"TERMINAL_INTENT_HAS_WORKING_ORDERS:{intentId}",
+                    "CRITICAL: Terminal Intent Has Working Orders",
+                    $"Intent {intentId} completed ({completionReason}) but {workingOrders.Count} protective order(s) still Working. Order IDs: {string.Join(", ", workingOrders.Select(o => o.OrderId))}.",
+                    priority: 2);
+            }
+            CancelProtectiveOrdersForIntent(intentId, utcNow);
+        }
+        else
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, intentId, "", "TERMINAL_INTENT_VERIFIED",
+                new { intent_id = intentId, stream = stream, completion_reason = completionReason }));
+        }
+    }
+
+    private List<Order> GetWorkingProtectiveOrdersForIntent(string intentId)
+    {
+        var result = new List<Order>();
+        if (_ntAccount == null) return result;
+        var account = _ntAccount as Account;
+        if (account == null) return result;
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+        foreach (var order in account.Orders)
+        {
+            if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                continue;
+            var tag = GetOrderTag(order) ?? "";
+            if (tag == stopTag || tag == targetTag)
+                result.Add(order);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
     /// This is used when updating existing protective orders fails - we cancel and recreate them.
     /// </summary>
     private void CancelProtectiveOrdersForIntent(string intentId, DateTimeOffset utcNow)
@@ -4559,13 +5143,22 @@ public sealed partial class NinjaTraderSimAdapter
     }
     
     /// <summary>
-    /// Emergency flatten when IEA is blocked. Bypasses IEA queue — calls broker directly.
+    /// Emergency flatten when IEA is blocked. Routes through IEA RequestFlatten (no bypass).
     /// Prevents position with no protectives when EnqueueAndWait times out.
     /// </summary>
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_ON_BLOCK", state: "ENGINE",
-            new { instrument, note = "Flatten on block — bypassing IEA queue" }));
+            new { instrument, note = "Flatten on block — requesting via IEA RequestFlatten" }));
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == System.Threading.Thread.CurrentThread.ManagedThreadId;
+            if (inContext)
+                return _iea.RequestFlatten(instrument, "IEA_BLOCK_EMERGENCY", "FlattenEmergency", utcNow);
+            var cmd = new NtFlattenInstrumentCommand($"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}", "EMERGENCY_BLOCK", instrument, "IEA_BLOCK_EMERGENCY", utcNow);
+            _ntActionQueue?.EnqueueNtAction(cmd, out _);
+            return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+        }
         return FlattenIntentReal("EMERGENCY_BLOCK", instrument, utcNow);
     }
 
@@ -4594,9 +5187,8 @@ public sealed partial class NinjaTraderSimAdapter
         
         try
         {
-            // CRITICAL FIX: Add null checks to prevent NullReferenceException
             // Get position for this instrument - use dynamic to handle different API signatures
-            dynamic dynAccountFlatten = account;
+            dynamic dynAccountPos = account;
             Position? position = null;
             string? instrumentName = null;
             
@@ -4624,7 +5216,7 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 if (ntInstrument != null)
                 {
-                    position = dynAccountFlatten.GetPosition(ntInstrument);
+                    position = dynAccountPos.GetPosition(ntInstrument);
                 }
             }
             catch
@@ -4634,7 +5226,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     if (!string.IsNullOrEmpty(instrumentName))
                     {
-                        position = dynAccountFlatten.GetPosition(instrumentName);
+                        position = dynAccountPos.GetPosition(instrumentName);
                     }
                 }
                 catch
@@ -4645,72 +5237,47 @@ public sealed partial class NinjaTraderSimAdapter
             
             if (position != null && position.MarketPosition == MarketPosition.Flat)
             {
-                // Already flat
+                // Already flat - no order sent (IEA flatten authority: account position is source of truth)
                 return FlattenResult.SuccessResult(utcNow);
             }
-            
-            // Note: NinjaTrader API doesn't support per-intent flattening
-            // We flatten the entire instrument position
-            // This is acceptable because:
-            // 1. The coordinator tracks remaining intents
-            // 2. If other intents exist, they would need to be re-entered (rare path)
-            // 3. This is an emergency fallback scenario
-            
-            // CRITICAL FIX: Add null checks before flattening
-            bool flattenSucceeded = false;
-            
-            // Record flatten call for broker flatten recognition (avoids UNTrackED_FILL cascade)
-            lock (_flattenRecognitionLock)
-            {
-                _lastFlattenInstrument = instrumentName ?? instrument;
-                _lastFlattenUtc = utcNow;
-            }
-            
-            // Flatten - use dynamic to handle different API signatures. Guard: must run on strategy thread.
-            var flattenSuccess = new[] { false };
+
+            // IEA Flatten Authority: Use position-derived market order instead of Account.Flatten.
+            // Position query + decision + submission as one critical section on strategy thread.
+            var resultHolder = new[] { FlattenResult.FailureResult("Not executed", utcNow) };
             if (!EnsureStrategyThreadOrEnqueue("FlattenIntentReal", intentId, instrument, $"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", () =>
             {
-                if (ntInstrument != null)
+                var (qty, dir) = (this as IIEAOrderExecutor).GetAccountPositionForInstrument(instrument);
+                if (qty == 0 || string.IsNullOrEmpty(dir))
                 {
-                    try
-                    {
-                        dynAccountFlatten.Flatten(ntInstrument);
-                        flattenSuccess[0] = true;
-                    }
-                    catch
-                    {
-                        try
-                        {
-                            dynAccountFlatten.Flatten(new[] { ntInstrument });
-                            flattenSuccess[0] = true;
-                        }
-                        catch
-                        {
-                            if (!string.IsNullOrEmpty(instrumentName))
-                            {
-                                try
-                                {
-                                    dynAccountFlatten.Flatten(instrumentName);
-                                    flattenSuccess[0] = true;
-                                }
-                                catch { }
-                            }
-                        }
-                    }
+                    resultHolder[0] = FlattenResult.SuccessResult(utcNow);
+                    return;
                 }
+                var absQty = Math.Abs(qty);
+                var chosenSide = dir.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+                var snapshot = new FlattenDecisionSnapshot
+                {
+                    Instrument = instrument,
+                    AccountQuantityAtDecision = qty,
+                    AccountDirectionAtDecision = dir,
+                    RequestedReason = intentId,
+                    CallerContext = "FlattenIntentReal",
+                    ChosenSide = chosenSide,
+                    ChosenQuantity = absQty,
+                    LatchRequestId = $"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}",
+                    DecisionUtc = utcNow
+                };
+                var submitResult = (this as IIEAOrderExecutor).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow);
+                resultHolder[0] = submitResult.Success ? FlattenResult.SuccessResult(utcNow) : FlattenResult.FailureResult(submitResult.ErrorMessage ?? "Flatten order failed", utcNow);
             }))
             {
                 return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
             }
-            flattenSucceeded = flattenSuccess[0];
-            
+            var flattenSucceeded = resultHolder[0].Success;
             if (!flattenSucceeded)
             {
-                var error = $"Flatten failed: ntInstrument is null or all flatten attempts failed. Instrument: {instrument}, InstrumentName: {instrumentName ?? "N/A"}";
-                return FlattenResult.FailureResult(error, utcNow);
+                return resultHolder[0];
             }
-            
-            // GC FIX: Check if position is null before accessing Quantity
+
             var positionQty = position?.Quantity ?? 0;
             
             // CRITICAL FIX: Cancel entry stop orders when position is manually flattened

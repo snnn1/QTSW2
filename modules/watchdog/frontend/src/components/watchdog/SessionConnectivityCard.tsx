@@ -15,6 +15,7 @@ function formatChicagoTime(iso: string | null): string {
 }
 
 function formatDuration(seconds: number): string {
+  if (seconds < 0) return '0s'  // Guard against negative (out-of-order events)
   if (seconds < 60) return `${Math.round(seconds)}s`
   const m = Math.floor(seconds / 60)
   const s = Math.round(seconds % 60)

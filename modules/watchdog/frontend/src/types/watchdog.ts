@@ -19,6 +19,10 @@ export interface WatchdogStatus {
   protective_failures_count: number;
   data_stall_detected: Record<string, DataStallInfo>;
   data_status?: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN';
+  /** Engine activity: RUNNING | IDLE | STALLED (derived from heartbeat + tick activity) */
+  engine_activity_classification?: 'RUNNING' | 'IDLE' | 'STALLED';
+  /** Feed health: DATA_FLOWING | DATA_STALLED | MARKET_CLOSED */
+  feed_health_classification?: 'DATA_FLOWING' | 'DATA_STALLED' | 'MARKET_CLOSED';
   market_open: boolean | null;
   // PHASE 3.1: Identity invariants status
   last_identity_invariants_pass: boolean | null;
@@ -171,6 +175,8 @@ export interface UnprotectedPosition {
 
 export interface WatchdogEvent {
   event_seq: number;
+  /** Phase 4: Canonical ID for REST/WS dedupe (run_id:event_seq) */
+  event_id?: string;
   run_id: string;
   timestamp_utc: string;
   timestamp_chicago: string;

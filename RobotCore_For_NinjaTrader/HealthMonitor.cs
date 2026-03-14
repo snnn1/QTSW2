@@ -91,7 +91,12 @@ public sealed class HealthMonitor
         "DISCONNECT_FAIL_CLOSED_ENTERED",
         "SLOT_FAILED_RUNTIME",
         "REENTRY_PROTECTION_FAILED",
-        "RECONCILIATION_QTY_MISMATCH"
+        "RECONCILIATION_QTY_MISMATCH",
+        // Phase 5 supervisory
+        "INSTRUMENT_HALTED",
+        "OPERATOR_ACK_REQUIRED",
+        "GLOBAL_KILL_SWITCH_ACTIVATED",
+        "SUPERVISORY_THRESHOLD_EXCEEDED"
     };
     
     // Background evaluation thread for data loss detection

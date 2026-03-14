@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -81,6 +82,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Gap 5: Callback when IEA EnqueueAndWait fails (timeout/overflow). Engine blocks instrument and stands down streams.</summary>
     private Action<string, DateTimeOffset, string>? _blockInstrumentCallback;
+
+    /// <summary>Gap 5: Canonical event writer. Set by engine before SetNTContext.</summary>
+    private ExecutionEventWriter? _eventWriter;
+
+    /// <summary>Gap 5: Set canonical event writer for replay. Call before SetNTContext when using IEA.</summary>
+    public void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;
+    private Action<string, string, object>? _onSupervisoryCriticalCallback;
     
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
@@ -116,6 +124,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private readonly List<UnresolvedExecutionRecord> _pendingUnresolvedExecutions = new();
     private readonly object _pendingUnresolvedLock = new();
     private const double UNRESOLVED_GRACE_MS = 500.0;
+    private const int UNRESOLVED_MAX_RETRIES = 5;
+    private const double UNRESOLVED_RETRY_INTERVAL_MS = 75.0;
     private int _nonIeaDedupInsertCount;
     private const int NON_IEA_DEDUP_EVICTION_INTERVAL = 100;
     private const double NON_IEA_DEDUP_MAX_AGE_MINUTES = 5.0;
@@ -439,12 +449,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Action<string, DateTimeOffset, string>? standDownStreamCallback,
         Func<object?>? getNotificationServiceCallback,
         Func<bool>? isExecutionAllowedCallback = null,
-        Action<string, DateTimeOffset, string>? blockInstrumentCallback = null)
+        Action<string, DateTimeOffset, string>? blockInstrumentCallback = null,
+        Action<string, string, object>? onSupervisoryCriticalCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
         _isExecutionAllowedCallback = isExecutionAllowedCallback;
         _blockInstrumentCallback = blockInstrumentCallback;
+        _onSupervisoryCriticalCallback = onSupervisoryCriticalCallback;
     }
     
     /// <summary>
@@ -478,7 +490,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             _ieaAccountName = accountName;
             _iea = InstrumentExecutionAuthorityRegistry.GetOrCreate(accountName, executionInstrumentKey,
                 () => new InstrumentExecutionAuthority(accountName, executionInstrumentKey, this, _log, _aggregationPolicy));
+            _iea.SetEventWriter(_eventWriter);
             _iea.SetOnEnqueueFailureCallback(_blockInstrumentCallback);
+            _iea.SetOnRecoveryRequestedCallback(OnRecoveryRequested);
+            _iea.SetOnRecoveryFlattenRequestedCallback(OnRecoveryFlattenRequested);
+            _iea.SetOnBootstrapSnapshotRequestedCallback(OnBootstrapSnapshotRequested);
+            _iea.SetOnSupervisoryCriticalCallback(_onSupervisoryCriticalCallback);
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "IEA_BINDING", state: "ENGINE",
                 new
                 {
@@ -507,8 +524,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // STEP 1: SIM Account Verification (MANDATORY) - now with real NT account
         VerifySimAccount();
 
-        // One-time: Re-register intents from open journal entries (for BE detection after restart)
+        // One-time: Re-register intents from open journal entries BEFORE bootstrap so runtime snapshot and adoption have correct IntentMap.
         HydrateIntentsFromOpenJournals();
+
+        // Phase 4: Bootstrap after hydration. Centralizes startup/reconnect determinism.
+        if (_useInstrumentExecutionAuthority && _iea != null)
+        {
+            _iea.BeginBootstrapForInstrument(executionInstrumentKey, BootstrapReason.STRATEGY_START, DateTimeOffset.UtcNow);
+        }
     }
 
     /// <summary>
@@ -640,6 +663,54 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         catch { return ""; }
     }
     
+    /// <summary>
+    /// Phase 3: Request recovery for instrument. Routes to IEA when bound.
+    /// </summary>
+    public void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(_ieaAccountName)) return;
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_ieaAccountName, instrument, null);
+        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
+        if (InstrumentExecutionAuthorityRegistry.TryGet(_ieaAccountName, execKey, out var iea))
+            iea.RequestRecovery(instrument, reason, context, utcNow);
+    }
+
+    /// <summary>
+    /// Phase 5: Request supervisory action for instrument. Routes to IEA when bound.
+    /// </summary>
+    public void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(_ieaAccountName)) return;
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_ieaAccountName, instrument, null);
+        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
+        if (InstrumentExecutionAuthorityRegistry.TryGet(_ieaAccountName, execKey, out var iea))
+            iea.RequestSupervisoryAction(instrument, reason, severity, context, utcNow);
+    }
+
+    /// <summary>
+    /// Enqueue execution command. Forwards to IEA when bound; no-op when IEA not enabled.
+    /// Strategy layers should use this instead of calling adapter.Flatten/SubmitOrders/CancelOrders directly.
+    /// </summary>
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
+    {
+        if (command == null) return;
+        if (!_useInstrumentExecutionAuthority || _iea == null)
+        {
+            _log.Write(RobotEvents.ExecutionBase(command.TimestampUtc, command.IntentId ?? "", command.Instrument, "EXECUTION_COMMAND_SKIPPED",
+                new { commandId = command.CommandId, reason = "IEA not enabled", commandType = command.GetType().Name }));
+            return;
+        }
+        var instrument = command.Instrument ?? "";
+        var execKey = !string.IsNullOrEmpty(_ieaAccountName)
+            ? ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_ieaAccountName, instrument, null)
+            : (instrument ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(execKey)) execKey = instrument.Trim().ToUpperInvariant();
+        if (InstrumentExecutionAuthorityRegistry.TryGet(_ieaAccountName ?? "", execKey, out var iea))
+            iea.EnqueueExecutionCommand(command);
+        else if (_iea != null)
+            _iea.EnqueueExecutionCommand(command);
+    }
+
     /// <summary>
     /// Get IEA identity for CRITICAL event payloads (when IEA enabled).
     /// </summary>
@@ -1985,6 +2056,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
         try
         {
+            if (_useInstrumentExecutionAuthority && _iea != null)
+            {
+                var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == System.Threading.Thread.CurrentThread.ManagedThreadId;
+                if (inContext)
+                    return _iea.RequestFlatten(instrument, intentId, intentId, utcNow);
+                var cmd = new NtFlattenInstrumentCommand($"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", intentId, instrument, "FLATTEN_DELEGATED", utcNow);
+                _ntActionQueue?.EnqueueNtAction(cmd, out _);
+                return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+            }
             return FlattenIntentReal(intentId, instrument, utcNow);
         }
         catch (Exception ex)
@@ -2261,6 +2341,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             
             // Only check intents with filled entries
             if (journalEntry == null || !journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal <= 0)
+                continue;
+            
+            // ZOMBIE_STOP FIX: Never place or modify BE for completed trades - prevents zombie stop orders
+            // that can fill after target/stop hit, creating extra positions not in journal (QTY_MISMATCH)
+            if (journalEntry.TradeCompleted)
+                continue;
+            
+            // TERMINAL_INTENT HARDENING: Only include intents with remaining open quantity
+            if (journalEntry.ExitFilledQuantityTotal >= journalEntry.EntryFilledQuantityTotal)
                 continue;
             
             // Check if BE has already been triggered (idempotency check)

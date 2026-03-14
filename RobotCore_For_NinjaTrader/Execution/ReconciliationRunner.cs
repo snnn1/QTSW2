@@ -144,6 +144,27 @@ public sealed class ReconciliationRunner
                         journal_qty = journalQty,
                         note = "Partial protection is worse than none. Freeze instrument-level."
                     }));
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "POSITION_DRIFT_DETECTED", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        broker_qty = accountQty,
+                        engine_qty = journalQty,
+                        journal_qty = journalQty,
+                        drift_class = journalQty > accountQty ? "journal_ahead" : "broker_ahead",
+                        intent_ids = intentIds,
+                        note = "Broker position and journal disagree."
+                    }));
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "EXPOSURE_INTEGRITY_VIOLATION", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        expected_position_from_intents = journalQty,
+                        broker_position = accountQty,
+                        drift_class = journalQty > accountQty ? "journal_ahead" : "broker_ahead",
+                        intent_ids = intentIds,
+                        note = "Total exposure must match system intent. Critical invariant violated."
+                    }));
                 _onQuantityMismatch?.Invoke(inst, utcNow, $"QTY_MISMATCH:account={accountQty},journal={journalQty}");
             }
         }

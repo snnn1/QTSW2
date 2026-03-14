@@ -19,14 +19,17 @@ const MAX_EVENTS = 200
 const REST_POLL_MS_WHEN_WS_CONNECTED = 10000  // 10s catch-up when WS primary
 const REST_POLL_MS_WHEN_WS_DISCONNECTED = 1500  // 1.5s when REST only
 
-/** Convert WebSocket event format to WatchdogEvent */
-function wsEventToWatchdogEvent(ws: { seq?: number; type?: string; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }): WatchdogEvent {
+/** Convert WebSocket event format to WatchdogEvent. Phase 4: use event_id for dedupe. */
+function wsEventToWatchdogEvent(ws: { seq?: number; event_id?: string; event_seq?: number; type?: string; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }): WatchdogEvent {
   const tsUtc = ws.ts_utc || new Date().toISOString()
   const d = new Date(tsUtc)
   const chicago = d.toLocaleString('en-US', { timeZone: 'America/Chicago' })
+  const runId = ws.run_id ?? ''
+  const eventSeq = ws.event_seq ?? ws.seq ?? 0
   return {
-    event_seq: ws.seq ?? 0,
-    run_id: ws.run_id ?? '',
+    event_seq: eventSeq,
+    event_id: ws.event_id ?? `${runId}:${eventSeq}`,
+    run_id: runId,
     timestamp_utc: tsUtc,
     timestamp_chicago: chicago,
     event_type: ws.type ?? 'UNKNOWN',
@@ -74,9 +77,9 @@ export function useWatchdogEvents() {
       // Filter repetitive events (gate violations, etc.) to reduce noise
       const filtered = filterRepetitiveEvents(deduplicated, 60000) // 60 second window
       
-      // Filter out already processed events
+      // Filter out already processed events (Phase 4: use event_id for REST/WS consistency)
       const unseenEvents = filtered.filter(event => {
-        const key = `${event.run_id}:${event.event_seq}`
+        const key = event.event_id ?? `${event.run_id}:${event.event_seq}`
         if (processedEventsRef.current.has(key)) {
           return false
         }
@@ -137,9 +140,9 @@ export function useWatchdogEvents() {
   // WebSocket subscription: merge live events when WS connected
   useEffect(() => {
     if (!wsSubscribe) return
-    const unsub = wsSubscribe((wsEvent: { type?: string; seq?: number; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }) => {
+    const unsub = wsSubscribe((wsEvent: { type?: string; seq?: number; event_id?: string; event_seq?: number; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }) => {
       if (wsEvent.type === 'heartbeat') return
-      const key = `ws:${wsEvent.run_id}:${wsEvent.seq}`
+      const key = wsEvent.event_id ?? `ws:${wsEvent.run_id}:${wsEvent.seq}`
       if (processedEventsRef.current.has(key)) return
       processedEventsRef.current.add(key)
       const ev = wsEventToWatchdogEvent(wsEvent)

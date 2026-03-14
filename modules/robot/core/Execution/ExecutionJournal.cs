@@ -1310,6 +1310,16 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Check if an intent is terminal (TradeCompleted).
+    /// Used for late-fill protection and orphan detection.
+    /// </summary>
+    public bool IsIntentCompleted(string intentId, string tradingDate, string stream)
+    {
+        var entry = GetEntry(intentId, tradingDate, stream);
+        return entry != null && entry.TradeCompleted;
+    }
+
+    /// <summary>
     /// Get execution journal entry for an intent.
     /// Returns null if entry doesn't exist.
     /// </summary>

@@ -2007,6 +2007,39 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            // LATE-FILL PROTECTION: If intent already completed, emit COMPLETED_INTENT_RECEIVED_FILL and return
+            var tradingDate = context.TradingDate ?? "";
+            var stream = context.Stream ?? "";
+            if (_executionJournal.IsIntentCompleted(intentId, tradingDate, stream))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_RECEIVED_FILL", "ENGINE",
+                    new
+                    {
+                        error = "Fill received for intent already TradeCompleted - stale/late fill on terminal intent",
+                        intent_id = intentId,
+                        broker_order_id = order.OrderId,
+                        instrument = orderInfo.Instrument,
+                        stream = stream,
+                        fill_price = fillPrice,
+                        fill_quantity = fillQuantity,
+                        side = orderInfo.Direction,
+                        exit_order_type = orderTypeForContext,
+                        execution_timestamp_utc = utcNow.ToString("o"),
+                        mapped = true,
+                        action = "ANOMALY_LOGGED",
+                        note = "CRITICAL: Late fill on completed intent - route to reconciliation."
+                    }));
+                var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+                if (notificationService != null)
+                {
+                    notificationService.EnqueueNotification($"COMPLETED_INTENT_RECEIVED_FILL:{intentId}",
+                        "CRITICAL: Late Fill on Completed Intent",
+                        $"Fill received for intent {intentId} already TradeCompleted. Broker Order: {order.OrderId}, Qty: {fillQuantity}, Price: {fillPrice}. Route to reconciliation.",
+                        priority: 2);
+                }
+                return;
+            }
+
             // Exit fill
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType
             // orderInfo might be from entry order if protective order wasn't added to _orderMap yet
@@ -2120,6 +2153,9 @@ public sealed partial class NinjaTraderSimAdapter
                             }));
                     }
                 }
+
+                // TERMINALIZATION: Cancel remaining protective orders and verify invariant
+                TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
             }
         }
         else
@@ -3200,6 +3236,66 @@ public sealed partial class NinjaTraderSimAdapter
         };
     }
     
+    /// <summary>
+    /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
+    /// <summary>
+    /// Terminalize an intent: cancel all protective orders, verify invariant.
+    /// Single canonical path for target fill, stop fill, flatten.
+    /// </summary>
+    private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
+        CancelProtectiveOrdersForIntent(intentId, utcNow);
+        var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
+        if (workingOrders.Count > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
+                new
+                {
+                    error = "Completed intent still has working protective orders - invariant violated",
+                    intent_id = intentId,
+                    stream = stream,
+                    completion_reason = completionReason,
+                    working_order_ids = workingOrders.Select(o => o.OrderId).ToList(),
+                    count = workingOrders.Count,
+                    action = "CRITICAL_ANOMALY",
+                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                }));
+            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
+            if (notificationService != null)
+            {
+                notificationService.EnqueueNotification($"TERMINAL_INTENT_HAS_WORKING_ORDERS:{intentId}",
+                    "CRITICAL: Terminal Intent Has Working Orders",
+                    $"Intent {intentId} completed ({completionReason}) but {workingOrders.Count} protective order(s) still Working.",
+                    priority: 2);
+            }
+            CancelProtectiveOrdersForIntent(intentId, utcNow);
+        }
+        else
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, intentId, "", "TERMINAL_INTENT_VERIFIED",
+                new { intent_id = intentId, stream = stream, completion_reason = completionReason }));
+        }
+    }
+
+    private List<Order> GetWorkingProtectiveOrdersForIntent(string intentId)
+    {
+        var result = new List<Order>();
+        if (_ntAccount == null) return result;
+        var account = _ntAccount as Account;
+        if (account == null) return result;
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+        foreach (var order in account.Orders)
+        {
+            if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                continue;
+            var tag = GetOrderTag(order) ?? "";
+            if (tag == stopTag || tag == targetTag)
+                result.Add(order);
+        }
+        return result;
+    }
+
     /// <summary>
     /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
     /// This is used when updating existing protective orders fails - we cancel and recreate them.

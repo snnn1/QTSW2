@@ -8,6 +8,7 @@ import { StreamStatusTable } from './components/watchdog/StreamStatusTable'
 import { RiskGatesPanel } from './components/watchdog/RiskGatesPanel'
 import { ActiveIntentPanel } from './components/watchdog/ActiveIntentPanel'
 import { FillHealthCard } from './components/watchdog/FillHealthCard'
+import { ExecutionIntegrityPanel } from './components/watchdog/ExecutionIntegrityPanel'
 import { ActiveAlertsCard } from './components/watchdog/ActiveAlertsCard'
 import { SessionConnectivityCard } from './components/watchdog/SessionConnectivityCard'
 import { DisconnectFeedCard } from './components/watchdog/DisconnectFeedCard'
@@ -22,22 +23,13 @@ import { useStreamStates } from './hooks/useStreamStates'
 import { useActiveIntents } from './hooks/useActiveIntents'
 import { useWatchdogAlerts } from './hooks/useWatchdogAlerts'
 import { useStreamPnl } from './hooks/useStreamPnl'
-import { getCurrentChicagoTime } from './utils/timeUtils.ts'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
+import { ChicagoClock } from './components/watchdog/ChicagoClock'
 import type { StreamState, WatchdogEvent } from './types/watchdog'
 
 export function WatchdogPage() {
-  const [chicagoTime, setChicagoTime] = useState(getCurrentChicagoTime())
   const [selectedStream, setSelectedStream] = useState<StreamState | null>(null)
   const [selectedEvent, setSelectedEvent] = useState<WatchdogEvent | null>(null)
-  
-  // Update Chicago time every second
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setChicagoTime(getCurrentChicagoTime())
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [])
   
   // Fetch data
   const { status, loading: statusLoading, error: statusError, lastSuccessfulPollTimestamp: statusPollTime } = useWatchdogStatus()
@@ -73,7 +65,7 @@ export function WatchdogPage() {
     return timestamps.length > 0 ? Math.max(...timestamps) : null
   }, [statusPollTime, eventsPollTime, gatesPollTime, positionsPollTime, streamsPollTime, intentsPollTime])
   
-  // Determine engine status - memoized to prevent unnecessary recalculations
+  // Determine engine status - prefer backend engine_activity_classification when available
   const engineStatus = useMemo(() => {
     if (!status) return 'STALLED'
 
@@ -81,7 +73,13 @@ export function WatchdogPage() {
     if (status.recovery_state === 'DISCONNECT_FAIL_CLOSED') return 'FAIL_CLOSED'
     if (status.recovery_state === 'RECOVERY_RUNNING') return 'RECOVERY_IN_PROGRESS'
 
-    // PATTERN 1: Handle bar-driven states
+    // Prefer backend engine_activity_classification (RUNNING | IDLE | STALLED)
+    const classification = status.engine_activity_classification
+    if (classification === 'RUNNING') return 'ALIVE'
+    if (classification === 'IDLE') return 'IDLE_MARKET_CLOSED'
+    if (classification === 'STALLED') return 'STALLED'
+
+    // Fallback: legacy engine_activity_state
     switch (status.engine_activity_state) {
       case 'ACTIVE':
       case 'ENGINE_ACTIVE_PROCESSING':
@@ -94,16 +92,21 @@ export function WatchdogPage() {
       case 'ENGINE_STALLED':
         return 'STALLED'
       default:
-        // Default to IDLE if unknown (safer than STALLED)
         return 'IDLE_MARKET_CLOSED'
     }
-  }, [status?.recovery_state, status?.engine_activity_state]) // Only depend on fields that affect result
+  }, [status?.recovery_state, status?.engine_activity_state, status?.engine_activity_classification])
   
-  // Determine data flow status - memoized with stable dependencies
-  // Uses same engine tick source as engine liveness (ENGINE_TICK_CALLSITE) when bar-age data unavailable
+  // Determine data flow status - prefer backend feed_health_classification when available
   const dataFlowStatus = useMemo(() => {
     if (!status) return 'UNKNOWN'
-    
+
+    // Prefer backend feed_health_classification (DATA_FLOWING | DATA_STALLED | MARKET_CLOSED)
+    const classification = status.feed_health_classification
+    if (classification === 'DATA_FLOWING') return 'FLOWING'
+    if (classification === 'DATA_STALLED') return 'STALLED'
+    if (classification === 'MARKET_CLOSED') return 'MARKET_CLOSED'
+
+    // Fallback: legacy frontend derivation
     const stalls = Object.values(status.data_stall_detected || {})
     const DATA_STALL_THRESHOLD = 120 // Match backend threshold (seconds)
     
@@ -176,7 +179,7 @@ export function WatchdogPage() {
     
     // No stalls detected = data flowing
     return 'FLOWING'
-  }, [status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago]) // Only depend on fields that affect result
+  }, [status?.feed_health_classification, status?.data_stall_detected, status?.market_open, status?.worst_last_bar_age_seconds, status?.last_engine_tick_chicago])
   
   // Build critical alerts (includes Phase 1 push alerts)
   const alerts = useMemo(() => {
@@ -267,7 +270,8 @@ export function WatchdogPage() {
         marketOpen={status?.market_open !== undefined ? status.market_open : null}
         connectionStatus={status?.connection_status ?? null}
         dataFlowStatus={dataFlowStatus}
-        chicagoTime={chicagoTime}
+        chicagoTime=""
+        clockSlot={<ChicagoClock />}
         lastEngineTick={status?.last_engine_tick_chicago || null}
         lastSuccessfulPollTimestamp={lastSuccessfulPollTimestamp}
         barsExpectedCount={status?.bars_expected_count}
@@ -356,6 +360,9 @@ export function WatchdogPage() {
 
             {/* Phase 1: Alert history (24h) */}
             <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
+
+            {/* Execution Integrity - anomaly counts */}
+            <ExecutionIntegrityPanel counts={status?.execution_integrity ?? null} />
 
             {/* Fill Health (execution logging hygiene) */}
             <FillHealthCard fillHealth={status?.fill_health} />

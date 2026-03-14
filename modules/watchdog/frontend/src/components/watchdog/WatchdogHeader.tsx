@@ -1,7 +1,7 @@
 /**
  * WatchdogHeader component - Global sticky header
  */
-import { useMemo } from 'react'
+import { useMemo, ReactNode } from 'react'
 import { CopyableText } from '../ui/CopyableText'
 import { formatChicagoTime } from '../../utils/timeUtils.ts'
 
@@ -10,8 +10,10 @@ interface WatchdogHeaderProps {
   engineStatus: 'ALIVE' | 'STALLED' | 'FAIL_CLOSED' | 'RECOVERY_IN_PROGRESS' | 'IDLE_MARKET_CLOSED'
   marketOpen: boolean | null
   connectionStatus: string | null
-  dataFlowStatus: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN'
+  dataFlowStatus: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'MARKET_CLOSED' | 'UNKNOWN'
   chicagoTime: string
+  /** When provided, renders this instead of chicagoTime (isolates 1s clock updates) */
+  clockSlot?: ReactNode
   lastEngineTick: string | null
   lastSuccessfulPollTimestamp: number | null
   // PHASE 3.1: Identity invariants status
@@ -34,7 +36,8 @@ export function WatchdogHeader({
   identityInvariantsPass,
   identityViolations,
   barsExpectedCount,
-  worstLastBarAgeSeconds
+  worstLastBarAgeSeconds,
+  clockSlot
 }: WatchdogHeaderProps) {
   // Compute data freshness
   const dataFreshness = useMemo(() => {
@@ -99,6 +102,8 @@ export function WatchdogHeader({
         return <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">DATA FLOWING</span>
       case 'STALLED':
         return <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">DATA STALLED</span>
+      case 'MARKET_CLOSED':
+        return <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">MARKET CLOSED</span>
       case 'ACCEPTABLE_SILENCE':
         return <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">DATA SILENT (OK)</span>
       default:
@@ -160,7 +165,7 @@ export function WatchdogHeader({
         <div className={`text-sm ${dataFreshness === 'OK' ? 'text-green-500' : 'text-red-500'}`}>
           Data Freshness: {dataFreshness}
         </div>
-        <div className="text-sm font-mono">{chicagoTime}</div>
+        <div className="text-sm font-mono">{clockSlot ?? chicagoTime}</div>
         {lastEngineTick && (
           <div className="text-xs text-gray-400">
             Last Tick: {formatChicagoTime(lastEngineTick)}

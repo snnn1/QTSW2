@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -214,5 +215,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
                     note = "Failed to cancel robot-owned orders in LIVE account"
                 }));
         }
+    }
+
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
+    {
+        // LIVE adapter stub: No-op (IEA not yet bound)
     }
 }

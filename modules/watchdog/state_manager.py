@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, time, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 import pytz
 
 from .config import (
@@ -23,8 +23,13 @@ from .config import (
     UNPROTECTED_TIMEOUT_SECONDS,
     DATA_STALL_THRESHOLD_SECONDS,
     RECOVERY_TIMEOUT_SECONDS,
+    RECOVERY_LOOP_COUNT_THRESHOLD,
+    RECOVERY_LOOP_WINDOW_SECONDS,
     STREAM_MAX_AGE_DAYS,
     IDENTITY_EXPIRY_SECONDS,
+    ORDER_STUCK_ENTRY_THRESHOLD_SECONDS,
+    ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS,
+    EXECUTION_LATENCY_SPIKE_THRESHOLD_MS,
 )
 from .market_session import is_market_open
 
@@ -81,7 +86,8 @@ class WatchdogStateManager:
     
     def __init__(self):
         # Engine state
-        self._last_engine_tick_utc: Optional[datetime] = None
+        self._last_engine_tick_utc: Optional[datetime] = None  # Event timestamp (for display)
+        self._last_engine_heartbeat: Optional[datetime] = None  # Phase 5: when we observed a tick (for liveness)
         self._last_engine_alive_value: bool = True  # Hysteresis: prevents flickering
         self._recovery_state: str = "CONNECTED_OK"
         self._recovery_started_utc: Optional[datetime] = None  # Track when recovery started for timeout
@@ -117,6 +123,7 @@ class WatchdogStateManager:
         self._execution_update_unknown_order_critical_events: List[datetime] = []
         self._execution_fill_blocked_events: List[datetime] = []  # EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL
         self._execution_fill_unmapped_events: List[datetime] = []
+        self._reconciliation_qty_mismatch_events: List[datetime] = []  # Position drift (RECONCILIATION_QTY_MISMATCH)
         
         # Data stall tracking: execution instrument full name -> last_bar_utc
         # CRITICAL: Track by execution instrument contract (e.g., "MES 03-26"), not canonical (e.g., "ES")
@@ -157,20 +164,36 @@ class WatchdogStateManager:
         self._data_status_history: List[tuple] = []   # List of (timestamp, status) tuples
         self._status_history_size = 3  # Keep last 3 status computations (15 seconds at 5s polling)
         self._status_change_threshold = 2  # Require 2 consecutive polls with same status before changing
+
+        # Phase 7-8: Stuck order and latency spike detection (watchdog-derived)
+        # broker_order_id -> {submitted_at, intent_id, instrument, role, stream_key}
+        self._pending_orders: Dict[str, Dict[str, Any]] = {}
+        self._pending_derived_events: List[Dict[str, Any]] = []
         
+    def invalidate_engine_liveness(self) -> None:
+        """
+        Clear engine tick/heartbeat, connection, and recovery when NinjaTrader process is not running
+        or at startup. Prevents false ENGINE ALIVE / BROKER CONNECTED / FAIL-CLOSED at login screen.
+        Sets _last_invalidate_utc so we reject ticks from tail that predate this invalidation.
+        """
+        now = datetime.now(timezone.utc)
+        self._last_engine_tick_utc = None
+        self._last_engine_heartbeat = None
+        self._last_engine_alive_value = False
+        self._connection_status = "Unknown"
+        self._recovery_state = "CONNECTED_OK"  # Clear stale FAIL-CLOSED from previous session
+        self._last_invalidate_utc = now
+
     def update_engine_tick(self, timestamp_utc: datetime):
         """
-        Update engine tick timestamp from ENGINE_TICK_CALLSITE event.
-        This represents engine loop (Tick()) execution - primary liveness indicator.
-        ENGINE_TICK_CALLSITE fires every Tick() call (rate-limited in feed to every 5 seconds).
-        
-        Use event timestamp (not processing time) so stale ticks from feed file (robot closed)
-        do not reset the stall timer. When robot is closed, we read old ticks from frontend_feed.jsonl;
-        using "now" would make ENGINE ALIVE persist for 75s after every tail read.
+        Update engine tick from ENGINE_TICK_CALLSITE / ENGINE_ALIVE.
+        - _last_engine_tick_utc: event timestamp (for display in last_engine_tick_chicago)
+        - _last_engine_heartbeat: when we observed the tick (for liveness, isolates ingestion lag)
         """
         now = datetime.now(timezone.utc)
         prev_tick = self._last_engine_tick_utc
         self._last_engine_tick_utc = timestamp_utc
+        self._last_engine_heartbeat = now  # Phase 5: observation time for liveness
 
         # Diagnostic: Log when ticks are received (rate-limited to avoid spam)
         if not hasattr(self, '_last_tick_update_log_utc'):
@@ -198,27 +221,160 @@ class WatchdogStateManager:
         # Track when recovery started for timeout detection
         if new_state == "RECOVERY_RUNNING":
             self._recovery_started_utc = timestamp_utc
+            # Phase 9: Recovery loop detection - record recovery entry
+            if not hasattr(self, "_recovery_started_timestamps"):
+                self._recovery_started_timestamps: deque = deque(maxlen=50)
+            self._recovery_started_timestamps.append(timestamp_utc)
         elif new_state in ("RECOVERY_COMPLETE", "CONNECTED_OK", "DISCONNECT_FAIL_CLOSED"):
             # Recovery completed or reset - clear start time
             self._recovery_started_utc = None
         
         self._recovery_state = new_state
     
+    def check_recovery_loop(self, now: Optional[datetime] = None) -> Optional[Dict]:
+        """
+        Phase 9: Check if recovery loop detected (N recoveries within window).
+        Returns event dict if detected, else None. Edge-triggered - callers should dedupe.
+        """
+        if not hasattr(self, "_recovery_started_timestamps"):
+            return None
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=RECOVERY_LOOP_WINDOW_SECONDS)
+        # Prune old entries
+        while self._recovery_started_timestamps and self._recovery_started_timestamps[0] < cutoff:
+            self._recovery_started_timestamps.popleft()
+        count = len(self._recovery_started_timestamps)
+        if count >= RECOVERY_LOOP_COUNT_THRESHOLD:
+            return {
+                "count": count,
+                "window_seconds": RECOVERY_LOOP_WINDOW_SECONDS,
+                "current_recovery_state": self._recovery_state,
+            }
+        return None
+
+    def record_order_submitted(
+        self,
+        broker_order_id: str,
+        submitted_at: datetime,
+        intent_id: str = "",
+        instrument: str = "",
+        role: str = "entry",
+        stream_key: str = "",
+    ) -> None:
+        """Phase 7-8: Record order submission for stuck/latency detection."""
+        if not broker_order_id:
+            return
+        self._pending_orders[broker_order_id] = {
+            "submitted_at": submitted_at,
+            "intent_id": intent_id,
+            "instrument": instrument,
+            "role": role,
+            "stream_key": stream_key,
+        }
+
+    def record_order_filled(
+        self,
+        broker_order_id: str,
+        filled_at: datetime,
+        qty: Optional[int] = None,
+        price: Optional[float] = None,
+    ) -> None:
+        """
+        Phase 8: Record fill and check for latency spike.
+        If threshold exceeded, appends EXECUTION_LATENCY_SPIKE_DETECTED to _pending_derived_events.
+        """
+        if not broker_order_id:
+            return
+        info = self._pending_orders.pop(broker_order_id, None)
+        if not info:
+            return
+        submitted_at = info.get("submitted_at")
+        if not submitted_at:
+            return
+        latency_ms = int((filled_at - submitted_at).total_seconds() * 1000)
+        if latency_ms >= EXECUTION_LATENCY_SPIKE_THRESHOLD_MS:
+            self._pending_derived_events.append({
+                "event_type": "EXECUTION_LATENCY_SPIKE_DETECTED",
+                "data": {
+                    "order_id": broker_order_id,
+                    "broker_order_id": broker_order_id,
+                    "intent_id": info.get("intent_id", ""),
+                    "instrument": info.get("instrument", ""),
+                    "stream_key": info.get("stream_key", ""),
+                    "role": info.get("role", ""),
+                    "submitted_at": submitted_at.isoformat(),
+                    "executed_at": filled_at.isoformat(),
+                    "latency_ms": latency_ms,
+                    "threshold_ms": EXECUTION_LATENCY_SPIKE_THRESHOLD_MS,
+                    "qty": qty,
+                    "price": price,
+                },
+            })
+
+    def record_order_cancelled(self, broker_order_id: str) -> None:
+        """Phase 7-8: Remove from pending when order cancelled."""
+        if broker_order_id:
+            self._pending_orders.pop(broker_order_id, None)
+
+    def check_stuck_orders(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """
+        Phase 7: Return list of stuck order events (working longer than threshold).
+        Caller should emit and clear to avoid repeat.
+        """
+        now = now or datetime.now(timezone.utc)
+        stuck = []
+        for broker_order_id, info in list(self._pending_orders.items()):
+            submitted_at = info.get("submitted_at")
+            if not submitted_at:
+                continue
+            role = info.get("role", "entry")
+            threshold = (
+                ORDER_STUCK_ENTRY_THRESHOLD_SECONDS
+                if role == "entry"
+                else ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS
+            )
+            working_sec = (now - submitted_at).total_seconds()
+            if working_sec >= threshold:
+                stuck.append({
+                    "broker_order_id": broker_order_id,
+                    "order_id": broker_order_id,
+                    "intent_id": info.get("intent_id", ""),
+                    "instrument": info.get("instrument", ""),
+                    "stream_key": info.get("stream_key", ""),
+                    "role": role,
+                    "order_state": "WORKING",
+                    "working_duration_seconds": int(working_sec),
+                    "threshold_seconds": threshold,
+                })
+                self._pending_orders.pop(broker_order_id, None)
+        return stuck
+
+    def drain_pending_derived_events(self) -> List[Dict[str, Any]]:
+        """Return and clear pending derived events (e.g. latency spike from record_order_filled)."""
+        events = list(self._pending_derived_events)
+        self._pending_derived_events.clear()
+        return events
+    
     def update_kill_switch(self, active: bool):
         """Update kill switch status."""
         self._kill_switch_active = active
     
-    def update_connection_status(self, status: str, timestamp_utc: datetime):
-        """Update connection status and session-based disconnect metrics."""
+    def update_connection_status(self, status: str, timestamp_utc: datetime, skip_session_metrics: bool = False):
+        """Update connection status and session-based disconnect metrics.
+        When skip_session_metrics=True (e.g. event from tail replay), only update _connection_status
+        and _last_connection_event_utc; do not increment disconnect count or add to downtime."""
         self._connection_status = status
         self._last_connection_event_utc = timestamp_utc
-        
+
+        if skip_session_metrics:
+            return
+
         try:
             chicago_dt = timestamp_utc.astimezone(CHICAGO_TZ)
             session = _infer_session_from_chicago(chicago_dt)
             trading_date = self.get_trading_date() or chicago_dt.strftime("%Y-%m-%d")
             key = (trading_date, session)
-            
+
             if status == "ConnectionLost":
                 if key != self._session_connectivity_key:
                     self._session_connectivity_key = key
@@ -231,7 +387,14 @@ class WatchdogStateManager:
                 # Connected / Recovered
                 if self._session_disconnect_start_utc:
                     duration = (timestamp_utc - self._session_disconnect_start_utc).total_seconds()
-                    self._session_total_downtime_seconds += duration
+                    # Only add positive duration (guard against out-of-order events / timestamp skew)
+                    if duration > 0:
+                        self._session_total_downtime_seconds += duration
+                    else:
+                        logger.debug(
+                            f"Session connectivity: skipping negative duration {duration:.1f}s "
+                            f"(recovery_ts={timestamp_utc.isoformat()}, disconnect_start={self._session_disconnect_start_utc.isoformat()})"
+                        )
                 self._session_disconnect_start_utc = None
         except Exception as e:
             logger.debug(f"Session connectivity update failed: {e}")
@@ -505,6 +668,12 @@ class WatchdogStateManager:
                                 state_entry_utc = state_entry_utc.replace(tzinfo=timezone.utc)
                         except Exception:
                             pass
+                    # Skip stale PRE_HYDRATION from journal (CL1/RTY1 showed 15h TIS - avoid re-adding)
+                    now_utc = datetime.now(timezone.utc)
+                    if last_state == "PRE_HYDRATION":
+                        age_sec = (now_utc - state_entry_utc).total_seconds()
+                        if age_sec > 30 * 60:  # Older than 30 min
+                            continue  # Don't hydrate stale PRE_HYDRATION
                     # Enrich with slot_time from timetable if available (for stuck detection)
                     slot_time_chicago = None
                     if self._timetable_streams and stream in self._timetable_streams:
@@ -668,6 +837,12 @@ class WatchdogStateManager:
         self._execution_fill_unmapped_events.append(timestamp_utc)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         self._execution_fill_unmapped_events = [e for e in self._execution_fill_unmapped_events if e > cutoff]
+
+    def record_reconciliation_qty_mismatch(self, timestamp_utc: datetime):
+        """Record RECONCILIATION_QTY_MISMATCH (position drift)."""
+        self._reconciliation_qty_mismatch_events.append(timestamp_utc)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._reconciliation_qty_mismatch_events = [e for e in self._reconciliation_qty_mismatch_events if e > cutoff]
     
     def record_duplicate_instance(
         self,
@@ -908,13 +1083,14 @@ class WatchdogStateManager:
                         f"Keeping active stream on ENGINE_START: {stream} "
                         f"(state: {info.state}, updated {time_since_update:.1f}s ago)"
                     )
-            # Also remove streams stuck in PRE_HYDRATION for > 2 hours (likely stale)
+            # Also remove streams stuck in PRE_HYDRATION for > 30 minutes (likely stale)
+            # CL1/RTY1 were showing 15h TIS - reduce from 2h to 30m to clear sooner
             elif info.state == "PRE_HYDRATION":
                 stuck_duration = (utc_now - info.state_entry_time_utc).total_seconds()
-                if stuck_duration > 2 * 60 * 60:  # 2 hours
+                if stuck_duration > 30 * 60:  # 30 minutes (was 2 hours)
                     logger.info(
                         f"Removing stale stream stuck in PRE_HYDRATION: {stream} "
-                        f"(stuck for {stuck_duration/3600:.1f} hours, trading_date: {trading_date})"
+                        f"(stuck for {stuck_duration/60:.1f} min, trading_date: {trading_date})"
                     )
                     keys_to_remove.append((trading_date, stream))
         
@@ -955,10 +1131,9 @@ class WatchdogStateManager:
         
         for (trading_date, stream), info in self._stream_states.items():
             # Check if stream is enabled on timetable (if timetable available)
-            stream_id = f"{trading_date}_{stream}"
+            # CRITICAL: _enabled_streams contains canonical stream names ("ES1", "CL2"), NOT "trading_date_stream"
             if self._enabled_streams is not None:
-                # Timetable available - only check enabled streams
-                if stream_id not in self._enabled_streams:
+                if stream not in self._enabled_streams:
                     continue  # Stream not enabled, skip it
             # If timetable unavailable (_enabled_streams is None), check all streams (conservative)
             
@@ -978,13 +1153,14 @@ class WatchdogStateManager:
         return False
     
     def compute_engine_alive(self) -> bool:
-        """Compute engine_alive derived field with hysteresis to prevent flickering."""
-        if self._last_engine_tick_utc is None:
+        """Compute engine_alive derived field with hysteresis. Phase 5: use heartbeat for liveness."""
+        heartbeat = getattr(self, "_last_engine_heartbeat", None) or self._last_engine_tick_utc
+        if heartbeat is None:
             self._last_engine_alive_value = False
             return False
-        
+
         now = datetime.now(timezone.utc)
-        elapsed = (now - self._last_engine_tick_utc).total_seconds()
+        elapsed = (now - heartbeat).total_seconds()
         
         # Hysteresis: when alive, require extra staleness before declaring dead
         # When dead, use normal threshold to recover quickly
@@ -1007,7 +1183,7 @@ class WatchdogStateManager:
             import logging
             logger = logging.getLogger(__name__)
             logger.info(
-                f"ENGINE_ALIVE_STATUS: last_engine_tick_utc={self._last_engine_tick_utc.isoformat() if self._last_engine_tick_utc else None}, "
+                f"ENGINE_ALIVE_STATUS: heartbeat={heartbeat.isoformat() if heartbeat else None}, "
                 f"elapsed_seconds={elapsed:.2f}, engine_alive={engine_alive}, threshold={ENGINE_TICK_STALL_THRESHOLD_SECONDS}"
             )
         
@@ -1206,11 +1382,13 @@ class WatchdogStateManager:
                 "currently_disconnected": self._connection_status == "ConnectionLost",
             }
         
+        # Clamp total_downtime to non-negative (guard against any residual corruption)
+        total_downtime = max(0.0, self._session_total_downtime_seconds)
         return {
             "session": session,
             "trading_date": trading_date,
             "disconnect_count": self._session_disconnect_count,
-            "total_downtime_seconds": round(self._session_total_downtime_seconds, 2),
+            "total_downtime_seconds": round(total_downtime, 2),
             "last_disconnect_chicago": (
                 self._session_last_disconnect_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._session_last_disconnect_utc else None
@@ -1293,8 +1471,9 @@ class WatchdogStateManager:
         # This is more reliable than bar events which are rate-limited to 60 seconds
         
         engine_tick_age = None
-        if self._last_engine_tick_utc:
-            engine_tick_age = (now - self._last_engine_tick_utc).total_seconds()
+        heartbeat = getattr(self, "_last_engine_heartbeat", None) or self._last_engine_tick_utc
+        if heartbeat:
+            engine_tick_age = (now - heartbeat).total_seconds()
         
         # PRIORITY 1: Check if ticks are arriving (most reliable indicator)
         # Use same hysteresis as compute_engine_alive to prevent flickering
@@ -1443,8 +1622,7 @@ class WatchdogStateManager:
                                 for (trading_date, stream), info in self._stream_states.items():
                                     stream_execution_instrument = getattr(info, 'execution_instrument', None)
                                     if stream_execution_instrument and stream_execution_instrument == execution_instrument_full_name:
-                                        stream_id = f"{trading_date}_{stream}"
-                                        if stream_id in self._enabled_streams:
+                                        if stream in self._enabled_streams:
                                             has_enabled_streams = True
                                             break
                             
@@ -1597,15 +1775,37 @@ class WatchdogStateManager:
                     smoothed_data_stall_detected = {}
                 # If previous was STALLED, this might be real - keep stalls
         
-        # Optimistic Connected: when status is Unknown and engine is alive, infer Connected
-        # (avoids showing Unknown when robot is running but no connection events yet)
+        # Connection status: tie to engine liveness so we never show Connected when engine is dead
         connection_status = self._connection_status
-        if connection_status == "Unknown" and engine_alive:
-            connection_status = "Connected"
+        if not engine_alive and connection_status == "Connected":
+            connection_status = "Unknown"  # Don't show BROKER CONNECTED when engine is stalled
+        elif connection_status == "Unknown" and engine_alive:
+            connection_status = "Connected"  # Optimistic: infer Connected when engine alive but no connection events yet
+
+        # Engine activity classification: RUNNING | IDLE | STALLED (professional dashboard clarity)
+        if frontend_engine_state == "ACTIVE":
+            engine_activity_classification = "RUNNING"
+        elif frontend_engine_state == "IDLE_MARKET_CLOSED":
+            engine_activity_classification = "IDLE"
+        else:
+            engine_activity_classification = "STALLED"
+
+        # Feed health classification: DATA_FLOWING | DATA_STALLED | MARKET_CLOSED
+        if smoothed_data_status == "FLOWING":
+            feed_health_classification = "DATA_FLOWING"
+        elif smoothed_data_status == "STALLED":
+            feed_health_classification = "DATA_STALLED"
+        elif not market_open or smoothed_data_status == "ACCEPTABLE_SILENCE":
+            feed_health_classification = "MARKET_CLOSED"
+        else:
+            # UNKNOWN: market open but no bar data yet - treat as MARKET_CLOSED (no alarm)
+            feed_health_classification = "MARKET_CLOSED"
         
         return {
             "engine_alive": engine_alive,
             "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values (smoothed)
+            "engine_activity_classification": engine_activity_classification,  # RUNNING | IDLE | STALLED
+            "feed_health_classification": feed_health_classification,  # DATA_FLOWING | DATA_STALLED | MARKET_CLOSED
             "last_engine_tick_chicago": (
                 self._last_engine_tick_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_engine_tick_utc else None
@@ -1779,14 +1979,14 @@ class CursorManager:
             logger.warning(f"Failed to load cursor: {e}")
             return {}
     
-    def save_cursor(self, cursor: Dict[str, int]):
-        """Save cursor state to file with retry logic."""
+    def save_cursor(self, cursor: Dict[str, int]) -> bool:
+        """Save cursor state to file with retry logic. Returns True on success, False on failure."""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 with open(self._cursor_file, 'w') as f:
                     json.dump(cursor, f, indent=2)
-                return  # Success
+                return True
             except Exception as e:
                 if attempt < max_retries - 1:
                     wait_time = 0.1 * (2 ** attempt)  # Exponential backoff
@@ -1794,3 +1994,5 @@ class CursorManager:
                     time.sleep(wait_time)
                 else:
                     logger.error(f"Failed to save cursor after {max_retries} attempts: {e}")
+                    return False
+        return False

@@ -1,8 +1,8 @@
 /**
  * StreamStatusTable component
- * Main stream status table with live timers
+ * Main stream status table. TIS updates when streams data changes (every 5s poll).
  */
-import { useState, useEffect } from 'react'
+import { useMemo } from 'react'
 import { formatDuration, computeTimeInState } from '../../utils/timeUtils.ts'
 import { useStreamPnl } from '../../hooks/useStreamPnl'
 import type { StreamState } from '../../types/watchdog'
@@ -18,16 +18,38 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
   const todayStr = new Date().toISOString().split('T')[0]
   const currentTradingDate = streams[0]?.trading_date || todayStr
   const { pnl } = useStreamPnl(currentTradingDate, undefined, marketOpen)
-  const [, forceUpdate] = useState(0)
-  
-  // Force re-render every second for live timers
-  useEffect(() => {
-    const interval = setInterval(() => {
-      forceUpdate(prev => prev + 1)
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [])
-  
+
+  // Sort streams - must run before any early return to satisfy Rules of Hooks
+  const sortedStreams = useMemo(() => [...streams].sort((a, b) => {
+    const aDate = a.trading_date || ''
+    const bDate = b.trading_date || ''
+    if (aDate !== bDate) {
+      if (aDate === todayStr) return -1
+      if (bDate === todayStr) return 1
+      return bDate.localeCompare(aDate)
+    }
+    const parseSlotTime = (slotTime: string | null | undefined): number => {
+      if (!slotTime || slotTime === '-' || slotTime === '') return 0
+      if (slotTime.includes('T')) {
+        try {
+          const match = slotTime.match(/T(\d{2}):(\d{2})/)
+          if (match) return parseInt(match[1], 10) * 60 + parseInt(match[2], 10)
+        } catch {}
+      }
+      if (slotTime.includes(':')) {
+        try {
+          const [hours, minutes] = slotTime.split(':').map(Number)
+          if (!isNaN(hours) && !isNaN(minutes)) return hours * 60 + minutes
+        } catch {}
+      }
+      return 0
+    }
+    const aSlot = parseSlotTime(a.slot_time_chicago)
+    const bSlot = parseSlotTime(b.slot_time_chicago)
+    if (bSlot !== aSlot) return bSlot - aSlot
+    return a.stream.localeCompare(b.stream)
+  }), [streams, todayStr])
+
   // Empty state with market-aware messaging
   if (streams.length === 0) {
     if (marketOpen === false) {
@@ -83,53 +105,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
     if (seconds > 300) return 'text-amber-500' // >5 min
     return 'text-white'
   }
-  
-  // Sort streams: today first, then by date (newest first), then by slot_time_chicago (latest first), then by stream name
-  const sortedStreams = [...streams].sort((a, b) => {
-    // Date order: today first, then by date descending
-    const aDate = a.trading_date || ''
-    const bDate = b.trading_date || ''
-    if (aDate !== bDate) {
-      if (aDate === todayStr) return -1
-      if (bDate === todayStr) return 1
-      return bDate.localeCompare(aDate)  // Newer dates first
-    }
-    // Parse slot times for comparison
-    const parseSlotTime = (slotTime: string | null | undefined): number => {
-      if (!slotTime || slotTime === '-' || slotTime === '') return 0
-      // Handle ISO format: "2026-01-27T07:30:00-06:00" -> extract "07:30"
-      if (slotTime.includes('T')) {
-        try {
-          const match = slotTime.match(/T(\d{2}):(\d{2})/)
-          if (match) {
-            const hours = parseInt(match[1], 10)
-            const minutes = parseInt(match[2], 10)
-            return hours * 60 + minutes // Convert to minutes for comparison
-          }
-        } catch {}
-      }
-      // Handle "HH:MM" format
-      if (slotTime.includes(':')) {
-        try {
-          const [hours, minutes] = slotTime.split(':').map(Number)
-          if (!isNaN(hours) && !isNaN(minutes)) {
-            return hours * 60 + minutes
-          }
-        } catch {}
-      }
-      return 0
-    }
-    
-    const aSlot = parseSlotTime(a.slot_time_chicago)
-    const bSlot = parseSlotTime(b.slot_time_chicago)
-    
-    // Sort by slot time descending (latest first), then by stream name ascending
-    if (bSlot !== aSlot) {
-      return bSlot - aSlot // Descending order (latest slot time first)
-    }
-    return a.stream.localeCompare(b.stream)
-  })
-  
+
   return (
     <div className="bg-gray-800 rounded-lg overflow-hidden">
       <div className="overflow-x-auto">
@@ -229,7 +205,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                   <td className="px-2 py-1 font-mono">
                     {(() => {
                       if (!streamPnl) {
-                        return <span className="text-gray-500">-</span>
+                        return <span className="text-gray-500">$0.00</span>
                       }
                       
                       if (streamPnl.open_positions > 0) {
@@ -238,7 +214,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                       
                       const realizedPnl = streamPnl.realized_pnl
                       if (realizedPnl === undefined || realizedPnl === null) {
-                        return <span className="text-gray-500">-</span>
+                        return <span className="text-gray-500">$0.00</span>
                       }
                       
                       return (

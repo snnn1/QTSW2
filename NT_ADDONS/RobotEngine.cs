@@ -170,13 +170,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
-    /// Check if execution is allowed based on recovery state.
-    /// Execution is allowed only in CONNECTED_OK or RECOVERY_COMPLETE states.
+    /// Check if execution is allowed based on recovery state and global kill switch.
+    /// Execution is allowed only when: CONNECTED_OK or RECOVERY_COMPLETE, AND global kill switch is off.
+    /// Phase 5: Kill switch blocks protectives and modifications (same path as entry orders).
     /// </summary>
     public bool IsExecutionAllowed()
     {
         lock (_engineLock)
         {
+            if (_killSwitch != null && _killSwitch.IsEnabled())
+                return false;
             return _recoveryState == ConnectionRecoveryState.CONNECTED_OK ||
                    _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE;
         }

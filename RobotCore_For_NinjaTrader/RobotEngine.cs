@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
@@ -123,6 +124,54 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
+    /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
+    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// </summary>
+    public void StartEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+            _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatTimer = new Timer(
+                _ => EmitTimerHeartbeatUnsafe(),
+                null,
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(5));
+        }
+    }
+
+    /// <summary>
+    /// Stop and dispose the engine heartbeat timer. Called on engine Stop or StandDown.
+    /// </summary>
+    public void StopEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+        }
+    }
+
+    /// <summary>
+    /// Emit ENGINE_TIMER_HEARTBEAT from timer callback. Must not acquire _engineLock (runs on thread pool).
+    /// </summary>
+    private void EmitTimerHeartbeatUnsafe()
+    {
+        try
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            var tradingDate = _heartbeatTradingDateCache ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+        }
+        catch (Exception ex)
+        {
+            try { _log.Write(new { ts_utc = DateTimeOffset.UtcNow.ToString("o"), event_type = "ENGINE_TIMER_HEARTBEAT_ERROR", error = ex.Message }); } catch { /* must not throw */ }
+        }
+    }
+
+    /// <summary>
     /// Run reconciliation periodically (throttled). Call from Tick.
     /// </summary>
     public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
@@ -191,7 +240,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
+    private readonly ExecutionEventWriter _eventWriter;
     private ReconciliationRunner? _reconciliationRunner;
+    private ProtectiveCoverageCoordinator? _protectiveCoordinator;
+    private MismatchEscalationCoordinator? _mismatchCoordinator;
     private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
@@ -284,6 +336,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private bool _recoveryRunnerActive = false;
     private readonly object _recoveryLock = new object();
     
+    // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
+    private Timer? _engineHeartbeatTimer;
+    private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
+    
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
     {
@@ -320,13 +376,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
-    /// Check if execution is allowed based on recovery state.
-    /// Execution is allowed only in CONNECTED_OK or RECOVERY_COMPLETE states.
+    /// Check if execution is allowed based on recovery state and global kill switch.
+    /// Execution is allowed only when: CONNECTED_OK or RECOVERY_COMPLETE, AND global kill switch is off.
+    /// Phase 5: Kill switch blocks protectives and modifications (same path as entry orders).
     /// </summary>
     public bool IsExecutionAllowed()
     {
         lock (_engineLock)
         {
+            if (_killSwitch != null && _killSwitch.IsEnabled())
+                return false;
             return _recoveryState == ConnectionRecoveryState.CONNECTED_OK ||
                    _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE;
         }
@@ -525,7 +584,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
+        _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log);
     }
+
+    /// <summary>
+    /// Gap 5: Canonical execution event writer for replay/audit. Subsystems emit via this.
+    /// </summary>
+    public ExecutionEventWriter EventWriter => _eventWriter;
 
     /// <summary>
     /// Report execution policy validation failure to HealthMonitor.
@@ -917,7 +982,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RISK_LATCH_HYDRATED", state: "ENGINE",
                     new { instrument = inst, note = "Persisted block re-applied on startup" }));
             }
-            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this, isInstrumentFrozen: inst => _frozenInstruments.Contains(inst));
+            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this, isInstrumentFrozen: IsInstrumentFrozenOrSupervisorilyBlocked);
+            _riskGate.SetOnGlobalKillSwitchBlocked((eventType, instrument, stream) =>
+            {
+                _healthMonitor?.ReportCritical(eventType, new Dictionary<string, object> { ["instrument"] = instrument, ["stream"] = stream, ["note"] = "Global kill switch blocks all execution" });
+            });
 
             // Try to create adapter (will throw if LIVE mode)
             _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
@@ -947,12 +1016,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
                 simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
+                simAdapter.SetEventWriter(_eventWriter);
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
                     isExecutionAllowedCallback: () => IsExecutionAllowed(),
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
+                        _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.IEA_ENQUEUE_FAILURE, SupervisorySeverity.HIGH, new { reason }, now);
                         // Flatten on block: prevent position with no protectives when IEA queue is blocked
                         var flattenResult = _executionAdapter.FlattenEmergency(instrument, now);
                         if (!flattenResult.Success)
@@ -969,6 +1040,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             { "policy", "IEA_FAIL_CLOSED_BLOCK_INSTRUMENT" },
                             { "note", "IEA queue timeout or overflow — instrument blocked; no new intents until restart" }
                         });
+                    },
+                    onSupervisoryCriticalCallback: (eventType, instrument, payload) =>
+                    {
+                        var dict = payload as Dictionary<string, object>;
+                        if (dict == null && payload != null)
+                        {
+                            dict = new Dictionary<string, object> { ["instrument"] = instrument, ["reason"] = payload.ToString() ?? "" };
+                        }
+                        else if (dict == null)
+                            dict = new Dictionary<string, object> { ["instrument"] = instrument };
+                        _healthMonitor?.ReportCritical(eventType, dict);
                     }); // Gap 5: IEA EnqueueAndWait failure → block instrument
                 
                 // Wire coordinator to adapter
@@ -980,6 +1062,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 onQuantityMismatch: (instrument, now, reason) =>
                 {
                     StandDownStreamsForInstrument(instrument, now, reason);
+                    _executionAdapter?.RequestRecoveryForInstrument(instrument, "RECONCILIATION_QTY_MISMATCH", new { reason }, now);
+                    _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason }, now);
                     _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
                     {
                         { "instrument", instrument },
@@ -1007,6 +1091,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }
                     }
                 });
+
+            // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
+            _protectiveCoordinator = new ProtectiveCoverageCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                isInstrumentBlocked: inst => _frozenInstruments.Contains(inst),
+                log: _log,
+                submitCorrective: TrySubmitCorrectiveStop,
+                emergencyFlatten: (instrument, utcNow) =>
+                {
+                    if (_executionAdapter is IIEAOrderExecutor iea)
+                        return iea.EmergencyFlatten(instrument, utcNow);
+                    return _executionAdapter?.FlattenEmergency(instrument, utcNow)
+                        ?? FlattenResult.FailureResult("No adapter", utcNow);
+                },
+                eventWriter: _eventWriter);
+
+            // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
+            _mismatchCoordinator = new MismatchEscalationCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                getMismatchObservations: AssembleMismatchObservations,
+                isInstrumentBlocked: inst => _frozenInstruments.Contains(inst) || (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false),
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                log: _log,
+                eventWriter: _eventWriter);
 
             // Log execution mode and adapter
             var adapterType = _executionAdapter.GetType().Name;
@@ -1305,8 +1418,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Stop()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
-        
+
         string? summaryPathToWrite = null;
         string? summaryJson = null;
 
@@ -1489,7 +1603,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }
 
                 // Start recovery runner (idempotent, single-threaded)
-                RunRecovery(utcNow);
+                RunRecovery(utcNow, _accountName ?? "");
             }
 
             // Reconciliation: periodic orphaned journal cleanup (throttled). Skip during Historical - no live account.
@@ -1640,6 +1754,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Health monitor: evaluate data loss (rate-limited internally)
             _healthMonitor?.Evaluate(utcNow);
+
+            // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
+            _protectiveCoordinator?.EmitMetrics(utcNow);
+            _mismatchCoordinator?.EmitMetrics(utcNow);
         }
     }
 
@@ -4111,6 +4229,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void StandDown()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         var streamCount = _streams.Count;
         var tradingDateStr = TradingDateString;
@@ -4399,6 +4518,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
+    /// Phase 5: Check if instrument is frozen (reconciliation/risk latch) or supervisorily blocked.
+    /// Used by RiskGate to block execution.
+    /// </summary>
+    private bool IsInstrumentFrozenOrSupervisorilyBlocked(string instrument)
+    {
+        if (_frozenInstruments.Contains(instrument)) return true;
+        if (_protectiveCoordinator != null && _protectiveCoordinator.IsInstrumentBlockedByProtective(instrument)) return true;
+        if (_mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(instrument)) return true;
+        var account = _accountName ?? "";
+        var ieas = InstrumentExecutionAuthorityRegistry.GetAllForAccount(account);
+        foreach (var iea in ieas)
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, instrument) && iea.IsSupervisorilyBlocked)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Freeze instrument (block execution) and stand down only streams that have positions.
     /// Streams without positions (e.g. PRE_HYDRATION, RANGE_BUILDING) continue to compute range; execution blocked via RiskGate.
     /// </summary>
@@ -4439,6 +4577,91 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
+    /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
+    /// </summary>
+    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations()
+    {
+        var list = new List<MismatchObservation>();
+        if (_executionAdapter == null) return list;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        AccountSnapshot snap;
+        try
+        {
+            snap = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            return list;
+        }
+
+        if (snap?.Positions == null && snap?.WorkingOrders == null)
+            return list;
+
+        var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var brokerWorkingByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var p in snap.Positions ?? new List<PositionSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            var inst = p.Instrument.Trim();
+            var qty = Math.Abs(p.Quantity);
+            brokerQtyByInst.TryGetValue(inst, out var existing);
+            brokerQtyByInst[inst] = existing + qty;
+        }
+
+        foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            var inst = w.Instrument.Trim();
+            brokerWorkingByInst.TryGetValue(inst, out var cnt);
+            brokerWorkingByInst[inst] = cnt + 1;
+        }
+
+        var openByInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var allInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in brokerQtyByInst.Keys) allInstruments.Add(k);
+        foreach (var k in brokerWorkingByInst.Keys) allInstruments.Add(k);
+        foreach (var k in openByInst.Keys)
+        {
+            if (!string.IsNullOrWhiteSpace(k)) allInstruments.Add(k.Trim());
+        }
+
+        foreach (var inst in allInstruments)
+        {
+            var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
+            var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var localWorking = 0;
+            if (openByInst.TryGetValue(inst, out var entries))
+                localWorking = entries.Count;
+            if (openByInst.TryGetValue(execVariant, out var entriesM))
+                localWorking += entriesM.Count;
+
+            if (brokerQty == journalQty && brokerWorking == localWorking)
+                continue;
+
+            var mismatchType = MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, localWorking);
+            list.Add(new MismatchObservation
+            {
+                Instrument = inst,
+                MismatchType = mismatchType,
+                Present = true,
+                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={localWorking}",
+                BrokerQty = brokerQty,
+                LocalQty = journalQty,
+                BrokerWorkingOrderCount = brokerWorking,
+                LocalWorkingOrderCount = localWorking,
+                ObservedUtc = utcNow,
+                Severity = "CRITICAL"
+            });
+        }
+
+        return list;
+    }
+
+    /// <summary>
     /// Flatten exposure for a specific intent (helper for coordinator callback).
     /// </summary>
     private FlattenResult FlattenIntent(string intentId, string instrument, DateTimeOffset utcNow)
@@ -4463,6 +4686,80 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         
         return false;
+    }
+
+    /// <summary>
+    /// Gap 3 Phase 4: Try to submit corrective stop. Deterministic stop-price policy:
+    /// 1) Use journal StopPrice if available and sane (protective for direction)
+    /// 2) Else use BEStopPrice if sane
+    /// 3) Else fail-closed: return NO_SAFE_STOP_PRICE, do not invent a price
+    /// </summary>
+    private ProtectiveCorrectiveResult TrySubmitCorrectiveStop(ProtectiveCorrectiveRequest req)
+    {
+        if (_executionAdapter == null)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_ADAPTER" };
+
+        var byInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        if (!byInst.TryGetValue(req.Instrument, out var entries) || entries.Count == 0)
+        {
+            // Fallback: match by canonical instrument (e.g. ES vs MES)
+            var key = byInst.Keys.FirstOrDefault(k => ExecutionInstrumentResolver.IsSameInstrument(k, req.Instrument));
+            if (key == null || !byInst.TryGetValue(key, out entries) || entries.Count == 0)
+                return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_JOURNAL_ENTRY" };
+        }
+
+        // Match by direction; pick first with matching direction and sufficient qty
+        var match = entries.FirstOrDefault(e =>
+            string.Equals(e.Entry.Direction, req.BrokerDirection, StringComparison.OrdinalIgnoreCase) &&
+            e.Entry.EntryFilledQuantityTotal > 0 &&
+            e.Entry.EntryFilledQuantityTotal >= Math.Abs(req.BrokerPositionQty));
+
+        if (match.Entry == null)
+            match = entries.FirstOrDefault(e =>
+                string.Equals(e.Entry.Direction, req.BrokerDirection, StringComparison.OrdinalIgnoreCase) &&
+                e.Entry.EntryFilledQuantityTotal > 0);
+
+        if (match.Entry == null)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_MATCHING_JOURNAL" };
+
+        var entry = match.Entry;
+        var intentId = match.IntentId;
+        var direction = entry.Direction ?? req.BrokerDirection;
+        var entryPrice = entry.EntryAvgFillPrice ?? entry.EntryPrice ?? entry.FillPrice;
+        var qty = Math.Min(entry.EntryFilledQuantityTotal, Math.Abs(req.BrokerPositionQty));
+        if (qty <= 0) qty = entry.EntryFilledQuantityTotal;
+
+        // Deterministic stop price: prefer StopPrice, else BEStopPrice; must be sane (protective)
+        decimal? stopPrice = null;
+        if (entry.StopPrice.HasValue && entry.StopPrice.Value >= ProtectiveAuditPolicy.MIN_STOP_PRICE)
+        {
+            if (string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.StopPrice.Value < entryPrice.Value)
+                stopPrice = entry.StopPrice.Value;
+            if (string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.StopPrice.Value > entryPrice.Value)
+                stopPrice = entry.StopPrice.Value;
+        }
+        if (!stopPrice.HasValue && entry.BEStopPrice.HasValue && entry.BEStopPrice.Value >= ProtectiveAuditPolicy.MIN_STOP_PRICE)
+        {
+            if (string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.BEStopPrice.Value < entryPrice.Value)
+                stopPrice = entry.BEStopPrice.Value;
+            if (string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.BEStopPrice.Value > entryPrice.Value)
+                stopPrice = entry.BEStopPrice.Value;
+        }
+        if (!stopPrice.HasValue)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_SAFE_STOP_PRICE" };
+
+        var utcNow = req.AuditUtc;
+        var result = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, null, utcNow);
+        return new ProtectiveCorrectiveResult
+        {
+            Submitted = result.Success,
+            IntentId = intentId,
+            FailureReason = result.Success ? null : (result.ErrorMessage ?? "SUBMIT_FAILED")
+        };
     }
     
     /// <summary>
@@ -4569,8 +4866,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Recovery runner: single-threaded, idempotent recovery orchestration.
     /// Called when entering RECOVERY_RUNNING state.
+    /// Phase 4: When IEAs exist for account, call BeginReconnectRecovery per instrument instead of account-level recovery.
     /// </summary>
-    private void RunRecovery(DateTimeOffset utcNow)
+    private void RunRecovery(DateTimeOffset utcNow, string accountName)
     {
         // Guard against re-entrancy
         lock (_recoveryLock)
@@ -4619,8 +4917,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     new { reason = "EXECUTION_ADAPTER_NULL" }));
                 return;
             }
+
+            // Phase 4: Per-instrument bootstrap when IEAs exist
+            var ieas = InstrumentExecutionAuthorityRegistry.GetAllForAccount(accountName);
+            if (ieas.Count > 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "CONNECTION_RECOVERY_REQUIRES_BOOTSTRAP", state: "ENGINE",
+                    new { instruments_count = ieas.Count, account_name = accountName }));
+                foreach (var iea in ieas)
+                {
+                    iea.BeginReconnectRecovery(iea.ExecutionInstrumentKey, utcNow);
+                }
+                _recoveryState = ConnectionRecoveryState.RECOVERY_COMPLETE;
+                _recoveryCompletedUtc = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "CONNECTION_RECOVERY_RESOLVED", state: "ENGINE",
+                    new { instruments_count = ieas.Count, note = "Per-instrument bootstrap initiated" }));
+                return;
+            }
             
-            // Step A: Snapshot
+            // Step A: Snapshot (legacy path when no IEAs)
             AccountSnapshot? snap = null;
             try
             {

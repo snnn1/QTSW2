@@ -1,5 +1,6 @@
 # Script to copy Robot.Core.dll, Robot.Contracts.dll, and dependencies to NinjaTrader Custom folder
-# Waits for NinjaTrader to close if DLL is locked
+# Uses atomic copy (write to .tmp, then rename) so NinjaTrader never reads a partially copied DLL.
+# NinjaTrader must be closed before deploying.
 # -NoPause: skip pause at end (for use by deploy script)
 
 param([switch]$NoPause)
@@ -23,7 +24,15 @@ foreach ($base in @(
 }
 if (-not $ntCustom) {
     Write-Host "[ERROR] NinjaTrader Custom folder not found. Tried OneDrive\Documents and Documents."
-    pause
+    if (-not $NoPause) { pause }
+    exit 1
+}
+
+# Ensure NinjaTrader is not running
+$ntProcess = Get-Process -Name "NinjaTrader" -ErrorAction SilentlyContinue
+if ($ntProcess) {
+    Write-Host "[ERROR] NinjaTrader must be closed before deploying Robot DLLs." -ForegroundColor Red
+    if (-not $NoPause) { pause }
     exit 1
 }
 
@@ -44,10 +53,6 @@ $filesToCopy = @(
     @{ Name = "Microsoft.Bcl.AsyncInterfaces.dll"; Required = $true }
 )
 
-Write-Host "============================================================"
-Write-Host "  Copying Robot.Core + dependencies to NinjaTrader"
-Write-Host "============================================================"
-Write-Host ""
 Write-Host "Source: $sourceDir"
 Write-Host "Destination: $ntCustom"
 Write-Host ""
@@ -55,61 +60,39 @@ Write-Host ""
 if (-not (Test-Path $sourceDir)) {
     Write-Host "[ERROR] Build output not found. Build first:"
     Write-Host "   dotnet build RobotCore_For_NinjaTrader\Robot.Core.csproj -c Release"
-    pause
+    if (-not $NoPause) { pause }
     exit 1
 }
 
 foreach ($f in $filesToCopy) {
     if ($f.Required -and -not (Test-Path (Join-Path $sourceDir $f.Name))) {
         Write-Host "[ERROR] Required file not found: $($f.Name)"
-        pause
+        if (-not $NoPause) { pause }
         exit 1
     }
 }
 
-# Try to copy, wait if locked
-$maxAttempts = 30
-$attempt = 0
-$copied = $false
-
-while ($attempt -lt $maxAttempts -and -not $copied) {
-    $attempt++
+# Atomic copy: write to .tmp, then rename (Rename-Item is atomic on NTFS)
+foreach ($f in $filesToCopy) {
+    $src = Join-Path $sourceDir $f.Name
+    if (-not (Test-Path $src)) { continue }
+    $dst = Join-Path $ntCustom $f.Name
+    $dstTmp = Join-Path $ntCustom ($f.Name + ".tmp")
     try {
-        foreach ($f in $filesToCopy) {
-            $src = Join-Path $sourceDir $f.Name
-            $dst = Join-Path $ntCustom $f.Name
-            if (Test-Path $src) {
-                Copy-Item $src $dst -Force -ErrorAction Stop
-                Write-Host "[OK] $($f.Name)"
-            }
-        }
-        $copied = $true
+        if (Test-Path $dst) { Remove-Item $dst -Force -ErrorAction Stop }
+        Copy-Item $src $dstTmp -Force -ErrorAction Stop
+        Rename-Item -Path $dstTmp -NewName $f.Name -Force -ErrorAction Stop
+        Write-Host "[OK] $($f.Name)"
+    } catch {
+        if (Test-Path $dstTmp) { Remove-Item $dstTmp -Force -ErrorAction SilentlyContinue }
+        Write-Host "[ERROR] Failed to copy $($f.Name): $_"
+        if (-not $NoPause) { pause }
+        exit 1
     }
-    catch {
-        if ($_.Exception.Message -match "being used by another process") {
-            if ($attempt -eq 1) {
-                Write-Host "[WAIT] DLL is locked by NinjaTrader. Waiting for it to close..."
-            }
-            Write-Host "  Attempt $attempt/$maxAttempts - locked, waiting 2 seconds..."
-            Start-Sleep -Seconds 2
-        }
-        else {
-            Write-Host "[ERROR] Failed to copy: $_"
-            pause
-            exit 1
-        }
-    }
-}
-
-if (-not $copied) {
-    Write-Host ""
-    Write-Host "[ERROR] Could not copy after $maxAttempts attempts. Close NinjaTrader and try again."
-    pause
-    exit 1
 }
 
 Write-Host ""
-Write-Host "[OK] All files copied successfully!"
+Write-Host "[OK] All files copied successfully (atomic swap)."
 Write-Host ""
 Write-Host "IMPORTANT: Restart NinjaTrader to load the new DLLs"
 Write-Host ""

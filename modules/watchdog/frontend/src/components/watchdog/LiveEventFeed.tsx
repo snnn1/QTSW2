@@ -2,10 +2,16 @@
  * LiveEventFeed component
  * Scrollable list of last ~200 events, sorted by event_seq ASC
  */
-import { memo, useRef, useEffect } from 'react'
+import { memo, useRef, useEffect, useMemo } from 'react'
 import { formatChicagoDateTime } from '../../utils/timeUtils.ts'
 import { getEventLevel, extractEventMessage } from '../../utils/eventUtils'
 import type { WatchdogEvent } from '../../types/watchdog'
+
+/** Internal heartbeat events hidden from UI to reduce verbosity (still ingested by watchdog) */
+const HIDDEN_EVENT_TYPES = new Set([
+  'ENGINE_TIMER_HEARTBEAT',
+  'ENGINE_TICK_CALLSITE',
+])
 
 interface LiveEventFeedProps {
   events: WatchdogEvent[]
@@ -16,7 +22,13 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const lastEventCountRef = useRef(0)
   const shouldAutoScrollRef = useRef(true)
-  
+
+  // Filter out internal heartbeat events for UI display only (watchdog still ingests them)
+  const displayEvents = useMemo(
+    () => events.filter((e) => !HIDDEN_EVENT_TYPES.has(e.event_type)),
+    [events]
+  )
+
   // Track if user has scrolled up (don't auto-scroll if they have)
   useEffect(() => {
     const container = scrollContainerRef.current
@@ -34,10 +46,10 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
   // Auto-scroll to bottom when new events arrive (only if user is at bottom)
   useEffect(() => {
     const container = scrollContainerRef.current
-    if (!container || events.length === 0) return
-    
+    if (!container || displayEvents.length === 0) return
+
     // Only auto-scroll if new events were added and user is at bottom
-    if (events.length > lastEventCountRef.current && shouldAutoScrollRef.current) {
+    if (displayEvents.length > lastEventCountRef.current && shouldAutoScrollRef.current) {
       // Use requestAnimationFrame to ensure DOM has updated
       requestAnimationFrame(() => {
         if (container) {
@@ -45,11 +57,12 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
         }
       })
     }
-    
-    lastEventCountRef.current = events.length
-  }, [events.length])
+
+    lastEventCountRef.current = displayEvents.length
+  }, [displayEvents.length])
+
   // Empty state
-  if (events.length === 0) {
+  if (displayEvents.length === 0) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
         <h2 className="text-lg font-semibold mb-4">Live Event Feed</h2>
@@ -86,7 +99,7 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
             </tr>
           </thead>
           <tbody>
-            {events.map((event) => {
+            {displayEvents.map((event) => {
               const level = getEventLevel(event.event_type)
               const message = extractEventMessage(event)
               const repetitiveCount = (event.data as any)?._repetitive_count

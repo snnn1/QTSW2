@@ -20,6 +20,7 @@ public sealed class UnresolvedExecutionRecord
     public DateTimeOffset FirstSeenUtc { get; }
     public int RetryCount { get; set; }
     public string? ExecutionId { get; }
+    public string? BrokerOrderId { get; }
 
     public UnresolvedExecutionRecord(
         object execution,
@@ -33,7 +34,8 @@ public sealed class UnresolvedExecutionRecord
         bool isProtectiveOrder,
         string? orderTypeFromTag,
         DateTimeOffset firstSeenUtc,
-        string? executionId = null)
+        string? executionId = null,
+        string? brokerOrderId = null)
     {
         Execution = execution ?? throw new ArgumentNullException(nameof(execution));
         Order = order ?? throw new ArgumentNullException(nameof(order));
@@ -47,6 +49,7 @@ public sealed class UnresolvedExecutionRecord
         OrderTypeFromTag = orderTypeFromTag;
         FirstSeenUtc = firstSeenUtc;
         ExecutionId = executionId;
+        BrokerOrderId = brokerOrderId;
     }
 
     public double ElapsedMs => (DateTimeOffset.UtcNow - FirstSeenUtc).TotalMilliseconds;

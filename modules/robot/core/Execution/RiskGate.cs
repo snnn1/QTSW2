@@ -24,14 +24,16 @@ public sealed class RiskGate
     private readonly RobotLogger _log;
     private readonly KillSwitch _killSwitch;
     private readonly IExecutionRecoveryGuard? _guard;
+    private readonly Func<string, bool>? _isInstrumentFrozen;
 
-    public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch, IExecutionRecoveryGuard? guard = null)
+    public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch, IExecutionRecoveryGuard? guard = null, Func<string, bool>? isInstrumentFrozen = null)
     {
         _spec = spec;
         _time = time;
         _log = log;
         _killSwitch = killSwitch;
         _guard = guard;
+        _isInstrumentFrozen = isInstrumentFrozen;
     }
 
     /// <summary>
@@ -50,7 +52,15 @@ public sealed class RiskGate
         DateTimeOffset utcNow)
     {
         var failedGates = new List<string>();
-        
+
+        // Gate -1: Instrument frozen (protective failure, reconciliation mismatch, etc.)
+        if (_isInstrumentFrozen != null && _isInstrumentFrozen(instrument))
+        {
+            failedGates.Add("INSTRUMENT_FROZEN");
+            LogRiskCheck(stream, instrument, session, slotTimeChicago, tradingDate, false, failedGates, utcNow);
+            return (false, "INSTRUMENT_FROZEN", failedGates);
+        }
+
         // Gate 0: Recovery state guard (blocks execution during disconnect recovery)
         if (_guard != null && !_guard.IsExecutionAllowed())
         {

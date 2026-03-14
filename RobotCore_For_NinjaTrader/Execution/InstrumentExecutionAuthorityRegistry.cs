@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -40,5 +42,16 @@ public static class InstrumentExecutionAuthorityRegistry
         var found = _registry.TryGetValue(key, out var existing);
         iea = existing;
         return found;
+    }
+
+    /// <summary>
+    /// Get all IEAs for the given account. Phase 4: used for per-instrument BeginReconnectRecovery.
+    /// </summary>
+    public static IReadOnlyList<InstrumentExecutionAuthority> GetAllForAccount(string accountName)
+    {
+        var account = accountName ?? "";
+        return _registry.Where(kvp => string.Equals(kvp.Key.Account, account, StringComparison.OrdinalIgnoreCase))
+            .Select(kvp => kvp.Value)
+            .ToList();
     }
 }

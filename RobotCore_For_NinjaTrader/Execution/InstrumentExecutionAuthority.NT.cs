@@ -166,6 +166,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             foreach (var id in allIntentIds)
                 OrderMap[id] = orderInfo;
+            RegisterOrder(Executor.GetOrderId(order), primaryIntentId, instrument, currentIntent.Stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "TryAggregateWithExistingOrders", orderInfo, utcNow);
 
             var ordersToSubmit = new List<object> { order };
 
@@ -195,6 +196,7 @@ public sealed partial class InstrumentExecutionAuthority
                     FilledQuantity = 0
                 };
                 OrderMap[oppId] = oppOi;
+                RegisterOrder(Executor.GetOrderId(oppOrder), oppId, instrument, oppIntent.Stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "TryAggregateWithExistingOrders_Opposite", oppOi, utcNow);
                 Executor.RecordSubmission(oppId, oppIntent.TradingDate ?? "", oppIntent.Stream ?? "", instrument, $"ENTRY_STOP_{oppositeDirection}", Executor.GetOrderId(oppOrder), utcNow);
             }
 
@@ -344,6 +346,21 @@ public sealed partial class InstrumentExecutionAuthority
                     if (stopQty.HasValue && stopQty.Value != totalFilledQuantity)
                     {
                         var stopReason = $"Protective stop quantity mismatch: stopQty={stopQty}, totalFilledQuantity={totalFilledQuantity}";
+                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                        {
+                            drift_type = "stop_quantity_mismatch",
+                            position_qty = totalFilledQuantity,
+                            expected_protective_qty = totalFilledQuantity,
+                            actual_protective_qty = stopQty,
+                            expected_stop_price = intent.StopPrice,
+                            actual_stop_price = existingStop,
+                            expected_target_price = intent.TargetPrice,
+                            actual_target_price = existingTarget,
+                            stream_key = intent.Stream,
+                            intent_id = intentId,
+                            instrument = intent.Instrument,
+                            iea_instance_id = InstanceId
+                        }));
                         Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
                             new { error = stopReason, intent_id = intentId, stop_qty = stopQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
                         Executor.FailClosed(intentId, intent, stopReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
@@ -355,6 +372,21 @@ public sealed partial class InstrumentExecutionAuthority
                     if (targetQty.HasValue && targetQty.Value != totalFilledQuantity)
                     {
                         var targetReason = $"Protective target quantity mismatch: targetQty={targetQty}, totalFilledQuantity={totalFilledQuantity}";
+                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                        {
+                            drift_type = "target_quantity_mismatch",
+                            position_qty = totalFilledQuantity,
+                            expected_protective_qty = totalFilledQuantity,
+                            actual_protective_qty = targetQty,
+                            expected_stop_price = intent.StopPrice,
+                            actual_stop_price = existingStop,
+                            expected_target_price = intent.TargetPrice,
+                            actual_target_price = existingTarget,
+                            stream_key = intent.Stream,
+                            intent_id = intentId,
+                            instrument = intent.Instrument,
+                            iea_instance_id = InstanceId
+                        }));
                         Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
                             new { error = targetReason, intent_id = intentId, target_qty = targetQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
                         Executor.FailClosed(intentId, intent, targetReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
@@ -368,6 +400,21 @@ public sealed partial class InstrumentExecutionAuthority
                     return;
                 }
                 var reason = $"Existing protectives mismatch policy: stop {existingStop} vs {intent.StopPrice}, target {existingTarget} vs {intent.TargetPrice}";
+                Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                {
+                    drift_type = "price_mismatch",
+                    position_qty = totalFilledQuantity,
+                    expected_stop_price = intent.StopPrice,
+                    actual_stop_price = existingStop,
+                    expected_target_price = intent.TargetPrice,
+                    actual_target_price = existingTarget,
+                    expected_protective_qty = totalFilledQuantity,
+                    actual_protective_qty = stopQty ?? targetQty,
+                    stream_key = intent.Stream,
+                    intent_id = intentId,
+                    instrument = intent.Instrument,
+                    iea_instance_id = InstanceId
+                }));
                 Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_MISMATCH_FAIL_CLOSE",
                     new { error = reason, intent_id = intentId, existing_stop = existingStop, existing_target = existingTarget, expected_stop = intent.StopPrice, expected_target = intent.TargetPrice, iea_instance_id = InstanceId }));
                 Executor.FailClosed(intentId, intent, reason, "PROTECTIVE_MISMATCH_FLATTENED", $"PROTECTIVE_MISMATCH:{intentId}",
@@ -448,13 +495,19 @@ public sealed partial class InstrumentExecutionAuthority
         Executor.EnqueueNtAction(cmd);
     }
 
-    /// <summary>Enqueue execution update for serialized processing.</summary>
+    /// <summary>Enqueue execution update for serialized processing. Uses EnqueueRecoveryEssential so fills and order updates are processed during recovery (flatten completion, stale snapshot detection).</summary>
     public void EnqueueExecutionUpdate(object execution, object order)
     {
         if (Executor == null) return;
-        Enqueue(() =>
+        EnqueueRecoveryEssential(() =>
         {
-            if (!_hasScannedForAdoption)
+            // Phase 4: Critical event during bootstrap marks snapshot stale (fill or order state change)
+            if (IsInBootstrap && IsCriticalBootstrapEvent(execution, order))
+            {
+                MarkBootstrapSnapshotStale(NowEvent());
+            }
+            // Phase 4: ScanAndAdopt only after bootstrap complete (or was run in ADOPT path)
+            if (!_hasScannedForAdoption && !IsInBootstrap && (CurrentRecoveryState == RecoveryState.NORMAL || CurrentRecoveryState == RecoveryState.RESOLVED))
             {
                 _hasScannedForAdoption = true;
                 ScanAndAdoptExistingProtectives();
@@ -463,11 +516,39 @@ public sealed partial class InstrumentExecutionAuthority
         });
     }
 
+    /// <summary>Phase 4: True if execution/order represents a critical event (fill or order state change to Working/Filled/Cancelled).</summary>
+    private static bool IsCriticalBootstrapEvent(object execution, object order)
+    {
+        try
+        {
+            dynamic dynExec = execution;
+            var qty = (int)(dynExec.Quantity ?? 0);
+            if (qty != 0) return true; // Fill
+            dynamic dynOrder = order;
+            var state = (dynOrder.OrderState ?? "").ToString();
+            if (state.IndexOf("Working", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                state.IndexOf("Filled", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                state.IndexOf("Cancelled", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                state.IndexOf("Rejected", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+        }
+        catch { }
+        return false;
+    }
+
     private bool _hasScannedForAdoption;
+
+    /// <summary>Phase 4: Run adoption for bootstrap ADOPT path. Calls ScanAndAdoptExistingProtectives then OnBootstrapAdoptionCompleted.</summary>
+    internal void RunBootstrapAdoption(string instrument, DateTimeOffset utcNow)
+    {
+        ScanAndAdoptExistingProtectives();
+        OnBootstrapAdoptionCompleted(instrument, utcNow);
+    }
 
     /// <summary>
     /// Gap 4: On first execution update, sync OrderMap with broker reality. Hydration does not mutate broker state.
     /// For each QTSW2 protective (STOP/TARGET) with entry filled per journal, populate OrderMap.
+    /// Phase 2: QTSW2 stop/target with no matching intent → UNOWNED_LIVE_ORDER_DETECTED, register UNOWNED, follow recovery (flatten).
     /// </summary>
     private void ScanAndAdoptExistingProtectives()
     {
@@ -482,27 +563,55 @@ public sealed partial class InstrumentExecutionAuthority
             var tag = Executor.GetOrderTag(o);
             if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
             var intentId = RobotOrderIds.DecodeIntentId(tag);
-            if (string.IsNullOrEmpty(intentId) || !activeIntentIds.Contains(intentId)) continue;
             var isStop = tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase);
             var isTarget = tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase);
-            if (!isStop && !isTarget) continue;
-            var mapKey = $"{intentId}:{(isStop ? "STOP" : "TARGET")}";
-            if (!OrderMap.TryGetValue(mapKey, out _))
+
+            if (isStop || isTarget)
             {
-                var oi = new OrderInfo
+                if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
                 {
-                    IntentId = intentId,
-                    Instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey,
-                    OrderId = o.OrderId,
-                    OrderType = isStop ? "STOP" : "TARGET",
-                    Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
-                    Quantity = o.Quantity,
-                    State = "WORKING",
-                    IsEntryOrder = false
-                };
-                OrderMap[mapKey] = oi;
-                if (isStop)
-                    Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
+                    var mapKey = $"{intentId}:{(isStop ? "STOP" : "TARGET")}";
+                    if (!OrderMap.TryGetValue(mapKey, out _))
+                    {
+                        var oi = new OrderInfo
+                        {
+                            IntentId = intentId,
+                            Instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey,
+                            OrderId = o.OrderId,
+                            OrderType = isStop ? "STOP" : "TARGET",
+                            Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
+                            Quantity = o.Quantity,
+                            State = "WORKING",
+                            IsEntryOrder = false
+                        };
+                        OrderMap[mapKey] = oi;
+                        RegisterAdoptedOrder(o.OrderId, intentId, oi.Instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "RESTART_ADOPTION", oi, NowEvent());
+                        if (isStop)
+                            Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
+                    }
+                }
+                else
+                {
+                    // Phase 2: No matching intent - unowned live order
+                    var instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey;
+                    if (!TryResolveByBrokerOrderId(o.OrderId, out _))
+                    {
+                        RegisterUnownedOrder(o.OrderId, intentId, instrument, "UNOWNED_LIVE_ORDER_DETECTED", NowEvent());
+                        Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId ?? "", instrument, "UNOWNED_LIVE_ORDER_DETECTED", new
+                        {
+                            broker_order_id = o.OrderId,
+                            intent_id = intentId,
+                            instrument,
+                            order_type = isStop ? "STOP" : "TARGET",
+                            note = "Restart scan: QTSW2 protective with no matching active intent",
+                            action = "RECOVERY_PHASE3",
+                            iea_instance_id = InstanceId
+                        }));
+                        var utcNow = NowEvent();
+                        RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                        RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                    }
+                }
             }
         }
     }

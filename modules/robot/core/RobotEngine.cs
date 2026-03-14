@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
@@ -85,7 +86,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private const double SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES = 5.0;
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
+    private ProtectiveCoverageCoordinator? _protectiveCoordinator;
+    private MismatchEscalationCoordinator? _mismatchCoordinator;
     private readonly ExecutionJournal _executionJournal;
+    private readonly ExecutionEventWriter _eventWriter;
     private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
@@ -145,6 +149,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private bool _recoveryRunnerActive = false;
     private readonly object _recoveryLock = new object();
     
+    // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
+    private Timer? _engineHeartbeatTimer;
+    private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
+    
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
     {
@@ -153,6 +161,54 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         public int BeforeDateLocked { get; set; }
         public int TotalAccepted { get; set; }
         public DateTimeOffset LastUpdateUtc { get; set; }
+    }
+
+    /// <summary>
+    /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
+    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// </summary>
+    public void StartEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+            _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatTimer = new Timer(
+                _ => EmitTimerHeartbeatUnsafe(),
+                null,
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(5));
+        }
+    }
+
+    /// <summary>
+    /// Stop and dispose the engine heartbeat timer. Called on engine Stop or StandDown.
+    /// </summary>
+    public void StopEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+        }
+    }
+
+    /// <summary>
+    /// Emit ENGINE_TIMER_HEARTBEAT from timer callback. Must not acquire _engineLock (runs on thread pool).
+    /// </summary>
+    private void EmitTimerHeartbeatUnsafe()
+    {
+        try
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            var tradingDate = _heartbeatTradingDateCache ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+        }
+        catch (Exception ex)
+        {
+            try { _log.Write(new { ts_utc = DateTimeOffset.UtcNow.ToString("o"), event_type = "ENGINE_TIMER_HEARTBEAT_ERROR", error = ex.Message }); } catch { /* must not throw */ }
+        }
     }
 
     /// <summary>
@@ -181,13 +237,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
-    /// Check if execution is allowed based on recovery state.
-    /// Execution is allowed only in CONNECTED_OK or RECOVERY_COMPLETE states.
+    /// Check if execution is allowed based on recovery state and global kill switch.
+    /// Execution is allowed only when: CONNECTED_OK or RECOVERY_COMPLETE, AND global kill switch is off.
+    /// Phase 5: Kill switch blocks protectives and modifications (same path as entry orders).
     /// </summary>
     public bool IsExecutionAllowed()
     {
         lock (_engineLock)
         {
+            if (_killSwitch != null && _killSwitch.IsEnabled())
+                return false;
             return _recoveryState == ConnectionRecoveryState.CONNECTED_OK ||
                    _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE;
         }
@@ -384,7 +443,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
+        _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log);
     }
+
+    /// <summary>
+    /// Gap 5: Canonical execution event writer for replay/audit. Subsystems emit via this.
+    /// </summary>
+    public ExecutionEventWriter EventWriter => _eventWriter;
 
     /// <summary>
     /// Report execution policy validation failure to HealthMonitor.
@@ -789,10 +854,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Initialize execution components now that spec is loaded
             if (_killSwitch == null)
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
-            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this);
 
             // Try to create adapter (will throw if LIVE mode)
             _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
+
+            // Gap 3 Phase 3: Protective coverage coordinator (blocks instruments on critical protective failure)
+            _protectiveCoordinator = new ProtectiveCoverageCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                isInstrumentBlocked: _ => false,
+                log: _log,
+                eventWriter: _eventWriter);
+
+            // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
+            _mismatchCoordinator = new MismatchEscalationCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                getMismatchObservations: AssembleMismatchObservations,
+                isInstrumentBlocked: inst => _protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false,
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                log: _log,
+                eventWriter: _eventWriter);
+
+            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this,
+                isInstrumentFrozen: inst => (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false) || (_mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) ?? false));
 
             // Set journal corruption callback for fail-closed behavior
             _executionJournal.SetJournalCorruptionCallback((stream, tradingDate, intentId, utcNow) =>
@@ -1121,6 +1209,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Stop()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         
         // PHASE 3.1: Release canonical market lock on shutdown
@@ -1419,6 +1508,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Health monitor: evaluate data loss (rate-limited internally)
             _healthMonitor?.Evaluate(utcNow);
+
+            // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
+            _protectiveCoordinator?.EmitMetrics(utcNow);
+
+            // Gap 4: Mismatch escalation metrics
+            _mismatchCoordinator?.EmitMetrics(utcNow);
         }
     }
 
@@ -3628,6 +3723,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void StandDown()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         var streamCount = _streams.Count;
         var tradingDateStr = TradingDateString;
@@ -3899,6 +3995,91 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
     
+    /// <summary>
+    /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
+    /// </summary>
+    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations()
+    {
+        var list = new List<MismatchObservation>();
+        if (_executionAdapter == null) return list;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        AccountSnapshot snap;
+        try
+        {
+            snap = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            return list;
+        }
+
+        if (snap?.Positions == null && snap?.WorkingOrders == null)
+            return list;
+
+        var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var brokerWorkingByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var p in snap.Positions ?? new List<PositionSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            var inst = p.Instrument.Trim();
+            var qty = Math.Abs(p.Quantity);
+            brokerQtyByInst.TryGetValue(inst, out var existing);
+            brokerQtyByInst[inst] = existing + qty;
+        }
+
+        foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            var inst = w.Instrument.Trim();
+            brokerWorkingByInst.TryGetValue(inst, out var cnt);
+            brokerWorkingByInst[inst] = cnt + 1;
+        }
+
+        var openByInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var allInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in brokerQtyByInst.Keys) allInstruments.Add(k);
+        foreach (var k in brokerWorkingByInst.Keys) allInstruments.Add(k);
+        foreach (var k in openByInst.Keys)
+        {
+            if (!string.IsNullOrWhiteSpace(k)) allInstruments.Add(k.Trim());
+        }
+
+        foreach (var inst in allInstruments)
+        {
+            var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
+            var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var localWorking = 0;
+            if (openByInst.TryGetValue(inst, out var entries))
+                localWorking = entries.Count;
+            if (openByInst.TryGetValue(execVariant, out var entriesM))
+                localWorking += entriesM.Count;
+
+            if (brokerQty == journalQty && brokerWorking == localWorking)
+                continue;
+
+            var mismatchType = MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, localWorking);
+            list.Add(new MismatchObservation
+            {
+                Instrument = inst,
+                MismatchType = mismatchType,
+                Present = true,
+                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={localWorking}",
+                BrokerQty = brokerQty,
+                LocalQty = journalQty,
+                BrokerWorkingOrderCount = brokerWorking,
+                LocalWorkingOrderCount = localWorking,
+                ObservedUtc = utcNow,
+                Severity = "CRITICAL"
+            });
+        }
+
+        return list;
+    }
+
     /// <summary>
     /// Flatten exposure for a specific intent (helper for coordinator callback).
     /// </summary>

@@ -64,10 +64,15 @@ class LedgerBuilder:
     def build_ledger_rows(
         self,
         trading_date: str,
-        stream: Optional[str] = None
+        stream: Optional[str] = None,
+        skip_invalid_intents: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Build ledger rows for all intents in trading_date (optionally filtered by stream).
+        
+        Args:
+            skip_invalid_intents: If True, skip intents that raise LedgerInvariantViolation
+                (e.g. exit_qty > entry_qty from overfill/corruption) so partial journal can be shown.
         
         Returns list of ledger rows with canonical fields:
         - trading_date, stream, instrument, intent_id, direction
@@ -87,11 +92,20 @@ class LedgerBuilder:
         ledger_rows = []
         
         for intent_id, journal in journal_entries.items():
-            row = self._build_ledger_row(
-                journal, intent_id, execution_fills.get(intent_id, [])
-            )
-            if row:
-                ledger_rows.append(row)
+            try:
+                row = self._build_ledger_row(
+                    journal, intent_id, execution_fills.get(intent_id, [])
+                )
+                if row:
+                    ledger_rows.append(row)
+            except LedgerInvariantViolation as e:
+                if skip_invalid_intents:
+                    logger.warning(
+                        f"LedgerBuilder: Skipping intent {intent_id} (stream={journal.get('stream')}) "
+                        f"due to invariant violation: {e}"
+                    )
+                else:
+                    raise
         
         return ledger_rows
     

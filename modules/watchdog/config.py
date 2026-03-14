@@ -61,8 +61,14 @@ DATA_STALL_THRESHOLD_SECONDS = 120  # Default, can be configurable per instrumen
 RECOVERY_TIMEOUT_SECONDS = 600  # 10 minutes
 
 # ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS: Reject ENGINE_TICK_CALLSITE events older than this when
-# initializing from end-of-file. Prevents false ENGINE ALIVE when feed has stale ticks from previous run.
-ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS = 90
+# initializing from tail (startup or after invalidate). Prevents false ENGINE ALIVE at login screen.
+# Strategy emits ticks every ~5s when running; 15s ensures we only trust ticks from active strategy.
+ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS = 15
+
+# SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS: When processing CONNECTION_LOST/RECOVERED from tail,
+# skip session metrics (disconnect count, downtime) if event is older than this. Prevents tail replay
+# from inflating "42 disconnects" when watchdog restarts. Status (_connection_status) still updated.
+SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS = 60
 
 # IDENTITY_EXPIRY_SECONDS: If no IDENTITY_INVARIANTS_STATUS event in this many seconds, treat identity as Unknown.
 IDENTITY_EXPIRY_SECONDS = 600  # 10 minutes
@@ -85,6 +91,20 @@ EVENTS_CACHE_TTL_SECONDS = 1
 # STREAM_MAX_AGE_DAYS: Maximum age for streams to be shown (today + N days back).
 # Streams older than this are filtered out. Must cover weekend carry-over (Fri -> Mon = 3 days).
 STREAM_MAX_AGE_DAYS = 3  # Allow today + Fri->Mon weekend carry-over
+
+# Feed/Ingestion health alert thresholds
+FEED_INGESTION_DELAY_THRESHOLD_SECONDS = 10  # Alert when feed lag > 10s
+WATCHDOG_LOOP_SLOW_THRESHOLD_MS = 500  # Alert when loop duration > 500ms (degradation is 900ms)
+ANOMALY_RATE_THRESHOLD = 10  # Anomalies in window
+ANOMALY_RATE_WINDOW_SECONDS = 300  # 5 minutes
+
+# Execution anomaly thresholds (Phase 12)
+DUPLICATE_ORDER_WINDOW_MS = 5000  # Window for duplicate submission detection
+ORDER_STUCK_ENTRY_THRESHOLD_SECONDS = 120  # Entry working too long
+ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS = 90  # Stop/target working too long
+EXECUTION_LATENCY_SPIKE_THRESHOLD_MS = 5000  # Submit→fill latency
+RECOVERY_LOOP_COUNT_THRESHOLD = 3  # Recovery entries in window
+RECOVERY_LOOP_WINDOW_SECONDS = 600  # Rolling window for recovery loop
 
 # Update frequencies (seconds)
 ENGINE_ALIVE_UPDATE_FREQUENCY = 5
@@ -110,6 +130,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Use ENGINE_TICK_CALLSITE (rate-limited) instead for reliable liveness monitoring
     "ENGINE_TICK_EXECUTED",  # Diagnostic: Tick() execution (Phase 1)
     "ENGINE_TICK_CALLSITE",  # Diagnostic: Tick() call site (rate-limited in event feed to every 5s)
+    "ENGINE_TIMER_HEARTBEAT",  # Timer-based heartbeat when market closed (no ticks)
     "ENGINE_TICK_BEFORE_LOCK",  # Diagnostic: before lock acquisition
     "ENGINE_TICK_LOCK_ACQUIRED",  # Diagnostic: after lock acquired
     "ENGINE_TICK_AFTER_LOCK",  # Diagnostic: after lock released
@@ -185,4 +206,16 @@ LIVE_CRITICAL_EVENT_TYPES = {
     # Bar acceptance tracking
     "BAR_ACCEPTED",  # Bar acceptance events (rate-limited in engine)
     "BAR_RECEIVED_NO_STREAMS",  # Bar received before streams created (for data stall detection)
+    # Execution anomaly monitoring (Phase 2-9)
+    "EXECUTION_GHOST_FILL_DETECTED",
+    "PROTECTIVE_DRIFT_DETECTED",
+    "ORPHAN_ORDER_DETECTED",
+    "DUPLICATE_ORDER_SUBMISSION_DETECTED",
+    "POSITION_DRIFT_DETECTED",
+    "ORDER_STUCK_DETECTED",
+    "EXECUTION_LATENCY_SPIKE_DETECTED",
+    "RECOVERY_LOOP_DETECTED",
+    "RECONCILIATION_QTY_MISMATCH",  # Position drift (broker vs journal)
+    "EXPOSURE_INTEGRITY_VIOLATION",  # Intent vs broker mismatch (critical invariant)
+    "ORDER_LIFECYCLE_TRANSITION_INVALID",  # Invalid order state transition
 }

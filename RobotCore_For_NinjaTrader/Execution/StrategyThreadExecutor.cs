@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -29,6 +30,7 @@ public interface INtActionExecutor
     void ExecuteSubmitProtectives(NtSubmitProtectivesCommand cmd);
     void ExecuteCancelOrders(NtCancelOrdersCommand cmd);
     void ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd);
+    void ExecuteSubmitEntryIntent(NtSubmitEntryIntentCommand cmd);
 }
 
 /// <summary>
@@ -138,6 +140,28 @@ public sealed class NtFlattenInstrumentCommand : INtAction
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteFlattenInstrument(this);
+}
+
+/// <summary>
+/// Command: submit entry intent (stop brackets). Dispatched from IEA execution command layer.
+/// </summary>
+public sealed class NtSubmitEntryIntentCommand : INtAction
+{
+    public string CorrelationId { get; }
+    public string ActionType => "SUBMIT_ENTRY_INTENT";
+    public string? IntentId => _command.IntentId;
+    public string? InstrumentKey => _command.Instrument;
+    public string Reason => _command.Reason ?? "SUBMIT_ENTRY_INTENT";
+    public SubmitEntryIntentCommand Command => _command;
+    private readonly SubmitEntryIntentCommand _command;
+
+    public NtSubmitEntryIntentCommand(string correlationId, SubmitEntryIntentCommand command)
+    {
+        CorrelationId = correlationId;
+        _command = command ?? throw new ArgumentNullException(nameof(command));
+    }
+
+    public void Execute(INtActionExecutor executor) => executor.ExecuteSubmitEntryIntent(this);
 }
 
 /// <summary>

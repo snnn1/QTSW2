@@ -43,10 +43,21 @@
           "buildTransitive/net6.0/System.Text.Json.targets": {}
         }
       },
+      "Robot.Contracts/1.0.0": {
+        "type": "project",
+        "framework": ".NETStandard,Version=v2.0",
+        "compile": {
+          "bin/placeholder/Robot.Contracts.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Robot.Contracts.dll": {}
+        }
+      },
       "Robot.Core/1.0.0": {
         "type": "project",
         "framework": ".NETCoreApp,Version=v8.0",
         "dependencies": {
+          "Robot.Contracts": "1.0.0",
           "System.Text.Json": "8.0.0"
         },
         "compile": {
@@ -166,6 +177,11 @@
         "system.text.json.nuspec",
         "useSharedDesignerContext.txt"
       ]
+    },
+    "Robot.Contracts/1.0.0": {
+      "type": "project",
+      "path": "../contracts/Robot.Contracts.csproj",
+      "msbuildProject": "../contracts/Robot.Contracts.csproj"
     },
     "Robot.Core/1.0.0": {
       "type": "project",

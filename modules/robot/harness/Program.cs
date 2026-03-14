@@ -41,12 +41,153 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 }
 
 // --test DST: run session close fallback timezone tests (DST boundary weeks)
+// --test TERMINAL_INTENT: run terminal intent hardening tests (IsIntentCompleted, BE exclusion)
+// --test IEA_FLATTEN: run IEA flatten authority tests (exposure-reduction invariant)
+// --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
+// --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
+// --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
+// --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
+// --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
 var testIndex = argsList.IndexOf("--test");
-if (testIndex >= 0 && testIndex + 1 < argsList.Count && argsList[testIndex + 1].Equals("DST", StringComparison.OrdinalIgnoreCase))
+if (testIndex >= 0 && testIndex + 1 < argsList.Count)
 {
-    var (pass, err) = SessionCloseFallbackTimeZoneTests.RunDstBoundaryTests();
-    Console.WriteLine(pass ? "PASS: DST boundary tests" : $"FAIL: {err}");
-    Environment.Exit(pass ? 0 : 1);
+    var testName = argsList[testIndex + 1];
+    if (testName.Equals("DST", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SessionCloseFallbackTimeZoneTests.RunDstBoundaryTests();
+        Console.WriteLine(pass ? "PASS: DST boundary tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("TERMINAL_INTENT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = TerminalIntentHardeningTests.RunTerminalIntentTests();
+        Console.WriteLine(pass ? "PASS: Terminal intent hardening tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("IEA_FLATTEN", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = IeaFlattenAuthorityTests.RunIeaFlattenTests();
+        Console.WriteLine(pass ? "PASS: IEA flatten authority tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("ORDER_REGISTRY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = OrderRegistryTests.RunOrderRegistryTests();
+        Console.WriteLine(pass ? "PASS: Order registry tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RECOVERY_PHASE3", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = RecoveryPhase3Tests.RunRecoveryPhase3Tests();
+        Console.WriteLine(pass ? "PASS: Recovery Phase 3 tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("BOOTSTRAP_PHASE4", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = BootstrapPhase4Tests.RunBootstrapPhase4Tests();
+        Console.WriteLine(pass ? "PASS: Bootstrap Phase 4 tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("SUPERVISORY_PHASE5", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SupervisoryPhase5Tests.RunSupervisoryPhase5Tests();
+        Console.WriteLine(pass ? "PASS: Supervisory Phase 5 tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("PHASE5_HARDENING", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = Phase5HardeningTests.RunPhase5HardeningTests();
+        Console.WriteLine(pass ? "PASS: Phase 5 hardening tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("EXECUTION_COMMANDS", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ExecutionCommandTests.RunExecutionCommandTests();
+        Console.WriteLine(pass ? "PASS: Execution command tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("INTENT_LIFECYCLE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = IntentLifecycleTests.RunIntentLifecycleTests();
+        Console.WriteLine(pass ? "PASS: Intent lifecycle tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("EXECUTION_ORDERING", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ExecutionEventOrderingTests.RunExecutionEventOrderingTests();
+        Console.WriteLine(pass ? "PASS: Execution event ordering tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("PROTECTIVE_AUDIT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ProtectiveCoverageAuditTests.RunProtectiveAuditTests();
+        Console.WriteLine(pass ? "PASS: Protective coverage audit tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("MISMATCH_ESCALATION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = MismatchEscalationTests.RunMismatchEscalationTests();
+        Console.WriteLine(pass ? "PASS: Mismatch escalation tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("EXECUTION_EVENT_REPLAY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ExecutionEventReplayTests.RunExecutionEventReplayTests();
+        Console.WriteLine(pass ? "PASS: Execution event replay tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("EXECUTION_SCENARIOS", StringComparison.OrdinalIgnoreCase))
+    {
+        RunExecutionScenarioTests();
+        return;
+    }
+}
+
+static void RunExecutionScenarioTests()
+{
+    Console.WriteLine("=== Execution Scenario Harness Tests ===");
+    Console.WriteLine();
+
+    var (allPassed, metrics, results) = ExecutionScenarioRunner.RunAll(msg => Console.WriteLine(msg));
+
+    foreach (var r in results)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"Scenario: {r.ScenarioName}");
+        Console.WriteLine($"  Final lifecycle: {r.FinalLifecycle ?? "N/A"}");
+        Console.WriteLine($"  Replay exposure: {r.ReplayExposure}");
+        Console.WriteLine($"  Protective block: {r.ProtectiveBlock}");
+        Console.WriteLine($"  Mismatch fail-closed: {r.MismatchFailClosed}");
+        Console.WriteLine($"  RESULT: {(r.Pass ? "PASS" : "FAIL")}");
+        if (!r.Pass && !string.IsNullOrEmpty(r.Error))
+            Console.WriteLine($"  REPLAY_STATE_MISMATCH: {r.Error}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("=== Summary ===");
+    Console.WriteLine($"  scenario_pass_count: {metrics.ScenarioPassCount}");
+    Console.WriteLine($"  scenario_fail_count: {metrics.ScenarioFailCount}");
+    Console.WriteLine($"  replay_validation_failures: {metrics.ReplayValidationFailures}");
+    Console.WriteLine();
+
+    if (!allPassed)
+    {
+        Console.WriteLine("SOME SCENARIOS FAILED");
+        Environment.Exit(1);
+    }
+
+    Console.WriteLine("=== Unit Tests ===");
+    var (ut1, e1) = ExecutionScenarioTests.TestScenarioRunnerExecutes();
+    Console.WriteLine(ut1 ? "  TestScenarioRunnerExecutes: PASS" : $"  TestScenarioRunnerExecutes: FAIL - {e1}");
+    var (ut2, e2) = ExecutionScenarioTests.TestReplayValidationRuns();
+    Console.WriteLine(ut2 ? "  TestReplayValidationRuns: PASS" : $"  TestReplayValidationRuns: FAIL - {e2}");
+    var (ut3, e3) = ExecutionScenarioTests.TestFailureConditionsDetected();
+    Console.WriteLine(ut3 ? "  TestFailureConditionsDetected: PASS" : $"  TestFailureConditionsDetected: FAIL - {e3}");
+    Console.WriteLine();
+
+    var unitPass = ut1 && ut2 && ut3;
+    Console.WriteLine(unitPass ? "ALL SCENARIOS AND UNIT TESTS PASSED" : "UNIT TESTS FAILED");
+    Environment.Exit(unitPass ? 0 : 1);
 }
 
 var root = ProjectRootResolver.ResolveProjectRoot();

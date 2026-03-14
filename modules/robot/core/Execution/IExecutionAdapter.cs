@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -130,6 +131,12 @@ public interface IExecutionAdapter
     /// <param name="snap">Account snapshot from GetAccountSnapshot</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Enqueue execution command for IEA processing. Strategy layers should use this instead of calling
+    /// adapter.Flatten/SubmitOrders/CancelOrders directly. Adapters with IEA forward to IEA; others no-op.
+    /// </summary>
+    void EnqueueExecutionCommand(ExecutionCommandBase command);
 }
 
 /// <summary>

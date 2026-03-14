@@ -120,11 +120,17 @@ async def get_events(
         next_seq = since_seq
         if events:
             next_seq = max(e.get("event_seq", 0) for e in events)
-        
+
+        # Phase 4: Add event_id for REST/WS dedupe consistency
+        events_with_id = [
+            {**e, "event_id": e.get("event_id") or f"{e.get('run_id', '')}:{e.get('event_seq', 0)}"}
+            for e in events
+        ]
+
         # Always return current_run_id so frontend can detect stale run and reset
         return {
             "run_id": current_run_id,
-            "events": events,
+            "events": events_with_id,
             "next_seq": next_seq
         }
     except HTTPException:
