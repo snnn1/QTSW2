@@ -30,6 +30,7 @@ from .config import (
     ORDER_STUCK_ENTRY_THRESHOLD_SECONDS,
     ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS,
     EXECUTION_LATENCY_SPIKE_THRESHOLD_MS,
+    DISCONNECT_DEDUPE_WINDOW_SECONDS,
 )
 from .market_session import is_market_open
 
@@ -100,6 +101,7 @@ class WatchdogStateManager:
         self._session_disconnect_count: int = 0
         self._session_disconnect_start_utc: Optional[datetime] = None  # When current disconnect started
         self._session_last_disconnect_utc: Optional[datetime] = None  # When last disconnect started
+        self._session_last_disconnect_for_dedupe_utc: Optional[datetime] = None  # Last LOST used for dedupe (cleared on RECOVERED)
         self._session_total_downtime_seconds: float = 0.0
         self._last_connectivity_daily_summary: Optional[Dict[str, Any]] = None  # Last CONNECTIVITY_DAILY_SUMMARY payload
         
@@ -228,7 +230,14 @@ class WatchdogStateManager:
         elif new_state in ("RECOVERY_COMPLETE", "CONNECTED_OK", "DISCONNECT_FAIL_CLOSED"):
             # Recovery completed or reset - clear start time
             self._recovery_started_utc = None
-        
+
+        # Log recovery state transitions for RECOVERY IN PROGRESS investigation
+        if self._recovery_state != new_state:
+            logger.info(
+                f"RECOVERY_STATE_CHANGE: {state} -> {new_state} "
+                f"(timestamp_utc={timestamp_utc.isoformat()})"
+            )
+
         self._recovery_state = new_state
     
     def check_recovery_loop(self, now: Optional[datetime] = None) -> Optional[Dict]:
@@ -380,11 +389,23 @@ class WatchdogStateManager:
                     self._session_connectivity_key = key
                     self._session_disconnect_count = 0
                     self._session_total_downtime_seconds = 0.0
+                    self._session_last_disconnect_for_dedupe_utc = None
+                # Dedupe: rapid flaps within DISCONNECT_DEDUPE_WINDOW_SECONDS count as one disconnect
+                last_dedupe = getattr(self, "_session_last_disconnect_for_dedupe_utc", None)
+                if last_dedupe is not None:
+                    elapsed = (timestamp_utc - last_dedupe).total_seconds()
+                    if elapsed < DISCONNECT_DEDUPE_WINDOW_SECONDS:
+                        # Rapid flap - don't increment, but update timestamps
+                        self._session_disconnect_start_utc = timestamp_utc
+                        self._session_last_disconnect_utc = timestamp_utc
+                        return
                 self._session_disconnect_count += 1
                 self._session_disconnect_start_utc = timestamp_utc
                 self._session_last_disconnect_utc = timestamp_utc
+                self._session_last_disconnect_for_dedupe_utc = timestamp_utc
             else:
-                # Connected / Recovered
+                # Connected / Recovered - clear dedupe timestamp so next LOST counts as new disconnect
+                self._session_last_disconnect_for_dedupe_utc = None
                 if self._session_disconnect_start_utc:
                     duration = (timestamp_utc - self._session_disconnect_start_utc).total_seconds()
                     # Only add positive duration (guard against out-of-order events / timestamp skew)
@@ -1736,9 +1757,10 @@ class WatchdogStateManager:
             elif any(d.get('stall_detected', False) for d in data_stall_detected.values()):
                 data_status = "ACCEPTABLE_SILENCE"  # Market closed or acceptable pause
             else:
-                data_status = "FLOWING"
+                data_status = "FLOWING" if engine_alive else "UNKNOWN"
         else:
-            data_status = "FLOWING"
+            # No stall detected - only show FLOWING when engine is alive (receiving live bars)
+            data_status = "FLOWING" if engine_alive else "UNKNOWN"
         
         # Apply smoothing/debouncing to data status
         self._data_status_history.append((now, data_status))
@@ -1960,6 +1982,18 @@ class ExecutionPolicyFailureInfo:
         self.note = note
 
 
+def _is_cursor_valid(cursor: Any) -> bool:
+    """Validate cursor: must be dict with str keys and int values."""
+    if not isinstance(cursor, dict):
+        return False
+    for k, v in cursor.items():
+        if not isinstance(k, str) or not k.strip():
+            return False
+        if not isinstance(v, int) or v < 0:
+            return False
+    return True
+
+
 class CursorManager:
     """Manages cursor state for incremental event tailing."""
     
@@ -1968,28 +2002,39 @@ class CursorManager:
         self._cursor_file.parent.mkdir(parents=True, exist_ok=True)
     
     def load_cursor(self) -> Dict[str, int]:
-        """Load cursor state from file."""
+        """Load cursor state from file. Returns {} if missing or invalid (triggers safe init)."""
         if not self._cursor_file.exists():
             return {}
         
         try:
             with open(self._cursor_file, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+            if not _is_cursor_valid(data):
+                logger.warning("Cursor content malformed (invalid keys/values) - treating as empty")
+                return {}
+            return data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Cursor file corrupted (JSON decode error): {e} - treating as empty")
+            return {}
         except Exception as e:
             logger.warning(f"Failed to load cursor: {e}")
             return {}
     
     def save_cursor(self, cursor: Dict[str, int]) -> bool:
-        """Save cursor state to file with retry logic. Returns True on success, False on failure."""
+        """Save cursor state atomically (write to temp, then rename). Returns True on success."""
+        if not isinstance(cursor, dict):
+            return False
+        tmp_file = self._cursor_file.with_suffix(".json.tmp")
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with open(self._cursor_file, 'w') as f:
+                with open(tmp_file, 'w') as f:
                     json.dump(cursor, f, indent=2)
+                tmp_file.replace(self._cursor_file)
                 return True
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = 0.1 * (2 ** attempt)  # Exponential backoff
+                    wait_time = 0.1 * (2 ** attempt)
                     logger.warning(f"Failed to save cursor (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait_time}s")
                     time.sleep(wait_time)
                 else:

@@ -1693,6 +1693,22 @@ public sealed partial class NinjaTraderSimAdapter
             return;
         }
 
+        // Reentry protective acceptance: when BOTH stop and target for a reentry intent are Working/Accepted,
+        // invoke HandleReentryProtectionAccepted (once per intent). Only for reentry protective set, not original entry.
+        if ((parsed.Leg == "STOP" || parsed.Leg == "TARGET") &&
+            intentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase) &&
+            (orderState == OrderState.Working || orderState == OrderState.Accepted) &&
+            !_reentryProtectionAcceptedNotified.Contains(intentId))
+        {
+            if (((IIEAOrderExecutor)this).HasWorkingProtectivesForIntent(intentId))
+            {
+                _reentryProtectionAcceptedNotified.Add(intentId);
+                _onReentryProtectionAcceptedCallback?.Invoke(intentId, utcNow);
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "REENTRY_PROTECTION_ACCEPTED_CALLBACK",
+                    new { reentry_intent_id = intentId, note = "Both reentry protective orders Working - HandleReentryProtectionAccepted invoked" }));
+            }
+        }
+
         // Update journal based on order state. Truth source: use parsed.Leg from tag, NOT orderInfo.OrderType.
         if (orderState == OrderState.Accepted)
         {
@@ -2924,7 +2940,11 @@ public sealed partial class NinjaTraderSimAdapter
                     var cumulativeForIntent = (orderInfo.AggregatedFilledByIntent != null && orderInfo.AggregatedFilledByIntent.TryGetValue(allocIntentId, out var cum))
                         ? cum
                         : allocQty;
-                    if (_useInstrumentExecutionAuthority && _iea != null)
+                    if (allocIntentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _onReentryFillCallback?.Invoke(allocIntentId, utcNow);
+                    }
+                    else if (_useInstrumentExecutionAuthority && _iea != null)
                         _iea.HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
                     else
                         HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
@@ -2940,7 +2960,11 @@ public sealed partial class NinjaTraderSimAdapter
 
                 CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
 
-                if (_useInstrumentExecutionAuthority && _iea != null)
+                if (intentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
+                {
+                    _onReentryFillCallback?.Invoke(intentId, utcNow);
+                }
+                else if (_useInstrumentExecutionAuthority && _iea != null)
                     _iea.HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
                 else
                     HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);

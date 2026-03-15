@@ -351,6 +351,9 @@ class WatchdogAggregator:
         self._anomaly_dedupe_queue: deque = deque(maxlen=500)
         # When cursor save fails, skip anomaly counting next cycle to avoid double-count on reprocess
         self._skip_anomaly_counting: bool = False
+
+        # Phase 9: Metrics history snapshots every 6 hours
+        self._last_metrics_snapshot_utc: Optional[datetime] = None
     
     async def start(self):
         """Start the aggregator service."""
@@ -364,7 +367,8 @@ class WatchdogAggregator:
 
         # Load cursor state
         cursor = self._cursor_manager.load_cursor()
-        logger.info(f"Loaded cursor state: {cursor}")
+        cursor_empty_or_invalid = not cursor
+        logger.info(f"Loaded cursor state: {cursor} (empty_or_invalid={cursor_empty_or_invalid})")
         
         # Initialize state from recent events on startup
         # INGESTION: Single tail read for all startup init (connection, tick, bars, identity)
@@ -381,8 +385,23 @@ class WatchdogAggregator:
                 except json.JSONDecodeError:
                     continue
 
-        logger.info("Rebuilding connection status from startup snapshot")
-        self._rebuild_connection_status_from_snapshot(startup_snapshot)
+        # Connection rebuild: when cursor empty/invalid, use safe init (skip session metrics, advance cursor)
+        if cursor_empty_or_invalid:
+            logger.info("Cursor empty or invalid - safe init: rebuild connection with skip_session_metrics, advance cursor")
+            self._rebuild_connection_status_from_snapshot(startup_snapshot, skip_session_metrics=True)
+            # Advance cursor to newest event per run_id so no historical events are replayed
+            cursor = {}
+            for ev in startup_snapshot:
+                run_id = ev.get("run_id")
+                event_seq = ev.get("event_seq", 0)
+                if run_id and isinstance(event_seq, (int, float)):
+                    cursor[run_id] = max(cursor.get(run_id, 0), int(event_seq))
+            if cursor:
+                self._cursor_manager.save_cursor(cursor)
+                logger.info(f"Advanced cursor to tail: {cursor}")
+        else:
+            logger.info("Rebuilding connection status from startup snapshot")
+            self._rebuild_connection_status_from_snapshot(startup_snapshot)
 
         logger.info("Hydrating intent exposures from execution journals")
         self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
@@ -501,6 +520,13 @@ class WatchdogAggregator:
                 process_name=PROCESS_MONITOR_PROCESS_NAME,
                 on_process_down=on_process_down,
                 on_process_restored=on_process_restored,
+            )
+            # Phase 4: Wire incident recorder to alert engine
+            from .incident_recorder import get_incident_recorder
+            from .alert_engine import on_incident
+            ns = self._notification_service
+            get_incident_recorder().set_on_incident_callback(
+                lambda r: on_incident(r, ns)
             )
         except Exception as e:
             logger.warning(f"Phase 1 notification/process monitor init failed: {e}", exc_info=True)
@@ -805,6 +831,16 @@ class WatchdogAggregator:
                 if cleanup_counter >= 60:  # Every 60 seconds
                     cleanup_counter = 0
                     self._cleanup_stale_streams_periodic()
+
+                # Phase 9: Metrics history snapshot every 6 hours
+                utc_now = datetime.now(timezone.utc)
+                if self._last_metrics_snapshot_utc is None or (utc_now - self._last_metrics_snapshot_utc).total_seconds() >= 6 * 3600:
+                    try:
+                        from .metrics_history import append_weekly_snapshot
+                        append_weekly_snapshot()
+                        self._last_metrics_snapshot_utc = utc_now
+                    except Exception as e:
+                        logger.debug(f"Metrics snapshot failed: {e}")
                 
                 # Phase 1: Check alert conditions (heartbeat, connection)
                 self._check_alert_conditions()
@@ -1215,6 +1251,20 @@ class WatchdogAggregator:
                             pass
                 except json.JSONDecodeError:
                     parse_errors += 1
+
+            # Cursor empty/invalid: safe init to prevent replay inflation (e.g. cursor file deleted mid-run)
+            if not cursor and parsed_events:
+                logger.warning("Cursor empty mid-run - safe init: rebuild connection with skip_session_metrics, advance cursor")
+                self._rebuild_connection_status_from_snapshot(parsed_events, skip_session_metrics=True)
+                cursor = {}
+                for ev in parsed_events:
+                    run_id = ev.get("run_id")
+                    event_seq = ev.get("event_seq", 0)
+                    if run_id and isinstance(event_seq, (int, float)):
+                        cursor[run_id] = max(cursor.get(run_id, 0), int(event_seq))
+                if cursor:
+                    self._cursor_manager.save_cursor(cursor)
+                    logger.info(f"Advanced cursor to tail (mid-run recovery): {cursor}")
 
             # Rebuilds from snapshot (no second read)
             if len(self._state_manager._stream_states) == 0:
@@ -1691,10 +1741,14 @@ class WatchdogAggregator:
         if to_process:
             logger.info(f"Rebuilt stream states from snapshot ({len(to_process)} events processed)")
 
-    def _rebuild_connection_status_from_snapshot(self, parsed_events: List[Dict]) -> None:
+    def _rebuild_connection_status_from_snapshot(
+        self, parsed_events: List[Dict], skip_session_metrics: bool = False
+    ) -> None:
         """Rebuild connection status from in-memory snapshot (no file read)."""
-        conn_types = ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED",
-                     "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION")
+        conn_types = (
+            "CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED",
+            "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION", "CONNECTION_CONFIRMED"
+        )
         latest_ev = None
         latest_ts = None
         for event in parsed_events:
@@ -1713,7 +1767,21 @@ class WatchdogAggregator:
                 latest_ev = event
                 latest_ts = ts
         if latest_ev:
-            self._event_processor.process_event(latest_ev)
+            if skip_session_metrics:
+                connection_status = "ConnectionLost" if "LOST" in latest_ev.get("event_type", "") else "Connected"
+                ts_str = latest_ev.get("timestamp_utc")
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        self._state_manager.update_connection_status(
+                            connection_status, ts, skip_session_metrics=True
+                        )
+                    except Exception:
+                        pass
+            else:
+                self._event_processor.process_event(latest_ev)
             logger.info(f"Rebuilt connection status from snapshot: {latest_ev.get('event_type')}")
     
     # Event types excluded from Live Event Feed (too verbose, backend/diagnostic only)

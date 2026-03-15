@@ -18,7 +18,16 @@ QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 import sys
 sys.path.insert(0, str(QTSW2_ROOT))
 from modules.watchdog.aggregator import WatchdogAggregator, _read_last_lines
+from modules.watchdog.incident_recorder import get_recent_incidents, get_incident_by_id, get_active_incidents
+from modules.watchdog.incident_correlator import CASCADE_UPSTREAM
+from modules.watchdog.reliability_metrics import get_reliability_metrics
+from modules.watchdog.metrics_history import (
+    aggregate_incidents_by_week,
+    aggregate_incidents_by_month,
+    get_metrics_history,
+)
 from modules.watchdog.config import (
+    FRONTEND_FEED_FILE,
     EXECUTION_JOURNALS_DIR,
     EXECUTION_SUMMARIES_DIR,
     ROBOT_JOURNAL_DIR,
@@ -230,6 +239,165 @@ async def get_open_journals(
         except Exception as e:
             logger.debug(f"Skip journal {journal_file.name}: {e}")
     return {"entries": entries, "count": len(entries)}
+
+
+@router.get("/incidents")
+async def get_incidents(
+    limit: int = Query(50, ge=1, le=200, description="Max incidents to return"),
+):
+    """Get recent incidents from incidents.jsonl (Phase 6)."""
+    try:
+        incidents = get_recent_incidents(limit=limit)
+        return {"incidents": incidents, "count": len(incidents)}
+    except Exception as e:
+        logger.error(f"Error getting incidents: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/incidents/active")
+async def get_active_incidents_endpoint():
+    """
+    Get currently active incidents (ongoing, not yet resolved).
+    Returns type, started time (Chicago), duration_sec, instruments.
+    """
+    try:
+        import pytz
+        chicago_tz = pytz.timezone("America/Chicago")
+        now = datetime.now(timezone.utc)
+        raw = get_active_incidents()
+        active = []
+        for incident_type, info in raw.items():
+            start_ts = info.get("start_ts")
+            if start_ts is None:
+                continue
+            if hasattr(start_ts, "total_seconds"):
+                duration_sec = int((now - start_ts).total_seconds())
+            else:
+                try:
+                    start_dt = datetime.fromisoformat(str(start_ts).replace("Z", "+00:00"))
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    duration_sec = int((now - start_dt).total_seconds())
+                except Exception:
+                    duration_sec = 0
+            started_chicago = start_ts.astimezone(chicago_tz).strftime("%H:%M:%S") if hasattr(start_ts, "astimezone") else str(start_ts)
+            active.append({
+                "type": incident_type,
+                "incident_id": info.get("incident_id"),
+                "started": started_chicago,
+                "started_iso": start_ts.isoformat() if hasattr(start_ts, "isoformat") else str(start_ts),
+                "duration_sec": duration_sec,
+                "instruments": sorted(info.get("instruments", [])),
+            })
+        return {"active": active, "count": len(active)}
+    except Exception as e:
+        logger.error(f"Error getting active incidents: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/metrics")
+async def get_metrics(
+    window_hours: float = Query(24, ge=0.25, le=168, description="Time window in hours"),
+):
+    """Get reliability metrics from incidents (Phase 6)."""
+    try:
+        metrics = get_reliability_metrics(window_hours=window_hours)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error getting metrics: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/metrics/history")
+async def get_metrics_history_endpoint(
+    granularity: str = Query("week", description="week or month"),
+    limit: int = Query(52, ge=1, le=104, description="Max records"),
+):
+    """Phase 8: Long-term reliability trends (by week or month)."""
+    try:
+        if granularity == "month":
+            data = aggregate_incidents_by_month()
+        else:
+            data = aggregate_incidents_by_week()
+        history = get_metrics_history(limit=limit)
+        return {
+            "by_period": data[-limit:] if data else [],
+            "stored_history": history,
+        }
+    except Exception as e:
+        logger.error(f"Error getting metrics history: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/instrument-health")
+async def get_instrument_health():
+    """Get per-instrument data status (OK / DATA STALLED / etc.) from aggregator status (Phase 6)."""
+    try:
+        aggregator = get_aggregator()
+        status = aggregator.get_watchdog_status()
+        data_stall = status.get("data_stall_detected") or {}
+        instruments: List[Dict] = []
+        for inst_key, info in data_stall.items():
+            stall_detected = info.get("stall_detected", False)
+            instruments.append({
+                "instrument": inst_key,
+                "status": "DATA_STALLED" if stall_detected else "OK",
+                "last_bar_chicago": info.get("last_bar_chicago"),
+                "elapsed_seconds": info.get("elapsed_seconds"),
+            })
+        return {"instruments": instruments, "count": len(instruments)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting instrument health: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/incidents/cascade")
+async def get_incident_cascade():
+    """Phase 7: Event correlation cascade map (CONNECTION_LOST -> DATA_STALL -> ENGINE_STALLED)."""
+    return {"cascade": {k: list(v) for k, v in CASCADE_UPSTREAM.items()}}
+
+
+@router.get("/incidents/{incident_id}/events")
+async def get_incident_events(incident_id: str):
+    """
+    Phase 7: Load events from frontend_feed in window [incident_start - 60s, incident_end + 60s].
+    For post-mortem debugging.
+    """
+    try:
+        incident = get_incident_by_id(incident_id)
+        if not incident:
+            raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+        start_str = incident.get("start_ts")
+        end_str = incident.get("end_ts")
+        if not start_str or not end_str:
+            raise HTTPException(status_code=400, detail="Incident missing start_ts or end_ts")
+        from datetime import timedelta
+        start_dt = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        window_start = start_dt - timedelta(seconds=60)
+        window_end = end_dt + timedelta(seconds=60)
+
+        from modules.watchdog.replay_helpers import load_incident_events
+        events = load_incident_events(window_start, window_end)
+        return {
+            "incident_id": incident_id,
+            "incident": incident,
+            "events": events,
+            "count": len(events),
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting incident events: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/ws-health")

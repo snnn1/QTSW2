@@ -40,15 +40,29 @@ public sealed class ScenarioMetrics
 public static class ExecutionScenarioRunner
 {
     /// <summary>
+    /// Run chaos scenarios only (real-world failure simulations). Aborts on first failure.
+    /// </summary>
+    public static (bool AllPassed, ScenarioMetrics Metrics, List<ScenarioResult> Results) RunChaos(
+        Action<string>? log = null)
+    {
+        return RunScenarios(ExecutionScenarioDefinitions.GetChaosScenarios(), log);
+    }
+
+    /// <summary>
     /// Run all scenarios in order. Aborts on first failure.
     /// </summary>
     public static (bool AllPassed, ScenarioMetrics Metrics, List<ScenarioResult> Results) RunAll(
         Action<string>? log = null)
     {
+        return RunScenarios(ExecutionScenarioDefinitions.GetAll(), log);
+    }
+
+    private static (bool AllPassed, ScenarioMetrics Metrics, List<ScenarioResult> Results) RunScenarios(
+        IReadOnlyList<ScenarioDefinition> scenarios,
+        Action<string>? log)
+    {
         var metrics = new ScenarioMetrics();
         var results = new List<ScenarioResult>();
-        var scenarios = ExecutionScenarioDefinitions.GetAll();
-
         var tempBase = Path.Combine(Path.GetTempPath(), "QTSW2_ExecutionScenarios_" + Guid.NewGuid().ToString("N").Substring(0, 8));
         try
         {

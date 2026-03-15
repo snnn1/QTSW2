@@ -27,7 +27,8 @@
   "entry_cutoff": {
     "type": "MARKET_CLOSE",
     "market_close_time": "16:00",
-    "rule": "If breakout occurs after market_close_time, treat as NoTrade (no entry)."
+    "market_reopen_time": "17:00",
+    "rule": "If breakout occurs after market_close_time, treat as NoTrade (no entry). Reentry after forced flatten at market_reopen_time."
   },
   "breakout": {
     "offset_ticks": 1,

@@ -24,6 +24,17 @@ ALERT_TYPE_LABELS = {
     "POTENTIAL_ORPHAN_POSITION": "Potential Orphan Position",
     "CONFIRMED_ORPHAN_POSITION": "Confirmed Orphan Position",
     "LOG_FILE_STALLED": "Log File Stalled",
+    # Phase 4: Incident-based alerts
+    "INCIDENT_CONNECTION_LOST": "Connection Lost (Incident)",
+    "INCIDENT_ENGINE_STALLED": "Engine Stalled (Incident)",
+    "INCIDENT_DATA_STALL": "Data Stall (Incident)",
+    "INCIDENT_FORCED_FLATTEN": "Forced Flatten (Incident)",
+    "INCIDENT_RECONCILIATION_QTY_MISMATCH": "Reconciliation Mismatch (Incident)",
+    "INCIDENT_FORCED_FLATTEN_FAILED": "Forced Flatten Failed (Incident)",
+    "INCIDENT_DUPLICATE_INSTANCE_DETECTED": "Duplicate Instance Detected (Incident)",
+    "INCIDENT_EXECUTION_POLICY_VALIDATION_FAILED": "Execution Policy Validation Failed (Incident)",
+    "INCIDENT_EXECUTION_JOURNAL_CORRUPTION": "Execution Journal Corruption (Incident)",
+    "INCIDENT_EXECUTION_JOURNAL_ERROR": "Execution Journal Error (Incident)",
 }
 
 # Severity tiers: critical, high, warning, info (enables sound/priority/escalation without redesign)
@@ -113,29 +124,7 @@ class NotificationService:
         if not self._enabled:
             return
 
-        # Dedupe: if already active, update last_seen and maybe resend
-        if self._ledger.is_alert_active(dedupe_key):
-            self._ledger.update_active_alert_last_seen(dedupe_key, context)
-            # Check resend interval
-            last = self._last_delivery_by_key.get(dedupe_key)
-            if last and (datetime.now(timezone.utc) - last).total_seconds() < min_resend_interval_seconds:
-                return
-            # Resend: put on queue (worker will send again)
-            alert = self._ledger.get_active_alert(dedupe_key)
-            if alert:
-                try:
-                    self._queue.put_nowait({
-                        "alert_id": alert.get("alert_id"),
-                        "alert_type": alert_type,
-                        "severity": severity,
-                        "context": context,
-                        "dedupe_key": dedupe_key,
-                        "first_seen_utc": alert.get("first_seen_utc"),
-                        "last_seen_utc": datetime.now(timezone.utc).isoformat(),
-                    })
-                except asyncio.QueueFull:
-                    logger.warning("Notification queue full, dropping resend")
-            return
+        # Deduplication disabled: every raise_alert() sends (fail-loud for live trading)
 
         # Rate limit: max alerts per hour
         rate_limits = self._config.get("rate_limits", {})

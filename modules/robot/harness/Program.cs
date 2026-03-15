@@ -44,6 +44,8 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test TERMINAL_INTENT: run terminal intent hardening tests (IsIntentCompleted, BE exclusion)
 // --test IEA_FLATTEN: run IEA flatten authority tests (exposure-reduction invariant)
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
+// --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
+// --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
@@ -112,6 +114,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: IEA alignment tests (forced flatten, slot expiry, reentry)" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("REENTRY_PROTECTION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReentryProtectionAcceptanceTests.RunReentryProtectionTests();
+        Console.WriteLine(pass ? "PASS: Reentry protection acceptance tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("REENTRY_TIMING", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReentryTimingTests.RunReentryTimingTests();
+        Console.WriteLine(pass ? "PASS: Reentry timing tests (holiday, early close, delayed open, fallback)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("INTENT_LIFECYCLE", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = IntentLifecycleTests.RunIntentLifecycleTests();
@@ -142,11 +156,65 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Execution event replay tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("CHAOS", StringComparison.OrdinalIgnoreCase))
+    {
+        RunChaosTests();
+        return;
+    }
+    else if (testName.Equals("RANDOM_STRESS", StringComparison.OrdinalIgnoreCase))
+    {
+        var durationIndex = argsList.IndexOf("--stress-duration");
+        var durationSec = (durationIndex >= 0 && durationIndex + 1 < argsList.Count && int.TryParse(argsList[durationIndex + 1], out var d))
+            ? d : 60;
+        var (pass, err) = RandomEventStressTests.RunRandomStressTests(durationSec);
+        Console.WriteLine(pass ? $"PASS: Random stress test ({durationSec}s)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("EXECUTION_SCENARIOS", StringComparison.OrdinalIgnoreCase))
     {
         RunExecutionScenarioTests();
         return;
     }
+}
+
+static void RunChaosTests()
+{
+    Console.WriteLine("=== Chaos Tests (Real-World Failure Simulation) ===");
+    Console.WriteLine("  Test B: Stop cancel recovery");
+    Console.WriteLine("  Test C: Protective recovery failure -> emergency flatten");
+    Console.WriteLine("  Test D: Persistent broker mismatch -> fail-closed");
+    Console.WriteLine("  Test E: Queue poison -> instrument frozen -> emergency flatten");
+    Console.WriteLine("  Test F: Session forced flatten near close");
+    Console.WriteLine();
+
+    var (allPassed, metrics, results) = ExecutionScenarioRunner.RunChaos(msg => Console.WriteLine(msg));
+
+    foreach (var r in results)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"Scenario: {r.ScenarioName}");
+        Console.WriteLine($"  Final lifecycle: {r.FinalLifecycle ?? "N/A"}");
+        Console.WriteLine($"  Replay exposure: {r.ReplayExposure}");
+        Console.WriteLine($"  Protective block: {r.ProtectiveBlock}");
+        Console.WriteLine($"  Mismatch fail-closed: {r.MismatchFailClosed}");
+        Console.WriteLine($"  RESULT: {(r.Pass ? "PASS" : "FAIL")}");
+        if (!r.Pass && !string.IsNullOrEmpty(r.Error))
+            Console.WriteLine($"  REPLAY_STATE_MISMATCH: {r.Error}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("=== Chaos Summary ===");
+    Console.WriteLine($"  chaos_pass_count: {metrics.ScenarioPassCount}");
+    Console.WriteLine($"  chaos_fail_count: {metrics.ScenarioFailCount}");
+    Console.WriteLine();
+
+    if (!allPassed)
+    {
+        Console.WriteLine("CHAOS TESTS FAILED");
+        Environment.Exit(1);
+    }
+    Console.WriteLine("ALL CHAOS TESTS PASSED");
+    Environment.Exit(0);
 }
 
 static void RunExecutionScenarioTests()

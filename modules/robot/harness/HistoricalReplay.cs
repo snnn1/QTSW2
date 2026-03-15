@@ -48,16 +48,20 @@ public static class HistoricalReplay
             // SessionCloseResolver parity: call SetSessionCloseResolved at trading day boundaries (source=HARNESS_CONFIG)
             var tradingDayStr = currentDate.ToString("yyyy-MM-dd");
             var marketCloseTime = spec.entry_cutoff?.market_close_time ?? "16:00";
+            var marketReopenTime = spec.entry_cutoff?.market_reopen_time ?? "17:00";
             var bufferSeconds = 300;
             var closeChicago = timeService.ConstructChicagoTime(currentDate, marketCloseTime);
             var flattenChicago = closeChicago.AddSeconds(-bufferSeconds);
             var flattenTriggerUtc = timeService.ConvertChicagoToUtc(flattenChicago);
             var resolvedCloseUtc = timeService.ConvertChicagoToUtc(closeChicago);
+            var reopenChicago = timeService.ConstructChicagoTime(currentDate, marketReopenTime);
+            var nextSessionBeginUtc = timeService.ConvertChicagoToUtc(reopenChicago);
             var sessionCloseResult = new SessionCloseResult
             {
                 HasSession = true,
                 FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = resolvedCloseUtc,
+                NextSessionBeginUtc = nextSessionBeginUtc,
                 BufferSeconds = bufferSeconds
             };
             engine.SetSessionCloseResolved(tradingDayStr, "S1", sessionCloseResult, "HARNESS_CONFIG");

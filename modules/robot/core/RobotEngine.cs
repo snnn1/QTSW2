@@ -2101,6 +2101,30 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
+    /// Get reentry-allowed UTC time for (tradingDay, sessionClass).
+    /// Returns (reentryUtc, hasSession). When hasSession=false, no reentry. When reentryUtc is null, caller should use spec fallback.
+    /// </summary>
+    public (DateTimeOffset? reentryUtc, bool hasSession) GetReentryAllowedUtc(string tradingDay, string sessionClass, DateTimeOffset utcNow)
+    {
+        var closeResult = GetSessionCloseResultOrFallback(tradingDay, sessionClass, utcNow, out _);
+        if (closeResult == null)
+            return (null, false);
+        if (!closeResult.HasSession)
+            return (null, false);
+        if (closeResult.NextSessionBeginUtc.HasValue)
+            return (closeResult.NextSessionBeginUtc.Value, true);
+        // Fallback: compute from spec market_reopen_time (same calendar day as market close)
+        if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
+        {
+            var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
+            var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
+            return (reopenUtc, true);
+        }
+        return (null, true);
+    }
+
+    /// <summary>
     /// Try get cached session close result for (tradingDay, sessionClass).
     /// </summary>
     public bool TryGetSessionCloseResult(string tradingDay, string sessionClass, out SessionCloseResult? result)
@@ -2182,11 +2206,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
             var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
             var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
+            var reopenStr = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec!.entry_cutoff!.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(tradingDate, reopenStr);
+            var nextSessionBeginUtc = _time.ConvertChicagoToUtc(reopenChicago);
             var fallback = new SessionCloseResult
             {
                 HasSession = true,
                 FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = sessionEndUtc,
+                NextSessionBeginUtc = nextSessionBeginUtc,
                 BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
                 BarsInstrument = _executionInstrument ?? "N/A"
             };

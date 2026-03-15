@@ -31,12 +31,12 @@ public static class ExecutionScenarioTests
     public static (bool Pass, string? Error) TestScenarioRunnerExecutes()
     {
         var scenarios = ExecutionScenarioDefinitions.GetAll();
-        if (scenarios.Count != 8)
-            return (false, $"Expected 8 scenarios, got {scenarios.Count}");
+        if (scenarios.Count != 9)
+            return (false, $"Expected 9 scenarios, got {scenarios.Count}");
 
         var (allPassed, metrics, results) = ExecutionScenarioRunner.RunAll(null);
-        if (results.Count != 8)
-            return (false, $"Expected 8 results, got {results.Count}");
+        if (results.Count != 9)
+            return (false, $"Expected 9 results, got {results.Count}");
         if (!allPassed)
             return (false, $"Scenarios failed: {results.First(r => !r.Pass).Error}");
         return (true, null);

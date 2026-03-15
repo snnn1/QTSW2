@@ -11,7 +11,12 @@ from typing import Dict, List, Optional
 from datetime import datetime, timezone
 import pytz
 
-from .config import FRONTEND_FEED_FILE, SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS
+from .config import (
+    DATA_EVENT_MAX_AGE_SECONDS,
+    FRONTEND_FEED_FILE,
+    SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS,
+)
+from .incident_recorder import process_event as incident_recorder_process_event
 from .state_manager import WatchdogStateManager
 from .timetable_poller import compute_timetable_trading_date
 
@@ -77,9 +82,22 @@ class EventProcessor:
         except Exception as e:
             logger.warning(f"Failed to parse timestamp {timestamp_str}: {e}")
             return None
+
+    def _should_accept_bar_event(self, bar_ts: datetime) -> bool:
+        """Return True if bar timestamp is recent enough (not stale from tail replay)."""
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+        bar_age = (datetime.now(timezone.utc) - bar_ts).total_seconds()
+        return bar_age <= DATA_EVENT_MAX_AGE_SECONDS
     
     def process_event(self, event: Dict):
         """Process a single event and update state manager."""
+        # Incident recorder: purely observational, never throws
+        try:
+            incident_recorder_process_event(event)
+        except Exception:
+            pass
+
         event_type = event.get("event_type", "")
         run_id = event.get("run_id", "")
         timestamp_utc_str = event.get("timestamp_utc", "")
@@ -133,7 +151,7 @@ class EventProcessor:
             
             if bar_time_utc_str:
                 bar_time_utc = self._parse_timestamp(bar_time_utc_str)
-                if bar_time_utc:
+                if bar_time_utc and self._should_accept_bar_event(bar_time_utc):
                     # Use execution_instrument_full_name if available, otherwise fall back to instrument
                     if execution_instrument_full_name:
                         self._state_manager.update_last_bar(execution_instrument_full_name, bar_time_utc)
@@ -146,6 +164,8 @@ class EventProcessor:
             # Bar events are data-flow only; stale bar events in tail must not resurrect engine_alive.
             # Track last bar time per execution instrument contract (authoritative)
             # CRITICAL: Use execution_instrument_full_name for bar tracking (e.g., "MES 03-26")
+            if not self._should_accept_bar_event(timestamp_utc):
+                return
             execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = event.get("instrument") or data.get("instrument")
             if execution_instrument_full_name:
@@ -946,6 +966,8 @@ class EventProcessor:
         elif event_type == "BAR_ACCEPTED":
             # Standardized fields are now always at top level (plan requirement #1)
             # Try multiple sources: data dict first (most reliable), then top-level event, then instrument fields
+            if not self._should_accept_bar_event(timestamp_utc):
+                return
             execution_instrument_full_name = (
                 data.get("execution_instrument_full_name") or 
                 event.get("execution_instrument_full_name") or
@@ -976,6 +998,8 @@ class EventProcessor:
         elif event_type == "BAR_RECEIVED_NO_STREAMS":
             # Track bar arrival even when no streams exist (for data stall detection)
             # This ensures watchdog can detect data stalls even before streams are created
+            if not self._should_accept_bar_event(timestamp_utc):
+                return
             # Try multiple sources: data dict first (most reliable), then top-level event, then instrument fields
             execution_instrument_full_name = (
                 data.get("execution_instrument_full_name") or 
@@ -1016,6 +1040,8 @@ class EventProcessor:
         
         elif event_type == "DATA_STALL_RECOVERED":
             # Use execution_instrument_full_name if available, otherwise fall back to instrument
+            if not self._should_accept_bar_event(timestamp_utc):
+                return
             execution_instrument_full_name = data.get("execution_instrument_full_name") or event.get("execution_instrument_full_name")
             instrument = event.get("instrument")
             if execution_instrument_full_name:

@@ -9,6 +9,7 @@ import type { StreamState } from '../types/watchdog'
 
 export function useStreamStates() {
   const [streams, setStreams] = useState<StreamState[]>([])
+  const [timetableUnavailable, setTimetableUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const hasLoadedRef = useRef(false)
@@ -35,6 +36,7 @@ export function useStreamStates() {
         }
         return newStreams
       })
+      setTimetableUnavailable(Boolean(data.timetable_unavailable))
       setError(null)
     }
     // Always mark as loaded to prevent infinite loading state
@@ -51,6 +53,7 @@ export function useStreamStates() {
   
   return {
     streams,
+    timetableUnavailable,
     loading,
     error,
     lastSuccessfulPollTimestamp

@@ -90,6 +90,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     public void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;
     private Action<string, string, object>? _onSupervisoryCriticalCallback;
     
+    /// <summary>Callback when reentry order fills. Engine invokes HandleReentryFill on matching stream.</summary>
+    private Action<string, DateTimeOffset>? _onReentryFillCallback;
+    
+    /// <summary>Callback when reentry protective bracket is accepted (both stop and target Working). Engine invokes HandleReentryProtectionAccepted on matching stream.</summary>
+    private Action<string, DateTimeOffset>? _onReentryProtectionAcceptedCallback;
+    
+    /// <summary>Reentry intents for which we have already invoked the protection-accepted callback (idempotency).</summary>
+    private readonly HashSet<string> _reentryProtectionAcceptedNotified = new(StringComparer.OrdinalIgnoreCase);
+    
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
     
@@ -450,13 +459,17 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<object?>? getNotificationServiceCallback,
         Func<bool>? isExecutionAllowedCallback = null,
         Action<string, DateTimeOffset, string>? blockInstrumentCallback = null,
-        Action<string, string, object>? onSupervisoryCriticalCallback = null)
+        Action<string, string, object>? onSupervisoryCriticalCallback = null,
+        Action<string, DateTimeOffset>? onReentryFillCallback = null,
+        Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
         _isExecutionAllowedCallback = isExecutionAllowedCallback;
         _blockInstrumentCallback = blockInstrumentCallback;
         _onSupervisoryCriticalCallback = onSupervisoryCriticalCallback;
+        _onReentryFillCallback = onReentryFillCallback;
+        _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
     }
     
     /// <summary>

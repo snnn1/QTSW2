@@ -62,6 +62,7 @@ public static class ExecutionScenarioDefinitions
     public const string SCENARIO_PERSISTENT_MISMATCH = "SCENARIO_PERSISTENT_MISMATCH";
     public const string SCENARIO_RESTART_RECONSTRUCTION = "SCENARIO_RESTART_RECONSTRUCTION";
     public const string SCENARIO_QUEUE_POISON_FLATTEN = "SCENARIO_QUEUE_POISON_FLATTEN";
+    public const string SCENARIO_SESSION_FORCED_FLATTEN = "SCENARIO_SESSION_FORCED_FLATTEN";
 
     public static IReadOnlyList<ScenarioDefinition> GetAll()
     {
@@ -74,7 +75,24 @@ public static class ExecutionScenarioDefinitions
             Scenario5_StopCancelFlatten(),
             Scenario6_PersistentMismatch(),
             Scenario7_RestartReconstruction(),
-            Scenario8_QueuePoisonFlatten()
+            Scenario8_QueuePoisonFlatten(),
+            Scenario9_SessionForcedFlatten()
+        };
+    }
+
+    /// <summary>
+    /// Chaos scenarios: real-world failure simulations (Tests B, C, D, E, F).
+    /// </summary>
+    public static IReadOnlyList<ScenarioDefinition> GetChaosScenarios()
+    {
+        var all = GetAll();
+        return new[]
+        {
+            all[3], // Scenario4: Stop cancel recovery (Test B)
+            all[4], // Scenario5: Stop cancel flatten (Test C)
+            all[5], // Scenario6: Persistent mismatch (Test D)
+            all[7], // Scenario8: Queue poison (Test E)
+            all[8]  // Scenario9: Session forced flatten (Test F)
         };
     }
 
@@ -325,6 +343,43 @@ public static class ExecutionScenarioDefinitions
                 Terminal = true,
                 OpenQuantity = 0,
                 InstrumentBlocked = true,
+                PositionFlattened = true,
+                IntentId = intentId
+            }
+        };
+    }
+
+    /// <summary>
+    /// Chaos Test F: Session forced flatten near close. Validates SESSION_FORCED_FLATTEN_TRIGGERED
+    /// → SESSION_FORCED_FLATTEN_SUBMITTED (path=immediate) → SESSION_FORCED_FLATTENED.
+    /// </summary>
+    private static ScenarioDefinition Scenario9_SessionForcedFlatten()
+    {
+        const string intentId = "intent-ff-1";
+        return new ScenarioDefinition
+        {
+            Name = SCENARIO_SESSION_FORCED_FLATTEN,
+            EventSteps = new List<EventStep>
+            {
+                new() { Type = ExecutionEventTypes.EXECUTION_OBSERVED, Instrument = "ES", IntentId = intentId, Quantity = 1, Side = "Long", Payload = new { filled_qty = 1m, side = "Long" } },
+                new() { Type = ExecutionEventTypes.LIFECYCLE_TRANSITIONED, Instrument = "ES", IntentId = intentId, LifecycleStateAfter = "WORKING" },
+                new() { Type = ExecutionEventTypes.ORDER_REGISTERED, Instrument = "ES", Payload = new { order_type = "Stop", order_type2 = "Target" } },
+                new() { Type = ExecutionEventTypes.SESSION_FORCED_FLATTEN_TRIGGERED, Instrument = "ES", Payload = new { path = "immediate", FlattenTriggerUtc = "2026-03-04T21:55:00Z" } },
+                new() { Type = ExecutionEventTypes.SESSION_FORCED_FLATTEN_SUBMITTED, Instrument = "ES", Payload = new { path = "immediate" } },
+                new() { Type = ExecutionEventTypes.EXECUTION_OBSERVED, Instrument = "ES", IntentId = intentId, Quantity = 1, Side = "Short", Payload = new { filled_qty = 1m, side = "Short" } },
+                new() { Type = ExecutionEventTypes.SESSION_FORCED_FLATTENED, Instrument = "ES", Payload = new { } },
+                new() { Type = ExecutionEventTypes.LIFECYCLE_TRANSITIONED, Instrument = "ES", IntentId = intentId, LifecycleStateAfter = "TERMINAL" },
+                new() { Type = ExecutionEventTypes.INTENT_TERMINALIZED, Instrument = "ES", IntentId = intentId }
+            },
+            ExpectedState = new ExpectedFinalState
+            {
+                LifecycleState = "TERMINAL",
+                BrokerExposure = 0,
+                ProtectiveBlock = false,
+                MismatchState = "NONE",
+                Terminal = true,
+                OpenQuantity = 0,
+                InstrumentBlocked = false,
                 PositionFlattened = true,
                 IntentId = intentId
             }

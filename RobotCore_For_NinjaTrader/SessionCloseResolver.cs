@@ -205,6 +205,7 @@ public static class SessionCloseResolver
         {
             var segments = new List<(DateTimeOffset BeginUtc, DateTimeOffset EndUtc)>();
             var sawTargetDay = false;
+            DateTimeOffset? nextSessionBeginUtc = null;
 
             var cursor = targetDate.Date.AddDays(-1).AddHours(18);
             var maxIterations = 200;
@@ -216,11 +217,17 @@ public static class SessionCloseResolver
                 var tradingDayExchange = si.ActualTradingDayExchange;
                 var tradingDayStr = tradingDayExchange.ToString("yyyy-MM-dd");
 
-                if (string.CompareOrdinal(tradingDayStr, targetTradingDay) > 0)
-                    break;
-
                 var begin = si.ActualSessionBegin;
                 var end = si.ActualSessionEnd;
+
+                if (string.CompareOrdinal(tradingDayStr, targetTradingDay) > 0)
+                {
+                    // First segment of next day = next session begin (market reopen for reentry)
+                    var beginOffset = new DateTimeOffset(begin, tz.GetUtcOffset(begin));
+                    nextSessionBeginUtc = beginOffset.ToUniversalTime();
+                    break;
+                }
+
                 if (tradingDayStr == targetTradingDay)
                 {
                     sawTargetDay = true;
@@ -268,6 +275,9 @@ public static class SessionCloseResolver
                 {
                     closeEndUtc = sorted[indexOfLargestGap].EndUtc;
                     largestGapMinutes = maxGap.TotalMinutes;
+                    // Next session begin = segment after the gap (for reentry time gate)
+                    if (!nextSessionBeginUtc.HasValue)
+                        nextSessionBeginUtc = sorted[indexOfLargestGap + 1].BeginUtc;
                 }
                 else
                 {
@@ -279,6 +289,7 @@ public static class SessionCloseResolver
             var flattenTriggerUtc = closeEndUtc.AddSeconds(-bufferSeconds);
             result.ResolvedSessionCloseUtc = closeEndUtc;
             result.FlattenTriggerUtc = flattenTriggerUtc;
+            result.NextSessionBeginUtc = nextSessionBeginUtc;
             result.HasSession = true;
 
             var closeEndChicago = TimeZoneInfo.ConvertTimeFromUtc(closeEndUtc.UtcDateTime, tz);

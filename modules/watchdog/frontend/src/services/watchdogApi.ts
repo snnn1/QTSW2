@@ -242,7 +242,7 @@ export async function fetchDailyJournal(tradingDate: string): Promise<ApiRespons
 /**
  * Fetch current stream states
  */
-export async function fetchStreamStates(): Promise<ApiResponse<{ timestamp_chicago: string; streams: StreamState[] }>> {
+export async function fetchStreamStates(): Promise<ApiResponse<{ timestamp_chicago: string; streams: StreamState[]; timetable_unavailable?: boolean }>> {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/stream-states`)
     if (!response.ok) {
@@ -363,6 +363,204 @@ export async function fetchWatchdogAlerts(
       } catch {
         /* ignore */
       }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Incident record from incidents.jsonl (Phase 6)
+ */
+export interface IncidentRecord {
+  incident_id?: string
+  type?: string
+  start_ts?: string
+  end_ts?: string
+  duration_sec?: number
+  instruments?: string[]
+}
+
+export interface IncidentsResponse {
+  incidents: IncidentRecord[]
+  count: number
+}
+
+/**
+ * Reliability metrics (Phase 6)
+ */
+export interface ReliabilityMetrics {
+  connection: {
+    disconnect_incidents: number
+    avg_disconnect_duration: number
+    max_disconnect_duration: number
+    uptime_percent: number
+  }
+  engine: {
+    engine_stalls: number
+    avg_stall_duration: number
+    max_stall_duration: number
+  }
+  data: {
+    data_stalls: number
+    avg_data_stall_duration: number
+  }
+  forced_flatten: { forced_flatten_count: number }
+  reconciliation: { reconciliation_mismatch_count: number }
+  window_hours: number
+  window_start?: string
+  window_end?: string
+}
+
+export interface InstrumentHealth {
+  instrument: string
+  status: 'OK' | 'DATA_STALLED'
+  last_bar_chicago?: string | null
+  elapsed_seconds?: number | null
+}
+
+export interface InstrumentHealthResponse {
+  instruments: InstrumentHealth[]
+  count: number
+}
+
+/**
+ * Active incident (ongoing, not yet resolved)
+ */
+export interface ActiveIncident {
+  type: string
+  incident_id?: string
+  started: string
+  started_iso?: string
+  duration_sec: number
+  instruments: string[]
+}
+
+export interface ActiveIncidentsResponse {
+  active: ActiveIncident[]
+  count: number
+}
+
+/**
+ * Fetch active incidents (ongoing)
+ */
+export async function fetchActiveIncidents(): Promise<ApiResponse<ActiveIncidentsResponse>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/incidents/active`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Fetch recent incidents (Phase 6)
+ */
+export async function fetchIncidents(limit = 50): Promise<ApiResponse<IncidentsResponse>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/incidents?limit=${limit}`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Fetch reliability metrics (Phase 6)
+ */
+export async function fetchReliabilityMetrics(windowHours = 24): Promise<ApiResponse<ReliabilityMetrics>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/metrics?window_hours=${windowHours}`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Phase 8: Metrics history (by week/month)
+ */
+export interface MetricsHistoryPeriod {
+  week_start?: string
+  month_start?: string
+  disconnect_incidents: number
+  engine_stalls: number
+  data_stalls: number
+  forced_flatten_count: number
+  reconciliation_mismatch_count: number
+  total_disconnect_duration_sec?: number
+}
+
+export interface MetricsHistoryResponse {
+  by_period: MetricsHistoryPeriod[]
+  stored_history: unknown[]
+}
+
+export async function fetchMetricsHistory(
+  granularity: 'week' | 'month' = 'week',
+  limit = 52
+): Promise<ApiResponse<MetricsHistoryResponse>> {
+  try {
+    const response = await fetchWithTimeout(
+      `${API_BASE}/metrics/history?granularity=${granularity}&limit=${limit}`
+    )
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Fetch instrument health (Phase 6)
+ */
+export async function fetchInstrumentHealth(): Promise<ApiResponse<InstrumentHealthResponse>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/instrument-health`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
       return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
     }
     const data = await response.json()

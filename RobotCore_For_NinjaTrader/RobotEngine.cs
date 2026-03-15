@@ -117,9 +117,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Run reconciliation once on Realtime transition (NT context ready).
     /// Closes orphaned journals when broker position is flat.
+    /// Skips when broker not connected (avoids meaningless RECONCILIATION_QTY_MISMATCH etc).
     /// </summary>
     public void RunReconciliationOnRealtimeStart()
     {
+        if (!IsBrokerConnected) return;
         _reconciliationRunner?.RunOnRealtimeStart(DateTimeOffset.UtcNow);
     }
 
@@ -173,10 +175,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>
     /// Run reconciliation periodically (throttled). Call from Tick.
+    /// Skips reconciliation when broker not connected (avoids meaningless mismatch warnings).
     /// </summary>
     public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
     {
         RunPendingForceReconcile(utcNow);
+        if (!IsBrokerConnected) return;
         _reconciliationRunner?.RunPeriodicThrottle(utcNow);
     }
 
@@ -316,6 +320,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _recoveryStartedUtc;
     private DateTimeOffset? _recoveryCompletedUtc;
     private ConnectionStatus _lastConnectionStatus = ConnectionStatus.Connected;
+
+    /// <summary>
+    /// True when broker connection is confirmed. Used to suppress reconciliation before connection is ready.
+    /// </summary>
+    private bool IsBrokerConnected => _lastConnectionStatus == ConnectionStatus.Connected;
     
     // Broker sync gate timestamps (for recovery synchronization)
     private DateTimeOffset? _lastOrderUpdateUtc;
@@ -1021,6 +1030,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
                     isExecutionAllowedCallback: () => IsExecutionAllowed(),
+                    onReentryFillCallback: (reentryIntentId, now) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentryFill(reentryIntentId, now);
+                    },
+                    onReentryProtectionAcceptedCallback: (reentryIntentId, now) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentryProtectionAccepted(now, reentryIntentId);
+                    },
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
                         _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.IEA_ENQUEUE_FAILURE, SupervisorySeverity.HIGH, new { reason }, now);
@@ -2399,6 +2418,30 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
+    /// Get reentry-allowed UTC time for (tradingDay, sessionClass).
+    /// Returns (reentryUtc, hasSession). When hasSession=false, no reentry. When reentryUtc is null, caller should use spec fallback.
+    /// </summary>
+    public (DateTimeOffset? reentryUtc, bool hasSession) GetReentryAllowedUtc(string tradingDay, string sessionClass, DateTimeOffset utcNow)
+    {
+        var closeResult = GetSessionCloseResultOrFallback(tradingDay, sessionClass, utcNow, out _);
+        if (closeResult == null)
+            return (null, false);
+        if (!closeResult.HasSession)
+            return (null, false);
+        if (closeResult.NextSessionBeginUtc.HasValue)
+            return (closeResult.NextSessionBeginUtc.Value, true);
+        // Fallback: compute from spec market_reopen_time (same calendar day as market close)
+        if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
+        {
+            var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
+            var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
+            return (reopenUtc, true);
+        }
+        return (null, true);
+    }
+
+    /// <summary>
     /// Try get cached session close result for (tradingDay, sessionClass).
     /// </summary>
     public bool TryGetSessionCloseResult(string tradingDay, string sessionClass, out SessionCloseResult? result)
@@ -2497,11 +2540,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
             var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
             var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
+            var reopenStr = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec!.entry_cutoff!.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(tradingDate, reopenStr);
+            var nextSessionBeginUtc = _time.ConvertChicagoToUtc(reopenChicago);
             var fallback = new SessionCloseResult
             {
                 HasSession = true,
                 FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = sessionEndUtc,
+                NextSessionBeginUtc = nextSessionBeginUtc,
                 BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
                 BarsInstrument = _executionInstrument ?? "N/A"
             };

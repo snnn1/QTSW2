@@ -19,11 +19,22 @@ ROBOT_LOG_READ_POSITIONS_FILE = QTSW2_ROOT / "data" / "robot_log_read_positions.
 
 # Phase 1: Alert ledger and notification config
 ALERT_LEDGER_PATH = QTSW2_ROOT / "data" / "watchdog" / "alert_ledger.jsonl"
+# Incident recorder: structured start/end events (CONNECTION_LOST, ENGINE_STALLED, etc.)
+INCIDENT_LOG_DIR = QTSW2_ROOT / "data" / "watchdog"
+INCIDENTS_FILE = INCIDENT_LOG_DIR / "incidents.jsonl"
+# Phase 9: Active incidents persistence (restart safety)
+ACTIVE_INCIDENTS_FILE = INCIDENT_LOG_DIR / "active_incidents.json"
+# Phase 8: Rolling metrics history (week/month aggregates)
+METRICS_HISTORY_FILE = INCIDENT_LOG_DIR / "metrics_history.jsonl"
+# Phase 9: Incident replay - read last N bytes from feed (avoids full-file scan)
+REPLAY_TAIL_BYTES = 20 * 1024 * 1024  # 20 MB
 # Status snapshot persistence for post-incident analysis (last 500 critical snapshots)
 STATUS_SNAPSHOTS_FILE = QTSW2_ROOT / "data" / "watchdog" / "status_snapshots.jsonl"
 STATUS_SNAPSHOTS_MAX_ENTRIES = 500
 NOTIFICATIONS_CONFIG_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.json"
 NOTIFICATIONS_SECRETS_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.secrets.json"
+# Phase 4: Incident-based alert rules, thresholds, cooldowns
+ALERTS_CONFIG_PATH = QTSW2_ROOT / "configs" / "watchdog" / "alerts.json"
 
 # Process monitor
 PROCESS_MONITOR_INTERVAL_SECONDS = 30
@@ -55,6 +66,8 @@ UNPROTECTED_TIMEOUT_SECONDS = 10
 # Set threshold to 120 seconds (2x rate limit) to avoid false positives from rate limiting
 # Increased from 90s to 120s to prevent flickering from temporary gaps
 DATA_STALL_THRESHOLD_SECONDS = 120  # Default, can be configurable per instrument
+# DATA_EVENT_MAX_AGE_SECONDS: Reject bar events older than this (prevents stale bars from tail causing false DATA FLOWING)
+DATA_EVENT_MAX_AGE_SECONDS = 120  # Align with DATA_STALL_THRESHOLD
 # RECOVERY_TIMEOUT_SECONDS: Maximum time recovery can be in RECOVERY_RUNNING state
 # If DISCONNECT_RECOVERY_COMPLETE event is not received within this time, auto-clear recovery state
 # Set to 10 minutes - recovery should complete quickly, but allow time for slow reconnections
@@ -69,6 +82,10 @@ ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS = 15
 # skip session metrics (disconnect count, downtime) if event is older than this. Prevents tail replay
 # from inflating "42 disconnects" when watchdog restarts. Status (_connection_status) still updated.
 SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS = 60
+
+# DISCONNECT_DEDUPE_WINDOW_SECONDS: Rapid connection flaps within this window count as one disconnect.
+# Prevents multiple CONNECTION_LOST events in quick succession from inflating session disconnect count.
+DISCONNECT_DEDUPE_WINDOW_SECONDS = 30
 
 # IDENTITY_EXPIRY_SECONDS: If no IDENTITY_INVARIANTS_STATUS event in this many seconds, treat identity as Unknown.
 IDENTITY_EXPIRY_SECONDS = 600  # 10 minutes
@@ -218,4 +235,15 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "RECONCILIATION_QTY_MISMATCH",  # Position drift (broker vs journal)
     "EXPOSURE_INTEGRITY_VIOLATION",  # Intent vs broker mismatch (critical invariant)
     "ORDER_LIFECYCLE_TRANSITION_INVALID",  # Invalid order state transition
+    # Forced flatten lifecycle (notification coverage fix)
+    "FORCED_FLATTEN_TRIGGERED",
+    "FORCED_FLATTEN_POSITION_CLOSED",
+    "SESSION_FORCED_FLATTENED",
+    "RECONCILIATION_PASS_SUMMARY",
+    "FORCED_FLATTEN_FAILED",
+    "FORCED_FLATTEN_EXPOSURE_REMAINING",
+    "REENTRY_FAILED",
+    "REENTRY_PROTECTION_FAILED",
+    "EXECUTION_JOURNAL_CORRUPTION",
+    "EXECUTION_JOURNAL_ERROR",
 }

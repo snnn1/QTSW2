@@ -1,0 +1,56 @@
+{
+  "enabled": true,
+  "rules": {
+    "CONNECTION_LOST": {
+      "min_duration_seconds": 60,
+      "severity": "critical",
+      "cooldown_seconds": 900
+    },
+    "ENGINE_STALLED": {
+      "min_duration_seconds": 30,
+      "severity": "critical",
+      "cooldown_seconds": 600
+    },
+    "DATA_STALL": {
+      "min_duration_seconds": 0,
+      "during_market_hours_only": true,
+      "severity": "high",
+      "cooldown_seconds": 600
+    },
+    "FORCED_FLATTEN": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 300
+    },
+    "RECONCILIATION_QTY_MISMATCH": {
+      "min_duration_seconds": 60,
+      "severity": "high",
+      "cooldown_seconds": 900
+    },
+    "FORCED_FLATTEN_FAILED": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "DUPLICATE_INSTANCE_DETECTED": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "EXECUTION_POLICY_VALIDATION_FAILED": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "EXECUTION_JOURNAL_CORRUPTION": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "EXECUTION_JOURNAL_ERROR": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    }
+  }
+}

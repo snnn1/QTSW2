@@ -86,6 +86,14 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
             return (false, $"NullExecutionAdapter.EnqueueExecutionCommand threw: {ex.Message}");
         }
 
+        // 5b. CapturingExecutionAdapter records SubmitMarketReentryCommand when enqueued
+        var capturingAdapter = new CapturingExecutionAdapter(log);
+        capturingAdapter.EnqueueExecutionCommand(reentryCmd);
+        if (!capturingAdapter.TryGetLastCommand<SubmitMarketReentryCommand>(out var capturedReentry))
+            return (false, "CapturingExecutionAdapter did not record SubmitMarketReentryCommand");
+        if (capturedReentry.ReentryIntentId != "slot1_REENTRY" || capturedReentry.Direction != "Short" || capturedReentry.Quantity != 2)
+            return (false, "CapturingExecutionAdapter recorded incorrect SubmitMarketReentryCommand fields");
+
         // 6. RequestSessionCloseFlattenImmediate: NullExecutionAdapter returns success (same-cycle path)
         var immediateResult = nullAdapter.RequestSessionCloseFlattenImmediate("intent-1", "MES", utcNow);
         if (immediateResult == null || !immediateResult.Success)
@@ -105,4 +113,62 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
 
         return (true, null);
     }
+}
+
+/// <summary>
+/// Test adapter that records EnqueueExecutionCommand calls for verification.
+/// </summary>
+internal sealed class CapturingExecutionAdapter : IExecutionAdapter
+{
+    private readonly RobotLogger _log;
+    private readonly List<ExecutionCommandBase> _commands = new();
+    private readonly object _lock = new();
+
+    public CapturingExecutionAdapter(RobotLogger log)
+    {
+        _log = log;
+    }
+
+    public bool TryGetLastCommand<T>(out T? cmd) where T : ExecutionCommandBase
+    {
+        lock (_lock)
+        {
+            for (var i = _commands.Count - 1; i >= 0; i--)
+            {
+                if (_commands[i] is T t)
+                {
+                    cmd = t;
+                    return true;
+                }
+            }
+        }
+        cmd = null;
+        return false;
+    }
+
+    public void EnqueueExecutionCommand(ExecutionCommandBase command)
+    {
+        lock (_lock)
+        {
+            _commands.Add(command);
+        }
+    }
+
+    public OrderSubmissionResult SubmitEntryOrder(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, DateTimeOffset utcNow)
+        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    public OrderSubmissionResult SubmitStopEntryOrder(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    public OrderSubmissionResult SubmitProtectiveStop(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    public OrderSubmissionResult SubmitTargetOrder(string intentId, string instrument, string direction, decimal targetPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    public OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow)
+        => OrderModificationResult.SuccessResult(utcNow);
+    public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)
+        => FlattenResult.SuccessResult(utcNow);
+    public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
+        => new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
+    public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow) { }
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+        => FlattenResult.SuccessResult(utcNow);
 }

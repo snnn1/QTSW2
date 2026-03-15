@@ -17,6 +17,9 @@ public sealed class SessionCloseResult
     /// <summary>Resolved session close time in UTC.</summary>
     public DateTimeOffset? ResolvedSessionCloseUtc { get; set; }
 
+    /// <summary>Next session begin time in UTC (market reopen). Used for reentry time gate.</summary>
+    public DateTimeOffset? NextSessionBeginUtc { get; set; }
+
     /// <summary>Buffer seconds before close (e.g., 300).</summary>
     public int BufferSeconds { get; set; }
 

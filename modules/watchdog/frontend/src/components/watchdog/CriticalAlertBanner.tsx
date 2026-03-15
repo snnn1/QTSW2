@@ -32,7 +32,7 @@ export function CriticalAlertBanner({ alerts }: CriticalAlertBannerProps) {
         <div
           key={index}
           onClick={() => handleClick(alert.scrollTo)}
-          className={`w-full py-3 px-4 cursor-pointer ${
+          className={`w-full py-1 px-2 cursor-pointer text-xs ${
             alert.type === 'critical'
               ? 'bg-red-600 text-white pulse-subtle'
               : 'bg-amber-500 text-black'

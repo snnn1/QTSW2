@@ -144,10 +144,10 @@ export function WatchdogHeader({
   }
   
   return (
-    <header className="fixed top-10 left-0 right-0 h-16 bg-gray-900 border-b border-gray-700 z-40 flex items-center px-6">
+    <header className="fixed top-6 left-0 right-0 h-10 bg-gray-900 border-b border-gray-700 z-40 flex items-center px-3">
       {/* Left */}
       <div className="flex items-center gap-4 flex-1">
-        <h1 className="text-xl font-bold">QTSW2 Execution Watchdog</h1>
+        <h1 className="text-base font-bold">QTSW2 Execution Watchdog</h1>
         {runId && <CopyableText text={runId} />}
       </div>
       

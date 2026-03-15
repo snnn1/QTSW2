@@ -79,6 +79,9 @@ public sealed class EntryCutoff
 
     public string market_close_time { get; set; } = "";
 
+    /// <summary>Market reopen time (Chicago) for reentry after forced flatten. Default 17:00.</summary>
+    public string market_reopen_time { get; set; } = "17:00";
+
     public string? rule { get; set; }
 
     public void ValidateOrThrow()

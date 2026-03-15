@@ -71,6 +71,8 @@ public static class ExecutionEventTypes
     public const string INTENT_TERMINALIZED = "INTENT_TERMINALIZED";
     public const string POSITION_FLATTENED = "POSITION_FLATTENED";
     public const string SESSION_FORCED_FLATTENED = "SESSION_FORCED_FLATTENED";
+    public const string SESSION_FORCED_FLATTEN_TRIGGERED = "SESSION_FORCED_FLATTEN_TRIGGERED";
+    public const string SESSION_FORCED_FLATTEN_SUBMITTED = "SESSION_FORCED_FLATTEN_SUBMITTED";
 }
 
 /// <summary>

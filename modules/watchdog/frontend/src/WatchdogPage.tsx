@@ -14,6 +14,11 @@ import { SessionConnectivityCard } from './components/watchdog/SessionConnectivi
 import { DisconnectFeedCard } from './components/watchdog/DisconnectFeedCard'
 import { AlertsHistoryCard } from './components/watchdog/AlertsHistoryCard'
 import { LiveEventFeed } from './components/watchdog/LiveEventFeed'
+import { IncidentTimeline } from './components/watchdog/IncidentTimeline'
+import { ActiveIncidentsPanel } from './components/watchdog/ActiveIncidentsPanel'
+import { ReliabilityPanel } from './components/watchdog/ReliabilityPanel'
+import { InstrumentHealthPanel } from './components/watchdog/InstrumentHealthPanel'
+import { MetricsHistoryPanel } from './components/watchdog/MetricsHistoryPanel'
 import { StreamDetailDrawer } from './components/watchdog/StreamDetailDrawer'
 import { useWatchdogStatus } from './hooks/useWatchdogStatus'
 import { useWatchdogEvents } from './hooks/useWatchdogEvents'
@@ -22,6 +27,11 @@ import { useUnprotectedPositions } from './hooks/useUnprotectedPositions'
 import { useStreamStates } from './hooks/useStreamStates'
 import { useActiveIntents } from './hooks/useActiveIntents'
 import { useWatchdogAlerts } from './hooks/useWatchdogAlerts'
+import { useIncidents } from './hooks/useIncidents'
+import { useActiveIncidents } from './hooks/useActiveIncidents'
+import { useReliabilityMetrics } from './hooks/useReliabilityMetrics'
+import { useInstrumentHealth } from './hooks/useInstrumentHealth'
+import { useMetricsHistory } from './hooks/useMetricsHistory'
 import { useStreamPnl } from './hooks/useStreamPnl'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
 import { ChicagoClock } from './components/watchdog/ChicagoClock'
@@ -36,9 +46,14 @@ export function WatchdogPage() {
   const { events, cursor, loading: eventsLoading, error: eventsError, lastSuccessfulPollTimestamp: eventsPollTime } = useWatchdogEvents()
   const { gates, loading: gatesLoading, error: gatesError, lastSuccessfulPollTimestamp: gatesPollTime } = useRiskGates()
   const { positions: unprotectedPositions, loading: positionsLoading, error: positionsError, lastSuccessfulPollTimestamp: positionsPollTime } = useUnprotectedPositions()
-  const { streams, loading: streamsLoading, error: streamsError, lastSuccessfulPollTimestamp: streamsPollTime } = useStreamStates()
+  const { streams, timetableUnavailable, loading: streamsLoading, error: streamsError, lastSuccessfulPollTimestamp: streamsPollTime } = useStreamStates()
   const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents()
   const { recentAlerts, loading: alertsHistoryLoading } = useWatchdogAlerts(24, 30)
+  const { incidents, loading: incidentsLoading } = useIncidents(50)
+  const { active: activeIncidents, loading: activeIncidentsLoading } = useActiveIncidents()
+  const { metrics, loading: metricsLoading } = useReliabilityMetrics(24)
+  const { instruments: instrumentHealth, loading: instrumentHealthLoading } = useInstrumentHealth()
+  const { byPeriod: metricsHistory, loading: metricsHistoryLoading } = useMetricsHistory('week', 12)
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
@@ -201,7 +216,7 @@ export function WatchdogPage() {
     if (unprotectedPositions.length > 0) {
       result.push({
         type: 'critical',
-        message: `UNPROTECTED POSITION: ${unprotectedPositions.length} intent(s) without protective orders`,
+        message: `UNPROTECTED: ${unprotectedPositions.length}`,
         scrollTo: 'active-intent-panel'
       })
     }
@@ -257,8 +272,16 @@ export function WatchdogPage() {
       })
     }
     
+    if (timetableUnavailable) {
+      result.push({
+        type: 'degraded',
+        message: 'Timetable unavailable (using fallback)',
+        scrollTo: 'stream-table'
+      })
+    }
+    
     return result
-  }, [status, unprotectedPositions])
+  }, [status, unprotectedPositions, timetableUnavailable])
   
   return (
     <div className="min-h-screen bg-black text-white">
@@ -284,7 +307,7 @@ export function WatchdogPage() {
       
       {/* Error Display */}
       {hasErrors && (
-        <div className="container mx-auto px-4 py-4 mt-28">
+        <div className="container mx-auto px-4 py-4 mt-16">
           <div className="bg-red-900 border border-red-700 rounded-lg p-4">
             <h2 className="text-lg font-semibold mb-2">API Errors</h2>
             <div className="space-y-1 text-sm">
@@ -304,7 +327,7 @@ export function WatchdogPage() {
       
       {/* Loading State */}
       {isLoading && !hasErrors && (
-        <div className="container mx-auto px-4 py-8 mt-24">
+        <div className="container mx-auto px-4 py-8 mt-16">
           <div className="text-center text-gray-400">
             <div className="text-lg mb-2">Loading watchdog data...</div>
             <div className="text-sm">Connecting to backend...</div>
@@ -312,7 +335,7 @@ export function WatchdogPage() {
         </div>
       )}
       
-      <div className="container mx-auto px-4 py-8 mt-24">
+      <div className="container mx-auto px-4 pt-0 pb-8 mt-16">
         <div className="grid grid-cols-10 gap-4">
           {/* Left Column (70%) */}
           <div className="col-span-7 space-y-4">
@@ -360,6 +383,21 @@ export function WatchdogPage() {
 
             {/* Phase 1: Alert history (24h) */}
             <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
+
+            {/* Active incidents (ongoing) */}
+            <ActiveIncidentsPanel active={activeIncidents} loading={activeIncidentsLoading} />
+
+            {/* Phase 6: Incident timeline (historical) */}
+            <IncidentTimeline incidents={incidents} loading={incidentsLoading} />
+
+            {/* Phase 6: System reliability */}
+            <ReliabilityPanel metrics={metrics} loading={metricsLoading} />
+
+            {/* Phase 6: Instrument health */}
+            <InstrumentHealthPanel instruments={instrumentHealth} loading={instrumentHealthLoading} />
+
+            {/* Phase 8: Reliability trends */}
+            <MetricsHistoryPanel byPeriod={metricsHistory} loading={metricsHistoryLoading} granularity="week" />
 
             {/* Execution Integrity - anomaly counts */}
             <ExecutionIntegrityPanel counts={status?.execution_integrity ?? null} />

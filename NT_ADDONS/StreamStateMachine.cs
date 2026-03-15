@@ -79,6 +79,8 @@ public sealed class StreamStateMachine
     // CRITICAL: These are DateTimeOffset values in Chicago timezone, not strings
     private DateTimeOffset RangeStartChicagoTime { get; set; }
     private DateTimeOffset SlotTimeChicagoTime { get; set; }
+    /// <summary>Market reopen (same calendar day as market close). Used for reentry time gate.</summary>
+    private DateTimeOffset MarketReopenChicagoTime { get; set; }
 
     private readonly TimeService _time;
     private readonly ParitySpec _spec;
@@ -5389,6 +5391,8 @@ public sealed class StreamStateMachine
         RangeStartChicagoTime = time.ConstructChicagoTime(tradingDate, rangeStartChicago);
         SlotTimeChicagoTime = time.ConstructChicagoTime(tradingDate, SlotTimeChicago);
         var marketCloseChicagoTime = time.ConstructChicagoTime(tradingDate, spec.entry_cutoff.market_close_time);
+        var marketReopenTimeStr = string.IsNullOrWhiteSpace(spec.entry_cutoff.market_reopen_time) ? "17:00" : spec.entry_cutoff.market_reopen_time;
+        MarketReopenChicagoTime = time.ConstructChicagoTime(DateOnly.FromDateTime(marketCloseChicagoTime.Date), marketReopenTimeStr);
         
         // DIAGNOSTIC: Log RangeStartChicagoTime initialization
         // This proves initialization happens and tells you when and from what it is derived
@@ -5610,6 +5614,10 @@ public sealed class StreamStateMachine
         {
             return; // Already committed or not active
         }
+        if (_journal.ExecutionInterruptedByClose)
+        {
+            return; // Already flattened this session — avoid redundant Flatten() every Tick
+        }
         
         // Guard: Verify post-entry condition
         var isPostEntry = false;
@@ -5818,11 +5826,28 @@ public sealed class StreamStateMachine
             return; // Conditions not met for re-entry
         }
         
-        // Time gate: now >= session_open_time (use RangeStartChicagoTime as proxy for session open)
-        var nowChicago = _time.ConvertUtcToChicago(utcNow);
-        if (nowChicago < RangeStartChicagoTime)
+        // Time gate: utcNow >= ReentryAllowedUtc (from SessionCloseResolver or spec fallback).
+        // No reentry when HasSession=false (holiday).
+        if (_engine != null)
         {
-            return; // Before session open
+            var (reentryUtc, hasSession) = _engine.GetReentryAllowedUtc(TradingDate, Session, utcNow);
+            if (!hasSession)
+                return; // Holiday - no session, no reentry
+            if (reentryUtc.HasValue && utcNow < reentryUtc.Value)
+                return; // Before market reopen
+            if (!reentryUtc.HasValue)
+            {
+                var nowChicago = _time.ConvertUtcToChicago(utcNow);
+                if (nowChicago < MarketReopenChicagoTime)
+                    return;
+            }
+        }
+        else
+        {
+            // No engine (e.g. harness) - use spec fallback
+            var nowChicago = _time.ConvertUtcToChicago(utcNow);
+            if (nowChicago < MarketReopenChicagoTime)
+                return;
         }
         
         // Market tradeable signal: At least one tick/price observed since reopen

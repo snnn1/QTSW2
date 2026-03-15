@@ -1863,6 +1863,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
+    /// Get reentry-allowed UTC time for (tradingDay, sessionClass).
+    /// NT_ADDONS uses spec fallback only (no SessionCloseResolver). Returns (reentryUtc, hasSession).
+    /// </summary>
+    public (DateTimeOffset? reentryUtc, bool hasSession) GetReentryAllowedUtc(string tradingDay, string sessionClass, DateTimeOffset utcNow)
+    {
+        if (_spec == null || _time == null || !DateOnly.TryParse(tradingDay, out var td))
+            return (null, true); // Fallback: caller uses MarketReopenChicagoTime
+        var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+        var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
+        var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
+        return (reopenUtc, true);
+    }
+
+    /// <summary>
     /// Get session start time for an instrument, with fallback to default.
     /// </summary>
     /// <param name="instrument">Instrument name</param>

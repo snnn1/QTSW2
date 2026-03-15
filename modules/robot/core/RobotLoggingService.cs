@@ -364,6 +364,12 @@ public sealed class RobotLoggingService : IDisposable
             evt.data = SensitiveDataFilter.FilterDictionary(evt.data);
         }
 
+        // Engine-level event deduplication: log once per engine state change, not once per instrument
+        var eventType = evt.@event ?? "";
+        var reason = evt.data != null && evt.data.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() : null;
+        if (!EngineLogDedupe.ShouldLog(eventType, reason))
+            return;
+
         // Backpressure: if queue exceeds max size, drop DEBUG first, then INFO
         if (_queue.Count >= MAX_QUEUE_SIZE)
         {
