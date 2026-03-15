@@ -71,8 +71,9 @@ export function useWatchdogEvents() {
         setCursor(prev => ({ ...prev, runId: data.run_id }))
       }
       
-      // Deduplicate new events
-      const deduplicated = deduplicateEvents(data.events)
+      // Deduplicate new events (guard against missing or invalid events array)
+      const rawEvents = Array.isArray(data.events) ? data.events : []
+      const deduplicated = deduplicateEvents(rawEvents)
       
       // Filter repetitive events (gate violations, etc.) to reduce noise
       const filtered = filterRepetitiveEvents(deduplicated, 60000) // 60 second window
@@ -91,25 +92,17 @@ export function useWatchdogEvents() {
         // Add new events and keep only last MAX_EVENTS
         // Use functional update to ensure we're working with latest state
         setEvents(prev => {
-          // Quick check: if no previous events and we have new ones, just return sorted new events
-          if (prev.length === 0) {
-            const sorted = sortEventsByTimestamp(unseenEvents)
-            return sorted.slice(-MAX_EVENTS)
+          try {
+            const combined = [...prev, ...unseenEvents]
+            const filtered = filterRepetitiveEvents(combined, 60000)
+            const sorted = sortEventsByTimestamp(filtered)
+            const result = sorted.slice(-MAX_EVENTS)
+            if (result.length === 0 && prev.length > 0) return prev
+            return result
+          } catch (e) {
+            console.error('[useWatchdogEvents] merge error:', e)
+            return prev
           }
-          
-          // Check if we're just appending (new events have timestamps after last)
-          const prevLastTs = prev.length > 0 ? (prev[prev.length - 1].timestamp_utc || prev[prev.length - 1].timestamp_chicago || '') : ''
-          const newFirstTs = unseenEvents[0]?.timestamp_utc || unseenEvents[0]?.timestamp_chicago || ''
-          
-          // If new events come after the last event (by timestamp) and we have room, just append
-          if (newFirstTs > prevLastTs && prev.length + unseenEvents.length <= MAX_EVENTS) {
-            return [...prev, ...unseenEvents]
-          }
-          
-          // Otherwise, combine and sort by timestamp
-          const combined = [...prev, ...unseenEvents]
-          const sorted = sortEventsByTimestamp(combined)
-          return sorted.slice(-MAX_EVENTS)
         })
         
         // Update cursor
@@ -142,14 +135,22 @@ export function useWatchdogEvents() {
     if (!wsSubscribe) return
     const unsub = wsSubscribe((wsEvent: { type?: string; seq?: number; event_id?: string; event_seq?: number; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }) => {
       if (wsEvent.type === 'heartbeat') return
-      const key = wsEvent.event_id ?? `ws:${wsEvent.run_id}:${wsEvent.seq}`
+      const key = wsEvent.event_id ?? `${wsEvent.run_id ?? ''}:${wsEvent.event_seq ?? wsEvent.seq ?? 0}`
       if (processedEventsRef.current.has(key)) return
       processedEventsRef.current.add(key)
       const ev = wsEventToWatchdogEvent(wsEvent)
       setEvents((prev) => {
-        const combined = [...prev, ev]
-        const sorted = sortEventsByTimestamp(combined)
-        return sorted.slice(-MAX_EVENTS)
+        try {
+          const combined = [...prev, ev]
+          const filtered = filterRepetitiveEvents(combined, 60000)
+          const sorted = sortEventsByTimestamp(filtered)
+          const result = sorted.slice(-MAX_EVENTS)
+          if (result.length === 0 && prev.length > 0) return prev
+          return result
+        } catch (e) {
+          console.error('[useWatchdogEvents] WS merge error:', e)
+          return prev
+        }
       })
     })
     return unsub

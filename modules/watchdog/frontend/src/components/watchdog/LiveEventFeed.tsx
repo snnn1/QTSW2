@@ -3,7 +3,7 @@
  * Scrollable list of last ~200 events, sorted by event_seq ASC
  */
 import { memo, useRef, useEffect, useMemo } from 'react'
-import { formatChicagoDateTime } from '../../utils/timeUtils.ts'
+import { formatChicagoDateTime, formatEventTimestamp } from '../../utils/timeUtils.ts'
 import { getEventLevel, extractEventMessage } from '../../utils/eventUtils'
 import type { WatchdogEvent } from '../../types/watchdog'
 
@@ -103,15 +103,20 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
               const level = getEventLevel(event.event_type)
               const message = extractEventMessage(event)
               const repetitiveCount = (event.data as any)?._repetitive_count
+              const firstTs = (event.data as any)?._repetitive_first_timestamp
+              const lastTs = (event.data as any)?._repetitive_last_timestamp
+              const isCollapsed = repetitiveCount != null && repetitiveCount > 1
               
               return (
                 <tr
                   key={`${event.run_id}:${event.event_seq}`}
                   onClick={() => onEventClick(event)}
-                  className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
+                  className="border-b border-gray-700 hover:bg-gray-700 cursor-pointer"
                 >
                   <td className="px-2 py-1 font-mono text-xs">
-                    {formatChicagoDateTime(event.timestamp_chicago)}
+                    {isCollapsed && firstTs
+                      ? `${formatEventTimestamp(firstTs)} – ${formatEventTimestamp(lastTs)}`
+                      : formatChicagoDateTime(event.timestamp_chicago)}
                   </td>
                   <td className="px-2 py-1">
                     <span className={`px-1 py-0.5 rounded text-xs ${getLevelBadgeColor(level)}`}>
@@ -121,13 +126,29 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
                   <td className="px-2 py-1 font-mono text-xs">
                     {event.stream || 'ENGINE'}
                   </td>
-                  <td className="px-2 py-1 text-xs">{event.event_type}</td>
-                  <td className="px-2 py-1 text-xs truncate max-w-xs" title={message}>
-                    {message}
-                    {repetitiveCount && repetitiveCount > 1 && (
-                      <span className="ml-2 text-amber-400 font-semibold">
-                        (×{repetitiveCount})
+                  <td className="px-2 py-1 text-xs">
+                    {event.event_type}
+                    {isCollapsed && (
+                      <span className="ml-1.5 text-amber-400 font-semibold" title={`${repetitiveCount} events collapsed`}>
+                        [×{repetitiveCount}]
                       </span>
+                    )}
+                  </td>
+                  <td className="px-2 py-1 text-xs max-w-xs" title={isCollapsed ? `count: ${repetitiveCount}, first: ${firstTs ? formatEventTimestamp(firstTs) : ''}, last: ${lastTs ? formatEventTimestamp(lastTs) : ''}` : message}>
+                    {isCollapsed ? (
+                      <span className="block">
+                        <span className="text-gray-300">{message}</span>
+                        <span className="block mt-1 text-amber-400 font-medium">
+                          count: {repetitiveCount}
+                          {firstTs && lastTs && (
+                            <span className="block text-xs font-normal text-gray-400">
+                              first: {formatEventTimestamp(firstTs)} · last: {formatEventTimestamp(lastTs)}
+                            </span>
+                          )}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="truncate block">{message}</span>
                     )}
                   </td>
                 </tr>
@@ -166,11 +187,12 @@ function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedP
     return false
   }
   
-  // Events are equal if the last event has the same run_id, event_seq, and timestamp
+  // Events are equal if the last event has the same run_id, event_seq, timestamp, and repetitive count
   return (
     prevLast.run_id === nextLast.run_id &&
     prevLast.event_seq === nextLast.event_seq &&
-    (prevLast.timestamp_chicago || prevLast.timestamp_utc) === (nextLast.timestamp_chicago || nextLast.timestamp_utc)
+    (prevLast.timestamp_chicago || prevLast.timestamp_utc) === (nextLast.timestamp_chicago || nextLast.timestamp_utc) &&
+    (prevLast.data as any)?._repetitive_count === (nextLast.data as any)?._repetitive_count
   )
 }
 

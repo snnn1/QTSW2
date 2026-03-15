@@ -148,7 +148,7 @@ export function StreamStatusTable({ streams, onStreamClick, marketOpen }: Stream
                 <tr
                   key={`${stream.trading_date}_${stream.stream}`}
                   onClick={() => onStreamClick(stream)}
-                  className="border-b border-gray-700 hover:bg-gray-750 cursor-pointer"
+                  className="border-b border-gray-700 hover:bg-gray-700 cursor-pointer"
                 >
                   <td className="px-2 py-1 whitespace-nowrap min-w-[5rem]" title={stream.trading_date || undefined}>
                     <span className={isCarryOver ? 'text-amber-400 font-medium' : 'text-gray-300'}>
