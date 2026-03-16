@@ -19,6 +19,7 @@ import sys
 sys.path.insert(0, str(QTSW2_ROOT))
 from modules.watchdog.aggregator import WatchdogAggregator, _read_last_lines
 from modules.watchdog.incident_recorder import get_recent_incidents, get_incident_by_id, get_active_incidents
+from modules.watchdog.slot_lifecycle_builder import build_slot_lifecycle
 from modules.watchdog.incident_correlator import CASCADE_UPSTREAM
 from modules.watchdog.reliability_metrics import get_reliability_metrics
 from modules.watchdog.metrics_history import (
@@ -292,6 +293,24 @@ async def get_active_incidents_endpoint():
         return {"active": active, "count": len(active)}
     except Exception as e:
         logger.error(f"Error getting active incidents: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/slot-lifecycle")
+async def get_slot_lifecycle():
+    """
+    Get slot lifecycle state (forced flatten, reentry, slot expiry) per stream.
+    Computed in-memory from event feed. No persistence.
+    """
+    try:
+        aggregator = get_aggregator()
+        events = aggregator.get_events_for_slot_lifecycle(500)
+        slots = build_slot_lifecycle(events)
+        return slots
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting slot lifecycle: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

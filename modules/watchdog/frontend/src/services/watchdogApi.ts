@@ -444,6 +444,40 @@ export interface ActiveIncidentsResponse {
   count: number
 }
 
+export interface SlotLifecycleSlot {
+  stream: string
+  instrument: string
+  slot_time: string
+  trading_date: string
+  flatten_triggered_time: string | null
+  flatten_completed_time: string | null
+  reentry_submitted_time: string | null
+  reentry_filled_time: string | null
+  slot_expiry_time: string | null
+  status: 'ACTIVE' | 'FLATTENED' | 'REENTERED' | 'EXPIRED' | 'BLOCKED' | 'ERROR'
+}
+
+/**
+ * Fetch slot lifecycle (forced flatten, reentry, slot expiry per stream)
+ */
+export async function fetchSlotLifecycle(): Promise<ApiResponse<SlotLifecycleSlot[]>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/slot-lifecycle`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch { /* ignore */ }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
 /**
  * Fetch active incidents (ongoing)
  */

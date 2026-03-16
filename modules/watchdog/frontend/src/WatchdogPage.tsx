@@ -12,6 +12,7 @@ import { ExecutionIntegrityPanel } from './components/watchdog/ExecutionIntegrit
 import { ActiveAlertsCard } from './components/watchdog/ActiveAlertsCard'
 import { SessionConnectivityCard } from './components/watchdog/SessionConnectivityCard'
 import { DisconnectFeedCard } from './components/watchdog/DisconnectFeedCard'
+import { SlotLifecyclePanel } from './components/watchdog/SlotLifecyclePanel'
 import { AlertsHistoryCard } from './components/watchdog/AlertsHistoryCard'
 import { LiveEventFeed } from './components/watchdog/LiveEventFeed'
 import { IncidentTimeline } from './components/watchdog/IncidentTimeline'
@@ -32,6 +33,7 @@ import { useActiveIncidents } from './hooks/useActiveIncidents'
 import { useReliabilityMetrics } from './hooks/useReliabilityMetrics'
 import { useInstrumentHealth } from './hooks/useInstrumentHealth'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
+import { useSlotLifecycle } from './hooks/useSlotLifecycle'
 import { useStreamPnl } from './hooks/useStreamPnl'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
 import { ChicagoClock } from './components/watchdog/ChicagoClock'
@@ -54,6 +56,7 @@ export function WatchdogPage() {
   const { metrics, loading: metricsLoading } = useReliabilityMetrics(24)
   const { instruments: instrumentHealth, loading: instrumentHealthLoading } = useInstrumentHealth()
   const { byPeriod: metricsHistory, loading: metricsHistoryLoading } = useMetricsHistory('week', 12)
+  const { slots: slotLifecycle, loading: slotLifecycleLoading } = useSlotLifecycle()
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
@@ -335,7 +338,7 @@ export function WatchdogPage() {
         </div>
       )}
       
-      <div className="container mx-auto px-4 pt-0 pb-8 mt-16">
+      <div className="container mx-auto px-4 pt-4 pb-8 mt-16">
         <div className="grid grid-cols-10 gap-4">
           {/* Left Column (70%) */}
           <div className="col-span-7 space-y-4">
@@ -380,6 +383,9 @@ export function WatchdogPage() {
               events={events}
               tradingDate={status?.trading_date ?? null}
             />
+
+            {/* Slot lifecycle - forced flatten, reentry, slot expiry */}
+            <SlotLifecyclePanel slots={slotLifecycle} loading={slotLifecycleLoading} />
 
             {/* Phase 1: Alert history (24h) */}
             <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />

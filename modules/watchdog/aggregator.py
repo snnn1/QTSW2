@@ -1900,7 +1900,11 @@ class WatchdogAggregator:
         except Exception as e:
             logger.error(f"Error reading feed file for events: {e}", exc_info=True)
         return events
-    
+
+    def get_events_for_slot_lifecycle(self, n: int = 500) -> List[Dict]:
+        """Get recent events for slot lifecycle aggregation. No run_id filter."""
+        return self._read_events_tail(n)
+
     def get_watchdog_status(self) -> Dict:
         """Get current watchdog status."""
         try:
