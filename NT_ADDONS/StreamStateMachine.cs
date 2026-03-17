@@ -101,6 +101,7 @@ public sealed class StreamStateMachine
     private readonly int _orderQuantity; // PHASE 3.2: Fixed order quantity for all intents (code-controlled)
     private readonly int _maxQuantity; // Policy max_size
     private bool _stopBracketsSubmittedAtLock = false;
+    private bool _reconciliationRequestedResubmit = false;
     
     // PHASE 4: Alert callback for missing data incidents
     private Action<string, string, string, int>? _alertCallback;
@@ -446,8 +447,12 @@ public sealed class StreamStateMachine
             // If a RANGE_LOCKED event exists for this stream+day, restore locked state
             if (isRestart && existing != null)
             {
-                // First, try to restore from hydration/ranges log (canonical source)
-                RestoreRangeLockedFromHydrationLog(tradingDateStr, Stream);
+                // Safe by design: skip restore when waiting for re-entry after forced flatten
+                // (would overwrite _stopBracketsSubmittedAtLock and could confuse retry logic)
+                if (!existing.ExecutionInterruptedByClose)
+                {
+                    RestoreRangeLockedFromHydrationLog(tradingDateStr, Stream);
+                }
                 
                 // FAIL-CLOSED: If previous_state == RANGE_LOCKED but restore failed AND bars are insufficient, suspend stream
                 if (existing.LastState == "RANGE_LOCKED" && !_rangeLocked)
@@ -2388,6 +2393,87 @@ public sealed class StreamStateMachine
     }
 
     /// <summary>
+    /// Breakout validity gate for delayed resubmit paths (recovery, restart retry).
+    /// Returns true if submission can proceed (price has not crossed breakout beyond tolerance).
+    /// Returns false if blocked; logs BREAKOUT_INVALIDATED and ENTRY_RESUBMIT_BLOCKED_BREAKOUT.
+    /// Fail-open: returns true when adapter is null or breakout levels missing (gate not applicable).
+    /// NOT used for initial slot-time submission — only for delayed resubmit-style paths.
+    /// </summary>
+    private bool IsBreakoutValidForResubmit(DateTimeOffset utcNow)
+    {
+        var toleranceTicks = 2;
+        if (_spec != null && _spec.TryGetInstrument(Instrument, out var inst))
+            toleranceTicks = inst.breakout_validity_tolerance_ticks;
+        if (_executionAdapter == null || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return true; // Fail open — gate not applicable
+
+        var (bid, ask) = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
+        var brkLong = _brkLongRounded.Value;
+        var brkShort = _brkShortRounded.Value;
+        var tolerance = toleranceTicks * _tickSize;
+        // Recovery/restart retry: fail-closed when price unavailable
+        if (!bid.HasValue && !ask.HasValue)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_RESUBMIT_BLOCKED_PRICE_UNAVAILABLE", State.ToString(),
+                new { stream_id = Stream, note = "Delayed resubmit blocked - market price unavailable; fail-closed" }));
+            return false;
+        }
+        var longInvalid = ask.HasValue && ask.Value >= brkLong + tolerance;
+        var shortInvalid = bid.HasValue && bid.Value <= brkShort - tolerance;
+
+        if (!longInvalid && !shortInvalid)
+            return true;
+
+        if (longInvalid)
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BREAKOUT_INVALIDATED", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    side = "long",
+                    current_price = ask,
+                    breakout_level = brkLong,
+                    tolerance = tolerance,
+                    tolerance_ticks = toleranceTicks,
+                    invalid_threshold = brkLong + tolerance,
+                    note = "Long breakout already crossed - ask >= brk_long + tolerance"
+                }));
+        if (shortInvalid)
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "BREAKOUT_INVALIDATED", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    side = "short",
+                    current_price = bid,
+                    breakout_level = brkShort,
+                    tolerance = tolerance,
+                    tolerance_ticks = toleranceTicks,
+                    invalid_threshold = brkShort - tolerance,
+                    note = "Short breakout already crossed - bid <= brk_short - tolerance"
+                }));
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "ENTRY_RESUBMIT_BLOCKED_BREAKOUT", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                current_bid = bid,
+                current_ask = ask,
+                brk_long = brkLong,
+                brk_short = brkShort,
+                tolerance = tolerance,
+                tolerance_ticks = toleranceTicks,
+                long_invalid = longInvalid,
+                short_invalid = shortInvalid,
+                reason = "breakout_already_triggered",
+                note = "Delayed resubmit blocked - price has crossed breakout; would create late entry"
+            }));
+        return false;
+    }
+
+    /// <summary>
     /// Handle RANGE_LOCKED state logic.
     /// </summary>
     private void HandleRangeLockedState(DateTimeOffset utcNow)
@@ -2397,9 +2483,11 @@ public sealed class StreamStateMachine
         // and the strategy was restarted. On restart, we retry placement if:
         // - Stop brackets weren't submitted yet (_stopBracketsSubmittedAtLock = false)
         // - Entry not detected
+        // - NOT waiting for re-entry after forced flatten (ExecutionInterruptedByClose)
         // - Before market close
         // - Range and breakout levels are available
-        if (!_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc &&
+        if (!_journal.ExecutionInterruptedByClose &&
+            !_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc &&
             RangeHigh.HasValue && RangeLow.HasValue &&
             _brkLongRounded.HasValue && _brkShortRounded.HasValue)
         {
@@ -2416,18 +2504,24 @@ public sealed class StreamStateMachine
             
             if (!alreadySubmitted)
             {
-                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                    "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
-                    new
-                    {
-                        stream_id = Stream,
-                        trading_date = TradingDate,
-                        slot_time_chicago = SlotTimeChicago,
-                        previous_attempt_failed = true,
-                        note = "Retrying stop bracket placement on restart after previous failure"
-                    }));
-                
-                SubmitStopEntryBracketsAtLock(utcNow);
+                if (IsBreakoutValidForResubmit(utcNow))
+                {
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            slot_time_chicago = SlotTimeChicago,
+                            previous_attempt_failed = true,
+                            note = "Retrying stop bracket placement on restart after previous failure"
+                        }));
+                    SubmitStopEntryBracketsAtLock(utcNow);
+                }
+                else
+                {
+                    Commit(utcNow, "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED");
+                }
             }
         }
         
@@ -2458,6 +2552,134 @@ public sealed class StreamStateMachine
             entryTimeUtc,
             triggerReason);
         return intent.ComputeIntentId();
+    }
+
+    /// <summary>
+    /// True if exactly one long and one short entry order exist on broker for this stream.
+    /// INVARIANT: A stream can never have more than 1 valid entry structure (exactly 2 orders).
+    /// Matching by intent ID / tag; excludes protectives (:STOP, :TARGET).
+    /// Partial or duplicate structures are invalid.
+    /// </summary>
+    public bool HasValidEntryOrdersOnBroker(AccountSnapshot snap)
+    {
+        if (!RangeHigh.HasValue || !RangeLow.HasValue ||
+            !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return false;
+
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+
+        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+        int longCount = 0, shortCount = 0;
+
+        foreach (var o in working)
+        {
+            if (!IsSameInstrument(o.Instrument))
+                continue;
+            var tag = o.Tag ?? "";
+            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var decoded = RobotOrderIds.DecodeIntentId(tag);
+            if (decoded == longIntentId) longCount++;
+            else if (decoded == shortIntentId) shortCount++;
+        }
+
+        return longCount == 1 && shortCount == 1;
+    }
+
+    private (int LongCount, int ShortCount, List<string> OrderIds) GetMatchingEntryOrderCounts(
+        AccountSnapshot snap, string longIntentId, string shortIntentId)
+    {
+        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+        int longCount = 0, shortCount = 0;
+        var orderIds = new List<string>();
+
+        foreach (var o in working)
+        {
+            if (!IsSameInstrument(o.Instrument))
+                continue;
+            var tag = o.Tag ?? "";
+            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var decoded = RobotOrderIds.DecodeIntentId(tag);
+            if (decoded == longIntentId) { longCount++; orderIds.Add(o.OrderId ?? ""); }
+            else if (decoded == shortIntentId) { shortCount++; orderIds.Add(o.OrderId ?? ""); }
+        }
+        return (longCount, shortCount, orderIds);
+    }
+
+    /// <summary>
+    /// Reconcile entry orders for recovery. If we should have orders but don't, reset _stopBracketsSubmittedAtLock
+    /// and set _reconciliationRequestedResubmit so next tick resubmits.
+    /// Returns (reconciled: we checked this stream, needsResubmit: we flagged for resubmission).
+    /// </summary>
+    public (bool Reconciled, bool NeedsResubmit) ReconcileEntryOrders(AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        if (Committed || State != StreamState.RANGE_LOCKED)
+            return (false, false);
+        if (_journal.ExecutionInterruptedByClose)
+            return (false, false); // Safe by design: no entry resubmit when waiting for re-entry after forced flatten
+        if (_entryDetected || utcNow >= MarketCloseUtc)
+            return (false, false);
+        if (!RangeHigh.HasValue || !RangeLow.HasValue || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return (false, false);
+
+        // Require flat position for this stream's instrument
+        var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
+        if (posQty != 0)
+            return (false, false);
+
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+        const int expectedCount = 2;
+
+        var (longCount, shortCount, orderIdList) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
+        var validStructure = longCount == 1 && shortCount == 1;
+        if (validStructure)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDERS_VERIFIED_PRESENT", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    trading_date = TradingDate,
+                    slot_time_chicago = SlotTimeChicago,
+                    long_intent_id = longIntentId,
+                    short_intent_id = shortIntentId,
+                    expected_count = expectedCount,
+                    actual_count = orderIdList.Count,
+                    order_ids = orderIdList,
+                    reason = "RECOVERY_RECONCILIATION"
+                }));
+            return (true, false);
+        }
+
+        // Orders missing or incomplete - reset flag and request resubmission
+        _stopBracketsSubmittedAtLock = false;
+        _journal.StopBracketsSubmittedAtLock = false;
+        _journals.Save(_journal);
+        _reconciliationRequestedResubmit = true;
+
+        var totalMatch = longCount + shortCount;
+        var reasonStr = totalMatch == 0 ? "missing" : totalMatch == 1 ? "partial_incomplete" : "duplicate_or_invalid";
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "ENTRY_ORDERS_MISSING_DETECTED", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                slot_time_chicago = SlotTimeChicago,
+                long_intent_id = longIntentId,
+                short_intent_id = shortIntentId,
+                expected_count = expectedCount,
+                actual_long_count = longCount,
+                actual_short_count = shortCount,
+                actual_total = totalMatch,
+                reason = reasonStr,
+                note = "Any incomplete structure (0, 1, or >2 matching orders) requires resubmission"
+            }));
+
+        return (true, true);
     }
 
     public void Arm(DateTimeOffset utcNow)
@@ -3390,8 +3612,8 @@ public sealed class StreamStateMachine
         var longIntentId = longIntent.ComputeIntentId();
         var shortIntentId = shortIntent.ComputeIntentId();
 
-        // Already submitted? then treat as done.
-        if (_executionJournal != null && 
+        // Already submitted? then treat as done. Bypass when reconciliation requested resubmit (broker/journal diverge).
+        if (!_reconciliationRequestedResubmit && _executionJournal != null &&
             (_executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
              _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream)))
         {
@@ -3399,6 +3621,45 @@ public sealed class StreamStateMachine
             _journal.StopBracketsSubmittedAtLock = true; // PERSIST: Update journal
             _journals.Save(_journal);
             return;
+        }
+
+        // CRITICAL: Position check before resubmit - prevent double exposure.
+        if (_reconciliationRequestedResubmit && _executionAdapter != null)
+        {
+            try
+            {
+                var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+                var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
+                if (posQty != 0)
+                {
+                    _reconciliationRequestedResubmit = false;
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "ENTRY_ORDERS_RESUBMIT_BLOCKED_POSITION_NOT_FLAT", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            position_qty = posQty,
+                            reason = "double_exposure_prevention",
+                            note = "Resubmit blocked - position not flat; would create double exposure"
+                        }));
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDERS_RESUBMIT_POSITION_CHECK_ERROR", State.ToString(),
+                    new { error = ex.Message, note = "Position check failed - blocking resubmit for safety" }));
+                return;
+            }
+
+            if (!IsBreakoutValidForResubmit(utcNow))
+            {
+                _reconciliationRequestedResubmit = false;
+                Commit(utcNow, "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED");
+                return;
+            }
         }
 
         try
@@ -3449,23 +3710,61 @@ public sealed class StreamStateMachine
                     }));
             }
 
+            // Pre-submit: if breakout already crossed, submit MARKET instead of STOP (prevents "price outside limits" rejection)
+            var (bid, ask) = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
+            var longCrossed = ask.HasValue && ask.Value >= brkLong;
+            var shortCrossed = bid.HasValue && bid.Value <= brkShort;
+            var longDecision = longCrossed ? "MARKET" : "STOP";
+            var shortDecision = shortCrossed ? "MARKET" : "STOP";
+            var longPriceDistTicks = (ask.HasValue && _tickSize > 0) ? (int)Math.Round((ask.Value - brkLong) / _tickSize) : (int?)null;
+            var shortPriceDistTicks = (bid.HasValue && _tickSize > 0) ? (int)Math.Round((brkShort - bid.Value) / _tickSize) : (int?)null;
+
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_TYPE_DECISION", State.ToString(),
+                new { stream = Stream, side = "LONG", decision = longDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, price_distance_ticks = longPriceDistTicks }));
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_TYPE_DECISION", State.ToString(),
+                new { stream = Stream, side = "SHORT", decision = shortDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, price_distance_ticks = shortPriceDistTicks }));
+
             // PHASE 2: Use ExecutionInstrument for order placement (not canonical Instrument)
             // PHASE 3: Use ExecutionInstrument for order placement (explicit, not ambiguous Instrument property)
             // PHASE 3.2: Use code-controlled order quantity (Chart Trader quantity ignored)
-            var longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
-            var shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
+            OrderSubmissionResult longRes;
+            OrderSubmissionResult shortRes;
+            if (longCrossed)
+                longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            else
+                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+            if (shortCrossed)
+                shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            else
+                shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
 
             // Persist to execution journal for idempotency (record both attempts)
             // PHASE 2: Journal uses ExecutionInstrument for execution tracking
             if (longRes.Success)
                 _executionJournal.RecordSubmission(longIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_LONG", longRes.BrokerOrderId, utcNow);
             else
-                _executionJournal.RecordRejection(longIntentId, TradingDate, Stream, longRes.ErrorMessage ?? "ENTRY_STOP_LONG_FAILED", utcNow);
+            {
+                var longErr = longRes.ErrorMessage ?? "ENTRY_STOP_LONG_FAILED";
+                _executionJournal.RecordRejection(longIntentId, TradingDate, Stream, longErr, utcNow);
+                if (longErr.IndexOf("price outside limits", StringComparison.OrdinalIgnoreCase) >= 0)
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "ENTRY_ORDER_REJECTED_PRICE_INVALID", State.ToString(),
+                        new { stream = Stream, side = "LONG", submitted_price = brkLong, current_bid = bid, current_ask = ask }));
+            }
 
             if (shortRes.Success)
                 _executionJournal.RecordSubmission(shortIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_SHORT", shortRes.BrokerOrderId, utcNow);
             else
-                _executionJournal.RecordRejection(shortIntentId, TradingDate, Stream, shortRes.ErrorMessage ?? "ENTRY_STOP_SHORT_FAILED", utcNow);
+            {
+                var shortErr = shortRes.ErrorMessage ?? "ENTRY_STOP_SHORT_FAILED";
+                _executionJournal.RecordRejection(shortIntentId, TradingDate, Stream, shortErr, utcNow);
+                if (shortErr.IndexOf("price outside limits", StringComparison.OrdinalIgnoreCase) >= 0)
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "ENTRY_ORDER_REJECTED_PRICE_INVALID", State.ToString(),
+                        new { stream = Stream, side = "SHORT", submitted_price = brkShort, current_bid = bid, current_ask = ask }));
+            }
 
             if (longRes.Success && shortRes.Success)
             {
@@ -3474,6 +3773,24 @@ public sealed class StreamStateMachine
                 // PERSIST: Save flag to journal immediately
                 _journal.StopBracketsSubmittedAtLock = true;
                 _journals.Save(_journal);
+                
+                if (_reconciliationRequestedResubmit)
+                {
+                    _reconciliationRequestedResubmit = false;
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "ENTRY_ORDERS_RESUBMITTED", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            long_intent_id = longIntentId,
+                            short_intent_id = shortIntentId,
+                            long_broker_order_id = longRes.BrokerOrderId,
+                            short_broker_order_id = shortRes.BrokerOrderId,
+                            reason = "reconciliation_resubmit",
+                            note = "Entry orders resubmitted after reconciliation detected missing/invalid orders"
+                        }));
+                }
                 
                 _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_SUBMITTED", new
                 {
@@ -4519,9 +4836,74 @@ public sealed class StreamStateMachine
             // Gate: Ensure breakout levels exist (canonical prerequisite for stop bracket submission)
             // Note: SubmitStopEntryBracketsAtLock() has internal gates on _brkLongRounded/_brkShortRounded (line 3255)
             //       and _breakoutLevelsMissing (line 3235), so this gate is redundant but kept for clarity
-            if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            //
+            // INITIAL SUBMISSION FRESHNESS: Block materially delayed first submissions.
+            // Normal immediate slot-time: within freshness window → allow (marketable stop OK).
+            // Delayed initial: beyond window → block NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION.
+            // Delayed resubmit/restart retry: handled separately in HandleRangeLockedState with IsBreakoutValidForResubmit.
+            var freshnessMinutes = _spec?.breakout?.initial_submission_freshness_minutes ?? 3;
+            var delayFromSlotMinutes = (utcNow - SlotTimeUtc).TotalMinutes;
+            if (delayFromSlotMinutes > freshnessMinutes)
             {
-                SubmitStopEntryBracketsAtLock(utcNow);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "INITIAL_SUBMISSION_BLOCKED_MATERIALLY_DELAYED", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        delay_from_slot_minutes = Math.Round(delayFromSlotMinutes, 2),
+                        freshness_window_minutes = freshnessMinutes,
+                        slot_time_utc = SlotTimeUtc.ToString("o"),
+                        note = "Initial submission blocked - materially delayed from slot time; would create late entry"
+                    }));
+                Commit(utcNow, "NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION", "NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION");
+            }
+            else if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            {
+                // PRICE SANITY (initial submission, within freshness): block clearly stale entries.
+                var sanityTicks = _spec?.breakout?.initial_submission_price_sanity_ticks ?? 10;
+                var sanityTolerance = sanityTicks * _tickSize;
+                var (bid, ask) = _executionAdapter?.GetCurrentMarketPrice(ExecutionInstrument, utcNow) ?? (null, null);
+                var brkLong = _brkLongRounded.Value;
+                var brkShort = _brkShortRounded.Value;
+                var longClearlyStale = ask.HasValue && ask.Value >= brkLong + sanityTolerance;
+                var shortClearlyStale = bid.HasValue && bid.Value <= brkShort - sanityTolerance;
+                if (longClearlyStale || shortClearlyStale)
+                {
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "INITIAL_SUBMISSION_BLOCKED_PRICE_SANITY", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            current_bid = bid,
+                            current_ask = ask,
+                            brk_long = brkLong,
+                            brk_short = brkShort,
+                            sanity_ticks = sanityTicks,
+                            long_clearly_stale = longClearlyStale,
+                            short_clearly_stale = shortClearlyStale,
+                            note = "Initial submission blocked - price distance from breakout exceeds sanity threshold"
+                        }));
+                    Commit(utcNow, "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY", "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY");
+                }
+                else
+                {
+                    var delayMin = (utcNow - SlotTimeUtc).TotalMinutes;
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "EXECUTION_METRIC_INITIAL_SUBMISSION_ALLOWED", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            metric_type = "initial_submission_allowed",
+                            delay_from_slot_minutes = Math.Round(delayMin, 3),
+                            current_bid = bid,
+                            current_ask = ask,
+                            brk_long = _brkLongRounded,
+                            brk_short = _brkShortRounded,
+                            price_distance_long_ticks = ask.HasValue && _tickSize > 0 ? (ask.Value - brkLong) / _tickSize : (decimal?)null,
+                            price_distance_short_ticks = bid.HasValue && _tickSize > 0 ? (brkShort - bid.Value) / _tickSize : (decimal?)null
+                        }));
+                    SubmitStopEntryBracketsAtLock(utcNow);
+                }
             }
             else if (_breakoutLevelsMissing)
             {

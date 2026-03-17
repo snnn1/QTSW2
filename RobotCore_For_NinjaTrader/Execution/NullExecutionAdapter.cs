@@ -25,6 +25,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         // DRYRUN: Log but do not place order
@@ -148,6 +149,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
             Positions = new List<PositionSnapshot>(),
             WorkingOrders = new List<WorkingOrderSnapshot>()
         };
+    }
+
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+    {
+        return (null, null); // DRYRUN: no market data — gate skips (fail open)
     }
     
     public void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument)

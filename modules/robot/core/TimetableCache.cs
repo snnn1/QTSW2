@@ -39,9 +39,8 @@ public static class TimetableCache
                 return (_cachedHash, _cachedTimetable, changed);
             }
 
-            // Cache miss: read, hash, parse, store
+            // Cache miss: read, parse, content-hash (excludes as_of), store
             var bytes = File.ReadAllBytes(path);
-            var hash = Sha256Hex(bytes);
             TimetableContract? timetable;
             try
             {
@@ -49,8 +48,10 @@ public static class TimetableCache
             }
             catch
             {
-                return (hash, null, true);
+                var rawHash = Sha256Hex(bytes);
+                return (rawHash, null, true);
             }
+            var hash = TimetableContentHasher.ComputeFromTimetable(timetable);
 
             _cachedPath = path;
             _cachedLastWriteUtc = lastWriteUtc;

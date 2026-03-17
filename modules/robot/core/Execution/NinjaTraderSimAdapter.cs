@@ -151,6 +151,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -202,7 +203,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         try
         {
-            return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
+            return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, ocoGroup, utcNow);
         }
         catch (Exception ex)
         {
@@ -1272,6 +1273,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         return GetAccountSnapshotReal(utcNow);
     }
+
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+    {
+#if !NINJATRADER
+        return (null, null);
+#endif
+        if (!_ntContextSet)
+            return (null, null);
+        return GetCurrentMarketPriceReal(instrument, utcNow);
+    }
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
@@ -1295,6 +1306,24 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
 
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
+    }
+
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
+#endif
+        if (!_ntContextSet)
+        {
+            var err = "NT context is not set. SetNTContext() must be called before orders can be cancelled.";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+                new { reason = "NT_CONTEXT_NOT_SET", error = err }));
+            throw new InvalidOperationException(err);
+        }
+        CancelOrdersReal(orderIds?.ToList() ?? new List<string>(), utcNow);
     }
 
     public void EnqueueExecutionCommand(ExecutionCommandBase command)

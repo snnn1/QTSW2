@@ -154,7 +154,7 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
         }
     }
 
-    public OrderSubmissionResult SubmitEntryOrder(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, DateTimeOffset utcNow)
+    public OrderSubmissionResult SubmitEntryOrder(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, string? ocoGroup, DateTimeOffset utcNow)
         => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
     public OrderSubmissionResult SubmitStopEntryOrder(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
         => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
@@ -168,7 +168,10 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
         => FlattenResult.SuccessResult(utcNow);
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
         => new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+        => (null, null);
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow) { }
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow) { }
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
 }

@@ -2,6 +2,7 @@
 // The .NT.cs partial provides real implementations when compiled with NinjaTrader.
 
 using System;
+using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -14,7 +15,7 @@ public sealed partial class NinjaTraderSimAdapter
     private void VerifySimAccountReal()
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
-    private OrderSubmissionResult SubmitEntryOrderReal(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, DateTimeOffset utcNow)
+    private OrderSubmissionResult SubmitEntryOrderReal(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, string? ocoGroup, DateTimeOffset utcNow)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
     private OrderSubmissionResult SubmitStopEntryOrderReal(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
@@ -46,6 +47,12 @@ public sealed partial class NinjaTraderSimAdapter
 
     private void CancelRobotOwnedWorkingOrdersReal(AccountSnapshot snap, DateTimeOffset utcNow)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
+
+    private void CancelOrdersReal(List<string> orderIds, DateTimeOffset utcNow)
+        => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
+
+    private (decimal? Bid, decimal? Ask) GetCurrentMarketPriceReal(string instrument, DateTimeOffset utcNow)
+        => (null, null);
 
     private bool CancelIntentOrdersReal(string intentId, DateTimeOffset utcNow)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");

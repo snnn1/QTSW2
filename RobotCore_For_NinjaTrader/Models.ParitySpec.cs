@@ -99,6 +99,20 @@ public sealed class BreakoutSpec
 
     public TickRounding tick_rounding { get; set; } = new();
 
+    /// <summary>
+    /// Max minutes from SlotTimeUtc for initial submission. Beyond this, block as materially delayed.
+    /// Default 3. Immediate slot-time marketable fills allowed; delayed first submissions blocked.
+    /// </summary>
+    public int initial_submission_freshness_minutes { get; set; } = 3;
+
+    /// <summary>
+    /// Price sanity check (initial submission only, within freshness window).
+    /// If price distance from breakout > this many ticks, block (clearly stale).
+    /// Long: block if ask >= brkLong + sanity_ticks. Short: block if bid <= brkShort - sanity_ticks.
+    /// Default 10. Preserves legitimate immediate fills; blocks clearly stale entries.
+    /// </summary>
+    public int initial_submission_price_sanity_ticks { get; set; } = 10;
+
     public void ValidateOrThrow()
     {
         if (offset_ticks != 1)
@@ -162,5 +176,7 @@ public sealed class ParityInstrument
     public string base_instrument { get; set; } = "";
 
     public decimal scaling_factor { get; set; }
+
+    public int breakout_validity_tolerance_ticks { get; set; } = 2;
 }
 

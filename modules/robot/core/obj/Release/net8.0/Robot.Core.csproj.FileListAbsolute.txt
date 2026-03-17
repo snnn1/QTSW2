@@ -1,3 +1,14 @@
 C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.GeneratedMSBuildEditorConfig.editorconfig
 C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.csproj.CoreCompileInputs.cache
 C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.sourcelink.json
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Release\net8.0\Robot.Core.deps.json
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Release\net8.0\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Release\net8.0\Robot.Core.pdb
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Release\net8.0\Robot.Contracts.dll
+C:\Users\jakej\QTSW2\modules\robot\core\bin\Release\net8.0\Robot.Contracts.pdb
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.csproj.AssemblyReference.cache
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.csproj.Up2Date
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\refint\Robot.Core.dll
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\Robot.Core.pdb
+C:\Users\jakej\QTSW2\modules\robot\core\obj\Release\net8.0\ref\Robot.Core.dll

@@ -25,6 +25,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         // DRYRUN: Log but do not place order
@@ -142,6 +143,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
             WorkingOrders = new List<WorkingOrderSnapshot>()
         };
     }
+
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+    {
+        return (null, null); // DRYRUN: no market data — gate skips (fail open)
+    }
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
@@ -158,6 +164,15 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
                 robot_owned_order_ids = robotOwnedOrders.Select(o => o.OrderId).ToList(),
                 note = "DRYRUN mode - would cancel robot-owned orders but not executing"
             }));
+    }
+
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+        // DRYRUN: Log what would be cancelled
+        var ids = orderIds?.ToList() ?? new List<string>();
+        if (ids.Count > 0)
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_DRYRUN", state: "ENGINE",
+                new { order_ids = ids, note = "DRYRUN mode - would cancel specific orders but not executing" }));
     }
 
     public void EnqueueExecutionCommand(ExecutionCommandBase command)

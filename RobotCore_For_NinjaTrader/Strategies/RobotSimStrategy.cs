@@ -230,6 +230,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // OnEachTick requires tick data to be available, which may block MGC/MYM/M2K strategies
                 Calculate = Calculate.OnBarClose; // Bar-based to avoid blocking Realtime transition
                 IsUnmanaged = true; // Required for manual order management
+                // Keep orders alive on brief connection loss: avoid strategy restart → order cancellation
+                ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
                 IsInstantiatedOnEachOptimizationIteration = false; // SIM mode only
                 TestInjectTradeOnStart = false;
                 TestInjectDirection = "Long";
@@ -747,6 +749,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 if (string.Equals(instrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
                                 {
                                     Log($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart", LogLevel.Information);
+                                    _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "BARS_REQUEST_TRIGGERED_FOR_REBUILD", new Dictionary<string, object>
+                                    {
+                                        { "instrument", instrument },
+                                        { "note", "BarsRequest triggered for RANGE_BUILDING/PRE_HYDRATION/ARMED stream on restart" }
+                                    });
                                     
                                     // Mark BarsRequest as pending BEFORE queuing (prevents premature range lock)
                                     if (_engine != null)
@@ -1293,27 +1300,41 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void WireNTContextToAdapter()
         {
             // Get adapter from engine using accessor method (replaces reflection)
-            var adapter = _engine.GetExecutionAdapter() as NinjaTraderSimAdapter;
-            
-            if (adapter is null)
+            var rawAdapter = _engine.GetExecutionAdapter();
+            if (rawAdapter is null)
             {
                 var error = "CRITICAL: Could not access execution adapter from engine - aborting strategy execution";
                 Log(error, LogLevel.Error);
                 throw new InvalidOperationException(error);
             }
-            
-            _adapter = adapter;
-            
-            // Set NT context (Account, Instrument) in adapter
-            var engineExecutionInstrument = _engine?.GetExecutionInstrument();
-            adapter.SetNTContext(Account, Instrument, engineExecutionInstrument);
+
+            // SIM: NinjaTraderSimAdapter - full event wiring for order/execution updates
+            if (rawAdapter is NinjaTraderSimAdapter simAdapter)
+            {
+                _adapter = simAdapter;
+                var engineExecutionInstrument = _engine?.GetExecutionInstrument();
+                simAdapter.SetNTContext(Account, Instrument, engineExecutionInstrument);
+            }
+            // LIVE: NinjaTraderLiveAdapter - SetNTContext for GetCurrentMarketPrice (breakout validity gate)
+            else if (rawAdapter is NinjaTraderLiveAdapter liveAdapter)
+            {
+                liveAdapter.SetNTContext(Account, Instrument);
+                _adapter = null; // LIVE stub: no order/execution event handling yet
+            }
+            else
+            {
+                var error = "CRITICAL: Execution adapter is not NinjaTraderSimAdapter or NinjaTraderLiveAdapter - aborting strategy execution";
+                Log(error, LogLevel.Error);
+                throw new InvalidOperationException(error);
+            }
             
             // Subscribe to NT order/execution events and forward to adapter
             Account.OrderUpdate += OnOrderUpdate;
             Account.ExecutionUpdate += OnExecutionUpdate;
             
             var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-            Log($"NT context wired to adapter: Account={Account.Name}, Instrument={instrumentName}", LogLevel.Information);
+            var adapterType = rawAdapter?.GetType().Name ?? "UNKNOWN";
+            Log($"NT context wired to adapter: Account={Account.Name}, Instrument={instrumentName}, Adapter={adapterType}", LogLevel.Information);
             
             // DIAGNOSTIC: Log adapter wiring completion
             if (_engine != null)

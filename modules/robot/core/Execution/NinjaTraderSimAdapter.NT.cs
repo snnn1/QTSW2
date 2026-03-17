@@ -113,6 +113,42 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// Get current market bid/ask for breakout validity gate.
+    /// </summary>
+    private (decimal? Bid, decimal? Ask) GetCurrentMarketPriceReal(string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntInstrument == null)
+            return (null, null);
+        try
+        {
+            dynamic dynInstrument = _ntInstrument;
+            var marketData = dynInstrument.MarketData;
+            if (marketData == null)
+                return (null, null);
+            double? bid = null;
+            double? ask = null;
+            try
+            {
+                bid = (double?)marketData.GetBid(0);
+                ask = (double?)marketData.GetAsk(0);
+            }
+            catch
+            {
+                try
+                {
+                    bid = (double?)marketData.Bid;
+                    ask = (double?)marketData.Ask;
+                }
+                catch { return (null, null); }
+            }
+            if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
+                return ((decimal)bid.Value, (decimal)ask.Value);
+        }
+        catch { }
+        return (null, null);
+    }
+
+    /// <summary>
     /// Helper method to get Intent info for journal logging.
     /// Returns tradingDate, stream, and intent prices from _intentMap if available.
     /// </summary>
@@ -175,6 +211,7 @@ public sealed partial class NinjaTraderSimAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         if (_ntAccount == null)
@@ -511,7 +548,7 @@ public sealed partial class NinjaTraderSimAdapter
                         quantity,                               // Quantity
                         0.0,                                    // LimitPrice (0 for StopMarket)
                         ntEntryPrice,                           // StopPrice
-                        null,                                   // Oco (entry orders from SubmitEntryOrderReal don't have ocoGroup)
+                        ocoGroup,                               // Oco (for MARKET+STOP bracket when breakout crossed)
                         RobotOrderIds.EncodeTag(intentId),      // OrderName
                         DateTime.MinValue,                      // Gtd
                         null                                    // CustomOrder
@@ -878,7 +915,7 @@ public sealed partial class NinjaTraderSimAdapter
             
             _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY", order.OrderId, acknowledgedAt, 
                 expectedEntryPrice: entryPrice, entryPrice: finalEntryPrice, stopPrice: intentStopPrice, 
-                targetPrice: intentTargetPrice, direction: finalDirection, ocoGroup: null);
+                targetPrice: intentTargetPrice, direction: finalDirection, ocoGroup: ocoGroup);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -3877,6 +3914,31 @@ public sealed partial class NinjaTraderSimAdapter
             // If position is flat, cancel all entry stop orders for this instrument
             if (position != null && position.MarketPosition == MarketPosition.Flat)
             {
+                // GUARD: Only cancel when at least one entry has filled for this instrument (post-entry cleanup).
+                // Pre-entry RANGE_LOCKED streams have valid entry orders waiting for breakout - do NOT cancel.
+                bool anyEntryFilledForInstrument = false;
+                foreach (var kvp in _intentMap)
+                {
+                    var intent = kvp.Value;
+                    if (intent.Instrument != instrument)
+                        continue;
+                    if (intent.TriggerReason == null ||
+                        (!intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") &&
+                         !intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                        continue;
+                    if (_executionJournal != null && !string.IsNullOrEmpty(intent.TradingDate) && !string.IsNullOrEmpty(intent.Stream))
+                    {
+                        var entry = _executionJournal.GetEntry(kvp.Key, intent.TradingDate, intent.Stream);
+                        if (entry != null && (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0))
+                        {
+                            anyEntryFilledForInstrument = true;
+                            break;
+                        }
+                    }
+                }
+                if (!anyEntryFilledForInstrument)
+                    return; // Pre-entry state (e.g. RANGE_LOCKED waiting) - do not cancel valid entry orders
+
                 // Find all entry intents for this instrument that haven't filled yet
                 var entryIntentIdsToCancel = new List<string>();
                 
@@ -4016,6 +4078,45 @@ public sealed partial class NinjaTraderSimAdapter
                     exception_type = ex.GetType().Name,
                     note = "Failed to cancel robot-owned orders"
                 }));
+        }
+    }
+
+    /// <summary>
+    /// Cancel specific orders by order ID (stream-scoped recovery).
+    /// </summary>
+    private void CancelOrdersReal(List<string> orderIds, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null || orderIds == null || orderIds.Count == 0)
+            return;
+
+        var account = _ntAccount as Account;
+        if (account == null)
+            return;
+
+        var orderIdSet = new HashSet<string>(orderIds, StringComparer.OrdinalIgnoreCase);
+        var ordersToCancel = new List<Order>();
+
+        foreach (var order in account.Orders)
+        {
+            if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                continue;
+            if (orderIdSet.Contains(order.OrderId))
+                ordersToCancel.Add(order);
+        }
+
+        if (ordersToCancel.Count > 0)
+        {
+            try
+            {
+                account.Cancel(ordersToCancel.ToArray());
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENTRY_ORDER_SET_CANCEL_CONFIRMED", state: "ENGINE",
+                    new { cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(), note = "Stream-scoped entry orders cancelled" }));
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_ERROR", state: "ENGINE",
+                    new { error = ex.Message, order_ids = orderIds, note = "Failed to cancel specific orders" }));
+            }
         }
     }
     

@@ -27,7 +27,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly RobotLogger _log; // Kept for backward compatibility during migration
     private readonly RobotLoggingService? _loggingService; // New async logging service (Fix B)
     private readonly JournalStore _journals;
-    private readonly FilePoller _timetablePoller;
+    private readonly TimetableFilePoller _timetablePoller;
     private readonly object _engineLock = new object(); // Serialize engine entrypoints (Tick/OnBar/etc.)
     
     // Engine run identifier (GUID per engine Start())
@@ -136,6 +136,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _disconnectFirstUtc;
     private DateTimeOffset? _recoveryStartedUtc;
     private DateTimeOffset? _recoveryCompletedUtc;
+    private DateTimeOffset? _secondReconciliationRunUtc; // Lightweight second reconciliation after recovery
+    private const int SECOND_RECONCILIATION_DELAY_MINUTES = 5;
     private ConnectionStatus _lastConnectionStatus = ConnectionStatus.Connected;
     
     // Broker sync gate timestamps (for recovery synchronization)
@@ -433,7 +435,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _log = new RobotLogger(projectRoot, _resolvedLogDir, instrument, _loggingService);
         
         _journals = new JournalStore(projectRoot);
-        _timetablePoller = new FilePoller(timetablePollInterval);
+        _timetablePoller = new TimetableFilePoller(timetablePollInterval);
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
@@ -528,30 +530,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (_killSwitch == null)
             {
                 _killSwitch = new KillSwitch(_root, _log);
-            }
-
-            // PHASE 1: Fail-fast for LIVE mode before engine starts
-            if (_executionMode == ExecutionMode.LIVE)
-            {
-                var errorMsg = "LIVE mode is not yet enabled. Use DRYRUN or SIM.";
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LIVE_MODE_BLOCKED", state: "ENGINE",
-                    new { error = errorMsg, execution_mode = _executionMode.ToString() }));
-
-                // Trigger high-priority alert (not log-only)
-                if (_healthMonitor != null)
-                {
-                    var notificationService = _healthMonitor.GetNotificationService();
-                    if (notificationService != null)
-                    {
-                        notificationService.EnqueueNotification(
-                            "LIVE_MODE_BLOCKED",
-                            "CRITICAL: LIVE Trading Blocked",
-                            $"Robot attempted to start in LIVE mode but it is not enabled. Execution blocked. Error: {errorMsg}",
-                            priority: 2); // Emergency priority
-                    }
-                }
-
-                throw new InvalidOperationException(errorMsg);
             }
 
             // Start async logging service if enabled (Fix B)
@@ -855,8 +833,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (_killSwitch == null)
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
 
-            // Try to create adapter (will throw if LIVE mode)
-            _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal);
+            // Create adapter (LIVE uses NinjaTraderLiveAdapter; Strategy wires SetNTContext)
+            _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal, _time);
 
             // Gap 3 Phase 3: Protective coverage coordinator (blocks instruments on critical protective failure)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
@@ -1372,6 +1350,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
                 // Broker is synchronized: transition to RECOVERY_RUNNING and start recovery
                 _recoveryState = ConnectionRecoveryState.RECOVERY_RUNNING;
+                _secondReconciliationRunUtc = null; // Reset for new recovery cycle
                 if (!_recoveryStartedUtc.HasValue)
                 {
                     _recoveryStartedUtc = utcNow;
@@ -1395,6 +1374,46 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // commit pre-entry streams first, and reentry streams would never reach slot expiry.
             foreach (var s in _streams.Values)
                 s.Tick(utcNow);
+
+            // Second reconciliation trigger (lightweight safety net): run once, ~5 min after recovery
+            if (_recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE &&
+                _recoveryCompletedUtc.HasValue &&
+                !_secondReconciliationRunUtc.HasValue &&
+                _executionAdapter != null &&
+                (utcNow - _recoveryCompletedUtc.Value).TotalMinutes >= SECOND_RECONCILIATION_DELAY_MINUTES)
+            {
+                try
+                {
+                    var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+                    var streamsReconciled = 0;
+                    var streamsNeedingResubmit = 0;
+                    foreach (var stream in _streams.Values)
+                    {
+                        if (stream.Committed || stream.State != StreamState.RANGE_LOCKED) continue;
+                        var (reconciled, needsResubmit) = stream.ReconcileEntryOrders(snap, utcNow);
+                        if (reconciled) streamsReconciled++;
+                        if (needsResubmit) streamsNeedingResubmit++;
+                    }
+                    _secondReconciliationRunUtc = utcNow;
+                    if (streamsReconciled > 0 || streamsNeedingResubmit > 0)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_SECOND_RECONCILIATION", state: "ENGINE",
+                            new
+                            {
+                                streams_reconciled = streamsReconciled,
+                                streams_needing_resubmit = streamsNeedingResubmit,
+                                delay_minutes = SECOND_RECONCILIATION_DELAY_MINUTES,
+                                note = "Lightweight second reconciliation (safety net)"
+                            }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_SECOND_RECONCILIATION_ERROR", state: "ENGINE",
+                        new { error = ex.Message, note = "Second reconciliation failed - non-fatal" }));
+                    _secondReconciliationRunUtc = utcNow; // Don't retry
+                }
+            }
 
             // Forced flatten block — per sessionClass (runs after slot expiry so both can work)
             var tradingDateStr = TradingDateString;
@@ -3949,6 +3968,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (_recoveryState == ConnectionRecoveryState.CONNECTED_OK || _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE)
                 {
                     _recoveryState = ConnectionRecoveryState.DISCONNECT_FAIL_CLOSED;
+                    _secondReconciliationRunUtc = null; // Reset for new recovery cycle
                     if (!_disconnectFirstUtc.HasValue)
                     {
                         _disconnectFirstUtc = utcNow;
@@ -4385,27 +4405,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
             
-            // Step C: Cancel robot-owned working orders only
-            try
-            {
-                _executionAdapter.CancelRobotOwnedWorkingOrders(snap, utcNow);
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_CANCELLED_ROBOT_ORDERS", state: "ENGINE",
-                    new
-                    {
-                        robot_owned_orders_cancelled = snap.WorkingOrders?.Count(o => IsRobotOwnedOrder(o)) ?? 0,
-                        note = "Robot-owned working orders cancelled"
-                    }));
-            }
-            catch (Exception ex)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_CANCELLED_ROBOT_ORDERS_FAILED", state: "ENGINE",
-                    new
-                    {
-                        error = ex.Message,
-                        exception_type = ex.GetType().Name,
-                        note = "Failed to cancel robot-owned orders - recovery continues"
-                    }));
-            }
+            // Step C: Preserve robot-owned working orders during recovery (align with RobotCore)
+            // Do NOT cancel - valid entry orders for RANGE_LOCKED streams should remain.
+            var robotOrderCount = snap.WorkingOrders?.Count(o => IsRobotOwnedOrder(o)) ?? 0;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_ORDERS_PRESERVED", state: "ENGINE",
+                new
+                {
+                    robot_owned_orders_preserved = robotOrderCount,
+                    note = "Robot-owned working orders preserved during recovery (no cancellation)"
+                }));
             
             // Step D: Protective re-establishment (for reconciled positions only)
             // This would require more detailed implementation - for now, log placeholder
@@ -4419,8 +4427,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
             
-            // Step E: Stream rebuild
+            // Step E: Entry-order reconciliation for RANGE_LOCKED streams
             var streamsReconciled = 0;
+            var streamsNeedingResubmit = 0;
             foreach (var stream in _streams.Values)
             {
                 if (stream.Committed || stream.State != StreamState.RANGE_LOCKED)
@@ -4428,18 +4437,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     continue; // Skip committed or non-locked streams
                 }
                 
-                // Verify required orders exist; cancel/rebuild if missing/incorrect
-                // This is simplified - in practice, you'd check journal and broker snapshot
-                streamsReconciled++;
+                var (reconciled, needsResubmit) = stream.ReconcileEntryOrders(snap, utcNow);
+                if (reconciled) streamsReconciled++;
+                if (needsResubmit) streamsNeedingResubmit++;
             }
             
-            if (streamsReconciled > 0)
+            if (streamsReconciled > 0 || streamsNeedingResubmit > 0)
             {
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_STREAM_ORDERS_RECONCILED", state: "ENGINE",
                     new
                     {
                         streams_reconciled = streamsReconciled,
-                        note = "Required working orders verified/rebuilt for eligible streams"
+                        streams_needing_resubmit = streamsNeedingResubmit,
+                        note = "Entry orders verified or flagged for resubmission"
                     }));
             }
             
@@ -4678,9 +4688,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // This handles the case where streams restart mid-session and need historical bars
             foreach (var stream in _streams.Values)
             {
-                // Check if stream is in PRE_HYDRATION or ARMED state and not committed
-                // This indicates BarsRequest may be needed for restart
-                if ((stream.State == StreamState.PRE_HYDRATION || stream.State == StreamState.ARMED) &&
+                // Check if stream is in PRE_HYDRATION, ARMED, or RANGE_BUILDING and not committed
+                // RANGE_BUILDING: may need more bars to lock; PRE_HYDRATION/ARMED: restore-fallback or slot not expired
+                if ((stream.State == StreamState.PRE_HYDRATION || stream.State == StreamState.ARMED || stream.State == StreamState.RANGE_BUILDING) &&
                     !stream.Committed)
                 {
                     var canonicalInstrument = stream.CanonicalInstrument;

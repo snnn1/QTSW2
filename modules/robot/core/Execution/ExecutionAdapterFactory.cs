@@ -11,10 +11,12 @@ public static class ExecutionAdapterFactory
     /// <summary>
     /// Create execution adapter based on mode.
     /// </summary>
-    public static IExecutionAdapter Create(ExecutionMode mode, string projectRoot, RobotLogger log, ExecutionJournal? executionJournal = null)
+    /// <param name="time">TimeService for LIVE adapter (breakout validity gate). Optional; defaults to America/Chicago.</param>
+    public static IExecutionAdapter Create(ExecutionMode mode, string projectRoot, RobotLogger log, ExecutionJournal? executionJournal = null, TimeService? time = null)
     {
         IExecutionAdapter adapter;
-        
+        var timeService = time ?? new TimeService("America/Chicago");
+
         switch (mode)
         {
             case ExecutionMode.DRYRUN:
@@ -38,8 +40,14 @@ public static class ExecutionAdapterFactory
                 break;
 
             case ExecutionMode.LIVE:
-                // LIVE mode requires explicit enablement (Phase C)
-                throw new InvalidOperationException("LIVE mode is not yet enabled. Use DRYRUN or SIM.");
+                adapter = new NinjaTraderLiveAdapter(log, timeService);
+                log.Write(RobotEvents.EngineBase(
+                    DateTimeOffset.UtcNow,
+                    tradingDate: "",
+                    eventType: "ADAPTER_SELECTED",
+                    state: "ENGINE",
+                    new { mode = "LIVE", adapter = "NinjaTraderLiveAdapter" }));
+                break;
 
             default:
                 throw new ArgumentException($"Unknown execution mode: {mode}", nameof(mode));

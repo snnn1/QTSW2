@@ -162,5 +162,7 @@ public sealed class ParityInstrument
     public string base_instrument { get; set; } = "";
 
     public decimal scaling_factor { get; set; }
+
+    public int breakout_validity_tolerance_ticks { get; set; } = 2;
 }
 

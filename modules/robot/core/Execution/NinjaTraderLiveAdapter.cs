@@ -9,11 +9,13 @@ namespace QTSW2.Robot.Core.Execution;
 /// NinjaTrader Live adapter: places orders in real brokerage account.
 /// Stub implementation - actual NT integration to be added in Phase C.
 /// Requires explicit two-key enable (CLI flag + config).
+/// GetCurrentMarketPrice: Uses Instrument.MarketData when SetNTContext called (breakout validity gate).
 /// </summary>
 public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
 {
     private readonly RobotLogger _log;
     private readonly TimeService _time;
+    private object? _ntInstrument; // NinjaTrader.Cbi.Instrument when SetNTContext called
 
     public NinjaTraderLiveAdapter(RobotLogger log, TimeService time)
     {
@@ -28,6 +30,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         // TODO: Phase C - Implement actual NT Live order placement with guardrails
@@ -215,6 +218,88 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
                     note = "Failed to cancel robot-owned orders in LIVE account"
                 }));
         }
+    }
+
+    /// <summary>
+    /// Set NinjaTrader context (Account, Instrument) from Strategy host.
+    /// Required for GetCurrentMarketPrice to return live bid/ask (breakout validity gate).
+    /// When not set, GetCurrentMarketPrice returns (null, null) → gate fail-open.
+    /// </summary>
+    public void SetNTContext(object account, object instrument)
+    {
+        _ntInstrument = instrument;
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "LIVE_ADAPTER_NT_CONTEXT_SET", state: "ENGINE",
+            new { note = "NinjaTrader Instrument set for live market price (breakout validity gate)" }));
+    }
+
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+    {
+        if (_ntInstrument == null)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "GET_MARKET_PRICE_LIVE_NO_CONTEXT", state: "ENGINE",
+                new { instrument, note = "LIVE adapter: SetNTContext not called - returning (null,null), gate fail-open" }));
+            return (null, null);
+        }
+        try
+        {
+            dynamic dynInstrument = _ntInstrument;
+            var marketData = dynInstrument.MarketData;
+            if (marketData == null)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "GET_MARKET_PRICE_LIVE_NO_MARKET_DATA", state: "ENGINE",
+                    new { instrument, note = "Instrument.MarketData is null - returning (null,null)" }));
+                return (null, null);
+            }
+            double? bid = null;
+            double? ask = null;
+            try
+            {
+                var bidObj = marketData.GetBid(0);
+                var askObj = marketData.GetAsk(0);
+                bid = ToDoubleOrNull(bidObj);
+                ask = ToDoubleOrNull(askObj);
+            }
+            catch
+            {
+                try
+                {
+                    var bidObj = marketData.Bid;
+                    var askObj = marketData.Ask;
+                    bid = ToDoubleOrNull(bidObj);
+                    ask = ToDoubleOrNull(askObj);
+                }
+                catch
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "GET_MARKET_PRICE_LIVE_ACCESS_ERROR", state: "ENGINE",
+                        new { instrument, note = "GetBid/GetAsk failed - returning (null,null)" }));
+                    return (null, null);
+                }
+            }
+            if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
+            {
+                return ((decimal)bid.Value, (decimal)ask.Value);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "GET_MARKET_PRICE_LIVE_EXCEPTION", state: "ENGINE",
+                new { instrument, error = ex.Message, note = "Exception accessing market data - returning (null,null)" }));
+        }
+        return (null, null);
+    }
+
+    private static double? ToDoubleOrNull(object? value)
+    {
+        if (value == null) return null;
+        try { return Convert.ToDouble(value); } catch { return null; }
+    }
+
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+        var ids = orderIds?.ToList() ?? new List<string>();
+        if (ids.Count > 0)
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_LIVE_STUB", state: "ENGINE",
+                new { order_ids = ids, account = "LIVE", note = "LIVE adapter CancelOrders not yet implemented" }));
     }
 
     public void EnqueueExecutionCommand(ExecutionCommandBase command)

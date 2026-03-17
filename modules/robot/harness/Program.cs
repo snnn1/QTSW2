@@ -84,6 +84,24 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Recovery Phase 3 tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("RANGE_BUILDING_SNAPSHOT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = RangeBuildingSnapshotTests.RunRangeBuildingSnapshotTests();
+        Console.WriteLine(pass ? "PASS: RANGE_BUILDING snapshot tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("BREAKOUT_EXECUTION_DECISION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = BreakoutExecutionDecisionTests.RunBreakoutExecutionDecisionTests();
+        Console.WriteLine(pass ? "PASS: Breakout execution decision tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("MIXED_STOP_MARKET_ENTRY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = MixedStopMarketEntryTests.RunMixedStopMarketEntryTests();
+        Console.WriteLine(pass ? "PASS: Mixed STOP/MARKET entry tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("BOOTSTRAP_PHASE4", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = BootstrapPhase4Tests.RunBootstrapPhase4Tests();
@@ -154,6 +172,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = ExecutionEventReplayTests.RunExecutionEventReplayTests();
         Console.WriteLine(pass ? "PASS: Execution event replay tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("ORDER_RECONCILIATION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = OrderReconciliationRecoveryTests.RunOrderReconciliationRecoveryTests();
+        Console.WriteLine(pass ? "PASS: Order reconciliation recovery tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("BREAKOUT_VALIDITY_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = BreakoutValidityGateTests.RunBreakoutValidityGateTests();
+        Console.WriteLine(pass ? "PASS: Breakout validity gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("CHAOS", StringComparison.OrdinalIgnoreCase))

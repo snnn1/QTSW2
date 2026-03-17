@@ -19,6 +19,7 @@ public interface IExecutionAdapter
     /// <param name="entryPrice">Entry price (null for market order, used as limit price for Limit orders, stop price for StopMarket orders)</param>
     /// <param name="quantity">Number of contracts</param>
     /// <param name="entryOrderType">Order type: "LIMIT", "STOP_MARKET", or "MARKET" (null defaults to Limit if entryPrice provided, Market if null)</param>
+    /// <param name="ocoGroup">Optional OCO group to link with paired entry (e.g. when breakout crossed, MARKET + STOP need same OCO)</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Order submission result</returns>
     OrderSubmissionResult SubmitEntryOrder(
@@ -28,6 +29,7 @@ public interface IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow);
 
     /// <summary>
@@ -123,6 +125,11 @@ public interface IExecutionAdapter
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Account snapshot</returns>
     AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Get current market bid/ask for breakout validity gate. Returns (null, null) when unavailable (gate skips, fail open).
+    /// </summary>
+    (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow);
     
     /// <summary>
     /// Cancel robot-owned working orders only (strict prefix matching: "QTSW2:").

@@ -150,6 +150,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         decimal? entryPrice,
         int quantity,
         string? entryOrderType,
+        string? ocoGroup,
         DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
@@ -201,7 +202,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         try
         {
-            return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, utcNow);
+            return SubmitEntryOrderReal(intentId, instrument, direction, entryPrice, quantity, entryOrderType, ocoGroup, utcNow);
         }
         catch (Exception ex)
         {
@@ -1270,6 +1271,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         }
 
         return GetAccountSnapshotReal(utcNow);
+    }
+
+    public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
+    {
+#if !NINJATRADER
+        return (null, null);
+#endif
+        if (!_ntContextSet)
+            return (null, null);
+        return GetCurrentMarketPriceReal(instrument, utcNow);
     }
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
