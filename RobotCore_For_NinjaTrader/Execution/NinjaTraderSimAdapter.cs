@@ -95,7 +95,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     /// <summary>Callback when reentry protective bracket is accepted (both stop and target Working). Engine invokes HandleReentryProtectionAccepted on matching stream.</summary>
     private Action<string, DateTimeOffset>? _onReentryProtectionAcceptedCallback;
-    
+
+    /// <summary>Callback to check if entry orders for a stream should be cancelled when position is flat (invalid lifecycle).
+    /// Returns (ShouldCancel, Reason) - true when stream is no longer eligible (EXPIRED, COMMITTED, forced_flatten, etc.).</summary>
+    private Func<string, string, (bool ShouldCancel, string? Reason)>? _shouldCancelEntryOrdersForStreamCallback;
+
     /// <summary>Reentry intents for which we have already invoked the protection-accepted callback (idempotency).</summary>
     private readonly HashSet<string> _reentryProtectionAcceptedNotified = new(StringComparer.OrdinalIgnoreCase);
     
@@ -461,7 +465,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Action<string, DateTimeOffset, string>? blockInstrumentCallback = null,
         Action<string, string, object>? onSupervisoryCriticalCallback = null,
         Action<string, DateTimeOffset>? onReentryFillCallback = null,
-        Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null)
+        Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null,
+        Func<string, string, (bool ShouldCancel, string? Reason)>? shouldCancelEntryOrdersForStreamCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -470,6 +475,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _onSupervisoryCriticalCallback = onSupervisoryCriticalCallback;
         _onReentryFillCallback = onReentryFillCallback;
         _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
+        _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
     }
     
     /// <summary>
@@ -2194,6 +2200,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
 
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
+    }
+
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+#if !NINJATRADER
+        var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined.";
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+            new { reason = "NINJATRADER_NOT_DEFINED", error }));
+        throw new InvalidOperationException(error);
+#else
+        CancelOrdersReal(orderIds?.ToList() ?? new List<string>(), utcNow);
+#endif
     }
 
     /// <summary>

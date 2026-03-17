@@ -29,6 +29,7 @@ from .config import (
     IDENTITY_EXPIRY_SECONDS,
     ORDER_STUCK_ENTRY_THRESHOLD_SECONDS,
     ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS,
+    ORDER_STUCK_REORDER_GRACE_SECONDS,
     EXECUTION_LATENCY_SPIKE_THRESHOLD_MS,
     DISCONNECT_DEDUPE_WINDOW_SECONDS,
 )
@@ -44,6 +45,34 @@ SLOT_ENDS = {
 }
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+# Execution policy cache for canonical -> execution instrument (YM -> MYM, etc.)
+_execution_instrument_cache: Optional[Dict[str, str]] = None
+
+
+def _get_execution_instrument_for_canonical(canonical: str) -> Optional[str]:
+    """Get enabled execution instrument for canonical from execution policy (e.g. YM -> MYM)."""
+    global _execution_instrument_cache
+    if not canonical:
+        return None
+    canonical = str(canonical).strip().upper()
+    try:
+        if _execution_instrument_cache is None:
+            policy_path = Path(__file__).parent.parent.parent / "configs" / "execution_policy.json"
+            if not policy_path.exists():
+                return None
+            with open(policy_path, "r", encoding="utf-8") as f:
+                policy = json.load(f)
+            cache = {}
+            for canon, cfg in policy.get("canonical_markets", {}).items():
+                for exec_inst, inst_cfg in cfg.get("execution_instruments", {}).items():
+                    if inst_cfg.get("enabled"):
+                        cache[canon.upper()] = exec_inst
+                        break
+            _execution_instrument_cache = cache
+        return _execution_instrument_cache.get(canonical)
+    except Exception:
+        return None
 
 
 def _infer_session_from_chicago(chicago_dt: datetime) -> str:
@@ -328,6 +357,7 @@ class WatchdogStateManager:
     def check_stuck_orders(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """
         Phase 7: Return list of stuck order events (working longer than threshold).
+        Reorder grace: skip flagging when within grace window (late cancel events from multi-file merge).
         Caller should emit and clear to avoid repeat.
         """
         now = now or datetime.now(timezone.utc)
@@ -343,19 +373,26 @@ class WatchdogStateManager:
                 else ORDER_STUCK_PROTECTIVE_THRESHOLD_SECONDS
             )
             working_sec = (now - submitted_at).total_seconds()
-            if working_sec >= threshold:
-                stuck.append({
-                    "broker_order_id": broker_order_id,
-                    "order_id": broker_order_id,
-                    "intent_id": info.get("intent_id", ""),
-                    "instrument": info.get("instrument", ""),
-                    "stream_key": info.get("stream_key", ""),
-                    "role": role,
-                    "order_state": "WORKING",
-                    "working_duration_seconds": int(working_sec),
-                    "threshold_seconds": threshold,
-                })
-                self._pending_orders.pop(broker_order_id, None)
+            if working_sec < threshold:
+                continue
+            if working_sec < threshold + ORDER_STUCK_REORDER_GRACE_SECONDS:
+                logger.debug(
+                    "ORDER_STUCK_SKIPPED_REORDER_GRACE broker_order_id=%s working_duration=%.0fs threshold=%s grace=%s",
+                    broker_order_id, working_sec, threshold, ORDER_STUCK_REORDER_GRACE_SECONDS,
+                )
+                continue
+            stuck.append({
+                "broker_order_id": broker_order_id,
+                "order_id": broker_order_id,
+                "intent_id": info.get("intent_id", ""),
+                "instrument": info.get("instrument", ""),
+                "stream_key": info.get("stream_key", ""),
+                "role": role,
+                "order_state": "WORKING",
+                "working_duration_seconds": int(working_sec),
+                "threshold_seconds": threshold,
+            })
+            self._pending_orders.pop(broker_order_id, None)
         return stuck
 
     def drain_pending_derived_events(self) -> List[Dict[str, Any]]:
@@ -1170,6 +1207,21 @@ class WatchdogStateManager:
                 elif execution_instrument_full_name.startswith(stream_execution_instrument.split()[0] if ' ' in stream_execution_instrument else stream_execution_instrument):
                     if info.state in bar_dependent_states and not info.committed:
                         return True
+            else:
+                # Fallback: stream has no execution_instrument from events (e.g. robot didn't emit it).
+                # Match by canonical instrument: "MYM 03-26" -> canonical "YM" should match YM1 stream.
+                stream_canonical = getattr(info, 'instrument', None) or (self._timetable_streams.get(stream) or {}).get('instrument', '')
+                if stream_canonical and execution_instrument_full_name:
+                    exec_root = execution_instrument_full_name.split()[0] if ' ' in execution_instrument_full_name else execution_instrument_full_name
+                    try:
+                        from modules.analyzer.logic.instrument_logic import InstrumentManager
+                        mgr = InstrumentManager()
+                        exec_canonical = mgr.get_base_instrument(exec_root) if mgr.is_micro_future(exec_root) else exec_root
+                        if exec_canonical and exec_canonical.upper() == str(stream_canonical).strip().upper():
+                            if info.state in bar_dependent_states and not info.committed:
+                                return True
+                    except Exception:
+                        pass
         
         return False
     
@@ -1442,16 +1494,32 @@ class WatchdogStateManager:
             execution_instrument = getattr(info, 'execution_instrument', None)
             if execution_instrument:
                 all_execution_instruments.add(execution_instrument)
+        # Include execution instruments from timetable for enabled streams (fixes MYM/YM not tracked)
+        # When robot emits instrument="YM" in bar events, we track under "YM"; timetable has YM1 -> YM -> MYM
+        timetable_execution_instruments = set()
+        if self._enabled_streams and self._timetable_streams:
+            for stream_id in self._enabled_streams:
+                meta = self._timetable_streams.get(stream_id, {})
+                canonical = meta.get('instrument', '')
+                if canonical:
+                    exec_instr = _get_execution_instrument_for_canonical(canonical)
+                    if exec_instr:
+                        all_execution_instruments.add(exec_instr)
+                        timetable_execution_instruments.add(exec_instr)
         
         # CRITICAL FIX: Filter out root-name entries (e.g., "M2K") that don't have contract suffix
         # These are old entries from before the contract name format change
         # Only keep entries that look like full contract names (contain space and date)
+        # Exception: timetable-derived execution instruments (e.g. MYM) are kept so YM1 is tracked
         filtered_instruments = set()
         for inst in all_execution_instruments:
             # Full contract names have format like "MES 03-26" (space + date)
             # Root names are just "MES" (no space)
             if ' ' in inst and len(inst.split()) >= 2:
                 # Looks like full contract name - keep it
+                filtered_instruments.add(inst)
+            elif inst in timetable_execution_instruments:
+                # From timetable (YM1 -> MYM) - keep so Instrument Health shows MYM
                 filtered_instruments.add(inst)
             elif inst not in self._last_bar_utc_by_execution_instrument:
                 # Root name but not in tracking dict - skip it
@@ -1549,6 +1617,18 @@ class WatchdogStateManager:
         # Check instruments that are expecting bars
         for execution_instrument_full_name in instruments_with_bars_expected:
             last_bar_utc = self._last_bar_utc_by_execution_instrument.get(execution_instrument_full_name)
+            # When robot emits instrument="YM" in bar events, bars are keyed by "YM" not "MYM"
+            # Fallback: check canonical bar key for timetable-derived execution instruments (MYM -> YM)
+            if last_bar_utc is None and execution_instrument_full_name in timetable_execution_instruments:
+                try:
+                    from modules.analyzer.logic.instrument_logic import InstrumentManager
+                    mgr = InstrumentManager()
+                    root = execution_instrument_full_name.split()[0] if ' ' in execution_instrument_full_name else execution_instrument_full_name
+                    canonical = mgr.get_base_instrument(root) if mgr.is_micro_future(root) else root
+                    if canonical:
+                        last_bar_utc = self._last_bar_utc_by_execution_instrument.get(canonical)
+                except Exception:
+                    pass
             if last_bar_utc:
                 elapsed = (now - last_bar_utc).total_seconds()
                 stall_detected = (

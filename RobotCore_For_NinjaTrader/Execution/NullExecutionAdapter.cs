@@ -187,6 +187,14 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         // DRYRUN: No-op
     }
 
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+        var ids = orderIds?.ToList() ?? new List<string>();
+        if (ids.Count > 0)
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "CANCEL_ORDERS_DRYRUN", state: "ENGINE",
+                new { order_ids = ids, note = "DRYRUN: would cancel orders" }));
+    }
+
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         // DRYRUN: Log what would be cancelled, but do nothing

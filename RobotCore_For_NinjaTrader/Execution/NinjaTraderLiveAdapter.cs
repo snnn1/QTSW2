@@ -203,6 +203,14 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         }
     }
     
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+        var ids = orderIds?.ToList() ?? new List<string>();
+        if (ids.Count > 0)
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ORDERS_LIVE_STUB", state: "ENGINE",
+                new { order_ids = ids, account = "LIVE", note = "LIVE adapter CancelOrders not yet implemented" }));
+    }
+
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         // LIVE adapter: Implement cancel using NT account (fail-closed on error)

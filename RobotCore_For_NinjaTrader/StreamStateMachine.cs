@@ -77,6 +77,20 @@ public sealed class StreamStateMachine
     public DateTimeOffset MarketCloseUtc { get; private set; }
 
     /// <summary>
+    /// Returns whether entry orders for this stream are still eligible (no cancellation needed when position flat).
+    /// When false, entry orders should be cancelled when position is flat (invalid lifecycle state).
+    /// Eligible: ACTIVE RANGE_LOCKED. Non-eligible: EXPIRED, COMMITTED, POST-FLATTEN, forced_flatten.
+    /// </summary>
+    public (bool Eligible, string? Reason) GetEntryOrderCancellationEligibility()
+    {
+        if (Committed) return (false, "committed");
+        if (State != StreamState.RANGE_LOCKED) return (false, "invalid_state");
+        if (_journal.SlotStatus != SlotStatus.ACTIVE) return (false, "slot_expired");
+        if (_journal.ExecutionInterruptedByClose) return (false, "forced_flatten");
+        return (true, null);
+    }
+
+    /// <summary>
     /// Returns a dictionary of stream status fields for logging (STREAM_STATUS_SUMMARY, STREAM_STATE_SNAPSHOT).
     /// </summary>
     public Dictionary<string, object> GetStatusForLogging(DateTimeOffset utcNow)
@@ -6868,6 +6882,14 @@ public sealed class StreamStateMachine
             {
                 try { simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow); }
                 catch { /* Log error but continue */ }
+            }
+            else if (_brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            {
+                // Pre-entry: cancel long/short entry bracket intents (OriginalIntentId empty when no fill)
+                var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+                var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+                try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
+                try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
             }
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {

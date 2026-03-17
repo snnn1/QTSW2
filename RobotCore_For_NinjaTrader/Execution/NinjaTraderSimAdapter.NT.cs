@@ -5537,12 +5537,13 @@ public sealed partial class NinjaTraderSimAdapter
                 }
             }
             
-            // If position is flat, cancel all entry stop orders for this instrument
+            // If position is flat, cancel entry stop orders when:
+            // 1. At least one entry filled (post-entry cleanup) - existing
+            // 2. Stream no longer eligible (slot_expired, committed, forced_flatten) - lifecycle cleanup
             if (position != null && position.MarketPosition == MarketPosition.Flat)
             {
-                // GUARD: Only cancel when at least one entry has filled for this instrument (post-entry cleanup).
-                // Pre-entry RANGE_LOCKED streams have valid entry orders waiting for breakout - do NOT cancel.
                 bool anyEntryFilledForInstrument = false;
+                var invalidStateIntentsToCancel = new List<(string IntentId, string Stream, string Reason)>();
                 foreach (var kvp in IntentMap)
                 {
                     var intent = kvp.Value;
@@ -5556,18 +5557,27 @@ public sealed partial class NinjaTraderSimAdapter
                         (!intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") &&
                          !intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
                         continue;
+                    var entryFilled = false;
                     if (_executionJournal != null && !string.IsNullOrEmpty(intent.TradingDate) && !string.IsNullOrEmpty(intent.Stream))
                     {
                         var entry = _executionJournal.GetEntry(kvp.Key, intent.TradingDate, intent.Stream);
-                        if (entry != null && (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0))
+                        entryFilled = entry != null && (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0);
+                    }
+                    if (entryFilled)
+                        anyEntryFilledForInstrument = true;
+                    else
+                    {
+                        // Unfilled - check if stream is no longer eligible (lifecycle cleanup)
+                        if (_shouldCancelEntryOrdersForStreamCallback != null && !string.IsNullOrEmpty(intent.Stream) && !string.IsNullOrEmpty(intent.TradingDate))
                         {
-                            anyEntryFilledForInstrument = true;
-                            break;
+                            var (shouldCancel, reason) = _shouldCancelEntryOrdersForStreamCallback(intent.Stream, intent.TradingDate);
+                            if (shouldCancel && !string.IsNullOrEmpty(reason))
+                                invalidStateIntentsToCancel.Add((kvp.Key, intent.Stream, reason));
                         }
                     }
                 }
-                if (!anyEntryFilledForInstrument)
-                    return; // Pre-entry state (e.g. RANGE_LOCKED waiting) - do not cancel valid entry orders
+                if (!anyEntryFilledForInstrument && invalidStateIntentsToCancel.Count == 0)
+                    return; // Pre-entry RANGE_LOCKED valid - do not cancel
 
                 // Reset ProtectionState for intents that had position (entry filled) - position now flat
                 foreach (var kvp in IntentMap)
@@ -5589,38 +5599,37 @@ public sealed partial class NinjaTraderSimAdapter
                             PruneIntentState(kvp.Key, "position_flat");
                     }
                 }
-                // Find all entry intents for this instrument that haven't filled yet
+                // Build cancellation list: post-entry cleanup (all unfilled) OR invalid-state lifecycle (stream no longer eligible)
                 var entryIntentIdsToCancel = new List<string>();
-                
-                foreach (var kvp in IntentMap)
+                var invalidStateReasons = new Dictionary<string, (string Stream, string Reason)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (intentId, stream, reason) in invalidStateIntentsToCancel)
                 {
-                    var intent = kvp.Value;
-                    
-                    // Match instrument (intent may store canonical NG, orderInfo may have execution MNG)
-                    var intentInstrument = intent.Instrument ?? "";
-                    var intentExecutionInstrument = intent.ExecutionInstrument ?? intentInstrument;
-                    if (string.IsNullOrEmpty(instrument) ||
-                        (string.Compare(intentInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0 &&
-                         string.Compare(intentExecutionInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0))
-                        continue;
-                    
-                    // Only check entry stop bracket intents
-                    if (intent.TriggerReason == null ||
-                        (!intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") &&
-                         !intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
-                        continue;
-                    
-                    // Check if entry hasn't filled yet
-                    var entryFilled = false;
-                    if (_executionJournal != null && !string.IsNullOrEmpty(intent.TradingDate) && !string.IsNullOrEmpty(intent.Stream))
+                    entryIntentIdsToCancel.Add(intentId);
+                    invalidStateReasons[intentId] = (stream, reason);
+                }
+                if (anyEntryFilledForInstrument)
+                {
+                    foreach (var kvp in IntentMap)
                     {
-                        var journalEntry = _executionJournal.GetEntry(kvp.Key, intent.TradingDate, intent.Stream);
-                        entryFilled = journalEntry != null && (journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0);
-                    }
-                    
-                    if (!entryFilled)
-                    {
-                        entryIntentIdsToCancel.Add(kvp.Key);
+                        var intent = kvp.Value;
+                        var intentInstrument = intent.Instrument ?? "";
+                        var intentExecutionInstrument = intent.ExecutionInstrument ?? intentInstrument;
+                        if (string.IsNullOrEmpty(instrument) ||
+                            (string.Compare(intentInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0 &&
+                             string.Compare(intentExecutionInstrument, instrument, StringComparison.OrdinalIgnoreCase) != 0))
+                            continue;
+                        if (intent.TriggerReason == null ||
+                            (!intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") &&
+                             !intent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
+                            continue;
+                        var entryFilled = false;
+                        if (_executionJournal != null && !string.IsNullOrEmpty(intent.TradingDate) && !string.IsNullOrEmpty(intent.Stream))
+                        {
+                            var journalEntry = _executionJournal.GetEntry(kvp.Key, intent.TradingDate, intent.Stream);
+                            entryFilled = journalEntry != null && (journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0);
+                        }
+                        if (!entryFilled && !entryIntentIdsToCancel.Contains(kvp.Key))
+                            entryIntentIdsToCancel.Add(kvp.Key);
                     }
                 }
                 
@@ -5630,17 +5639,15 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     foreach (var entryIntentId in entryIntentIdsToCancel)
                     {
-                        var cid = $"CANCEL:{entryIntentId}:POSITION_FLAT_CLEANUP";
-                        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, entryIntentId, instrument, false, "POSITION_FLAT_CLEANUP", utcNow), out _);
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_ENQUEUED_ON_POSITION_FLAT",
-                            new
-                            {
-                                cancelled_entry_intent_id = entryIntentId,
-                                instrument = instrument,
-                                position_market_position = "Flat",
-                                correlation_id = cid,
-                                note = "Cancel enqueued for strategy thread (position flat cleanup)"
-                            }));
+                        var isInvalidState = invalidStateReasons.TryGetValue(entryIntentId, out var inv);
+                        var cid = isInvalidState ? $"CANCEL:{entryIntentId}:INVALID_STATE" : $"CANCEL:{entryIntentId}:POSITION_FLAT_CLEANUP";
+                        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, entryIntentId, instrument, false, isInvalidState ? "INVALID_STATE" : "POSITION_FLAT_CLEANUP", utcNow), out _);
+                        if (isInvalidState)
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_ORDERS_CANCELLED_POSITION_FLAT_INVALID_STATE",
+                                new { stream = inv.Stream, instrument = instrument, state = "flat", reason = inv.Reason, correlation_id = cid }));
+                        else
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_ENQUEUED_ON_POSITION_FLAT",
+                                new { cancelled_entry_intent_id = entryIntentId, instrument = instrument, position_market_position = "Flat", correlation_id = cid, note = "Cancel enqueued for strategy thread (position flat cleanup)" }));
                     }
                 }
                 else
@@ -5652,26 +5659,18 @@ public sealed partial class NinjaTraderSimAdapter
                             var cancelled = CancelIntentOrders(entryIntentId, utcNow);
                             if (cancelled)
                             {
-                                _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCELLED_ON_POSITION_FLAT",
-                                    new
-                                    {
-                                        cancelled_entry_intent_id = entryIntentId,
-                                        instrument = instrument,
-                                        position_market_position = "Flat",
-                                        note = "Cancelled entry stop order because position is flat (manual closure detected)"
-                                    }));
+                                if (invalidStateReasons.TryGetValue(entryIntentId, out var inv))
+                                    _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_ORDERS_CANCELLED_POSITION_FLAT_INVALID_STATE",
+                                        new { stream = inv.Stream, instrument = instrument, state = "flat", reason = inv.Reason }));
+                                else
+                                    _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCELLED_ON_POSITION_FLAT",
+                                        new { cancelled_entry_intent_id = entryIntentId, instrument = instrument, position_market_position = "Flat", note = "Cancelled entry stop order because position is flat (manual closure detected)" }));
                             }
                         }
                         catch (Exception ex)
                         {
                             _log.Write(RobotEvents.ExecutionBase(utcNow, entryIntentId, instrument, "ENTRY_STOP_CANCEL_FAILED_ON_POSITION_FLAT",
-                                new
-                                {
-                                    error = ex.Message,
-                                    entry_intent_id = entryIntentId,
-                                    instrument = instrument,
-                                    note = "Failed to cancel entry stop order when position went flat - re-entry may occur"
-                                }));
+                                new { error = ex.Message, entry_intent_id = entryIntentId, instrument = instrument, note = "Failed to cancel entry stop order when position went flat - re-entry may occur" }));
                         }
                     }
                 }
@@ -5694,6 +5693,47 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>
     /// Cancel robot-owned working orders using real NT API (strict prefix matching).
     /// </summary>
+    /// <summary>
+    /// Cancel specific orders by broker order ID (stream-scoped recovery, e.g. CancelAndRebuild).
+    /// </summary>
+    private void CancelOrdersReal(List<string> orderIds, DateTimeOffset utcNow)
+    {
+        if (_ntAccount == null || orderIds == null || orderIds.Count == 0)
+            return;
+
+        var account = _ntAccount as Account;
+        if (account == null)
+            return;
+
+        var orderIdSet = new HashSet<string>(orderIds, StringComparer.OrdinalIgnoreCase);
+        var ordersToCancel = new List<Order>();
+
+        foreach (var order in account.Orders)
+        {
+            if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
+                continue;
+            if (orderIdSet.Contains(order.OrderId))
+                ordersToCancel.Add(order);
+        }
+
+        if (ordersToCancel.Count > 0)
+        {
+            try
+            {
+                if (!EnsureStrategyThreadOrEnqueue("CancelOrdersReal", null, null, $"CANCEL_ORDERS:{string.Join(",", orderIds)}",
+                    () => account.Cancel(ordersToCancel.ToArray())))
+                    return;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENTRY_ORDER_SET_CANCEL_CONFIRMED", state: "ENGINE",
+                    new { cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(), note = "Stream-scoped entry orders cancelled" }));
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_ROBOT_ORDERS_ERROR", state: "ENGINE",
+                    new { error = ex.Message, order_ids = orderIds, note = "Failed to cancel specific orders" }));
+            }
+        }
+    }
+
     private void CancelRobotOwnedWorkingOrdersReal(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         if (_ntAccount == null)

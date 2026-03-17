@@ -153,6 +153,13 @@ public interface IExecutionAdapter
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
 
     /// <summary>
+    /// Cancel specific orders by broker order IDs (stream-scoped recovery, e.g. CancelAndRebuild).
+    /// </summary>
+    /// <param name="orderIds">Broker order IDs to cancel</param>
+    /// <param name="utcNow">Current UTC timestamp</param>
+    void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow);
+
+    /// <summary>
     /// Phase 3: Evaluate break-even triggers. When IEA enabled, delegates to IEA. Uses tick de-dupe when tickTimeFromEvent provided.
     /// </summary>
     /// <param name="tickPrice">Current tick price</param>

@@ -1048,6 +1048,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         else if (dict == null)
                             dict = new Dictionary<string, object> { ["instrument"] = instrument };
                         _healthMonitor?.ReportCritical(eventType, dict);
+                    },
+                    shouldCancelEntryOrdersForStreamCallback: (streamId, tradingDate) =>
+                    {
+                        if (!_streams.TryGetValue(streamId, out var stream))
+                            return (true, "stream_not_found");
+                        if (stream.TradingDate != tradingDate)
+                            return (true, "stream_trading_date_mismatch");
+                        var (eligible, reason) = stream.GetEntryOrderCancellationEligibility();
+                        return (!eligible, reason);
                     }); // Gap 5: IEA EnqueueAndWait failure → block instrument
                 
                 // Wire coordinator to adapter

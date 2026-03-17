@@ -343,5 +343,21 @@ public sealed class StreamJournal
     /// Used when cloning-forward post-entry active slots across date rollover.
     /// </summary>
     public string? PriorJournalKey { get; set; }
+
+    /// <summary>
+    /// Entry-order recovery action (ResubmitClean, CancelAndRebuild, None).
+    /// Persisted for restart recovery.
+    /// </summary>
+    public string? RecoveryAction { get; set; }
+
+    /// <summary>
+    /// Reason for recovery action (e.g. missing, partial).
+    /// </summary>
+    public string? RecoveryActionReason { get; set; }
+
+    /// <summary>
+    /// When recovery action was issued (ISO 8601).
+    /// </summary>
+    public string? RecoveryActionIssuedUtc { get; set; }
 }
 

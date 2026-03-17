@@ -494,15 +494,23 @@ class EventFeedGenerator:
         
         processed_count = 0
         
-        # Read new events from all log files
+        # Read new events from all log files (attach file path for deterministic secondary sort)
         all_events = []
         for log_file in log_files:
             events = self._read_log_file_incremental(log_file)
-            all_events.extend(events)
+            for i, ev in enumerate(events):
+                all_events.append((ev, str(log_file), i))
         
-        # Sort events by timestamp to maintain chronological order
+        # Sort by (timestamp, file_path, index) for strict ordering across multi-file merge
         # RobotLogEvent uses "ts_utc"; converted format uses "timestamp_utc"
-        all_events.sort(key=lambda e: e.get("timestamp_utc") or e.get("ts_utc") or e.get("timestamp") or "")
+        # event_seq in raw events used as tertiary when present (replay)
+        def _sort_key(item):
+            ev, path, idx = item
+            ts = ev.get("timestamp_utc") or ev.get("ts_utc") or ev.get("timestamp") or ""
+            seq = ev.get("event_seq", 0) if isinstance(ev.get("event_seq"), (int, float)) else 0
+            return (ts, path, idx, seq)
+        all_events.sort(key=_sort_key)
+        all_events = [ev for ev, _, _ in all_events]
         
         # Process events and write to frontend feed
         tick_callsite_written = 0

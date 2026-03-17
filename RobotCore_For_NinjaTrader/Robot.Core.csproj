@@ -28,4 +28,8 @@
     <Compile Remove="NinjaTraderBarProviderWrapper.cs" />
     <Compile Remove="Strategies\RobotSimStrategy.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
+    <Compile Include="..\modules\robot\core\EntryOrderRecoveryTypes.cs" Link="EntryOrderRecoveryTypes.cs" />
+  </ItemGroup>
 </Project>
