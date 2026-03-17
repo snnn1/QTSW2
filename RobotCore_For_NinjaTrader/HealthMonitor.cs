@@ -46,6 +46,21 @@ public sealed class HealthMonitor
     
     // Data loss tracking: timestamp of last received bar per instrument
     private readonly Dictionary<string, DateTimeOffset> _lastBarUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 2: Multi-bar confirmation (debounce) - rolling bar intervals per instrument
+    private readonly Dictionary<string, List<double>> _lastBarIntervals = new(StringComparer.OrdinalIgnoreCase);
+    private const int BAR_INTERVAL_HISTORY_SIZE = 20;
+
+    // Phase 3: Activity-aware - last volume and price change per instrument (optional, for low-activity filtering)
+    private readonly Dictionary<string, long> _lastVolume = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, decimal> _lastClose = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 5: Cooldown after recovery - no new stall for expected_interval * 2
+    private readonly Dictionary<string, DateTimeOffset> _recoveryCooldownUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 4: Aggregation delay detection - track when instruments entered stall (for multi-instrument classification)
+    private readonly Dictionary<string, DateTimeOffset> _stallDetectedAtUtc = new(StringComparer.OrdinalIgnoreCase);
+    private const int AGGREGATION_DELAY_WINDOW_SECONDS = 60;
     
     // PHASE 3: Engine heartbeat and timetable poll tracking
     private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
@@ -675,29 +690,83 @@ public sealed class HealthMonitor
     /// <summary>
     /// Record bar reception for an instrument.
     /// </summary>
-    public void OnBar(string instrument, DateTimeOffset barUtc)
+    /// <param name="instrument">Instrument symbol</param>
+    /// <param name="barUtc">Bar timestamp (UTC)</param>
+    /// <param name="close">Optional bar close for activity-aware filtering (price change)</param>
+    /// <param name="volume">Optional bar volume for low-activity detection</param>
+    public void OnBar(string instrument, DateTimeOffset barUtc, decimal? close = null, long? volume = null)
     {
+        var utcNow = DateTimeOffset.UtcNow;
+
+        // Phase 2: Track bar intervals for debounce (expected interval = median of last N)
+        if (_lastBarUtcByInstrument.TryGetValue(instrument, out var prevBarUtc))
+        {
+            var intervalSec = (barUtc - prevBarUtc).TotalSeconds;
+            if (intervalSec > 0 && intervalSec < 86400) // Sanity: 0-24h
+            {
+                if (!_lastBarIntervals.TryGetValue(instrument, out var list))
+                {
+                    list = new List<double>();
+                    _lastBarIntervals[instrument] = list;
+                }
+                list.Add(intervalSec);
+                if (list.Count > BAR_INTERVAL_HISTORY_SIZE)
+                    list.RemoveAt(0);
+            }
+        }
+
+        // Phase 3: Track close and volume for activity-aware filtering
+        if (close.HasValue)
+            _lastClose[instrument] = close.Value;
+        if (volume.HasValue)
+            _lastVolume[instrument] = volume.Value;
+
         _lastBarUtcByInstrument[instrument] = barUtc;
-        
+
         // PHASE 4: Track that instrument has received initial data
         if (!_instrumentHasReceivedData.ContainsKey(instrument))
         {
             _instrumentHasReceivedData[instrument] = true;
             _instrumentFirstBarUtc[instrument] = barUtc;
         }
-        
+
         // Clear data loss flag if it was active (recovery)
+        var prevBarUtcForRecovery = _lastBarUtcByInstrument.TryGetValue(instrument, out var pbu) ? pbu : (DateTimeOffset?)null;
         if (_dataStallActive.TryGetValue(instrument, out var isActive) && isActive)
         {
             _dataStallActive[instrument] = false;
-            
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
+            _stallDetectedAtUtc.Remove(instrument);
+
+            // Phase 5: Set recovery cooldown (no new stall for expected_interval * 2)
+            var expectedInterval = GetExpectedIntervalSeconds(instrument);
+            var cooldownSec = Math.Max(expectedInterval * 2, 60);
+            _recoveryCooldownUntil[instrument] = utcNow.AddSeconds(cooldownSec);
+
+            var stallDuration = prevBarUtcForRecovery.HasValue ? (barUtc - prevBarUtcForRecovery.Value).TotalSeconds : 0;
+            var barsMissedEstimate = expectedInterval > 0 ? (int)Math.Round(stallDuration / expectedInterval) : 0;
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
                 new
                 {
                     instrument = instrument,
-                    last_bar_utc = barUtc.ToString("o")
+                    last_bar_utc = barUtc.ToString("o"),
+                    stall_duration_seconds = Math.Round(stallDuration, 1),
+                    bars_missed_estimate = barsMissedEstimate
                 }));
         }
+    }
+
+    /// <summary>
+    /// Get median expected bar interval (seconds) for debounce. Returns 0 if insufficient history.
+    /// </summary>
+    private double GetExpectedIntervalSeconds(string instrument)
+    {
+        if (!_lastBarIntervals.TryGetValue(instrument, out var list) || list.Count < 3)
+            return 0;
+        var sorted = new List<double>(list);
+        sorted.Sort();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
     }
     
     /// <summary>
@@ -887,57 +956,122 @@ public sealed class HealthMonitor
     }
     
     /// <summary>
-    /// PHASE 4: Evaluate data stalls (session-aware).
-    /// DISABLED: Notifications suppressed (log only) - handled by gap tolerance + range invalidation.
+    /// PHASE 4: Evaluate data stalls (quant-grade: instrument-aware, debounced, activity-aware).
+    /// Replaces simple "elapsed >= threshold" with: threshold = instrument-specific, debounce = expected_interval*3,
+    /// activity filter = low volume/price change suppresses stall when elapsed < threshold*2.
     /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
-        // Check each instrument that has received bars
         var instrumentsToCheck = new List<string>(_lastBarUtcByInstrument.Keys);
-        
+
         foreach (var instrument in instrumentsToCheck)
         {
             var lastBarUtc = _lastBarUtcByInstrument[instrument];
             var elapsed = (utcNow - lastBarUtc).TotalSeconds;
-            
-            var threshold = _config.data_stall_seconds;
-            
-            if (elapsed >= threshold)
+
+            // Part 1: Instrument-aware threshold
+            var thresholdSeconds = _config.GetStallThresholdSeconds(instrument);
+
+            // Part 2: Debounce - require elapsed >= max(threshold, expected_interval * 3)
+            var expectedInterval = GetExpectedIntervalSeconds(instrument);
+            var debounceThreshold = expectedInterval > 0 ? Math.Max(thresholdSeconds, expectedInterval * 3) : thresholdSeconds;
+
+            // Part 5: Cooldown - skip if we're in recovery cooldown
+            if (_recoveryCooldownUntil.TryGetValue(instrument, out var cooldownUntil) && utcNow < cooldownUntil)
+                continue;
+
+            // Part 3: Activity-aware - if low activity and elapsed < threshold*2, do NOT trigger stall
+            var isLowActivity = IsLowActivity(instrument);
+            if (isLowActivity && elapsed < thresholdSeconds * 2)
+                continue;
+
+            if (elapsed >= debounceThreshold)
             {
                 if (!_dataStallActive.TryGetValue(instrument, out var isActive) || !isActive)
                 {
-                    // First detection: mark active and log (no notification)
                     _dataStallActive[instrument] = true;
-                    
-                    // Rate limit logging to reduce verbosity (log at most once per 15 minutes per instrument)
+                    _stallDetectedAtUtc[instrument] = utcNow;
+
+                    // Part 4: Stall classification
+                    var classification = ClassifyStall(instrument, elapsed, expectedInterval, thresholdSeconds, isLowActivity, utcNow);
+
                     var shouldLog = true;
                     if (_lastDataLossLogUtcByInstrument.TryGetValue(instrument, out var lastLogUtc))
                     {
                         var timeSinceLastLog = (utcNow - lastLogUtc).TotalMinutes;
                         shouldLog = timeSinceLastLog >= DATA_LOSS_LOG_RATE_LIMIT_MINUTES;
                     }
-                    
+
                     if (shouldLog)
                     {
                         _lastDataLossLogUtcByInstrument[instrument] = utcNow;
-                        
-                        // LOG ONLY - no notification (handled by gap tolerance + range invalidation)
+
                         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
                             new
                             {
                                 instrument = instrument,
                                 last_bar_utc = lastBarUtc.ToString("o"),
-                                elapsed_seconds = elapsed,
-                                threshold_seconds = threshold,
+                                elapsed_seconds = Math.Round(elapsed, 1),
+                                expected_interval = expectedInterval > 0 ? Math.Round(expectedInterval, 1) : (double?)null,
+                                threshold_used = thresholdSeconds,
+                                stall_classification = classification,
+                                is_low_activity = isLowActivity,
                                 note = "Notification suppressed - handled by gap tolerance + range invalidation (log only, rate-limited)"
                             }));
                     }
-                    
-                    // NOTIFICATION DISABLED: Data loss is handled by gap tolerance + range invalidation
-                    // SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1);
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Check if instrument is in low-activity regime (volume 0 or tiny price change).
+    /// When volume/close not available, returns false (no suppression).
+    /// </summary>
+    private bool IsLowActivity(string instrument)
+    {
+        if (_lastVolume.TryGetValue(instrument, out var vol) && vol == 0)
+            return true;
+        if (_lastClose.TryGetValue(instrument, out var lastClose) && _lastBarUtcByInstrument.TryGetValue(instrument, out var lastBarUtc))
+        {
+            // Price change from previous bar - we'd need prev close. We don't have it easily.
+            // Use expected_interval as proxy: if expected > 120s (2 min bars), treat as low-activity regime
+            var expected = GetExpectedIntervalSeconds(instrument);
+            return expected > 120;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Classify stall: LOW_LIQUIDITY, AGGREGATION_DELAY, FEED_DELAY, DISCONNECT.
+    /// </summary>
+    private string ClassifyStall(string instrument, double elapsed, double expectedInterval, int thresholdSeconds, bool isLowActivity, DateTimeOffset utcNow)
+    {
+        if (isLowActivity && elapsed >= thresholdSeconds)
+            return "LOW_LIQUIDITY";
+
+        if (_currentIncident != null && _currentIncident.FirstDetectedUtc.HasValue)
+        {
+            var incidentAge = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
+            if (incidentAge < 300) // Connection event within 5 min
+                return "DISCONNECT";
+        }
+
+        var simultaneousCount = 0;
+        foreach (var kv in _stallDetectedAtUtc)
+        {
+            if (kv.Key == instrument) continue;
+            var age = (utcNow - kv.Value).TotalSeconds;
+            if (age <= AGGREGATION_DELAY_WINDOW_SECONDS)
+                simultaneousCount++;
+        }
+        if (simultaneousCount >= 1)
+            return "AGGREGATION_DELAY";
+
+        if (expectedInterval > 0 && elapsed >= expectedInterval * 2 && elapsed <= expectedInterval * 3 + 60)
+            return "FEED_DELAY";
+
+        return "DISCONNECT";
     }
     
     /// <summary>

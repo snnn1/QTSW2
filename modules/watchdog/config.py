@@ -63,9 +63,10 @@ STUCK_STREAM_THRESHOLD_SECONDS = 300
 UNPROTECTED_TIMEOUT_SECONDS = 10
 # DATA_STALL_THRESHOLD_SECONDS must be > rate limit of bar tracking events
 # ONBARUPDATE_CALLED and ENGINE_TICK_HEARTBEAT are rate-limited to 60 seconds
-# Set threshold to 120 seconds (2x rate limit) to avoid false positives from rate limiting
-# Increased from 90s to 120s to prevent flickering from temporary gaps
-DATA_STALL_THRESHOLD_SECONDS = 120  # Default, can be configurable per instrument
+# Aligned with HealthMonitor quant-grade redesign: 300s default, instrument-aware in robot
+DATA_STALL_THRESHOLD_SECONDS = 300
+# Grace period for bar reordering (late bars from multi-file merge)
+DATA_STALL_REORDER_GRACE_SECONDS = 10
 # DATA_EVENT_MAX_AGE_SECONDS: Reject bar events older than this (prevents stale bars from tail causing false DATA FLOWING)
 DATA_EVENT_MAX_AGE_SECONDS = 120  # Align with DATA_STALL_THRESHOLD
 # RECOVERY_TIMEOUT_SECONDS: Maximum time recovery can be in RECOVERY_RUNNING state

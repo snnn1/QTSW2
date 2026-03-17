@@ -46,6 +46,21 @@ public sealed class HealthMonitor
     
     // Data loss tracking: timestamp of last received bar per instrument
     private readonly Dictionary<string, DateTimeOffset> _lastBarUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 2: Multi-bar confirmation (debounce)
+    private readonly Dictionary<string, List<double>> _lastBarIntervals = new(StringComparer.OrdinalIgnoreCase);
+    private const int BAR_INTERVAL_HISTORY_SIZE = 20;
+
+    // Phase 3: Activity-aware
+    private readonly Dictionary<string, long> _lastVolume = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, decimal> _lastClose = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 5: Cooldown after recovery
+    private readonly Dictionary<string, DateTimeOffset> _recoveryCooldownUntil = new(StringComparer.OrdinalIgnoreCase);
+
+    // Phase 4: Aggregation delay detection
+    private readonly Dictionary<string, DateTimeOffset> _stallDetectedAtUtc = new(StringComparer.OrdinalIgnoreCase);
+    private const int AGGREGATION_DELAY_WINDOW_SECONDS = 60;
     
     // PHASE 3: Engine heartbeat and timetable poll tracking
     private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
@@ -453,29 +468,68 @@ public sealed class HealthMonitor
     /// <summary>
     /// Record bar reception for an instrument.
     /// </summary>
-    public void OnBar(string instrument, DateTimeOffset barUtc)
+    public void OnBar(string instrument, DateTimeOffset barUtc, decimal? close = null, long? volume = null)
     {
+        var utcNow = DateTimeOffset.UtcNow;
+
+        if (_lastBarUtcByInstrument.TryGetValue(instrument, out var prevBarUtc))
+        {
+            var intervalSec = (barUtc - prevBarUtc).TotalSeconds;
+            if (intervalSec > 0 && intervalSec < 86400)
+            {
+                if (!_lastBarIntervals.TryGetValue(instrument, out var list))
+                {
+                    list = new List<double>();
+                    _lastBarIntervals[instrument] = list;
+                }
+                list.Add(intervalSec);
+                if (list.Count > BAR_INTERVAL_HISTORY_SIZE)
+                    list.RemoveAt(0);
+            }
+        }
+
+        if (close.HasValue) _lastClose[instrument] = close.Value;
+        if (volume.HasValue) _lastVolume[instrument] = volume.Value;
+
+        var prevBarUtcForRecovery = _lastBarUtcByInstrument.TryGetValue(instrument, out var pbu) ? pbu : (DateTimeOffset?)null;
         _lastBarUtcByInstrument[instrument] = barUtc;
-        
-        // PHASE 4: Track that instrument has received initial data
+
         if (!_instrumentHasReceivedData.ContainsKey(instrument))
         {
             _instrumentHasReceivedData[instrument] = true;
             _instrumentFirstBarUtc[instrument] = barUtc;
         }
-        
-        // Clear data loss flag if it was active (recovery)
         if (_dataStallActive.TryGetValue(instrument, out var isActive) && isActive)
         {
             _dataStallActive[instrument] = false;
-            
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
+            _stallDetectedAtUtc.Remove(instrument);
+
+            var expectedInterval = GetExpectedIntervalSeconds(instrument);
+            var cooldownSec = Math.Max(expectedInterval * 2, 60);
+            _recoveryCooldownUntil[instrument] = utcNow.AddSeconds(cooldownSec);
+
+            var stallDuration = prevBarUtcForRecovery.HasValue ? (barUtc - prevBarUtcForRecovery.Value).TotalSeconds : 0;
+            var barsMissedEstimate = expectedInterval > 0 ? (int)Math.Round(stallDuration / expectedInterval) : 0;
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_STALL_RECOVERED", state: "ENGINE",
                 new
                 {
                     instrument = instrument,
-                    last_bar_utc = barUtc.ToString("o")
+                    last_bar_utc = barUtc.ToString("o"),
+                    stall_duration_seconds = Math.Round(stallDuration, 1),
+                    bars_missed_estimate = barsMissedEstimate
                 }));
         }
+    }
+
+    private double GetExpectedIntervalSeconds(string instrument)
+    {
+        if (!_lastBarIntervals.TryGetValue(instrument, out var list) || list.Count < 3)
+            return 0;
+        var sorted = new List<double>(list);
+        sorted.Sort();
+        var mid = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
     }
     
     /// <summary>
@@ -621,57 +675,101 @@ public sealed class HealthMonitor
     }
     
     /// <summary>
-    /// PHASE 4: Evaluate data stalls (session-aware).
-    /// DISABLED: Notifications suppressed (log only) - handled by gap tolerance + range invalidation.
+    /// PHASE 4: Evaluate data stalls (quant-grade: instrument-aware, debounced, activity-aware).
     /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
-        // Check each instrument that has received bars
         var instrumentsToCheck = new List<string>(_lastBarUtcByInstrument.Keys);
-        
+
         foreach (var instrument in instrumentsToCheck)
         {
             var lastBarUtc = _lastBarUtcByInstrument[instrument];
             var elapsed = (utcNow - lastBarUtc).TotalSeconds;
-            
-            var threshold = _config.data_stall_seconds;
-            
-            if (elapsed >= threshold)
+
+            var thresholdSeconds = _config.GetStallThresholdSeconds(instrument);
+            var expectedInterval = GetExpectedIntervalSeconds(instrument);
+            var debounceThreshold = expectedInterval > 0 ? Math.Max(thresholdSeconds, expectedInterval * 3) : thresholdSeconds;
+
+            if (_recoveryCooldownUntil.TryGetValue(instrument, out var cooldownUntil) && utcNow < cooldownUntil)
+                continue;
+
+            var isLowActivity = IsLowActivity(instrument);
+            if (isLowActivity && elapsed < thresholdSeconds * 2)
+                continue;
+
+            if (elapsed >= debounceThreshold)
             {
                 if (!_dataStallActive.TryGetValue(instrument, out var isActive) || !isActive)
                 {
-                    // First detection: mark active and log (no notification)
                     _dataStallActive[instrument] = true;
-                    
-                    // Rate limit logging to reduce verbosity (log at most once per 15 minutes per instrument)
+                    _stallDetectedAtUtc[instrument] = utcNow;
+
+                    var classification = ClassifyStall(instrument, elapsed, expectedInterval, thresholdSeconds, isLowActivity, utcNow);
+
                     var shouldLog = true;
                     if (_lastDataLossLogUtcByInstrument.TryGetValue(instrument, out var lastLogUtc))
                     {
                         var timeSinceLastLog = (utcNow - lastLogUtc).TotalMinutes;
                         shouldLog = timeSinceLastLog >= DATA_LOSS_LOG_RATE_LIMIT_MINUTES;
                     }
-                    
+
                     if (shouldLog)
                     {
                         _lastDataLossLogUtcByInstrument[instrument] = utcNow;
-                        
-                        // LOG ONLY - no notification (handled by gap tolerance + range invalidation)
+
                         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DATA_LOSS_DETECTED", state: "ENGINE",
                             new
                             {
                                 instrument = instrument,
                                 last_bar_utc = lastBarUtc.ToString("o"),
-                                elapsed_seconds = elapsed,
-                                threshold_seconds = threshold,
+                                elapsed_seconds = Math.Round(elapsed, 1),
+                                expected_interval = expectedInterval > 0 ? Math.Round(expectedInterval, 1) : (double?)null,
+                                threshold_used = thresholdSeconds,
+                                stall_classification = classification,
+                                is_low_activity = isLowActivity,
                                 note = "Notification suppressed - handled by gap tolerance + range invalidation (log only, rate-limited)"
                             }));
                     }
-                    
-                    // NOTIFICATION DISABLED: Data loss is handled by gap tolerance + range invalidation
-                    // SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1);
                 }
             }
         }
+    }
+
+    private bool IsLowActivity(string instrument)
+    {
+        if (_lastVolume.TryGetValue(instrument, out var vol) && vol == 0)
+            return true;
+        var expected = GetExpectedIntervalSeconds(instrument);
+        return expected > 120;
+    }
+
+    private string ClassifyStall(string instrument, double elapsed, double expectedInterval, int thresholdSeconds, bool isLowActivity, DateTimeOffset utcNow)
+    {
+        if (isLowActivity && elapsed >= thresholdSeconds)
+            return "LOW_LIQUIDITY";
+
+        if (_currentIncident != null && _currentIncident.FirstDetectedUtc.HasValue)
+        {
+            var incidentAge = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
+            if (incidentAge < 300)
+                return "DISCONNECT";
+        }
+
+        var simultaneousCount = 0;
+        foreach (var kv in _stallDetectedAtUtc)
+        {
+            if (kv.Key == instrument) continue;
+            var age = (utcNow - kv.Value).TotalSeconds;
+            if (age <= AGGREGATION_DELAY_WINDOW_SECONDS)
+                simultaneousCount++;
+        }
+        if (simultaneousCount >= 1)
+            return "AGGREGATION_DELAY";
+
+        if (expectedInterval > 0 && elapsed >= expectedInterval * 2 && elapsed <= expectedInterval * 3 + 60)
+            return "FEED_DELAY";
+
+        return "DISCONNECT";
     }
     
     /// <summary>

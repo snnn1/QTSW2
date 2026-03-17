@@ -126,7 +126,7 @@ export function WatchdogPage() {
 
     // Fallback: legacy frontend derivation
     const stalls = Object.values(status.data_stall_detected || {})
-    const DATA_STALL_THRESHOLD = 120 // Match backend threshold (seconds)
+    const DATA_STALL_THRESHOLD = 300 // Match backend threshold (seconds)
     
     // Helper: compute engine tick age in seconds (same source as engine liveness)
     const getEngineTickAgeSeconds = (): number | null => {

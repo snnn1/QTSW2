@@ -1438,7 +1438,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         // Health monitor: record bar reception (early, before other processing)
-        _healthMonitor?.OnBar(instrument, barUtc);
+        _healthMonitor?.OnBar(instrument, barUtc, close: close);
         
         // Update last tick timestamp for broker synchronization check
         // Bar updates indicate connection health, so track them for recovery sync

@@ -4741,32 +4741,68 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (!string.IsNullOrWhiteSpace(k)) allInstruments.Add(k.Trim());
         }
 
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+
         foreach (var inst in allInstruments)
         {
             var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
             var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
             var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
-            var localWorking = 0;
+
+            // ORDER_REGISTRY_MISSING fix: local_working from IEA registry (owned+adopted working), NOT journal.
+            // Journal = filled positions only. Working entry orders are in IEA, not journal.
+            int localWorking;
+            int journalWorking = 0;
             if (openByInst.TryGetValue(inst, out var entries))
-                localWorking = entries.Count;
+                journalWorking = entries.Count;
             if (openByInst.TryGetValue(execVariant, out var entriesM))
-                localWorking += entriesM.Count;
+                journalWorking += entriesM.Count;
+
+            if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var iea))
+            {
+                localWorking = iea.GetOwnedPlusAdoptedWorkingCount();
+                // Diagnostic: log when broker_working != iea_working to catch ORDER_REGISTRY_MISSING root causes
+                if (brokerWorking != localWorking)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_ORDER_SOURCE_BREAKDOWN", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, iea_working = localWorking, journal_working = journalWorking }));
+            }
+            else if (useIea)
+            {
+                // IEA unavailable but UseInstrumentExecutionAuthority=true → FAIL CLOSED (do NOT fallback to journal)
+                localWorking = -1; // Sentinel: IEA unavailable
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_IEA_UNAVAILABLE", state: "ENGINE",
+                    new { instrument = inst, broker_working = brokerWorking, note = "IEA unavailable for instrument; failing closed (no journal fallback)" }));
+            }
+            else
+            {
+                // IEA not enabled: fail closed when broker has working orders (cannot safely reconcile)
+                localWorking = brokerWorking > 0 ? -1 : 0;
+                if (brokerWorking > 0)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_IEA_DISABLED", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, note = "UseInstrumentExecutionAuthority=false; cannot reconcile working orders; failing closed" }));
+            }
 
             if (brokerQty == journalQty && brokerWorking == localWorking)
                 continue;
 
-            var mismatchType = MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, localWorking);
+            // IEA unavailable or disabled with broker working → treat as ORDER_REGISTRY_MISSING (fail closed)
+            var effectiveLocalWorking = localWorking < 0 ? 0 : localWorking;
+            var mismatchType = localWorking < 0
+                ? MismatchType.ORDER_REGISTRY_MISSING
+                : MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, effectiveLocalWorking);
+
             list.Add(new MismatchObservation
             {
                 Instrument = inst,
                 MismatchType = mismatchType,
                 Present = true,
-                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={localWorking}",
+                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
                 BrokerQty = brokerQty,
                 LocalQty = journalQty,
                 BrokerWorkingOrderCount = brokerWorking,
-                LocalWorkingOrderCount = localWorking,
+                LocalWorkingOrderCount = effectiveLocalWorking,
                 ObservedUtc = utcNow,
                 Severity = "CRITICAL"
             });

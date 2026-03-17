@@ -108,6 +108,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Bootstrap Phase 4 tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("DATA_STALL_DETECTION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = HealthMonitorDataStallTests.RunDataStallDetectionTests();
+        Console.WriteLine(pass ? "PASS: Data stall detection tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("SUPERVISORY_PHASE5", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = SupervisoryPhase5Tests.RunSupervisoryPhase5Tests();
