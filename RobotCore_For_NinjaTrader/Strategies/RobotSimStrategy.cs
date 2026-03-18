@@ -1736,8 +1736,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ResolveAndSetSessionCloseIfNeeded();
                 UpdateSessionIndices(tickTimeUtc);
-                var tickAgeSec = (nowUtc - _lastTickUpdateUtcForBE).TotalSeconds;
-                if (tickAgeSec > BE_TICK_STALE_WARNING_SECONDS && HasAccountPositionInInstrument() && _engine != null)
+                // Guard: do not compute tick age from MinValue (no valid Last tick received yet)
+                var hasValidTickForBE = _lastTickUpdateUtcForBE != DateTimeOffset.MinValue;
+                double tickAgeSec = hasValidTickForBE ? (nowUtc - _lastTickUpdateUtcForBE).TotalSeconds : 0;
+                if (!hasValidTickForBE && HasAccountPositionInInstrument() && _engine != null)
+                {
+                    var instName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                    var key = $"{instName}:BE_NO_VALID_TICK";
+                    if (!_lastBeGateBlockedUtcByReason.TryGetValue(key, out var lastLog) || (nowUtc - lastLog).TotalSeconds >= BE_GATE_BLOCKED_RATE_LIMIT_SECONDS)
+                    {
+                        _lastBeGateBlockedUtcByReason[key] = nowUtc;
+                        _engine.LogEngineEvent(nowUtc, "BE_NO_VALID_TICK_YET", new Dictionary<string, object>
+                        {
+                            { "instrument", instName },
+                            { "note", "No Last tick received yet - not treating as stale. OnMarketData(Last) has not fired." }
+                        });
+                    }
+                }
+                else if (tickAgeSec > BE_TICK_STALE_WARNING_SECONDS && HasAccountPositionInInstrument() && _engine != null)
                 {
                     var instName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
                     var key = $"{instName}:BE_TICK_STALE";
@@ -2062,7 +2078,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
             {
                 _lastBePathActiveLogUtc[instrumentName] = now;
-                var activeCount = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(executionInstrument).Count : -1;
+                var activeIntents = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(executionInstrument) : null;
+                var activeCount = activeIntents?.Count ?? -1;
+                _engine.LogEngineEvent(now, "BE_INTENT_RESOLUTION_INPUT", new Dictionary<string, object>
+                {
+                    { "chart_instrument", instrumentName },
+                    { "execution_instrument", executionInstrument },
+                    { "resolved_active_intent_count", activeCount },
+                    { "tick_price", tickPrice }
+                });
                 _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
                 {
                     { "instrument", instrumentName },
@@ -2076,9 +2100,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE", new Dictionary<string, object>
                     {
-                        { "instrument", instrumentName },
+                        { "chart_instrument", instrumentName },
                         { "execution_instrument", executionInstrument },
+                        { "resolved_active_intent_count", 0 },
                         { "tick_price", tickPrice },
+                        { "stand_down_reason", "exposure_exists_but_no_intent_found" },
                         { "note", "CRITICAL: Account has exposure but BE filter returned 0 intents. Likely execution instrument mismatch (chart vs intent)." }
                     });
                 }

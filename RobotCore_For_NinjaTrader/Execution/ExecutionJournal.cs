@@ -1480,6 +1480,100 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
+    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
+    /// </summary>
+    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            return result;
+        }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+
+                var tradingDate = parts[0];
+                var intentId = parts[parts.Length - 1];
+                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null) continue;
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                }
+
+                if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
+
+                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                result.Add(intentId);
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Try get journal entry for adoption candidate by intentId.
+    /// Used for cross-instance fill resolution when IntentMap may not have the intent yet.
+    /// Returns (tradingDate, stream, entry) if found; null otherwise.
+    /// </summary>
+    public (string TradingDate, string Stream, ExecutionJournalEntry Entry)? TryGetAdoptionCandidateEntry(string intentId, string executionInstrument, string? canonicalInstrument = null)
+    {
+        if (string.IsNullOrWhiteSpace(intentId)) return null;
+        string[] files;
+        try { files = Directory.GetFiles(_journalDir, "*.json"); }
+        catch { return null; }
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+                var fileIntentId = parts[parts.Length - 1];
+                if (!string.Equals(fileIntentId, intentId, StringComparison.OrdinalIgnoreCase)) continue;
+                var tradingDate = parts[0];
+                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null) continue;
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                }
+                if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
+                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                return (tradingDate, stream, entry);
+            }
+            catch { /* skip */ }
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Get count of open journal entries for an instrument. Matches execution instrument and optionally canonical.
     /// </summary>
     public int GetOpenJournalCountForInstrument(string executionInstrument, string? canonicalInstrument = null)

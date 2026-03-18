@@ -105,6 +105,22 @@ public sealed class OrderRegistry
     public IReadOnlyList<string> GetWorkingOrderIds() =>
         _byBrokerOrderId.Where(kvp => kvp.Value.LifecycleState == OrderLifecycleState.WORKING).Select(kvp => kvp.Key).ToList();
 
+    /// <summary>Count of owned+adopted orders in SUBMITTED, WORKING, or PART_FILLED (non-terminal live).
+    /// Used for ORDER_REGISTRY_MISSING reconciliation — avoids false positives during SUBMITTED→WORKING transition.</summary>
+    public int GetOwnedPlusAdoptedWorkingCount()
+    {
+        var entries = _byBrokerOrderId.Values;
+        var count = 0;
+        foreach (var e in entries)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED && e.OwnershipStatus != OrderOwnershipStatus.ADOPTED)
+                continue;
+            if (e.LifecycleState == OrderLifecycleState.SUBMITTED || e.LifecycleState == OrderLifecycleState.WORKING || e.LifecycleState == OrderLifecycleState.PART_FILLED)
+                count++;
+        }
+        return count;
+    }
+
     public int CleanupTerminalOrders(DateTimeOffset cutoffUtc, Func<string, bool>? excludeIfReferencedByIntent = null)
     {
         var toRemove = new List<string>();

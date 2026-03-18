@@ -100,6 +100,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// Returns (ShouldCancel, Reason) - true when stream is no longer eligible (EXPIRED, COMMITTED, forced_flatten, etc.).</summary>
     private Func<string, string, (bool ShouldCancel, string? Reason)>? _shouldCancelEntryOrdersForStreamCallback;
 
+    /// <summary>Callback to check if slot journal shows RANGE_LOCKED + StopBracketsSubmittedAtLock for a stream trading this instrument.
+    /// Used at bootstrap to ADOPT working entry stops on restart instead of flattening.</summary>
+    private Func<string, bool>? _hasSlotJournalWithEntryStopsForInstrumentCallback;
+
     /// <summary>Reentry intents for which we have already invoked the protection-accepted callback (idempotency).</summary>
     private readonly HashSet<string> _reentryProtectionAcceptedNotified = new(StringComparer.OrdinalIgnoreCase);
     
@@ -466,7 +470,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Action<string, string, object>? onSupervisoryCriticalCallback = null,
         Action<string, DateTimeOffset>? onReentryFillCallback = null,
         Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null,
-        Func<string, string, (bool ShouldCancel, string? Reason)>? shouldCancelEntryOrdersForStreamCallback = null)
+        Func<string, string, (bool ShouldCancel, string? Reason)>? shouldCancelEntryOrdersForStreamCallback = null,
+        Func<string, bool>? hasSlotJournalWithEntryStopsForInstrumentCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -476,6 +481,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _onReentryFillCallback = onReentryFillCallback;
         _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
         _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
+        _hasSlotJournalWithEntryStopsForInstrumentCallback = hasSlotJournalWithEntryStopsForInstrumentCallback;
     }
     
     /// <summary>
@@ -585,10 +591,28 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 count++;
             }
         }
+        // Also hydrate adoption candidates (EntrySubmitted, !TradeCompleted) so adopted-order fills can resolve IntentMap
+        var execVariant = ourExecutionInstrument.StartsWith("M", StringComparison.OrdinalIgnoreCase) && ourExecutionInstrument.Length > 1 ? ourExecutionInstrument : "M" + ourExecutionInstrument;
+        var canonical = DeriveCanonicalFromExecutionInstrument(execVariant);
+        var adoptionIds = _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(ourExecutionInstrument, canonical);
+        foreach (var id in _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(execVariant, canonical))
+            adoptionIds.Add(id);
+        foreach (var intentId in adoptionIds)
+        {
+            if (IntentMap.ContainsKey(intentId)) continue;
+            var adoptionEntry = _executionJournal.TryGetAdoptionCandidateEntry(intentId, ourExecutionInstrument, canonical)
+                ?? _executionJournal.TryGetAdoptionCandidateEntry(intentId, execVariant, canonical);
+            if (!adoptionEntry.HasValue) continue;
+            var (td, st, ent) = adoptionEntry.Value;
+            var intent = CreateIntentFromJournalEntry(td, st, intentId, ent);
+            if (intent == null) continue;
+            RegisterIntent(intent);
+            count++;
+        }
         if (count > 0)
         {
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENTS_HYDRATED_FROM_JOURNAL", state: "ENGINE",
-                new { intent_count = count, execution_instrument = ourRoot, note = "Re-registered intents from open journals for BE detection" }));
+                new { intent_count = count, execution_instrument = ourRoot, note = "Re-registered intents from open journals for BE detection and adoption fill resolution" }));
         }
         else if (byInst.Count > 0)
         {
@@ -2168,6 +2192,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         return GetAccountSnapshotReal(utcNow);
     }
 
+    /// <summary>Get active intent IDs for protective audit (engine/journal-backed, filled entries).</summary>
+    public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
+    {
+        var active = GetActiveIntentsForBEMonitoring(instrument);
+        return active.Select(x => x.intentId).ToList();
+    }
+
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
     {
 #if !NINJATRADER
@@ -2375,10 +2406,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             var intentId = kvp.Key;
             var intent = kvp.Value;
             
-            // CRITICAL FIX: Filter by execution instrument - each strategy only gets ticks for its chart
-            // Without this, MES strategy would compare MES tick price against YM/GC/NG intents (wrong!)
+            // CRITICAL FIX: Filter by execution instrument - each strategy only gets ticks for its chart.
+            // Use IsSameInstrument for alias resolution (M2K↔RTY, MES↔ES, MNQ↔NQ) so BE does not return 0
+            // when a real live position exists for the monitored execution instrument.
             if (!string.IsNullOrEmpty(executionInstrument) &&
-                !string.Equals(intent.ExecutionInstrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
+                !ExecutionInstrumentResolver.IsSameInstrument(intent.ExecutionInstrument, executionInstrument))
                 continue;
             
             // Check if intent has required fields for BE monitoring
@@ -2432,6 +2464,35 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
         
         return activeIntents;
+    }
+
+    /// <summary>
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Uses execution journal EntrySubmitted (includes unfilled entry stops) — separate from BE monitoring.
+    /// </summary>
+    public IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument)
+    {
+        if (string.IsNullOrEmpty(executionInstrument)) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var execVariant = executionInstrument.StartsWith("M", StringComparison.OrdinalIgnoreCase) && executionInstrument.Length > 1 ? executionInstrument : "M" + executionInstrument;
+        var canonical = DeriveCanonicalFromExecutionInstrument(executionInstrument);
+        var ids = _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(executionInstrument, canonical);
+        var idsVariant = _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(execVariant, canonical);
+        foreach (var id in idsVariant) ids.Add(id);
+        return ids;
+    }
+
+    private static string DeriveCanonicalFromExecutionInstrument(string execInst)
+    {
+        if (string.IsNullOrEmpty(execInst)) return "";
+        var u = execInst.ToUpperInvariant();
+        if (u.StartsWith("MES")) return "ES";
+        if (u.StartsWith("MNQ")) return "NQ";
+        if (u.StartsWith("MYM")) return "YM";
+        if (u.StartsWith("MGC")) return "GC";
+        if (u.StartsWith("MCL")) return "CL";
+        if (u.StartsWith("MNG")) return "NG";
+        if (u.StartsWith("M2K")) return "RTY";
+        return execInst.Length >= 2 ? execInst.Substring(0, 2).ToUpperInvariant() : execInst;
     }
 
     /// <summary>

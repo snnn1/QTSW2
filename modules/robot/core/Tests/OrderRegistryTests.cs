@@ -175,6 +175,36 @@ public static class OrderRegistryTests
         if (metrics.UnownedOrdersDetected < 0 || metrics.RegistryIntegrityFailures < 0)
             return (false, "Metrics should be non-negative");
 
+        // ORDER_REGISTRY_MISSING fix tests
+        // 16. GetOwnedPlusAdoptedWorkingCount: SUBMITTED entry orders count (pre-entry, no false mismatch)
+        var reg2 = new OrderRegistry();
+        var oi1 = new MinimalOrderInfo { OrderId = "e1", Instrument = "MYM" };
+        reg2.Register(new OrderRegistryEntry { BrokerOrderId = "e1", IntentId = "i1", Instrument = "MYM", OrderRole = OrderRole.ENTRY, OwnershipStatus = OrderOwnershipStatus.OWNED, LifecycleState = OrderLifecycleState.SUBMITTED, CreatedUtc = utc, OrderInfo = oi1 });
+        var oi2 = new MinimalOrderInfo { OrderId = "e2", Instrument = "MYM" };
+        reg2.Register(new OrderRegistryEntry { BrokerOrderId = "e2", IntentId = "i2", Instrument = "MYM", OrderRole = OrderRole.ENTRY, OwnershipStatus = OrderOwnershipStatus.OWNED, LifecycleState = OrderLifecycleState.SUBMITTED, CreatedUtc = utc, OrderInfo = oi2 });
+        var count = reg2.GetOwnedPlusAdoptedWorkingCount();
+        if (count != 2)
+            return (false, $"Pre-entry: expected 2 (SUBMITTED), got {count}");
+
+        // 17. Transition state: SUBMITTED + WORKING both count
+        reg2.UpdateLifecycle("e1", OrderLifecycleState.WORKING, null);
+        count = reg2.GetOwnedPlusAdoptedWorkingCount();
+        if (count != 2)
+            return (false, $"Transition: expected 2 (SUBMITTED+WORKING), got {count}");
+
+        // 18. True mismatch scenario: broker has 2, IEA has 0 → empty registry returns 0
+        var reg3 = new OrderRegistry();
+        if (reg3.GetOwnedPlusAdoptedWorkingCount() != 0)
+            return (false, "Empty registry should return 0");
+
+        // 19. Duplicate adoption prevention: Register same broker order id twice overwrites
+        var reg4 = new OrderRegistry();
+        var dupOi = new MinimalOrderInfo { OrderId = "broker-dup", Instrument = "MNQ" };
+        reg4.Register(new OrderRegistryEntry { BrokerOrderId = "broker-dup", IntentId = "i-dup", Instrument = "MNQ", OrderRole = OrderRole.ADOPTED, OwnershipStatus = OrderOwnershipStatus.ADOPTED, LifecycleState = OrderLifecycleState.WORKING, CreatedUtc = utc, OrderInfo = dupOi });
+        reg4.Register(new OrderRegistryEntry { BrokerOrderId = "broker-dup", IntentId = "i-dup", Instrument = "MNQ", OrderRole = OrderRole.ADOPTED, OwnershipStatus = OrderOwnershipStatus.ADOPTED, LifecycleState = OrderLifecycleState.WORKING, CreatedUtc = utc, OrderInfo = dupOi });
+        if (reg4.GetOwnedPlusAdoptedWorkingCount() != 1)
+            return (false, $"Duplicate adoption: Register same broker id twice should overwrite, count=1, got {reg4.GetOwnedPlusAdoptedWorkingCount()}");
+
         return (true, null);
     }
 }

@@ -510,7 +510,7 @@ public sealed partial class InstrumentExecutionAuthority
             if (!_hasScannedForAdoption && !IsInBootstrap && (CurrentRecoveryState == RecoveryState.NORMAL || CurrentRecoveryState == RecoveryState.RESOLVED))
             {
                 _hasScannedForAdoption = true;
-                ScanAndAdoptExistingProtectives();
+                ScanAndAdoptExistingOrders();
             }
             Executor.ProcessExecutionUpdate(execution, order);
         });
@@ -538,10 +538,25 @@ public sealed partial class InstrumentExecutionAuthority
 
     private bool _hasScannedForAdoption;
 
-    /// <summary>Phase 4: Run adoption for bootstrap ADOPT path. Calls ScanAndAdoptExistingProtectives then OnBootstrapAdoptionCompleted.</summary>
+    /// <summary>Run adoption for late recovery (reconciliation). Returns count of orders adopted.</summary>
+    public int TryRecoveryAdoption()
+    {
+        var before = GetOwnedPlusAdoptedWorkingCount();
+        ScanAndAdoptExistingOrders();
+        var after = GetOwnedPlusAdoptedWorkingCount();
+        return Math.Max(0, after - before);
+    }
+
+    /// <summary>Phase 4: Run adoption for bootstrap ADOPT path. Calls ScanAndAdoptExistingOrders then OnBootstrapAdoptionCompleted.</summary>
     internal void RunBootstrapAdoption(string instrument, DateTimeOffset utcNow)
     {
-        ScanAndAdoptExistingProtectives();
+        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_ADOPTION_ATTEMPT", new
+        {
+            instrument,
+            iea_instance_id = InstanceId,
+            note = "Running adoption for bootstrap ADOPT path"
+        }));
+        ScanAndAdoptExistingOrders();
         OnBootstrapAdoptionCompleted(instrument, utcNow);
     }
 
@@ -549,14 +564,21 @@ public sealed partial class InstrumentExecutionAuthority
     /// Gap 4: On first execution update, sync OrderMap with broker reality. Hydration does not mutate broker state.
     /// For each QTSW2 protective (STOP/TARGET) with entry filled per journal, populate OrderMap.
     /// Phase 2: QTSW2 stop/target with no matching intent → UNOWNED_LIVE_ORDER_DETECTED, register UNOWNED, follow recovery (flatten).
+    /// IEA robustness: Also adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET) so registry never loses orders on restart.
     /// </summary>
-    private void ScanAndAdoptExistingProtectives()
+    private void ScanAndAdoptExistingOrders()
     {
         if (Executor == null || Log == null) return;
         var account = Executor.GetAccount() as Account;
         if (account?.Orders == null) return;
-        var activeIntents = Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey);
-        var activeIntentIds = new HashSet<string>(activeIntents.Select(x => x.intentId), StringComparer.OrdinalIgnoreCase);
+        var activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+        var workingCount = account.Orders.Count(o => o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
+        Log?.Write(RobotEvents.EngineBase(NowEvent(), "", ExecutionInstrumentKey, "ADOPTION_SCAN_START", new
+        {
+            adoption_candidate_count = activeIntentIds.Count,
+            broker_working_count = workingCount,
+            iea_instance_id = InstanceId
+        }));
         foreach (Order o in account.Orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
@@ -588,6 +610,14 @@ public sealed partial class InstrumentExecutionAuthority
                         RegisterAdoptedOrder(o.OrderId, intentId, oi.Instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "RESTART_ADOPTION", oi, NowEvent());
                         if (isStop)
                             Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
+                        Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, oi.Instrument, "ADOPTION_SUCCESS", new
+                        {
+                            broker_order_id = o.OrderId,
+                            intent_id = intentId,
+                            order_class = isStop ? "STOP" : "TARGET",
+                            source = "RESTART_ADOPTION",
+                            iea_instance_id = InstanceId
+                        }));
                     }
                 }
                 else
@@ -613,7 +643,152 @@ public sealed partial class InstrumentExecutionAuthority
                     }
                 }
             }
+            else
+            {
+                // IEA robustness: Adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET). Prevents ORDER_REGISTRY_MISSING on restart.
+                if (TryResolveByBrokerOrderId(o.OrderId, out _)) continue;
+                var instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey;
+                if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
+                {
+                    var oi = new OrderInfo
+                    {
+                        IntentId = intentId,
+                        Instrument = instrument,
+                        OrderId = o.OrderId,
+                        OrderType = "ENTRY",
+                        Price = (decimal?)o.StopPrice ?? (decimal?)o.LimitPrice,
+                        Quantity = o.Quantity,
+                        State = "WORKING",
+                        IsEntryOrder = true,
+                        FilledQuantity = 0
+                    };
+                    OrderMap[intentId] = oi;
+                    RegisterAdoptedOrder(o.OrderId, intentId, instrument, OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", oi, NowEvent());
+                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
+                    {
+                        broker_order_id = o.OrderId,
+                        intent_id = intentId,
+                        order_class = "ENTRY_STOP",
+                        source = "RESTART_ADOPTION_ENTRY",
+                        iea_instance_id = InstanceId
+                    }));
+                }
+                else
+                {
+                    RegisterUnownedOrder(o.OrderId, intentId, instrument, "UNOWNED_ENTRY_RESTART", NowEvent());
+                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId ?? "", instrument, "UNOWNED_LIVE_ORDER_DETECTED", new
+                    {
+                        broker_order_id = o.OrderId,
+                        intent_id = intentId,
+                        instrument,
+                        order_type = "ENTRY",
+                        note = "Restart scan: QTSW2 entry with no matching active intent",
+                        action = "RECOVERY_PHASE3",
+                        iea_instance_id = InstanceId
+                    }));
+                    var utcNow = NowEvent();
+                    RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                    RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// Adopt a broker order into registry when registry is missing it (broker_has_registry_missing).
+    /// Restores IEA consistency so we never lose orders. Returns true if adopted.
+    /// </summary>
+    internal bool TryAdoptBrokerOrderIfNotInRegistry(Order o)
+    {
+        if (Executor == null || o == null) return false;
+        var id = o.OrderId?.ToString();
+        if (string.IsNullOrEmpty(id) || TryResolveByBrokerOrderId(id, out _)) return false;
+
+        var tag = Executor.GetOrderTag(o);
+        if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+        {
+            RegisterUnownedOrder(id, null, o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey, "BROKER_REGISTRY_MISSING_NON_QTSW2", NowEvent());
+            return false; // Not adopted (unowned)
+        }
+
+        var intentId = RobotOrderIds.DecodeIntentId(tag);
+        var isStop = tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase);
+        var isTarget = tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase);
+        var instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey;
+        var activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+
+        if (isStop || isTarget)
+        {
+            if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
+            {
+                var mapKey = $"{intentId}:{(isStop ? "STOP" : "TARGET")}";
+                if (!OrderMap.TryGetValue(mapKey, out _))
+                {
+                    var oi = new OrderInfo
+                    {
+                        IntentId = intentId,
+                        Instrument = instrument,
+                        OrderId = o.OrderId,
+                        OrderType = isStop ? "STOP" : "TARGET",
+                        Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
+                        Quantity = o.Quantity,
+                        State = "WORKING",
+                        IsEntryOrder = false
+                    };
+                    OrderMap[mapKey] = oi;
+                    RegisterAdoptedOrder(o.OrderId, intentId, instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
+                    if (isStop)
+                        Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
+                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
+                    {
+                        broker_order_id = o.OrderId,
+                        intent_id = intentId,
+                        order_class = isStop ? "STOP" : "TARGET",
+                        source = "REGISTRY_BROKER_DIVERGENCE",
+                        iea_instance_id = InstanceId
+                    }));
+                    return true;
+                }
+            }
+            else
+            {
+                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: false);
+            }
+        }
+        else
+        {
+            if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
+            {
+                var oi = new OrderInfo
+                {
+                    IntentId = intentId,
+                    Instrument = instrument,
+                    OrderId = o.OrderId,
+                    OrderType = "ENTRY",
+                    Price = (decimal?)o.StopPrice ?? (decimal?)o.LimitPrice,
+                    Quantity = o.Quantity,
+                    State = "WORKING",
+                    IsEntryOrder = true,
+                    FilledQuantity = 0
+                };
+                OrderMap[intentId] = oi;
+                RegisterAdoptedOrder(o.OrderId, intentId, instrument, OrderRole.ENTRY, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
+                Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
+                {
+                    broker_order_id = o.OrderId,
+                    intent_id = intentId,
+                    order_class = "ENTRY_STOP",
+                    source = "REGISTRY_BROKER_DIVERGENCE",
+                    iea_instance_id = InstanceId
+                }));
+                return true;
+            }
+            else
+            {
+                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: true);
+            }
+        }
+        return false;
     }
 
     /// <summary>

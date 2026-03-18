@@ -40,7 +40,7 @@ New states in `RecoveryState` (before NORMAL in lifecycle):
 - **BootstrapReason**: STRATEGY_START, PLATFORM_RESTART, CONNECTION_RECOVERED, etc.
 - **BootstrapClassification**: CLEAN_START, RESUME_WITH_NO_POSITION_NO_ORDERS, ADOPTION_REQUIRED, POSITION_PRESENT_NO_OWNED_ORDERS, LIVE_ORDERS_PRESENT_NO_POSITION, JOURNAL_RUNTIME_DIVERGENCE, MANUAL_INTERVENTION_PRESENT, UNSAFE_STARTUP_AMBIGUITY
 - **BootstrapDecision**: RESUME, ADOPT, RECONCILE_THEN_RESUME, FLATTEN_THEN_RECONSTRUCT, HALT
-- **BootstrapSnapshot**: BrokerPositionQty, BrokerWorkingOrderCount, JournalQty, UnownedLiveOrderCount, RegistrySnapshot, etc.
+- **BootstrapSnapshot**: BrokerPositionQty, BrokerWorkingOrderCount, JournalQty, UnownedLiveOrderCount, RegistrySnapshot, SlotJournalShowsEntryStopsExpected, etc.
 
 ## Decision Rules
 
@@ -50,10 +50,12 @@ New states in `RecoveryState` (before NORMAL in lifecycle):
 | RESUME_WITH_NO_POSITION_NO_ORDERS | RESUME |
 | ADOPTION_REQUIRED | ADOPT |
 | POSITION_PRESENT_NO_OWNED_ORDERS | FLATTEN_THEN_RECONSTRUCT |
-| LIVE_ORDERS_PRESENT_NO_POSITION | FLATTEN_THEN_RECONSTRUCT |
+| LIVE_ORDERS_PRESENT_NO_POSITION | ADOPT if SlotJournalShowsEntryStopsExpected; else FLATTEN_THEN_RECONSTRUCT |
 | JOURNAL_RUNTIME_DIVERGENCE | FLATTEN_THEN_RECONSTRUCT |
 | MANUAL_INTERVENTION_PRESENT | HALT |
 | UNSAFE_STARTUP_AMBIGUITY | HALT |
+
+**Restart fix**: When `LIVE_ORDERS_PRESENT_NO_POSITION` (working entry stops, no position), the decider checks `SlotJournalShowsEntryStopsExpected`. If any stream for the instrument has slot journal with `LastState=RANGE_LOCKED` and `StopBracketsSubmittedAtLock=true`, the decision is ADOPT instead of FLATTEN. This preserves valid entry stops after NinjaTrader shutdown/restart.
 
 ## Entry Points
 
@@ -94,4 +96,4 @@ When a critical event (fill or order state change to Working/Filled/Cancelled/Re
 
 Run: `dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --test BOOTSTRAP_PHASE4`
 
-Tests cover: CLEAN_START→RESUME, RESUME_WITH_NO_POSITION_NO_ORDERS→RESUME, MANUAL_INTERVENTION_PRESENT→HALT, POSITION_PRESENT_NO_OWNED_ORDERS→FLATTEN, ADOPTION_REQUIRED→ADOPT, JOURNAL_RUNTIME_DIVERGENCE→FLATTEN, LIVE_ORDERS_PRESENT_NO_POSITION→FLATTEN.
+Tests cover: CLEAN_START→RESUME, RESUME_WITH_NO_POSITION_NO_ORDERS→RESUME, MANUAL_INTERVENTION_PRESENT→HALT, POSITION_PRESENT_NO_OWNED_ORDERS→FLATTEN, ADOPTION_REQUIRED→ADOPT, JOURNAL_RUNTIME_DIVERGENCE→FLATTEN, LIVE_ORDERS_PRESENT_NO_POSITION→FLATTEN (default), LIVE_ORDERS_PRESENT_NO_POSITION+SlotJournalShowsEntryStopsExpected→ADOPT (restart fix).

@@ -69,4 +69,7 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
         }
         return list;
     }
+
+    public IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument) =>
+        Array.Empty<string>();
 }

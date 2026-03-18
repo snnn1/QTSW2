@@ -63,6 +63,12 @@ public interface IIEAOrderExecutor
     /// <summary>Phase 3: Get active intents eligible for BE monitoring (entry filled, BE not yet applied).</summary>
     IReadOnlyList<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> GetActiveIntentsForBEMonitoring(string? executionInstrument);
 
+    /// <summary>
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Includes unfilled entry stops (EntrySubmitted) — separate from BE monitoring which requires EntryFilled.
+    /// </summary>
+    IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument);
+
     /// <summary>Phase 3: Evaluate BE triggers and dispatch modify. Single evaluation function; branch only at mutation.</summary>
     void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument);
 

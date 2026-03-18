@@ -182,6 +182,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         return FlattenResult.SuccessResult(utcNow);
     }
 
+    public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
+    {
+        return Array.Empty<string>();
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         // DRYRUN: No-op

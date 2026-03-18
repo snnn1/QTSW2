@@ -110,6 +110,11 @@ public sealed partial class InstrumentExecutionAuthority
         }));
     }
 
+    /// <summary>Count of owned+adopted orders in SUBMITTED, WORKING, or PART_FILLED.
+    /// Used for ORDER_REGISTRY_MISSING reconciliation — broker working vs IEA registry, NOT journal.</summary>
+    internal int GetOwnedPlusAdoptedWorkingCount() =>
+        _orderRegistry.GetOwnedPlusAdoptedWorkingCount();
+
     /// <summary>Try resolve by broker order id first (canonical path).</summary>
     internal bool TryResolveByBrokerOrderId(string brokerOrderId, out OrderRegistryEntry? entry) =>
         _orderRegistry.TryResolveByBrokerOrderId(brokerOrderId, out entry);
@@ -204,7 +209,7 @@ public sealed partial class InstrumentExecutionAuthority
             OrderRole = OrderRole.ADOPTED,
             OwnershipStatus = OrderOwnershipStatus.ADOPTED,
             LifecycleState = OrderLifecycleState.WORKING,
-            SourceContext = sourceContext ?? "ScanAndAdoptExistingProtectives",
+            SourceContext = sourceContext ?? "ScanAndAdoptExistingOrders",
             CreatedUtc = utcNow,
             OrderInfo = orderInfo,
             LastResolutionPath = "Adopted"
@@ -216,6 +221,9 @@ public sealed partial class InstrumentExecutionAuthority
             _orderRegistry.AddAlias($"{intentId}:STOP", brokerOrderId);
         else if (orderRole == OrderRole.TARGET)
             _orderRegistry.AddAlias($"{intentId}:TARGET", brokerOrderId);
+
+        var isEntry = orderRole == OrderRole.ENTRY;
+        SharedAdoptedOrderRegistry.Register(brokerOrderId, intentId, instrument ?? "", null, null, isEntry);
 
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_REGISTRY_ADOPTED", new
         {

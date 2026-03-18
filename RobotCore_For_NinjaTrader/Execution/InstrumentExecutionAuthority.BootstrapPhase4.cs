@@ -153,6 +153,18 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 case BootstrapDecision.RESUME:
                     Interlocked.Increment(ref _bootstrapResumedTotal);
+                    // Observability: log when RESUME chosen with no broker orders visible (delayed broker risk)
+                    if (snapshot.BrokerWorkingOrderCount == 0)
+                    {
+                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_RESUME_NO_BROKER_ORDERS", new
+                        {
+                            instrument,
+                            broker_working_count = 0,
+                            classification = classification.ToString(),
+                            note = "Bootstrap chose RESUME with no broker orders visible. If broker reports orders later, reconciliation/adoption will handle.",
+                            iea_instance_id = InstanceId
+                        }));
+                    }
                     if (TryTransition(RecoveryState.BOOTSTRAP_DECIDING, RecoveryState.RESOLVED, utcNow))
                     {
                         _recoveryState = RecoveryState.RESOLVED;
@@ -197,7 +209,7 @@ public sealed partial class InstrumentExecutionAuthority
         }
     }
 
-    /// <summary>Mark bootstrap adoption completed. Call when ScanAndAdoptExistingProtectives finishes for ADOPT path.</summary>
+    /// <summary>Mark bootstrap adoption completed. Call when ScanAndAdoptExistingOrders finishes for ADOPT path.</summary>
     public void OnBootstrapAdoptionCompleted(string instrument, DateTimeOffset utcNow)
     {
         lock (_recoveryStateLock)

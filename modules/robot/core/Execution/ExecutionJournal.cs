@@ -1419,6 +1419,50 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
+    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
+    /// </summary>
+    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string[] files;
+        try { files = Directory.GetFiles(_journalDir, "*.json"); }
+        catch { return result; }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+
+                var intentId = parts[parts.Length - 1];
+
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    var json = File.ReadAllText(path);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                }
+
+                if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
+
+                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
+                result.Add(intentId);
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Get sum of EntryFilledQuantityTotal for open journal entries matching an instrument.
     /// </summary>
     public int GetOpenJournalQuantitySumForInstrument(string executionInstrument, string? canonicalInstrument = null)

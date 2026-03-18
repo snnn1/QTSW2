@@ -190,6 +190,12 @@ public interface IExecutionAdapter
     void EnqueueExecutionCommand(ExecutionCommandBase command);
 
     /// <summary>
+    /// Get active intent IDs for protective audit (intents with filled entries, !TradeCompleted).
+    /// Used by ProtectiveCoverageCoordinator to pass expected intents to audit. Returns empty when not available.
+    /// </summary>
+    IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
+
+    /// <summary>
     /// Session-close immediate flatten: enqueue cancel+flatten NtActions and drain in same cycle.
     /// Guarantees same-cycle execution before session close. Use for forced flatten when next-bar delay is unacceptable.
     /// Returns null if not supported (caller should use EmergencyFlatten fallback).

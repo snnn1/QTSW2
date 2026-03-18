@@ -35,6 +35,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Engine run identifier (GUID per engine Start())
     private string? _runId;
+    private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue;
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -346,7 +347,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Recovery runner guard (prevent re-entrancy)
     private bool _recoveryRunnerActive = false;
     private readonly object _recoveryLock = new object();
-    
+
+    // Throttle repeated RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT logs per (instrument, brokerWorking, localWorking)
+    private readonly Dictionary<string, DateTimeOffset> _recoveryAttemptLogThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+    private const int RecoveryAttemptLogThrottleSeconds = 60;
+
     // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
     private Timer? _engineHeartbeatTimer;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
@@ -665,9 +670,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         // CRITICAL: Set run_id before any Start-path logs
         _runId = Guid.NewGuid().ToString("N");
+        _engineStartUtc = DateTimeOffset.UtcNow;
         _log.SetRunId(_runId);
 
-        var utcNow = DateTimeOffset.UtcNow;
+        var utcNow = _engineStartUtc;
 
         // Initialize HealthMonitor after run_id is set so any health-monitor logs include run_id.
         InitializeHealthMonitorIfNeeded();
@@ -1057,7 +1063,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             return (true, "stream_trading_date_mismatch");
                         var (eligible, reason) = stream.GetEntryOrderCancellationEligibility();
                         return (!eligible, reason);
-                    }); // Gap 5: IEA EnqueueAndWait failure → block instrument
+                    },
+                    hasSlotJournalWithEntryStopsForInstrumentCallback: HasSlotJournalWithEntryStopsForInstrument); // Bootstrap: ADOPT entry stops on restart
                 
                 // Wire coordinator to adapter
                 simAdapter.SetCoordinator(coordinator);
@@ -1114,7 +1121,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     return _executionAdapter?.FlattenEmergency(instrument, utcNow)
                         ?? FlattenResult.FailureResult("No adapter", utcNow);
                 },
-                eventWriter: _eventWriter);
+                eventWriter: _eventWriter,
+                getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst));
 
             // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
             _mismatchCoordinator = new MismatchEscalationCoordinator(
@@ -4787,11 +4795,64 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (brokerQty == journalQty && brokerWorking == localWorking)
                 continue;
 
-            // IEA unavailable or disabled with broker working → treat as ORDER_REGISTRY_MISSING (fail closed)
             var effectiveLocalWorking = localWorking < 0 ? 0 : localWorking;
+
+            // ORDER_REGISTRY_MISSING recovery: attempt adoption before fail-closed
+            if (brokerWorking > 0 && effectiveLocalWorking == 0 && useIea &&
+                InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaForRecovery))
+            {
+                var throttleKey = $"{inst}_{brokerWorking}_{effectiveLocalWorking}";
+                var shouldLogAttempt = true;
+                lock (_recoveryAttemptLogThrottle)
+                {
+                    if (_recoveryAttemptLogThrottle.TryGetValue(throttleKey, out var lastLog))
+                    {
+                        if ((utcNow - lastLog).TotalSeconds < RecoveryAttemptLogThrottleSeconds)
+                            shouldLogAttempt = false;
+                    }
+                    if (shouldLogAttempt)
+                        _recoveryAttemptLogThrottle[throttleKey] = utcNow;
+                    // Prune entries older than throttle window
+                    var cutoff = utcNow.AddSeconds(-RecoveryAttemptLogThrottleSeconds);
+                    var toRemove = _recoveryAttemptLogThrottle.Where(k => k.Value < cutoff).Select(k => k.Key).ToList();
+                    foreach (var k in toRemove)
+                        _recoveryAttemptLogThrottle.Remove(k);
+                }
+                if (shouldLogAttempt)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, iea_working_before = effectiveLocalWorking }));
+                }
+                var adopted = ieaForRecovery.TryRecoveryAdoption();
+                var localAfter = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
+                if (adopted > 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS", state: "ENGINE",
+                        new { instrument = inst, adopted_count = adopted, iea_working_after = localAfter }));
+                    var delayMs = _engineStartUtc != DateTimeOffset.MinValue ? (long)(utcNow - _engineStartUtc).TotalMilliseconds : 0;
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STARTUP_RECOVERY_ADOPTION_OCCURRED", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, adopted_count = adopted, delay_from_startup_ms = delayMs }));
+                }
+                if (localAfter == brokerWorking)
+                    continue; // Recovery succeeded, no mismatch
+                if (adopted > 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_PARTIAL", state: "ENGINE",
+                        new { instrument = inst, adopted_count = adopted, broker_working = brokerWorking, iea_working_after = localAfter, note = "Still mismatched after adoption" }));
+                }
+                effectiveLocalWorking = localAfter;
+            }
+
+            // IEA unavailable or disabled with broker working → treat as ORDER_REGISTRY_MISSING (fail closed)
             var mismatchType = localWorking < 0
                 ? MismatchType.ORDER_REGISTRY_MISSING
                 : MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, effectiveLocalWorking);
+
+            if (mismatchType == MismatchType.ORDER_REGISTRY_MISSING && brokerWorking > 0 && effectiveLocalWorking == 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ORDER_REGISTRY_MISSING_FAIL_CLOSED", state: "ENGINE",
+                    new { instrument = inst, broker_working = brokerWorking, iea_working = effectiveLocalWorking, reason = "No adoptable evidence or adoption recovery failed" }));
+            }
 
             list.Add(new MismatchObservation
             {
@@ -5447,7 +5508,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return _streams?.Count ?? 0;
         }
     }
-    
+
+    /// <summary>
+    /// Check if any stream for this instrument has slot journal with RANGE_LOCKED + StopBracketsSubmittedAtLock.
+    /// Used at bootstrap to ADOPT working entry stops on NinjaTrader restart instead of flattening them as orphans.
+    /// </summary>
+    internal bool HasSlotJournalWithEntryStopsForInstrument(string instrument)
+    {
+        lock (_engineLock)
+        {
+            if (!_activeTradingDate.HasValue || _streams == null || _streams.Count == 0)
+                return false;
+
+            var canonicalOfExecution = GetCanonicalInstrument(instrument);
+            var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
+
+            foreach (var stream in _streams.Values)
+            {
+                if (!string.Equals(stream.CanonicalInstrument, canonicalOfExecution, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var journal = _journals.TryLoad(tradingDateStr, stream.Stream);
+                if (journal != null &&
+                    string.Equals(journal.LastState, "RANGE_LOCKED", StringComparison.OrdinalIgnoreCase) &&
+                    journal.StopBracketsSubmittedAtLock)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
     /// <summary>
     /// Get time range covering all enabled streams for an instrument (for BarsRequest).
     /// Returns the earliest range_start and latest slot_time across all enabled streams for the instrument.

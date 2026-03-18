@@ -67,11 +67,12 @@ public static class ExecutionInstrumentResolver
         {
             case "MES": return "ES";
             case "MNQ": return "NQ";
-            case "M2K": return "NQ";
+            case "M2K": return "RTY";  // M2K = micro Russell 2000, RTY = Russell 2000
             case "MYM": return "YM";
             case "MCL": return "CL";
             case "MGC": return "GC";
             case "MNG": return "NG";
+            case "RTY": return "RTY";
             default: return instrument;
         }
     }

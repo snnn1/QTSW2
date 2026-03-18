@@ -208,6 +208,9 @@ public sealed partial class NinjaTraderSimAdapter
     IReadOnlyList<(string intentId, Intent intent, decimal beTriggerPrice, decimal entryPrice, decimal? actualFillPrice, string direction)> IIEAOrderExecutor.GetActiveIntentsForBEMonitoring(string? executionInstrument) =>
         GetActiveIntentsForBEMonitoring(executionInstrument);
 
+    IReadOnlyCollection<string> IIEAOrderExecutor.GetAdoptionCandidateIntentIds(string? executionInstrument) =>
+        GetAdoptionCandidateIntentIds(executionInstrument);
+
     OrderModificationResult IIEAOrderExecutor.ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow) =>
         ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow);
 
@@ -462,6 +465,7 @@ public sealed partial class NinjaTraderSimAdapter
         var registry = _iea.GetRegistrySnapshotForRecovery();
         var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
         var protectiveStatus = ComputeProtectiveStatusFromBroker(account, instrument, brokerQty);
+        var slotJournalShowsEntryStops = _hasSlotJournalWithEntryStopsForInstrumentCallback?.Invoke(instrument) ?? false;
         var snapshot = new BootstrapSnapshot
         {
             Instrument = instrument,
@@ -474,7 +478,8 @@ public sealed partial class NinjaTraderSimAdapter
             RuntimeIntentSnapshot = runtime,
             CaptureUtc = utcNow,
             SnapshotEpoch = 0,
-            ProtectiveStatus = protectiveStatus
+            ProtectiveStatus = protectiveStatus,
+            SlotJournalShowsEntryStopsExpected = slotJournalShowsEntryStops
         };
         _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_SNAPSHOT_CAPTURED", new
         {
@@ -483,6 +488,7 @@ public sealed partial class NinjaTraderSimAdapter
             broker_working_count = brokerWorkingCount,
             journal_qty = journalQty,
             unowned_live_count = registry.UnownedLiveCount,
+            slot_journal_shows_entry_stops_expected = slotJournalShowsEntryStops,
             iea_instance_id = _iea.InstanceId
         }));
         var decision = _iea.ProcessBootstrapResult(snapshot, utcNow);
@@ -2630,6 +2636,103 @@ public sealed partial class NinjaTraderSimAdapter
             }
         }
         
+        // If still no orderInfo, try shared adopted-order registry (cross-instance fill resolution)
+        if (orderInfo == null && !string.IsNullOrEmpty(intentId) && !isProtectiveOrder)
+        {
+            var brokerOrderIdStr = order.OrderId?.ToString();
+            if (!string.IsNullOrEmpty(brokerOrderIdStr) && SharedAdoptedOrderRegistry.TryResolve(brokerOrderIdStr, out var adoptedRecord) && adoptedRecord != null)
+            {
+                var instrumentForResolve = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                var execVariant = instrumentForResolve.StartsWith("M", StringComparison.OrdinalIgnoreCase) && instrumentForResolve.Length > 1 ? instrumentForResolve : "M" + instrumentForResolve;
+                var canonical = DeriveCanonicalFromExecutionInstrument(execVariant);
+                var journalEntry = _executionJournal.TryGetAdoptionCandidateEntry(adoptedRecord.IntentId, instrumentForResolve, canonical);
+                if (journalEntry.HasValue && adoptedRecord.IsEntryOrder)
+                {
+                    var (tradingDate, stream, jEntry) = journalEntry.Value;
+                    if (!string.IsNullOrWhiteSpace(tradingDate) && !string.IsNullOrWhiteSpace(stream))
+                    {
+                        if (!IntentMap.TryGetValue(adoptedRecord.IntentId, out var intent) || intent == null)
+                        {
+                            intent = CreateIntentFromJournalEntry(tradingDate, stream, adoptedRecord.IntentId, jEntry);
+                            if (intent != null)
+                                RegisterIntent(intent);
+                        }
+                        if (intent != null)
+                        {
+                        orderInfo = new OrderInfo
+                        {
+                            IntentId = adoptedRecord.IntentId,
+                            Instrument = adoptedRecord.Instrument,
+                            OrderId = brokerOrderIdStr,
+                            OrderType = "ENTRY",
+                            State = "FILLED",
+                            IsEntryOrder = true,
+                            Quantity = order.Quantity,
+                            FilledQuantity = fillQuantity,
+                            Price = (decimal?)order.StopPrice ?? (decimal?)order.LimitPrice
+                        };
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, adoptedRecord.IntentId, instrumentForResolve, "ADOPTED_ORDER_FILL_RESOLVED_CROSS_INSTANCE", new
+                        {
+                            broker_order_id = brokerOrderIdStr,
+                            intent_id = adoptedRecord.IntentId,
+                            receiving_instance_id = _iea?.InstanceId,
+                            note = "Resolved via SharedAdoptedOrderRegistry for journaling"
+                        }));
+                        decimal contractMultiplier = 100;
+                        try
+                        {
+                            if (order?.Instrument?.MasterInstrument != null)
+                                contractMultiplier = (decimal)order.Instrument.MasterInstrument.PointValue;
+                        }
+                        catch { /* fallback 100 */ }
+                        var context = new IntentContext
+                        {
+                            IntentId = adoptedRecord.IntentId,
+                            TradingDate = tradingDate,
+                            Stream = stream,
+                            Direction = intent.Direction ?? "Long",
+                            ExecutionInstrument = intent.Instrument ?? instrumentForResolve,
+                            CanonicalInstrument = canonical,
+                            ContractMultiplier = contractMultiplier,
+                            Tag = encodedTag
+                        };
+                        _executionJournal.RecordEntryFill(
+                            context.IntentId,
+                            context.TradingDate,
+                            context.Stream,
+                            fillPrice,
+                            fillQuantity,
+                            utcNow,
+                            context.ContractMultiplier,
+                            context.Direction,
+                            context.ExecutionInstrument,
+                            context.CanonicalInstrument,
+                            brokerOrderInstrumentKey: instrumentForResolve);
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, adoptedRecord.IntentId, instrumentForResolve, "ADOPTED_ORDER_FILL_JOURNALED", new
+                        {
+                            broker_order_id = brokerOrderIdStr,
+                            intent_id = adoptedRecord.IntentId,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            trading_date = tradingDate,
+                            stream = stream
+                        }));
+                        _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, context.ExecutionInstrument, context.Direction ?? "", utcNow);
+                        _iea?.HandleEntryFill(adoptedRecord.IntentId, intent, fillPrice, fillQuantity, fillQuantity, utcNow);
+                        return;
+                        }
+                    }
+                }
+                _log.Write(RobotEvents.ExecutionBase(utcNow, adoptedRecord.IntentId ?? "", instrumentForResolve, "ADOPTED_ORDER_FILL_UNRESOLVED", new
+                {
+                    broker_order_id = brokerOrderIdStr,
+                    intent_id = adoptedRecord.IntentId,
+                    reason = journalEntry.HasValue ? "context_incomplete" : "no_journal_entry",
+                    note = "SharedAdoptedOrderRegistry had record but could not journal"
+                }));
+            }
+        }
+
         // If still no orderInfo, handle as untracked
         if (orderInfo == null)
         {

@@ -432,55 +432,58 @@ public sealed class NotificationService : IDisposable
                             _lastDequeuedAt = DateTimeOffset.UtcNow;
                         }
                         
-                        // Send notification via Pushover with timeout guard
-                        PushoverClient.SendResult result;
-                        try
+                        // Send notification via Pushover with timeout guard and bounded retry for priority 2
+                        const int MaxRetriesForPriority2 = 2;
+                        const int RetryDelaySeconds = 2;
+                        PushoverClient.SendResult result = default!;
+                        var isCritical = request.Priority == 2;
+                        var attempt = 0;
+                        do
                         {
-                            // Implement timeout guard using Task.WhenAny (10 seconds max)
-                            var sendTask = PushoverClient.SendAsync(
-                                _config.pushover_user_key,
-                                _config.pushover_app_token,
-                                request.Title,
-                                request.Message,
-                                request.Priority
-                            );
-                            
-                            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
-                            var completedTask = await Task.WhenAny(sendTask, timeoutTask);
-                            
-                            if (completedTask == timeoutTask)
+                            attempt++;
+                            try
                             {
-                                // Timeout occurred
-                                result = new PushoverClient.SendResult
+                                var sendTask = PushoverClient.SendAsync(
+                                    _config.pushover_user_key,
+                                    _config.pushover_app_token,
+                                    request.Title,
+                                    request.Message,
+                                    request.Priority
+                                );
+                                
+                                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+                                var completedTask = await Task.WhenAny(sendTask, timeoutTask);
+                                
+                                if (completedTask == timeoutTask)
                                 {
-                                    Success = false,
-                                    Exception = new TimeoutException("Pushover send operation timed out after 10 seconds")
-                                };
+                                    result = new PushoverClient.SendResult
+                                    {
+                                        Success = false,
+                                        Exception = new TimeoutException("Pushover send operation timed out after 10 seconds")
+                                    };
+                                }
+                                else
+                                {
+                                    result = await sendTask;
+                                }
                             }
-                            else
+                            catch (OperationCanceledException ex)
                             {
-                                // Send completed (successfully or with error)
-                                result = await sendTask;
+                                result = new PushoverClient.SendResult { Success = false, Exception = ex };
                             }
-                        }
-                        catch (OperationCanceledException ex)
-                        {
-                            // Cancellation occurred
-                            result = new PushoverClient.SendResult
+                            catch (Exception ex)
                             {
-                                Success = false,
-                                Exception = ex
-                            };
-                        }
-                        catch (Exception ex)
-                        {
-                            // Unexpected exception during send
-                            result = new PushoverClient.SendResult
+                                result = new PushoverClient.SendResult { Success = false, Exception = ex };
+                            }
+                            
+                            if (result.Success) break;
+                            
+                            if (isCritical && attempt < MaxRetriesForPriority2)
                             {
-                                Success = false,
-                                Exception = ex
-                            };
-                        }
+                                WriteNotificationLog("WARN", $"Pushover send failed (attempt {attempt}), retrying in {RetryDelaySeconds}s: Key={request.Key}, Title={request.Title}, Error={result.Exception?.Message ?? "unknown"}");
+                                await Task.Delay(TimeSpan.FromSeconds(RetryDelaySeconds), cancellationToken);
+                            }
+                        } while (!result.Success && isCritical && attempt < MaxRetriesForPriority2);
                         
                         if (result.Success)
                         {
@@ -510,6 +513,8 @@ public sealed class NotificationService : IDisposable
                             // Build error message
                             var errorParts = new System.Text.StringBuilder();
                             errorParts.Append($"Pushover notification failed: ");
+                            if (isCritical && attempt > 1)
+                                errorParts.Append($"after {attempt} attempts ");
                             errorParts.Append($"Key={request.Key}, ");
                             errorParts.Append($"Title={request.Title}, ");
                             errorParts.Append($"Priority={request.Priority}, ");

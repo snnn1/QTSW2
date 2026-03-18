@@ -20,6 +20,7 @@ public sealed class ProtectiveCoverageCoordinator
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
+    private readonly Func<string, IReadOnlyCollection<string>>? _getActiveIntentIdsForInstrument;
     private readonly Func<string, bool> _isFlattenInProgress;
     private readonly Func<string, bool> _isRecoveryInProgress;
     private readonly Func<string, bool> _isInstrumentBlockedExternal;
@@ -48,10 +49,12 @@ public sealed class ProtectiveCoverageCoordinator
         RobotLogger? log,
         Func<ProtectiveCorrectiveRequest, ProtectiveCorrectiveResult>? submitCorrective = null,
         Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
-        ExecutionEventWriter? eventWriter = null)
+        ExecutionEventWriter? eventWriter = null,
+        Func<string, IReadOnlyCollection<string>>? getActiveIntentIdsForInstrument = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
+        _getActiveIntentIdsForInstrument = getActiveIntentIdsForInstrument;
         _isFlattenInProgress = isFlattenInProgress ?? (_ => false);
         _isRecoveryInProgress = isRecoveryInProgress ?? (_ => false);
         _isInstrumentBlockedExternal = isInstrumentBlocked ?? (_ => false);
@@ -102,17 +105,18 @@ public sealed class ProtectiveCoverageCoordinator
 
                 var inst = instrument.Trim();
                 var blockedForAudit = _isInstrumentBlockedExternal(inst) || IsInstrumentBlockedByProtective(inst);
+                var activeIntentIds = _getActiveIntentIdsForInstrument?.Invoke(inst);
 
                 var result = ProtectiveCoverageAudit.Audit(
                     inst,
                     snapshot,
-                    activeIntentIds: null,
+                    activeIntentIds,
                     flattenInProgress: _isFlattenInProgress(inst),
                     recoveryInProgress: _isRecoveryInProgress(inst),
                     instrumentBlocked: blockedForAudit,
                     utcNow);
 
-                ProcessResult(result);
+                ProcessResult(result, activeIntentIds, utcNow);
             }
 
             _lastAuditUtc = utcNow;
@@ -142,10 +146,27 @@ public sealed class ProtectiveCoverageCoordinator
         });
     }
 
-    private void ProcessResult(ProtectiveAuditResult result)
+    private void ProcessResult(ProtectiveAuditResult result, IReadOnlyCollection<string>? activeIntentIds, DateTimeOffset utcNow)
     {
         var inst = result.Instrument;
         if (string.IsNullOrWhiteSpace(inst)) return;
+
+        // Diagnostic: log audit context for protective_missing_stop and critical failures
+        if (ProtectiveCoverageAudit.IsCritical(result.Status) || result.Status == ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+        {
+            var expectedCount = activeIntentIds?.Count ?? -1;
+            var foundStopQty = result.StopQty;
+            var reason = activeIntentIds == null ? "expected_intent_set_null" : (activeIntentIds.Count == 0 ? "expected_intent_set_empty" : null);
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "PROTECTIVE_AUDIT_CONTEXT", new
+            {
+                instrument = inst,
+                audit_status = result.Status.ToString(),
+                expected_active_intent_ids_count = expectedCount,
+                found_protective_stop_qty = foundStopQty,
+                broker_position_qty = result.BrokerPositionQty,
+                context_wiring_reason = reason ?? "ok"
+            }));
+        }
 
         var state = GetOrAddState(inst);
 
@@ -389,7 +410,7 @@ public sealed class ProtectiveCoverageCoordinator
     /// <summary>For tests: process a result directly (bypasses timer).</summary>
     internal void ProcessResultForTest(ProtectiveAuditResult result)
     {
-        ProcessResult(result);
+        ProcessResult(result, null, result.AuditUtc);
     }
 
     /// <summary>For tests: get current state (read-only).</summary>

@@ -329,6 +329,11 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         // LIVE adapter: No-op (stub)
     }
 
+    public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
+    {
+        return Array.Empty<string>();
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         // LIVE adapter: No-op (stub - IEA not yet bound)

@@ -114,7 +114,7 @@ public static class BootstrapPhase4Tests
         if (d != BootstrapDecision.FLATTEN_THEN_RECONSTRUCT)
             return (false, $"Journal divergence: expected FLATTEN_THEN_RECONSTRUCT, got {d}");
 
-        // 7. Live orders present no position -> FLATTEN_THEN_RECONSTRUCT
+        // 7. Live orders present no position (no slot journal) -> FLATTEN_THEN_RECONSTRUCT
         snap = new BootstrapSnapshot
         {
             Instrument = "MES",
@@ -122,7 +122,8 @@ public static class BootstrapPhase4Tests
             BrokerWorkingOrderCount = 1,
             JournalQty = 0,
             UnownedLiveOrderCount = 0,
-            RegistrySnapshot = new RecoveryRegistrySnapshot { UnownedLiveCount = 0 }
+            RegistrySnapshot = new RecoveryRegistrySnapshot { UnownedLiveCount = 0 },
+            SlotJournalShowsEntryStopsExpected = false
         };
         c = BootstrapClassifier.Classify(snap);
         if (c != BootstrapClassification.LIVE_ORDERS_PRESENT_NO_POSITION)
@@ -130,6 +131,24 @@ public static class BootstrapPhase4Tests
         d = BootstrapDecider.Decide(c, snap);
         if (d != BootstrapDecision.FLATTEN_THEN_RECONSTRUCT)
             return (false, $"Live orders no position: expected FLATTEN_THEN_RECONSTRUCT, got {d}");
+
+        // 7b. Live orders present no position + slot journal shows RANGE_LOCKED+StopBracketsSubmittedAtLock -> ADOPT (restart fix)
+        snap = new BootstrapSnapshot
+        {
+            Instrument = "MES",
+            BrokerPositionQty = 0,
+            BrokerWorkingOrderCount = 1,
+            JournalQty = 0,
+            UnownedLiveOrderCount = 0,
+            RegistrySnapshot = new RecoveryRegistrySnapshot { UnownedLiveCount = 0 },
+            SlotJournalShowsEntryStopsExpected = true
+        };
+        c = BootstrapClassifier.Classify(snap);
+        if (c != BootstrapClassification.LIVE_ORDERS_PRESENT_NO_POSITION)
+            return (false, $"Live orders + slot journal: expected LIVE_ORDERS_PRESENT_NO_POSITION, got {c}");
+        d = BootstrapDecider.Decide(c, snap);
+        if (d != BootstrapDecision.ADOPT)
+            return (false, $"Live orders + slot journal: expected ADOPT (restart fix), got {d}");
 
         // 8. Unknown requires supervisor (ambiguous state) -> HALT
         snap = new BootstrapSnapshot

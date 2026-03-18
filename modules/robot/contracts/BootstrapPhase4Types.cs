@@ -72,6 +72,12 @@ public sealed class BootstrapSnapshot
     public object? RuntimeIntentSnapshot { get; set; }
     /// <summary>Broker-truth protective status when position exists.</summary>
     public ProtectiveStatus ProtectiveStatus { get; set; } = ProtectiveStatus.UNKNOWN;
+
+    /// <summary>
+    /// True when slot journal shows RANGE_LOCKED + StopBracketsSubmittedAtLock for a stream trading this instrument.
+    /// Used to ADOPT working entry stops on restart instead of flattening them as orphans.
+    /// </summary>
+    public bool SlotJournalShowsEntryStopsExpected { get; set; }
 }
 
 /// <summary>Classifies startup snapshot into controlled set.</summary>
@@ -136,6 +142,11 @@ public static class BootstrapDecider
 {
     public static BootstrapDecision Decide(BootstrapClassification classification, BootstrapSnapshot snapshot)
     {
+        // RESTART FIX: Working entry stops with no position are valid when slot journal shows RANGE_LOCKED + StopBracketsSubmittedAtLock.
+        // ADOPT instead of flatten to preserve entry stops after NinjaTrader restart.
+        if (classification == BootstrapClassification.LIVE_ORDERS_PRESENT_NO_POSITION && snapshot.SlotJournalShowsEntryStopsExpected)
+            return BootstrapDecision.ADOPT;
+
         return classification switch
         {
             BootstrapClassification.CLEAN_START => BootstrapDecision.RESUME,

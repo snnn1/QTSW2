@@ -15,12 +15,14 @@ public sealed partial class InstrumentExecutionAuthority
     private const int TerminalRetentionMinutes = 10;
 
     /// <summary>Phase 2: Register an unowned order (manual/external). Classifies as UNOWNED.</summary>
+    /// <param name="isEntryOrder">True when order is an entry order from adoption path — enables fill journaling.</param>
     internal void RegisterUnownedOrder(
         string brokerOrderId,
         string? intentId,
         string instrument,
         string? sourceContext,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        bool isEntryOrder = false)
     {
         if (string.IsNullOrEmpty(brokerOrderId)) return;
 
@@ -30,7 +32,7 @@ public sealed partial class InstrumentExecutionAuthority
             Instrument = instrument ?? "",
             OrderType = "UNKNOWN",
             State = "UNOWNED",
-            IsEntryOrder = false,
+            IsEntryOrder = isEntryOrder,
             Quantity = 0,
             FilledQuantity = 0
         };
@@ -52,6 +54,9 @@ public sealed partial class InstrumentExecutionAuthority
 
         _orderRegistry.Register(entry);
         _orderRegistry.IncrementUnownedDetected();
+
+        if (!string.IsNullOrEmpty(intentId))
+            SharedAdoptedOrderRegistry.Register(brokerOrderId, intentId, instrument ?? "", null, null, isEntryOrder);
 
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", new
         {
@@ -118,24 +123,34 @@ public sealed partial class InstrumentExecutionAuthority
             }
         }
 
-        // Broker has live order but registry does not
-        foreach (var brokerId in brokerOrderIds)
+        // Broker has live order but registry does not — IEA robustness: adopt immediately to restore consistency
+        foreach (Order o in account.Orders)
         {
-            if (!_orderRegistry.Contains(brokerId))
+            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            var brokerId = o.OrderId?.ToString();
+            if (string.IsNullOrEmpty(brokerId) || _orderRegistry.Contains(brokerId)) continue;
+
+            _orderRegistry.IncrementIntegrityFailure();
+            Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
             {
-                _orderRegistry.IncrementIntegrityFailure();
-                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
+                broker_order_id = brokerId,
+                direction = "broker_has_registry_missing",
+                note = "Broker has live order but registry does not — adopting to restore consistency",
+                iea_instance_id = InstanceId
+            }));
+            if (TryAdoptBrokerOrderIfNotInRegistry(o))
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE_ADOPTED", new
                 {
                     broker_order_id = brokerId,
-                    direction = "broker_has_registry_missing",
-                    note = "Broker has live order but registry does not",
+                    note = "Order adopted into registry",
                     iea_instance_id = InstanceId
                 }));
-#if NINJATRADER
-                RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
-                RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
-#endif
             }
+#if NINJATRADER
+            RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
+            RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
+#endif
         }
     }
 

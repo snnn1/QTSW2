@@ -78,6 +78,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Order registry tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("SHARED_ADOPTED_ORDER_REGISTRY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SharedAdoptedOrderRegistryTests.RunSharedAdoptedOrderRegistryTests();
+        Console.WriteLine(pass ? "PASS: Shared adopted order registry tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("RECOVERY_PHASE3", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = RecoveryPhase3Tests.RunRecoveryPhase3Tests();
@@ -106,6 +112,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = BootstrapPhase4Tests.RunBootstrapPhase4Tests();
         Console.WriteLine(pass ? "PASS: Bootstrap Phase 4 tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("ADOPTION_RECOVERY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = AdoptionRecoveryTests.RunAdoptionRecoveryTests();
+        Console.WriteLine(pass ? "PASS: Adoption recovery tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RECONCILIATION_RECOVERY_SCENARIOS", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReconciliationRecoveryScenarioTests.RunReconciliationRecoveryScenarioTests();
+        Console.WriteLine(pass ? "PASS: Reconciliation recovery scenario tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("DATA_STALL_DETECTION", StringComparison.OrdinalIgnoreCase))
