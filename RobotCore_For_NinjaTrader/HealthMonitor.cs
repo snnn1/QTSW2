@@ -104,6 +104,7 @@ public sealed class HealthMonitor
     {
         "EXECUTION_GATE_INVARIANT_VIOLATION",
         "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "DISCONNECT_RECOVERY_COMPLETE",
         "SLOT_FAILED_RUNTIME",
         "REENTRY_PROTECTION_FAILED",
         "RECONCILIATION_QTY_MISMATCH",
@@ -1197,6 +1198,24 @@ public sealed class HealthMonitor
     }
     
     /// <summary>
+    /// Get instance count for current connection-lost incident (for notification message).
+    /// May be 1 when first instance sends; other instances may increment shortly after.
+    /// </summary>
+    private int? GetConnectionLostInstanceCountForCurrentIncident()
+    {
+        var incidentId = _currentIncident?.GetIncidentId();
+        if (!incidentId.HasValue)
+            return null;
+        var sharedIncidentKey = incidentId.Value / TICKS_PER_60_SECONDS;
+        lock (_sharedConnectionLock)
+        {
+            if (_sharedConnectionLostInstanceCountByIncident.TryGetValue(sharedIncidentKey, out var count))
+                return count;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Build human-readable message from critical event payload.
     /// </summary>
     private string BuildCriticalEventMessage(string eventType, Dictionary<string, object>? payload)
@@ -1225,7 +1244,17 @@ public sealed class HealthMonitor
                 parts.Add($"Connection: {connName}");
             if (payload.TryGetValue("active_stream_count", out var streamCount) && streamCount != null)
                 parts.Add($"Active Streams: {streamCount}");
+            var instanceCount = GetConnectionLostInstanceCountForCurrentIncident();
+            if (instanceCount.HasValue && instanceCount.Value > 0)
+                parts.Add($"Detected by {instanceCount.Value} strategy instance(s)");
             parts.Add("All execution blocked - requires operator intervention");
+        }
+        else if (eventType == "DISCONNECT_RECOVERY_COMPLETE")
+        {
+            parts.Add("Robot Exited Fail-Closed Mode");
+            parts.Add("Recovery complete - execution unblocked");
+            if (payload.TryGetValue("recovery_completed_utc", out var completedUtc) && completedUtc != null)
+                parts.Add($"Completed: {completedUtc}");
         }
         else
         {

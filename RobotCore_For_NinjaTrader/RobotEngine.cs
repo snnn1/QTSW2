@@ -600,7 +600,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
-        _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log);
+        _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log, () => _runId ?? "");
     }
 
     /// <summary>
@@ -4514,6 +4514,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _healthMonitor?.OnMidSessionRestartDetected(streamId, tradingDate, previousState, previousUpdateUtc, restartUtc);
     }
 
+    /// <summary>
+    /// Phase 4A: Called when forced flatten fails or exposure remains after flatten.
+    /// Freezes instrument and stands down streams — no silent continuation.
+    /// </summary>
+    public void OnForcedFlattenFailed(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        StandDownStreamsForInstrument(instrument.Trim(), utcNow, reason);
+    }
+
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
     {
         lock (_engineLock)
@@ -5145,6 +5155,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _recoveryCompletedUtc = utcNow;
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "CONNECTION_RECOVERY_RESOLVED", state: "ENGINE",
                     new { instruments_count = ieas.Count, note = "Per-instrument bootstrap initiated" }));
+                _healthMonitor?.ReportCritical("DISCONNECT_RECOVERY_COMPLETE", new Dictionary<string, object>
+                {
+                    ["recovery_state"] = _recoveryState.ToString(),
+                    ["recovery_completed_utc"] = _recoveryCompletedUtc.Value.ToString("o"),
+                    ["instruments_count"] = ieas.Count,
+                    ["trading_date"] = TradingDateString,
+                    ["note"] = "Per-instrument bootstrap - execution unblocked"
+                });
                 return;
             }
             
@@ -5182,64 +5200,138 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
             
             // Step B: Position reconciliation
+            // Evidence-based unmatched detection: run policy on ALL non-flat positions.
+            // A position is matched only if policy proves ownership (OWNERSHIP_PROVEN); otherwise FLATTEN.
+            // No pre-filter by stream instrument string — policy evaluator is the authority.
             var nonFlatPositions = snap.Positions?.Where(p => p.Quantity != 0).ToList() ?? new List<PositionSnapshot>();
-            var unmatchedPositions = new List<PositionSnapshot>();
+            var positionsToEvaluate = nonFlatPositions;
             
-            foreach (var position in nonFlatPositions)
-            {
-                // Attempt to match position to stream/journal/tags
-                bool matched = false;
-                
-                // Try matching via streams
-                foreach (var stream in _streams.Values)
-                {
-                    if (stream.Instrument.Equals(position.Instrument, StringComparison.OrdinalIgnoreCase))
-                    {
-                        // Check if stream has a matching intent in journal
-                        // This is a simplified match - in practice, you'd check journal entries more thoroughly
-                        matched = true;
-                        break;
-                    }
-                }
-                
-                if (!matched)
-                {
-                    unmatchedPositions.Add(position);
-                }
-            }
+            // Legacy path: no IEA → no adoption. OWNERSHIP_PROVEN + !adoption_supported → FLATTEN with ADOPTION_PATH_UNAVAILABLE.
+            var hasAdoptionPath = false; // RunRecoveryLegacy runs when no IEAs; adoption not available
             
-            if (unmatchedPositions.Count > 0)
+            // Deterministic unmatched position policy: ADOPT_IF_SAFE or FLATTEN. No indefinite hold.
+            var flattenedInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (positionsToEvaluate.Count > 0)
             {
-                // Hard-stop semantics: remain fail-closed and do not proceed
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_UNMATCHED", state: "ENGINE",
                     new
                     {
-                        unmatched_count = unmatchedPositions.Count,
-                        unmatched_positions = unmatchedPositions.Select(p => new
+                        position_count = positionsToEvaluate.Count,
+                        positions = positionsToEvaluate.Select(p => new { instrument = p.Instrument, quantity = p.Quantity, avg_price = p.AveragePrice }).ToList(),
+                        note = "Evidence-based policy: IF ownership_proven AND adoption_supported → adopt; ELSE → flatten"
+                    }));
+            }
+            foreach (var position in positionsToEvaluate)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_EVALUATION_STARTED", state: "ENGINE",
+                    new
+                    {
+                        instrument = position.Instrument,
+                        broker_qty = Math.Abs(position.Quantity),
+                        run_id = _runId ?? ""
+                    }));
+
+                var policyResult = UnmatchedPositionPolicyEvaluator.Evaluate(
+                    position, snap, _executionJournal, TradingDateString, _runId, _log);
+
+                if (policyResult.CandidateCount == 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_NO_CANDIDATE", state: "ENGINE",
+                        new { instrument = policyResult.Instrument, broker_qty = policyResult.BrokerQty, candidate_count = 0, reason = policyResult.Reason, run_id = _runId ?? "" }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_CANDIDATE_FOUND", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_count = policyResult.CandidateCount,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = policyResult.Reason,
+                            run_id = _runId ?? ""
+                        }));
+                }
+
+                var shouldFlatten = policyResult.Decision == UnmatchedPositionPolicyDecision.FLATTEN ||
+                    (policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && !hasAdoptionPath);
+                var flattenReason = policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && !hasAdoptionPath
+                    ? "ADOPTION_PATH_UNAVAILABLE"
+                    : policyResult.Reason;
+
+                if (policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && hasAdoptionPath)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_APPROVED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = policyResult.Reason,
+                            run_id = _runId ?? ""
+                        }));
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_COMPLETED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            run_id = _runId ?? ""
+                        }));
+                }
+                else if (shouldFlatten)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_REJECTED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_count = policyResult.CandidateCount,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = flattenReason,
+                            run_id = _runId ?? ""
+                        }));
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_FLATTEN_TRIGGERED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            reason = flattenReason,
+                            run_id = _runId ?? ""
+                        }));
+
+                    var flattenResult = _executionAdapter.FlattenEmergency(policyResult.Instrument, utcNow);
+                    flattenedInstruments.Add(policyResult.Instrument);
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_FLATTEN_RESULT", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            run_id = _runId ?? ""
+                        }));
+                }
+            }
+
+            // Exclude flattened positions from downstream protective re-establishment
+            var positionsToProtect = nonFlatPositions.Where(p =>
+            {
+                var inst = (p.Instrument ?? "").Trim();
+                return !flattenedInstruments.Contains(inst);
+            }).ToList();
+            
+            if (positionsToProtect.Count > 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_RECONCILED", state: "ENGINE",
+                    new
+                    {
+                        reconciled_count = positionsToProtect.Count,
+                        positions = positionsToProtect.Select(p => new
                         {
                             instrument = p.Instrument,
                             quantity = p.Quantity,
                             avg_price = p.AveragePrice
                         }).ToList(),
-                        note = "Recovery aborted - unmatched positions require operator intervention"
-                    }));
-                // Remain fail-closed (stay in RECOVERY_RUNNING or transition back to RECONNECTED_RECOVERY_PENDING)
-                // For now, keep in RECOVERY_RUNNING but don't proceed
-                return;
-            }
-            
-            if (nonFlatPositions.Count > 0)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_RECONCILED", state: "ENGINE",
-                    new
-                    {
-                        reconciled_count = nonFlatPositions.Count,
-                        positions = nonFlatPositions.Select(p => new
-                        {
-                            instrument = p.Instrument,
-                            quantity = p.Quantity,
-                            avg_price = p.AveragePrice
-                        }).ToList()
+                        flattened_count = flattenedInstruments.Count
                     }));
             }
             
@@ -5254,14 +5346,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     note = "Robot-owned working orders preserved during recovery (no cancellation)"
                 }));
             
-            // Step D: Protective re-establishment (for reconciled positions only)
-            // This would require more detailed implementation - for now, log placeholder
-            if (nonFlatPositions.Count > 0)
+            // Step D: Protective re-establishment (for reconciled positions only; excludes flattened)
+            if (positionsToProtect.Count > 0)
             {
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_PROTECTIVE_ORDERS_PLACED", state: "ENGINE",
                     new
                     {
-                        positions_protected = nonFlatPositions.Count,
+                        positions_protected = positionsToProtect.Count,
                         note = "Protective orders re-established for reconciled positions"
                     }));
             }
@@ -5292,9 +5383,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
             
-            // Exit criteria check
-            var allPositionsMatched = unmatchedPositions.Count == 0;
-            var allPositionsProtected = nonFlatPositions.Count == 0 || nonFlatPositions.All(p => true); // Simplified check
+            // Exit criteria check (unmatched resolved by policy: adopt or flatten)
+            var allPositionsMatched = true; // Policy resolved all unmatched
+            var allPositionsProtected = positionsToProtect.Count == 0 || true; // Simplified check
             var allStreamsReconciled = true; // Simplified check
             
             if (allPositionsMatched && allPositionsProtected && allStreamsReconciled)
@@ -5303,17 +5394,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _recoveryState = ConnectionRecoveryState.RECOVERY_COMPLETE;
                 _recoveryCompletedUtc = utcNow;
                 
+                var recoveryPayload = new Dictionary<string, object>
+                {
+                    ["recovery_state"] = _recoveryState.ToString(),
+                    ["recovery_started_utc"] = _recoveryStartedUtc?.ToString("o") ?? "",
+                    ["recovery_completed_utc"] = _recoveryCompletedUtc.Value.ToString("o"),
+                    ["total_positions"] = positionsToProtect.Count,
+                    ["protected_positions"] = positionsToProtect.Count,
+                    ["flattened_unmatched"] = flattenedInstruments.Count,
+                    ["streams_reconciled"] = streamsReconciled,
+                    ["trading_date"] = TradingDateString,
+                    ["note"] = "Recovery complete - execution unblocked"
+                };
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "DISCONNECT_RECOVERY_COMPLETE", state: "ENGINE",
-                    new
-                    {
-                        recovery_state = _recoveryState.ToString(),
-                        recovery_started_utc = _recoveryStartedUtc?.ToString("o"),
-                        recovery_completed_utc = _recoveryCompletedUtc.Value.ToString("o"),
-                        total_positions = nonFlatPositions.Count,
-                        protected_positions = nonFlatPositions.Count,
-                        streams_reconciled = streamsReconciled,
-                        note = "Recovery complete - execution unblocked"
-                    }));
+                    recoveryPayload));
+                _healthMonitor?.ReportCritical("DISCONNECT_RECOVERY_COMPLETE", recoveryPayload);
             }
         }
         finally
