@@ -81,6 +81,22 @@ async def get_watchdog_status():
         raise HTTPException(status_code=500, detail=f"Error getting watchdog status: {str(e)}")
 
 
+@router.get("/operator-snapshot")
+async def get_operator_snapshot(
+    n_events: int = Query(500, ge=100, le=2000, description="Number of recent events to derive from"),
+):
+    """Get deterministic per-instrument operator snapshot (Phase 1). Read-only derivation."""
+    try:
+        aggregator = get_aggregator()
+        snapshot = aggregator.get_operator_snapshot(n_events=n_events)
+        return {"snapshot": snapshot}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting operator snapshot: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting operator snapshot: {str(e)}")
+
+
 @router.get("/alerts")
 async def get_alerts(
     active_only: bool = Query(False, description="Return only active alerts"),

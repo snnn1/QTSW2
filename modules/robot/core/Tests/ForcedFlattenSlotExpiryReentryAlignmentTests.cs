@@ -166,6 +166,8 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
         => OrderModificationResult.SuccessResult(utcNow);
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+        => FlattenResult.SuccessResult(utcNow);
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
         => new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)

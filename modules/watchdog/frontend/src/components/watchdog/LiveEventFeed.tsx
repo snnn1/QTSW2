@@ -25,7 +25,7 @@ function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
 
   // Filter out internal heartbeat events for UI display only (watchdog still ingests them)
   const displayEvents = useMemo(
-    () => events.filter((e) => !HIDDEN_EVENT_TYPES.has(e.event_type)),
+    () => (events ?? []).filter((e) => e && !HIDDEN_EVENT_TYPES.has(e.event_type)),
     [events]
   )
 
@@ -168,20 +168,23 @@ function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedP
     return false
   }
   
+  const prevEvents = prevProps.events ?? []
+  const nextEvents = nextProps.events ?? []
+  
   // If array lengths differ, events changed
-  if (prevProps.events.length !== nextProps.events.length) {
+  if (prevEvents.length !== nextEvents.length) {
     return false
   }
   
   // If both empty, they're equal
-  if (prevProps.events.length === 0) {
+  if (prevEvents.length === 0) {
     return true
   }
   
   // Compare by checking if the last event (by timestamp) is the same
   // Events are sorted by timestamp, so last in array = most recent
-  const prevLast = prevProps.events[prevProps.events.length - 1]
-  const nextLast = nextProps.events[nextProps.events.length - 1]
+  const prevLast = prevEvents[prevEvents.length - 1]
+  const nextLast = nextEvents[nextEvents.length - 1]
   
   if (!prevLast || !nextLast) {
     return false

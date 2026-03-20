@@ -341,9 +341,14 @@ public sealed class RobotLoggingService : IDisposable
                 return;
             }
             
-            // Rate limiting: apply only to DEBUG and INFO levels
-            if (string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase))
+            // Rate limiting: apply to DEBUG, INFO, and WARN when event type is in event_rate_limits
+            // (CRITICAL_NOTIFICATION_SKIPPED is WARN but floods when multi-instance; throttle via config)
+            var eventTypeForRateLimit = evt.@event ?? "";
+            var isRateLimitableLevel = string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase) ||
+                (string.Equals(evt.level, "WARN", StringComparison.OrdinalIgnoreCase) &&
+                 _config.event_rate_limits != null && _config.event_rate_limits.ContainsKey(eventTypeForRateLimit));
+            if (isRateLimitableLevel)
             {
                 if (!CheckRateLimit(evt))
                 {
@@ -366,7 +371,7 @@ public sealed class RobotLoggingService : IDisposable
 
         // Engine-level event deduplication: log once per engine state change, not once per instrument
         var eventType = evt.@event ?? "";
-        var reason = evt.data != null && evt.data.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() : null;
+        var reason = BuildDedupeReason(eventType, evt.data);
         if (!EngineLogDedupe.ShouldLog(eventType, reason))
             return;
 
@@ -393,6 +398,23 @@ public sealed class RobotLoggingService : IDisposable
         _queue.Enqueue(evt);
     }
     
+    /// <summary>
+    /// Build dedupe key reason for EngineLogDedupe.
+    /// RECONCILIATION_ORDER_SOURCE_BREAKDOWN uses instrument:broker_working:iea_working for per-instrument dedupe.
+    /// </summary>
+    private static string? BuildDedupeReason(string eventType, Dictionary<string, object?>? data)
+    {
+        if (data == null) return null;
+        if (string.Equals(eventType, "RECONCILIATION_ORDER_SOURCE_BREAKDOWN", StringComparison.OrdinalIgnoreCase))
+        {
+            var inst = data.TryGetValue("instrument", out var i) ? i?.ToString() ?? "" : "";
+            var bw = data.TryGetValue("broker_working", out var b) ? b?.ToString() ?? "" : "";
+            var iw = data.TryGetValue("iea_working", out var ie) ? ie?.ToString() ?? "" : "";
+            return $"{inst}:{bw}:{iw}";
+        }
+        return data.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() : null;
+    }
+
     /// <summary>
     /// Check rate limit for event. Returns true if event should be logged, false if rate limit exceeded.
     /// Rate limits apply ONLY to DEBUG and INFO levels. ERROR and CRITICAL always bypass.

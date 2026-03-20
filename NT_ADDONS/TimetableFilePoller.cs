@@ -21,6 +21,12 @@ public sealed class TimetableFilePoller
 
     public bool ShouldPoll(DateTimeOffset utcNow) => utcNow - _lastPollUtc >= _pollInterval;
 
+    /// <summary>Mark that a poll occurred (updates interval). Use when polling via TimetableCache.</summary>
+    public void MarkPolled(DateTimeOffset utcNow)
+    {
+        _lastPollUtc = utcNow;
+    }
+
     public FilePollResult Poll(string path, DateTimeOffset utcNow)
     {
         _lastPollUtc = utcNow;

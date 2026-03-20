@@ -82,6 +82,8 @@ public static class MixedStopMarketEntryTests
             => _base.ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow);
         public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)
             => _base.Flatten(intentId, instrument, utcNow);
+        public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+            => _base.FlattenEmergency(instrument, utcNow);
         public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
             => _base.GetAccountSnapshot(utcNow);
         public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)

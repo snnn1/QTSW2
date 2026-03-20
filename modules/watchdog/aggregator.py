@@ -25,6 +25,7 @@ from .event_processor import EventProcessor
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
 from .config import (
+    ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
     ALERT_STARTUP_GRACE_SECONDS,
     CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS,
     EXECUTION_JOURNALS_DIR,
@@ -351,6 +352,9 @@ class WatchdogAggregator:
         self._anomaly_dedupe_queue: deque = deque(maxlen=500)
         # When cursor save fails, skip anomaly counting next cycle to avoid double-count on reprocess
         self._skip_anomaly_counting: bool = False
+
+        # ORDER_STUCK_DETECTED throttle: avoid flood when recovery loops keep submitting new orders
+        self._last_order_stuck_alert_utc: Optional[datetime] = None
 
         # Phase 9: Metrics history snapshots every 6 hours
         self._last_metrics_snapshot_utc: Optional[datetime] = None
@@ -1144,16 +1148,42 @@ class WatchdogAggregator:
             self._notification_service.resolve_alert("ANOMALY_RATE_EXCEEDED")
 
         # Phase 7: ORDER_STUCK_DETECTED - derived from ORDER_SUBMIT_SUCCESS without fill/cancel within threshold
+        # Throttle: when recovery loops, new orders keep getting stuck; cooldown stops alert flood
         stuck_orders = self._state_manager.check_stuck_orders(now_utc)
         for stuck in stuck_orders:
             self._add_derived_event_to_buffer("ORDER_STUCK_DETECTED", stuck)
-            self._notification_service.raise_alert(
-                alert_type="ORDER_STUCK_DETECTED",
-                severity="medium",
-                context=stuck,
-                dedupe_key=f"ORDER_STUCK_DETECTED:{stuck.get('broker_order_id', '')}",
-                min_resend_interval_seconds=120,
+        # Alert only if outside cooldown; when 2+ stuck, emit one aggregated alert
+        if stuck_orders:
+            within_cooldown = (
+                self._last_order_stuck_alert_utc is not None
+                and (now_utc - self._last_order_stuck_alert_utc).total_seconds() < ORDER_STUCK_DETECTED_COOLDOWN_SECONDS
             )
+            if not within_cooldown:
+                self._last_order_stuck_alert_utc = now_utc
+                if len(stuck_orders) >= 2:
+                    # Aggregate: one alert for N orders (stops flood when many stuck at once)
+                    summary = {
+                        "count": len(stuck_orders),
+                        "broker_order_ids": [s.get("broker_order_id", "") for s in stuck_orders],
+                        "instruments": list({s.get("instrument", "") for s in stuck_orders if s.get("instrument")}),
+                        "sample": stuck_orders[0],
+                    }
+                    self._notification_service.raise_alert(
+                        alert_type="ORDER_STUCK_DETECTED",
+                        severity="medium",
+                        context=summary,
+                        dedupe_key="ORDER_STUCK_DETECTED_BATCH",
+                        min_resend_interval_seconds=ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
+                    )
+                else:
+                    stuck = stuck_orders[0]
+                    self._notification_service.raise_alert(
+                        alert_type="ORDER_STUCK_DETECTED",
+                        severity="medium",
+                        context=stuck,
+                        dedupe_key=f"ORDER_STUCK_DETECTED:{stuck.get('broker_order_id', '')}",
+                        min_resend_interval_seconds=ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
+                    )
 
         # LOG_FILE_STALLED: feed file size unchanged for 60s (logging deadlock, file handle lost, NT not flushing)
         if LOG_GROWTH_MONITOR_FILE.exists():
@@ -1905,6 +1935,15 @@ class WatchdogAggregator:
         """Get recent events for slot lifecycle aggregation. No run_id filter."""
         return self._read_events_tail(n)
 
+    def get_operator_snapshot(self, n_events: int = 500) -> Dict[str, Dict[str, Any]]:
+        """
+        Build deterministic per-instrument operator snapshot (Phase 1).
+        Read-only derivation from events + state_manager. No side effects.
+        """
+        from .state.operator_snapshot import build_operator_snapshot
+        events = self.get_events_for_slot_lifecycle(n_events)
+        return build_operator_snapshot(events, self._state_manager)
+
     def get_watchdog_status(self) -> Dict:
         """Get current watchdog status."""
         try:
@@ -2156,9 +2195,12 @@ class WatchdogAggregator:
         try:
             # Hydrate stream states from slot journals when event-derived state is missing (throttled 30s)
             # Also hydrate range data from ranges_{date}.jsonl for RANGE_LOCKED streams missing range_high/low
+            # Run intent hydration first so DONE from execution journal TradeCompleted is applied before
+            # slot journal hydration (which would otherwise overwrite DONE with stale RANGE_LOCKED)
             now_utc = datetime.now(timezone.utc)
             if self._last_slot_journal_hydrate_utc is None or \
                     (now_utc - self._last_slot_journal_hydrate_utc).total_seconds() >= 30:
+                self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
                 self._state_manager.hydrate_stream_states_from_slot_journals()
                 self._state_manager.hydrate_range_data_from_ranges_file()
                 self._last_slot_journal_hydrate_utc = now_utc
@@ -2511,38 +2553,71 @@ class WatchdogAggregator:
         """
         event_type = event.get("event_type", "")
         
-        # Canonical list of important event types (only events that exist in feed)
+        # Canonical list of important event types (Phase 0: full real-time mirror of critical state)
+        # Must include all execution decisions so WebSocket = REST for live system view
         important_types = {
+            # Connection
             "CONNECTION_LOST",
             "CONNECTION_LOST_SUSTAINED",
             "CONNECTION_RECOVERED",
-            "CONNECTION_RECOVERED_NOTIFICATION",  # Recovery notification after sustained disconnect
-            "CONNECTIVITY_DAILY_SUMMARY",  # Daily disconnect metrics
-            "CONNECTIVITY_INCIDENT",  # 5+ disconnects in 1h or single disconnect >120s
+            "CONNECTION_RECOVERED_NOTIFICATION",
+            "CONNECTION_CONFIRMED",
+            # Disconnect / recovery state
+            "DISCONNECT_FAIL_CLOSED_ENTERED",
+            "DISCONNECT_RECOVERY_STARTED",
+            "DISCONNECT_RECOVERY_COMPLETE",
+            "DISCONNECT_RECOVERY_ABORTED",
+            # Bootstrap decisions
+            "BOOTSTRAP_DECISION_RESUME",
+            "BOOTSTRAP_DECISION_ADOPT",
+            "BOOTSTRAP_DECISION_FLATTEN",
+            "BOOTSTRAP_DECISION_HALT",
+            "BOOTSTRAP_ADOPTION_COMPLETED",
+            # Recovery decisions
+            "RECOVERY_DECISION_RESUME",
+            "RECOVERY_DECISION_ADOPT",
+            "RECOVERY_DECISION_FLATTEN",
+            "RECOVERY_DECISION_HALT",
+            "RECOVERY_POSITION_UNMATCHED",
+            # Forced flatten
+            "FORCED_FLATTEN_TRIGGERED",
+            "FORCED_FLATTEN_POSITION_CLOSED",
+            "FORCED_FLATTEN_FAILED",
+            "SESSION_FORCED_FLATTENED",
+            # Adoption / reconciliation
+            "ADOPTION_SUCCESS",
+            "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS",
+            "ADOPTION_GRACE_EXPIRED_UNOWNED",
+            "IEA_ENQUEUE_AND_WAIT_TIMEOUT",
+            "RECONCILIATION_PASS_SUMMARY",
+            "RECONCILIATION_QTY_MISMATCH",
+            # Protective orders
+            "PROTECTIVE_ORDERS_SUBMITTED",
+            "PROTECTIVE_ORDERS_FAILED_FLATTENED",
+            "PROTECTIVE_DRIFT_DETECTED",
+            # Connectivity / engine / stream (existing)
+            "CONNECTIVITY_DAILY_SUMMARY",
+            "CONNECTIVITY_INCIDENT",
             "ENGINE_TICK_STALL_DETECTED",
             "ENGINE_TICK_STALL_RECOVERED",
             "STREAM_STATE_TRANSITION",
-            "DATA_STALL_RECOVERED",  # Actual event from feed
-            "IDENTITY_INVARIANTS_STATUS",  # Actual event from feed
+            "DATA_STALL_RECOVERED",
+            "IDENTITY_INVARIANTS_STATUS",
             "KILL_SWITCH_ACTIVE",
             "EXECUTION_BLOCKED",
             "EXECUTION_ALLOWED",
             # Execution anomaly monitoring (Phase 10)
             "EXECUTION_GHOST_FILL_DETECTED",
-            "PROTECTIVE_DRIFT_DETECTED",
             "ORPHAN_ORDER_DETECTED",
-            "MANUAL_OR_EXTERNAL_ORDER_DETECTED",  # Maps to orphan anomaly
-            "UNOWNED_LIVE_ORDER_DETECTED",  # Maps to orphan anomaly
+            "MANUAL_OR_EXTERNAL_ORDER_DETECTED",
+            "UNOWNED_LIVE_ORDER_DETECTED",
             "DUPLICATE_ORDER_SUBMISSION_DETECTED",
             "POSITION_DRIFT_DETECTED",
             "ORDER_STUCK_DETECTED",
             "EXECUTION_LATENCY_SPIKE_DETECTED",
             "RECOVERY_LOOP_DETECTED",
-            "RECONCILIATION_QTY_MISMATCH",
             "EXPOSURE_INTEGRITY_VIOLATION",
             "ORDER_LIFECYCLE_TRANSITION_INVALID",
-            # Note: DATA_STALL_DETECTED, UNPROTECTED_POSITION_DETECTED are computed, not feed events
-            # Note: RISK_GATE_CHANGED, TRADING_ALLOWED_CHANGED are derived, can be added later
         }
         
         # Exclude to avoid spam
@@ -2610,6 +2685,12 @@ class WatchdogAggregator:
             "EXECUTION_BLOCKED",
             "UNPROTECTED_POSITION_DETECTED",
             "DATA_STALL_DETECTED",
+            # Phase 0: recovery / bootstrap / flatten
+            "RECOVERY_POSITION_UNMATCHED",
+            "DISCONNECT_FAIL_CLOSED_ENTERED",
+            "FORCED_FLATTEN_FAILED",
+            "BOOTSTRAP_DECISION_HALT",
+            "RECOVERY_DECISION_HALT",
             # Execution anomalies (Phase 10)
             "EXECUTION_GHOST_FILL_DETECTED",
             "PROTECTIVE_DRIFT_DETECTED",

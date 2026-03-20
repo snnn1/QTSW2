@@ -88,6 +88,11 @@ SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS = 60
 # Prevents multiple CONNECTION_LOST events in quick succession from inflating session disconnect count.
 DISCONNECT_DEDUPE_WINDOW_SECONDS = 30
 
+# CONNECTION_STABLE_WINDOW_SECONDS: Require this many seconds with no CONNECTION_LOST after
+# CONNECTION_RECOVERED/CONNECTION_CONFIRMED before declaring "connection_stable=True".
+# Answers: "Are we actually back online and stable?"
+CONNECTION_STABLE_WINDOW_SECONDS = 45
+
 # IDENTITY_EXPIRY_SECONDS: If no IDENTITY_INVARIANTS_STATUS event in this many seconds, treat identity as Unknown.
 IDENTITY_EXPIRY_SECONDS = 600  # 10 minutes
 
@@ -164,6 +169,25 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "DISCONNECT_RECOVERY_STARTED",
     "DISCONNECT_RECOVERY_COMPLETE",
     "DISCONNECT_RECOVERY_ABORTED",
+    # Bootstrap decisions (Part 3: visibility for disconnect/restart incident reconstruction)
+    "BOOTSTRAP_DECISION_RESUME",
+    "BOOTSTRAP_DECISION_ADOPT",
+    "BOOTSTRAP_DECISION_FLATTEN",
+    "BOOTSTRAP_DECISION_HALT",
+    "BOOTSTRAP_ADOPTION_COMPLETED",
+    # Recovery decisions
+    "RECOVERY_DECISION_RESUME",
+    "RECOVERY_DECISION_ADOPT",
+    "RECOVERY_DECISION_FLATTEN",
+    "RECOVERY_DECISION_HALT",
+    "RECOVERY_POSITION_UNMATCHED",  # Position unmatched; operator action required (Phase 0)
+    # Adoption outcomes (low frequency)
+    "ADOPTION_SUCCESS",
+    "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS",
+    # Adoption failure (critical - grace expired, orders treated UNOWNED)
+    "ADOPTION_GRACE_EXPIRED_UNOWNED",
+    # Execution path stalls (critical - correlate with disconnects)
+    "IEA_ENQUEUE_AND_WAIT_TIMEOUT",
     # Connection Status
     "CONNECTION_LOST",
     "CONNECTION_LOST_SUSTAINED",

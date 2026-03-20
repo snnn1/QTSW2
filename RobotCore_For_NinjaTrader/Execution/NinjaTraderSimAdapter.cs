@@ -731,6 +731,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
+    /// Retry deferred adoption scan when candidates were empty but broker had orders.
+    /// Call from periodic path so retry does not depend only on execution updates.
+    /// </summary>
+    public void TryRetryDeferredAdoptionScan()
+    {
+        _iea?.TryRetryDeferredAdoptionScanIfDeferred();
+    }
+
+    /// <summary>
     /// Enqueue execution command. Forwards to IEA when bound; no-op when IEA not enabled.
     /// Strategy layers should use this instead of calling adapter.Flatten/SubmitOrders/CancelOrders directly.
     /// </summary>
@@ -2189,7 +2198,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             throw new InvalidOperationException(error);
         }
 
-        return GetAccountSnapshotReal(utcNow);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var snap = GetAccountSnapshotReal(utcNow);
+        sw.Stop();
+        SnapshotMetricsCollector.GetOrCreate(_log).RecordCall(
+            DateTimeOffset.UtcNow, sw.ElapsedMilliseconds,
+            snap?.Positions?.Count ?? 0, snap?.WorkingOrders?.Count ?? 0);
+        return snap;
     }
 
     /// <summary>Get active intent IDs for protective audit (engine/journal-backed, filled entries).</summary>
@@ -2479,6 +2494,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         var idsVariant = _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(execVariant, canonical);
         foreach (var id in idsVariant) ids.Add(id);
         return ids;
+    }
+
+    /// <summary>
+    /// Get journal visibility diagnostics for adoption deferral logging.
+    /// </summary>
+    public (string JournalDir, int FileCount, bool DirectoryExists) GetJournalDiagnostics(string? executionInstrument)
+    {
+        var (exists, count, dir) = _executionJournal.GetJournalDiagnostics();
+        return (dir, count, exists);
     }
 
     private static string DeriveCanonicalFromExecutionInstrument(string execInst)

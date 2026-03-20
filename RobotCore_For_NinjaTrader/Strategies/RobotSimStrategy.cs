@@ -407,7 +407,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // CRITICAL: Pass both execution instrument (e.g., "MGC") and MasterInstrument.Name (e.g., "GC")
                     // for explicit canonical matching per authoritative rule
                     var masterInstrumentName = Instrument.MasterInstrument.Name; // e.g., "GC" for "MGC 03-26"
-                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(5), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName, masterInstrumentName: masterInstrumentName);
+                    _engine = new RobotEngine(projectRoot, TimeSpan.FromSeconds(10), ExecutionMode.SIM, customLogDir: null, customTimetablePath: null, instrument: engineInstrumentName, masterInstrumentName: masterInstrumentName);
                 
                 // PHASE 1: Set account info for startup banner
                 // Reuse accountName variable declared above

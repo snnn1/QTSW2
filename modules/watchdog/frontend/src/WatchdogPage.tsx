@@ -295,6 +295,7 @@ export function WatchdogPage() {
         engineStatus={engineStatus}
         marketOpen={status?.market_open !== undefined ? status.market_open : null}
         connectionStatus={status?.connection_status ?? null}
+        derivedConnectionState={status?.derived_connection_state ?? null}
         dataFlowStatus={dataFlowStatus}
         chicagoTime=""
         clockSlot={<ChicagoClock />}

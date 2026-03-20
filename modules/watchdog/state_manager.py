@@ -32,6 +32,7 @@ from .config import (
     ORDER_STUCK_REORDER_GRACE_SECONDS,
     EXECUTION_LATENCY_SPIKE_THRESHOLD_MS,
     DISCONNECT_DEDUPE_WINDOW_SECONDS,
+    CONNECTION_STABLE_WINDOW_SECONDS,
 )
 from .market_session import is_market_open
 
@@ -124,6 +125,9 @@ class WatchdogStateManager:
         self._kill_switch_active: bool = False
         self._connection_status: str = "Unknown"  # Default until we receive a connection event
         self._last_connection_event_utc: Optional[datetime] = None
+        self._last_connection_lost_utc: Optional[datetime] = None  # When we last saw CONNECTION_LOST
+        self._connection_stable_since_utc: Optional[datetime] = None  # When we last saw Connected (no LOST since)
+        self._last_derived_connection_state: Optional[str] = None  # For transition logging only; state is always computed
         
         # Session-based disconnect metrics (S1 = before 09:30 CT, S2 = 09:30+ CT)
         self._session_connectivity_key: Optional[tuple] = None  # (trading_date, "S1"|"S2")
@@ -200,6 +204,12 @@ class WatchdogStateManager:
         # broker_order_id -> {submitted_at, intent_id, instrument, role, stream_key}
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
         self._pending_derived_events: List[Dict[str, Any]] = []
+
+        # Phase 1: Unresolved RECOVERY_POSITION_UNMATCHED (persists until resolution)
+        # instrument root -> True (action_required=FLATTEN until cleared)
+        # Cleared ONLY on explicit instrument-specific resolution (ADOPTION_SUCCESS,
+        # RECONCILIATION_RECOVERY_ADOPTION_SUCCESS, FORCED_FLATTEN_POSITION_CLOSED with instrument)
+        self._unresolved_unmatched_instruments: Set[str] = set()
         
     def invalidate_engine_liveness(self) -> None:
         """
@@ -408,9 +418,18 @@ class WatchdogStateManager:
     def update_connection_status(self, status: str, timestamp_utc: datetime, skip_session_metrics: bool = False):
         """Update connection status and session-based disconnect metrics.
         When skip_session_metrics=True (e.g. event from tail replay), only update _connection_status
-        and _last_connection_event_utc; do not increment disconnect count or add to downtime."""
+        and _last_connection_event_utc; do not increment disconnect count or add to downtime.
+        Recovery visibility: track _last_connection_lost_utc and _connection_stable_since_utc for
+        connection_stable computation (no LOST for CONNECTION_STABLE_WINDOW_SECONDS after recovery)."""
         self._connection_status = status
         self._last_connection_event_utc = timestamp_utc
+
+        if status == "ConnectionLost":
+            self._last_connection_lost_utc = timestamp_utc
+            self._connection_stable_since_utc = None
+        else:
+            # Connected / Recovered / Confirmed
+            self._connection_stable_since_utc = timestamp_utc
 
         if skip_session_metrics:
             return
@@ -713,7 +732,13 @@ class WatchdogStateManager:
                         continue
                     key = (trading_date, stream)
                     existing = self._stream_states.get(key)
-                    # Always overwrite from slot journal when it matches current_trading_date - journal is
+                    # Do NOT overwrite DONE/committed with RANGE_LOCKED from journal - slot journal can lag
+                    # (robot may not flush DONE until end of session). Event-derived DONE from execution
+                    # journal TradeCompleted, TRADE_RECONCILED, etc. is more authoritative.
+                    if existing and (existing.state == "DONE" or existing.committed):
+                        if last_state in ("RANGE_LOCKED", "OPEN"):
+                            continue  # Preserve DONE - journal is stale
+                    # Overwrite from slot journal when it matches current_trading_date - journal is
                     # authoritative (robot-persisted). Stale event-derived state (e.g. RANGE_LOCKED from Feb 27
                     # bleeding into Mar 6) must be corrected. Previously we skipped when existing had state.
                     state_entry_utc = datetime.now(timezone.utc)
@@ -901,7 +926,21 @@ class WatchdogStateManager:
         self._reconciliation_qty_mismatch_events.append(timestamp_utc)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
         self._reconciliation_qty_mismatch_events = [e for e in self._reconciliation_qty_mismatch_events if e > cutoff]
-    
+
+    def record_unresolved_unmatched(self, instrument: str) -> None:
+        """Record RECOVERY_POSITION_UNMATCHED for instrument. Persists until resolution."""
+        root = str(instrument).strip().split()[0].upper() if instrument else ""
+        if root:
+            self._unresolved_unmatched_instruments.add(root)
+
+    def clear_unresolved_unmatched(self, instrument: Optional[str] = None) -> None:
+        """Clear unresolved unmatched when adoption/flatten succeeds. If instrument is None, clear all."""
+        if instrument:
+            root = str(instrument).strip().split()[0].upper()
+            self._unresolved_unmatched_instruments.discard(root)
+        else:
+            self._unresolved_unmatched_instruments.clear()
+
     def record_duplicate_instance(
         self,
         account: str,
@@ -1437,6 +1476,36 @@ class WatchdogStateManager:
             "trading_date_set": self._trading_date is not None and self._trading_date != ""
         }
     
+    def _compute_connection_stable(self, now: datetime) -> bool:
+        """True iff derived_connection_state == STABLE. Use derived state for consistency."""
+        return self._compute_derived_connection_state(now) == "STABLE"
+
+    def _compute_derived_connection_state(self, now_utc: datetime) -> str:
+        """
+        Deterministic derived connection state: LOST | RECOVERING | STABLE.
+        Timestamp-driven, idempotent (same inputs -> same state).
+        """
+        stable_since = self._connection_stable_since_utc
+        last_lost = self._last_connection_lost_utc
+        window = CONNECTION_STABLE_WINDOW_SECONDS
+
+        # Case 1 — LOST: no valid recovery since last disconnect
+        if stable_since is None:
+            return "LOST"
+        if last_lost is not None and stable_since <= last_lost:
+            return "LOST"
+
+        # Case 2 — RECOVERING: recovery seen, stability window not satisfied
+        elapsed = (now_utc - stable_since).total_seconds()
+        if elapsed < window:
+            return "RECOVERING"
+
+        # Case 3 — STABLE: recovery valid and held long enough
+        if elapsed >= window and (last_lost is None or stable_since > last_lost):
+            return "STABLE"
+
+        return "LOST"
+
     def _compute_session_connectivity(self, now: datetime) -> Dict[str, Any]:
         """Compute session-based disconnect metrics for real-time display."""
         chicago_now = now.astimezone(CHICAGO_TZ)
@@ -1884,6 +1953,20 @@ class WatchdogStateManager:
         elif connection_status == "Unknown" and engine_alive:
             connection_status = "Connected"  # Optimistic: infer Connected when engine alive but no connection events yet
 
+        # Derived connection state: LOST | RECOVERING | STABLE (deterministic, timestamp-driven)
+        derived_connection_state = self._compute_derived_connection_state(now)
+        prev_state = self._last_derived_connection_state
+        if prev_state is not None and prev_state != derived_connection_state:
+            self._last_derived_connection_state = derived_connection_state
+            event_name = f"CONNECTION_STATE_{derived_connection_state}"
+            logger.info(
+                f"{event_name}: {prev_state} -> {derived_connection_state} "
+                f"(stable_since={self._connection_stable_since_utc.isoformat() if self._connection_stable_since_utc else None}, "
+                f"last_lost={self._last_connection_lost_utc.isoformat() if self._last_connection_lost_utc else None})"
+            )
+        elif prev_state is None:
+            self._last_derived_connection_state = derived_connection_state
+
         # Engine activity classification: RUNNING | IDLE | STALLED (professional dashboard clarity)
         if frontend_engine_state == "ACTIVE":
             engine_activity_classification = "RUNNING"
@@ -1916,9 +1999,19 @@ class WatchdogStateManager:
             "recovery_state": recovery_state,  # Use computed recovery_state (may be auto-cleared)
             "kill_switch_active": self._kill_switch_active,
             "connection_status": connection_status,
+            "derived_connection_state": derived_connection_state,
             "last_connection_event_chicago": (
                 self._last_connection_event_utc.astimezone(CHICAGO_TZ).isoformat()
                 if self._last_connection_event_utc else None
+            ),
+            "connection_stable": self._compute_connection_stable(now),
+            "seconds_since_last_connection_lost": (
+                (now - self._last_connection_lost_utc).total_seconds()
+                if self._last_connection_lost_utc else None
+            ),
+            "connection_stable_since_chicago": (
+                self._connection_stable_since_utc.astimezone(CHICAGO_TZ).isoformat()
+                if self._connection_stable_since_utc else None
             ),
             "session_connectivity": self._compute_session_connectivity(now),
             "last_connectivity_daily_summary": self._last_connectivity_daily_summary,

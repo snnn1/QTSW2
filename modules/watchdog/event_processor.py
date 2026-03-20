@@ -1091,6 +1091,24 @@ class EventProcessor:
         elif event_type == "RECONCILIATION_QTY_MISMATCH":
             self._state_manager.record_reconciliation_qty_mismatch(timestamp_utc)
 
+        elif event_type == "RECOVERY_POSITION_UNMATCHED":
+            instrument = event.get("instrument") or data.get("instrument") or data.get("execution_instrument")
+            if instrument:
+                self._state_manager.record_unresolved_unmatched(instrument)
+
+        elif event_type in ("ADOPTION_SUCCESS", "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS"):
+            instrument = event.get("instrument") or data.get("instrument") or data.get("execution_instrument")
+            if instrument:
+                self._state_manager.clear_unresolved_unmatched(instrument)
+
+        elif event_type == "FORCED_FLATTEN_POSITION_CLOSED":
+            # Only clear when instrument is explicit — do NOT clear on global/ambiguous events
+            instrument = event.get("instrument") or data.get("instrument") or data.get("execution_instrument")
+            if instrument:
+                self._state_manager.clear_unresolved_unmatched(instrument)
+            # RECONCILIATION_PASS_SUMMARY and SESSION_FORCED_FLATTENED are global/ambiguous —
+            # do NOT use to clear per-instrument unmatched state
+
         elif event_type == "ORDER_SUBMIT_SUCCESS":
             # Phase 7-8: Track for stuck order and latency spike detection
             broker_order_id = data.get("broker_order_id") or event.get("broker_order_id")
@@ -1126,6 +1144,12 @@ class EventProcessor:
 
         elif event_type == "ORDER_CANCELLED":
             # Phase 7-8: Remove from pending
+            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
+            if broker_order_id:
+                self._state_manager.record_order_cancelled(broker_order_id)
+
+        elif event_type == "ORDER_REJECTED":
+            # Phase 7-8: Remove from pending (rejected orders never fill/cancel; were falsely triggering ORDER_STUCK_DETECTED)
             broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
             if broker_order_id:
                 self._state_manager.record_order_cancelled(broker_order_id)

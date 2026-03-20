@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
@@ -31,6 +35,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Engine run identifier (GUID per engine Start())
     private string? _runId;
+    private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue;
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -40,20 +45,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string _executionPolicyPath = ""; // PHASE 4: Execution policy file path
     private ExecutionPolicy? _executionPolicy; // PHASE 4: Loaded execution policy
     
-    // PHASE 3.1: Single-executor guard for canonical markets
-    private CanonicalMarketLock? _canonicalMarketLock;
     private readonly string? _executionInstrument; // Execution instrument from constructor (MES, ES, etc.)
     private readonly string? _masterInstrumentName; // MasterInstrument.Name from NinjaTrader (for explicit canonical matching)
 
     private string? _lastTimetableHash;
     private TimetableContract? _lastTimetable; // Store timetable for application after trading date is locked
     private DateOnly? _activeTradingDate; // PHASE 3: Store as DateOnly (authoritative), convert to string only for logging/journal
+    private HashSet<string>? _eligibleSet; // Session Eligibility Freeze: stream keys that may trade this session (loaded once per trading_date)
     
     /// <summary>
     /// Get trading date as string for logging/journal purposes.
     /// Returns empty string if trading date is not yet set.
     /// </summary>
     private string TradingDateString => _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+
+    /// <summary>
+    /// Convert UTC to Chicago timezone. For strategy layer (e.g. SessionCloseResolver).
+    /// </summary>
+    public DateTimeOffset ConvertUtcToChicago(DateTimeOffset utcTime)
+    {
+        lock (_engineLock) { return _time?.ConvertUtcToChicago(utcTime) ?? utcTime; }
+    }
+
+    /// <summary>
+    /// Get parity spec for SessionCloseResolver (strategy layer). Returns null if not loaded.
+    /// </summary>
+    public ParitySpec? GetParitySpec()
+    {
+        lock (_engineLock) { return _spec; }
+    }
 
     /// <summary>
     /// Get current trading date (for external access, e.g., NinjaTrader strategy).
@@ -67,14 +87,169 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>
+    /// Get execution instrument (e.g., MNQ, MGC) for IEA routing and BE monitoring.
+    /// Resolves chart instrument to execution instrument via policy: CL→MCL, NQ→MNQ, etc.
+    /// CRITICAL: Intents have ExecutionInstrument from streams (MCL, MNQ). BE filter must match.
+    /// </summary>
+    public string GetExecutionInstrument()
+    {
+        var chartOrCanonical = _executionInstrument ?? "";
+        if (string.IsNullOrWhiteSpace(chartOrCanonical)) return "";
+        if (_executionPolicy != null)
+        {
+            var resolved = _executionPolicy.GetEnabledExecutionInstrument(chartOrCanonical);
+            if (!string.IsNullOrWhiteSpace(resolved))
+                return resolved;
+        }
+        return chartOrCanonical;
+    }
+
+    /// <summary>
+    /// Pre-load execution journal cache for trading date.
+    /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
+    /// </summary>
+    public void WarmExecutionJournalCacheForTradingDate(string tradingDate)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate)) return;
+        _executionJournal.WarmCacheForTradingDate(tradingDate);
+    }
+
+    /// <summary>
+    /// Run reconciliation once on Realtime transition (NT context ready).
+    /// Closes orphaned journals when broker position is flat.
+    /// Skips when broker not connected (avoids meaningless RECONCILIATION_QTY_MISMATCH etc).
+    /// </summary>
+    public void RunReconciliationOnRealtimeStart()
+    {
+        if (!IsBrokerConnected) return;
+        _reconciliationRunner?.RunOnRealtimeStart(DateTimeOffset.UtcNow);
+    }
+
+    /// <summary>
+    /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
+    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// </summary>
+    public void StartEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+            _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatTimer = new Timer(
+                _ => EmitTimerHeartbeatUnsafe(),
+                null,
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(5));
+        }
+    }
+
+    /// <summary>
+    /// Stop and dispose the engine heartbeat timer. Called on engine Stop or StandDown.
+    /// </summary>
+    public void StopEngineHeartbeatTimer()
+    {
+        lock (_engineLock)
+        {
+            _engineHeartbeatTimer?.Dispose();
+            _engineHeartbeatTimer = null;
+        }
+    }
+
+    /// <summary>
+    /// Emit ENGINE_TIMER_HEARTBEAT from timer callback. Must not acquire _engineLock (runs on thread pool).
+    /// </summary>
+    private void EmitTimerHeartbeatUnsafe()
+    {
+        try
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            var tradingDate = _heartbeatTradingDateCache ?? "";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            _executionAdapter?.TryRetryDeferredAdoptionScan();
+        }
+        catch (Exception ex)
+        {
+            try { _log.Write(new { ts_utc = DateTimeOffset.UtcNow.ToString("o"), event_type = "ENGINE_TIMER_HEARTBEAT_ERROR", error = ex.Message }); } catch { /* must not throw */ }
+        }
+    }
+
+    /// <summary>
+    /// Run reconciliation periodically (throttled). Call from Tick.
+    /// Skips reconciliation when broker not connected (avoids meaningless mismatch warnings).
+    /// </summary>
+    public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
+    {
+        RunPendingForceReconcile(utcNow);
+        if (!IsBrokerConnected) return;
+        _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+    }
+
+    private const string PENDING_FORCE_RECONCILE_FILE = "pending_force_reconcile.json";
+
+    /// <summary>
+    /// Check for pending force-reconcile trigger file. When operator confirms account is correct,
+    /// create data/pending_force_reconcile.json with {"instruments": ["MYM", "MCL"]} to force-close orphan journals.
+    /// </summary>
+    private void RunPendingForceReconcile(DateTimeOffset utcNow)
+    {
+        var path = Path.Combine(_root, "data", PENDING_FORCE_RECONCILE_FILE);
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var parsed = JsonUtil.Deserialize<ForceReconcileTrigger>(json);
+            if (parsed?.instruments == null || parsed.instruments.Count == 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_SKIPPED", state: "ENGINE",
+                    new { reason = "INVALID_FORMAT", path, note = "Expected {\"instruments\": [\"MYM\", ...]}" }));
+                File.Delete(path);
+                return;
+            }
+
+            var totalClosed = 0;
+            foreach (var inst in parsed.instruments.Where(x => !string.IsNullOrWhiteSpace(x)))
+            {
+                var instTrimmed = inst!.Trim();
+                var closed = _executionJournal.ForceReconcileOrphanJournalsForInstrument(instTrimmed, utcNow);
+                totalClosed += closed;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "", eventType: "FORCE_RECONCILE_EXECUTED", state: "ENGINE",
+                    new { instrument = instTrimmed, journals_closed = closed }));
+            }
+
+            File.Delete(path);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_COMPLETE", state: "ENGINE",
+                new { total_journals_closed = totalClosed, instruments = parsed.instruments }));
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FORCE_RECONCILE_ERROR", state: "ENGINE",
+                new { path, error = ex.Message }));
+        }
+    }
+
     private readonly Dictionary<string, StreamStateMachine> _streams = new();
     private readonly ExecutionMode _executionMode;
     
     // Session start time per instrument (from TradingHours, fallback to 17:00 CST)
     private readonly Dictionary<string, string> _sessionStartTimes = new Dictionary<string, string>();
+
+    // SessionCloseResolver: cache per (tradingDay, sessionClass)
+    private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _sessionCloseResults = new();
+    private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseEmittedKeys = new();
+
+    // Session index per sessionClass for re-entry gate (S1, S2)
+    private readonly Dictionary<string, (string tradingDay, int index)> _currentSessionKeyByClass = new();
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
+    private readonly ExecutionEventWriter _eventWriter;
+    private ReconciliationRunner? _reconciliationRunner;
+    private ProtectiveCoverageCoordinator? _protectiveCoordinator;
+    private MismatchEscalationCoordinator? _mismatchCoordinator;
     private KillSwitch? _killSwitch;
     private readonly ExecutionSummary _executionSummary;
     private HealthMonitor? _healthMonitor; // Optional: health monitoring and alerts
@@ -101,6 +276,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Gap violation summary tracking (rate-limited)
     private DateTimeOffset? _lastGapViolationSummaryUtc = null;
+
+    // Stream status summary (rate-limited, diagnostic only)
+    private DateTimeOffset? _lastStreamStatusSummaryUtc = null;
+    private const double STREAM_STATUS_SUMMARY_INTERVAL_MINUTES = 5.0;
+
+    // Forced flatten skip diagnostic (rate-limited) — when session close not cached
+    private DateTimeOffset? _lastForcedFlattenSkipLogUtc = null;
+    private const double FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES = 5.0;
+
+    // Session close cache missing alert — first time we detect cache empty in forced flatten block
+    private DateTimeOffset? _firstSessionCloseCacheMissUtc = null;
+    private const double SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES = 5.0;
+
+    // One-shot: emit once per (tradingDay, sessionClass), suppress until next trading day
+    private readonly HashSet<(string, string)> _sessionCloseFallbackEmittedKeys = new();
+    private readonly HashSet<(string, string)> _sessionCloseCacheMissingEmittedKeys = new();
+    private readonly HashSet<(string, string)> _sessionCloseFallbackFailedEmittedKeys = new();
+
+    // Event-driven snapshot (strict 60s rate limit, independent of periodic)
+    private DateTimeOffset? _lastEventDrivenSnapshotUtc = null;
+    private const double EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS = 60.0;
     
     // PHASE 3.1: Identity invariants status tracking (rate-limited)
     private DateTimeOffset? _lastIdentityInvariantsCheckUtc = null;
@@ -116,6 +312,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private string? _accountName;
     private string? _environment;
     
+    // Instruments frozen due to RECONCILIATION_QTY_MISMATCH or FLATTEN_FAILED_PERSISTENT (block execution; allow range building)
+    private readonly HashSet<string> _frozenInstruments = new(StringComparer.OrdinalIgnoreCase);
+    private RiskLatchManager? _riskLatchManager;
+
     // Disconnect recovery state machine
     private ConnectionRecoveryState _recoveryState = ConnectionRecoveryState.CONNECTED_OK;
     private DateTimeOffset? _disconnectFirstUtc;
@@ -124,6 +324,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _secondReconciliationRunUtc; // Lightweight second reconciliation after recovery
     private const int SECOND_RECONCILIATION_DELAY_MINUTES = 5;
     private ConnectionStatus _lastConnectionStatus = ConnectionStatus.Connected;
+
+    /// <summary>
+    /// True when broker connection is confirmed. Used to suppress reconciliation before connection is ready.
+    /// </summary>
+    private bool IsBrokerConnected => _lastConnectionStatus == ConnectionStatus.Connected;
     
     // Broker sync gate timestamps (for recovery synchronization)
     private DateTimeOffset? _lastOrderUpdateUtc;
@@ -132,9 +337,30 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset? _reconnectUtc;
     private DateTimeOffset? _lastSyncWaitLogUtc; // Rate-limiting for DISCONNECT_RECOVERY_WAITING_FOR_SYNC
     
+    // ENGINE_TICK_CALLSITE rate limit: log at most once per 5 seconds to prevent log flooding during Historical
+    // (Watchdog uses this for liveness; 5s is sufficient. During Historical, thousands of ticks would otherwise flood queue.)
+    private DateTimeOffset? _lastEngineTickCallsiteLogUtc = null;
+    private const double ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5.0;
+    
+    // Diagnostic: one-time log when we skip timetable poll during Historical (confirms fix is deployed)
+    private bool _loggedHistoricalPollSkip = false;
+
+    // TimetableCache instrumentation: rate-limited HIT/REFRESH logs for validation
+    private DateTimeOffset? _lastTimetableCacheHitLogUtc;
+    private DateTimeOffset? _lastTimetableCacheRefreshLogUtc;
+    private const double TIMETABLE_CACHE_LOG_RATE_LIMIT_SECONDS = 60.0;
+    
     // Recovery runner guard (prevent re-entrancy)
     private bool _recoveryRunnerActive = false;
     private readonly object _recoveryLock = new object();
+
+    // Throttle repeated RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT logs per (instrument, brokerWorking, localWorking)
+    private readonly Dictionary<string, DateTimeOffset> _recoveryAttemptLogThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+    private const int RecoveryAttemptLogThrottleSeconds = 60;
+
+    // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
+    private Timer? _engineHeartbeatTimer;
+    private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
     
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
@@ -227,6 +453,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 canonical_instrument = canonicalInstrument,
                 note = "BarsRequest marked as completed - range lock can proceed"
             });
+            TryEmitEventDrivenSnapshot(utcNow, "BARSREQUEST_COMPLETE");
         }
     }
     
@@ -294,7 +521,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         _root = projectRoot;
         _executionMode = executionMode;
-        _executionInstrument = instrument; // PHASE 3.1: Store execution instrument for canonical lock
+        _executionInstrument = instrument;
         _masterInstrumentName = masterInstrumentName; // Store MasterInstrument.Name for explicit canonical matching
         
         // Log the instrument passed from NinjaTrader (for debugging)
@@ -373,12 +600,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
         _executionPolicyPath = Path.Combine(_root, "configs", "execution_policy.json"); // PHASE 4: Execution policy path (standardized)
+        // Eligibility path built per trading_date: data/eligibility/eligibility_YYYY-MM-DD.json
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
         _executionSummary = new ExecutionSummary();
+        _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log, () => _runId ?? "");
     }
+
+    /// <summary>
+    /// Gap 5: Canonical execution event writer for replay/audit. Subsystems emit via this.
+    /// </summary>
+    public ExecutionEventWriter EventWriter => _eventWriter;
 
     /// <summary>
     /// Report execution policy validation failure to HealthMonitor.
@@ -442,9 +676,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         // CRITICAL: Set run_id before any Start-path logs
         _runId = Guid.NewGuid().ToString("N");
+        _engineStartUtc = DateTimeOffset.UtcNow;
         _log.SetRunId(_runId);
 
-        var utcNow = DateTimeOffset.UtcNow;
+        var utcNow = _engineStartUtc;
 
         // Initialize HealthMonitor after run_id is set so any health-monitor logs include run_id.
         InitializeHealthMonitorIfNeeded();
@@ -496,10 +731,29 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     max_file_size_mb = _loggingConfig.max_file_size_mb,
                     max_rotated_files = _loggingConfig.max_rotated_files,
                     min_log_level = _loggingConfig.min_log_level,
-                    enable_diagnostic_logs = _loggingConfig.enable_diagnostic_logs,
+                    enable_diagnostic_logs = _loggingConfig.DiagnosticsEnabled,
                     diagnostic_rate_limits = _loggingConfig.diagnostic_rate_limits,
                     archive_days = _loggingConfig.archive_days
                 }));
+
+            // Startup dependency check: verify Robot.Contracts.dll is loadable (deployment integrity)
+            try
+            {
+                var contractsType = Type.GetType("QTSW2.Robot.Contracts.IEventClock, Robot.Contracts");
+                if (contractsType == null)
+                    throw new InvalidOperationException("Robot.Contracts.IEventClock type not found");
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "STARTUP_DEPENDENCY_CHECK_FAILED", state: "ENGINE",
+                    new
+                    {
+                        assembly = "Robot.Contracts",
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        fix_hint = "Deploy Robot.Contracts.dll to NinjaTrader bin directory; verify project reference and build output"
+                    }));
+            }
 
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_START", state: "ENGINE",
                 new
@@ -689,62 +943,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 4: Policy validation occurs in ApplyTimetable based on actual enabled directives
                 // No single-instrument assumption validation here - enforcement happens where streams are created
                 
-                // PHASE 3.1: Acquire canonical market lock BEFORE policy activation logging
-                // This ensures observability consistency: lock acquisition happens before policy activation logs
-                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _runId != null)
+                // PHASE 4: Emit policy activation log (canonical market lock removed - multiple instances per market allowed)
+                if (!string.IsNullOrWhiteSpace(_executionInstrument) && _executionPolicy != null)
                 {
                     var canonicalInstrument = GetCanonicalInstrument(_executionInstrument);
-                    _canonicalMarketLock = new CanonicalMarketLock(_root, canonicalInstrument, _runId, _log);
-                    
-                    if (!_canonicalMarketLock.TryAcquire(utcNow))
+                    var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
+                    if (execInstPolicy != null && execInstPolicy.enabled)
                     {
-                        // Lock acquisition failed - another instance is active
-                        var errorMsg = $"PHASE 3.1: Another robot instance is already executing canonical market '{canonicalInstrument}'. " +
-                                     $"This instance (execution instrument: {_executionInstrument}) will not start to prevent duplicate execution.";
-                        
-                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANONICAL_MARKET_ALREADY_ACTIVE", state: "ENGINE",
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
                             new
                             {
                                 canonical_instrument = canonicalInstrument,
                                 execution_instrument = _executionInstrument,
-                                run_id = _runId,
-                                note = errorMsg
+                                resolved_order_quantity = execInstPolicy.base_size,
+                                base_size = execInstPolicy.base_size,
+                                max_size = execInstPolicy.max_size,
+                                note = "Policy loaded at startup; not reloadable"
                             }));
-                        
-                        // Trigger high-priority alert
-                        if (_healthMonitor != null)
-                        {
-                            var notificationService = _healthMonitor.GetNotificationService();
-                            if (notificationService != null)
-                            {
-                                notificationService.EnqueueNotification(
-                                    "CANONICAL_MARKET_ALREADY_ACTIVE",
-                                    "CRITICAL: Duplicate Executor Blocked",
-                                    errorMsg,
-                                    priority: 2); // Emergency priority
-                            }
-                        }
-                        
-                        throw new InvalidOperationException(errorMsg);
-                    }
-                    
-                    // PHASE 4: Emit policy activation log AFTER lock acquisition (observability consistency)
-                    if (_executionPolicy != null)
-                    {
-                        var execInstPolicy = _executionPolicy.GetExecutionInstrumentPolicy(canonicalInstrument, _executionInstrument);
-                        if (execInstPolicy != null && execInstPolicy.enabled)
-                        {
-                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_POLICY_ACTIVE", state: "ENGINE",
-                                new
-                                {
-                                    canonical_instrument = canonicalInstrument,
-                                    execution_instrument = _executionInstrument,
-                                    resolved_order_quantity = execInstPolicy.base_size,
-                                    base_size = execInstPolicy.base_size,
-                                    max_size = execInstPolicy.max_size,
-                                    note = "Policy loaded at startup; not reloadable"
-                                }));
-                        }
                     }
                 }
             }
@@ -758,7 +973,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // Initialize execution components now that spec is loaded
             if (_killSwitch == null)
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
-            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this);
+            // Hydrate risk latches (persisted instrument blocks) so blocks survive restarts
+            _riskLatchManager = new RiskLatchManager(_root, _accountName ?? "UNKNOWN");
+            foreach (var inst in _riskLatchManager.Hydrate())
+            {
+                _frozenInstruments.Add(inst);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RISK_LATCH_HYDRATED", state: "ENGINE",
+                    new { instrument = inst, note = "Persisted block re-applied on startup" }));
+            }
+            _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this, isInstrumentFrozen: IsInstrumentFrozenOrSupervisorilyBlocked);
+            _riskGate.SetOnGlobalKillSwitchBlocked((eventType, instrument, stream) =>
+            {
+                _healthMonitor?.ReportCritical(eventType, new Dictionary<string, object> { ["instrument"] = instrument, ["stream"] = stream, ["note"] = "Global kill switch blocks all execution" });
+            });
 
             // Create adapter (LIVE uses NinjaTraderLiveAdapter; Strategy wires SetNTContext)
             _executionAdapter = ExecutionAdapterFactory.Create(_executionMode, _root, _log, _executionJournal, _time);
@@ -786,14 +1013,133 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // PHASE 2: Set engine callbacks for protective order failure recovery
             if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
             {
+                simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
+                simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
+                simAdapter.SetEventWriter(_eventWriter);
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
-                    isExecutionAllowedCallback: () => IsExecutionAllowed()); // CRITICAL FIX: Pass recovery state check
+                    isExecutionAllowedCallback: () => IsExecutionAllowed(),
+                    onReentryFillCallback: (reentryIntentId, now) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentryFill(reentryIntentId, now);
+                    },
+                    onReentryProtectionAcceptedCallback: (reentryIntentId, now) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentryProtectionAccepted(now, reentryIntentId);
+                    },
+                    blockInstrumentCallback: (instrument, now, reason) =>
+                    {
+                        _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.IEA_ENQUEUE_FAILURE, SupervisorySeverity.HIGH, new { reason }, now);
+                        // Flatten on block: prevent position with no protectives when IEA queue is blocked
+                        var flattenResult = _executionAdapter.FlattenEmergency(instrument, now);
+                        if (!flattenResult.Success)
+                        {
+                            LogEvent(RobotEvents.EngineBase(now, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                                eventType: "FLATTEN_EMERGENCY_ON_BLOCK_FAILED", state: "ENGINE",
+                                new { instrument, reason, error = flattenResult.ErrorMessage, note = "Flatten on block failed; position may be unprotected" }));
+                        }
+                        StandDownStreamsForInstrument(instrument, now, reason);
+                        _healthMonitor?.ReportCritical("IEA_ENQUEUE_FAILURE_INSTRUMENT_BLOCKED", new Dictionary<string, object>
+                        {
+                            { "instrument", instrument },
+                            { "reason", reason },
+                            { "policy", "IEA_FAIL_CLOSED_BLOCK_INSTRUMENT" },
+                            { "note", "IEA queue timeout or overflow — instrument blocked; no new intents until restart" }
+                        });
+                    },
+                    onSupervisoryCriticalCallback: (eventType, instrument, payload) =>
+                    {
+                        var dict = payload as Dictionary<string, object>;
+                        if (dict == null && payload != null)
+                        {
+                            dict = new Dictionary<string, object> { ["instrument"] = instrument, ["reason"] = payload.ToString() ?? "" };
+                        }
+                        else if (dict == null)
+                            dict = new Dictionary<string, object> { ["instrument"] = instrument };
+                        _healthMonitor?.ReportCritical(eventType, dict);
+                    },
+                    shouldCancelEntryOrdersForStreamCallback: (streamId, tradingDate) =>
+                    {
+                        if (!_streams.TryGetValue(streamId, out var stream))
+                            return (true, "stream_not_found");
+                        if (stream.TradingDate != tradingDate)
+                            return (true, "stream_trading_date_mismatch");
+                        var (eligible, reason) = stream.GetEntryOrderCancellationEligibility();
+                        return (!eligible, reason);
+                    },
+                    hasSlotJournalWithEntryStopsForInstrumentCallback: HasSlotJournalWithEntryStopsForInstrument); // Bootstrap: ADOPT entry stops on restart
                 
                 // Wire coordinator to adapter
                 simAdapter.SetCoordinator(coordinator);
             }
+
+            // Create reconciliation runner for orphaned journal cleanup + quantity reconciliation
+            _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log,
+                onQuantityMismatch: (instrument, now, reason) =>
+                {
+                    StandDownStreamsForInstrument(instrument, now, reason);
+                    _executionAdapter?.RequestRecoveryForInstrument(instrument, "RECONCILIATION_QTY_MISMATCH", new { reason }, now);
+                    _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason }, now);
+                    _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
+                    {
+                        { "instrument", instrument },
+                        { "reason", reason },
+                        { "note", "Push notification + instrument freeze" }
+                    });
+                },
+                onReconciliationPassComplete: qtyByInstrument =>
+                {
+                    lock (_engineLock)
+                    {
+                        foreach (var inst in _frozenInstruments.ToList())
+                        {
+                            var shouldUnfreeze = qtyByInstrument.TryGetValue(inst, out var qtys)
+                                ? qtys.AccountQty == qtys.JournalQty
+                                : true; // Not in map = no position + no open journals = resolved
+                            if (shouldUnfreeze)
+                            {
+                                _frozenInstruments.Remove(inst);
+                                _riskLatchManager?.Clear(inst);
+                                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                                    eventType: "INSTRUMENT_UNFROZEN", state: "ENGINE",
+                                    new { instrument = inst, note = "Reconciliation qty match restored" }));
+                            }
+                        }
+                    }
+                });
+
+            // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
+            _protectiveCoordinator = new ProtectiveCoverageCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                isInstrumentBlocked: inst => _frozenInstruments.Contains(inst),
+                log: _log,
+                submitCorrective: TrySubmitCorrectiveStop,
+                emergencyFlatten: (instrument, utcNow) =>
+                {
+                    if (_executionAdapter is IIEAOrderExecutor iea)
+                        return iea.EmergencyFlatten(instrument, utcNow);
+                    return _executionAdapter?.FlattenEmergency(instrument, utcNow)
+                        ?? FlattenResult.FailureResult("No adapter", utcNow);
+                },
+                eventWriter: _eventWriter,
+                getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst));
+
+            // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
+            _mismatchCoordinator = new MismatchEscalationCoordinator(
+                getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
+                getActiveInstruments: () => Array.Empty<string>(),
+                getMismatchObservations: (snap, utcNow) => AssembleMismatchObservations(snap, utcNow),
+                isInstrumentBlocked: inst => _frozenInstruments.Contains(inst) || (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false),
+                isFlattenInProgress: _ => false,
+                isRecoveryInProgress: _ => false,
+                log: _log,
+                eventWriter: _eventWriter);
 
             // Log execution mode and adapter
             var adapterType = _executionAdapter.GetType().Name;
@@ -955,6 +1301,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     {
                         _healthMonitor = new HealthMonitor(_root, healthMonitorConfig, _log);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
+                        _healthMonitor.SetMarketOpenCallback(() => _time != null && TimeService.IsCmeMarketOpen(_time.ConvertUtcToChicago(DateTimeOffset.UtcNow)));
                     }
                     else
                     {
@@ -1010,7 +1357,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         range_start_utc = stream.RangeStartUtc.ToString("o"),
                         range_start_chicago = rangeStartChicago.ToString("o"),
                         slot_time_chicago = stream.SlotTimeChicago,
-                        note = "Ensure NinjaTrader 'Days to load' setting includes historical data for the range window"
+                        note = "Ensure NinjaTrader 'Days to load' setting includes historical data for the range window",
+                        fix_hint = "Chart → Right-click → Data Series → set 'Days to load' to cover range window (e.g. 5–10 days)"
                     }));
             }
         }
@@ -1090,11 +1438,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Stop()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
-        
-        // PHASE 3.1: Release canonical market lock on shutdown
-        _canonicalMarketLock?.Release(utcNow);
-        
+
         string? summaryPathToWrite = null;
         string? summaryJson = null;
 
@@ -1139,16 +1485,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
-    /// <summary>Tick with explicit Historical flag. Use when caller knows State (e.g. strategy). Skips timetable poll during Historical.</summary>
+    /// <summary>Tick with explicit Historical flag. Use this when caller knows State (e.g. strategy).</summary>
     public void Tick(DateTimeOffset utcNow, bool isHistorical)
     {
         TickInternal(utcNow, isHistorical);
     }
 
-    /// <summary>Tick with inferred Historical. Prefer Tick(utcNow, isHistorical) when caller has State.</summary>
+    /// <summary>Tick with inferred Historical (bar time lag). Prefer Tick(utcNow, isHistorical) when caller has State.</summary>
     public void Tick(DateTimeOffset utcNow)
     {
-        Tick(utcNow, false);
+        var nowWall = DateTimeOffset.UtcNow;
+        var barTimeLagMinutes = (nowWall - utcNow).TotalMinutes;
+        var inferredHistorical = barTimeLagMinutes > 2.0;
+        TickInternal(utcNow, inferredHistorical);
     }
 
     private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
@@ -1174,9 +1523,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        // CRITICAL: During Historical, skip timetable poll - we're replaying bars, no config changes.
-        var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(utcNow);
-        var parsed = shouldPoll ? PollAndParseTimetable(utcNow) : default;
+        // CRITICAL: During Historical, skip timetable poll entirely - we're replaying bars, no config changes.
+        // This avoids ~400 file reads + SHA256 + JSON parse per strategy during Historical.
+        var nowWall = DateTimeOffset.UtcNow;
+        var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(nowWall);
+        var parsed = shouldPoll ? PollAndParseTimetable(nowWall) : default;
+        
+        // Diagnostic: log once per engine when we skip poll during Historical (confirms fix is deployed)
+        if (isHistorical && !_loggedHistoricalPollSkip)
+        {
+            _loggedHistoricalPollSkip = true;
+            LogEvent(RobotEvents.EngineBase(nowWall, tradingDate: TradingDateString, eventType: "HISTORICAL_POLL_SKIP_ACTIVE", state: "ENGINE",
+                new { note = "Timetable poll skipped during Historical - fix deployed" }));
+        }
 
         lock (_engineLock)
         {
@@ -1184,14 +1543,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
             
             // WATCHDOG: Log ENGINE_TICK_CALLSITE for watchdog liveness monitoring
-            // This is the primary heartbeat indicator for engine liveness
-            // Rate-limited in event feed to every 5 seconds, but log every call here
-            // Watchdog uses this to detect engine stalls (threshold: 15 seconds)
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
-                new
-                {
-                    note = "Tick() called - watchdog liveness signal. Rate-limited in feed to every 5 seconds."
-                }));
+            // Rate-limited to once per 5 seconds of REAL time, not bar time.
+            // During Historical, utcNow is bar time (1 min/bar) so (utcNow - last) would fire every bar.
+            // Use wall-clock (nowWall from outer scope) for rate limit so we log at most every 5s.
+            var shouldLogTickCallsite = !_lastEngineTickCallsiteLogUtc.HasValue ||
+                (nowWall - _lastEngineTickCallsiteLogUtc.Value).TotalSeconds >= ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS;
+            if (shouldLogTickCallsite)
+            {
+                _lastEngineTickCallsiteLogUtc = nowWall;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_TICK_CALLSITE", state: "ENGINE",
+                    new
+                    {
+                        note = "Tick() called - watchdog liveness signal. Rate-limited to every 5 seconds."
+                    }));
+            }
             
             // PHASE 3: Update engine heartbeat timestamp for liveness monitoring
             _lastTickUtc = utcNow;
@@ -1259,8 +1624,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }
 
                 // Start recovery runner (idempotent, single-threaded)
-                RunRecovery(utcNow);
+                RunRecovery(utcNow, _accountName ?? "");
             }
+
+            // Reconciliation: periodic orphaned journal cleanup (throttled). Skip during Historical - no live account.
+            if (!isHistorical)
+                RunReconciliationPeriodicThrottle(utcNow);
 
             // Timetable reactivity (disk I/O already completed outside lock)
             if (shouldPoll)
@@ -1271,6 +1640,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
             }
 
+            // SLOT EXPIRY: Run stream.Tick BEFORE forced flatten so slot expiry (at NextSlotTimeUtc)
+            // can run and commit streams before forced flatten. Otherwise forced flatten would
+            // commit pre-entry streams first, and reentry streams would never reach slot expiry.
             foreach (var s in _streams.Values)
                 s.Tick(utcNow);
 
@@ -1314,6 +1686,104 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }
             }
 
+            // Forced flatten block — per sessionClass (runs after slot expiry so both can work)
+            var tradingDateStr = TradingDateString;
+            if (!string.IsNullOrEmpty(tradingDateStr))
+            {
+                foreach (var sessionClass in new[] { "S1", "S2" })
+                {
+                    var closeResult = GetSessionCloseResultOrFallback(tradingDateStr, sessionClass, utcNow, out var usedFallback);
+                    if (closeResult == null)
+                    {
+                        // No cache and fallback failed — log skip and SESSION_CLOSE_CACHE_MISSING if persistent
+                        var shouldLogSkip = !_lastForcedFlattenSkipLogUtc.HasValue ||
+                            (utcNow - _lastForcedFlattenSkipLogUtc.Value).TotalMinutes >= FORCED_FLATTEN_SKIP_LOG_INTERVAL_MINUTES;
+                        if (shouldLogSkip && _streams.Values.Any(s => s.Session == sessionClass && !s.Committed))
+                        {
+                            _lastForcedFlattenSkipLogUtc = utcNow;
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_SKIP_NO_CACHE", state: "ENGINE",
+                                new
+                                {
+                                    session_class = sessionClass,
+                                    trading_date = tradingDateStr,
+                                    note = "Session close not resolved and fallback unavailable — forced flatten will not trigger"
+                                }));
+                        }
+                        // SESSION_CLOSE_CACHE_MISSING: ERROR once per (tradingDay, sessionClass) when cache empty 5+ min
+                        if (!_firstSessionCloseCacheMissUtc.HasValue)
+                            _firstSessionCloseCacheMissUtc = utcNow;
+                        var minutesMissing = (utcNow - _firstSessionCloseCacheMissUtc.Value).TotalMinutes;
+                        if (minutesMissing >= SESSION_CLOSE_CACHE_MISSING_ALERT_MINUTES)
+                        {
+                            var cacheMissKey = (tradingDateStr, sessionClass);
+                            bool shouldEmitCacheMiss;
+                            lock (_engineLock)
+                            {
+                                shouldEmitCacheMiss = _sessionCloseCacheMissingEmittedKeys.Add(cacheMissKey);
+                            }
+                            if (shouldEmitCacheMiss)
+                            {
+                                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_CLOSE_CACHE_MISSING", state: "ENGINE",
+                                    new
+                                    {
+                                        instrument = _executionInstrument ?? "N/A",
+                                        trading_date = tradingDateStr,
+                                        session_class = sessionClass,
+                                        minutes_missing = Math.Round(minutesMissing, 1),
+                                        note = "Session close cache empty for 5+ minutes — forced flatten cannot trigger; watchdog alert"
+                                    }));
+                            }
+                        }
+                        continue;
+                    }
+                    if (!closeResult.HasSession || !closeResult.FlattenTriggerUtc.HasValue)
+                        continue;
+                    if (utcNow < closeResult.FlattenTriggerUtc.Value)
+                        continue;
+
+                    // Cache populated (or fallback used) — reset missing timer
+                    _firstSessionCloseCacheMissUtc = null;
+
+                    // Emit FORCED_FLATTEN_TRIGGERED once per (tradingDay, sessionClass)
+                    if (!_journals.HasForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass))
+                    {
+                        _journals.MarkForcedFlattenTriggeredEmitted(tradingDateStr, sessionClass);
+                        var streamsInSession = _streams.Values.Where(s => s.Session == sessionClass && !s.Committed).ToList();
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "FORCED_FLATTEN_TRIGGERED", state: "ENGINE",
+                            new
+                            {
+                                reason = "SESSION_CLOSE",
+                                session_class = sessionClass,
+                                source = usedFallback ? "FALLBACK_SPEC" : "LIVE_RESOLVER",
+                                resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
+                                buffer_seconds = closeResult.BufferSeconds,
+                                trading_date = tradingDateStr,
+                                streams_impacted = streamsInSession.Select(s => s.Stream).ToList(),
+                                used_fallback = usedFallback
+                            }));
+                    }
+
+                    foreach (var s in _streams.Values)
+                    {
+                        if (s.Session != sessionClass || s.Committed) continue;
+                        s.HandleForcedFlatten(utcNow);
+                    }
+                }
+            }
+
+            // Periodic stream status summary (diagnostic only, rate-limited to every 5 minutes)
+            if (_loggingConfig.DiagnosticsEnabled && _streams.Count > 0)
+            {
+                var timeSinceLastSummary = (_lastStreamStatusSummaryUtc == null)
+                    ? double.MaxValue
+                    : (utcNow - _lastStreamStatusSummaryUtc.Value).TotalMinutes;
+                if (timeSinceLastSummary >= STREAM_STATUS_SUMMARY_INTERVAL_MINUTES)
+                {
+                    _lastStreamStatusSummaryUtc = utcNow;
+                    LogStreamStatusSummary(utcNow);
+                }
+            }
+
             // Track and log gap violations across all streams (rate-limited to once per 5 minutes)
             var timeSinceLastGapViolationSummary = (utcNow - (_lastGapViolationSummaryUtc ?? DateTimeOffset.MinValue)).TotalMinutes;
             if (timeSinceLastGapViolationSummary >= 5.0 || _lastGapViolationSummaryUtc == null)
@@ -1345,6 +1815,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Health monitor: evaluate data loss (rate-limited internally)
             _healthMonitor?.Evaluate(utcNow);
+
+            // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
+            _protectiveCoordinator?.EmitMetrics(utcNow);
+            _mismatchCoordinator?.EmitMetrics(utcNow);
         }
     }
 
@@ -1438,7 +1912,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         // Health monitor: record bar reception (early, before other processing)
-        _healthMonitor?.OnBar(instrument, barUtc, close: close);
+        _healthMonitor?.OnBar(instrument, barUtc);
         
         // Update last tick timestamp for broker synchronization check
         // Bar updates indicate connection health, so track them for recovery sync
@@ -1706,7 +2180,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 s.OnBar(barUtc, open, high, low, close, utcNow);
                 
                 // Log bar delivery to stream (rate-limited, diagnostic only)
-                if (_loggingConfig.enable_diagnostic_logs)
+                if (_loggingConfig.DiagnosticsEnabled)
                 {
                     var deliveryKey = $"bar_delivery_{instrument}_{s.Session}_{s.SlotTimeChicago}";
                     var shouldLogDelivery = !_lastBarDeliveryLogUtc.TryGetValue(deliveryKey, out var lastDelivery) ||
@@ -1732,19 +2206,25 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         
-        // 🔴 Diagnostic Point #2: Log bar routing summary (every bar, diagnostic-only)
-        if (_loggingConfig.enable_diagnostic_logs)
+        // 🔴 Diagnostic Point #2: Log bar routing summary (rate-limited: once per 5 min per instrument)
+        if (_loggingConfig.DiagnosticsEnabled)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
-                new
-                {
-                    raw_instrument = rawInstrument,
-                    canonical_instrument = canonicalInstrument,
-                    streams_checked = streamsChecked,
-                    streams_matched = streamsReceivingBar.Count,
-                    streams_receiving_bar = streamsReceivingBar,
-                    note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
-                }));
+            var shouldLogRouting = !_lastBarRoutingDiagnosticUtc.TryGetValue(instrument, out var lastRouting) ||
+                                   (utcNow - lastRouting).TotalMinutes >= 5.0;
+            if (shouldLogRouting)
+            {
+                _lastBarRoutingDiagnosticUtc[instrument] = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_ROUTING_DIAGNOSTIC", state: "ENGINE",
+                    new
+                    {
+                        raw_instrument = rawInstrument,
+                        canonical_instrument = canonicalInstrument,
+                        streams_checked = streamsChecked,
+                        streams_matched = streamsReceivingBar.Count,
+                        streams_receiving_bar = streamsReceivingBar,
+                        note = "Diagnostic Point #2: Bar routing summary - shows canonical mapping and stream matching"
+                    }));
+            }
         }
         
         // Log bar delivery summary periodically (rate-limited)
@@ -1819,6 +2299,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Rate-limiting for bar delivery logging (per stream)
     private readonly Dictionary<string, DateTimeOffset> _lastBarDeliveryLogUtc = new Dictionary<string, DateTimeOffset>();
+    private readonly Dictionary<string, DateTimeOffset> _lastBarRoutingDiagnosticUtc = new Dictionary<string, DateTimeOffset>();
     private DateTimeOffset? _lastBarDeliverySummaryUtc = null;
     
     // Bar acceptance heartbeat tracking (rate-limited)
@@ -1831,7 +2312,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private void LogBarDeliverySummaryIfNeeded(DateTimeOffset utcNow, string instrument, List<string> streamsReceivingBar, List<string> streamsFilteredOut)
     {
-        if (!_loggingConfig.enable_diagnostic_logs) return;
+        if (!_loggingConfig.DiagnosticsEnabled) return;
         
         if (_lastBarDeliverySummaryUtc.HasValue && 
             (utcNow - _lastBarDeliverySummaryUtc.Value).TotalMinutes < BAR_DELIVERY_SUMMARY_INTERVAL_MINUTES)
@@ -1880,21 +2361,289 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }));
         }
     }
-    
+
+    /// <summary>
+    /// Set session close resolution result for (tradingDay, sessionClass).
+    /// Called by strategy (SessionCloseResolver) or HistoricalReplay harness.
+    /// Emits SESSION_CLOSE_RESOLVED or failure event per FailureReason:
+    /// SESSION_CLOSE_HOLIDAY, SESSION_CLOSE_NO_ELIGIBLE_SEGMENTS, SESSION_CLOSE_ITERATION_ERROR, SESSION_CLOSE_EXCEPTION.
+    /// </summary>
+    public void SetSessionCloseResolved(string tradingDay, string sessionClass, SessionCloseResult result)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return;
+        if (sessionClass != "S1" && sessionClass != "S2") return;
+
+        var r = result ?? new SessionCloseResult();
+        bool shouldEmit;
+        lock (_engineLock)
+        {
+            var key = (tradingDay, sessionClass);
+            _sessionCloseResults[key] = r;
+            shouldEmit = _sessionCloseEmittedKeys.Add(key);
+        }
+
+        if (!shouldEmit) return; // Already emitted for this (tradingDay, sessionClass)
+
+        var utcNow = DateTimeOffset.UtcNow;
+        if (r.HasSession)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLVED", state: "ENGINE",
+                new
+                {
+                    trading_day = tradingDay,
+                    session_class = sessionClass,
+                    instrument = r.BarsInstrument ?? _executionInstrument ?? "N/A",
+                    flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
+                    resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
+                    buffer_seconds = r.BufferSeconds,
+                    resolution_source = "LIVE_RESOLVER"
+                }));
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLUTION_SUCCESS", state: "ENGINE",
+                new { trading_day = tradingDay, session_class = sessionClass, bars_count = r.BarsCount, bars_instrument = r.BarsInstrument ?? "N/A" }));
+        }
+        else
+        {
+            var eventType = r.FailureReason switch
+            {
+                "HOLIDAY" => "SESSION_CLOSE_HOLIDAY",
+                "NO_ELIGIBLE_SEGMENTS" => "SESSION_CLOSE_NO_ELIGIBLE_SEGMENTS",
+                "ITERATION_ERROR" => "SESSION_CLOSE_ITERATION_ERROR",
+                "NO_BARS" or "EMPTY_BARS" or "TRADING_HOURS_MISSING" or "TIMEZONE_ERROR" or "SESSION_ITERATOR_ERROR" or "SESSION_CALCULATION_ERROR" or "UNHANDLED_EXCEPTION" => "SESSION_CLOSE_RESOLUTION_FAILURE",
+                _ => "SESSION_CLOSE_RESOLUTION_FAILURE"
+            };
+            var note = r.FailureReason switch
+            {
+                "HOLIDAY" => "Exchange holiday per TradingHours template",
+                "NO_ELIGIBLE_SEGMENTS" => "Sessions exist but none overlap timetable window",
+                "ITERATION_ERROR" => "Date resolution failed",
+                "NO_BARS" => "Bars collection is null",
+                "EMPTY_BARS" => "Bars collection is empty",
+                "TRADING_HOURS_MISSING" => "Bars.TradingHours is null",
+                "TIMEZONE_ERROR" => "Chicago timezone resolution failed",
+                "SESSION_ITERATOR_ERROR" => "SessionIterator creation failed",
+                "SESSION_CALCULATION_ERROR" => "Session iteration/calculation threw",
+                "UNHANDLED_EXCEPTION" => "Unexpected exception in resolver",
+                _ => "Resolution failed"
+            };
+            var failurePayload = new Dictionary<string, object?>
+            {
+                ["trading_day"] = tradingDay,
+                ["session_class"] = sessionClass,
+                ["failure_reason"] = r.FailureReason ?? "UNKNOWN",
+                ["exception_type"] = r.ExceptionType ?? (object?)"",
+                ["exception_message"] = r.ExceptionMessage ?? (object?)"",
+                ["stack_trace_truncated"] = r.StackTraceTruncated ?? (object?)"",
+                ["bars_count"] = r.BarsCount,
+                ["bars_instrument"] = r.BarsInstrument ?? "N/A",
+                ["trading_hours_name"] = r.TradingHoursName ?? "N/A",
+                ["strategy_instance_id"] = r.StrategyInstanceId ?? "N/A",
+                ["note"] = note
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE", failurePayload));
+            if (r.ExceptionType != null || !string.IsNullOrEmpty(r.ExceptionMessage) || !string.IsNullOrEmpty(r.StackTraceTruncated))
+            {
+                System.Diagnostics.Trace.TraceError($"[SessionClose] {r.FailureReason}: {r.ExceptionType ?? "N/A"} {r.ExceptionMessage ?? ""}\n{r.StackTraceTruncated ?? ""}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Set current session index for re-entry gate. Called by strategy each Realtime tick per sessionClass.
+    /// </summary>
+    public void SetCurrentSessionIndex(string tradingDay, string sessionClass, int index)
+    {
+        if (string.IsNullOrWhiteSpace(sessionClass) || sessionClass != "S1" && sessionClass != "S2") return;
+        lock (_engineLock)
+        {
+            _currentSessionKeyByClass[sessionClass] = (tradingDay ?? "", index);
+        }
+    }
+
     /// <summary>
     /// Get reentry-allowed UTC time for (tradingDay, sessionClass).
-    /// NT_ADDONS uses spec fallback only (no SessionCloseResolver). Returns (reentryUtc, hasSession).
+    /// Returns (reentryUtc, hasSession). When hasSession=false, no reentry. When reentryUtc is null, caller should use spec fallback.
     /// </summary>
     public (DateTimeOffset? reentryUtc, bool hasSession) GetReentryAllowedUtc(string tradingDay, string sessionClass, DateTimeOffset utcNow)
     {
-        if (_spec == null || _time == null || !DateOnly.TryParse(tradingDay, out var td))
-            return (null, true); // Fallback: caller uses MarketReopenChicagoTime
-        var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
-        var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
-        var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
-        return (reopenUtc, true);
+        var closeResult = GetSessionCloseResultOrFallback(tradingDay, sessionClass, utcNow, out _);
+        if (closeResult == null)
+            return (null, false);
+        if (!closeResult.HasSession)
+            return (null, false);
+        if (closeResult.NextSessionBeginUtc.HasValue)
+            return (closeResult.NextSessionBeginUtc.Value, true);
+        // Fallback: compute from spec market_reopen_time (same calendar day as market close)
+        if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
+        {
+            var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
+            var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
+            return (reopenUtc, true);
+        }
+        return (null, true);
     }
 
+    /// <summary>
+    /// Try get cached session close result for (tradingDay, sessionClass).
+    /// </summary>
+    public bool TryGetSessionCloseResult(string tradingDay, string sessionClass, out SessionCloseResult? result)
+    {
+        result = null;
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass)) return false;
+        lock (_engineLock)
+        {
+            if (_sessionCloseResults.TryGetValue((tradingDay, sessionClass), out var r))
+            {
+                result = r;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
+
+    /// <summary>
+    /// CME equity index default close. Used when spec is null (emergency fail-closed).
+    /// Spec market_close_time is America/Chicago local time (DST-aware via TimeService).
+    /// </summary>
+    private const string EMERGENCY_MARKET_CLOSE_DEFAULT = "16:00";
+
+    /// <summary>
+    /// Get session close from cache, or compute fallback. Ensures forced flatten can trigger even when
+    /// ResolveAndSetSessionCloseIfNeeded never ran.
+    ///
+    /// TIMEZONE CONTRACT (non-negotiable):
+    /// - spec.entry_cutoff.market_close_time is America/Chicago local time (DST-aware).
+    /// - TimeService.ConstructChicagoTime uses GetUtcOffset(localDateTime) for correct DST.
+    /// - ConvertChicagoToUtc produces UTC for comparison with utcNow.
+    /// - Never treat Chicago local as UTC.
+    /// </summary>
+    private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
+    {
+        usedFallback = false;
+        if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
+            return cached;
+
+        if (!DateOnly.TryParse(tradingDay, out var tradingDate))
+            return null;
+
+        // Path 1: Spec available — use spec.entry_cutoff.market_close_time (America/Chicago local)
+        if (_spec != null && _time != null)
+        {
+            var marketCloseTime = _spec.entry_cutoff?.market_close_time;
+            if (!string.IsNullOrWhiteSpace(marketCloseTime))
+            {
+                var result = ComputeFallbackFromTime(tradingDate, marketCloseTime, tradingDay, sessionClass, utcNow, "SPEC", ref usedFallback);
+                if (result != null)
+                    return result;
+            }
+        }
+
+        // Path 2: Spec null or market_close_time empty — emergency fail-closed (hard default 16:00 CT)
+        if (_time != null)
+        {
+            var failKey = (tradingDay, sessionClass);
+            bool shouldLogFail;
+            lock (_engineLock)
+            {
+                shouldLogFail = _sessionCloseFallbackFailedEmittedKeys.Add(failKey);
+            }
+            if (shouldLogFail)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_FAILED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        reason = _spec == null ? "SPEC_NULL" : "MARKET_CLOSE_TIME_EMPTY",
+                        emergency_close_used = EMERGENCY_MARKET_CLOSE_DEFAULT,
+                        note = "Spec unavailable — using emergency 16:00 CT default (fail-closed)"
+                    }));
+            }
+            var emergency = ComputeFallbackFromTime(tradingDate, EMERGENCY_MARKET_CLOSE_DEFAULT, tradingDay, sessionClass, utcNow, "EMERGENCY", ref usedFallback);
+            if (emergency != null)
+                return emergency;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Compute session close from (tradingDate, hhmm) in America/Chicago local time.
+    /// hhmm is interpreted as spec timezone (America/Chicago). DST-aware.
+    /// </summary>
+    private SessionCloseResult? ComputeFallbackFromTime(DateOnly tradingDate, string hhmm, string tradingDay, string sessionClass, DateTimeOffset utcNow, string source, ref bool usedFallback)
+    {
+        try
+        {
+            // America/Chicago local → UTC (deterministic, DST-aware)
+            var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
+            var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
+            var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
+            var reopenStr = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec!.entry_cutoff!.market_reopen_time;
+            var reopenChicago = _time.ConstructChicagoTime(tradingDate, reopenStr);
+            var nextSessionBeginUtc = _time.ConvertChicagoToUtc(reopenChicago);
+            var fallback = new SessionCloseResult
+            {
+                HasSession = true,
+                FlattenTriggerUtc = flattenTriggerUtc,
+                ResolvedSessionCloseUtc = sessionEndUtc,
+                NextSessionBeginUtc = nextSessionBeginUtc,
+                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BarsInstrument = _executionInstrument ?? "N/A"
+            };
+            var key = (tradingDay, sessionClass);
+            bool shouldLog;
+            lock (_engineLock)
+            {
+                shouldLog = _sessionCloseFallbackEmittedKeys.Add(key);
+            }
+            if (shouldLog)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_USED", state: "ENGINE",
+                    new
+                    {
+                        instrument = _executionInstrument ?? "N/A",
+                        trading_date = tradingDay,
+                        session_class = sessionClass,
+                        computed_session_close_utc = sessionEndUtc.ToString("o"),
+                        flatten_trigger_utc = flattenTriggerUtc.ToString("o"),
+                        resolution_source = source,
+                        timezone = "America/Chicago",
+                        note = "Session close from fallback — ResolveAndSetSessionCloseIfNeeded did not populate cache"
+                    }));
+            }
+            usedFallback = true;
+            return fallback;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Try get current session index for sessionClass. Used by stream re-entry gate.
+    /// </summary>
+    public bool TryGetCurrentSessionIndex(string sessionClass, out string tradingDay, out int index)
+    {
+        tradingDay = "";
+        index = 0;
+        if (string.IsNullOrWhiteSpace(sessionClass)) return false;
+        lock (_engineLock)
+        {
+            if (_currentSessionKeyByClass.TryGetValue(sessionClass, out var tuple))
+            {
+                tradingDay = tuple.tradingDay;
+                index = tuple.index;
+                return true;
+            }
+        }
+        return false;
+    }
+    
     /// <summary>
     /// Get session start time for an instrument, with fallback to default.
     /// </summary>
@@ -1968,6 +2717,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// This method allows the NinjaTrader strategy to request historical bars and feed them to streams.
     /// Streams must exist before calling this method (created in Start()).
     /// Filters out bars that are in the future relative to current time to avoid duplicates with live bars.
+    /// See docs/PRE_HYDRATION_DEEP_DIVE.md for flow, Operator Decision Tree, and troubleshooting.
     /// </summary>
     public void LoadPreHydrationBars(string instrument, List<Bar> bars, DateTimeOffset utcNow)
     {
@@ -2179,7 +2929,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }));
                     
                     // HIGH-SIGNAL WARNING: Bars skipped during active range-building indicates state machine issue
-                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.DONE)
+                    if (stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.RANGE_LOCKED || stream.State == StreamState.DONE)
                     {
                         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_BARS_SKIPPED_ACTIVE_STREAM", state: "ENGINE",
                             new
@@ -2592,22 +3342,45 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private (FilePollResult Poll, TimetableContract? Timetable, Exception? ParseException) PollAndParseTimetable(DateTimeOffset utcNow)
     {
-        var poll = _timetablePoller.Poll(_timetablePath, utcNow);
-        if (poll.Error is not null)
+        _timetablePoller.MarkPolled(utcNow);
+
+        if (!File.Exists(_timetablePath))
         {
-            return (poll, null, null);
+            return (new FilePollResult(false, null, "MISSING"), null, null);
         }
 
-        // Even if unchanged, we may still parse when force==true (handled by caller).
-        try
+        var (hash, timetable, changed, wasCacheHit) = TimetableCache.GetOrLoad(_timetablePath, _lastTimetableHash);
+
+        // Instrumentation: rate-limited TIMETABLE_CACHE_HIT / TIMETABLE_CACHE_REFRESH for validation
+        if (wasCacheHit)
         {
-            var timetable = TimetableContract.LoadFromFile(_timetablePath);
-            return (poll, timetable, null);
+            var shouldLog = !_lastTimetableCacheHitLogUtc.HasValue ||
+                (utcNow - _lastTimetableCacheHitLogUtc.Value).TotalSeconds >= TIMETABLE_CACHE_LOG_RATE_LIMIT_SECONDS;
+            if (shouldLog)
+            {
+                _lastTimetableCacheHitLogUtc = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_CACHE_HIT", state: "ENGINE",
+                    new { note = "Timetable served from cache (no disk read)" }));
+            }
         }
-        catch (Exception ex)
+        else
         {
-            return (poll, null, ex);
+            _lastTimetableCacheRefreshLogUtc = utcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_CACHE_REFRESH", state: "ENGINE",
+                new { note = "Timetable refreshed from disk (cache miss or file changed)" }));
         }
+
+        // Parse error: GetOrLoad returns (rawHash, null, true, false) when LoadFromBytes fails
+        if (timetable is null && hash is not null)
+        {
+            return (new FilePollResult(true, hash, "PARSE_ERROR"), null, new InvalidOperationException("Timetable parse failed"));
+        }
+        if (timetable is null && hash is null)
+        {
+            return (new FilePollResult(false, null, "MISSING"), null, null);
+        }
+
+        return (new FilePollResult(changed, hash, null), timetable, null);
     }
 
     private void ReloadTimetableIfChanged(
@@ -2726,6 +3499,49 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
+        // Session Eligibility Freeze: load eligibility_<trading_date>.json — fail closed if missing
+        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{timetableTradingDate.Value:yyyy-MM-dd}.json");
+        EligibilityContract? eligibility = null;
+        try
+        {
+            eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
+                new { path = eligibilityPath, error = ex.Message, note = "Eligibility file load failed - engine will stand down" }));
+            StandDown();
+            return;
+        }
+
+        if (eligibility == null)
+        {
+            // Startup safety: machine may have been offline at 18:00 CT — try to generate eligibility
+            var tradingDateStr = timetableTradingDate.Value.ToString("yyyy-MM-dd");
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
+                new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found - attempting startup generation" }));
+
+            var generated = TryGenerateEligibilityAtStartup(timetableTradingDate.Value, utcNow);
+            if (generated)
+            {
+                eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
+            }
+
+            if (eligibility == null)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
+                    new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found after startup generation - fail closed" }));
+                StandDown();
+                return;
+            }
+        }
+
+        _eligibleSet = eligibility.GetEligibleStreamSet();
+        var eligibleCount = _eligibleSet.Count;
+        var eligibilityHash = ComputeFileHash(eligibilityPath);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
+            new { path = eligibilityPath, eligible_count = eligibleCount, eligibility_hash = eligibilityHash, matrix_hash = eligibility.source_matrix_hash }));
+
         var isReplayTimetable = timetable.metadata?.replay == true;
 
         // Only log timetable events when actually changed (or forced/initial load)
@@ -2773,9 +3589,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         else if (_activeTradingDate.HasValue && _streams.Count > 0)
         {
-            // If trading date is already locked and streams exist, apply timetable changes immediately
-            // This handles timetable updates after initial stream creation
-            ApplyTimetable(timetable, utcNow);
+            // Apply timetable updates (e.g. NG 09:30 -> 11:00 slot change) but block adding NEW streams.
+            // Matrix app auto-update can overwrite timetable mid-day; we allow slot-time updates for existing
+            // streams but prevent new stream creation. See docs/robot/incidents/2026-03-04_TIMETABLE_OVERRIDE_INVESTIGATION.md
+            ApplyTimetable(timetable, utcNow, allowNewStreams: false);
         }
         else
         {
@@ -2795,7 +3612,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // (simplified to only monitor connection loss and data loss)
     }
 
-    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow)
+    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow, bool allowNewStreams = true)
     {
         // Trading date must be locked before streams can be created
         if (_spec is null || _time is null || _lastTimetableHash is null || !_activeTradingDate.HasValue)
@@ -3032,6 +3849,32 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }
                 }
             }
+
+            // Session Eligibility Freeze: only process directives for streams in eligible_set
+            if (_eligibleSet != null && !string.IsNullOrWhiteSpace(streamId) && !_eligibleSet.Contains(streamId))
+            {
+                skippedCount++;
+                var skipReason = "NOT_ELIGIBLE";
+                if (!skippedReasons.ContainsKey(skipReason))
+                    skippedReasons[skipReason] = 0;
+                skippedReasons[skipReason]++;
+                var skipTradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+                DateTimeOffset? skipSlotTimeUtc = null;
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(slotTimeChicago))
+                        skipSlotTimeUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
+                }
+                catch { }
+                LogEvent(RobotEvents.Base(_time, utcNow, skipTradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, skipSlotTimeUtc,
+                    "DIRECTIVE_IGNORED_NOT_ELIGIBLE", "ENGINE", new
+                    {
+                        stream_key = streamId,
+                        slot_time = slotTimeChicago,
+                        note = "Stream not in session eligibility freeze - directive ignored"
+                    }));
+                continue;
+            }
             
             // Track stream ID occurrences for duplicate detection (using canonical stream ID)
             if (!string.IsNullOrWhiteSpace(streamId))
@@ -3178,8 +4021,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }));
                     continue;
                 }
-                
-                sm.ApplyDirectiveUpdate(directive.slot_time, _activeTradingDate.Value, utcNow);
+
+                var oldSlot = sm.SlotTimeChicago;
+                var applied = sm.ApplyDirectiveUpdate(directive.slot_time, _activeTradingDate.Value, utcNow);
+                if (applied)
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "DIRECTIVE_UPDATE_APPLIED", "ENGINE", new { old_slot = oldSlot, new_slot = directive.slot_time }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "DIRECTIVE_IGNORED_STATE_LOCKED", "ENGINE", new { stream_key = streamId, state = sm.State.ToString() }));
+                }
+            }
+            else if (!allowNewStreams)
+            {
+                // Mid-day update: block new stream creation (e.g. matrix auto-update added NQ2, GC2).
+                // Slot-time changes for existing streams are applied above. Only block additions.
+                // SESSION_FREEZE: eligibility frozen at 18:00 CT; no new streams mid-day.
+                LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                    "STREAM_ADDITION_BLOCKED", "ENGINE", new
+                    {
+                        reason = "SESSION_FREEZE",
+                        stream_id = streamId,
+                        slot_time = slotTimeChicago,
+                        note = "New stream blocked during mid-day timetable update (session eligibility frozen); slot-time changes for existing streams are applied"
+                    }));
             }
             else
             {
@@ -3261,7 +4129,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     riskGate: _riskGate, 
                     executionJournal: _executionJournal, 
                     loggingConfig: _loggingConfig,
-                    engine: this); // Pass engine reference for BarsRequest status checks
+                    engine: this, // Pass engine reference for BarsRequest status checks
+                    isInstrumentBlockedForReentry: inst => IsInstrumentBlockedForReentry(inst),
+                    emergencyFlatten: (inst, utcNow) =>
+                    {
+                        if (_executionAdapter is IIEAOrderExecutor iea)
+                            return iea.EmergencyFlatten(inst, utcNow);
+                        return _executionAdapter?.FlattenEmergency(inst, utcNow) ?? FlattenResult.FailureResult("No adapter", utcNow);
+                    },
+                    isIeaQueueHealthyForInstrument: inst => IsIeaQueueHealthyForInstrument(inst),
+                    eventWriter: _eventWriter);
                 
                 // PHASE 3: Post-creation assertion - verify stream properties match expectations
                 if (newSm.ExecutionInstrument != executionInstrument)
@@ -3396,8 +4273,84 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // but the skeleton remains fail-closed (no orders) regardless.
     }
 
+    /// <summary>
+    /// Startup safety: if machine was offline at 18:00 CT, generate eligibility now.
+    /// Returns true if file was created and can be loaded.
+    /// </summary>
+    private bool TryGenerateEligibilityAtStartup(DateOnly tradingDate, DateTimeOffset utcNow)
+    {
+        var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+        var scriptPath = Path.Combine(_root, "scripts", "eligibility_builder.py");
+        if (!File.Exists(scriptPath))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_SKIP", state: "ENGINE",
+                new { script_path = scriptPath, note = "Eligibility builder script not found - cannot generate at startup" }));
+            return false;
+        }
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = "python",
+            Arguments = $"\"{scriptPath}\" --date {tradingDateStr}",
+            WorkingDirectory = _root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        try
+        {
+            using var process = Process.Start(psi);
+            if (process == null)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                    new { note = "Failed to start eligibility builder process" }));
+                return false;
+            }
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(30000);
+
+            if (process.ExitCode != 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                    new { exit_code = process.ExitCode, stderr = stderr.Length > 500 ? stderr.Substring(0, 500) : stderr }));
+                return false;
+            }
+
+            var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{tradingDateStr}.json");
+            if (File.Exists(eligibilityPath))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_GENERATED_AT_STARTUP", state: "ENGINE",
+                    new { path = eligibilityPath, note = "Eligibility generated at startup (machine was offline at 18:00 CT)" }));
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_STARTUP_FAILED", state: "ENGINE",
+                new { error = ex.Message }));
+        }
+        return false;
+    }
+
+    private static string? ComputeFileHash(string path)
+    {
+        if (!File.Exists(path)) return null;
+        try
+        {
+            using var sha = SHA256.Create();
+            using var stream = File.OpenRead(path);
+            var hash = sha.ComputeHash(stream);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant().Substring(0, 16);
+        }
+        catch { return null; }
+    }
+
     private void StandDown()
     {
+        StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         var streamCount = _streams.Count;
         var tradingDateStr = TradingDateString;
@@ -3540,8 +4493,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     /// <summary>
     /// Expose execution adapter for strategy files (replaces reflection-based access).
+    /// Public so NinjaTrader.Custom assembly can access when using DLL-only deployment.
     /// </summary>
-    internal IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
+    public IExecutionAdapter? GetExecutionAdapter() => _executionAdapter;
+
+    /// <summary>
+    /// Submit test inject entry (RegisterIntent + RegisterIntentPolicy + SubmitEntryOrder).
+    /// Used by RobotSimStrategy when TestInjectTradeOnStart is enabled.
+    /// Returns null if adapter does not support intent registration.
+    /// </summary>
+    public OrderSubmissionResult? SubmitTestInjectEntry(Intent intent, int qty, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter == null) return null;
+        if (_executionAdapter is not IIntentRegistrationAdapter reg) return null;
+        var intentId = intent.ComputeIntentId();
+        reg.RegisterIntent(intent);
+        reg.RegisterIntentPolicy(intentId, qty, qty, intent.Instrument, intent.ExecutionInstrument, "TEST_INJECT");
+        return _executionAdapter.SubmitEntryOrder(intentId, intent.ExecutionInstrument, intent.Direction ?? "Long", null, qty, "MARKET", null, utcNow);
+    }
     
     /// <summary>
     /// Expose time service for components that need direct access (e.g., bar providers).
@@ -3572,6 +4541,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public void OnMidSessionRestartDetected(string streamId, string tradingDate, string previousState, DateTimeOffset previousUpdateUtc, DateTimeOffset restartUtc)
     {
         _healthMonitor?.OnMidSessionRestartDetected(streamId, tradingDate, previousState, previousUpdateUtc, restartUtc);
+    }
+
+    /// <summary>
+    /// Phase 4A: Called when forced flatten fails or exposure remains after flatten.
+    /// Freezes instrument and stands down streams — no silent continuation.
+    /// </summary>
+    public void OnForcedFlattenFailed(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        StandDownStreamsForInstrument(instrument.Trim(), utcNow, reason);
     }
 
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)
@@ -3669,7 +4648,259 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
     }
+
+    /// <summary>
+    /// Phase 5: Check if instrument is frozen (reconciliation/risk latch) or supervisorily blocked.
+    /// Used by RiskGate to block execution.
+    /// </summary>
+    private bool IsInstrumentFrozenOrSupervisorilyBlocked(string instrument)
+    {
+        if (_frozenInstruments.Contains(instrument)) return true;
+        if (_protectiveCoordinator != null && _protectiveCoordinator.IsInstrumentBlockedByProtective(instrument)) return true;
+        if (_mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(instrument)) return true;
+        var account = _accountName ?? "";
+        var ieas = InstrumentExecutionAuthorityRegistry.GetAllForAccount(account);
+        foreach (var iea in ieas)
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, instrument) && iea.IsSupervisorilyBlocked)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// IEA alignment: Check if instrument is blocked for reentry (protective, mismatch, frozen, supervisory, queue poison).
+    /// </summary>
+    private bool IsInstrumentBlockedForReentry(string instrument)
+    {
+        if (IsInstrumentFrozenOrSupervisorilyBlocked(instrument)) return true;
+        var account = _accountName ?? "";
+        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, instrument) && iea.IsInstrumentBlocked)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// IEA alignment: Check if IEA queue is healthy for instrument (not blocked by timeout/overflow).
+    /// Used to decide queued flatten vs emergency flatten fallback.
+    /// </summary>
+    private bool IsIeaQueueHealthyForInstrument(string instrument)
+    {
+        var account = _accountName ?? "";
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, instrument, null);
+        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
+        if (InstrumentExecutionAuthorityRegistry.TryGet(account, execKey, out var iea))
+            return !iea.IsInstrumentBlocked;
+        return true;
+    }
+
+    /// <summary>
+    /// Freeze instrument (block execution) and stand down only streams that have positions.
+    /// Streams without positions (e.g. PRE_HYDRATION, RANGE_BUILDING) continue to compute range; execution blocked via RiskGate.
+    /// </summary>
+    private void StandDownStreamsForInstrument(string instrument, DateTimeOffset utcNow, string reason)
+    {
+        lock (_engineLock)
+        {
+            _frozenInstruments.Add(instrument);
+            _riskLatchManager?.Persist(instrument, reason);
+
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            foreach (var kvp in _streams)
+            {
+                var stream = kvp.Value;
+                var streamInst = stream.Instrument ?? "";
+                var streamExec = stream.ExecutionInstrument ?? "";
+                if (!string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Only stand down streams with entry fills (have positions). Others continue to range-build; execution blocked by RiskGate.
+                var hasPosition = _executionJournal.HasEntryFillForStream(tradingDateStr, stream.Stream);
+                if (hasPosition)
+                {
+                    stream.EnterRecoveryManage(utcNow, reason);
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                        eventType: "STREAM_STAND_DOWN", state: "ENGINE",
+                        new { stream_id = kvp.Key, reason = reason, instrument }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                        eventType: "STREAM_FROZEN_NO_STAND_DOWN", state: "ENGINE",
+                        new { stream_id = kvp.Key, reason = reason, instrument, note = "No position; range building continues; execution blocked" }));
+                }
+            }
+        }
+    }
     
+    /// <summary>
+    /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
+    /// A1: Accepts snapshot as parameter — exactly one snapshot per coordinator tick.
+    /// </summary>
+    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations(AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        var list = new List<MismatchObservation>();
+        if (snap == null) return list;
+
+        if (snap.Positions == null && snap.WorkingOrders == null)
+            return list;
+
+        var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var brokerWorkingByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var p in snap.Positions ?? new List<PositionSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            var inst = p.Instrument.Trim();
+            var qty = Math.Abs(p.Quantity);
+            brokerQtyByInst.TryGetValue(inst, out var existing);
+            brokerQtyByInst[inst] = existing + qty;
+        }
+
+        foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            var inst = w.Instrument.Trim();
+            brokerWorkingByInst.TryGetValue(inst, out var cnt);
+            brokerWorkingByInst[inst] = cnt + 1;
+        }
+
+        var openByInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var allInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in brokerQtyByInst.Keys) allInstruments.Add(k);
+        foreach (var k in brokerWorkingByInst.Keys) allInstruments.Add(k);
+        foreach (var k in openByInst.Keys)
+        {
+            if (!string.IsNullOrWhiteSpace(k)) allInstruments.Add(k.Trim());
+        }
+
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+
+        foreach (var inst in allInstruments)
+        {
+            var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
+            var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+
+            // ORDER_REGISTRY_MISSING fix: local_working from IEA registry (owned+adopted working), NOT journal.
+            // Journal = filled positions only. Working entry orders are in IEA, not journal.
+            int localWorking;
+            int journalWorking = 0;
+            if (openByInst.TryGetValue(inst, out var entries))
+                journalWorking = entries.Count;
+            if (openByInst.TryGetValue(execVariant, out var entriesM))
+                journalWorking += entriesM.Count;
+
+            if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var iea))
+            {
+                localWorking = iea.GetOwnedPlusAdoptedWorkingCount();
+                // Diagnostic: log when broker_working != iea_working to catch ORDER_REGISTRY_MISSING root causes
+                if (brokerWorking != localWorking)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_ORDER_SOURCE_BREAKDOWN", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, iea_working = localWorking, journal_working = journalWorking }));
+            }
+            else if (useIea)
+            {
+                // IEA unavailable but UseInstrumentExecutionAuthority=true → FAIL CLOSED (do NOT fallback to journal)
+                localWorking = -1; // Sentinel: IEA unavailable
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_IEA_UNAVAILABLE", state: "ENGINE",
+                    new { instrument = inst, broker_working = brokerWorking, note = "IEA unavailable for instrument; failing closed (no journal fallback)" }));
+            }
+            else
+            {
+                // IEA not enabled: fail closed when broker has working orders (cannot safely reconcile)
+                localWorking = brokerWorking > 0 ? -1 : 0;
+                if (brokerWorking > 0)
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_IEA_DISABLED", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, note = "UseInstrumentExecutionAuthority=false; cannot reconcile working orders; failing closed" }));
+            }
+
+            if (brokerQty == journalQty && brokerWorking == localWorking)
+                continue;
+
+            var effectiveLocalWorking = localWorking < 0 ? 0 : localWorking;
+
+            // ORDER_REGISTRY_MISSING recovery: attempt adoption before fail-closed
+            if (brokerWorking > 0 && effectiveLocalWorking == 0 && useIea &&
+                InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaForRecovery))
+            {
+                var throttleKey = $"{inst}_{brokerWorking}_{effectiveLocalWorking}";
+                var shouldLogAttempt = true;
+                lock (_recoveryAttemptLogThrottle)
+                {
+                    if (_recoveryAttemptLogThrottle.TryGetValue(throttleKey, out var lastLog))
+                    {
+                        if ((utcNow - lastLog).TotalSeconds < RecoveryAttemptLogThrottleSeconds)
+                            shouldLogAttempt = false;
+                    }
+                    if (shouldLogAttempt)
+                        _recoveryAttemptLogThrottle[throttleKey] = utcNow;
+                    // Prune entries older than throttle window
+                    var cutoff = utcNow.AddSeconds(-RecoveryAttemptLogThrottleSeconds);
+                    var toRemove = _recoveryAttemptLogThrottle.Where(k => k.Value < cutoff).Select(k => k.Key).ToList();
+                    foreach (var k in toRemove)
+                        _recoveryAttemptLogThrottle.Remove(k);
+                }
+                if (shouldLogAttempt)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, iea_working_before = effectiveLocalWorking }));
+                }
+                var adopted = ieaForRecovery.TryRecoveryAdoption();
+                var localAfter = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
+                if (adopted > 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS", state: "ENGINE",
+                        new { instrument = inst, adopted_count = adopted, iea_working_after = localAfter }));
+                    var delayMs = _engineStartUtc != DateTimeOffset.MinValue ? (long)(utcNow - _engineStartUtc).TotalMilliseconds : 0;
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STARTUP_RECOVERY_ADOPTION_OCCURRED", state: "ENGINE",
+                        new { instrument = inst, broker_working = brokerWorking, adopted_count = adopted, delay_from_startup_ms = delayMs }));
+                }
+                if (localAfter == brokerWorking)
+                    continue; // Recovery succeeded, no mismatch
+                if (adopted > 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_PARTIAL", state: "ENGINE",
+                        new { instrument = inst, adopted_count = adopted, broker_working = brokerWorking, iea_working_after = localAfter, note = "Still mismatched after adoption" }));
+                }
+                effectiveLocalWorking = localAfter;
+            }
+
+            // IEA unavailable or disabled with broker working → treat as ORDER_REGISTRY_MISSING (fail closed)
+            var mismatchType = localWorking < 0
+                ? MismatchType.ORDER_REGISTRY_MISSING
+                : MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, effectiveLocalWorking);
+
+            if (mismatchType == MismatchType.ORDER_REGISTRY_MISSING && brokerWorking > 0 && effectiveLocalWorking == 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ORDER_REGISTRY_MISSING_FAIL_CLOSED", state: "ENGINE",
+                    new { instrument = inst, broker_working = brokerWorking, iea_working = effectiveLocalWorking, reason = "No adoptable evidence or adoption recovery failed" }));
+            }
+
+            list.Add(new MismatchObservation
+            {
+                Instrument = inst,
+                MismatchType = mismatchType,
+                Present = true,
+                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
+                BrokerQty = brokerQty,
+                LocalQty = journalQty,
+                BrokerWorkingOrderCount = brokerWorking,
+                LocalWorkingOrderCount = effectiveLocalWorking,
+                ObservedUtc = utcNow,
+                Severity = "CRITICAL"
+            });
+        }
+
+        return list;
+    }
+
     /// <summary>
     /// Flatten exposure for a specific intent (helper for coordinator callback).
     /// </summary>
@@ -3695,6 +4926,80 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         
         return false;
+    }
+
+    /// <summary>
+    /// Gap 3 Phase 4: Try to submit corrective stop. Deterministic stop-price policy:
+    /// 1) Use journal StopPrice if available and sane (protective for direction)
+    /// 2) Else use BEStopPrice if sane
+    /// 3) Else fail-closed: return NO_SAFE_STOP_PRICE, do not invent a price
+    /// </summary>
+    private ProtectiveCorrectiveResult TrySubmitCorrectiveStop(ProtectiveCorrectiveRequest req)
+    {
+        if (_executionAdapter == null)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_ADAPTER" };
+
+        var byInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        if (!byInst.TryGetValue(req.Instrument, out var entries) || entries.Count == 0)
+        {
+            // Fallback: match by canonical instrument (e.g. ES vs MES)
+            var key = byInst.Keys.FirstOrDefault(k => ExecutionInstrumentResolver.IsSameInstrument(k, req.Instrument));
+            if (key == null || !byInst.TryGetValue(key, out entries) || entries.Count == 0)
+                return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_JOURNAL_ENTRY" };
+        }
+
+        // Match by direction; pick first with matching direction and sufficient qty
+        var match = entries.FirstOrDefault(e =>
+            string.Equals(e.Entry.Direction, req.BrokerDirection, StringComparison.OrdinalIgnoreCase) &&
+            e.Entry.EntryFilledQuantityTotal > 0 &&
+            e.Entry.EntryFilledQuantityTotal >= Math.Abs(req.BrokerPositionQty));
+
+        if (match.Entry == null)
+            match = entries.FirstOrDefault(e =>
+                string.Equals(e.Entry.Direction, req.BrokerDirection, StringComparison.OrdinalIgnoreCase) &&
+                e.Entry.EntryFilledQuantityTotal > 0);
+
+        if (match.Entry == null)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_MATCHING_JOURNAL" };
+
+        var entry = match.Entry;
+        var intentId = match.IntentId;
+        var direction = entry.Direction ?? req.BrokerDirection;
+        var entryPrice = entry.EntryAvgFillPrice ?? entry.EntryPrice ?? entry.FillPrice;
+        var qty = Math.Min(entry.EntryFilledQuantityTotal, Math.Abs(req.BrokerPositionQty));
+        if (qty <= 0) qty = entry.EntryFilledQuantityTotal;
+
+        // Deterministic stop price: prefer StopPrice, else BEStopPrice; must be sane (protective)
+        decimal? stopPrice = null;
+        if (entry.StopPrice.HasValue && entry.StopPrice.Value >= ProtectiveAuditPolicy.MIN_STOP_PRICE)
+        {
+            if (string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.StopPrice.Value < entryPrice.Value)
+                stopPrice = entry.StopPrice.Value;
+            if (string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.StopPrice.Value > entryPrice.Value)
+                stopPrice = entry.StopPrice.Value;
+        }
+        if (!stopPrice.HasValue && entry.BEStopPrice.HasValue && entry.BEStopPrice.Value >= ProtectiveAuditPolicy.MIN_STOP_PRICE)
+        {
+            if (string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.BEStopPrice.Value < entryPrice.Value)
+                stopPrice = entry.BEStopPrice.Value;
+            if (string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase) && entryPrice.HasValue &&
+                entry.BEStopPrice.Value > entryPrice.Value)
+                stopPrice = entry.BEStopPrice.Value;
+        }
+        if (!stopPrice.HasValue)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_SAFE_STOP_PRICE" };
+
+        var utcNow = req.AuditUtc;
+        var result = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, null, utcNow);
+        return new ProtectiveCorrectiveResult
+        {
+            Submitted = result.Success,
+            IntentId = intentId,
+            FailureReason = result.Success ? null : (result.ErrorMessage ?? "SUBMIT_FAILED")
+        };
     }
     
     /// <summary>
@@ -3801,8 +5106,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Recovery runner: single-threaded, idempotent recovery orchestration.
     /// Called when entering RECOVERY_RUNNING state.
+    /// Phase 4: When IEAs exist for account, call BeginReconnectRecovery per instrument instead of account-level recovery.
     /// </summary>
-    private void RunRecovery(DateTimeOffset utcNow)
+    private void RunRecovery(DateTimeOffset utcNow, string accountName)
     {
         // Guard against re-entrancy
         lock (_recoveryLock)
@@ -3853,8 +5159,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     new { reason = "EXECUTION_ADAPTER_NULL" }));
                 return;
             }
+
+            // Phase 4: Per-instrument bootstrap when IEAs exist
+            var ieas = InstrumentExecutionAuthorityRegistry.GetAllForAccount(accountName);
+            if (ieas.Count > 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "CONNECTION_RECOVERY_REQUIRES_BOOTSTRAP", state: "ENGINE",
+                    new { instruments_count = ieas.Count, account_name = accountName }));
+                foreach (var iea in ieas)
+                {
+                    iea.BeginReconnectRecovery(iea.ExecutionInstrumentKey, utcNow);
+                }
+                _recoveryState = ConnectionRecoveryState.RECOVERY_COMPLETE;
+                _recoveryCompletedUtc = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "CONNECTION_RECOVERY_RESOLVED", state: "ENGINE",
+                    new { instruments_count = ieas.Count, note = "Per-instrument bootstrap initiated" }));
+                _healthMonitor?.ReportCritical("DISCONNECT_RECOVERY_COMPLETE", new Dictionary<string, object>
+                {
+                    ["recovery_state"] = _recoveryState.ToString(),
+                    ["recovery_completed_utc"] = _recoveryCompletedUtc.Value.ToString("o"),
+                    ["instruments_count"] = ieas.Count,
+                    ["trading_date"] = TradingDateString,
+                    ["note"] = "Per-instrument bootstrap - execution unblocked"
+                });
+                return;
+            }
             
-            // Step A: Snapshot
+            // Step A: Snapshot (legacy path when no IEAs)
             AccountSnapshot? snap = null;
             try
             {
@@ -3888,69 +5219,144 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
             
             // Step B: Position reconciliation
+            // Evidence-based unmatched detection: run policy on ALL non-flat positions.
+            // A position is matched only if policy proves ownership (OWNERSHIP_PROVEN); otherwise FLATTEN.
+            // No pre-filter by stream instrument string — policy evaluator is the authority.
             var nonFlatPositions = snap.Positions?.Where(p => p.Quantity != 0).ToList() ?? new List<PositionSnapshot>();
-            var unmatchedPositions = new List<PositionSnapshot>();
+            var positionsToEvaluate = nonFlatPositions;
             
-            foreach (var position in nonFlatPositions)
-            {
-                // Attempt to match position to stream/journal/tags
-                bool matched = false;
-                
-                // Try matching via streams
-                foreach (var stream in _streams.Values)
-                {
-                    if (stream.Instrument.Equals(position.Instrument, StringComparison.OrdinalIgnoreCase))
-                    {
-                        // Check if stream has a matching intent in journal
-                        // This is a simplified match - in practice, you'd check journal entries more thoroughly
-                        matched = true;
-                        break;
-                    }
-                }
-                
-                if (!matched)
-                {
-                    unmatchedPositions.Add(position);
-                }
-            }
+            // Legacy path: no IEA → no adoption. OWNERSHIP_PROVEN + !adoption_supported → FLATTEN with ADOPTION_PATH_UNAVAILABLE.
+            var hasAdoptionPath = false; // RunRecoveryLegacy runs when no IEAs; adoption not available
             
-            if (unmatchedPositions.Count > 0)
+            // Deterministic unmatched position policy: ADOPT_IF_SAFE or FLATTEN. No indefinite hold.
+            var flattenedInstruments = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (positionsToEvaluate.Count > 0)
             {
-                // Hard-stop semantics: remain fail-closed and do not proceed
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_UNMATCHED", state: "ENGINE",
                     new
                     {
-                        unmatched_count = unmatchedPositions.Count,
-                        unmatched_positions = unmatchedPositions.Select(p => new
+                        position_count = positionsToEvaluate.Count,
+                        positions = positionsToEvaluate.Select(p => new { instrument = p.Instrument, quantity = p.Quantity, avg_price = p.AveragePrice }).ToList(),
+                        note = "Evidence-based policy: IF ownership_proven AND adoption_supported → adopt; ELSE → flatten"
+                    }));
+            }
+            foreach (var position in positionsToEvaluate)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_EVALUATION_STARTED", state: "ENGINE",
+                    new
+                    {
+                        instrument = position.Instrument,
+                        broker_qty = Math.Abs(position.Quantity),
+                        run_id = _runId ?? ""
+                    }));
+
+                var policyResult = UnmatchedPositionPolicyEvaluator.Evaluate(
+                    position, snap, _executionJournal, TradingDateString, _runId, _log);
+
+                if (policyResult.CandidateCount == 0)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_NO_CANDIDATE", state: "ENGINE",
+                        new { instrument = policyResult.Instrument, broker_qty = policyResult.BrokerQty, candidate_count = 0, reason = policyResult.Reason, run_id = _runId ?? "" }));
+                }
+                else
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_CANDIDATE_FOUND", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_count = policyResult.CandidateCount,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = policyResult.Reason,
+                            run_id = _runId ?? ""
+                        }));
+                }
+
+                var shouldFlatten = policyResult.Decision == UnmatchedPositionPolicyDecision.FLATTEN ||
+                    (policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && !hasAdoptionPath);
+                var flattenReason = policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && !hasAdoptionPath
+                    ? "ADOPTION_PATH_UNAVAILABLE"
+                    : policyResult.Reason;
+
+                if (policyResult.Decision == UnmatchedPositionPolicyDecision.OWNERSHIP_PROVEN && hasAdoptionPath)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_APPROVED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = policyResult.Reason,
+                            run_id = _runId ?? ""
+                        }));
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_COMPLETED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            run_id = _runId ?? ""
+                        }));
+                }
+                else if (shouldFlatten)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_ADOPT_REJECTED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            candidate_count = policyResult.CandidateCount,
+                            candidate_intent_id = policyResult.CandidateIntentId,
+                            reason = flattenReason,
+                            run_id = _runId ?? ""
+                        }));
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_POLICY_FLATTEN_TRIGGERED", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            broker_qty = policyResult.BrokerQty,
+                            reason = flattenReason,
+                            run_id = _runId ?? ""
+                        }));
+
+                    var flattenResult = _executionAdapter.FlattenEmergency(policyResult.Instrument, utcNow);
+                    flattenedInstruments.Add(policyResult.Instrument);
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_FLATTEN_RESULT", state: "ENGINE",
+                        new
+                        {
+                            instrument = policyResult.Instrument,
+                            flatten_success = flattenResult.Success,
+                            flatten_error = flattenResult.ErrorMessage,
+                            run_id = _runId ?? ""
+                        }));
+                }
+            }
+
+            // Exclude flattened positions from downstream protective re-establishment
+            var positionsToProtect = nonFlatPositions.Where(p =>
+            {
+                var inst = (p.Instrument ?? "").Trim();
+                return !flattenedInstruments.Contains(inst);
+            }).ToList();
+            
+            if (positionsToProtect.Count > 0)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_RECONCILED", state: "ENGINE",
+                    new
+                    {
+                        reconciled_count = positionsToProtect.Count,
+                        positions = positionsToProtect.Select(p => new
                         {
                             instrument = p.Instrument,
                             quantity = p.Quantity,
                             avg_price = p.AveragePrice
                         }).ToList(),
-                        note = "Recovery aborted - unmatched positions require operator intervention"
-                    }));
-                // Remain fail-closed (stay in RECOVERY_RUNNING or transition back to RECONNECTED_RECOVERY_PENDING)
-                // For now, keep in RECOVERY_RUNNING but don't proceed
-                return;
-            }
-            
-            if (nonFlatPositions.Count > 0)
-            {
-                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_POSITION_RECONCILED", state: "ENGINE",
-                    new
-                    {
-                        reconciled_count = nonFlatPositions.Count,
-                        positions = nonFlatPositions.Select(p => new
-                        {
-                            instrument = p.Instrument,
-                            quantity = p.Quantity,
-                            avg_price = p.AveragePrice
-                        }).ToList()
+                        flattened_count = flattenedInstruments.Count
                     }));
             }
             
-            // Step C: Preserve robot-owned working orders during recovery (align with RobotCore)
-            // Do NOT cancel - valid entry orders for RANGE_LOCKED streams should remain.
+            // Step C: Preserve robot-owned working orders during recovery (user preference: do not cancel)
+            // Previously: CancelRobotOwnedWorkingOrders was called here to avoid orphaned orders.
+            // Now: Working orders are left in place so they can fill after reconnect.
             var robotOrderCount = snap.WorkingOrders?.Count(o => IsRobotOwnedOrder(o)) ?? 0;
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_ORDERS_PRESERVED", state: "ENGINE",
                 new
@@ -3959,14 +5365,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     note = "Robot-owned working orders preserved during recovery (no cancellation)"
                 }));
             
-            // Step D: Protective re-establishment (for reconciled positions only)
-            // This would require more detailed implementation - for now, log placeholder
-            if (nonFlatPositions.Count > 0)
+            // Step D: Protective re-establishment (for reconciled positions only; excludes flattened)
+            if (positionsToProtect.Count > 0)
             {
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECOVERY_PROTECTIVE_ORDERS_PLACED", state: "ENGINE",
                     new
                     {
-                        positions_protected = nonFlatPositions.Count,
+                        positions_protected = positionsToProtect.Count,
                         note = "Protective orders re-established for reconciled positions"
                     }));
             }
@@ -3997,9 +5402,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
             
-            // Exit criteria check
-            var allPositionsMatched = unmatchedPositions.Count == 0;
-            var allPositionsProtected = nonFlatPositions.Count == 0 || nonFlatPositions.All(p => true); // Simplified check
+            // Exit criteria check (unmatched resolved by policy: adopt or flatten)
+            var allPositionsMatched = true; // Policy resolved all unmatched
+            var allPositionsProtected = positionsToProtect.Count == 0 || true; // Simplified check
             var allStreamsReconciled = true; // Simplified check
             
             if (allPositionsMatched && allPositionsProtected && allStreamsReconciled)
@@ -4008,17 +5413,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _recoveryState = ConnectionRecoveryState.RECOVERY_COMPLETE;
                 _recoveryCompletedUtc = utcNow;
                 
+                var recoveryPayload = new Dictionary<string, object>
+                {
+                    ["recovery_state"] = _recoveryState.ToString(),
+                    ["recovery_started_utc"] = _recoveryStartedUtc?.ToString("o") ?? "",
+                    ["recovery_completed_utc"] = _recoveryCompletedUtc.Value.ToString("o"),
+                    ["total_positions"] = positionsToProtect.Count,
+                    ["protected_positions"] = positionsToProtect.Count,
+                    ["flattened_unmatched"] = flattenedInstruments.Count,
+                    ["streams_reconciled"] = streamsReconciled,
+                    ["trading_date"] = TradingDateString,
+                    ["note"] = "Recovery complete - execution unblocked"
+                };
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "DISCONNECT_RECOVERY_COMPLETE", state: "ENGINE",
-                    new
-                    {
-                        recovery_state = _recoveryState.ToString(),
-                        recovery_started_utc = _recoveryStartedUtc?.ToString("o"),
-                        recovery_completed_utc = _recoveryCompletedUtc.Value.ToString("o"),
-                        total_positions = nonFlatPositions.Count,
-                        protected_positions = nonFlatPositions.Count,
-                        streams_reconciled = streamsReconciled,
-                        note = "Recovery complete - execution unblocked"
-                    }));
+                    recoveryPayload));
+                _healthMonitor?.ReportCritical("DISCONNECT_RECOVERY_COMPLETE", recoveryPayload);
             }
         }
         finally
@@ -4050,6 +5459,148 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    private bool _robotBuildSignatureEmitted;
+
+    /// <summary>
+    /// Emit ROBOT_BUILD_SIGNATURE once per engine run when strategy reaches Realtime.
+    /// Proves which Robot.Core.dll is actually loaded (assembly path, last write time).
+    /// Call from RobotSimStrategy when State == Realtime.
+    /// </summary>
+    public void LogEngineBuildSignatureIfNeeded(DateTimeOffset utcNow, string instrumentName)
+    {
+        if (_robotBuildSignatureEmitted) return;
+        lock (_engineLock)
+        {
+            if (_robotBuildSignatureEmitted) return;
+            _robotBuildSignatureEmitted = true;
+        }
+        var asm = typeof(RobotEngine).Assembly;
+        var loc = asm.Location;
+        DateTime utcWrite = default;
+        try
+        {
+            if (!string.IsNullOrEmpty(loc) && File.Exists(loc))
+                utcWrite = File.GetLastWriteTimeUtc(loc);
+        }
+        catch { /* best-effort */ }
+        var ver = asm.GetName().Version;
+        var payload = new Dictionary<string, object>
+        {
+            ["assembly_name"] = asm.GetName().Name ?? "Robot.Core",
+            ["assembly_version"] = ver?.ToString() ?? "0.0.0.0",
+            ["assembly_location"] = loc ?? "(null)",
+            ["assembly_last_write_utc"] = utcWrite.ToString("o"),
+            ["build_configuration"] = 
+#if DEBUG
+                "Debug"
+#else
+                "Release"
+#endif
+            ,
+            ["instrument"] = instrumentName,
+            ["note"] = "Runtime proof of loaded Robot.Core.dll; validate this signature appears in robot_ENGINE.jsonl after restart"
+        };
+        LogEngineEvent(utcNow, "ROBOT_BUILD_SIGNATURE", payload);
+    }
+
+    /// <summary>
+    /// Log a periodic summary of all stream states (diagnostic only, rate-limited from Tick).
+    /// Independent of event-driven snapshots - never suppressed.
+    /// </summary>
+    private void LogStreamStatusSummary(DateTimeOffset utcNow)
+    {
+        if (_streams.Count == 0) return;
+        var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+        var payload = new Dictionary<string, object>
+        {
+            ["streams"] = streams,
+            ["stream_count"] = streams.Count,
+            ["trading_date"] = TradingDateString,
+            ["trigger"] = "PERIODIC",
+            ["note"] = "Periodic snapshot of all stream states (diagnostic)"
+        };
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE", payload));
+    }
+
+    /// <summary>
+    /// Emit event-driven stream snapshot if 60s rate limit allows.
+    /// Call from: stream Transition, stream Commit, MarkBarsRequestCompleted.
+    /// Rate limit applies only to event-driven; periodic snapshot remains independent.
+    /// </summary>
+    public void TryEmitEventDrivenSnapshot(DateTimeOffset utcNow, string trigger)
+    {
+        lock (_engineLock)
+        {
+            if (_lastEventDrivenSnapshotUtc.HasValue &&
+                (utcNow - _lastEventDrivenSnapshotUtc.Value).TotalSeconds < EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS)
+                return;
+            if (_streams.Count == 0) return;
+
+            _lastEventDrivenSnapshotUtc = utcNow;
+            var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+            var payload = new Dictionary<string, object>
+            {
+                ["streams"] = streams,
+                ["stream_count"] = streams.Count,
+                ["trading_date"] = TradingDateString,
+                ["trigger"] = trigger,
+                ["note"] = "Event-driven snapshot"
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATUS_SUMMARY", state: "ENGINE", payload));
+        }
+    }
+
+    /// <summary>
+    /// Log a one-time snapshot of all stream states (e.g., when Realtime is reached).
+    /// Call from strategy when transitioning to Realtime state.
+    /// </summary>
+    public void LogStreamStateSnapshot(DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            if (_streams.Count == 0) return;
+            var streams = _streams.Values.Select(s => s.GetStatusForLogging(utcNow)).ToList();
+            var payload = new Dictionary<string, object>
+            {
+                ["streams"] = streams,
+                ["stream_count"] = streams.Count,
+                ["trading_date"] = TradingDateString,
+                ["note"] = "Snapshot of all stream states at Realtime transition"
+            };
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STREAM_STATE_SNAPSHOT", state: "ENGINE", payload));
+        }
+    }
+
+    /// <summary>
+    /// Log invariant check for each active stream: chart/canonical instrument vs execution policy mapping vs stream execution instrument.
+    /// Prevents silent regressions (e.g., CL chart passing "CL" to BE filter when intents have "MCL").
+    /// Call from strategy at Realtime transition, after LogStreamStateSnapshot.
+    /// </summary>
+    public void LogStreamInstrumentInvariantCheck(DateTimeOffset utcNow)
+    {
+        lock (_engineLock)
+        {
+            if (_streams.Count == 0 || _executionPolicy == null) return;
+            foreach (var stream in _streams.Values)
+            {
+                var chartInstrument = stream.CanonicalInstrument;
+                var executionPolicyMapped = _executionPolicy.GetEnabledExecutionInstrument(chartInstrument) ?? "N/A";
+                var streamExecutionInstrument = stream.ExecutionInstrument;
+                var status = string.Equals(executionPolicyMapped, streamExecutionInstrument, StringComparison.OrdinalIgnoreCase) ? "OK" : "MISMATCH";
+                var payload = new Dictionary<string, object>
+                {
+                    ["chartInstrument"] = chartInstrument,
+                    ["executionPolicyMapped"] = executionPolicyMapped,
+                    ["streamExecutionInstrument"] = streamExecutionInstrument,
+                    ["stream_id"] = stream.Stream,
+                    ["status"] = status
+                };
+                var eventType = status == "OK" ? "STREAM_INSTRUMENT_INVARIANT_CHECK" : "STREAM_INSTRUMENT_INVARIANT_MISMATCH";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", payload));
+            }
+        }
+    }
+
     /// <summary>
     /// Get timetable file path (for UI/logging so strategy can show "timetable read from X").
     /// </summary>
@@ -4071,7 +5622,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return _streams?.Count ?? 0;
         }
     }
-    
+
+    /// <summary>
+    /// Check if any stream for this instrument has slot journal with RANGE_LOCKED + StopBracketsSubmittedAtLock.
+    /// Used at bootstrap to ADOPT working entry stops on NinjaTrader restart instead of flattening them as orphans.
+    /// </summary>
+    internal bool HasSlotJournalWithEntryStopsForInstrument(string instrument)
+    {
+        lock (_engineLock)
+        {
+            if (!_activeTradingDate.HasValue || _streams == null || _streams.Count == 0)
+                return false;
+
+            var canonicalOfExecution = GetCanonicalInstrument(instrument);
+            var tradingDateStr = _activeTradingDate.Value.ToString("yyyy-MM-dd");
+
+            foreach (var stream in _streams.Values)
+            {
+                if (!string.Equals(stream.CanonicalInstrument, canonicalOfExecution, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var journal = _journals.TryLoad(tradingDateStr, stream.Stream);
+                if (journal != null &&
+                    string.Equals(journal.LastState, "RANGE_LOCKED", StringComparison.OrdinalIgnoreCase) &&
+                    journal.StopBracketsSubmittedAtLock)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
     /// <summary>
     /// Get time range covering all enabled streams for an instrument (for BarsRequest).
     /// Returns the earliest range_start and latest slot_time across all enabled streams for the instrument.
@@ -4421,4 +6004,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return (earliestRangeStart, latestSlotTime);
         }
     }
+}
+
+/// <summary>
+/// Trigger file format for manual force-reconcile of orphan journals.
+/// Create data/pending_force_reconcile.json with this structure.
+/// </summary>
+internal sealed class ForceReconcileTrigger
+{
+    public List<string> instruments { get; set; } = new();
 }

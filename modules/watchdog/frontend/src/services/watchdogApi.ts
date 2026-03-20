@@ -605,6 +605,53 @@ export async function fetchInstrumentHealth(): Promise<ApiResponse<InstrumentHea
 }
 
 /**
+ * Operator snapshot instrument (Phase 2)
+ */
+export interface OperatorSnapshotInstrument {
+  instrument: string
+  system_state: string
+  exposure: { quantity: number; source: string }
+  ownership: string
+  protectives: string
+  last_event: string
+  action_required: string
+  status: 'SAFE' | 'WARNING' | 'CRITICAL'
+  action_label: string
+  confidence: 'HIGH' | 'MEDIUM' | 'LOW'
+}
+
+export interface OperatorSnapshotResponse {
+  snapshot: Record<string, OperatorSnapshotInstrument>
+}
+
+/**
+ * Fetch operator snapshot (Phase 2 decision + severity)
+ */
+export async function fetchOperatorSnapshot(
+  nEvents = 500
+): Promise<ApiResponse<OperatorSnapshotResponse>> {
+  try {
+    const response = await fetchWithTimeout(
+      `${API_BASE}/operator-snapshot?n_events=${nEvents}`
+    )
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) errorDetail = errorData.detail
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
  * Fetch stream P&L
  */
 export async function fetchStreamPnl(

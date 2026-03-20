@@ -7,7 +7,9 @@
  * Format date as Chicago time (HH:mm:ss CT)
  */
 export function formatChicagoTime(date: Date | string): string {
+  if (date == null) return ''
   const d = typeof date === 'string' ? new Date(date) : date
+  if (!(d instanceof Date) || isNaN(d.getTime())) return ''
   return d.toLocaleTimeString('en-US', {
     timeZone: 'America/Chicago',
     hour12: false,
@@ -21,7 +23,9 @@ export function formatChicagoTime(date: Date | string): string {
  * Format date as Chicago time with milliseconds (HH:mm:ss.mmm CT)
  */
 export function formatChicagoTimeWithMs(date: Date | string): string {
+  if (date == null) return ''
   const d = typeof date === 'string' ? new Date(date) : date
+  if (!(d instanceof Date) || isNaN(d.getTime())) return ''
   const timeStr = d.toLocaleTimeString('en-US', {
     timeZone: 'America/Chicago',
     hour12: false,
@@ -37,7 +41,9 @@ export function formatChicagoTimeWithMs(date: Date | string): string {
  * Format date as full Chicago datetime (YYYY-MM-DD HH:mm:ss.mmm CT)
  */
 export function formatChicagoDateTime(date: Date | string): string {
+  if (date == null) return ''
   const d = typeof date === 'string' ? new Date(date) : date
+  if (!(d instanceof Date) || isNaN(d.getTime())) return ''
   
   // Use Intl.DateTimeFormat for consistent formatting
   const formatter = new Intl.DateTimeFormat('en-US', {
@@ -135,11 +141,11 @@ export function getCurrentChicagoTimeWithMs(): string {
  * Used by WebSocketContext and other components
  */
 export function formatEventTimestamp(timestamp: string): string {
-  if (!timestamp) return ''
+  if (timestamp == null || typeof timestamp !== 'string') return ''
   
   try {
     const date = new Date(timestamp)
-    if (isNaN(date.getTime())) return timestamp // Return original if invalid
+    if (isNaN(date.getTime())) return ''
     
     // Format as HH:mm:ss.mmm in Chicago timezone
     const formatter = new Intl.DateTimeFormat('en-US', {

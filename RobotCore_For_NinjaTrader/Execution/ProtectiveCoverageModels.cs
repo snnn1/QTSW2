@@ -110,7 +110,7 @@ public sealed class ProtectiveCorrectiveResult
 /// <summary>Policy thresholds for protective audit. Config-backed constants.</summary>
 public static class ProtectiveAuditPolicy
 {
-    public const int PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS = 1000;
+    public const int PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS = 5000;
     public const int PROTECTIVE_AUDIT_INTERVAL_INACTIVE_MS = 5000;
     public const int PROTECTIVE_RECOVERY_CONFIRM_MS = 2500;
     /// <summary>Phase 4: Timeout before escalating to ESCALATE_TO_FLATTEN when corrective submitted but still critical.</summary>

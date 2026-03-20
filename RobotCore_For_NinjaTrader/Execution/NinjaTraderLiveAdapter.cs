@@ -11,10 +11,11 @@ namespace QTSW2.Robot.Core.Execution;
 /// Requires explicit two-key enable (CLI flag + config).
 /// GetCurrentMarketPrice: Uses Instrument.MarketData when SetNTContext called (breakout validity gate).
 /// </summary>
-public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
+public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
 {
     private readonly RobotLogger _log;
     private readonly TimeService _time;
+    private object? _ntAccount;   // NinjaTrader.Cbi.Account when SetNTContext called
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument when SetNTContext called
 
     public NinjaTraderLiveAdapter(RobotLogger log, TimeService time)
@@ -158,13 +159,12 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
 
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
     {
-        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_LIVE_STUB", state: "ENGINE",
-            new { instrument, note = "LIVE adapter FlattenEmergency not yet implemented" }));
-        return FlattenResult.FailureResult("LIVE adapter FlattenEmergency not yet implemented", utcNow);
+        return FlattenEmergencyReal(instrument, utcNow);
     }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         // LIVE adapter: Implement snapshot using NT account (fail-closed on error)
         try
         {
@@ -177,14 +177,19 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
                     note = "LIVE adapter snapshot not yet implemented - returning empty snapshot"
                 }));
             
-            return new AccountSnapshot
+            var snap = new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
+            sw.Stop();
+            SnapshotMetricsCollector.GetOrCreate(_log).RecordCall(DateTimeOffset.UtcNow, sw.ElapsedMilliseconds, 0, 0);
+            return snap;
         }
         catch (Exception ex)
         {
+            sw.Stop();
+            SnapshotMetricsCollector.GetOrCreate(_log).RecordCall(DateTimeOffset.UtcNow, sw.ElapsedMilliseconds, 0, 0);
             // Fail-closed logging
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ACCOUNT_SNAPSHOT_LIVE_ERROR", state: "ENGINE",
                 new
@@ -252,9 +257,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
     /// </summary>
     public void SetNTContext(object account, object instrument, string? engineExecutionInstrument = null)
     {
+        _ntAccount = account;
         _ntInstrument = instrument;
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "LIVE_ADAPTER_NT_CONTEXT_SET", state: "ENGINE",
-            new { note = "NinjaTrader Instrument set for live market price (breakout validity gate)" }));
+            new { note = "NinjaTrader Account and Instrument set for live execution" }));
     }
 
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
@@ -327,6 +333,11 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
     public void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow)
     {
         // LIVE adapter: No-op (stub)
+    }
+
+    public void TryRetryDeferredAdoptionScan()
+    {
+        // LIVE adapter: No IEA, no-op
     }
 
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)

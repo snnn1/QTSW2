@@ -1,5 +1,6 @@
 # Build and deploy Robot.Core + dependencies + strategy to NinjaTrader
 # Run from project root
+# NinjaTrader uses pre-built Robot.Core.dll (not source). Do NOT copy AddOns source.
 
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD }
@@ -20,6 +21,13 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "[OK] Build succeeded" -ForegroundColor Green
+Write-Host ""
+
+# Step 1b: Sync NT_ADDONS from RobotCore (prevents divergence)
+if (Test-Path (Join-Path $projectRoot "NT_ADDONS")) {
+    Write-Host "[1b] Syncing NT_ADDONS from RobotCore_For_NinjaTrader..." -ForegroundColor Cyan
+    & (Join-Path $projectRoot "sync_nt_addons_from_robotcore.ps1") | Out-Null
+}
 Write-Host ""
 
 # Step 2: Copy DLLs

@@ -272,7 +272,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// Gap 1: Enqueue work and block until result. Used for entry submission and flatten.
     /// Deadlock guard: if called from worker thread, executes inline. Fail-fast on queue overflow or timeout.
     /// </summary>
-    internal (bool success, T? result) EnqueueAndWait<T>(Func<T> work, int timeoutMs = 5000)
+    /// <param name="context">Optional caller context for IEA_ENQUEUE_AND_WAIT_TIMING diagnostics.</param>
+    internal (bool success, T? result) EnqueueAndWait<T>(Func<T> work, int timeoutMs = 5000, string? context = null)
     {
         if (Executor == null) return (false, default);
         if (!_workerRunning) return (false, default);
@@ -323,6 +324,8 @@ public sealed partial class InstrumentExecutionAuthority
         }
         if (Thread.CurrentThread == _workerThread)
             return (true, work());
+        var queueDepthAtStart = QueueDepth;
+        var startUtc = NowWall();
         T? result = default;
         Exception? ex = null;
         var done = new ManualResetEventSlim(false);
@@ -341,12 +344,17 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 _instrumentBlocked = true;
                 var utcNow = NowWall();
+                var elapsedMs = (long)(utcNow - startUtc).TotalMilliseconds;
                 Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_TIMEOUT", state: "ENGINE",
                     new
                     {
                         iea_instance_id = InstanceId,
                         execution_instrument_key = ExecutionInstrumentKey,
                         timeout_ms = timeoutMs,
+                        elapsed_ms = elapsedMs,
+                        queue_depth_at_start = queueDepthAtStart,
+                        queue_depth_now = QueueDepth,
+                        context = context ?? "",
                         enqueue_sequence = Interlocked.Read(ref _enqueueSequence),
                         last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence),
                         policy = "IEA_FAIL_CLOSED_BLOCK_INSTRUMENT",
@@ -354,6 +362,23 @@ public sealed partial class InstrumentExecutionAuthority
                     }));
                 _onEnqueueFailureCallback?.Invoke(ExecutionInstrumentKey, utcNow, "IEA_ENQUEUE_AND_WAIT_TIMEOUT");
                 return (false, default);
+            }
+            var endUtc = NowWall();
+            var elapsedMsSuccess = (long)(endUtc - startUtc).TotalMilliseconds;
+            if (elapsedMsSuccess >= 1000)
+            {
+                Log?.Write(RobotEvents.EngineBase(endUtc, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_TIMING", state: "ENGINE",
+                    new
+                    {
+                        iea_instance_id = InstanceId,
+                        execution_instrument_key = ExecutionInstrumentKey,
+                        elapsed_ms = elapsedMsSuccess,
+                        queue_depth_at_start = queueDepthAtStart,
+                        queue_depth_now = QueueDepth,
+                        context = context ?? "",
+                        timeout = false,
+                        note = "Slow EnqueueAndWait — correlate with disconnects"
+                    }));
             }
             if (ex != null) throw ex;
             return (true, result);
@@ -371,7 +396,7 @@ public sealed partial class InstrumentExecutionAuthority
     internal FlattenResult EnqueueFlattenAndWait(Func<FlattenResult> work, int timeoutMs = 10000)
     {
         var utcNow = DateTimeOffset.UtcNow;
-        var (success, result) = EnqueueAndWait(work, timeoutMs);
+        var (success, result) = EnqueueAndWait(work, timeoutMs, "Flatten");
         if (!success) return FlattenResult.FailureResult("Flatten failed (IEA queue overflow or timeout)", utcNow);
         return result ?? FlattenResult.FailureResult("Flatten returned null", utcNow);
     }

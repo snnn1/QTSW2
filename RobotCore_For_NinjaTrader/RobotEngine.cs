@@ -167,6 +167,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var utcNow = DateTimeOffset.UtcNow;
             var tradingDate = _heartbeatTradingDateCache ?? "";
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            _executionAdapter?.TryRetryDeferredAdoptionScan();
         }
         catch (Exception ex)
         {
@@ -343,6 +344,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Diagnostic: one-time log when we skip timetable poll during Historical (confirms fix is deployed)
     private bool _loggedHistoricalPollSkip = false;
+
+    // TimetableCache instrumentation: rate-limited HIT/REFRESH logs for validation
+    private DateTimeOffset? _lastTimetableCacheHitLogUtc;
+    private DateTimeOffset? _lastTimetableCacheRefreshLogUtc;
+    private const double TIMETABLE_CACHE_LOG_RATE_LIMIT_SECONDS = 60.0;
     
     // Recovery runner guard (prevent re-entrancy)
     private bool _recoveryRunnerActive = false;
@@ -1128,7 +1134,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _mismatchCoordinator = new MismatchEscalationCoordinator(
                 getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
                 getActiveInstruments: () => Array.Empty<string>(),
-                getMismatchObservations: AssembleMismatchObservations,
+                getMismatchObservations: (snap, utcNow) => AssembleMismatchObservations(snap, utcNow),
                 isInstrumentBlocked: inst => _frozenInstruments.Contains(inst) || (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false),
                 isFlattenInProgress: _ => false,
                 isRecoveryInProgress: _ => false,
@@ -3336,22 +3342,45 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private (FilePollResult Poll, TimetableContract? Timetable, Exception? ParseException) PollAndParseTimetable(DateTimeOffset utcNow)
     {
-        var poll = _timetablePoller.Poll(_timetablePath, utcNow);
-        if (poll.Error is not null)
+        _timetablePoller.MarkPolled(utcNow);
+
+        if (!File.Exists(_timetablePath))
         {
-            return (poll, null, null);
+            return (new FilePollResult(false, null, "MISSING"), null, null);
         }
 
-        // Even if unchanged, we may still parse when force==true (handled by caller).
-        try
+        var (hash, timetable, changed, wasCacheHit) = TimetableCache.GetOrLoad(_timetablePath, _lastTimetableHash);
+
+        // Instrumentation: rate-limited TIMETABLE_CACHE_HIT / TIMETABLE_CACHE_REFRESH for validation
+        if (wasCacheHit)
         {
-            var timetable = TimetableContract.LoadFromFile(_timetablePath);
-            return (poll, timetable, null);
+            var shouldLog = !_lastTimetableCacheHitLogUtc.HasValue ||
+                (utcNow - _lastTimetableCacheHitLogUtc.Value).TotalSeconds >= TIMETABLE_CACHE_LOG_RATE_LIMIT_SECONDS;
+            if (shouldLog)
+            {
+                _lastTimetableCacheHitLogUtc = utcNow;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_CACHE_HIT", state: "ENGINE",
+                    new { note = "Timetable served from cache (no disk read)" }));
+            }
         }
-        catch (Exception ex)
+        else
         {
-            return (poll, null, ex);
+            _lastTimetableCacheRefreshLogUtc = utcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_CACHE_REFRESH", state: "ENGINE",
+                new { note = "Timetable refreshed from disk (cache miss or file changed)" }));
         }
+
+        // Parse error: GetOrLoad returns (rawHash, null, true, false) when LoadFromBytes fails
+        if (timetable is null && hash is not null)
+        {
+            return (new FilePollResult(true, hash, "PARSE_ERROR"), null, new InvalidOperationException("Timetable parse failed"));
+        }
+        if (timetable is null && hash is null)
+        {
+            return (new FilePollResult(false, null, "MISSING"), null, null);
+        }
+
+        return (new FilePollResult(changed, hash, null), timetable, null);
     }
 
     private void ReloadTimetableIfChanged(
@@ -4710,24 +4739,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     /// <summary>
     /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
+    /// A1: Accepts snapshot as parameter — exactly one snapshot per coordinator tick.
     /// </summary>
-    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations()
+    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         var list = new List<MismatchObservation>();
-        if (_executionAdapter == null) return list;
+        if (snap == null) return list;
 
-        var utcNow = DateTimeOffset.UtcNow;
-        AccountSnapshot snap;
-        try
-        {
-            snap = _executionAdapter.GetAccountSnapshot(utcNow);
-        }
-        catch
-        {
-            return list;
-        }
-
-        if (snap?.Positions == null && snap?.WorkingOrders == null)
+        if (snap.Positions == null && snap.WorkingOrders == null)
             return list;
 
         var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);

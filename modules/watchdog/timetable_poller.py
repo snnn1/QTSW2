@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 
+def _compute_content_hash(timetable: dict) -> str:
+    """
+    Compute content-only hash (excludes as_of, source) to avoid false restarts
+    when only metadata (e.g. as_of timestamp) changes.
+    """
+    content = {k: v for k, v in timetable.items() if k not in ("as_of", "source")}
+    # Sort streams by stream id for deterministic hash (matches C# TimetableContentHasher)
+    if "streams" in content and isinstance(content["streams"], list):
+        content["streams"] = sorted(
+            content["streams"],
+            key=lambda s: s.get("stream", "") if isinstance(s, dict) else "",
+        )
+    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def compute_timetable_trading_date(chicago_now: datetime) -> str:
     """
     Compute trading_date using CME rollover rule (17:00 Chicago).
@@ -84,14 +100,11 @@ class TimetablePoller:
             return (computed_trading_date, None, None, None)
         
         try:
-            # Read file contents for hashing
+            # Read file contents
             with open(self._timetable_path, 'rb') as f:
                 file_contents = f.read()
             
-            # Compute hash
-            timetable_hash = hashlib.sha256(file_contents).hexdigest()
-            
-            # Parse JSON
+            # Parse JSON first (needed for content hash)
             try:
                 timetable = json.loads(file_contents.decode('utf-8'))
             except json.JSONDecodeError as e:
@@ -100,6 +113,9 @@ class TimetablePoller:
                     f"timetable file parse error: {e} (fail-open mode)"
                 )
                 return (computed_trading_date, None, None, None)
+            
+            # Content-only hash (excludes as_of, source) to avoid false restarts when only metadata changes
+            timetable_hash = _compute_content_hash(timetable)
             
             # Extract trading_date from timetable (authoritative source)
             timetable_trading_date = timetable.get('trading_date')

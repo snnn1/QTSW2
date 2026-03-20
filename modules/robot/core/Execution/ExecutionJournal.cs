@@ -1463,7 +1463,48 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
-    /// Get sum of EntryFilledQuantityTotal for open journal entries matching an instrument.
+    /// Get adoption candidate journal entry for an intent. EntrySubmitted && !TradeCompleted, instrument match.
+    /// Returns (tradingDate, stream, entry) if found; null otherwise.
+    /// </summary>
+    public (string TradingDate, string Stream, ExecutionJournalEntry Entry)? TryGetAdoptionCandidateEntry(string intentId, string executionInstrument, string? canonicalInstrument = null)
+    {
+        if (string.IsNullOrWhiteSpace(intentId)) return null;
+        string[] files;
+        try { files = Directory.GetFiles(_journalDir, "*.json"); }
+        catch { return null; }
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+                var fileIntentId = parts[parts.Length - 1];
+                if (!string.Equals(fileIntentId, intentId, StringComparison.OrdinalIgnoreCase)) continue;
+                var tradingDate = parts[0];
+                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+                ExecutionJournalEntry? entry;
+                lock (_lock)
+                {
+                    var json = File.ReadAllText(path);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                }
+                if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
+                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
+                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                    continue;
+                return (tradingDate, stream, entry);
+            }
+            catch { /* skip */ }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Get sum of remaining open quantity for journal entries matching an instrument. For quantity reconciliation.
+    /// Uses EntryFilledQuantityTotal - ExitFilledQuantityTotal (not just EntryFilledQuantityTotal) so partial exits
+    /// (e.g. 1 of 2 at target) reconcile correctly. See 2026-03-17_YM1_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.
     /// </summary>
     public int GetOpenJournalQuantitySumForInstrument(string executionInstrument, string? canonicalInstrument = null)
     {
@@ -1477,7 +1518,10 @@ public sealed class ExecutionJournal
                 (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
             {
                 foreach (var (_, _, _, entry) in kvp.Value)
-                    sum += entry.EntryFilledQuantityTotal;
+                {
+                    var remaining = Math.Max(0, entry.EntryFilledQuantityTotal - entry.ExitFilledQuantityTotal);
+                    sum += remaining;
+                }
             }
         }
         return sum;

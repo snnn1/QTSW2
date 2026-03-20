@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
@@ -210,6 +211,9 @@ public sealed partial class NinjaTraderSimAdapter
 
     IReadOnlyCollection<string> IIEAOrderExecutor.GetAdoptionCandidateIntentIds(string? executionInstrument) =>
         GetAdoptionCandidateIntentIds(executionInstrument);
+
+    (string JournalDir, int FileCount, bool DirectoryExists) IIEAOrderExecutor.GetJournalDiagnostics(string? executionInstrument) =>
+        GetJournalDiagnostics(executionInstrument);
 
     OrderModificationResult IIEAOrderExecutor.ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow) =>
         ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow);
@@ -2450,8 +2454,13 @@ public sealed partial class NinjaTraderSimAdapter
             return;
         }
 
+        var fillPathSw = Stopwatch.StartNew();
+        string? fillPathIntentId = null;
+        try
+        {
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
+        fillPathIntentId = intentId;
         var utcNow = DateTimeOffset.UtcNow;
 
         if (_useInstrumentExecutionAuthority && _iea != null &&
@@ -2806,6 +2815,16 @@ public sealed partial class NinjaTraderSimAdapter
         var recordNorm = new UnresolvedExecutionRecord(execution, order, intentId, instrumentNorm, encodedTag,
             fillPrice, fillQuantity, order.OrderState.ToString(), isProtectiveOrder, orderTypeFromTag, utcNow, execIdNorm);
         ProcessExecutionUpdateContinuation(recordNorm, orderInfo);
+        }
+        finally
+        {
+            var elapsed = fillPathSw.ElapsedMilliseconds;
+            if (elapsed >= 100)
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "FILL_PATH_SLOW", "ENGINE",
+                    new { total_ms = elapsed, intent_id = fillPathIntentId, note = "Correlate with disconnects; disconnects preceded by heavy fill-path bursts?" }));
+            }
+        }
     }
 
     private void ProcessExecutionUpdateContinuation(UnresolvedExecutionRecord record, OrderInfo orderInfo)

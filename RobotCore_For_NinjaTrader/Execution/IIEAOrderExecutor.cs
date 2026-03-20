@@ -69,6 +69,12 @@ public interface IIEAOrderExecutor
     /// </summary>
     IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument);
 
+    /// <summary>
+    /// Get journal visibility diagnostics for adoption deferral logging.
+    /// Returns (journalDir, fileCount, directoryExists). FileCount is -1 on read failure.
+    /// </summary>
+    (string JournalDir, int FileCount, bool DirectoryExists) GetJournalDiagnostics(string? executionInstrument);
+
     /// <summary>Phase 3: Evaluate BE triggers and dispatch modify. Single evaluation function; branch only at mutation.</summary>
     void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument);
 

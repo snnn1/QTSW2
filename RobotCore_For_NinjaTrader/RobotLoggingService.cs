@@ -83,6 +83,13 @@ public sealed class RobotLoggingService : IDisposable
     private DateTime _lastPipelineMetricUtc = DateTime.MinValue;
     private const int PIPELINE_METRIC_INTERVAL_SECONDS = 60; // 1 minute - lightweight, good operational visibility
     private int _debugCountThisMinute = 0;
+    // Phase B: Logging metrics
+    private long _eventsEnqueuedSinceLastMetric = 0;
+    private long _eventsEnqueuedTotal = 0;
+    private int _peakQueueDepth = 0;
+    private double _avgQueueDepth = 0;
+    private bool _avgQueueDepthInitialized = false;
+    private long _lastFlushDurationMs = 0;
     private DateTimeOffset _lastDebugCapResetUtc = DateTimeOffset.UtcNow;
 
     private sealed class DailySummaryAggregator
@@ -393,9 +400,14 @@ public sealed class RobotLoggingService : IDisposable
                 }
             }
             
-            // Rate limiting: apply only to DEBUG and INFO levels
-            if (string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase))
+            // Rate limiting: apply to DEBUG, INFO, and WARN when event type is in event_rate_limits
+            // (CRITICAL_NOTIFICATION_SKIPPED is WARN but floods when multi-instance; throttle via config)
+            var eventTypeForRateLimit = evt.@event ?? "";
+            var isRateLimitableLevel = string.Equals(evt.level, "DEBUG", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(evt.level, "INFO", StringComparison.OrdinalIgnoreCase) ||
+                (string.Equals(evt.level, "WARN", StringComparison.OrdinalIgnoreCase) &&
+                 _config.event_rate_limits != null && _config.event_rate_limits.ContainsKey(eventTypeForRateLimit));
+            if (isRateLimitableLevel)
             {
                 if (!CheckRateLimit(evt))
                 {
@@ -418,7 +430,7 @@ public sealed class RobotLoggingService : IDisposable
 
         // Engine-level event deduplication: log once per engine state change, not once per instrument
         var eventType = evt.@event ?? "";
-        var reason = evt.data != null && evt.data.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() : null;
+        var reason = BuildDedupeReason(eventType, evt.data);
         if (!EngineLogDedupe.ShouldLog(eventType, reason))
             return;
 
@@ -443,8 +455,27 @@ public sealed class RobotLoggingService : IDisposable
         }
 
         _queue.Enqueue(evt);
+        Interlocked.Increment(ref _eventsEnqueuedSinceLastMetric);
+        Interlocked.Increment(ref _eventsEnqueuedTotal);
     }
     
+    /// <summary>
+    /// Build dedupe key reason for EngineLogDedupe.
+    /// RECONCILIATION_ORDER_SOURCE_BREAKDOWN uses instrument:broker_working:iea_working for per-instrument dedupe.
+    /// </summary>
+    private static string? BuildDedupeReason(string eventType, Dictionary<string, object?>? data)
+    {
+        if (data == null) return null;
+        if (string.Equals(eventType, "RECONCILIATION_ORDER_SOURCE_BREAKDOWN", StringComparison.OrdinalIgnoreCase))
+        {
+            var inst = data.TryGetValue("instrument", out var i) ? i?.ToString() ?? "" : "";
+            var bw = data.TryGetValue("broker_working", out var b) ? b?.ToString() ?? "" : "";
+            var iw = data.TryGetValue("iea_working", out var ie) ? ie?.ToString() ?? "" : "";
+            return $"{inst}:{bw}:{iw}";
+        }
+        return data.TryGetValue("reason", out var reasonObj) ? reasonObj?.ToString() : null;
+    }
+
     /// <summary>
     /// Check DEBUG volume cap (per-minute). Returns true if event should be logged, false if cap exceeded.
     /// </summary>
@@ -702,6 +733,7 @@ public sealed class RobotLoggingService : IDisposable
 
     private void FlushBatch(bool force)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         var batch = new List<RobotLogEvent>();
         var count = force ? int.MaxValue : MAX_BATCH_PER_FLUSH;
 
@@ -755,6 +787,9 @@ public sealed class RobotLoggingService : IDisposable
             var queueSize = _queue.Count;
             LogErrorToFile($"Backpressure: dropped_debug={droppedDebug}, dropped_info={droppedInfo}, queue_size={queueSize}");
         }
+
+        sw.Stop();
+        Interlocked.Exchange(ref _lastFlushDurationMs, sw.ElapsedMilliseconds);
     }
 
     private void MaybeWriteDailySummary(bool force)
@@ -1117,11 +1152,32 @@ public sealed class RobotLoggingService : IDisposable
 
     /// <summary>
     /// Emit periodic pipeline metric event (queue depth, drops, etc.) to ENGINE log.
+    /// Phase B: Adds avg_queue_depth, peak_queue_depth, events_per_sec, flush_time_ms.
     /// </summary>
     private void EmitPipelineMetric(int queueDepth)
     {
         try
         {
+            // Phase B: Update peak and running average
+            lock (_rateLimitLock)
+            {
+                if (queueDepth > _peakQueueDepth)
+                    _peakQueueDepth = queueDepth;
+                if (!_avgQueueDepthInitialized)
+                {
+                    _avgQueueDepth = queueDepth;
+                    _avgQueueDepthInitialized = true;
+                }
+                else
+                {
+                    _avgQueueDepth = _avgQueueDepth * 0.9 + queueDepth * 0.1;
+                }
+            }
+
+            var eventsThisMinute = Interlocked.Exchange(ref _eventsEnqueuedSinceLastMetric, 0);
+            var eventsPerSec = eventsThisMinute / (double)PIPELINE_METRIC_INTERVAL_SECONDS;
+            var flushMs = Interlocked.Read(ref _lastFlushDurationMs);
+
             var droppedDebug = Interlocked.Read(ref _droppedDebugCount);
             var droppedInfo = Interlocked.Read(ref _droppedInfoCount);
             var droppedDebugCap = Interlocked.Read(ref _droppedDebugVolumeCapCount);
@@ -1136,11 +1192,16 @@ public sealed class RobotLoggingService : IDisposable
                 data: new Dictionary<string, object?>
                 {
                     ["queue_depth"] = queueDepth,
+                    ["avg_queue_depth"] = Math.Round(_avgQueueDepth, 1),
+                    ["peak_queue_depth"] = _peakQueueDepth,
+                    ["events_per_sec"] = Math.Round(eventsPerSec, 2),
+                    ["flush_time_ms"] = flushMs,
                     ["max_queue_size"] = MAX_QUEUE_SIZE,
                     ["dropped_debug"] = droppedDebug,
                     ["dropped_info"] = droppedInfo,
                     ["dropped_debug_volume_cap"] = droppedDebugCap,
-                    ["write_failure_count"] = _writeFailureCount
+                    ["write_failure_count"] = _writeFailureCount,
+                    ["note"] = "Phase B: logging metrics for CPU audit"
                 }
             );
             _queue.Enqueue(metricEvent); // Safe: metric is INFO, queue likely has space

@@ -120,6 +120,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Adoption recovery tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("DELAYED_JOURNAL_VISIBILITY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = DelayedJournalVisibilityTests.RunDelayedJournalVisibilityTests();
+        Console.WriteLine(pass ? "PASS: Delayed journal visibility tests (adoption-on-restart)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("UNMATCHED_POSITION_POLICY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = UnmatchedPositionPolicyTests.RunUnmatchedPositionPolicyTests();
+        Console.WriteLine(pass ? "PASS: Unmatched position policy tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("RECONCILIATION_RECOVERY_SCENARIOS", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = ReconciliationRecoveryScenarioTests.RunReconciliationRecoveryScenarioTests();

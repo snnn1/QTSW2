@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
@@ -62,6 +63,24 @@ public sealed class ExecutionJournal
     
     /// <summary>Journal directory path (for diagnostics).</summary>
     public string JournalDirectory => _journalDir;
+
+    /// <summary>
+    /// Get journal visibility diagnostics for adoption deferral logging.
+    /// Returns (directory exists, file count, directory path). FileCount is -1 on read failure.
+    /// </summary>
+    public (bool DirectoryExists, int FileCount, string JournalDir) GetJournalDiagnostics()
+    {
+        try
+        {
+            var exists = Directory.Exists(_journalDir);
+            var files = exists ? Directory.GetFiles(_journalDir, "*.json") : Array.Empty<string>();
+            return (exists, files.Length, _journalDir);
+        }
+        catch
+        {
+            return (false, -1, _journalDir);
+        }
+    }
 
     /// <summary>
     /// Set callback for journal corruption events (stream stand-down).
@@ -410,7 +429,8 @@ public sealed class ExecutionJournal
         string canonicalInstrument,
         string? brokerOrderInstrumentKey = null)
     {
-        lock (_lock)
+        var cacheHit = false;
+        WithLockTiming("RecordEntryFill", tradingDate, () =>
         {
             // INVARIANT: Journal instrument must equal execution instrument (broker position key).
             // Prevents silent divergence if canonical instrument is mistakenly used.
@@ -470,6 +490,7 @@ public sealed class ExecutionJournal
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
+                cacheHit = true;
                 entry = existing;
             }
             else if (File.Exists(journalPath))
@@ -638,7 +659,7 @@ public sealed class ExecutionJournal
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
             _entryFillByStream[$"{tradingDate}_{stream}"] = true;
-        }
+        }, () => new { cache_hit = cacheHit });
     }
     
     /// <summary>
@@ -656,7 +677,8 @@ public sealed class ExecutionJournal
         DateTimeOffset utcNow,
         string? slotInstanceKey = null)  // Optional: slot_instance_key for health sink granularity
     {
-        lock (_lock)
+        var cacheHit = false;
+        WithLockTiming("RecordExitFill", tradingDate, () =>
         {
             // CRITICAL: Validate key fields - reject empty/whitespace
             if (string.IsNullOrWhiteSpace(tradingDate))
@@ -693,6 +715,7 @@ public sealed class ExecutionJournal
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
+                cacheHit = true;
                 entry = existing;
             }
             else if (File.Exists(journalPath))
@@ -1040,7 +1063,7 @@ public sealed class ExecutionJournal
             
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
-        }
+        }, () => new { cache_hit = cacheHit });
     }
 
     /// <summary>
@@ -1592,7 +1615,9 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
-    /// Get sum of EntryFilledQuantityTotal for open journal entries matching an instrument. For quantity reconciliation.
+    /// Get sum of remaining open quantity for journal entries matching an instrument. For quantity reconciliation.
+    /// Uses EntryFilledQuantityTotal - ExitFilledQuantityTotal (not just EntryFilledQuantityTotal) so partial exits
+    /// (e.g. 1 of 2 at target) reconcile correctly. See 2026-03-17_YM1_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.
     /// </summary>
     public int GetOpenJournalQuantitySumForInstrument(string executionInstrument, string? canonicalInstrument = null)
     {
@@ -1606,7 +1631,10 @@ public sealed class ExecutionJournal
                 (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
             {
                 foreach (var (_, _, _, entry) in kvp.Value)
-                    sum += entry.EntryFilledQuantityTotal;
+                {
+                    var remaining = Math.Max(0, entry.EntryFilledQuantityTotal - entry.ExitFilledQuantityTotal);
+                    sum += remaining;
+                }
             }
         }
         return sum;
@@ -1826,6 +1854,47 @@ public sealed class ExecutionJournal
         }
     }
 
+    private const int JOURNAL_IO_SLOW_THRESHOLD_MS = 100;
+    private const int JOURNAL_LOCK_SLOW_WAIT_MS = 50;
+    private const int JOURNAL_LOCK_SLOW_HOLD_MS = 100;
+
+    /// <summary>Execute action under journal lock with timing. Logs JOURNAL_LOCK_SLOW when wait or hold exceeds threshold.</summary>
+    /// <param name="extra">Optional extra data (e.g. cache_hit) - invoked after action, merged into log.</param>
+    private void WithLockTiming(string context, string tradingDate, Action action, Func<object?>? extra = null)
+    {
+        var waitSw = Stopwatch.StartNew();
+        lock (_lock)
+        {
+            var waitMs = waitSw.ElapsedMilliseconds;
+            var holdSw = Stopwatch.StartNew();
+            try
+            {
+                action();
+            }
+            finally
+            {
+                var holdMs = holdSw.ElapsedMilliseconds;
+                if (waitMs >= JOURNAL_LOCK_SLOW_WAIT_MS || holdMs >= JOURNAL_LOCK_SLOW_HOLD_MS)
+                {
+                    var ev = new Dictionary<string, object?>
+                    {
+                        ["context"] = context,
+                        ["lock_wait_ms"] = waitMs,
+                        ["lock_hold_ms"] = holdMs,
+                        ["note"] = "Correlate with disconnects"
+                    };
+                    var ex = extra?.Invoke();
+                    if (ex != null)
+                    {
+                        foreach (var p in ex.GetType().GetProperties())
+                            ev[p.Name] = p.GetValue(ex);
+                    }
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate ?? "", "JOURNAL_LOCK_SLOW", "ENGINE", ev));
+                }
+            }
+        }
+    }
+
     private void SaveJournal(string path, ExecutionJournalEntry entry)
     {
         const int maxRetries = 3;
@@ -1834,12 +1903,19 @@ public sealed class ExecutionJournal
         {
             try
             {
+                var sw = Stopwatch.StartNew();
                 var json = JsonUtil.Serialize(entry);
                 // FileShare.Read allows concurrent reads during write (avoids RECONCILIATION_QTY_MISMATCH from file lock)
                 using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
-                using (var sw = new StreamWriter(fs))
+                using (var swriter = new StreamWriter(fs))
                 {
-                    sw.Write(json);
+                    swriter.Write(json);
+                }
+                sw.Stop();
+                if (sw.ElapsedMilliseconds >= JOURNAL_IO_SLOW_THRESHOLD_MS)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "JOURNAL_IO_SLOW", "ENGINE",
+                        new { op = "write", path, elapsed_ms = sw.ElapsedMilliseconds, attempt, note = "Correlate with disconnects" }));
                 }
                 return;
             }
@@ -1867,11 +1943,20 @@ public sealed class ExecutionJournal
         {
             try
             {
+                var sw = Stopwatch.StartNew();
+                string content;
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var sr = new StreamReader(fs))
                 {
-                    return sr.ReadToEnd();
+                    content = sr.ReadToEnd();
                 }
+                sw.Stop();
+                if (sw.ElapsedMilliseconds >= JOURNAL_IO_SLOW_THRESHOLD_MS)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", "JOURNAL_IO_SLOW", "ENGINE",
+                        new { op = "read", path, elapsed_ms = sw.ElapsedMilliseconds, attempt, note = "Correlate with disconnects" }));
+                }
+                return content;
             }
             catch (IOException) when (attempt < maxRetries)
             {

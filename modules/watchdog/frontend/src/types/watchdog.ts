@@ -11,6 +11,8 @@ export interface WatchdogStatus {
   recovery_state: string;
   kill_switch_active: boolean;
   connection_status: string;
+  /** Authoritative: LOST | RECOVERING | STABLE (deterministic, timestamp-driven) */
+  derived_connection_state?: 'LOST' | 'RECOVERING' | 'STABLE';
   last_connection_event_chicago: string | null;
   session_connectivity?: SessionConnectivityInfo | null;
   last_connectivity_daily_summary?: ConnectivityDailySummary | null;

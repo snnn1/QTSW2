@@ -196,6 +196,13 @@ public interface IExecutionAdapter
     IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
 
     /// <summary>
+    /// Retry deferred adoption scan when candidates were empty but broker had orders (journal load race).
+    /// Call from periodic path (e.g. reconciliation) so retry does not depend only on execution updates.
+    /// No-op for adapters without IEA.
+    /// </summary>
+    void TryRetryDeferredAdoptionScan();
+
+    /// <summary>
     /// Session-close immediate flatten: enqueue cancel+flatten NtActions and drain in same cycle.
     /// Guarantees same-cycle execution before session close. Use for forced flatten when next-bar delay is unacceptable.
     /// Returns null if not supported (caller should use EmergencyFlatten fallback).

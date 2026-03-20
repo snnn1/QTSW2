@@ -537,6 +537,40 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     private bool _hasScannedForAdoption;
+    private DateTimeOffset? _firstAdoptionScanUtc;
+    private int _adoptionDeferredCount;
+    private bool _adoptionDeferred;
+    private volatile bool _adoptionScanInProgress;
+
+    /// <summary>Seconds to defer UNOWNED when adoption candidates empty but broker has orders (journal load race).</summary>
+    private const int RestartAdoptionGraceSeconds = 20;
+    /// <summary>Max deferred scans before proceeding to UNOWNED (prevents infinite loop).</summary>
+    private const int RestartAdoptionMaxDeferredScans = 10;
+
+    /// <summary>
+    /// Retry adoption scan when deferred (candidates empty, broker has orders).
+    /// Call from periodic path (e.g. engine heartbeat) so retry does not depend only on execution updates.
+    /// Enqueues ScanAndAdoptExistingOrders to IEA worker; no-op if not deferred or scan already in flight.
+    /// Guard: at most one adoption scan queued/running at a time.
+    /// </summary>
+    internal void TryRetryDeferredAdoptionScanIfDeferred()
+    {
+        if (!_adoptionDeferred) return;
+        if (_adoptionScanInProgress) return;
+        _adoptionScanInProgress = true;
+        try
+        {
+            EnqueueRecoveryEssential(() =>
+            {
+                try { ScanAndAdoptExistingOrders(); }
+                finally { _adoptionScanInProgress = false; }
+            });
+        }
+        catch
+        {
+            _adoptionScanInProgress = false;
+        }
+    }
 
     /// <summary>Run adoption for late recovery (reconciliation). Returns count of orders adopted.</summary>
     public int TryRecoveryAdoption()
@@ -565,6 +599,7 @@ public sealed partial class InstrumentExecutionAuthority
     /// For each QTSW2 protective (STOP/TARGET) with entry filled per journal, populate OrderMap.
     /// Phase 2: QTSW2 stop/target with no matching intent → UNOWNED_LIVE_ORDER_DETECTED, register UNOWNED, follow recovery (flatten).
     /// IEA robustness: Also adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET) so registry never loses orders on restart.
+    /// Adoption-on-restart hardening: Defer UNOWNED when candidates empty but broker has orders (journal load race); retry within grace window.
     /// </summary>
     private void ScanAndAdoptExistingOrders()
     {
@@ -573,12 +608,77 @@ public sealed partial class InstrumentExecutionAuthority
         if (account?.Orders == null) return;
         var activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
         var workingCount = account.Orders.Count(o => o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
-        Log?.Write(RobotEvents.EngineBase(NowEvent(), "", ExecutionInstrumentKey, "ADOPTION_SCAN_START", new
+        var qtsw2WorkingCount = 0;
+        foreach (Order o in account.Orders)
+        {
+            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            var tag = Executor.GetOrderTag(o);
+            if (!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+                qtsw2WorkingCount++;
+        }
+        var utcNow = NowEvent();
+        var (journalDir, journalFileCount, journalDirExists) = Executor.GetJournalDiagnostics(ExecutionInstrumentKey);
+        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_SCAN_START", new
         {
             adoption_candidate_count = activeIntentIds.Count,
             broker_working_count = workingCount,
+            qtsw2_working_count = qtsw2WorkingCount,
+            journal_dir = journalDir,
+            journal_file_count = journalFileCount,
+            journal_dir_exists = journalDirExists,
             iea_instance_id = InstanceId
         }));
+
+        if (activeIntentIds.Count == 0 && qtsw2WorkingCount > 0)
+        {
+            _adoptionDeferredCount++;
+            _firstAdoptionScanUtc ??= utcNow;
+            var elapsedMs = (long)(utcNow - _firstAdoptionScanUtc.Value).TotalMilliseconds;
+            var action = AdoptionDeferralDecision.Evaluate(activeIntentIds.Count, qtsw2WorkingCount, _adoptionDeferredCount, elapsedMs, RestartAdoptionGraceSeconds, RestartAdoptionMaxDeferredScans);
+            if (action == AdoptionDeferralAction.Defer)
+            {
+                _adoptionDeferred = true;
+                _hasScannedForAdoption = false;
+                Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_DEFERRED_CANDIDATES_EMPTY", new
+                {
+                    broker_working_count = qtsw2WorkingCount,
+                    journal_dir = journalDir,
+                    retry_count = _adoptionDeferredCount,
+                    elapsed_since_first_scan_ms = elapsedMs,
+                    journal_file_count = journalFileCount,
+                    journal_dir_exists = journalDirExists,
+                    iea_instance_id = InstanceId,
+                    note = "Candidates empty but broker has QTSW2 orders; defer UNOWNED to allow journal load"
+                }));
+                return;
+            }
+            _adoptionDeferred = false;
+            Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_GRACE_EXPIRED_UNOWNED", new
+            {
+                broker_working_count = qtsw2WorkingCount,
+                journal_dir = journalDir,
+                retry_count = _adoptionDeferredCount,
+                elapsed_since_first_scan_ms = elapsedMs,
+                journal_file_count = journalFileCount,
+                journal_dir_exists = journalDirExists,
+                iea_instance_id = InstanceId,
+                note = "Grace window expired; proceeding to UNOWNED"
+            }));
+        }
+        else if (activeIntentIds.Count == 0 && qtsw2WorkingCount == 0)
+        {
+            _hasScannedForAdoption = true;
+            _adoptionDeferred = false;
+            Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_CANDIDATES_EMPTY_NO_BROKER_ORDERS", new
+            {
+                journal_dir = journalDir,
+                journal_file_count = journalFileCount,
+                iea_instance_id = InstanceId,
+                note = "Nothing to adopt"
+            }));
+            return;
+        }
+
         foreach (Order o in account.Orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
@@ -637,7 +737,6 @@ public sealed partial class InstrumentExecutionAuthority
                             action = "RECOVERY_PHASE3",
                             iea_instance_id = InstanceId
                         }));
-                        var utcNow = NowEvent();
                         RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
                         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
                     }
@@ -682,16 +781,17 @@ public sealed partial class InstrumentExecutionAuthority
                         intent_id = intentId,
                         instrument,
                         order_type = "ENTRY",
-                        note = "Restart scan: QTSW2 entry with no matching active intent",
-                        action = "RECOVERY_PHASE3",
-                        iea_instance_id = InstanceId
-                    }));
-                    var utcNow = NowEvent();
+                            note = "Restart scan: QTSW2 entry with no matching active intent",
+                            action = "RECOVERY_PHASE3",
+                            iea_instance_id = InstanceId
+                        }));
                     RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
                     RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
                 }
             }
         }
+        _hasScannedForAdoption = true;
+        _adoptionDeferred = false;
     }
 
     /// <summary>

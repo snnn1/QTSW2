@@ -9,6 +9,7 @@ export function WatchdogNavigationBar() {
   
   const navItems = [
     { path: '/watchdog', label: 'Watchdog' },
+    { path: '/operator', label: 'Operator' },
     { path: '/daily', label: 'Daily' },
     { path: '/journal', label: 'Journal' },
     { path: '/summary', label: 'Summary' },

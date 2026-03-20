@@ -1331,6 +1331,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         // Harness build: No IEA; no-op. NT build uses RobotCore_For_NinjaTrader with full IEA.
     }
 
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY", state: "ENGINE",
+            new { instrument, note = "Emergency flatten by instrument (unmatched position policy or IEA block)" }));
+        return Flatten("EMERGENCY_BLOCK", instrument, utcNow);
+    }
+
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
         // Harness build: No IEA/NT action queue; return null so caller uses EmergencyFlatten fallback.

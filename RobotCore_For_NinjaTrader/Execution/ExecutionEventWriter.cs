@@ -11,11 +11,14 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Writes canonical execution events to append-only JSONL streams.
 /// Per-instrument per-trading-day. Thread-safe. On write failure: log critical, continue.
+/// When getRunId is provided, uses per-instance files (instrument_runIdPrefix.jsonl) to avoid
+/// multiple strategy instances contending on the same file.
 /// </summary>
 public sealed class ExecutionEventWriter
 {
     private readonly string _projectRoot;
     private readonly Func<string> _getTradingDate;
+    private readonly Func<string>? _getRunId;
     private readonly RobotLogger? _log;
     private readonly ExecutionEventSequence _sequence = new ExecutionEventSequence();
     private readonly object _writeLock = new object();
@@ -24,10 +27,11 @@ public sealed class ExecutionEventWriter
     private int _writeFailures;
     private readonly HashSet<string> _streamsOpened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    public ExecutionEventWriter(string projectRoot, Func<string> getTradingDate, RobotLogger? log)
+    public ExecutionEventWriter(string projectRoot, Func<string> getTradingDate, RobotLogger? log, Func<string>? getRunId = null)
     {
         _projectRoot = projectRoot ?? throw new ArgumentNullException(nameof(projectRoot));
         _getTradingDate = getTradingDate ?? (() => "");
+        _getRunId = getRunId;
         _log = log;
     }
 
@@ -86,6 +90,12 @@ public sealed class ExecutionEventWriter
     {
         var td = string.IsNullOrWhiteSpace(tradingDate) ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd") : tradingDate.Trim();
         var inst = string.IsNullOrWhiteSpace(instrument) ? "_unknown" : SanitizeFileName(instrument);
+        var runId = _getRunId?.Invoke();
+        if (!string.IsNullOrWhiteSpace(runId))
+        {
+            var prefix = runId!.Length >= 8 ? runId.Substring(0, 8) : runId;
+            inst = inst + "_" + SanitizeFileName(prefix);
+        }
         var baseDir = Path.Combine(_projectRoot, "automation", "logs", "execution_events", td);
         return Path.Combine(baseDir, inst + ".jsonl");
     }

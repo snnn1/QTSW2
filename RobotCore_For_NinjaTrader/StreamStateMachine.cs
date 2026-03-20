@@ -6766,6 +6766,7 @@ public sealed class StreamStateMachine
         {
             LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Flatten failed after {MAX_FLATTEN_RETRIES} attempts: {flattenResult?.ErrorMessage ?? "Unknown"}",
                 new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument });
+            _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_FAILED", utcNow);
             return;
         }
         
@@ -6810,6 +6811,10 @@ public sealed class StreamStateMachine
                 LogHealth("CRITICAL", "FORCED_FLATTEN_EXPOSURE_REMAINING",
                     $"Position still open after flatten: {ExecutionInstrument} qty={posQty}",
                     new { instrument = ExecutionInstrument, quantity = posQty, original_intent_id = _journal.OriginalIntentId });
+                LogHealth("CRITICAL", "MANUAL_FLATTEN_REQUIRED",
+                    $"Operator must manually flatten {ExecutionInstrument} — automated flatten did not close position",
+                    new { instrument = ExecutionInstrument, quantity = posQty });
+                _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_EXPOSURE_REMAINING", utcNow);
             }
         }
         catch (Exception ex)

@@ -20,7 +20,7 @@ public sealed class MismatchEscalationCoordinator
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
-    private readonly Func<IReadOnlyList<MismatchObservation>> _getMismatchObservations;
+    private readonly Func<AccountSnapshot, DateTimeOffset, IReadOnlyList<MismatchObservation>> _getMismatchObservations;
     private readonly Func<string, bool> _isInstrumentBlocked;
     private readonly Func<string, bool> _isFlattenInProgress;
     private readonly Func<string, bool> _isRecoveryInProgress;
@@ -45,7 +45,7 @@ public sealed class MismatchEscalationCoordinator
     public MismatchEscalationCoordinator(
         Func<AccountSnapshot> getSnapshot,
         Func<IReadOnlyList<string>> getActiveInstruments,
-        Func<IReadOnlyList<MismatchObservation>> getMismatchObservations,
+        Func<AccountSnapshot, DateTimeOffset, IReadOnlyList<MismatchObservation>> getMismatchObservations,
         Func<string, bool> isInstrumentBlocked,
         Func<string, bool> isFlattenInProgress,
         Func<string, bool> isRecoveryInProgress,
@@ -54,7 +54,7 @@ public sealed class MismatchEscalationCoordinator
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
-        _getMismatchObservations = getMismatchObservations ?? (() => Array.Empty<MismatchObservation>());
+        _getMismatchObservations = getMismatchObservations ?? ((_, _) => Array.Empty<MismatchObservation>());
         _isInstrumentBlocked = isInstrumentBlocked ?? (_ => false);
         _isFlattenInProgress = isFlattenInProgress ?? (_ => false);
         _isRecoveryInProgress = isRecoveryInProgress ?? (_ => false);
@@ -97,7 +97,7 @@ public sealed class MismatchEscalationCoordinator
                 instruments = fromPositions;
             }
 
-            var observations = _getMismatchObservations();
+            var observations = _getMismatchObservations(snapshot, utcNow);
             var obsByInstrument = observations
                 .Where(o => !string.IsNullOrWhiteSpace(o.Instrument))
                 .GroupBy(o => o.Instrument.Trim(), StringComparer.OrdinalIgnoreCase)

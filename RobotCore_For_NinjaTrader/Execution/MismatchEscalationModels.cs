@@ -84,7 +84,7 @@ public sealed class MismatchInstrumentState
 /// <summary>Policy thresholds for mismatch escalation.</summary>
 public static class MismatchEscalationPolicy
 {
-    public const int MISMATCH_AUDIT_INTERVAL_MS = 1000;
+    public const int MISMATCH_AUDIT_INTERVAL_MS = 5000;
     public const int MISMATCH_PERSISTENT_THRESHOLD_MS = 10000;
     public const int MISMATCH_FAIL_CLOSED_THRESHOLD_MS = 30000;
     public const int MISMATCH_CLEAR_CONSECUTIVE_CLEAN_PASSES = 2;

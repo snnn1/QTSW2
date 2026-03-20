@@ -20,15 +20,30 @@ public static class TimetableCache
     private static TimetableContract? _cachedTimetable;
 
     /// <summary>
-    /// Get or load timetable. Returns (hash, timetable, changed from lastHash).
+    /// Get or load timetable. Returns (hash, timetable, changed from lastHash, wasCacheHit).
     /// Uses file LastWriteTimeUtc as cache key; skips disk read when file unchanged.
+    /// Single read path per process; atomic swap of cached object.
     /// </summary>
-    public static (string? Hash, TimetableContract? Timetable, bool Changed) GetOrLoad(string path, string? lastHash)
+    public static (string? Hash, TimetableContract? Timetable, bool Changed, bool WasCacheHit) GetOrLoad(string path, string? lastHash)
     {
         if (!File.Exists(path))
-            return (null, null, false);
+            return (null, null, false, false);
 
-        var lastWriteUtc = File.GetLastWriteTimeUtc(path);
+        DateTime lastWriteUtc;
+        try
+        {
+            lastWriteUtc = File.GetLastWriteTimeUtc(path);
+        }
+        catch (IOException)
+        {
+            // File replaced or locked; retain previous if available
+            lock (_lock)
+            {
+                if (_cachedPath == path && _cachedTimetable != null)
+                    return (_cachedHash, _cachedTimetable, false, true);
+            }
+            return (null, null, false, false);
+        }
 
         lock (_lock)
         {
@@ -36,11 +51,23 @@ public static class TimetableCache
             {
                 // Cache hit: file unchanged since last read
                 var changed = lastHash is null || !string.Equals(_cachedHash, lastHash, StringComparison.OrdinalIgnoreCase);
-                return (_cachedHash, _cachedTimetable, changed);
+                return (_cachedHash, _cachedTimetable, changed, true);
             }
 
             // Cache miss: read, parse, content-hash (excludes as_of), store
-            var bytes = File.ReadAllBytes(path);
+            byte[] bytes;
+            try
+            {
+                bytes = File.ReadAllBytes(path);
+            }
+            catch (IOException)
+            {
+                // File in use (e.g. pipeline writing); retain previous snapshot, retry next interval
+                if (_cachedPath == path && _cachedTimetable != null)
+                    return (_cachedHash, _cachedTimetable, false, true);
+                return (null, null, false, false);
+            }
+
             TimetableContract? timetable;
             try
             {
@@ -48,19 +75,20 @@ public static class TimetableCache
             }
             catch
             {
+                // Partial/corrupt file; do not overwrite cache
                 var rawHash = Sha256Hex(bytes);
-                return (rawHash, null, true);
+                return (rawHash, null, true, false);
             }
             var hash = TimetableContentHasher.ComputeFromTimetable(timetable);
 
             _cachedPath = path;
             _cachedLastWriteUtc = lastWriteUtc;
             _cachedBytes = bytes;
-            _cachedHash = hash; // content hash (excludes as_of)
+            _cachedHash = hash;
             _cachedTimetable = timetable;
 
             var changedResult = lastHash is null || !string.Equals(hash, lastHash, StringComparison.OrdinalIgnoreCase);
-            return (hash, timetable, changedResult);
+            return (hash, timetable, changedResult, false);
         }
     }
 

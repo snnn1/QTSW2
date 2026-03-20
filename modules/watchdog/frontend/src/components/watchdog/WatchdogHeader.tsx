@@ -10,6 +10,8 @@ interface WatchdogHeaderProps {
   engineStatus: 'ALIVE' | 'STALLED' | 'FAIL_CLOSED' | 'RECOVERY_IN_PROGRESS' | 'IDLE_MARKET_CLOSED'
   marketOpen: boolean | null
   connectionStatus: string | null
+  /** LOST | RECOVERING | STABLE - when present, used for badge (disconnected / recovering / stable) */
+  derivedConnectionState?: 'LOST' | 'RECOVERING' | 'STABLE' | null
   dataFlowStatus: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'MARKET_CLOSED' | 'UNKNOWN'
   chicagoTime: string
   /** When provided, renders this instead of chicagoTime (isolates 1s clock updates) */
@@ -29,6 +31,7 @@ export function WatchdogHeader({
   engineStatus,
   marketOpen,
   connectionStatus,
+  derivedConnectionState,
   dataFlowStatus,
   chicagoTime,
   lastEngineTick,
@@ -84,8 +87,17 @@ export function WatchdogHeader({
     }
   }
   
-  // Get broker connection status badge
+  // Get broker connection status badge (prefer derived_connection_state when available)
   const getBrokerStatusBadge = () => {
+    if (derivedConnectionState === 'LOST') {
+      return <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">BROKER DISCONNECTED</span>
+    }
+    if (derivedConnectionState === 'RECOVERING') {
+      return <span className="px-3 py-1.5 bg-amber-500 text-black rounded-full font-semibold text-sm whitespace-nowrap" title="Recovering - not safe yet">BROKER RECOVERING</span>
+    }
+    if (derivedConnectionState === 'STABLE') {
+      return <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">BROKER CONNECTED</span>
+    }
     if (connectionStatus === null) {
       return <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">BROKER UNKNOWN</span>
     }
