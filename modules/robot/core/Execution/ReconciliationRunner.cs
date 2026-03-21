@@ -38,7 +38,7 @@ public sealed class ReconciliationRunner
     /// </summary>
     public void RunOnRealtimeStart(DateTimeOffset utcNow)
     {
-        RunInternal(utcNow);
+        RunInternal(utcNow, null);
     }
 
     /// <summary>
@@ -48,12 +48,31 @@ public sealed class ReconciliationRunner
     {
         if ((utcNow - _lastRunUtc).TotalSeconds < ThrottleIntervalSeconds)
             return;
-        RunInternal(utcNow);
+        RunInternal(utcNow, null);
     }
 
-    private void RunInternal(DateTimeOffset utcNow)
+    /// <summary>
+    /// Bypass periodic throttle (e.g. normal-mode full reconciliation).
+    /// </summary>
+    public void ForceRunNow(DateTimeOffset utcNow)
+    {
+        RunInternal(utcNow, null);
+    }
+
+    /// <summary>
+    /// P1.5-D: Instrument-scoped gate recovery — skips qty-mismatch freeze callbacks and destructive orphan journal closure for this instrument.
+    /// </summary>
+    public void ForceRunGateRecoveryForInstrument(DateTimeOffset utcNow, string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        RunInternal(utcNow, new ReconciliationRunOptions { GateRecoveryInstrument = instrument.Trim() });
+    }
+
+    private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
         _lastRunUtc = utcNow;
+        var gateInst = options?.GateRecoveryInstrument?.Trim();
+        var gateMode = !string.IsNullOrEmpty(gateInst);
 
         AccountSnapshot snap;
         try
@@ -96,6 +115,9 @@ public sealed class ReconciliationRunner
             var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
             if (journalQty != accountQty)
             {
+                if (gateMode && MatchesGateInstrument(inst, gateInst!))
+                    continue;
+
                 // Emit RECONCILIATION_CONTEXT before RECONCILIATION_QTY_MISMATCH for ops-grade diagnostics
                 var intentIds = new List<string>();
                 var lastFills = new List<object>();
@@ -122,6 +144,7 @@ public sealed class ReconciliationRunner
                     }
                 }
                 var taxonomy = journalQty > accountQty ? "journal_ahead" : (accountQty > journalQty ? "broker_ahead" : "unknown");
+                var openInstSummary = openByInstrument.ToDictionary(k => k.Key, v => v.Value.Sum(e => e.Entry.EntryFilledQuantityTotal));
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_CONTEXT", "ENGINE",
                     new
                     {
@@ -131,6 +154,8 @@ public sealed class ReconciliationRunner
                         intent_ids = intentIds,
                         last_fills = lastFills,
                         mismatch_taxonomy = taxonomy,
+                        journal_dir = _journal.JournalDirectory,
+                        open_instruments_qty = openInstSummary,
                         note = "Context for RECONCILIATION_QTY_MISMATCH"
                     }));
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_QTY_MISMATCH", "ENGINE",
@@ -140,6 +165,27 @@ public sealed class ReconciliationRunner
                         account_qty = accountQty,
                         journal_qty = journalQty,
                         note = "Partial protection is worse than none. Freeze instrument-level."
+                    }));
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "POSITION_DRIFT_DETECTED", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        broker_qty = accountQty,
+                        engine_qty = journalQty,
+                        journal_qty = journalQty,
+                        drift_class = journalQty > accountQty ? "journal_ahead" : "broker_ahead",
+                        intent_ids = intentIds,
+                        note = "Broker position and journal disagree."
+                    }));
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "EXPOSURE_INTEGRITY_VIOLATION", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        expected_position_from_intents = journalQty,
+                        broker_position = accountQty,
+                        drift_class = journalQty > accountQty ? "journal_ahead" : "broker_ahead",
+                        intent_ids = intentIds,
+                        note = "Total exposure must match system intent. Critical invariant violated."
                     }));
                 _onQuantityMismatch?.Invoke(inst, utcNow, $"QTY_MISMATCH:account={accountQty},journal={journalQty}");
             }
@@ -161,6 +207,9 @@ public sealed class ReconciliationRunner
             var entries = kvp.Value;
 
             if (entries.Count == 0) continue;
+
+            if (gateMode && MatchesGateInstrument(instrument, gateInst!))
+                continue;
 
             var brokerFlat = !instrumentsWithPosition.Contains(instrument);
             var hasWorkingOrders = workingOrders.Any(w =>
@@ -229,5 +278,19 @@ public sealed class ReconciliationRunner
             result[inst] = (accountQty, journalQty);
         }
         return result;
+    }
+
+    private static bool MatchesGateInstrument(string journalOrBrokerKey, string gateInstrument)
+    {
+        if (string.IsNullOrWhiteSpace(journalOrBrokerKey) || string.IsNullOrWhiteSpace(gateInstrument))
+            return false;
+        var k = journalOrBrokerKey.Trim();
+        var g = gateInstrument.Trim();
+        if (string.Equals(k, g, StringComparison.OrdinalIgnoreCase))
+            return true;
+        var gVariant = g.StartsWith("M", StringComparison.OrdinalIgnoreCase) && g.Length > 1 ? g : "M" + g;
+        var kVariant = k.StartsWith("M", StringComparison.OrdinalIgnoreCase) && k.Length > 1 ? k : "M" + k;
+        return string.Equals(k, gVariant, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(kVariant, g, StringComparison.OrdinalIgnoreCase);
     }
 }

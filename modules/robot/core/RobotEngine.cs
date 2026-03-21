@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -846,16 +847,22 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 log: _log,
                 eventWriter: _eventWriter);
 
-            // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
+            // Gap 4 + P1.5: modules/harness — same gate FSM; IEA/registry may be absent (evaluate uses journal fallback).
+            var stableWindowMsHarness = _executionMode == ExecutionMode.SIM
+                ? MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM
+                : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
             _mismatchCoordinator = new MismatchEscalationCoordinator(
                 getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
                 getActiveInstruments: () => Array.Empty<string>(),
-                getMismatchObservations: AssembleMismatchObservations,
+                getMismatchObservations: (snap, utcNow) => AssembleMismatchObservations(snap, utcNow),
                 isInstrumentBlocked: inst => _protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false,
                 isFlattenInProgress: _ => false,
                 isRecoveryInProgress: _ => false,
                 log: _log,
-                eventWriter: _eventWriter);
+                eventWriter: _eventWriter,
+                runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
+                evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
+                stateConsistencyStableWindowMs: stableWindowMsHarness);
 
             _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this,
                 isInstrumentFrozen: inst => (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false) || (_mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) ?? false));
@@ -4055,21 +4062,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// <summary>
     /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
     /// </summary>
-    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations()
+    private IReadOnlyList<MismatchObservation> AssembleMismatchObservations(AccountSnapshot snap, DateTimeOffset utcNow)
     {
         var list = new List<MismatchObservation>();
         if (_executionAdapter == null) return list;
-
-        var utcNow = DateTimeOffset.UtcNow;
-        AccountSnapshot snap;
-        try
-        {
-            snap = _executionAdapter.GetAccountSnapshot(utcNow);
-        }
-        catch
-        {
-            return list;
-        }
 
         if (snap?.Positions == null && snap?.WorkingOrders == null)
             return list;
@@ -4135,6 +4131,121 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         return list;
+    }
+
+    private static int CountBrokerWorkingOrders(AccountSnapshot? snap, string instrument)
+    {
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return 0;
+        var inst = instrument.Trim();
+        return snap.WorkingOrders.Count(w => string.Equals(w.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static int SumBrokerPositionQty(AccountSnapshot? snap, string instrument)
+    {
+        if (snap?.Positions == null || string.IsNullOrWhiteSpace(instrument)) return 0;
+        var inst = instrument.Trim();
+        var sum = 0;
+        foreach (var p in snap.Positions)
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            if (!string.Equals(p.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            sum += Math.Abs(p.Quantity);
+        }
+        return sum;
+    }
+
+    private StateConsistencyReleaseReadinessResult EvaluateStateConsistencyReleaseReadiness(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow)
+    {
+        var input = BuildStateConsistencyReleaseEvaluationInputHarness(instrument, snapshot, utcNow);
+        return StateConsistencyReleaseEvaluator.Evaluate(input);
+    }
+
+    /// <summary>Harness/modules: no IEA registry — journal-based working proxy when IEA disabled; fail-closed when IEA required but unavailable.</summary>
+    private StateConsistencyReleaseEvaluationInput BuildStateConsistencyReleaseEvaluationInputHarness(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        var input = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = inst,
+            SnapshotSufficient = snap != null,
+            UseInstrumentExecutionAuthority = false
+        };
+        if (snap == null) return input;
+
+        input.BrokerPositionQty = SumBrokerPositionQty(snap, inst);
+        input.BrokerWorkingCount = CountBrokerWorkingOrders(snap, inst);
+
+        var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
+        input.JournalOpenQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+
+        var openByInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var journalWorking = 0;
+        if (openByInst.TryGetValue(inst, out var e1)) journalWorking += e1.Count;
+        if (openByInst.TryGetValue(execVariant, out var e2)) journalWorking += e2.Count;
+
+        if (input.UseInstrumentExecutionAuthority)
+        {
+            input.IeaOwnedPlusAdoptedWorking = -1;
+            var ids = _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(inst, null);
+            foreach (var x in _executionJournal.GetAdoptionCandidateIntentIdsForInstrument(execVariant, null))
+                ids.Add(x);
+            input.PendingAdoptionCandidateCount = ids.Count;
+        }
+        else
+        {
+            input.IeaOwnedPlusAdoptedWorking = journalWorking;
+            input.PendingAdoptionCandidateCount = 0;
+        }
+
+        return input;
+    }
+
+    private GateReconciliationResult? RunInstrumentGateReconciliation(string instrument, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return null;
+        var inst = instrument.Trim();
+        var sw = Stopwatch.StartNew();
+        var result = new GateReconciliationResult
+        {
+            Instrument = inst,
+            Mode = ReconciliationRunMode.GateRecovery,
+            RunnerInvoked = false,
+            Reason = "harness_no_reconciliation_runner",
+            OutcomeStatus = ReconciliationOutcomeStatus.Partial
+        };
+        AccountSnapshot? snapAfter;
+        try
+        {
+            snapAfter = _executionAdapter?.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            sw.Stop();
+            result.DurationMs = sw.ElapsedMilliseconds;
+            result.OutcomeStatus = ReconciliationOutcomeStatus.NoDataOptional;
+            result.Reason = "snapshot_failed";
+            return result;
+        }
+
+        if (snapAfter == null)
+        {
+            sw.Stop();
+            result.DurationMs = sw.ElapsedMilliseconds;
+            result.OutcomeStatus = ReconciliationOutcomeStatus.NoDataOptional;
+            result.Reason = "null_snapshot";
+            return result;
+        }
+
+        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow);
+        result.ReleaseReadyAfter = readiness.ReleaseReady;
+        result.UnexplainedWorkingCountAfter = readiness.UnexplainedBrokerWorkingCount;
+        result.UnexplainedPositionQtyAfter = readiness.UnexplainedBrokerPositionQty;
+        result.BrokerWorkingCountBefore = result.BrokerWorkingCountAfter = CountBrokerWorkingOrders(snapAfter, inst);
+        result.IeaOwnedCountBefore = result.IeaOwnedCountAfter = readiness.ReleaseReady ? 0 : -1;
+        result.OutcomeStatus = readiness.ReleaseReady ? ReconciliationOutcomeStatus.Success : ReconciliationOutcomeStatus.Partial;
+        result.Reason = readiness.Summary;
+        sw.Stop();
+        result.DurationMs = sw.ElapsedMilliseconds;
+        return result;
     }
 
     /// <summary>

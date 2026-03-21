@@ -150,24 +150,28 @@ public static class HistoricalReplay
         }
     }
 
+    /// <summary>
+    /// Replay-only timetable file — never writes live <c>timetable_current.json</c> (single publisher: TimetableEngine).
+    /// </summary>
+    public static string ReplayCurrentTimetablePath(string projectRoot) =>
+        Path.Combine(projectRoot, "data", "timetable", "timetable_replay_current.json");
+
     public static void UpdateTimetableTradingDateIfReplay(string projectRoot, DateOnly tradingDate, TimeService timeService)
     {
-        // Check if replay timetable exists
         var replayTimetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_replay.json");
+        var replayCurrentPath = ReplayCurrentTimetablePath(projectRoot);
+        Directory.CreateDirectory(Path.GetDirectoryName(replayCurrentPath)!);
+
         if (!File.Exists(replayTimetablePath))
         {
-            // No replay timetable - use dynamic creation (backward compatibility)
-            var timetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_current.json");
-            CreateTimetableForDate(timetablePath, tradingDate, timeService);
+            CreateTimetableForDate(replayCurrentPath, tradingDate, timeService);
             return;
         }
 
-        // Update replay timetable trading_date for this date
         try
         {
             var timetable = TimetableContract.LoadFromFile(replayTimetablePath);
-            
-            // Create updated timetable with new trading_date
+
             var updatedTimetable = new
             {
                 as_of = timetable.as_of,
@@ -185,26 +189,18 @@ public static class HistoricalReplay
                 }).ToArray()
             };
 
-            // Write updated timetable to BOTH replay and current (engine watches current)
             var json = JsonSerializer.Serialize(updatedTimetable);
-            File.WriteAllText(replayTimetablePath, json);
-            
-            // Also update timetable_current.json so engine can see it
-            var currentTimetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_current.json");
-            File.WriteAllText(currentTimetablePath, json);
+            File.WriteAllText(replayCurrentPath, json);
         }
         catch
         {
-            // If replay timetable is invalid, fall back to dynamic creation
-            var timetablePath = Path.Combine(projectRoot, "data", "timetable", "timetable_current.json");
-            CreateTimetableForDate(timetablePath, tradingDate, timeService);
+            CreateTimetableForDate(replayCurrentPath, tradingDate, timeService);
         }
     }
 
     private static void CreateTimetableForDate(string timetablePath, DateOnly tradingDate, TimeService timeService)
     {
-        // This method is kept for backward compatibility when no replay timetable exists
-        // It creates a minimal timetable - should not be used when replay timetable is available
+        // Minimal timetable for harness replay only (written to timetable_replay_current.json).
         var utcNow = DateTimeOffset.UtcNow;
         var chicagoNow = timeService.GetChicagoNow(utcNow);
 

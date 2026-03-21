@@ -73,6 +73,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     // PHASE 2: Callback to stand down stream on protective order failure
     private Action<string, DateTimeOffset, string>? _standDownStreamCallback;
+
+    /// <summary>P2 Phase 1: true when state-consistency / mismatch gate blocks the instrument (prevents aggregation sibling cancel).</summary>
+    private Func<string, bool>? _instrumentMismatchGateEngaged;
+
+    /// <summary>P2 Phase 1: host stands down implicated streams after stream-scoped containment decision.</summary>
+    private Action<StateOwnershipAttributionResult, DateTimeOffset>? _p2StreamContainmentEngineCallback;
+
+    /// <summary>P2 Phase 1: set mismatch gate probe (invoked with NT instrument name or execution key).</summary>
+    public void SetInstrumentMismatchGateEngagedCallback(Func<string, bool>? callback) =>
+        _instrumentMismatchGateEngaged = callback;
+
+    /// <summary>P2 Phase 1: engine callback after IEA chooses stream containment (no instrument flatten).</summary>
+    public void SetP2StreamContainmentEngineCallback(Action<StateOwnershipAttributionResult, DateTimeOffset>? callback) =>
+        _p2StreamContainmentEngineCallback = callback;
     
     // PHASE 2: Callback to get notification service for alerts
     private Func<object?>? _getNotificationServiceCallback;
@@ -212,6 +226,27 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             if (_strategyThreadContextCount == 0)
                 _strategyThreadId = 0;
         }
+    }
+
+    /// <summary>
+    /// P2.6.7: Only ExecuteFlattenInstrument (NT command drain) may mint this token.
+    /// Blocks arbitrary bypass of FlattenIntentReal pre-submit destructive policy.
+    /// </summary>
+    public readonly struct NtDestructivePolicyAlreadyAppliedToken
+    {
+        internal NtDestructivePolicyAlreadyAppliedToken(string correlationId, string expectedInstrumentKey, string precheckPolicyReasonCode)
+        {
+            CorrelationId = correlationId ?? "";
+            ExpectedInstrumentKey = expectedInstrumentKey ?? "";
+            PrecheckPolicyReasonCode = precheckPolicyReasonCode ?? "";
+        }
+
+        public string CorrelationId { get; }
+        public string ExpectedInstrumentKey { get; }
+        public string PrecheckPolicyReasonCode { get; }
+
+        internal static NtDestructivePolicyAlreadyAppliedToken ForNtFlattenCommand(NtFlattenInstrumentCommand cmd, string precheckPolicyReasonCode) =>
+            new(cmd.CorrelationId, cmd.Instrument, precheckPolicyReasonCode);
     }
 
     /// <summary>
@@ -518,9 +553,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             _iea.SetEventWriter(_eventWriter);
             _iea.SetOnEnqueueFailureCallback(_blockInstrumentCallback);
             _iea.SetOnRecoveryRequestedCallback(OnRecoveryRequested);
-            _iea.SetOnRecoveryFlattenRequestedCallback(OnRecoveryFlattenRequested);
+            _iea.SetOnRecoveryFlattenRequestedCallback(OnRecoveryFlattenRequestedFromIeCallback);
             _iea.SetOnBootstrapSnapshotRequestedCallback(OnBootstrapSnapshotRequested);
             _iea.SetOnSupervisoryCriticalCallback(_onSupervisoryCriticalCallback);
+            _iea.SetAggregationSiblingCancelGuardCallback(key => _instrumentMismatchGateEngaged?.Invoke(key) == true);
+            _iea.SetOnP2StreamContainmentCallback((attr, now) => _p2StreamContainmentEngineCallback?.Invoke(attr, now));
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "IEA_BINDING", state: "ENGINE",
                 new
                 {
@@ -736,7 +773,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// </summary>
     public void TryRetryDeferredAdoptionScan()
     {
-        _iea?.TryRetryDeferredAdoptionScanIfDeferred();
+        if (_useInstrumentExecutionAuthority && !string.IsNullOrEmpty(_ieaAccountName))
+            InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(_ieaAccountName!, _log);
+        else
+            _iea?.TryRetryDeferredAdoptionScanIfDeferred();
     }
 
     /// <summary>
@@ -749,7 +789,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
-        _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow), out _);
+            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
+                DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL), out _);
         var lockObj = _iea?.EntrySubmissionLock;
         if (lockObj != null)
         {
@@ -1455,12 +1496,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // Notify coordinator of protective failure
         _coordinator?.OnProtectiveFailure(intentId, intent.Stream, utcNow);
 
-        // NT THREADING FIX: When IEA enabled, worker may call FailClosed. Enqueue NT actions for strategy thread.
-        if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
+        // P2.6.6: Any fail-closed flatten uses NtFlattenInstrumentCommand → policy (FAIL_CLOSED trigger), not Flatten→RequestFlatten.
+        if (_ntActionQueue != null)
         {
             var cid = $"FAILCLOSED:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
             _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, intentId, intent.Instrument, false, failureReason, utcNow), out _);
-            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid + ":F", intentId, intent.Instrument ?? "", failureReason, utcNow), out _);
+            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid + ":F", intentId, intent.Instrument ?? "", failureReason, utcNow,
+                DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED, allowAccountWideCancelFallback: false), out _);
             _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"{eventType}: {failureReason}");
             PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, FlattenResult.FailureResult("Enqueued for strategy thread", utcNow), utcNow);
             var notificationSvc = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -1476,8 +1518,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return;
         }
 
-        // Flatten position immediately with retry logic (strategy thread path)
-        var flattenResult = FlattenWithRetry(intentId, intent.Instrument, utcNow);
+        // P2.6.6: no Flatten→RequestFlatten chain; direct path still hits policy in FlattenIntentReal (FAIL_CLOSED).
+        var flattenResult = FlattenIntentReal(intentId, intent.Instrument ?? "", utcNow,
+            destructiveSourceOverride: DestructiveActionSource.FAIL_CLOSED,
+            explicitTriggerOverride: DestructiveTriggerReason.FAIL_CLOSED);
         
         // Stand down stream
         _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"{eventType}: {failureReason}");
@@ -2131,10 +2175,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         {
             if (_useInstrumentExecutionAuthority && _iea != null)
             {
-                var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == System.Threading.Thread.CurrentThread.ManagedThreadId;
-                if (inContext)
-                    return _iea.RequestFlatten(instrument, intentId, intentId, utcNow);
-                var cmd = new NtFlattenInstrumentCommand($"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", intentId, instrument, "FLATTEN_DELEGATED", utcNow);
+                // P2.6.6: never call RequestFlatten directly from adapter — single funnel via NtFlattenInstrumentCommand.
+                var cmd = new NtFlattenInstrumentCommand($"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", intentId, instrument, "FLATTEN_DELEGATED", utcNow,
+                    DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, allowAccountWideCancelFallback: false);
                 _ntActionQueue?.EnqueueNtAction(cmd, out _);
                 return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
             }
@@ -2245,7 +2288,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             throw new InvalidOperationException(error);
         }
 
-        CancelRobotOwnedWorkingOrdersReal(snap, utcNow);
+        CancelRobotOwnedWorkingOrdersReal(snap, utcNow, instrumentRootForScope: null, explicitBrokerOrderIds: null, allowAccountWideCancelFallback: false, correlationId: null);
     }
 
     public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)

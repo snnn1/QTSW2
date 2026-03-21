@@ -18,13 +18,13 @@ public static class MismatchEscalationTests
         var coordinator = new MismatchEscalationCoordinator(
             getSnapshot: () => emptySnap,
             getActiveInstruments: () => Array.Empty<string>(),
-            getMismatchObservations: () => Array.Empty<MismatchObservation>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
             isInstrumentBlocked: _ => false,
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null);
 
-        // 1. First mismatch creates DETECTED but does not block immediately
+        // 1. First mismatch creates DETECTED and engages state-consistency gate (immediate block)
         coordinator.ProcessObservationForTest(new MismatchObservation
         {
             Instrument = "ES",
@@ -39,8 +39,10 @@ public static class MismatchEscalationTests
             return (false, "State should exist after first mismatch");
         if (state.EscalationState != MismatchEscalationState.DETECTED)
             return (false, $"First mismatch: expected DETECTED, got {state.EscalationState}");
-        if (state.Blocked)
-            return (false, "First mismatch: should NOT block immediately (below persistent threshold)");
+        if (!state.Blocked)
+            return (false, "First mismatch: should block immediately via STATE_CONSISTENCY_GATE");
+        if (state.BlockReason != MismatchEscalationPolicy.BLOCK_REASON_STATE_CONSISTENCY_GATE)
+            return (false, $"First mismatch: expected block reason STATE_CONSISTENCY_GATE, got '{state.BlockReason}'");
 
         // 2. Mismatch persisting beyond persistent threshold transitions to PERSISTENT_MISMATCH and blocks instrument
         var t1 = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS + 100);
@@ -65,7 +67,7 @@ public static class MismatchEscalationTests
         var coord2 = new MismatchEscalationCoordinator(
             getSnapshot: () => emptySnap,
             getActiveInstruments: () => Array.Empty<string>(),
-            getMismatchObservations: () => Array.Empty<MismatchObservation>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
             isInstrumentBlocked: _ => false,
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
@@ -78,11 +80,11 @@ public static class MismatchEscalationTests
         if (state?.EscalationState != MismatchEscalationState.FAIL_CLOSED)
             return (false, $"After fail-closed threshold: expected FAIL_CLOSED, got {state?.EscalationState}");
 
-        // 4. Two consecutive clean passes clear DETECTED or PERSISTENT_MISMATCH state if not fail-closed
+        // 4. P1.5: clean signal absent does not clear gate (only stability release clears)
         var coord3 = new MismatchEscalationCoordinator(
             getSnapshot: () => emptySnap,
             getActiveInstruments: () => Array.Empty<string>(),
-            getMismatchObservations: () => Array.Empty<MismatchObservation>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
             isInstrumentBlocked: _ => false,
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
@@ -91,10 +93,10 @@ public static class MismatchEscalationTests
         coord3.ProcessCleanPassForTest("RTY", utcNow.AddSeconds(1));
         coord3.ProcessCleanPassForTest("RTY", utcNow.AddSeconds(2));
         state = coord3.GetStateForTest("RTY");
-        if (state?.EscalationState != MismatchEscalationState.NONE)
-            return (false, $"After 2 clean passes: expected NONE, got {state?.EscalationState}");
-        if (coord3.IsInstrumentBlockedByMismatch("RTY"))
-            return (false, "Should not be blocked after clear");
+        if (state?.EscalationState == MismatchEscalationState.NONE)
+            return (false, "After clean passes: P1.5 should not auto-clear to NONE without gate release");
+        if (!coord3.IsInstrumentBlockedByMismatch("RTY"))
+            return (false, "After clean passes: should remain blocked until stability release");
 
         // 5. FAIL_CLOSED remains blocked and does not auto-clear
         coord2.ProcessCleanPassForTest("NQ", t2.AddSeconds(1));
@@ -109,7 +111,7 @@ public static class MismatchEscalationTests
         var coord4 = new MismatchEscalationCoordinator(
             getSnapshot: () => emptySnap,
             getActiveInstruments: () => Array.Empty<string>(),
-            getMismatchObservations: () => Array.Empty<MismatchObservation>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
             isInstrumentBlocked: _ => false,
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
@@ -128,7 +130,7 @@ public static class MismatchEscalationTests
         var coord5 = new MismatchEscalationCoordinator(
             getSnapshot: () => emptySnap,
             getActiveInstruments: () => Array.Empty<string>(),
-            getMismatchObservations: () => Array.Empty<MismatchObservation>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
             isInstrumentBlocked: _ => false,
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
@@ -142,9 +144,9 @@ public static class MismatchEscalationTests
         if (!coordinator.IsInstrumentBlockedByMismatch("ES"))
             return (false, "Entry gating: mismatch-blocked instrument should be blocked");
 
-        // 10. Block reason returned is persistent mismatch reason
+        // 10. Block reason upgrades to persistent after threshold
         var reason = coordinator.GetBlockReason("ES");
-        if (string.IsNullOrEmpty(reason) || !reason.Contains("PERSISTENT") && !reason.Contains("RECONCILIATION"))
+        if (string.IsNullOrEmpty(reason) || (!reason.Contains("PERSISTENT") && !reason.Contains("RECONCILIATION")))
             return (false, $"Block reason: expected persistent mismatch reason, got '{reason}'");
 
         return (true, null);

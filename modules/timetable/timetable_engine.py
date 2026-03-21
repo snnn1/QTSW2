@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 import logging
 import sys
 import json
@@ -56,7 +56,8 @@ class TimetableEngine:
     
     def __init__(self, master_matrix_dir: str = "data/master_matrix",
                  analyzer_runs_dir: str = "data/analyzed",
-                 timetable_output_dir: Optional[str] = None):
+                 timetable_output_dir: Optional[str] = None,
+                 project_root: Optional[str] = None):
         """
         Initialize Timetable Engine.
         
@@ -64,10 +65,12 @@ class TimetableEngine:
             master_matrix_dir: Directory containing master matrix files
             analyzer_runs_dir: Directory containing analyzer output files (for RS calculation)
             timetable_output_dir: If set, write timetable to this dir as timetable_copy.json (not timetable_current.json)
+            project_root: Repo root for logs/timetable_publish.jsonl (default: infer from this file location)
         """
         self.master_matrix_dir = Path(master_matrix_dir)
         self.analyzer_runs_dir = Path(analyzer_runs_dir)
         self.timetable_output_dir = timetable_output_dir
+        self._project_root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parents[2]
         
         # Streams to process
         self.streams = [
@@ -558,7 +561,13 @@ class TimetableEngine:
             )
         if not streams:
             return
-        self._write_execution_timetable_file(streams, trade_date)
+        self._write_execution_timetable_file(
+            streams,
+            trade_date or "",
+            ledger_writer="matrix",
+            ledger_source="master_matrix",
+            execution_document_source="master_matrix",
+        )
 
     def build_timetable_dataframe_from_master_matrix(
         self,
@@ -1076,13 +1085,57 @@ class TimetableEngine:
             })
         return streams
 
-    def _write_execution_timetable_file(self, streams: List[Dict], trade_date: str) -> None:
+    def publish_execution_timetable_current(
+        self,
+        streams: List[Dict],
+        trade_date: str = "",
+        *,
+        execution_document_source: str = "master_matrix",
+        ledger_writer: str = "timetable_engine",
+        ledger_source: Optional[str] = None,
+        eligibility_overwrite: bool = False,
+    ) -> None:
+        """
+        **Single supported Python path** to publish live `data/timetable/timetable_current.json`.
+
+        Validates, atomic write, eligibility side-effect, publish ledger. Callers (dashboard, matrix, CLI)
+        must use this or `_write_execution_timetable_file` with the same contract — do not duplicate
+        json.dump/replace elsewhere for `timetable_current.json`.
+        """
+        if self.timetable_output_dir:
+            raise ValueError(
+                "publish_execution_timetable_current requires TimetableEngine without timetable_output_dir "
+                "(copy mode writes timetable_copy.json only)."
+            )
+        self._write_execution_timetable_file(
+            streams,
+            trade_date,
+            execution_document_source=execution_document_source,
+            ledger_writer=ledger_writer,
+            ledger_source=ledger_source,
+            eligibility_overwrite=eligibility_overwrite,
+        )
+
+    def _write_execution_timetable_file(
+        self,
+        streams: List[Dict],
+        trade_date: str,
+        *,
+        execution_document_source: str = "master_matrix",
+        ledger_writer: str = "timetable_engine",
+        ledger_source: Optional[str] = None,
+        eligibility_overwrite: bool = False,
+    ) -> None:
         """
         Internal method to write execution timetable file.
         
         Args:
             streams: List of stream dicts with stream, instrument, session, slot_time, enabled, block_reason (optional)
-            trade_date: Trading date (YYYY-MM-DD)
+            trade_date: Trading date (YYYY-MM-DD) — informational vs CME-computed trading_date in document
+            execution_document_source: JSON `source` field (e.g. master_matrix, dashboard_ui)
+            ledger_writer: logs/timetable_publish.jsonl `writer` field
+            ledger_source: ledger `source` field (defaults to execution_document_source)
+            eligibility_overwrite: If True, overwrite eligibility file when publishing (dashboard saves)
         """
         output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
         filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
@@ -1090,6 +1143,12 @@ class TimetableEngine:
         
         # Clean up old files (keep only the canonical file for this output dir)
         self._cleanup_old_timetable_files(output_dir, keep_filename=filename_base)
+
+        # Fail-closed: never write bad slot/instrument rows to timetable_current.json (robot consumes this file).
+        # Incident 2026-03-20: ES1/NG1 incorrectly received YM's S1 07:30 from matrix churn — reject at source.
+        from modules.timetable.timetable_write_guard import validate_streams_before_execution_write
+
+        validate_streams_before_execution_write(streams, session_time_slots=self.session_time_slots)
         
         # Get current timestamp in America/Chicago timezone
         chicago_tz = pytz.timezone("America/Chicago")
@@ -1151,7 +1210,7 @@ class TimetableEngine:
             'as_of': as_of,
             'trading_date': trading_date,  # Use computed value, not trade_date parameter
             'timezone': 'America/Chicago',
-            'source': 'master_matrix',
+            'source': execution_document_source,
             'streams': streams
         }
         
@@ -1169,6 +1228,29 @@ class TimetableEngine:
             
             logger.info(f"Execution timetable written: {final_file} ({len(streams)} streams)")
 
+            # Publish ledger (live timetable_current.json only)
+            if filename_base == "timetable_current":
+                try:
+                    from modules.timetable.timetable_content_hash import compute_content_hash_from_document
+                    from modules.timetable.timetable_publish_ledger import append_timetable_publish_ledger
+
+                    with open(final_file, "r", encoding="utf-8") as rf:
+                        written_doc = json.load(rf)
+                    content_hash = compute_content_hash_from_document(written_doc)
+                    append_timetable_publish_ledger(
+                        self._project_root,
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "hash": content_hash,
+                            "writer": ledger_writer,
+                            "source": ledger_source or execution_document_source,
+                            "streams_count": len(streams),
+                            "path": str(final_file.resolve()),
+                        },
+                    )
+                except Exception as e:
+                    logger.warning("TIMETABLE_PUBLISH_LEDGER_SKIP: %s", e)
+
             # Session Eligibility Freeze: write eligibility_<trading_date>.json (never overwrite)
             # Skip when all streams have no_rs_data — generate_timetable had no analyzer data;
             # eligibility builder (matrix-derived) will create correct file when triggered
@@ -1181,6 +1263,7 @@ class TimetableEngine:
                         trading_date=trading_date,
                         output_dir=str(output_dir),
                         source_matrix_hash=None,
+                        overwrite=eligibility_overwrite,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to write eligibility file: {e}")
@@ -1256,7 +1339,13 @@ class TimetableEngine:
             streams.append(stream_entry)
         
         # Write execution timetable file using shared method
-        self._write_execution_timetable_file(streams, trade_date)
+        self._write_execution_timetable_file(
+            streams,
+            trade_date,
+            ledger_writer="timetable_engine",
+            ledger_source="generate_timetable",
+            execution_document_source="master_matrix",
+        )
     
     def _cleanup_old_timetable_files(self, output_dir: Path, keep_filename: str = "timetable_current") -> None:
         """

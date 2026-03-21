@@ -135,7 +135,8 @@ public sealed partial class InstrumentExecutionAuthority
 
         var reason = string.IsNullOrEmpty(cmd.Reason) ? cmd.FlattenReason.ToString() : cmd.Reason;
         var correlationId = $"FLATTEN:{(string.IsNullOrEmpty(intentId) ? "CMD" : intentId)}:{cmd.TimestampUtc:yyyyMMddHHmmssfff}";
-        var ntCmd = new NtFlattenInstrumentCommand(correlationId, cmd.IntentId, instrument, reason, cmd.TimestampUtc);
+        var ntCmd = new NtFlattenInstrumentCommand(correlationId, cmd.IntentId, instrument, reason, cmd.TimestampUtc,
+            DestructiveActionSource.COMMAND, DestructiveTriggerReason.MANUAL);
         Executor.EnqueueNtAction(ntCmd);
 
         Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, intentId, instrument, "EXECUTION_COMMAND_COMPLETED",

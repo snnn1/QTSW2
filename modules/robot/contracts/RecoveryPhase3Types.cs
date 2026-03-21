@@ -121,3 +121,32 @@ public static class RecoveryReconstructor
         return ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE;
     }
 }
+
+/// <summary>Deterministic recovery action from reconstruction (shared by IEA and P2 guard).</summary>
+public enum RecoveryActionKind
+{
+    Resume,
+    Adopt,
+    Flatten,
+    Halt
+}
+
+/// <summary>Maps reconstruction classification to recovery action (single source of truth).</summary>
+public static class RecoveryPhase3DecisionRules
+{
+    public static RecoveryActionKind GetActionKind(ReconstructionClassification classification, ReconstructionResult result)
+    {
+        return classification switch
+        {
+            ReconstructionClassification.CLEAN => RecoveryActionKind.Resume,
+            ReconstructionClassification.ADOPTION_POSSIBLE => result.BrokerPositionQty != 0 ? RecoveryActionKind.Adopt : RecoveryActionKind.Resume,
+            ReconstructionClassification.POSITION_ONLY_MISMATCH => result.UnownedLiveOrderCount > 0 ? RecoveryActionKind.Flatten : RecoveryActionKind.Resume,
+            ReconstructionClassification.LIVE_ORDER_OWNERSHIP_MISMATCH => RecoveryActionKind.Flatten,
+            ReconstructionClassification.JOURNAL_BROKER_MISMATCH => RecoveryActionKind.Flatten,
+            ReconstructionClassification.TERMINALITY_MISMATCH => RecoveryActionKind.Flatten,
+            ReconstructionClassification.MANUAL_INTERVENTION_DETECTED => RecoveryActionKind.Flatten,
+            ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE => RecoveryActionKind.Halt,
+            _ => RecoveryActionKind.Halt
+        };
+    }
+}

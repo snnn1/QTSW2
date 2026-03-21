@@ -1503,6 +1503,29 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Strip NinjaTrader full contract name to root symbol (e.g. "MES 03-26" → "MES") for adoption matching.
+    /// </summary>
+    private static string NormalizeJournalInstrumentSymbol(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var s = raw.Trim();
+        var sp = s.IndexOf(' ');
+        if (sp > 0) s = s.Substring(0, sp);
+        return s;
+    }
+
+    /// <summary>True if journal entry instrument matches IEA execution key or canonical (ES vs MES, etc.).</summary>
+    private static bool JournalInstrumentMatchesExecutionKey(string? entryInstrument, string executionInstrument, string? canonicalInstrument)
+    {
+        var inst = NormalizeJournalInstrumentSymbol(string.IsNullOrWhiteSpace(entryInstrument) ? "UNKNOWN" : entryInstrument);
+        var exec = NormalizeJournalInstrumentSymbol(executionInstrument);
+        var canon = string.IsNullOrEmpty(canonicalInstrument) ? null : NormalizeJournalInstrumentSymbol(canonicalInstrument);
+        if (string.Equals(inst, exec, StringComparison.OrdinalIgnoreCase)) return true;
+        if (canon != null && string.Equals(inst, canon, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    /// <summary>
     /// Get intent IDs that are adoption candidates for restart recovery.
     /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
     /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
@@ -1542,9 +1565,7 @@ public sealed class ExecutionJournal
 
                 if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
 
-                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
-                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
-                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                if (!JournalInstrumentMatchesExecutionKey(entry.Instrument, executionInstrument, canonicalInstrument))
                     continue;
 
                 result.Add(intentId);
@@ -1585,9 +1606,7 @@ public sealed class ExecutionJournal
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                 }
                 if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
-                var inst = string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument.Trim();
-                if (!string.Equals(inst, executionInstrument, StringComparison.OrdinalIgnoreCase) &&
-                    (string.IsNullOrEmpty(canonicalInstrument) || !string.Equals(inst, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                if (!JournalInstrumentMatchesExecutionKey(entry.Instrument, executionInstrument, canonicalInstrument))
                     continue;
                 return (tradingDate, stream, entry);
             }

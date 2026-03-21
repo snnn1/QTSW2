@@ -24,6 +24,9 @@ public static class DelayedJournalVisibilityTests
         var (p3, e3) = TestNoUnownedBeforeSuccess();
         if (!p3) return (false, e3);
 
+        var (p4, e4) = TestManyRapidScansDoNotForceUnowned();
+        if (!p4) return (false, e4);
+
         return (true, null);
     }
 
@@ -35,7 +38,7 @@ public static class DelayedJournalVisibilityTests
     {
         // call 1-3 → empty, call 4 → valid candidates (1)
         var sequence = new[] { 0, 0, 0, 1 };
-        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000);
+        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000, graceSeconds: 20);
 
         if (results[0] != AdoptionDeferralAction.Defer)
             return (false, $"Scan 1: expected Defer, got {results[0]}");
@@ -57,7 +60,7 @@ public static class DelayedJournalVisibilityTests
     {
         // 5 scans at 5s each = 25s > 20s grace. All empty.
         var sequence = new[] { 0, 0, 0, 0, 0 };
-        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000);
+        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000, graceSeconds: 20);
 
         if (results[0] != AdoptionDeferralAction.Defer)
             return (false, $"Scan 1: expected Defer, got {results[0]}");
@@ -82,13 +85,33 @@ public static class DelayedJournalVisibilityTests
     private static (bool Pass, string? Error) TestNoUnownedBeforeSuccess()
     {
         var sequence = new[] { 0, 0, 0, 1 };
-        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000);
+        var results = AdoptionDeferralDecision.SimulateSequence(sequence, qtsw2WorkingCount: 1, msBetweenScans: 5000, graceSeconds: 20);
 
         foreach (var r in results)
         {
             if (r == AdoptionDeferralAction.GraceExpiredUnowned)
                 return (false, "Success path must never emit GraceExpiredUnowned (no UNOWNED before adoption)");
         }
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Regression: NT can deliver dozens of execution updates in &lt;1s. Defer must use wall clock only, not scan count.
+    /// </summary>
+    private static (bool Pass, string? Error) TestManyRapidScansDoNotForceUnowned()
+    {
+        const int graceSeconds = 30;
+        for (var i = 0; i < 50; i++)
+        {
+            var a = AdoptionDeferralDecision.Evaluate(0, 1, elapsedSinceFirstScanMs: 0, graceSeconds: graceSeconds);
+            if (a != AdoptionDeferralAction.Defer)
+                return (false, $"Scan {i + 1} with elapsed=0: expected Defer, got {a} (rapid updates must not exhaust deferral)");
+        }
+
+        var expired = AdoptionDeferralDecision.Evaluate(0, 1, elapsedSinceFirstScanMs: graceSeconds * 1000L + 1, graceSeconds: graceSeconds);
+        if (expired != AdoptionDeferralAction.GraceExpiredUnowned)
+            return (false, $"After grace+1ms: expected GraceExpiredUnowned, got {expired}");
+
         return (true, null);
     }
 }

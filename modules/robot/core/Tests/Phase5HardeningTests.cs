@@ -64,9 +64,10 @@ public static class Phase5HardeningTests
                     new { stream = "ES1", instrument = "MES", session = "S1", slot_time = "07:30", enabled = true }
                 }
             });
-            File.WriteAllText(Path.Combine(dataTimetable, "timetable_current.json"), timetableJson);
+            // Isolated filename — live timetable_current.json is published only via TimetableEngine (Python).
+            File.WriteAllText(Path.Combine(dataTimetable, "timetable_phase5_test.json"), timetableJson);
 
-            var timetablePath = Path.Combine(dataTimetable, "timetable_current.json");
+            var timetablePath = Path.Combine(dataTimetable, "timetable_phase5_test.json");
 
             // Test 1: Kill switch ENABLED -> IsExecutionAllowed false
             File.WriteAllText(Path.Combine(configsRobot, "kill_switch.json"),

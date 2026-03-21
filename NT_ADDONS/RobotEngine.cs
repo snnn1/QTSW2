@@ -167,7 +167,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var utcNow = DateTimeOffset.UtcNow;
             var tradingDate = _heartbeatTradingDateCache ?? "";
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
-            _executionAdapter?.TryRetryDeferredAdoptionScan();
+            if (_executionPolicy?.UseInstrumentExecutionAuthority == true && !string.IsNullOrEmpty(_accountName))
+                InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(_accountName!, _log);
+            else
+                _executionAdapter?.TryRetryDeferredAdoptionScan();
         }
         catch (Exception ex)
         {
@@ -1080,15 +1083,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log,
                 onQuantityMismatch: (instrument, now, reason) =>
                 {
-                    StandDownStreamsForInstrument(instrument, now, reason);
-                    _executionAdapter?.RequestRecoveryForInstrument(instrument, "RECONCILIATION_QTY_MISMATCH", new { reason }, now);
-                    _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason }, now);
-                    _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
+                    if (_executionPolicy?.UseInstrumentExecutionAuthority == true)
+                        HandleReconciliationQtyMismatchP2(instrument, now, reason);
+                    else
                     {
-                        { "instrument", instrument },
-                        { "reason", reason },
-                        { "note", "Push notification + instrument freeze" }
-                    });
+                        StandDownStreamsForInstrument(instrument, now, reason);
+                        _executionAdapter?.RequestRecoveryForInstrument(instrument, "RECONCILIATION_QTY_MISMATCH", new { reason }, now);
+                        _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason }, now);
+                        _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
+                        {
+                            { "instrument", instrument },
+                            { "reason", reason },
+                            { "note", "Push notification + instrument freeze" }
+                        });
+                    }
                 },
                 onReconciliationPassComplete: qtyByInstrument =>
                 {
@@ -1130,7 +1138,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 eventWriter: _eventWriter,
                 getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst));
 
-            // Gap 4: Mismatch escalation coordinator (blocks instruments on persistent broker/journal divergence)
+            // Gap 4 + P1.5: Mismatch escalation + closed-loop state-consistency gate
+            var stableWindowMsNt = _executionMode == ExecutionMode.SIM
+                ? MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM
+                : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
             _mismatchCoordinator = new MismatchEscalationCoordinator(
                 getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
                 getActiveInstruments: () => Array.Empty<string>(),
@@ -1139,7 +1150,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 isFlattenInProgress: _ => false,
                 isRecoveryInProgress: _ => false,
                 log: _log,
-                eventWriter: _eventWriter);
+                eventWriter: _eventWriter,
+                runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
+                evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
+                stateConsistencyStableWindowMs: stableWindowMsNt);
+
+            if (_executionAdapter is NinjaTraderSimAdapter simP2Nt)
+            {
+                simP2Nt.SetInstrumentMismatchGateEngagedCallback(inst =>
+                    _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
+                simP2Nt.SetP2StreamContainmentEngineCallback((attr, now) =>
+                {
+                    foreach (var streamId in attr.ImplicatedStreams)
+                    {
+                        if (!string.IsNullOrEmpty(streamId))
+                            StandDownSingleStreamForOwnershipAmbiguity(streamId, now, attr);
+                    }
+                });
+            }
 
             // Log execution mode and adapter
             var adapterType = _executionAdapter.GetType().Name;
@@ -4649,6 +4677,180 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>P2 Phase 1 (P2.1-C): stand down one stream for ownership ambiguity; siblings unaffected.</summary>
+    public void StandDownSingleStreamForOwnershipAmbiguity(string streamId, DateTimeOffset utcNow, StateOwnershipAttributionResult attribution)
+    {
+        if (string.IsNullOrEmpty(streamId)) return;
+        var gateEngaged = _mismatchCoordinator != null &&
+                          _mismatchCoordinator.IsInstrumentBlockedByMismatch(attribution.ExecutionInstrumentKey);
+        lock (_engineLock)
+        {
+            if (_streams.TryGetValue(streamId, out var stream))
+            {
+                stream.EnterRecoveryManage(utcNow, "P2_OWNERSHIP_AMBIGUITY");
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                    eventType: "STREAM_SCOPED_STAND_DOWN", state: "ENGINE",
+                    new
+                    {
+                        stream_id = streamId,
+                        execution_instrument_key = attribution.ExecutionInstrumentKey,
+                        implicated_streams = attribution.ImplicatedStreams,
+                        implicated_intent_ids = attribution.ImplicatedIntentIds,
+                        unattributed_order_ids = attribution.UnattributedBrokerOrderIds,
+                        recovery_scope = "StreamScoped",
+                        reason = "OWNERSHIP_AMBIGUITY_P2",
+                        gate_state = gateEngaged ? "engaged" : "not_engaged",
+                        sibling_streams_preserved = true,
+                        destructive_action_blocked = true
+                    }));
+            }
+        }
+    }
+
+    /// <summary>P2 Phase 1: per-stream open exposure from journals for reconciliation attribution.</summary>
+    private List<(string Stream, int OpenQty)> GetStreamOpenExposureForInstrument(string instrument)
+    {
+        var inst = (instrument ?? "").Trim();
+        var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+        var byStream = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in _executionJournal.GetOpenJournalEntriesByInstrument())
+        {
+            var jinst = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(jinst)) continue;
+            if (!string.Equals(jinst, inst, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(jinst, execVariant, StringComparison.OrdinalIgnoreCase))
+                continue;
+            foreach (var (_, stream, _, entry) in kvp.Value)
+            {
+                var qty = entry.EntryFilledQuantityTotal;
+                if (qty <= 0) continue;
+                var s = stream ?? "";
+                byStream.TryGetValue(s, out var q);
+                byStream[s] = q + qty;
+            }
+        }
+        return byStream.Select(k => (k.Key, k.Value)).ToList();
+    }
+
+    /// <summary>P2 Phase 1: reconciliation qty mismatch — stream scope when attributable to one stream.</summary>
+    private void HandleReconciliationQtyMismatchP2(string instrument, DateTimeOffset utcNow, string reason)
+    {
+        var inst = (instrument ?? "").Trim();
+        var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+        AccountSnapshot? snap = null;
+        try
+        {
+            snap = _executionAdapter?.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            snap = null;
+        }
+        var accountQty = 0;
+        if (snap?.Positions != null)
+        {
+            foreach (var p in snap.Positions)
+            {
+                if (p.Quantity == 0 || string.IsNullOrWhiteSpace(p.Instrument)) continue;
+                var pinst = p.Instrument.Trim();
+                if (!string.Equals(pinst, inst, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(pinst, execVariant, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                accountQty += Math.Abs(p.Quantity);
+            }
+        }
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+        var streamRows = GetStreamOpenExposureForInstrument(inst);
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, _executionInstrument);
+        if (string.IsNullOrEmpty(execKey)) execKey = inst.ToUpperInvariant();
+        var attribution = RecoveryOwnershipAttributionEvaluator.EvaluateReconciliationQuantityMismatch(
+            execKey, accountQty, journalQty, streamRows);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+            eventType: "RECOVERY_SCOPE_CLASSIFIED", state: "ENGINE",
+            new
+            {
+                instrument = inst,
+                execution_instrument_key = execKey,
+                context = "RECONCILIATION_QTY_MISMATCH",
+                attributable_scope = attribution.AttributableScope.ToString(),
+                implicated_streams = attribution.ImplicatedStreams,
+                account_qty = accountQty,
+                journal_qty = journalQty
+            }));
+        var freezeAll = RecoveryOwnershipAttributionEvaluator.CanEscalateReconciliationToInstrumentFreeze(attribution, accountQty, journalQty);
+        if (freezeAll)
+        {
+            var reconPol = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(new DestructiveActionPolicyInput
+            {
+                Source = DestructiveActionSource.RECONCILIATION,
+                ReconciliationInstrumentRecoveryRequested = true,
+                ReconciliationAttribution = attribution,
+                BrokerPositionQty = accountQty,
+                JournalOpenQtySum = journalQty,
+                ExecutionInstrumentKey = execKey,
+                ReconstructionActionKind = RecoveryActionKind.Flatten
+            });
+            if (!reconPol.AllowInstrumentScope)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                    eventType: "RECONCILIATION_INSTRUMENT_RECOVERY_POLICY_DENIED", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        execution_instrument_key = execKey,
+                        policy_reason = reconPol.ReasonCode,
+                        policy_path = reconPol.PolicyPath,
+                        note = "P2.6: reconciliation freeze path blocked by destructive policy — falling back to stream stand-down only"
+                    }));
+                foreach (var streamId in attribution.ImplicatedStreams)
+                {
+                    if (!string.IsNullOrEmpty(streamId))
+                        StandDownSingleStreamForOwnershipAmbiguity(streamId, utcNow, attribution);
+                }
+                _executionAdapter?.RequestSupervisoryActionForInstrument(inst, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason, scope = "stream_policy_denied" }, utcNow);
+                return;
+            }
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                eventType: "DESTRUCTIVE_ACTION_EXECUTED", state: "ENGINE",
+                new
+                {
+                    execution_instrument_key = execKey,
+                    trigger_source = DestructiveActionSource.RECONCILIATION.ToString(),
+                    reason_code = reconPol.ReasonCode,
+                    policy_path = reconPol.PolicyPath,
+                    context = "RECONCILIATION_QTY_MISMATCH_INSTRUMENT_RECOVERY",
+                    account_qty = accountQty,
+                    journal_qty = journalQty
+                }));
+            StandDownStreamsForInstrument(inst, utcNow, reason);
+            _executionAdapter?.RequestRecoveryForInstrument(inst, "RECONCILIATION_QTY_MISMATCH", new { reason }, utcNow);
+            _executionAdapter?.RequestSupervisoryActionForInstrument(inst, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason }, utcNow);
+            _healthMonitor?.ReportCritical("RECONCILIATION_QTY_MISMATCH", new Dictionary<string, object>
+            {
+                { "instrument", inst },
+                { "reason", reason },
+                { "note", "P2: instrument-wide freeze — attribution required broader scope" }
+            });
+            return;
+        }
+        foreach (var streamId in attribution.ImplicatedStreams)
+        {
+            if (!string.IsNullOrEmpty(streamId))
+                StandDownSingleStreamForOwnershipAmbiguity(streamId, utcNow, attribution);
+        }
+        _executionAdapter?.RequestSupervisoryActionForInstrument(inst, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason, scope = "stream" }, utcNow);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+            eventType: "INSTRUMENT_SCOPED_RECOVERY_BLOCKED_BY_ATTRIBUTION", state: "ENGINE",
+            new
+            {
+                instrument = inst,
+                context = "RECONCILIATION_QTY_MISMATCH",
+                summary = attribution.Summary,
+                sibling_streams_preserved = true,
+                note = "P2: single-stream journal attribution — no full instrument freeze"
+            }));
+    }
+
     /// <summary>
     /// Phase 5: Check if instrument is frozen (reconciliation/risk latch) or supervisorily blocked.
     /// Used by RiskGate to block execution.
@@ -4899,6 +5101,162 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         return list;
+    }
+
+    private static int CountBrokerWorkingOrders(AccountSnapshot? snap, string instrument)
+    {
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return 0;
+        var inst = instrument.Trim();
+        return snap.WorkingOrders.Count(w => string.Equals(w.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static int SumBrokerPositionQty(AccountSnapshot? snap, string instrument)
+    {
+        if (snap?.Positions == null || string.IsNullOrWhiteSpace(instrument)) return 0;
+        var inst = instrument.Trim();
+        var sum = 0;
+        foreach (var p in snap.Positions)
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            if (!string.Equals(p.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            sum += Math.Abs(p.Quantity);
+        }
+        return sum;
+    }
+
+    private StateConsistencyReleaseReadinessResult EvaluateStateConsistencyReleaseReadiness(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow)
+    {
+        var input = BuildStateConsistencyReleaseEvaluationInput(instrument, snapshot, utcNow);
+        return StateConsistencyReleaseEvaluator.Evaluate(input);
+    }
+
+    private StateConsistencyReleaseEvaluationInput BuildStateConsistencyReleaseEvaluationInput(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        var input = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = inst,
+            SnapshotSufficient = snap != null,
+            UseInstrumentExecutionAuthority = _executionPolicy?.UseInstrumentExecutionAuthority ?? false
+        };
+        if (snap == null) return input;
+
+        input.BrokerPositionQty = SumBrokerPositionQty(snap, inst);
+        input.BrokerWorkingCount = CountBrokerWorkingOrders(snap, inst);
+
+        var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
+        input.JournalOpenQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+
+        var useIea = input.UseInstrumentExecutionAuthority;
+        var account = _accountName ?? "";
+        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var iea))
+        {
+            input.IeaOwnedPlusAdoptedWorking = iea.GetOwnedPlusAdoptedWorkingCount();
+            input.PendingAdoptionCandidateCount = iea.Executor?.GetAdoptionCandidateIntentIds(iea.ExecutionInstrumentKey).Count ?? 0;
+        }
+        else
+            input.IeaOwnedPlusAdoptedWorking = useIea ? -1 : 0;
+
+        return input;
+    }
+
+    private GateReconciliationResult? RunInstrumentGateReconciliation(string instrument, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter == null || string.IsNullOrWhiteSpace(instrument)) return null;
+        var inst = instrument.Trim();
+        var sw = Stopwatch.StartNew();
+        var result = new GateReconciliationResult
+        {
+            Instrument = inst,
+            Mode = ReconciliationRunMode.GateRecovery,
+            RunnerInvoked = _reconciliationRunner != null
+        };
+
+        AccountSnapshot? snapBefore;
+        try
+        {
+            snapBefore = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            sw.Stop();
+            result.DurationMs = sw.ElapsedMilliseconds;
+            result.OutcomeStatus = ReconciliationOutcomeStatus.NoDataOptional;
+            result.Reason = "snapshot_before_failed";
+            return result;
+        }
+
+        result.BrokerWorkingCountBefore = CountBrokerWorkingOrders(snapBefore, inst);
+
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaBeforeProbe))
+        {
+            result.IeaOwnedCountBefore = ieaBeforeProbe.GetOwnedPlusAdoptedWorkingCount();
+            result.AdoptionCandidateCountBefore = ieaBeforeProbe.Executor?.GetAdoptionCandidateIntentIds(ieaBeforeProbe.ExecutionInstrumentKey).Count ?? 0;
+        }
+        else
+        {
+            result.IeaOwnedCountBefore = useIea ? -1 : 0;
+            result.AdoptionCandidateCountBefore = 0;
+        }
+
+        _reconciliationRunner?.ForceRunGateRecoveryForInstrument(utcNow, inst);
+
+        if (InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaRecover))
+        {
+            try
+            {
+                ieaRecover.TryRecoveryAdoption();
+            }
+            catch
+            {
+                // Adoption is best-effort during gate recovery
+            }
+        }
+
+        AccountSnapshot? snapAfter;
+        try
+        {
+            snapAfter = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            sw.Stop();
+            result.DurationMs = sw.ElapsedMilliseconds;
+            result.OutcomeStatus = ReconciliationOutcomeStatus.NoDataOptional;
+            result.Reason = "snapshot_after_failed";
+            return result;
+        }
+
+        result.BrokerWorkingCountAfter = CountBrokerWorkingOrders(snapAfter, inst);
+        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaAfterProbe))
+        {
+            result.IeaOwnedCountAfter = ieaAfterProbe.GetOwnedPlusAdoptedWorkingCount();
+            result.AdoptionCandidateCountAfter = ieaAfterProbe.Executor?.GetAdoptionCandidateIntentIds(ieaAfterProbe.ExecutionInstrumentKey).Count ?? 0;
+        }
+        else
+        {
+            result.IeaOwnedCountAfter = useIea ? -1 : 0;
+            result.AdoptionCandidateCountAfter = 0;
+        }
+
+        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow);
+        result.ReleaseReadyAfter = readiness.ReleaseReady;
+        result.UnexplainedWorkingCountAfter = readiness.UnexplainedBrokerWorkingCount;
+        result.UnexplainedPositionQtyAfter = readiness.UnexplainedBrokerPositionQty;
+
+        result.OutcomeStatus = readiness.ReleaseReady
+            ? ReconciliationOutcomeStatus.Success
+            : (result.BrokerWorkingCountAfter != result.BrokerWorkingCountBefore ||
+               result.IeaOwnedCountAfter != result.IeaOwnedCountBefore ||
+               result.AdoptionCandidateCountAfter != result.AdoptionCandidateCountBefore
+                ? ReconciliationOutcomeStatus.Partial
+                : ReconciliationOutcomeStatus.Failed);
+
+        result.Reason = readiness.Summary;
+        sw.Stop();
+        result.DurationMs = sw.ElapsedMilliseconds;
+        return result;
     }
 
     /// <summary>

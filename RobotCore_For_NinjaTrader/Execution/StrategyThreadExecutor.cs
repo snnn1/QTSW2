@@ -114,6 +114,7 @@ public sealed class NtCancelOrdersCommand : INtAction
 
 /// <summary>
 /// Command: flatten instrument position.
+/// P2.6: carries destructive policy metadata so ExecuteFlattenInstrument can enforce a single policy surface + cancel scope.
 /// </summary>
 public sealed class NtFlattenInstrumentCommand : INtAction
 {
@@ -124,13 +125,29 @@ public sealed class NtFlattenInstrumentCommand : INtAction
     public string Reason { get; }
     public string Instrument { get; }
     public DateTimeOffset UtcNow { get; }
+    public DestructiveActionSource DestructiveSource { get; }
+    public DestructiveTriggerReason? ExplicitPolicyTrigger { get; }
+    public bool AllowAccountWideCancelFallback { get; }
+    public bool HasRecoveryPolicySeal { get; }
+    public bool RecoveryPolicySealAllowInstrument { get; }
+    public string? RecoveryPolicySealCode { get; }
+    public string? RecoveryPolicySealAttributionScope { get; }
+    public IReadOnlyList<string>? ExplicitCancelBrokerOrderIds { get; }
 
     public NtFlattenInstrumentCommand(
         string correlationId,
         string? intentId,
         string instrument,
         string reason,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        DestructiveActionSource destructiveSource = DestructiveActionSource.RECOVERY,
+        DestructiveTriggerReason? explicitPolicyTrigger = null,
+        bool allowAccountWideCancelFallback = false,
+        bool hasRecoveryPolicySeal = false,
+        bool recoveryPolicySealAllowInstrument = false,
+        string? recoveryPolicySealCode = null,
+        string? recoveryPolicySealAttributionScope = null,
+        IReadOnlyList<string>? explicitCancelBrokerOrderIds = null)
     {
         CorrelationId = correlationId;
         IntentId = intentId;
@@ -138,6 +155,14 @@ public sealed class NtFlattenInstrumentCommand : INtAction
         Instrument = instrument;
         Reason = reason;
         UtcNow = utcNow;
+        DestructiveSource = destructiveSource;
+        ExplicitPolicyTrigger = explicitPolicyTrigger;
+        AllowAccountWideCancelFallback = allowAccountWideCancelFallback;
+        HasRecoveryPolicySeal = hasRecoveryPolicySeal;
+        RecoveryPolicySealAllowInstrument = recoveryPolicySealAllowInstrument;
+        RecoveryPolicySealCode = recoveryPolicySealCode;
+        RecoveryPolicySealAttributionScope = recoveryPolicySealAttributionScope;
+        ExplicitCancelBrokerOrderIds = explicitCancelBrokerOrderIds;
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteFlattenInstrument(this);

@@ -38,7 +38,7 @@ public sealed class ReconciliationRunner
     /// </summary>
     public void RunOnRealtimeStart(DateTimeOffset utcNow)
     {
-        RunInternal(utcNow);
+        RunInternal(utcNow, null);
     }
 
     /// <summary>
@@ -48,12 +48,31 @@ public sealed class ReconciliationRunner
     {
         if ((utcNow - _lastRunUtc).TotalSeconds < ThrottleIntervalSeconds)
             return;
-        RunInternal(utcNow);
+        RunInternal(utcNow, null);
     }
 
-    private void RunInternal(DateTimeOffset utcNow)
+    /// <summary>
+    /// Bypass periodic throttle (e.g. normal-mode full reconciliation).
+    /// </summary>
+    public void ForceRunNow(DateTimeOffset utcNow)
+    {
+        RunInternal(utcNow, null);
+    }
+
+    /// <summary>
+    /// P1.5-D: Instrument-scoped gate recovery — skips qty-mismatch freeze callbacks and destructive orphan journal closure for this instrument.
+    /// </summary>
+    public void ForceRunGateRecoveryForInstrument(DateTimeOffset utcNow, string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        RunInternal(utcNow, new ReconciliationRunOptions { GateRecoveryInstrument = instrument.Trim() });
+    }
+
+    private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
         _lastRunUtc = utcNow;
+        var gateInst = options?.GateRecoveryInstrument?.Trim();
+        var gateMode = !string.IsNullOrEmpty(gateInst);
 
         AccountSnapshot snap;
         try
@@ -96,6 +115,9 @@ public sealed class ReconciliationRunner
             var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
             if (journalQty != accountQty)
             {
+                if (gateMode && MatchesGateInstrument(inst, gateInst!))
+                    continue;
+
                 // Emit RECONCILIATION_CONTEXT before RECONCILIATION_QTY_MISMATCH for ops-grade diagnostics
                 var intentIds = new List<string>();
                 var lastFills = new List<object>();
@@ -186,6 +208,9 @@ public sealed class ReconciliationRunner
 
             if (entries.Count == 0) continue;
 
+            if (gateMode && MatchesGateInstrument(instrument, gateInst!))
+                continue;
+
             var brokerFlat = !instrumentsWithPosition.Contains(instrument);
             var hasWorkingOrders = workingOrders.Any(w =>
                 string.Equals(w.Instrument?.Trim(), instrument, StringComparison.OrdinalIgnoreCase));
@@ -253,5 +278,19 @@ public sealed class ReconciliationRunner
             result[inst] = (accountQty, journalQty);
         }
         return result;
+    }
+
+    private static bool MatchesGateInstrument(string journalOrBrokerKey, string gateInstrument)
+    {
+        if (string.IsNullOrWhiteSpace(journalOrBrokerKey) || string.IsNullOrWhiteSpace(gateInstrument))
+            return false;
+        var k = journalOrBrokerKey.Trim();
+        var g = gateInstrument.Trim();
+        if (string.Equals(k, g, StringComparison.OrdinalIgnoreCase))
+            return true;
+        var gVariant = g.StartsWith("M", StringComparison.OrdinalIgnoreCase) && g.Length > 1 ? g : "M" + g;
+        var kVariant = k.StartsWith("M", StringComparison.OrdinalIgnoreCase) && k.Length > 1 ? k : "M" + k;
+        return string.Equals(k, gVariant, StringComparison.OrdinalIgnoreCase)
+               || string.Equals(kVariant, g, StringComparison.OrdinalIgnoreCase);
     }
 }

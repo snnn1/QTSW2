@@ -6,7 +6,8 @@
     "rule": "Analyzer execution change -> update this spec -> update robot",
     "notes": [
       "This spec is the canonical parity contract.",
-      "Do not change Robot semantics without an Analyzer change first."
+      "Do not change Robot semantics without an Analyzer change first.",
+      "breakout.initial_submission_freshness_minutes: max minutes after SlotTimeUtc for first bracket submit (default 3 in robot if omitted). Set to 0 to disable NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION from delay-from-slot only."
     ]
   },
   "stream_mapping": {
@@ -31,6 +32,8 @@
     "rule": "If breakout occurs after market_close_time, treat as NoTrade (no entry). Reentry after forced flatten at market_reopen_time."
   },
   "breakout": {
+    "initial_submission_freshness_minutes": 3,
+    "initial_submission_price_sanity_ticks": 10,
     "offset_ticks": 1,
     "formula": {
       "brk_long": "range_high + tick_size",
@@ -90,8 +93,8 @@
     "ES": { "tick_size": 0.25, "base_target": 10.0, "is_micro": false, "base_instrument": "ES", "scaling_factor": 1.0 },
     "NQ": { "tick_size": 0.25, "base_target": 50.0, "is_micro": false, "base_instrument": "NQ", "scaling_factor": 1.0 },
     "YM": { "tick_size": 1.0, "base_target": 100.0, "is_micro": false, "base_instrument": "YM", "scaling_factor": 1.0 },
-    "CL": { "tick_size": 0.01, "base_target": 0.5, "is_micro": false, "base_instrument": "CL", "scaling_factor": 1.0 },
-    "NG": { "tick_size": 0.001, "base_target": 0.05, "is_micro": false, "base_instrument": "NG", "scaling_factor": 1.0 },
+    "CL": { "tick_size": 0.01, "base_target": 0.5, "is_micro": false, "base_instrument": "CL", "scaling_factor": 1.0, "breakout_validity_tolerance_ticks": 4 },
+    "NG": { "tick_size": 0.001, "base_target": 0.05, "is_micro": false, "base_instrument": "NG", "scaling_factor": 1.0, "breakout_validity_tolerance_ticks": 7 },
     "GC": { "tick_size": 0.1, "base_target": 5.0, "is_micro": false, "base_instrument": "GC", "scaling_factor": 1.0 },
     "RTY": { "tick_size": 0.1, "base_target": 10.0, "is_micro": false, "base_instrument": "RTY", "scaling_factor": 1.0 },
     "MES": { "tick_size": 0.25, "base_target": 10.0, "is_micro": true, "base_instrument": "ES", "scaling_factor": 0.1 },

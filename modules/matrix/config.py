@@ -13,6 +13,12 @@ SLOT_ENDS = {
     "S2": ["09:30", "10:00", "10:30", "11:00"],
 }
 
+# --- Timetable write guard (incident 2026-03-20) ---
+# S1 @ 07:30 is the designated "early" slot (used by YM in production). ES/NG/NQ/etc. must not receive it:
+# that pattern indicates a matrix row merge / export bug, not a valid strategy choice.
+S1_EARLY_OPEN_SLOT_TIME = "07:30"
+S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT = frozenset({"YM"})
+
 # Rolling window size for time slot history
 ROLLING_WINDOW_SIZE = 13
 
@@ -45,5 +51,6 @@ SAVE_JSON_ON_BUILD = _save_json_env in ("1", "true", "yes", "on") if _save_json_
 
 __all__ = ['SLOT_ENDS', 'ROLLING_WINDOW_SIZE', 'DOM_BLOCKED_DAYS', 'SCF_THRESHOLD', 
            'MATRIX_REPROCESS_TRADING_DAYS', 'MATRIX_CHECKPOINT_FREQUENCY', 'ALLOW_INVALID_DATES_SALVAGE',
-           'CRITICAL_STREAMS', 'SAVE_JSON_ON_BUILD']
+           'CRITICAL_STREAMS', 'SAVE_JSON_ON_BUILD',
+           'S1_EARLY_OPEN_SLOT_TIME', 'S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT']
 

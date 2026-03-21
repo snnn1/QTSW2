@@ -65,6 +65,12 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Gap 5: Callback when instrument is blocked (notify engine to stand down streams, freeze instrument).</summary>
     private Action<string, DateTimeOffset, string>? _onEnqueueFailureCallback;
 
+    /// <summary>P2 Phase 1: optional gate check (e.g. mismatch coordinator) — blocks aggregation-driven sibling cancels when true.</summary>
+    private Func<string, bool>? _aggregationSiblingCancelGuard;
+
+    internal void SetAggregationSiblingCancelGuardCallback(Func<string, bool>? callback) =>
+        _aggregationSiblingCancelGuard = callback;
+
     /// <summary>Gap 5: Set callback for EnqueueAndWait failure. Called by adapter when binding IEA.</summary>
     internal void SetOnEnqueueFailureCallback(Action<string, DateTimeOffset, string>? callback)
     {

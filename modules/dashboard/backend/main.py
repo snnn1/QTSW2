@@ -798,7 +798,8 @@ async def generate_timetable(request: TimetableRequest):
         
         engine = TimetableEngine(
             master_matrix_dir="data/master_matrix",
-            analyzer_runs_dir=request.analyzer_runs_dir
+            analyzer_runs_dir=request.analyzer_runs_dir,
+            project_root=str(QTSW2_ROOT),
         )
         engine.scf_threshold = request.scf_threshold
         
@@ -858,18 +859,21 @@ async def generate_timetable(request: TimetableRequest):
 
 @app.post("/api/timetable/execution")
 async def save_execution_timetable(request: ExecutionTimetableRequest):
-    """Save execution timetable file from UI-calculated timetable."""
+    """Publish execution timetable via TimetableEngine only (single writer to timetable_current.json)."""
     try:
-        import json
-        import pytz
-        from pathlib import Path
-        
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.timetable.timetable_engine import TimetableEngine
+
         output_dir = QTSW2_ROOT / "data" / "timetable"
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Clean up old timetable files only (never delete eligibility_*.json — robot fails closed without them)
+
         for file_path in output_dir.iterdir():
-            if file_path.name in ("timetable_current.json", "timetable_current.tmp"):
+            if file_path.name in (
+                "timetable_current.json",
+                "timetable_current.tmp",
+                "timetable_replay_current.json",
+                "timetable_replay_current.tmp",
+            ):
                 continue
             if file_path.name.startswith("eligibility_"):
                 continue
@@ -877,111 +881,50 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                 file_path.unlink()
             except Exception:
                 pass
-        
-        # Get current timestamp in America/Chicago timezone
-        chicago_tz = pytz.timezone("America/Chicago")
-        chicago_now = datetime.now(chicago_tz)
-        as_of = chicago_now.isoformat()
-        
-        # Compute trading_date using CME rollover rule (17:00 Chicago)
-        # If Chicago time < 17:00: trading_date = Chicago calendar date
-        # If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
-        chicago_date = chicago_now.date()
-        chicago_hour = chicago_now.hour
-        
-        # Rollover at 17:00 Chicago time
-        if chicago_hour >= 17:
-            from datetime import timedelta
-            trading_date = (chicago_date + timedelta(days=1)).isoformat()
-            rollover_applied = True
-        else:
-            trading_date = chicago_date.isoformat()
-            rollover_applied = False
-        
-        # Log CME trading date computation for verification
-        logging.info(
-            f"CME_TRADING_DATE_ROLLOVER: "
-            f"Chicago time={chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
-            f"hour={chicago_hour}, "
-            f"calendar_date={chicago_date.isoformat()}, "
-            f"computed_trading_date={trading_date}, "
-            f"rollover_applied={rollover_applied}"
-        )
-        
-        # Validation: Flag violations
-        if chicago_hour >= 17 and trading_date == chicago_date.isoformat():
-            logging.warning(
-                f"CME_TRADING_DATE_VALIDATION_FAILED: "
-                f"as_of={as_of} (>= 17:00) but trading_date={trading_date} "
-                f"equals calendar date {chicago_date.isoformat()}"
+
+        streams_payload = [
+            (s.model_dump() if hasattr(s, "model_dump") else s.dict()) for s in request.streams
+        ]
+
+        def _publish_sync():
+            engine = TimetableEngine(
+                master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+                analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+                project_root=str(QTSW2_ROOT),
             )
-        
-        # Optional: Log if request.trading_date differs
-        if request.trading_date != trading_date:
-            logging.info(
-                f"CME_TRADING_DATE_COMPUTED: "
-                f"request.trading_date={request.trading_date}, computed trading_date={trading_date}"
+            engine.publish_execution_timetable_current(
+                streams_payload,
+                request.trading_date,
+                execution_document_source="dashboard_ui",
+                ledger_writer="dashboard",
+                ledger_source="ui",
+                eligibility_overwrite=True,
             )
-        
-        # Build execution timetable document
-        execution_timetable = {
-            'as_of': as_of,
-            'trading_date': trading_date,  # Use computed value
-            'timezone': 'America/Chicago',
-            'source': 'master_matrix',
-            'streams': [s.dict() for s in request.streams]
-        }
-        
-        # Atomic write: write to temp file, then rename
-        temp_file = output_dir / "timetable_current.tmp"
-        final_file = output_dir / "timetable_current.json"
-        
+
         try:
-            # Write to temporary file
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(execution_timetable, f, indent=2, ensure_ascii=False)
-            
-            # Atomic rename
-            temp_file.replace(final_file)
+            await asyncio.to_thread(_publish_sync)
+        except ValueError as e:
+            logging.error("TIMETABLE_EXECUTION_SAVE_REJECTED: %s", e)
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
-            # Write eligibility from timetable (source of truth) — robot trades only enabled streams
-            try:
-                from modules.timetable.eligibility_writer import write_eligibility_file
-                streams_for_eligibility = [
-                    {"stream": s.stream, "enabled": s.enabled, "block_reason": None if s.enabled else "disabled_by_timetable"}
-                    for s in request.streams
-                ]
-                write_eligibility_file(
-                    streams_for_eligibility,
-                    trading_date=trading_date,
-                    output_dir=str(output_dir),
-                    overwrite=True,
-                )
-            except Exception as e:
-                logging.warning("ELIGIBILITY_WRITE_FROM_TIMETABLE_SKIP: %s", e)
+        final_file = output_dir / "timetable_current.json"
 
-            # Trigger eligibility builder in background (will skip — file exists)
-            try:
-                from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
-                _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
-            except Exception as e:
-                logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable save: %s", e)
-            
-            return {
-                "status": "success",
-                "message": "Execution timetable saved",
-                "file": str(final_file),
-                "streams": len(request.streams)
-            }
+        try:
+            from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
+
+            _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
         except Exception as e:
-            # Clean up temp file on error
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except:
-                    pass
-            raise
-        
+            logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable save: %s", e)
+
+        return {
+            "status": "success",
+            "message": "Execution timetable saved",
+            "file": str(final_file),
+            "streams": len(request.streams),
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save execution timetable: {str(e)}")
 

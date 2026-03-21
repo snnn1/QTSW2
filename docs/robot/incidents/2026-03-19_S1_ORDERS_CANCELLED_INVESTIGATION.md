@@ -1,7 +1,8 @@
 # Investigation: S1 Orders Cancelled (2026-03-19)
 
 **Date**: 2026-03-19  
-**Source**: Robot logs (`logs/robot/robot_MES.jsonl`, execution journals, frontend feed)
+**Source**: Robot logs (`logs/robot/robot_MES.jsonl`, execution journals, frontend feed)  
+**Summaries hub:** [docs/robot/summaries/README.md](../summaries/README.md) · [Master roll-up Mar 17–20](../summaries/MASTER_RECENT_ISSUES_AND_FIXES_2026-03-17_through_2026-03-20.md)
 
 ---
 
@@ -88,3 +89,5 @@ Possible reasons it did not:
 2. **Reconciliation recovery** – Use `TryRecoveryAdoption` before escalating ORDER_REGISTRY_MISSING (see incident report 2026-03-17).
 3. **Restart adoption delay** – Add a short delay or retry loop before treating orders as UNOWNED on restart, to allow journal load to complete.
 4. **Logging** – Log when `GetAdoptionCandidateIntentIds` is empty or when adoption is skipped, to distinguish “no candidates” from “candidates not yet loaded”.
+
+**Update (follow-up investigation):** See [2026-03-19 ES1 / ES2 adoption & submission](2026-03-19_ES1_ES2_ADOPTION_AND_SUBMISSION_INVESTIGATION.md) for root-cause analysis (burst execution updates vs adoption deferral scan cap, NT full instrument names) and implemented code fixes.

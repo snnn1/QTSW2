@@ -7,6 +7,16 @@ using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
 
+/// <summary>P2.6: Staged metadata for NT flatten command when IEA invokes recovery flatten callback (callback arity is fixed).</summary>
+public sealed class RecoveryFlattenNtMetadata
+{
+    public bool HasSeal { get; set; }
+    public bool SealAllowInstrument { get; set; }
+    public string SealReasonCode { get; set; } = "";
+    public string AttributionScope { get; set; } = "";
+    public DestructiveActionSource DestructiveSource { get; set; } = DestructiveActionSource.RECOVERY;
+}
+
 /// <summary>
 /// Phase 3: Deterministic recovery and incident-state control.
 /// Instrument-scoped recovery state model. Normal mode and recovery mode are explicitly separated.
@@ -35,7 +45,9 @@ public sealed partial class InstrumentExecutionAuthority
         RESUME,
         ADOPT,
         FLATTEN,
-        HALT
+        HALT,
+        /// <summary>P2 Phase 1: contain to implicated stream(s); no instrument flatten.</summary>
+        STREAM_SCOPED_CONTAIN
     }
 
     private RecoveryState _recoveryState = RecoveryState.NORMAL;
@@ -57,6 +69,22 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>Callback to execute flatten (e.g. enqueue NtFlattenInstrumentCommand). Called when decision is FLATTEN.</summary>
     private Action<string, string, string, DateTimeOffset>? _onRecoveryFlattenRequestedCallback;
+
+    private RecoveryFlattenNtMetadata? _pendingRecoveryFlattenNtMetadata;
+
+    /// <summary>P2.6: Adapter consumes staged metadata on recovery flatten callback (single NT enqueue with policy seal).</summary>
+    public bool TryConsumeRecoveryFlattenNtMetadata(out RecoveryFlattenNtMetadata? metadata)
+    {
+        metadata = _pendingRecoveryFlattenNtMetadata;
+        _pendingRecoveryFlattenNtMetadata = null;
+        return metadata != null;
+    }
+
+    /// <summary>P2 Phase 1: after stream-scoped containment decision, notify host to stand down streams / emit events.</summary>
+    private Action<StateOwnershipAttributionResult, DateTimeOffset>? _onP2StreamContainmentCallback;
+
+    internal void SetOnP2StreamContainmentCallback(Action<StateOwnershipAttributionResult, DateTimeOffset>? callback) =>
+        _onP2StreamContainmentCallback = callback;
 
     /// <summary>Current recovery state.</summary>
     public RecoveryState CurrentRecoveryState
@@ -182,7 +210,11 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     /// <summary>Process reconstruction result. Chooses deterministic decision and updates state.</summary>
-    public RecoveryDecision ProcessReconstructionResult(ReconstructionResult result, DateTimeOffset utcNow)
+    public RecoveryDecision ProcessReconstructionResult(ReconstructionResult result, DateTimeOffset utcNow) =>
+        ProcessReconstructionResult(result, utcNow, null);
+
+    /// <summary>Process reconstruction result with optional P2 stream containment override.</summary>
+    public RecoveryDecision ProcessReconstructionResult(ReconstructionResult result, DateTimeOffset utcNow, P2PostReconstructionDirective? p2)
     {
         var instrument = result.Instrument ?? ExecutionInstrumentKey;
         var classification = result.Classification;
@@ -210,7 +242,16 @@ public sealed partial class InstrumentExecutionAuthority
 
             _lastClassification = classification;
 
-            var decision = ChooseRecoveryDecision(classification, result, utcNow);
+            RecoveryDecision decision;
+            StateOwnershipAttributionResult? p2Attribution = null;
+            if (p2?.UseStreamContainmentInsteadOfInstrumentFlatten == true)
+            {
+                decision = RecoveryDecision.STREAM_SCOPED_CONTAIN;
+                p2Attribution = p2.Attribution;
+            }
+            else
+                decision = ChooseRecoveryDecision(classification, result, utcNow);
+
             _lastDecision = decision;
 
             Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_RESULT", new
@@ -223,6 +264,29 @@ public sealed partial class InstrumentExecutionAuthority
                 unowned_live_count = result.UnownedLiveOrderCount,
                 iea_instance_id = InstanceId
             }));
+
+            if (decision == RecoveryDecision.STREAM_SCOPED_CONTAIN)
+            {
+                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_SCOPE_CLASSIFIED", new
+                {
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    recovery_scope = "StreamScoped",
+                    implicated_streams = p2Attribution?.ImplicatedStreams ?? new List<string>(),
+                    implicated_intent_ids = p2Attribution?.ImplicatedIntentIds ?? new List<string>(),
+                    unattributed_order_ids = p2Attribution?.UnattributedBrokerOrderIds ?? new List<string>(),
+                    attributable_scope = p2Attribution?.AttributableScope.ToString() ?? "",
+                    summary = p2Attribution?.Summary ?? "",
+                    iea_instance_id = InstanceId,
+                    destructive_action_blocked = true,
+                    sibling_streams_preserved = true
+                }));
+                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STREAM_RECOVERY_OWNERSHIP_REPAIR_STARTED", new
+                {
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    note = "Stream containment: host should stand down implicated streams; no instrument flatten",
+                    iea_instance_id = InstanceId
+                }));
+            }
 
             switch (decision)
             {
@@ -264,6 +328,22 @@ public sealed partial class InstrumentExecutionAuthority
                         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_RECOVERY_HALT, SupervisorySeverity.HIGH, new { classification = classification.ToString() }, utcNow);
                     }
                     break;
+                case RecoveryDecision.STREAM_SCOPED_CONTAIN:
+                    Interlocked.Increment(ref _recoveryResumeTotal);
+                    if (TryTransition(RecoveryState.RECOVERY_ACTION_REQUIRED, RecoveryState.RESOLVED, utcNow))
+                    {
+                        _recoveryState = RecoveryState.RESOLVED;
+                        Interlocked.Increment(ref _recoveryResolvedTotal);
+                        if (p2Attribution != null)
+                            _onP2StreamContainmentCallback?.Invoke(p2Attribution, utcNow);
+                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STREAM_RECOVERY_OWNERSHIP_REPAIR_RESULT", new
+                        {
+                            instrument,
+                            outcome = "STREAM_SCOPED_CONTAINMENT",
+                            iea_instance_id = InstanceId
+                        }));
+                    }
+                    break;
             }
 
             return decision;
@@ -272,16 +352,13 @@ public sealed partial class InstrumentExecutionAuthority
 
     private RecoveryDecision ChooseRecoveryDecision(ReconstructionClassification classification, ReconstructionResult result, DateTimeOffset utcNow)
     {
-        return classification switch
+        var kind = RecoveryPhase3DecisionRules.GetActionKind(classification, result);
+        return kind switch
         {
-            ReconstructionClassification.CLEAN => RecoveryDecision.RESUME,
-            ReconstructionClassification.ADOPTION_POSSIBLE => result.BrokerPositionQty != 0 ? RecoveryDecision.ADOPT : RecoveryDecision.RESUME,
-            ReconstructionClassification.POSITION_ONLY_MISMATCH => result.UnownedLiveOrderCount > 0 ? RecoveryDecision.FLATTEN : RecoveryDecision.RESUME,
-            ReconstructionClassification.LIVE_ORDER_OWNERSHIP_MISMATCH => RecoveryDecision.FLATTEN,
-            ReconstructionClassification.JOURNAL_BROKER_MISMATCH => RecoveryDecision.FLATTEN,
-            ReconstructionClassification.TERMINALITY_MISMATCH => RecoveryDecision.FLATTEN,
-            ReconstructionClassification.MANUAL_INTERVENTION_DETECTED => RecoveryDecision.FLATTEN,
-            ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE => RecoveryDecision.HALT,
+            RecoveryActionKind.Resume => RecoveryDecision.RESUME,
+            RecoveryActionKind.Adopt => RecoveryDecision.ADOPT,
+            RecoveryActionKind.Flatten => RecoveryDecision.FLATTEN,
+            RecoveryActionKind.Halt => RecoveryDecision.HALT,
             _ => RecoveryDecision.HALT
         };
     }
@@ -289,19 +366,88 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Execute recovery flatten via canonical path. Call when ProcessReconstructionResult returns FLATTEN.</summary>
     public void ExecuteRecoveryFlatten(string instrument, string reason, string callerContext, DateTimeOffset utcNow)
     {
+        var isBootstrap = (reason ?? "").IndexOf("BOOTSTRAP", StringComparison.OrdinalIgnoreCase) >= 0;
+        var pol = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(new DestructiveActionPolicyInput
+        {
+            Source = isBootstrap ? DestructiveActionSource.BOOTSTRAP : DestructiveActionSource.RECOVERY,
+            RecoveryReasonString = reason,
+            BootstrapAdministrativeFlatten = isBootstrap,
+            ReconstructionActionKind = RecoveryActionKind.Flatten,
+            ExecutionInstrumentKey = ExecutionInstrumentKey
+        });
+        if (!pol.AllowInstrumentScope)
+        {
+            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_POLICY_DENIED", new
+            {
+                instrument,
+                reason,
+                caller_context = callerContext,
+                policy_reason = pol.ReasonCode,
+                policy_path = pol.PolicyPath,
+                iea_instance_id = InstanceId
+            }));
+            return;
+        }
+
         RecordFlatten(instrument, utcNow);
         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_FLATTEN_ACTIONS, SupervisorySeverity.MEDIUM, new { reason, callerContext }, utcNow);
         Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_REQUESTED", new { instrument, reason, iea_instance_id = InstanceId }));
 
         if (_onRecoveryFlattenRequestedCallback != null)
         {
+            _pendingRecoveryFlattenNtMetadata = new RecoveryFlattenNtMetadata
+            {
+                HasSeal = true,
+                SealAllowInstrument = true,
+                SealReasonCode = pol.ReasonCode,
+                AttributionScope = "",
+                DestructiveSource = isBootstrap ? DestructiveActionSource.BOOTSTRAP : DestructiveActionSource.RECOVERY
+            };
             _onRecoveryFlattenRequestedCallback.Invoke(instrument, reason, callerContext, utcNow);
             return;
         }
 
-        var res = RequestFlatten(instrument, reason, callerContext, utcNow);
-        if (res.Success)
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_RESOLVED", new { instrument, iea_instance_id = InstanceId }));
+        // P2.6.6: never call RequestFlatten directly — same funnel as adapter (NtFlattenInstrumentCommand → ExecuteFlattenInstrument → policy).
+        if (Executor == null)
+        {
+            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_ENQUEUE_FAILED", new
+            {
+                instrument,
+                reason,
+                caller_context = callerContext,
+                note = "Executor null — cannot enqueue recovery flatten",
+                iea_instance_id = InstanceId
+            }));
+            return;
+        }
+
+        var prefix = isBootstrap ? "BOOTSTRAP" : "RECOVERY";
+        var cid = $"{prefix}_IEA_NO_CB:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+        var src = isBootstrap ? DestructiveActionSource.BOOTSTRAP : DestructiveActionSource.RECOVERY;
+        var ntCmd = new NtFlattenInstrumentCommand(
+            cid,
+            null,
+            instrument,
+            reason,
+            utcNow,
+            destructiveSource: src,
+            explicitPolicyTrigger: null,
+            allowAccountWideCancelFallback: false,
+            hasRecoveryPolicySeal: true,
+            recoveryPolicySealAllowInstrument: true,
+            recoveryPolicySealCode: pol.ReasonCode,
+            recoveryPolicySealAttributionScope: "");
+        if (!Executor.EnqueueNtAction(ntCmd))
+        {
+            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_ENQUEUE_FAILED", new
+            {
+                instrument,
+                reason,
+                caller_context = callerContext,
+                note = "EnqueueNtAction returned false",
+                iea_instance_id = InstanceId
+            }));
+        }
     }
 
     /// <summary>Mark recovery flatten resolved. Call when flatten fill received or account flat. May transition to RESOLVED or run reconstruction again.</summary>
@@ -382,6 +528,61 @@ public sealed partial class InstrumentExecutionAuthority
                 activeIntents.Add(kvp.Key);
         }
         return new RecoveryRuntimeIntentSnapshot { ActiveIntentIds = activeIntents };
+    }
+
+    /// <summary>P2 Phase 1: build input for centralized ownership attribution (broker rows filled by adapter).</summary>
+    internal RecoveryAttributionSnapshot BuildRecoveryAttributionSnapshot(
+        int brokerPositionQty,
+        int brokerWorkingCount,
+        int journalOpenQtySum,
+        string? triggerReason,
+        string? triggerIntentId,
+        string? triggerBrokerOrderId,
+        bool gateEngagedForSymbol)
+    {
+        var snap = new RecoveryAttributionSnapshot
+        {
+            ExecutionInstrumentKey = ExecutionInstrumentKey,
+            BrokerPositionQty = brokerPositionQty,
+            BrokerWorkingCount = brokerWorkingCount,
+            JournalOpenQtySum = journalOpenQtySum,
+            TriggerReason = triggerReason,
+            TriggerIntentId = triggerIntentId,
+            TriggerBrokerOrderId = triggerBrokerOrderId,
+            GateEngagedForSymbol = gateEngagedForSymbol
+        };
+        var unowned = 0;
+        foreach (var kvp in IntentMap)
+        {
+            if (kvp.Key.IndexOf(':') >= 0) continue;
+            var intent = kvp.Value;
+            var hasWorking = OrderMap.TryGetValue(kvp.Key, out var oi) &&
+                             (string.Equals(oi.State, "WORKING", StringComparison.OrdinalIgnoreCase) ||
+                              string.Equals(oi.State, "ACCEPTED", StringComparison.OrdinalIgnoreCase) ||
+                              string.Equals(oi.State, "SUBMITTED", StringComparison.OrdinalIgnoreCase));
+            snap.Intents.Add(new RecoveryAttributionIntentRow
+            {
+                IntentId = kvp.Key,
+                Stream = intent.Stream,
+                HasWorkingOrder = hasWorking
+            });
+        }
+
+        foreach (var e in _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING))
+        {
+            if (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED) unowned++;
+            snap.RegistryWorking.Add(new RecoveryAttributionRegistryRow
+            {
+                BrokerOrderId = e.BrokerOrderId,
+                IntentId = e.IntentId,
+                Stream = e.Stream,
+                OwnershipStatus = e.OwnershipStatus.ToString(),
+                IsEntry = e.OrderRole == OrderRole.ENTRY
+            });
+        }
+
+        snap.DegradedOwnershipOrAmbiguity = unowned > 0 || IsInRecovery || gateEngagedForSymbol;
+        return snap;
     }
 
     /// <summary>Emit recovery metrics.</summary>

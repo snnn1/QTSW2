@@ -45,8 +45,8 @@ def run_sim_test(date: str, instrument: str = "ES", num_streams: int = 1, projec
         "streams": []
     }
     
-    # Add streams (ES1, ES2 for S1 slots)
-    slot_times = ["07:30", "08:00"][:num_streams]
+    # Add streams — S1 slots must match timetable_write_guard (ES ≠ YM early 07:30)
+    slot_times = ["09:00", "08:00"][:num_streams]
     for i, slot_time in enumerate(slot_times, start=1):
         timetable["streams"].append({
             "stream": f"{instrument}{i}",

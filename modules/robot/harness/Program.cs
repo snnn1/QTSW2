@@ -47,6 +47,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
 // --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
+// --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
@@ -88,6 +89,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = RecoveryPhase3Tests.RunRecoveryPhase3Tests();
         Console.WriteLine(pass ? "PASS: Recovery Phase 3 tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RECOVERY_P2_PHASE1", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = P2RecoveryPhase1Tests.RunP2RecoveryPhase1Tests();
+        Console.WriteLine(pass ? "PASS: P2 Phase 1 recovery attribution tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("P2_6_DESTRUCTIVE_POLICY_TESTS", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = P2_6DestructivePolicyTests.RunP2_6DestructivePolicyTests();
+        Console.WriteLine(pass ? "PASS: P2.6 destructive policy tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("RANGE_BUILDING_SNAPSHOT", StringComparison.OrdinalIgnoreCase))
@@ -202,6 +215,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = MismatchEscalationTests.RunMismatchEscalationTests();
         Console.WriteLine(pass ? "PASS: Mismatch escalation tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("STATE_CONSISTENCY_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = StateConsistencyGateTests.RunStateConsistencyGateTests();
+        Console.WriteLine(pass ? "PASS: State consistency gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("EXECUTION_EVENT_REPLAY", StringComparison.OrdinalIgnoreCase))
@@ -354,28 +373,29 @@ var timetablePath = customTimetablePath ?? Path.Combine(root, "data", "timetable
 
 if (argsList.Contains("--write-sample-timetable"))
 {
-    Directory.CreateDirectory(Path.GetDirectoryName(timetablePath)!);
+    // Do not write timetable_current.json from harness — live file is published only via TimetableEngine (Python).
+    var samplePath = Path.Combine(root, "data", "timetable", "timetable_harness_sample.json");
+    Directory.CreateDirectory(Path.GetDirectoryName(samplePath)!);
     var spec = ParitySpec.LoadFromFile(Path.Combine(root, "configs", "analyzer_robot_parity.json"));
     var time = new TimeService(spec.timezone);
     var utcNow = DateTimeOffset.UtcNow;
     var tradingDate = time.GetChicagoDateToday(utcNow).ToString("yyyy-MM-dd");
 
-    // Sample: ES1 S1 07:30 (valid slot), ES2 S2 09:30 (valid slot)
     var sample = new
     {
         as_of = time.GetChicagoNow(utcNow).ToString("o"),
         trading_date = tradingDate,
         timezone = "America/Chicago",
-        source = "harness",
+        source = "harness_sample",
         streams = new[]
         {
-            new { stream = "ES1", instrument = "ES", session = "S1", slot_time = "07:30", enabled = true },
+            new { stream = "ES1", instrument = "ES", session = "S1", slot_time = "09:00", enabled = true },
             new { stream = "ES2", instrument = "ES", session = "S2", slot_time = "09:30", enabled = true }
         }
     };
 
-    File.WriteAllText(timetablePath, JsonSerializer.Serialize(sample));
-    Console.WriteLine($"Wrote sample timetable to: {timetablePath}");
+    File.WriteAllText(samplePath, JsonSerializer.Serialize(sample));
+    Console.WriteLine($"Wrote sample to {samplePath} (not live timetable_current — use TimetableEngine / dashboard / matrix publish).");
 }
 
 Console.WriteLine($"Project root: {root}");
@@ -435,15 +455,25 @@ if (argsList.Contains("--replay"))
     if (logDirIndex >= 0 && logDirIndex + 1 < argsList.Count)
         logDir = argsList[logDirIndex + 1];
     
-    // In replay mode, use timetable_replay.json if it exists and --timetable-path not specified
-    string? replayTimetablePath = customTimetablePath;
-    if (replayTimetablePath == null)
+    // Replay consumes timetable_replay_current.json (never overwrites live timetable_current.json).
+    string? engineTimetablePath = customTimetablePath;
+    if (engineTimetablePath == null)
     {
-        var replayTimetable = Path.Combine(root, "data", "timetable", "timetable_replay.json");
-        if (File.Exists(replayTimetable))
+        HistoricalReplay.UpdateTimetableTradingDateIfReplay(root, startDate, timeSvc);
+        var replayCurrent = HistoricalReplay.ReplayCurrentTimetablePath(root);
+        if (File.Exists(replayCurrent))
         {
-            replayTimetablePath = replayTimetable;
-            Console.WriteLine($"Replay mode: Using timetable_replay.json");
+            engineTimetablePath = replayCurrent;
+            Console.WriteLine("Replay mode: Using timetable_replay_current.json");
+        }
+        else
+        {
+            var replayTemplate = Path.Combine(root, "data", "timetable", "timetable_replay.json");
+            if (File.Exists(replayTemplate))
+            {
+                engineTimetablePath = replayTemplate;
+                Console.WriteLine("Replay mode: Using timetable_replay.json (replay_current missing)");
+            }
         }
     }
     
@@ -451,15 +481,7 @@ if (argsList.Contains("--replay"))
     if (logDir != null)
         Console.WriteLine($"Custom log directory: {logDir}");
     
-    // CRITICAL: Update timetable BEFORE starting engine so it sees valid streams
-    // The engine loads timetable on Start(), so we need it ready first
-    if (replayTimetablePath != null && File.Exists(replayTimetablePath))
-    {
-        // Update timetable for first date before engine starts
-        HistoricalReplay.UpdateTimetableTradingDateIfReplay(root, startDate, timeSvc);
-    }
-    
-    var engine = new RobotEngine(root, TimeSpan.FromSeconds(1), executionMode, logDir, replayTimetablePath);
+    var engine = new RobotEngine(root, TimeSpan.FromSeconds(1), executionMode, logDir, engineTimetablePath);
     engine.Start();
     var snapshotRoot = Path.Combine(root, "data", "translated");
     HistoricalReplay.Replay(engine, specLoaded, timeSvc, snapshotRoot, root, startDate, endDate);

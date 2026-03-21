@@ -41,8 +41,9 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>
     /// Canonical flatten request. Call only from strategy thread.
     /// Derives side and quantity from account position at decision time.
+    /// P2.6.6: Final gate — DestructiveActionPolicy must allow before any flatten order is submitted.
     /// </summary>
-    public FlattenResult RequestFlatten(string instrument, string reason, string? callerContext, DateTimeOffset utcNow)
+    public FlattenResult RequestFlatten(string instrument, string reason, string? callerContext, DateTimeOffset utcNow, FlattenPolicyExecutionContext? policyContext = null)
     {
         if (Executor == null || Log == null)
             return FlattenResult.FailureResult("IEA executor or log not set", utcNow);
@@ -126,6 +127,85 @@ public sealed partial class InstrumentExecutionAuthority
                 return FlattenResult.FailureResult(invariantError ?? "FLATTEN_DIRECTION_INVALID", utcNow);
             }
 
+            var pc = policyContext ?? FlattenPolicyExecutionContext.CreateDefault(reason);
+
+            if (pc.PrecheckAllowInstrument.HasValue && !pc.PrecheckAllowInstrument.Value)
+            {
+                ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
+                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_INVARIANT_VIOLATION", new
+                {
+                    note = "P2.6.7: RequestFlatten received context where adapter pre-check disallowed instrument scope",
+                    correlation_id = pc.PrecheckCorrelationId,
+                    execution_instrument_key = ExecutionInstrumentKey
+                }));
+                return FlattenResult.FailureResult("P2.6.7: invalid flatten policy context (precheck disallowed)", utcNow);
+            }
+
+            // P2.6.7: Drift detection — pre-cancel snapshot (adapter) vs live read at final gate
+            if (pc.PrecheckBrokerPositionQtyAbs.HasValue && pc.PrecheckBrokerPositionQtyAbs.Value != absQty)
+            {
+                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
+                {
+                    drift_kind = "broker_abs_qty",
+                    precheck_abs = pc.PrecheckBrokerPositionQtyAbs.Value,
+                    final_abs = absQty,
+                    correlation_id = pc.PrecheckCorrelationId,
+                    precheck_policy_reason = pc.PrecheckPolicyReasonCode,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    note = "Position size changed between ExecuteFlattenInstrument pre-check and RequestFlatten"
+                }));
+            }
+
+            if (pc.PrecheckBrokerQtySigned.HasValue && quantity != 0 && pc.PrecheckBrokerQtySigned.Value != 0 &&
+                Math.Sign(pc.PrecheckBrokerQtySigned.Value) != Math.Sign(quantity))
+            {
+                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
+                {
+                    drift_kind = "position_side_flip",
+                    precheck_signed_qty = pc.PrecheckBrokerQtySigned.Value,
+                    final_signed_qty = quantity,
+                    correlation_id = pc.PrecheckCorrelationId,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    severity = "CRITICAL",
+                    note = "Long/short sign changed between pre-check and submit — final policy still applies"
+                }));
+            }
+
+            var triggerResolved = DestructiveTriggerParser.Resolve(pc.ExplicitTrigger, reason);
+            var polInput = pc.ToPolicyInput(ExecutionInstrumentKey, absQty, reason);
+            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_REQUESTED", new
+            {
+                source = pc.Source.ToString(),
+                trigger = triggerResolved.ToString(),
+                execution_instrument_key = ExecutionInstrumentKey,
+                instrument = instrumentKey,
+                caller_context = callerContext,
+                phase = "pre_submit_request_flatten"
+            }));
+            var submitDecision = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(polInput);
+            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_DECISION", new
+            {
+                allowed = submitDecision.AllowInstrumentScope,
+                reason = submitDecision.ReasonCode,
+                scope = submitDecision.CancelScopeMode,
+                policy_path = submitDecision.PolicyPath,
+                phase = "pre_submit_request_flatten"
+            }));
+            if (!submitDecision.AllowInstrumentScope)
+            {
+                ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
+                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_BLOCKED", new
+                {
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    instrument = instrumentKey,
+                    reason_code = submitDecision.ReasonCode,
+                    policy_path = submitDecision.PolicyPath,
+                    caller_context = callerContext,
+                    note = "P2.6.6: RequestFlatten blocked by destructive policy (no order submitted)"
+                }));
+                return FlattenResult.FailureResult($"Destructive policy denied flatten ({submitDecision.ReasonCode})", utcNow);
+            }
+
             var snapshot = new FlattenDecisionSnapshot
             {
                 Instrument = instrumentKey,
@@ -157,6 +237,15 @@ public sealed partial class InstrumentExecutionAuthority
             entry.OrderId = submitResult.BrokerOrderId;
             if (!string.IsNullOrEmpty(submitResult.BrokerOrderId))
                 RegisterFlattenOrder(submitResult.BrokerOrderId, instrumentKey, OrderOwnershipStatus.OWNED, "RequestFlatten", utcNow);
+            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_EXECUTED", new
+            {
+                execution_instrument_key = ExecutionInstrumentKey,
+                instrument = instrumentKey,
+                source = pc.Source.ToString(),
+                trigger = triggerResolved.ToString(),
+                broker_order_id = submitResult.BrokerOrderId,
+                phase = "flatten_order_submitted"
+            }));
             return FlattenResult.SuccessResult(utcNow);
         }
         catch (Exception ex)

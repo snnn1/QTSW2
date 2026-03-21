@@ -12,8 +12,8 @@
 **Path:** `TryLockRange` → `SubmitStopEntryBracketsAtLock(utcNow)`.
 
 **Gates:**
-- Within freshness window: `(utcNow - SlotTimeUtc).TotalMinutes <= initial_submission_freshness_minutes` (default 3).
-- Price sanity: not "clearly stale" (long: `ask < brkLong + sanityTolerance`; short: `bid > brkShort - sanityTolerance`).
+- Freshness window: `(utcNow - SlotTimeUtc).TotalMinutes <= initial_submission_freshness_minutes` (default **3** when omitted from spec). Set **`breakout.initial_submission_freshness_minutes` to `0`** (or negative) in the parity spec JSON to **disable** the time-based block; **`NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION`** is not used for delay-from-slot in that case.
+- Price sanity: not "clearly stale" (long: `ask < brkLong + sanityTolerance`; short: `bid > brkShort - sanityTolerance`) — still applies when freshness is disabled.
 - Breakout levels present, before market close.
 
 **Decision:** `GetCurrentMarketPrice` → if `ask >= brkLong` → MARKET BUY; if `bid <= brkShort` → MARKET SELL; else STOP.
@@ -29,7 +29,7 @@
 **When:** First submission attempt is materially delayed from slot time.
 
 **Block reasons:**
-- `INITIAL_SUBMISSION_BLOCKED_MATERIALLY_DELAYED`: `delay_from_slot_minutes > freshness_minutes`.
+- `INITIAL_SUBMISSION_BLOCKED_MATERIALLY_DELAYED`: `freshness_minutes > 0` and `delay_from_slot_minutes > freshness_minutes`.
 - `INITIAL_SUBMISSION_BLOCKED_PRICE_SANITY`: price clearly beyond breakout (sanity_ticks).
 
 **Outcome:** `Commit(utcNow, "NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION" | "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY", ...)`.

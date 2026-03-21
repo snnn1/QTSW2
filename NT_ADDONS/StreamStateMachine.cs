@@ -4840,10 +4840,11 @@ public sealed class StreamStateMachine
             // INITIAL SUBMISSION FRESHNESS: Block materially delayed first submissions.
             // Normal immediate slot-time: within freshness window → allow (marketable stop OK).
             // Delayed initial: beyond window → block NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION.
+            // freshness_minutes <= 0 disables this gate (parity spec); price sanity below still applies.
             // Delayed resubmit/restart retry: handled separately in HandleRangeLockedState with IsBreakoutValidForResubmit.
             var freshnessMinutes = _spec?.breakout?.initial_submission_freshness_minutes ?? 3;
             var delayFromSlotMinutes = (utcNow - SlotTimeUtc).TotalMinutes;
-            if (delayFromSlotMinutes > freshnessMinutes)
+            if (freshnessMinutes > 0 && delayFromSlotMinutes > freshnessMinutes)
             {
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "INITIAL_SUBMISSION_BLOCKED_MATERIALLY_DELAYED", State.ToString(),

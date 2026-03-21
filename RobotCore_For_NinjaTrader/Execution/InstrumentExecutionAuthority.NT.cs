@@ -14,6 +14,19 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class InstrumentExecutionAuthority
 {
+    /// <summary>P2.1-F: block aggregation that would cancel sibling working orders when unsafe.</summary>
+    private bool IsAggregationSiblingCancelBlockedForP2()
+    {
+        if (_aggregationSiblingCancelGuard != null && _aggregationSiblingCancelGuard(ExecutionInstrumentKey))
+            return true;
+        foreach (var e in _orderRegistry.GetAllEntries())
+        {
+            if (e.LifecycleState == OrderLifecycleState.WORKING && e.OwnershipStatus == OrderOwnershipStatus.UNOWNED)
+                return true;
+        }
+        return IsInRecovery;
+    }
+
     // Phase 3: Trap G - queue serialization (replaces BE-specific lock; queue handles all mutations)
     /// <summary>
     /// Submit stop entry order. Tries aggregation first; falls back to single order.
@@ -57,6 +70,18 @@ public sealed partial class InstrumentExecutionAuthority
         DateTimeOffset utcNow)
     {
         if (Executor == null || Log == null) return null;
+        if (IsAggregationSiblingCancelBlockedForP2())
+        {
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "AGGREGATION_CANCEL_BLOCKED_DUE_TO_ATTRIBUTION", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    iea_instance_id = InstanceId,
+                    note = "P2.1-F: sibling cancel/aggregate blocked while ownership degraded, recovery active, or mismatch gate engaged"
+                }));
+            return null;
+        }
         if (!IntentMap.TryGetValue(intentId, out var currentIntent))
             return null;
 
@@ -542,10 +567,11 @@ public sealed partial class InstrumentExecutionAuthority
     private bool _adoptionDeferred;
     private volatile bool _adoptionScanInProgress;
 
-    /// <summary>Seconds to defer UNOWNED when adoption candidates empty but broker has orders (journal load race).</summary>
-    private const int RestartAdoptionGraceSeconds = 20;
-    /// <summary>Max deferred scans before proceeding to UNOWNED (prevents infinite loop).</summary>
-    private const int RestartAdoptionMaxDeferredScans = 10;
+    /// <summary>True when adoption retry is pending (heartbeat / execution paths should consider enqueueing a scan).</summary>
+    internal bool HasDeferredAdoptionScanPending => _adoptionDeferred;
+
+    /// <summary>Wall-clock seconds to defer UNOWNED when adoption candidates empty but broker has orders (journal load race / path resolution).</summary>
+    private const int RestartAdoptionGraceSeconds = 60;
 
     /// <summary>
     /// Retry adoption scan when deferred (candidates empty, broker has orders).
@@ -553,10 +579,11 @@ public sealed partial class InstrumentExecutionAuthority
     /// Enqueues ScanAndAdoptExistingOrders to IEA worker; no-op if not deferred or scan already in flight.
     /// Guard: at most one adoption scan queued/running at a time.
     /// </summary>
-    internal void TryRetryDeferredAdoptionScanIfDeferred()
+    /// <returns>True if a scan was enqueued on the IEA worker; false if not deferred, scan already in progress, or enqueue failed.</returns>
+    internal bool TryRetryDeferredAdoptionScanIfDeferred()
     {
-        if (!_adoptionDeferred) return;
-        if (_adoptionScanInProgress) return;
+        if (!_adoptionDeferred) return false;
+        if (_adoptionScanInProgress) return false;
         _adoptionScanInProgress = true;
         try
         {
@@ -565,10 +592,12 @@ public sealed partial class InstrumentExecutionAuthority
                 try { ScanAndAdoptExistingOrders(); }
                 finally { _adoptionScanInProgress = false; }
             });
+            return true;
         }
         catch
         {
             _adoptionScanInProgress = false;
+            return false;
         }
     }
 
@@ -634,7 +663,7 @@ public sealed partial class InstrumentExecutionAuthority
             _adoptionDeferredCount++;
             _firstAdoptionScanUtc ??= utcNow;
             var elapsedMs = (long)(utcNow - _firstAdoptionScanUtc.Value).TotalMilliseconds;
-            var action = AdoptionDeferralDecision.Evaluate(activeIntentIds.Count, qtsw2WorkingCount, _adoptionDeferredCount, elapsedMs, RestartAdoptionGraceSeconds, RestartAdoptionMaxDeferredScans);
+            var action = AdoptionDeferralDecision.Evaluate(activeIntentIds.Count, qtsw2WorkingCount, elapsedMs, RestartAdoptionGraceSeconds);
             if (action == AdoptionDeferralAction.Defer)
             {
                 _adoptionDeferred = true;

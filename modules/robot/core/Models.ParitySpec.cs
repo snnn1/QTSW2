@@ -101,7 +101,7 @@ public sealed class BreakoutSpec
 
     /// <summary>
     /// Max minutes from SlotTimeUtc for initial submission. Beyond this, block as materially delayed.
-    /// Default 3. Immediate slot-time marketable fills allowed; delayed first submissions blocked.
+    /// Default 3. Set to 0 (or negative) to disable this time gate only (price sanity still applies).
     /// </summary>
     public int initial_submission_freshness_minutes { get; set; } = 3;
 

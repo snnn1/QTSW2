@@ -217,7 +217,12 @@ def save_master_matrix(
             df_copy = df.copy()
             if 'trade_date' in df_copy.columns and not pd.api.types.is_datetime64_any_dtype(df_copy['trade_date']):
                 df_copy['trade_date'] = pd.to_datetime(df_copy['trade_date'], errors='raise')
-            engine = TimetableEngine(timetable_output_dir=timetable_output_dir) if timetable_output_dir else TimetableEngine()
+            root = Path(__file__).resolve().parents[2]
+            engine = (
+                TimetableEngine(timetable_output_dir=timetable_output_dir, project_root=str(root))
+                if timetable_output_dir
+                else TimetableEngine(project_root=str(root))
+            )
             engine.write_execution_timetable_from_master_matrix(
                 df_copy,
                 trade_date=specific_date,

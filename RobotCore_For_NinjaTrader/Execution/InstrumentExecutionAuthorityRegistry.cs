@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -53,5 +54,33 @@ public static class InstrumentExecutionAuthorityRegistry
         return _registry.Where(kvp => string.Equals(kvp.Key.Account, account, StringComparison.OrdinalIgnoreCase))
             .Select(kvp => kvp.Value)
             .ToList();
+    }
+
+    /// <summary>
+    /// Engine heartbeat: for each IEA on the account with a deferred adoption scan, try to enqueue <see cref="InstrumentExecutionAuthority.TryRetryDeferredAdoptionScanIfDeferred"/>.
+    /// Logs one structured event when any deferred IEA was considered (per-IEA enqueue outcome).
+    /// </summary>
+    public static void RetryDeferredAdoptionScansForAccount(string accountName, RobotLogger? log)
+    {
+        var account = accountName ?? "";
+        if (string.IsNullOrWhiteSpace(account)) return;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var rows = new List<object>();
+        foreach (var iea in GetAllForAccount(account))
+        {
+            if (!iea.HasDeferredAdoptionScanPending) continue;
+            var enqueued = iea.TryRetryDeferredAdoptionScanIfDeferred();
+            rows.Add(new
+            {
+                execution_instrument_key = iea.ExecutionInstrumentKey,
+                iea_instance_id = iea.InstanceId,
+                scan_enqueued = enqueued
+            });
+        }
+
+        if (rows.Count == 0) return;
+        log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ADOPTION_DEFERRAL_HEARTBEAT_RETRY", state: "ENGINE",
+            new { account, iea_retries = rows }));
     }
 }

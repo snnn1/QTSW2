@@ -316,13 +316,74 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
-    /// <summary>Gap 2: Emergency flatten bypass. Bypasses IEA queue. MUST be called from strategy thread.</summary>
+    /// <summary>
+    /// P2.6.7: Emergency flatten — still bypasses IEA queue but is constrained: strategy thread only + explicit policy classification before submit.
+    /// </summary>
     FlattenResult IIEAOrderExecutor.EmergencyFlatten(string instrument, DateTimeOffset utcNow)
     {
+        var currentThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        var inStrategyContext = _strategyThreadContextCount > 0 && _strategyThreadId == currentThreadId;
+        if (!inStrategyContext)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EMERGENCY_FLATTEN_CONSTRAINT_VIOLATION", state: "CRITICAL",
+                new
+                {
+                    instrument,
+                    note = "P2.6.7: EmergencyFlatten must run on strategy thread — use NtFlattenInstrumentCommand / FlattenEmergency enqueue path"
+                }));
+            return FlattenResult.FailureResult("EmergencyFlatten requires strategy thread (enqueue FlattenEmergency or drain NT actions)", utcNow);
+        }
+
         var (quantity, direction) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(instrument);
         if (quantity == 0 || string.IsNullOrEmpty(direction))
             return FlattenResult.SuccessResult(utcNow);
         var absQty = Math.Abs(quantity);
+        var execKey = _iea?.ExecutionInstrumentKey ?? instrument;
+        var execVariant = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
+        var journalQty = 0;
+        try
+        {
+            journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        }
+        catch { /* observability */ }
+
+        var emInput = new DestructiveActionPolicyInput
+        {
+            Source = DestructiveActionSource.EMERGENCY,
+            ExplicitTrigger = DestructiveTriggerReason.DIRECT_EMERGENCY_FLATTEN,
+            RecoveryReasonString = "EMERGENCY_FLATTEN_BYPASS",
+            ExecutionInstrumentKey = execKey,
+            BrokerPositionQty = absQty,
+            JournalOpenQtySum = journalQty,
+            ReconstructionActionKind = RecoveryActionKind.Flatten
+        };
+        var emDecision = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(emInput);
+        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_REQUESTED", new
+        {
+            source = DestructiveActionSource.EMERGENCY.ToString(),
+            trigger = DestructiveTriggerReason.DIRECT_EMERGENCY_FLATTEN.ToString(),
+            execution_instrument_key = execKey,
+            phase = "emergency_flatten_direct"
+        }));
+        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_DECISION", new
+        {
+            allowed = emDecision.AllowInstrumentScope,
+            reason = emDecision.ReasonCode,
+            scope = emDecision.CancelScopeMode,
+            policy_path = emDecision.PolicyPath,
+            phase = "emergency_flatten_direct"
+        }));
+        if (!emDecision.AllowInstrumentScope)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_BLOCKED", new
+            {
+                execution_instrument_key = execKey,
+                reason_code = emDecision.ReasonCode,
+                note = "P2.6.7: EmergencyFlatten denied by policy (unexpected)"
+            }));
+            return FlattenResult.FailureResult($"Emergency flatten policy denied ({emDecision.ReasonCode})", utcNow);
+        }
+
         var chosenSide = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
         var requestId = $"EMERGENCY:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
         var snapshot = new FlattenDecisionSnapshot
@@ -338,7 +399,26 @@ public sealed partial class NinjaTraderSimAdapter
             LatchState = "EmergencyBypass",
             DecisionUtc = utcNow
         };
+        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "EMERGENCY_FLATTEN_EXECUTING", new
+        {
+            instrument,
+            abs_qty = absQty,
+            execution_instrument_key = execKey,
+            policy_path = emDecision.PolicyPath,
+            note = "P2.6.7: constrained direct submit after policy allow"
+        }));
         var submitResult = ((IIEAOrderExecutor)this).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow);
+        if (submitResult.Success)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_EXECUTED", new
+            {
+                execution_instrument_key = execKey,
+                source = DestructiveActionSource.EMERGENCY.ToString(),
+                trigger = DestructiveTriggerReason.DIRECT_EMERGENCY_FLATTEN.ToString(),
+                broker_order_id = submitResult.BrokerOrderId,
+                phase = "emergency_flatten_direct_submit"
+            }));
+        }
         return submitResult.Success ? FlattenResult.SuccessResult(utcNow) : FlattenResult.FailureResult(submitResult.ErrorMessage ?? "Emergency flatten failed", utcNow);
     }
 
@@ -500,6 +580,193 @@ public sealed partial class NinjaTraderSimAdapter
             _iea.RunBootstrapAdoption(instrument, utcNow);
     }
 
+    /// <summary>P2 Phase 1: populate broker working rows for ownership attribution.</summary>
+    private void EnrichRecoveryAttributionBrokerOrders(RecoveryAttributionSnapshot snap, string instrument)
+    {
+        if (_iea == null) return;
+        var account = _ntAccount as Account;
+        if (account?.Orders == null) return;
+        var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument ?? "";
+        foreach (var o in account.Orders)
+        {
+            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot))
+                continue;
+            var id = o.OrderId.ToString() ?? "";
+            var tag = GetOrderTag(o) ?? "";
+            var row = new RecoveryAttributionBrokerOrderRow { BrokerOrderId = id, IsAggregatedTag = RobotOrderIds.IsAggregatedTag(tag) };
+            if (row.IsAggregatedTag)
+            {
+                var agg = RobotOrderIds.DecodeAggregatedIntentIds(tag);
+                if (agg != null) row.AggregatedIntentIds.AddRange(agg);
+            }
+            else if (!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+                row.TagIntentId = RobotOrderIds.DecodeIntentId(tag);
+            if (_iea.TryResolveByBrokerOrderId(id, out var re) && re != null)
+                row.RegistryIntentId = re.IntentId;
+            snap.BrokerWorking.Add(row);
+        }
+    }
+
+    /// <summary>P2.6: Rebuild recovery policy inputs when a flatten command lacks enqueue seal (legacy / defensive).</summary>
+    private bool TryBuildRecoveryDestructivePolicyInputFromLiveState(
+        string instrument,
+        string reason,
+        object? context,
+        DateTimeOffset utcNow,
+        out DestructiveActionPolicyInput? policyInput,
+        out StateOwnershipAttributionResult? attributionOut,
+        out RecoveryAttributionSnapshot? snapOut)
+    {
+        policyInput = null;
+        attributionOut = null;
+        snapOut = null;
+        if (_iea == null) return false;
+        var execInst = _iea.ExecutionInstrumentKey;
+        int brokerQty = 0, brokerWorkingCount = 0;
+        try
+        {
+            var (qty, _) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(instrument);
+            brokerQty = Math.Abs(qty);
+            var account = _ntAccount as Account;
+            if (account?.Orders != null)
+            {
+                var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
+                brokerWorkingCount = account.Orders.Count(o =>
+                    (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
+                    ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
+            }
+        }
+        catch
+        {
+            return false;
+        }
+        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var registry = _iea.GetRegistrySnapshotForRecovery();
+        var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
+        var result = RecoveryReconstructor.Reconstruct(instrument, brokerQty, brokerWorkingCount, journalQty, registry, runtime, reason);
+        var actionKind = RecoveryPhase3DecisionRules.GetActionKind(result.Classification, result);
+        if (actionKind != RecoveryActionKind.Flatten)
+        {
+            policyInput = new DestructiveActionPolicyInput
+            {
+                Source = DestructiveActionSource.RECOVERY,
+                RecoveryReasonString = reason,
+                ReconstructionActionKind = actionKind,
+                ExecutionInstrumentKey = execInst,
+                BrokerPositionQty = brokerQty,
+                JournalOpenQtySum = journalQty
+            };
+            return true;
+        }
+        if (RecoveryOwnershipAttributionEvaluator.IsEmergencyInstrumentRecoveryTrigger(reason))
+        {
+            policyInput = new DestructiveActionPolicyInput
+            {
+                Source = DestructiveActionSource.RECOVERY,
+                RecoveryReasonString = reason,
+                ExplicitTrigger = DestructiveTriggerParser.TryParseStrictPrefix(reason),
+                ReconstructionActionKind = actionKind,
+                ExecutionInstrumentKey = execInst,
+                BrokerPositionQty = brokerQty,
+                JournalOpenQtySum = journalQty
+            };
+            return true;
+        }
+        string? triggerIntent = null;
+        string? triggerBroker = null;
+        try
+        {
+            if (context != null)
+            {
+                dynamic d = context;
+                triggerIntent = d.intent_id?.ToString();
+                triggerBroker = d.broker_order_id?.ToString();
+            }
+        }
+        catch { /* best-effort */ }
+        var gateEngaged = _instrumentMismatchGateEngaged?.Invoke(instrument) == true
+                          || _instrumentMismatchGateEngaged?.Invoke(execInst) == true;
+        var snap = _iea.BuildRecoveryAttributionSnapshot(brokerQty, brokerWorkingCount, journalQty, reason, triggerIntent, triggerBroker, gateEngaged);
+        EnrichRecoveryAttributionBrokerOrders(snap, instrument);
+        var attribution = RecoveryOwnershipAttributionEvaluator.EvaluateOwnershipAttributionForRecovery(snap);
+        attributionOut = attribution;
+        snapOut = snap;
+        policyInput = new DestructiveActionPolicyInput
+        {
+            Source = DestructiveActionSource.RECOVERY,
+            RecoveryReasonString = reason,
+            ReconstructionActionKind = actionKind,
+            GateEngagedForSymbol = gateEngaged,
+            ExecutionInstrumentKey = execInst,
+            BrokerPositionQty = brokerQty,
+            JournalOpenQtySum = journalQty,
+            Attribution = attribution,
+            AttributionSnapshot = snap
+        };
+        return true;
+    }
+
+    /// <summary>P2.6.6: Shared template for pre-cancel policy and RequestFlatten final gate (broker qty refreshed in RequestFlatten).</summary>
+    private bool TryBuildDestructivePolicyInputForFlattenCommand(NtFlattenInstrumentCommand cmd, DateTimeOffset utcNow, out DestructiveActionPolicyInput? input)
+    {
+        input = null;
+        var execKey = _iea?.ExecutionInstrumentKey ?? "";
+        if (cmd.HasRecoveryPolicySeal)
+        {
+            input = new DestructiveActionPolicyInput
+            {
+                Source = cmd.DestructiveSource,
+                RecoveryReasonString = cmd.Reason,
+                ExplicitTrigger = cmd.ExplicitPolicyTrigger,
+                ExecutionInstrumentKey = execKey,
+                RecoveryEnqueuePolicySealValid = true,
+                RecoveryEnqueueAllowInstrument = cmd.RecoveryPolicySealAllowInstrument,
+                RecoveryEnqueueReasonCode = cmd.RecoveryPolicySealCode,
+                ReconstructionActionKind = RecoveryActionKind.Flatten
+            };
+            return true;
+        }
+
+        if (cmd.DestructiveSource != DestructiveActionSource.RECOVERY)
+        {
+            var built = new DestructiveActionPolicyInput
+            {
+                Source = cmd.DestructiveSource,
+                RecoveryReasonString = cmd.Reason,
+                ExplicitTrigger = cmd.ExplicitPolicyTrigger,
+                ExecutionInstrumentKey = execKey,
+                ReconstructionActionKind = RecoveryActionKind.Flatten
+            };
+            if (cmd.DestructiveSource == DestructiveActionSource.BOOTSTRAP)
+                built.BootstrapAdministrativeFlatten = true;
+            else if (cmd.DestructiveSource is DestructiveActionSource.MANUAL or DestructiveActionSource.COMMAND)
+                built.ManualInstrumentFlatten = true;
+            else if (cmd.DestructiveSource == DestructiveActionSource.FAIL_CLOSED)
+                built.ExplicitTrigger = DestructiveTriggerReason.FAIL_CLOSED;
+            else if (cmd.DestructiveSource == DestructiveActionSource.EMERGENCY)
+                built.ExplicitTrigger = DestructiveTriggerReason.IEA_ENQUEUE_FAILURE;
+            input = built;
+            return true;
+        }
+
+        if (!TryBuildRecoveryDestructivePolicyInputFromLiveState(cmd.Instrument, cmd.Reason, null, utcNow, out var rebuilt, out _, out _))
+        {
+            input = new DestructiveActionPolicyInput
+            {
+                Source = DestructiveActionSource.RECOVERY,
+                RecoveryReasonString = cmd.Reason,
+                ExecutionInstrumentKey = execKey,
+                ReconstructionActionKind = RecoveryActionKind.Halt
+            };
+            return true;
+        }
+
+        input = rebuilt;
+        return true;
+    }
+
     /// <summary>Phase 3: Recovery callback. Gathers broker/journal/registry/runtime data, runs reconstruction, processes result.</summary>
     private void OnRecoveryRequested(string instrument, string reason, object context, DateTimeOffset utcNow)
     {
@@ -530,31 +797,256 @@ public sealed partial class NinjaTraderSimAdapter
         var registry = _iea.GetRegistrySnapshotForRecovery();
         var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
         var result = RecoveryReconstructor.Reconstruct(instrument, brokerQty, brokerWorkingCount, journalQty, registry, runtime, reason);
-        var decision = _iea.ProcessReconstructionResult(result, utcNow);
+        var actionKind = RecoveryPhase3DecisionRules.GetActionKind(result.Classification, result);
+
+        string? triggerIntent = null;
+        string? triggerBroker = null;
+        try
+        {
+            if (context != null)
+            {
+                dynamic d = context;
+                triggerIntent = d.intent_id?.ToString();
+                triggerBroker = d.broker_order_id?.ToString();
+            }
+        }
+        catch { /* best-effort context parse */ }
+
+        var gateEngaged = _instrumentMismatchGateEngaged?.Invoke(instrument) == true
+                          || _instrumentMismatchGateEngaged?.Invoke(execInst) == true;
+
+        StateOwnershipAttributionResult? p2Attribution = null;
+        if (actionKind == RecoveryActionKind.Flatten && !RecoveryOwnershipAttributionEvaluator.IsEmergencyInstrumentRecoveryTrigger(reason))
+        {
+            var snap = _iea.BuildRecoveryAttributionSnapshot(brokerQty, brokerWorkingCount, journalQty, reason, triggerIntent, triggerBroker, gateEngaged);
+            EnrichRecoveryAttributionBrokerOrders(snap, instrument);
+            var attribution = RecoveryOwnershipAttributionEvaluator.EvaluateOwnershipAttributionForRecovery(snap);
+            p2Attribution = attribution;
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STREAM_OWNERSHIP_AMBIGUITY_DETECTED", new
+            {
+                execution_instrument_key = execInst,
+                implicated_streams = attribution.ImplicatedStreams,
+                implicated_intent_ids = attribution.ImplicatedIntentIds,
+                unattributed_order_ids = attribution.UnattributedBrokerOrderIds,
+                attributable_scope = attribution.AttributableScope.ToString(),
+                gate_state = gateEngaged ? "engaged" : "not_engaged",
+                broker_position_qty = brokerQty,
+                broker_working_count = brokerWorkingCount,
+                iea_instance_id = _iea.InstanceId
+            }));
+            var recoveryPolicyInput = new DestructiveActionPolicyInput
+            {
+                Source = DestructiveActionSource.RECOVERY,
+                RecoveryReasonString = reason,
+                ReconstructionActionKind = RecoveryActionKind.Flatten,
+                GateEngagedForSymbol = gateEngaged,
+                ExecutionInstrumentKey = execInst,
+                BrokerPositionQty = brokerQty,
+                JournalOpenQtySum = journalQty,
+                Attribution = attribution,
+                AttributionSnapshot = snap
+            };
+            var recoveryPolicyDecision = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(recoveryPolicyInput);
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_DECISION", new
+            {
+                allowed = recoveryPolicyDecision.AllowInstrumentScope,
+                reason = recoveryPolicyDecision.ReasonCode,
+                scope = recoveryPolicyDecision.CancelScopeMode,
+                policy_path = recoveryPolicyDecision.PolicyPath,
+                phase = "on_recovery_requested_instrument_escalation",
+                iea_instance_id = _iea.InstanceId
+            }));
+            if (!recoveryPolicyDecision.AllowInstrumentScope)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_SCOPED_RECOVERY_BLOCKED_BY_ATTRIBUTION", new
+                {
+                    execution_instrument_key = execInst,
+                    summary = attribution.Summary,
+                    recommended_scope = attribution.RecommendedRecoveryScope.ToString(),
+                    sibling_streams_preserved = true,
+                    destructive_action_blocked = true,
+                    policy_reason_code = recoveryPolicyDecision.ReasonCode,
+                    iea_instance_id = _iea.InstanceId
+                }));
+                _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_BLOCKED", new
+                {
+                    execution_instrument_key = execInst,
+                    reason_code = recoveryPolicyDecision.ReasonCode,
+                    phase = "on_recovery_requested_stream_containment",
+                    iea_instance_id = _iea.InstanceId
+                }));
+                _iea.ProcessReconstructionResult(result, utcNow, new P2PostReconstructionDirective
+                {
+                    UseStreamContainmentInsteadOfInstrumentFlatten = true,
+                    Attribution = attribution
+                });
+                return;
+            }
+            if (attribution.IsContradictory)
+                _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "CROSS_STREAM_CONTRADICTION_DETECTED", new
+                {
+                    execution_instrument_key = execInst,
+                    contradictions = attribution.Contradictions,
+                    iea_instance_id = _iea.InstanceId
+                }));
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_ESCALATION_APPROVED", new
+            {
+                attribution_scope = attribution.AttributableScope.ToString(),
+                reason,
+                gate_engaged = gateEngaged,
+                broker_position_qty = brokerQty,
+                journal_open_qty = journalQty,
+                execution_instrument_key = execInst,
+                iea_instance_id = _iea.InstanceId
+            }));
+            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_SCOPED_RECOVERY_ALLOWED", new
+            {
+                execution_instrument_key = execInst,
+                summary = attribution.Summary,
+                attributable_scope = attribution.AttributableScope.ToString(),
+                iea_instance_id = _iea.InstanceId
+            }));
+        }
+
+        var decision = _iea.ProcessReconstructionResult(result, utcNow, null);
         if (decision == InstrumentExecutionAuthority.RecoveryDecision.FLATTEN)
-            OnRecoveryFlattenRequested(instrument, reason, "RECOVERY_PHASE3", utcNow);
+        {
+            var emergRec = RecoveryOwnershipAttributionEvaluator.IsEmergencyInstrumentRecoveryTrigger(reason);
+            var meta = new RecoveryFlattenNtMetadata
+            {
+                HasSeal = true,
+                SealAllowInstrument = true,
+                SealReasonCode = emergRec ? "EMERGENCY_RECOVERY" : "recovery_attribution_allows_instrument",
+                AttributionScope = emergRec ? "" : (p2Attribution?.AttributableScope.ToString() ?? ""),
+                DestructiveSource = DestructiveActionSource.RECOVERY
+            };
+            EnqueueRecoveryFlattenNtCommand(instrument, reason, "RECOVERY_PHASE3", utcNow, meta);
+        }
     }
 
-    /// <summary>Phase 3: Execute recovery flatten via canonical path (enqueue NtFlattenInstrumentCommand).</summary>
-    private void OnRecoveryFlattenRequested(string instrument, string reason, string callerContext, DateTimeOffset utcNow)
+    /// <summary>IEA recovery flatten callback (fixed arity). Consumes staged P2.6 metadata from IEA.</summary>
+    private void OnRecoveryFlattenRequestedFromIeCallback(string instrument, string reason, string callerContext, DateTimeOffset utcNow)
     {
-        var cid = $"RECOVERY:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
-        _ntActionQueue?.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, null, instrument, reason, utcNow), out _);
+        RecoveryFlattenNtMetadata? meta = null;
+        _iea?.TryConsumeRecoveryFlattenNtMetadata(out meta);
+        EnqueueRecoveryFlattenNtCommand(instrument, reason, callerContext, utcNow, meta);
+    }
+
+    /// <summary>Phase 3: Enqueue NtFlattenInstrumentCommand with P2.6 policy seal / source.</summary>
+    private void EnqueueRecoveryFlattenNtCommand(string instrument, string reason, string callerContext, DateTimeOffset utcNow, RecoveryFlattenNtMetadata? meta)
+    {
+        var src = meta?.DestructiveSource ?? DestructiveActionSource.RECOVERY;
+        var prefix = src == DestructiveActionSource.BOOTSTRAP ? "BOOTSTRAP" : "RECOVERY";
+        var cid = $"{prefix}:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+        var hasSeal = meta?.HasSeal ?? false;
+        var sealAllow = meta?.SealAllowInstrument ?? false;
+        var cmd = new NtFlattenInstrumentCommand(
+            cid,
+            null,
+            instrument,
+            reason,
+            utcNow,
+            destructiveSource: src,
+            explicitPolicyTrigger: null,
+            allowAccountWideCancelFallback: false,
+            hasRecoveryPolicySeal: hasSeal,
+            recoveryPolicySealAllowInstrument: sealAllow,
+            recoveryPolicySealCode: meta?.SealReasonCode,
+            recoveryPolicySealAttributionScope: meta?.AttributionScope);
+        _ntActionQueue?.EnqueueNtAction(cmd, out _);
     }
 
     void INtActionExecutor.ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd)
     {
-        _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_REQUESTED", new { correlation_id = cmd.CorrelationId, reason = cmd.Reason }));
-        // Cancel-then-flatten: cancel robot-owned working orders first to prevent refills/reopens
-        CancelRobotOwnedWorkingOrdersReal(default, cmd.UtcNow);
+        var utcNow = cmd.UtcNow;
+        var execKey = _iea?.ExecutionInstrumentKey ?? "";
+        var preTrigger = DestructiveTriggerParser.Resolve(cmd.ExplicitPolicyTrigger, cmd.Reason);
+        _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_ACTION_REQUESTED", new
+        {
+            execution_instrument_key = execKey,
+            correlation_id = cmd.CorrelationId,
+            source = cmd.DestructiveSource.ToString(),
+            trigger = preTrigger.ToString(),
+            instrument = cmd.Instrument,
+            phase = "execute_flatten_instrument_entry"
+        }));
+
+        TryBuildDestructivePolicyInputForFlattenCommand(cmd, utcNow, out var policyTemplate);
+        var decision = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(policyTemplate!);
+        _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_ACTION_DECISION", new
+        {
+            allowed = decision.AllowInstrumentScope,
+            reason = decision.ReasonCode,
+            scope = decision.CancelScopeMode,
+            policy_path = decision.PolicyPath,
+            phase = "pre_cancel_execute_flatten_instrument",
+            correlation_id = cmd.CorrelationId
+        }));
+
+        int brokerQtySigned = 0, brokerQty = 0, journalQty = 0;
+        try
+        {
+            var (qty, _) = ((IIEAOrderExecutor)this).GetAccountPositionForInstrument(cmd.Instrument);
+            brokerQtySigned = qty;
+            brokerQty = Math.Abs(qty);
+            var execInst = execKey;
+            var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
+            journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(cmd.Instrument, execVariant);
+        }
+        catch { /* observability only */ }
+
+        if (!decision.AllowInstrumentScope)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_ACTION_BLOCKED", new
+            {
+                execution_instrument_key = execKey,
+                correlation_id = cmd.CorrelationId,
+                trigger_source = cmd.DestructiveSource.ToString(),
+                reason_code = decision.ReasonCode,
+                policy_path = decision.PolicyPath,
+                is_emergency = decision.IsEmergency,
+                note = "P2.6: instrument flatten denied by centralized policy"
+            }));
+            throw new InvalidOperationException($"P2.6: destructive policy denied instrument flatten ({decision.ReasonCode})");
+        }
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_REQUESTED", new { correlation_id = cmd.CorrelationId, reason = cmd.Reason }));
+        // Cancel-then-flatten: cancel robot-owned working orders first (P2.6: scoped to instrument unless explicit set / fallback)
+        CancelRobotOwnedWorkingOrdersReal(default, utcNow, cmd.Instrument, cmd.ExplicitCancelBrokerOrderIds, cmd.AllowAccountWideCancelFallback, cmd.CorrelationId);
+        try
+        {
+            var execVariantPostCancel = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
+            var journalAfterCancel = _executionJournal.GetOpenJournalQuantitySumForInstrument(cmd.Instrument, execVariantPostCancel);
+            if (journalAfterCancel != journalQty)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
+                {
+                    drift_kind = "journal_open_qty_after_cancel_phase",
+                    precheck_journal = journalQty,
+                    post_cancel_journal = journalAfterCancel,
+                    correlation_id = cmd.CorrelationId,
+                    note = "P2.6.7: journal sum changed between pre-check and post-cancel (RequestFlatten still uses final broker read)"
+                }));
+            }
+        }
+        catch { /* observability */ }
+
         FlattenResult result;
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            result = _iea.RequestFlatten(cmd.Instrument, cmd.Reason, cmd.IntentId ?? "NT_FLATTEN", cmd.UtcNow);
+            var flattenCtx = FlattenPolicyExecutionContext.FromDestructivePolicyInput(policyTemplate!);
+            flattenCtx.PrecheckBrokerPositionQtyAbs = brokerQty;
+            flattenCtx.PrecheckBrokerQtySigned = brokerQtySigned;
+            flattenCtx.PrecheckJournalOpenQtySum = journalQty;
+            flattenCtx.PrecheckCorrelationId = cmd.CorrelationId;
+            flattenCtx.PrecheckPolicyReasonCode = decision.ReasonCode;
+            flattenCtx.PrecheckAllowInstrument = decision.AllowInstrumentScope;
+            result = _iea.RequestFlatten(cmd.Instrument, cmd.Reason, cmd.IntentId ?? "NT_FLATTEN", cmd.UtcNow, flattenCtx);
         }
         else
         {
-            result = FlattenIntentReal(cmd.IntentId ?? "NT_FLATTEN", cmd.Instrument, cmd.UtcNow);
+            var token = NtDestructivePolicyAlreadyAppliedToken.ForNtFlattenCommand(cmd, decision.ReasonCode);
+            result = FlattenIntentReal(cmd.IntentId ?? "NT_FLATTEN", cmd.Instrument, cmd.UtcNow, policyPrechecked: token, cmd.DestructiveSource, cmd.ExplicitPolicyTrigger);
         }
         _log.Write(RobotEvents.ExecutionBase(cmd.UtcNow, cmd.IntentId ?? "", cmd.Instrument, "FLATTEN_SUBMITTED", new { correlation_id = cmd.CorrelationId, success = result.Success }));
         if (!result.Success) throw new InvalidOperationException($"Flatten failed: {result.ErrorMessage}");
@@ -708,7 +1200,8 @@ public sealed partial class NinjaTraderSimAdapter
                 if (retryCount < FLATTEN_VERIFY_MAX_RETRIES)
                 {
                     var newCid = $"{correlationId}:R{retryCount + 1}";
-                    _ntActionQueue?.EnqueueNtAction(new NtFlattenInstrumentCommand(newCid, null, instrumentKey, $"VERIFY_FAIL_RETRY_{retryCount + 1}", utcNow), out _);
+                    _ntActionQueue?.EnqueueNtAction(new NtFlattenInstrumentCommand(newCid, null, instrumentKey, $"VERIFY_FAIL_RETRY_{retryCount + 1}", utcNow,
+                        DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL), out _);
                     _pendingFlattenVerifications[instrumentKey] = (utcNow, retryCount + 1, utcNow.AddSeconds(FLATTEN_VERIFY_WINDOW_SEC), newCid, instrumentRef);
                 }
                 else
@@ -2399,7 +2892,8 @@ public sealed partial class NinjaTraderSimAdapter
         if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
         {
             var cid = $"UNKNOWN_ORDER:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "UNKNOWN_ORDER_FILL", utcNow), out _);
+            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, instrument, "UNKNOWN_ORDER_FILL", utcNow,
+                DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED), out _);
             var ns = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
             ns?.EnqueueNotification($"UNKNOWN_ORDER_FILL_ENQUEUED:{intentId}", $"Unknown Order Fill - Flatten Enqueued - {instrument}", $"Fill for order not in map. Intent: {intentId}", priority: 1);
         }
@@ -2535,7 +3029,8 @@ public sealed partial class NinjaTraderSimAdapter
             if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
             {
                 var cid = $"UNTrackED_FILL:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
-                _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, null, instrument, "UNTrackED_FILL", utcNow), out _);
+                _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, null, instrument, "UNTrackED_FILL", utcNow,
+                    DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED), out _);
                 LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_ENQUEUED",
                     new
                     {
@@ -3117,7 +3612,8 @@ public sealed partial class NinjaTraderSimAdapter
                 if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
                 {
                     var cid = $"INTENT_LOST:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-                    _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, orderInfo.Instrument, "INTENT_NOT_FOUND_AFTER_CONTEXT", utcNow), out _);
+                    _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid, intentId, orderInfo.Instrument, "INTENT_NOT_FOUND_AFTER_CONTEXT", utcNow,
+                        DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED), out _);
                     LogCriticalEngineWithIeaContext(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_ENQUEUED", "ENGINE",
                         new { intent_id = intentId, instrument = orderInfo.Instrument, stream = context.Stream, correlation_id = cid });
                     _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
@@ -5365,19 +5861,16 @@ public sealed partial class NinjaTraderSimAdapter
     }
     
     /// <summary>
-    /// Emergency flatten when IEA is blocked. Routes through IEA RequestFlatten (no bypass).
-    /// Prevents position with no protectives when EnqueueAndWait times out.
+    /// Emergency flatten when IEA is blocked. P2.6.6: always NtFlattenInstrumentCommand → ExecuteFlattenInstrument (policy funnel).
     /// </summary>
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_ON_BLOCK", state: "ENGINE",
-            new { instrument, note = "Flatten on block — requesting via IEA RequestFlatten" }));
+            new { instrument, note = "Flatten on block — enqueued via NtFlattenInstrumentCommand (policy funnel)" }));
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == System.Threading.Thread.CurrentThread.ManagedThreadId;
-            if (inContext)
-                return _iea.RequestFlatten(instrument, "IEA_BLOCK_EMERGENCY", "FlattenEmergency", utcNow);
-            var cmd = new NtFlattenInstrumentCommand($"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}", "EMERGENCY_BLOCK", instrument, "IEA_BLOCK_EMERGENCY", utcNow);
+            var cmd = new NtFlattenInstrumentCommand($"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}", "EMERGENCY_BLOCK", instrument, "IEA_BLOCK_EMERGENCY", utcNow,
+                DestructiveActionSource.EMERGENCY, DestructiveTriggerReason.IEA_ENQUEUE_FAILURE);
             _ntActionQueue?.EnqueueNtAction(cmd, out _);
             return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
         }
@@ -5386,8 +5879,9 @@ public sealed partial class NinjaTraderSimAdapter
 
     /// <summary>
     /// Flatten exposure for a specific intent only using real NT API.
+    /// P2.6.7: pre-submit policy is mandatory unless <paramref name="policyPrechecked"/> is minted by ExecuteFlattenInstrument (token + instrument invariants).
     /// </summary>
-    private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
+    private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow, NtDestructivePolicyAlreadyAppliedToken? policyPrechecked = null, DestructiveActionSource? destructiveSourceOverride = null, DestructiveTriggerReason? explicitTriggerOverride = null)
     {
         PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
         if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
@@ -5476,6 +5970,94 @@ public sealed partial class NinjaTraderSimAdapter
                 }
                 var absQty = Math.Abs(qty);
                 var chosenSide = dir.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+
+                if (policyPrechecked.HasValue)
+                {
+                    if (!string.Equals(instrument, policyPrechecked.Value.ExpectedInstrumentKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_POLICY_INVARIANT_VIOLATION", new
+                        {
+                            drift_kind = "policy_token_instrument_mismatch",
+                            token_expected = policyPrechecked.Value.ExpectedInstrumentKey,
+                            actual_instrument = instrument,
+                            correlation_id = policyPrechecked.Value.CorrelationId,
+                            note = "P2.6.7: NtDestructivePolicyAlreadyAppliedToken does not match instrument — refusing skip"
+                        }));
+                        resultHolder[0] = FlattenResult.FailureResult("P2.6.7: destructive policy token instrument mismatch", utcNow);
+                        return;
+                    }
+                    var ct = System.Threading.Thread.CurrentThread.ManagedThreadId;
+                    if (_strategyThreadContextCount <= 0 || _strategyThreadId != ct)
+                    {
+                        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_POLICY_INVARIANT_VIOLATION", new
+                        {
+                            drift_kind = "policy_token_wrong_thread",
+                            correlation_id = policyPrechecked.Value.CorrelationId,
+                            note = "P2.6.7: policy preclear token requires strategy thread context"
+                        }));
+                        resultHolder[0] = FlattenResult.FailureResult("P2.6.7: policy token requires strategy thread", utcNow);
+                        return;
+                    }
+                }
+
+                if (!policyPrechecked.HasValue)
+                {
+                    var execKey = _iea?.ExecutionInstrumentKey ?? instrument;
+                    var execVariant = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
+                    var journalQty = _executionJournal != null
+                        ? _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant)
+                        : 0;
+                    var src = destructiveSourceOverride
+                              ?? (intentId == "EMERGENCY_BLOCK" ? DestructiveActionSource.EMERGENCY : DestructiveActionSource.MANUAL);
+                    DestructiveTriggerReason? expl = explicitTriggerOverride;
+                    if (src == DestructiveActionSource.EMERGENCY)
+                        expl ??= DestructiveTriggerReason.IEA_ENQUEUE_FAILURE;
+                    else if (src == DestructiveActionSource.FAIL_CLOSED)
+                        expl ??= DestructiveTriggerReason.FAIL_CLOSED;
+                    else
+                        expl ??= DestructiveTriggerReason.MANUAL;
+                    var polIn = new DestructiveActionPolicyInput
+                    {
+                        Source = src,
+                        RecoveryReasonString = intentId,
+                        ExplicitTrigger = expl,
+                        ExecutionInstrumentKey = execKey,
+                        BrokerPositionQty = absQty,
+                        JournalOpenQtySum = journalQty,
+                        ReconstructionActionKind = RecoveryActionKind.Flatten,
+                        ManualInstrumentFlatten = src is DestructiveActionSource.MANUAL or DestructiveActionSource.COMMAND,
+                        BootstrapAdministrativeFlatten = src == DestructiveActionSource.BOOTSTRAP
+                    };
+                    var tr = DestructiveTriggerParser.Resolve(polIn.ExplicitTrigger, polIn.RecoveryReasonString);
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_REQUESTED", new
+                    {
+                        source = src.ToString(),
+                        trigger = tr.ToString(),
+                        execution_instrument_key = execKey,
+                        phase = "flatten_intent_real_pre_submit"
+                    }));
+                    var polDec = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(polIn);
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_DECISION", new
+                    {
+                        allowed = polDec.AllowInstrumentScope,
+                        reason = polDec.ReasonCode,
+                        scope = polDec.CancelScopeMode,
+                        policy_path = polDec.PolicyPath,
+                        phase = "flatten_intent_real_pre_submit"
+                    }));
+                    if (!polDec.AllowInstrumentScope)
+                    {
+                        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_BLOCKED", new
+                        {
+                            execution_instrument_key = execKey,
+                            reason_code = polDec.ReasonCode,
+                            note = "P2.6.6: FlattenIntentReal blocked by policy (no order submitted)"
+                        }));
+                        resultHolder[0] = FlattenResult.FailureResult($"Destructive policy denied flatten ({polDec.ReasonCode})", utcNow);
+                        return;
+                    }
+                }
+
                 var snapshot = new FlattenDecisionSnapshot
                 {
                     Instrument = instrument,
@@ -5489,6 +6071,20 @@ public sealed partial class NinjaTraderSimAdapter
                     DecisionUtc = utcNow
                 };
                 var submitResult = (this as IIEAOrderExecutor).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow);
+                if (submitResult.Success)
+                {
+                    var execKey2 = _iea?.ExecutionInstrumentKey ?? instrument;
+                    var src2 = destructiveSourceOverride
+                               ?? (intentId == "EMERGENCY_BLOCK" ? DestructiveActionSource.EMERGENCY : DestructiveActionSource.MANUAL);
+                    var tr2 = DestructiveTriggerParser.Resolve(explicitTriggerOverride ?? (src2 == DestructiveActionSource.EMERGENCY ? DestructiveTriggerReason.IEA_ENQUEUE_FAILURE : DestructiveTriggerReason.MANUAL), intentId);
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "DESTRUCTIVE_ACTION_EXECUTED", new
+                    {
+                        execution_instrument_key = execKey2,
+                        source = src2.ToString(),
+                        trigger = tr2.ToString(),
+                        phase = "flatten_intent_real_order_submitted"
+                    }));
+                }
                 resultHolder[0] = submitResult.Success ? FlattenResult.SuccessResult(utcNow) : FlattenResult.FailureResult(submitResult.ErrorMessage ?? "Flatten order failed", utcNow);
             }))
             {
@@ -5856,53 +6452,124 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
-    private void CancelRobotOwnedWorkingOrdersReal(AccountSnapshot snap, DateTimeOffset utcNow)
+    private void CancelRobotOwnedWorkingOrdersReal(
+        AccountSnapshot snap,
+        DateTimeOffset utcNow,
+        string? instrumentRootForScope,
+        IReadOnlyList<string>? explicitBrokerOrderIds,
+        bool allowAccountWideCancelFallback,
+        string? correlationId)
     {
         if (_ntAccount == null)
-        {
             return;
-        }
-        
+
         var account = _ntAccount as Account;
         if (account == null)
-        {
             return;
-        }
-        
+
+        var executionInstrumentKey = _iea?.ExecutionInstrumentKey ?? "";
+        var instRoot = (instrumentRootForScope ?? "").Split(' ').FirstOrDefault() ?? instrumentRootForScope ?? "";
+        var totalSeen = 0;
         var ordersToCancel = new List<Order>();
-        
+        string cancelScopeApplied;
+
         try
         {
-            // Find robot-owned orders in account
+            var idSet = explicitBrokerOrderIds != null && explicitBrokerOrderIds.Count > 0
+                ? new HashSet<string>(explicitBrokerOrderIds, StringComparer.OrdinalIgnoreCase)
+                : null;
+
+            if (idSet == null && string.IsNullOrEmpty(instRoot) && !allowAccountWideCancelFallback)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_SCOPE_SKIPPED_NO_INSTRUMENT", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument_key = executionInstrumentKey,
+                        correlation_id = correlationId,
+                        note = "P2.6: no instrument scope, no explicit order set, fallback disabled — robot cancel skipped"
+                    }));
+                return;
+            }
+
+            if (idSet == null && string.IsNullOrEmpty(instRoot) && allowAccountWideCancelFallback)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_SCOPE_FALLBACK_ACCOUNT_WIDE", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument_key = executionInstrumentKey,
+                        correlation_id = correlationId,
+                        note = "P2.6: instrument scope unavailable — account-wide QTSW2 cancel fallback"
+                    }));
+            }
+
             foreach (var order in account.Orders)
             {
                 if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
-                {
                     continue;
-                }
-                
+                totalSeen++;
+
                 var tag = GetOrderTag(order) ?? "";
                 var oco = order.Oco ?? "";
-                
-                // Strict robot-owned detection: Tag or OCO starts with "QTSW2:"
-                if ((!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) ||
-                    (!string.IsNullOrEmpty(oco) && oco.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)))
+                var isRobot = (!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) ||
+                              (!string.IsNullOrEmpty(oco) && oco.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase));
+                if (!isRobot)
+                    continue;
+
+                if (idSet != null)
                 {
-                    ordersToCancel.Add(order);
+                    var oid = order.OrderId.ToString() ?? "";
+                    if (idSet.Contains(oid))
+                        ordersToCancel.Add(order);
+                    continue;
                 }
+
+                if (!string.IsNullOrEmpty(instRoot))
+                {
+                    var oInst = order.Instrument?.MasterInstrument?.Name ?? order.Instrument?.FullName ?? "";
+                    if (ExecutionInstrumentResolver.IsSameInstrument(oInst, instRoot))
+                        ordersToCancel.Add(order);
+                    continue;
+                }
+
+                if (allowAccountWideCancelFallback)
+                    ordersToCancel.Add(order);
             }
-            
+
+            cancelScopeApplied = idSet != null ? "explicit_set" : (!string.IsNullOrEmpty(instRoot) ? "instrument" : "fallback_account");
+
             if (ordersToCancel.Count > 0)
             {
                 var ordersArr = ordersToCancel.ToArray();
                 if (!EnsureStrategyThreadOrEnqueue("CancelRobotOwnedWorkingOrdersReal", null, null, "CANCEL_ROBOT_ORDERS", () => account.Cancel(ordersArr)))
                     return;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_SCOPE_APPLIED", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument_key = executionInstrumentKey,
+                        correlation_id = correlationId,
+                        total_orders_seen = totalSeen,
+                        total_orders_cancelled = ordersToCancel.Count,
+                        cancel_scope = cancelScopeApplied
+                    }));
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ROBOT_ORDERS_CANCELLED", state: "ENGINE",
                     new
                     {
                         cancelled_count = ordersToCancel.Count,
                         cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
-                        note = "Robot-owned working orders cancelled"
+                        cancel_scope = cancelScopeApplied,
+                        note = "Robot-owned working orders cancelled (P2.6 scoped)"
+                    }));
+            }
+            else if (totalSeen > 0)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_SCOPE_APPLIED", state: "ENGINE",
+                    new
+                    {
+                        execution_instrument_key = executionInstrumentKey,
+                        correlation_id = correlationId,
+                        total_orders_seen = totalSeen,
+                        total_orders_cancelled = 0,
+                        cancel_scope = cancelScopeApplied
                     }));
             }
         }

@@ -79,6 +79,17 @@ public sealed class MismatchInstrumentState
     public long PersistenceMs { get; set; }
     public string? LastSummary { get; set; }
     public bool MismatchStillPresent { get; set; }
+
+    /// <summary>P1.5-A: Gate lifecycle (instrument-scoped). <see cref="GateLifecyclePhase.None"/> when gate not active.</summary>
+    public GateLifecyclePhase GateLifecyclePhase { get; set; }
+
+    /// <summary>Start of continuous release-ready window (UTC).</summary>
+    public DateTimeOffset FirstConsistentUtc { get; set; }
+
+    public DateTimeOffset LastConsistentUtc { get; set; }
+    public DateTimeOffset LastReleaseUtc { get; set; }
+    public DateTimeOffset LastGateEngagedUtc { get; set; }
+    public int StableWindowMsApplied { get; set; }
 }
 
 /// <summary>Policy thresholds for mismatch escalation.</summary>
@@ -92,4 +103,16 @@ public static class MismatchEscalationPolicy
 
     /// <summary>Block reason for persistent mismatch. Distinguishable from protective, queue poison, supervisory.</summary>
     public const string BLOCK_REASON_PERSISTENT_MISMATCH = "PERSISTENT_RECONCILIATION_MISMATCH";
+
+    /// <summary>
+    /// Block new risk immediately on first mismatch detection (before persistence threshold).
+    /// Escalation still advances to PERSISTENT_MISMATCH for logging/metrics; block reason then upgrades.
+    /// </summary>
+    public const string BLOCK_REASON_STATE_CONSISTENCY_GATE = "STATE_CONSISTENCY_GATE";
+
+    /// <summary>P1.5-C: Minimum continuous time release invariants must hold before unblock (live default).</summary>
+    public const int STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE = 10_000;
+
+    /// <summary>P1.5-C: Slightly longer window when snapshots/noise warrant (sim / harness).</summary>
+    public const int STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM = 12_000;
 }

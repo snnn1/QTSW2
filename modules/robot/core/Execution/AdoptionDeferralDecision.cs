@@ -32,17 +32,18 @@ public static class AdoptionDeferralDecision
     /// </summary>
     /// <param name="candidateCount">Count from GetAdoptionCandidateIntentIds.</param>
     /// <param name="qtsw2WorkingCount">Broker working orders with QTSW2 tag.</param>
-    /// <param name="deferredCount">Number of deferred scans so far (1-based).</param>
-    /// <param name="elapsedSinceFirstScanMs">Milliseconds since first deferred scan.</param>
-    /// <param name="graceSeconds">Grace window (default 20).</param>
-    /// <param name="maxDeferredScans">Max retries before grace expiry (default 10).</param>
+    /// <param name="elapsedSinceFirstScanMs">Wall-clock milliseconds since first scan in this adoption episode (see IEA _firstAdoptionScanUtc).</param>
+    /// <param name="graceSeconds">Grace window (default 60). Only wall-clock time gates UNOWNED — not scan count.</param>
+    /// <remarks>
+    /// Previous versions also capped deferral by scan count. NinjaTrader can emit many execution updates per second,
+    /// each triggering a scan, which exhausted the cap in &lt;1s while elapsed wall time was still ~0 — false UNOWNED
+    /// and flatten (see docs/robot/incidents/2026-03-19_ES1_ES2_ADOPTION_AND_SUBMISSION_INVESTIGATION.md).
+    /// </remarks>
     public static AdoptionDeferralAction Evaluate(
         int candidateCount,
         int qtsw2WorkingCount,
-        int deferredCount,
         long elapsedSinceFirstScanMs,
-        int graceSeconds = 20,
-        int maxDeferredScans = 10)
+        int graceSeconds = 60)
     {
         if (candidateCount > 0)
             return AdoptionDeferralAction.Proceed;
@@ -50,10 +51,8 @@ public static class AdoptionDeferralDecision
         if (candidateCount == 0 && qtsw2WorkingCount == 0)
             return AdoptionDeferralAction.CandidatesEmptyNoBrokerOrders;
 
-        // candidateCount == 0 && qtsw2WorkingCount > 0
-        var withinGrace = elapsedSinceFirstScanMs < graceSeconds * 1000L;
-        var underRetryLimit = deferredCount <= maxDeferredScans;
-        if (withinGrace && underRetryLimit)
+        // candidateCount == 0 && qtsw2WorkingCount > 0 — defer on wall clock only
+        if (elapsedSinceFirstScanMs < graceSeconds * 1000L)
             return AdoptionDeferralAction.Defer;
         return AdoptionDeferralAction.GraceExpiredUnowned;
     }
@@ -64,24 +63,21 @@ public static class AdoptionDeferralDecision
     /// </summary>
     /// <param name="candidateCountPerScan">Candidate count for each scan (1-based index).</param>
     /// <param name="qtsw2WorkingCount">Broker QTSW2 orders (constant).</param>
-    /// <param name="msBetweenScans">Milliseconds between scans.</param>
+    /// <param name="msBetweenScans">Simulated wall-clock ms added after each Defer (models time between retries).</param>
     public static AdoptionDeferralAction[] SimulateSequence(
         int[] candidateCountPerScan,
         int qtsw2WorkingCount,
-        int msBetweenScans = 5000)
+        int msBetweenScans = 5000,
+        int graceSeconds = 60)
     {
         var results = new AdoptionDeferralAction[candidateCountPerScan.Length];
         long elapsedMs = 0;
-        int deferredCount = 0;
         for (int i = 0; i < candidateCountPerScan.Length; i++)
         {
-            var action = Evaluate(candidateCountPerScan[i], qtsw2WorkingCount, deferredCount + 1, elapsedMs);
+            var action = Evaluate(candidateCountPerScan[i], qtsw2WorkingCount, elapsedMs, graceSeconds);
             results[i] = action;
             if (action == AdoptionDeferralAction.Defer)
-            {
-                deferredCount++;
                 elapsedMs += msBetweenScans;
-            }
         }
         return results;
     }
