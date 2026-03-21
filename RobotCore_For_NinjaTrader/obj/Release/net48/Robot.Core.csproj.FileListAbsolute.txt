@@ -9,6 +9,8 @@ C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\System.Text.Enc
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\System.Text.Json.dll
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\System.Threading.Tasks.Extensions.dll
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\System.ValueTuple.dll
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Contracts.dll
+C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Contracts.pdb
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.csproj.AssemblyReference.cache
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.GeneratedMSBuildEditorConfig.editorconfig
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.csproj.CoreCompileInputs.cache
@@ -16,5 +18,3 @@ C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.sour
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.csproj.Up2Date
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.dll
 C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\obj\Release\net48\Robot.Core.pdb
-C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Contracts.dll
-C:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Contracts.pdb
