@@ -12,8 +12,8 @@
 **Path:** `TryLockRange` → `SubmitStopEntryBracketsAtLock(utcNow)`.
 
 **Gates:**
-- Freshness window: `(utcNow - SlotTimeUtc).TotalMinutes <= initial_submission_freshness_minutes` (default **3** when omitted from spec). Set **`breakout.initial_submission_freshness_minutes` to `0`** (or negative) in the parity spec JSON to **disable** the time-based block; **`NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION`** is not used for delay-from-slot in that case.
-- Price sanity: not "clearly stale" (long: `ask < brkLong + sanityTolerance`; short: `bid > brkShort - sanityTolerance`) — still applies when freshness is disabled.
+- Freshness window: `(utcNow - SlotTimeUtc).TotalMinutes <= initial_submission_freshness_minutes` (default **0** / **disabled** when omitted from spec or in `configs/analyzer_robot_parity.json`). Set **`breakout.initial_submission_freshness_minutes`** to a **positive** value to **enable** the time-based block; **`NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION`** is not used for delay-from-slot when the value is **≤ 0**.
+- **P2.10 unified breakout validity:** `LogAndEvaluateUnifiedBreakoutEntryValidity(..., "FIRST_LOCK", failClosedOnMissingQuotes: false)` — same tick math as restart/recovery (`instruments[*].breakout_validity_tolerance_ticks`, default **2**); missing bid+ask → **fail-open** on first lock.
 - Breakout levels present, before market close.
 
 **Decision:** `GetCurrentMarketPrice` → if `ask >= brkLong` → MARKET BUY; if `bid <= brkShort` → MARKET SELL; else STOP.
@@ -30,11 +30,11 @@
 
 **Block reasons:**
 - `INITIAL_SUBMISSION_BLOCKED_MATERIALLY_DELAYED`: `freshness_minutes > 0` and `delay_from_slot_minutes > freshness_minutes`.
-- `INITIAL_SUBMISSION_BLOCKED_PRICE_SANITY`: price clearly beyond breakout (sanity_ticks).
+- `BREAKOUT_INVALIDATED_UNIFIED` / `NO_TRADE_UNIFIED_BREAKOUT_INVALID`: price beyond `brk ± breakout_validity_tolerance_ticks` (same rule as restart/recovery).
 
-**Outcome:** `Commit(utcNow, "NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION" | "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY", ...)`.
+**Outcome:** `Commit(utcNow, "NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION" | "NO_TRADE_UNIFIED_BREAKOUT_INVALID", ...)`.
 
-**Note:** Delayed resubmit/restart retry uses separate path (`HandleRangeLockedState` + `IsBreakoutValidForResubmit`).
+**Note:** Restart retry and recovery use the **same** `IsBreakoutStillValidForEntry` math with **fail-closed** when bid and ask are both missing (`RECOVERY` / `RESTART` paths).
 
 ---
 
@@ -66,7 +66,7 @@
 - `!_stopBracketsSubmittedAtLock`, `!_entryDetected`, before market close.
 - Range and breakout levels available.
 - Intents not already submitted (idempotency).
-- `IsBreakoutValidForResubmit(utcNow) == true`.
+- `LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RESTART", true) == true`.
 
 **If breakout crossed beyond tolerance:** `Commit(utcNow, "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED", ...)`.
 

@@ -1863,6 +1863,37 @@ public sealed class StreamStateMachine
                         Commit(utcNow, "NO_TRADE_LATE_START_MISSED_BREAKOUT", "NO_TRADE_LATE_START_MISSED_BREAKOUT");
                         return; // Do not transition to ARMED
                     }
+
+                    // P2.10: bar-based missed-breakout passed — align with unified tick rule vs breakout stops (last bar close if no top-of-book).
+                    if (isLateStart && reconstructedRangeHigh.HasValue && reconstructedRangeLow.HasValue)
+                    {
+                        var brkL = UtilityRoundToTick.RoundToTick(reconstructedRangeHigh.Value + _tickSize, _tickSize);
+                        var brkS = UtilityRoundToTick.RoundToTick(reconstructedRangeLow.Value - _tickSize, _tickSize);
+                        decimal? hbBid = null, hbAsk = null;
+                        if (_executionAdapter != null)
+                        {
+                            var t = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
+                            hbBid = t.Bid;
+                            hbAsk = t.Ask;
+                        }
+                        if (!hbBid.HasValue && !hbAsk.HasValue)
+                        {
+                            var snap = GetBarBufferSnapshot();
+                            if (snap.Count > 0)
+                            {
+                                snap.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+                                var c = snap[snap.Count - 1].Close;
+                                hbBid = c;
+                                hbAsk = c;
+                            }
+                        }
+                        if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "LATE_HYDRATION", failClosedOnMissingQuotes: false,
+                                brkL, brkS, hbBid, hbAsk))
+                        {
+                            Commit(utcNow, "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID");
+                            return;
+                        }
+                    }
                     
                     // HYDRATION_SNAPSHOT: Consolidated snapshot per stream
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, 
@@ -2160,6 +2191,37 @@ public sealed class StreamStateMachine
                 catch (Exception)
                 {
                     // Fail-safe: hydration logging never throws
+                }
+
+                // P2.10: after bar-based missed-breakout scan, unify with same tick rule (DRYRUN path; SIM path above).
+                if (!missedBreakout && isLateStart && reconstructedRangeHigh.HasValue && reconstructedRangeLow.HasValue)
+                {
+                    var brkL = UtilityRoundToTick.RoundToTick(reconstructedRangeHigh.Value + _tickSize, _tickSize);
+                    var brkS = UtilityRoundToTick.RoundToTick(reconstructedRangeLow.Value - _tickSize, _tickSize);
+                    decimal? hbBid = null, hbAsk = null;
+                    if (_executionAdapter != null)
+                    {
+                        var t = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
+                        hbBid = t.Bid;
+                        hbAsk = t.Ask;
+                    }
+                    if (!hbBid.HasValue && !hbAsk.HasValue)
+                    {
+                        var snap = GetBarBufferSnapshot();
+                        if (snap.Count > 0)
+                        {
+                            snap.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+                            var c = snap[snap.Count - 1].Close;
+                            hbBid = c;
+                            hbAsk = c;
+                        }
+                    }
+                    if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "LATE_HYDRATION", failClosedOnMissingQuotes: false,
+                            brkL, brkS, hbBid, hbAsk))
+                    {
+                        Commit(utcNow, "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID");
+                        return;
+                    }
                 }
                 
                 Transition(utcNow, StreamState.ARMED, shouldForceTransition ? "PRE_HYDRATION_FORCED_TIMEOUT" : "PRE_HYDRATION_COMPLETE");
@@ -2537,7 +2599,7 @@ public sealed class StreamStateMachine
             
             if (!alreadySubmitted)
             {
-                if (IsBreakoutValidForResubmit(utcNow))
+                if (LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RESTART", failClosedOnMissingQuotes: true))
                 {
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
@@ -2818,89 +2880,100 @@ public sealed class StreamStateMachine
         return orderIds;
     }
 
-    /// <summary>
-    /// Breakout validity gate for delayed resubmit paths (recovery, restart retry).
-    /// Returns true if submission can proceed (price has not crossed breakout beyond tolerance).
-    /// Returns false if blocked; logs BREAKOUT_INVALIDATED and ENTRY_RESUBMIT_BLOCKED_BREAKOUT.
-    /// Fail-open: returns true when adapter is null or breakout levels missing (gate not applicable).
-    /// NOT used for initial slot-time submission — only for delayed resubmit-style paths.
-    /// </summary>
-    private bool IsBreakoutValidForResubmit(DateTimeOffset utcNow)
+    /// <summary>P2.10: Single tick-distance rule vs breakout stops (parity: <see cref="ParityInstrument.breakout_validity_tolerance_ticks"/>).</summary>
+    private int GetBreakoutValidityToleranceTicks()
     {
-        var toleranceTicks = 2;
         if (_spec != null && _spec.TryGetInstrument(Instrument, out var inst))
-            toleranceTicks = inst.breakout_validity_tolerance_ticks;
-        if (_executionAdapter == null || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
-            return true; // Fail open — gate not applicable
+            return Math.Max(1, inst.breakout_validity_tolerance_ticks);
+        return 2;
+    }
 
-        var (bid, ask) = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
-        var brkLong = _brkLongRounded.Value;
-        var brkShort = _brkShortRounded.Value;
-        var tolerance = toleranceTicks * _tickSize;
-        // Recovery/restart retry: fail-closed when price unavailable (blocks silent bad entries during uncertainty)
+    /// <summary>P2.10 mandatory core: same math for every path; missing-quote policy is caller-controlled.</summary>
+    private bool IsBreakoutStillValidForEntry(
+        decimal? bid,
+        decimal? ask,
+        decimal brkLong,
+        decimal brkShort,
+        int toleranceTicks,
+        bool failClosedOnMissingQuotes)
+    {
         if (!bid.HasValue && !ask.HasValue)
-        {
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "ENTRY_RESUBMIT_BLOCKED_PRICE_UNAVAILABLE", State.ToString(),
-                new
-                {
-                    stream_id = Stream,
-                    metric_type = "blocked_price_unavailable",
-                    note = "Delayed resubmit blocked - market price unavailable; fail-closed to prevent silent bad entry"
-                }));
-            return false;
-        }
+            return !failClosedOnMissingQuotes;
+        var tolerance = toleranceTicks * _tickSize;
         var longInvalid = ask.HasValue && ask.Value >= brkLong + tolerance;
         var shortInvalid = bid.HasValue && bid.Value <= brkShort - tolerance;
+        return !(longInvalid || shortInvalid);
+    }
 
-        if (!longInvalid && !shortInvalid)
+    /// <summary>
+    /// P2.10 unified gate: logs <c>BREAKOUT_VALIDATED_UNIFIED</c> / <c>BREAKOUT_INVALIDATED_UNIFIED</c>.
+    /// Returns true if valid or gate N/A (no breakout levels). Returns false if blocked.
+    /// </summary>
+    private bool LogAndEvaluateUnifiedBreakoutEntryValidity(
+        DateTimeOffset utcNow,
+        string path,
+        bool failClosedOnMissingQuotes,
+        decimal? brkLongOverride = null,
+        decimal? brkShortOverride = null,
+        decimal? bidOverride = null,
+        decimal? askOverride = null)
+    {
+        var brkLong = brkLongOverride ?? _brkLongRounded;
+        var brkShort = brkShortOverride ?? _brkShortRounded;
+        if (!brkLong.HasValue || !brkShort.HasValue)
             return true;
 
-        if (longInvalid)
+        var toleranceTicks = GetBreakoutValidityToleranceTicks();
+        decimal? bid = bidOverride;
+        decimal? ask = askOverride;
+        if (!bid.HasValue && !ask.HasValue && _executionAdapter != null)
+        {
+            var t = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
+            bid = t.Bid;
+            ask = t.Ask;
+        }
+
+        var tolerance = toleranceTicks * _tickSize;
+        var valid = IsBreakoutStillValidForEntry(bid, ask, brkLong.Value, brkShort.Value, toleranceTicks, failClosedOnMissingQuotes);
+        var longInvalid = ask.HasValue && ask.Value >= brkLong.Value + tolerance;
+        var shortInvalid = bid.HasValue && bid.Value <= brkShort.Value - tolerance;
+        var missingQuotes = !bid.HasValue && !ask.HasValue;
+
+        if (valid)
+        {
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "BREAKOUT_INVALIDATED", State.ToString(),
+                "BREAKOUT_VALIDATED_UNIFIED", State.ToString(),
                 new
                 {
                     stream_id = Stream,
-                    side = "long",
-                    current_price = ask,
-                    breakout_level = brkLong,
-                    tolerance = tolerance,
+                    path,
+                    current_bid = bid,
+                    current_ask = ask,
+                    brk_long = brkLong,
+                    brk_short = brkShort,
                     tolerance_ticks = toleranceTicks,
-                    invalid_threshold = brkLong + tolerance,
-                    note = "Long breakout already crossed - ask >= brk_long + tolerance"
+                    note = "Unified breakout entry validity — proceed"
                 }));
-        if (shortInvalid)
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "BREAKOUT_INVALIDATED", State.ToString(),
-                new
-                {
-                    stream_id = Stream,
-                    side = "short",
-                    current_price = bid,
-                    breakout_level = brkShort,
-                    tolerance = tolerance,
-                    tolerance_ticks = toleranceTicks,
-                    invalid_threshold = brkShort - tolerance,
-                    note = "Short breakout already crossed - bid <= brk_short - tolerance"
-                }));
+            return true;
+        }
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "ENTRY_RESUBMIT_BLOCKED_BREAKOUT", State.ToString(),
+            "BREAKOUT_INVALIDATED_UNIFIED", State.ToString(),
             new
             {
                 stream_id = Stream,
-                metric_type = "blocked_breakout_validity",
-                trading_date = TradingDate,
+                path,
                 current_bid = bid,
                 current_ask = ask,
                 brk_long = brkLong,
                 brk_short = brkShort,
-                tolerance = tolerance,
                 tolerance_ticks = toleranceTicks,
                 long_invalid = longInvalid,
                 short_invalid = shortInvalid,
-                reason = "breakout_already_triggered",
-                note = "Delayed resubmit blocked - price has crossed breakout; would create late entry"
+                missing_quotes = missingQuotes,
+                fail_closed_on_missing_quotes = failClosedOnMissingQuotes,
+                reason = missingQuotes && failClosedOnMissingQuotes ? "missing_quotes_fail_closed" : "beyond_breakout_tolerance",
+                note = "Unified breakout entry validity — block"
             }));
         return false;
     }
@@ -2938,7 +3011,7 @@ public sealed class StreamStateMachine
             return false;
         }
 
-        if (!IsBreakoutValidForResubmit(utcNow))
+        if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RECOVERY", failClosedOnMissingQuotes: true))
         {
             ClearRecoveryAction(utcNow);
             Commit(utcNow, "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED");
@@ -5137,8 +5210,8 @@ public sealed class StreamStateMachine
             // Normal immediate slot-time: within freshness window → allow (marketable stop OK).
             // Delayed initial: beyond window → block NO_TRADE_MATERIALLY_DELAYED_INITIAL_SUBMISSION.
             // freshness_minutes <= 0 disables this gate (parity spec); price sanity below still applies.
-            // Delayed resubmit/restart retry: handled separately in HandleRangeLockedState with IsBreakoutValidForResubmit.
-            var freshnessMinutes = _spec?.breakout?.initial_submission_freshness_minutes ?? 3;
+            // Delayed resubmit/restart retry: same unified validity as first lock (HandleRangeLockedState + recovery).
+            var freshnessMinutes = _spec?.breakout?.initial_submission_freshness_minutes ?? 0;
             var delayFromSlotMinutes = (utcNow - SlotTimeUtc).TotalMinutes;
             if (freshnessMinutes > 0 && delayFromSlotMinutes > freshnessMinutes)
             {
@@ -5157,37 +5230,16 @@ public sealed class StreamStateMachine
             }
             else if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
-                // PRICE SANITY (initial submission, within freshness): block clearly stale entries.
-                // If price distance from breakout > sanity_ticks, block. Price unavailable → allow (fail-open for initial).
-                var sanityTicks = _spec?.breakout?.initial_submission_price_sanity_ticks ?? 10;
-                var sanityTolerance = sanityTicks * _tickSize;
-                var (bid, ask) = _executionAdapter?.GetCurrentMarketPrice(ExecutionInstrument, utcNow) ?? (null, null);
-                var brkLong = _brkLongRounded.Value;
-                var brkShort = _brkShortRounded.Value;
-                var longClearlyStale = ask.HasValue && ask.Value >= brkLong + sanityTolerance;
-                var shortClearlyStale = bid.HasValue && bid.Value <= brkShort - sanityTolerance;
-                if (longClearlyStale || shortClearlyStale)
+                // P2.10: unified breakout validity (breakout_validity_tolerance_ticks only; fail-open if quotes missing).
+                if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "FIRST_LOCK", failClosedOnMissingQuotes: false))
                 {
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "INITIAL_SUBMISSION_BLOCKED_PRICE_SANITY", State.ToString(),
-                        new
-                        {
-                            stream_id = Stream,
-                            metric_type = "blocked_price_sanity",
-                            current_bid = bid,
-                            current_ask = ask,
-                            brk_long = brkLong,
-                            brk_short = brkShort,
-                            sanity_ticks = sanityTicks,
-                            long_clearly_stale = longClearlyStale,
-                            short_clearly_stale = shortClearlyStale,
-                            note = "Initial submission blocked - price distance from breakout exceeds sanity threshold; clearly stale entry"
-                        }));
-                    Commit(utcNow, "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY", "NO_TRADE_INITIAL_SUBMISSION_PRICE_SANITY");
+                    Commit(utcNow, "NO_TRADE_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_UNIFIED_BREAKOUT_INVALID");
                 }
                 else
                 {
-                    // Measurement: log allowed submission for aggregation (delay, price distance)
+                    var (bid, ask) = _executionAdapter?.GetCurrentMarketPrice(ExecutionInstrument, utcNow) ?? (null, null);
+                    var brkLong = _brkLongRounded.Value;
+                    var brkShort = _brkShortRounded.Value;
                     var delayMin = (utcNow - SlotTimeUtc).TotalMinutes;
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "EXECUTION_METRIC_INITIAL_SUBMISSION_ALLOWED", State.ToString(),

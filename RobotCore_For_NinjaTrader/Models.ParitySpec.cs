@@ -101,15 +101,13 @@ public sealed class BreakoutSpec
 
     /// <summary>
     /// Max minutes from SlotTimeUtc for initial submission. Beyond this, block as materially delayed.
-    /// Default 3. Set to 0 (or negative) to disable this time gate only (price sanity still applies).
+    /// Default 0 (disabled). Set to a positive value to enforce the time gate (price sanity still applies when enabled path runs).
     /// </summary>
-    public int initial_submission_freshness_minutes { get; set; } = 3;
+    public int initial_submission_freshness_minutes { get; set; } = 0;
 
     /// <summary>
-    /// Price sanity check (initial submission only, within freshness window).
-    /// If price distance from breakout > this many ticks, block (clearly stale).
-    /// Long: block if ask >= brkLong + sanity_ticks. Short: block if bid <= brkShort - sanity_ticks.
-    /// Default 10. Preserves legitimate immediate fills; blocks clearly stale entries.
+    /// Deprecated (P2.10): Not read by the robot. Unified validity uses
+    /// <see cref="ParityInstrument.breakout_validity_tolerance_ticks"/> for all entry paths.
     /// </summary>
     public int initial_submission_price_sanity_ticks { get; set; } = 10;
 

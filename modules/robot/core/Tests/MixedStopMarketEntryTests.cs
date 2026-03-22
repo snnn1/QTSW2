@@ -117,7 +117,7 @@ public static class MixedStopMarketEntryTests
             if (sm == null) return (false, "CreateStreamWithRiskGate returned null");
 
             // brkLong=4501, brkShort=4494. Long crossed: ask >= 4501. Short not crossed: bid > 4494.
-            // Within IsBreakoutValidForResubmit: ask < 4501.5, bid > 4493.5
+            // Within unified validity (2 ticks × 0.25): ask < 4501.5, bid > 4493.5
             adapter.TestBid = 4494.25m;
             adapter.TestAsk = 4501.25m;
 
@@ -169,7 +169,7 @@ public static class MixedStopMarketEntryTests
             if (sm == null) return (false, "CreateStreamWithRiskGate returned null");
 
             // brkLong=4501, brkShort=4494. Short crossed: bid <= 4494. Long not crossed: ask < 4501.
-            // Within IsBreakoutValidForResubmit: bid > 4493.5, ask < 4501.5
+            // Within unified validity: bid > 4493.5, ask < 4501.5
             adapter.TestBid = 4494m;   // exactly at brk_short → short crossed
             adapter.TestAsk = 4500m;  // below brk_long → long not crossed
 
