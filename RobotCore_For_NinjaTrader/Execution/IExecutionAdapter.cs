@@ -225,9 +225,13 @@ public class AccountSnapshot
 /// </summary>
 public class PositionSnapshot
 {
+    /// <summary>NT MasterInstrument.Name — canonical bucket key for <see cref="BrokerPositionResolver"/>.</summary>
     public string Instrument { get; set; } = "";
     public int Quantity { get; set; }
     public decimal AveragePrice { get; set; }
+
+    /// <summary>Optional contract label for audit logs (e.g. NT Instrument.FullName). Bucketing uses <see cref="Instrument"/> only.</summary>
+    public string? ContractLabel { get; set; }
 }
 
 /// <summary>

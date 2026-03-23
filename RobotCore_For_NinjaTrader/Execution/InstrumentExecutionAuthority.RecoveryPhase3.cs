@@ -151,7 +151,7 @@ public sealed partial class InstrumentExecutionAuthority
     private bool TryTransition(RecoveryState from, RecoveryState to, DateTimeOffset utcNow)
     {
         if (ValidTransitions.Contains((from, to))) return true;
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "RECOVERY_STATE_TRANSITION_INVALID", new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_STATE_TRANSITION_INVALID", state: "ENGINE", new
         {
             from_state = from.ToString(),
             to_state = to.ToString(),
@@ -177,7 +177,7 @@ public sealed partial class InstrumentExecutionAuthority
                 _recoveryTriggeredUtc = utcNow;
                 Interlocked.Increment(ref _recoveryTriggersTotal);
 
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_REQUEST_RECEIVED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_REQUEST_RECEIVED", state: "ENGINE", new
                 {
                     instrument,
                     reason,
@@ -186,7 +186,7 @@ public sealed partial class InstrumentExecutionAuthority
             }
             else
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_ALREADY_ACTIVE", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_ALREADY_ACTIVE", state: "ENGINE", new
                 {
                     instrument,
                     new_reason = reason,
@@ -195,12 +195,16 @@ public sealed partial class InstrumentExecutionAuthority
                     iea_instance_id = InstanceId
                 }));
                 _recoveryReasons.Add(reason);
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_ESCALATED", new
+                var emitEscalated = ReconciliationStateTracker.Shared.ShouldEmitRecoveryEscalatedLog(AccountName, instrument, reason);
+                if (emitEscalated)
                 {
-                    instrument,
-                    reason,
-                    iea_instance_id = InstanceId
-                }));
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_ESCALATED", state: "ENGINE", new
+                    {
+                        instrument,
+                        reason,
+                        iea_instance_id = InstanceId
+                    }));
+                }
                 _onRecoveryRequestedCallback?.Invoke(instrument, reason, context, utcNow);
                 return;
             }
@@ -224,7 +228,7 @@ public sealed partial class InstrumentExecutionAuthority
             var current = _recoveryState;
             if (current != RecoveryState.RECOVERY_PENDING && current != RecoveryState.RECONSTRUCTING && current != RecoveryState.RECOVERY_ACTION_REQUIRED)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_IGNORED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_RECONSTRUCTION_IGNORED", state: "ENGINE", new
                 {
                     instrument,
                     current_state = current.ToString(),
@@ -254,7 +258,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             _lastDecision = decision;
 
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_RESULT", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_RECONSTRUCTION_RESULT", state: "ENGINE", new
             {
                 instrument,
                 classification = classification.ToString(),
@@ -267,7 +271,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             if (decision == RecoveryDecision.STREAM_SCOPED_CONTAIN)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_SCOPE_CLASSIFIED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_SCOPE_CLASSIFIED", state: "ENGINE", new
                 {
                     execution_instrument_key = ExecutionInstrumentKey,
                     recovery_scope = "StreamScoped",
@@ -280,7 +284,7 @@ public sealed partial class InstrumentExecutionAuthority
                     destructive_action_blocked = true,
                     sibling_streams_preserved = true
                 }));
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STREAM_RECOVERY_OWNERSHIP_REPAIR_STARTED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "STREAM_RECOVERY_OWNERSHIP_REPAIR_STARTED", state: "ENGINE", new
                 {
                     execution_instrument_key = ExecutionInstrumentKey,
                     note = "Stream containment: host should stand down implicated streams; no instrument flatten",
@@ -296,7 +300,7 @@ public sealed partial class InstrumentExecutionAuthority
                     {
                         _recoveryState = RecoveryState.RESOLVED;
                         Interlocked.Increment(ref _recoveryResolvedTotal);
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_DECISION_RESUME", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_DECISION_RESUME", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                     }
                     break;
                 case RecoveryDecision.ADOPT:
@@ -305,7 +309,7 @@ public sealed partial class InstrumentExecutionAuthority
                     {
                         _recoveryState = RecoveryState.RESOLVED;
                         Interlocked.Increment(ref _recoveryResolvedTotal);
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_DECISION_ADOPT", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_DECISION_ADOPT", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                     }
                     break;
                 case RecoveryDecision.FLATTEN:
@@ -313,7 +317,7 @@ public sealed partial class InstrumentExecutionAuthority
                     if (TryTransition(RecoveryState.RECOVERY_ACTION_REQUIRED, RecoveryState.FLATTENING, utcNow))
                     {
                         _recoveryState = RecoveryState.FLATTENING;
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_DECISION_FLATTEN", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_DECISION_FLATTEN", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                     }
                     break;
                 case RecoveryDecision.HALT:
@@ -322,9 +326,9 @@ public sealed partial class InstrumentExecutionAuthority
                     if (TryTransition(RecoveryState.RECOVERY_ACTION_REQUIRED, RecoveryState.HALTED, utcNow))
                     {
                         _recoveryState = RecoveryState.HALTED;
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_DECISION_HALT", new { instrument, iea_instance_id = InstanceId }));
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_HALTED", new { instrument, iea_instance_id = InstanceId }));
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_OPERATOR_ACTION_REQUIRED", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_DECISION_HALT", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_HALTED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_OPERATOR_ACTION_REQUIRED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_RECOVERY_HALT, SupervisorySeverity.HIGH, new { classification = classification.ToString() }, utcNow);
                     }
                     break;
@@ -336,7 +340,7 @@ public sealed partial class InstrumentExecutionAuthority
                         Interlocked.Increment(ref _recoveryResolvedTotal);
                         if (p2Attribution != null)
                             _onP2StreamContainmentCallback?.Invoke(p2Attribution, utcNow);
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STREAM_RECOVERY_OWNERSHIP_REPAIR_RESULT", new
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "STREAM_RECOVERY_OWNERSHIP_REPAIR_RESULT", state: "ENGINE", new
                         {
                             instrument,
                             outcome = "STREAM_SCOPED_CONTAINMENT",
@@ -377,7 +381,7 @@ public sealed partial class InstrumentExecutionAuthority
         });
         if (!pol.AllowInstrumentScope)
         {
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_POLICY_DENIED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_FLATTEN_POLICY_DENIED", state: "ENGINE", new
             {
                 instrument,
                 reason,
@@ -391,7 +395,7 @@ public sealed partial class InstrumentExecutionAuthority
 
         RecordFlatten(instrument, utcNow);
         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_FLATTEN_ACTIONS, SupervisorySeverity.MEDIUM, new { reason, callerContext }, utcNow);
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_REQUESTED", new { instrument, reason, iea_instance_id = InstanceId }));
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_FLATTEN_REQUESTED", state: "ENGINE", new { instrument, reason, iea_instance_id = InstanceId }));
 
         if (_onRecoveryFlattenRequestedCallback != null)
         {
@@ -410,7 +414,7 @@ public sealed partial class InstrumentExecutionAuthority
         // P2.6.6: never call RequestFlatten directly — same funnel as adapter (NtFlattenInstrumentCommand → ExecuteFlattenInstrument → policy).
         if (Executor == null)
         {
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_ENQUEUE_FAILED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_FLATTEN_ENQUEUE_FAILED", state: "ENGINE", new
             {
                 instrument,
                 reason,
@@ -439,7 +443,7 @@ public sealed partial class InstrumentExecutionAuthority
             recoveryPolicySealAttributionScope: "");
         if (!Executor.EnqueueNtAction(ntCmd))
         {
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_ENQUEUE_FAILED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_FLATTEN_ENQUEUE_FAILED", state: "ENGINE", new
             {
                 instrument,
                 reason,
@@ -458,7 +462,7 @@ public sealed partial class InstrumentExecutionAuthority
             if (_recoveryState != RecoveryState.FLATTENING) return;
             _recoveryState = RecoveryState.RESOLVED;
             Interlocked.Increment(ref _recoveryResolvedTotal);
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_FLATTEN_RESOLVED", new { instrument, iea_instance_id = InstanceId }));
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_FLATTEN_RESOLVED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
         }
     }
 
@@ -474,7 +478,7 @@ public sealed partial class InstrumentExecutionAuthority
             _recoveryState = RecoveryState.NORMAL;
             _recoveryReason = "";
             _recoveryReasons.Clear();
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RESOLVED", new { instrument, iea_instance_id = InstanceId }));
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_RESOLVED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
             return true;
         }
     }
@@ -494,9 +498,10 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (!IsInRecovery) return true;
         var eventType = IsInBootstrap ? "BOOTSTRAP_GUARD_BLOCKED_NORMAL_MANAGEMENT" : "RECOVERY_GUARD_BLOCKED_NORMAL_MANAGEMENT";
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, eventType, new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE", new
         {
             operation,
+            execution_instrument_key = ExecutionInstrumentKey,
             recovery_state = CurrentRecoveryState.ToString(),
             iea_instance_id = InstanceId
         }));
@@ -588,7 +593,7 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Emit recovery metrics.</summary>
     internal void EmitRecoveryMetrics(DateTimeOffset utcNow)
     {
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "RECOVERY_METRICS", new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECOVERY_METRICS", state: "ENGINE", new
         {
             instruments_in_recovery = IsInRecovery ? 1 : 0,
             recovery_state = CurrentRecoveryState.ToString(),

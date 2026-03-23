@@ -46,6 +46,8 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
 // --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
 // --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
+// --test BROKER_POSITION_IDENTITY: canonical broker bucket alignment (reconciliation / flatten)
+// --test FLATTEN_COORDINATION_TRACKER: cross-chart flatten owner + verify debounce coordinator
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
@@ -97,6 +99,24 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: P2 Phase 1 recovery attribution tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("RECONCILIATION_STATE_TRACKER", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReconciliationStateTrackerTests.RunReconciliationStateTrackerTests();
+        Console.WriteLine(pass ? "PASS: Reconciliation state tracker (debounce / single-writer)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("BROKER_POSITION_IDENTITY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = BrokerPositionIdentityTests.RunBrokerPositionIdentityTests();
+        Console.WriteLine(pass ? "PASS: Broker position identity (reconciliation / resolver alignment)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("FLATTEN_COORDINATION_TRACKER", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = FlattenCoordinationTrackerTests.RunFlattenCoordinationTrackerTests();
+        Console.WriteLine(pass ? "PASS: Flatten coordination tracker (cross-chart owner + verify debounce)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("P2_6_DESTRUCTIVE_POLICY_TESTS", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = P2_6DestructivePolicyTests.RunP2_6DestructivePolicyTests();
@@ -131,6 +151,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = AdoptionRecoveryTests.RunAdoptionRecoveryTests();
         Console.WriteLine(pass ? "PASS: Adoption recovery tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("ADOPTION_SCAN_HARDENING", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = AdoptionScanHardeningTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Adoption scan hardening tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("DELAYED_JOURNAL_VISIBILITY", StringComparison.OrdinalIgnoreCase))

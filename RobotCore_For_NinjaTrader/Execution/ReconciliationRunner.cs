@@ -16,21 +16,33 @@ public sealed class ReconciliationRunner
     private readonly IExecutionAdapter _adapter;
     private readonly ExecutionJournal _journal;
     private readonly RobotLogger _log;
-    private readonly Action<string, DateTimeOffset, string>? _onQuantityMismatch;
+    private readonly Action<string, DateTimeOffset, string, int, int>? _onQuantityMismatch;
     private readonly Action<Dictionary<string, (int AccountQty, int JournalQty)>>? _onReconciliationPassComplete;
+    private readonly Func<string?>? _reconciliationAccountName;
+    private readonly Func<string>? _reconciliationInstanceId;
+    private readonly ReconciliationStateTracker? _reconciliationTracker;
+    private readonly TimeSpan _reconciliationDebounceWindow;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
 
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
-        Action<string, DateTimeOffset, string>? onQuantityMismatch = null,
-        Action<Dictionary<string, (int AccountQty, int JournalQty)>>? onReconciliationPassComplete = null)
+        Action<string, DateTimeOffset, string, int, int>? onQuantityMismatch = null,
+        Action<Dictionary<string, (int AccountQty, int JournalQty)>>? onReconciliationPassComplete = null,
+        Func<string?>? reconciliationAccountName = null,
+        Func<string>? reconciliationInstanceId = null,
+        ReconciliationStateTracker? reconciliationTracker = null,
+        TimeSpan? reconciliationDebounceWindow = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _onQuantityMismatch = onQuantityMismatch;
         _onReconciliationPassComplete = onReconciliationPassComplete;
+        _reconciliationAccountName = reconciliationAccountName;
+        _reconciliationInstanceId = reconciliationInstanceId;
+        _reconciliationTracker = reconciliationTracker;
+        _reconciliationDebounceWindow = reconciliationDebounceWindow ?? ReconciliationStateTracker.DefaultDebounceWindow;
     }
 
     /// <summary>
@@ -93,17 +105,11 @@ public sealed class ReconciliationRunner
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
 
         var instrumentsWithPosition = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var accountQtyByInstrument = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var accountQtyByInstrument = BrokerPositionResolver.BuildReconciliationAbsTotalsByCanonicalKey(positions);
         foreach (var p in positions)
         {
             if (p.Quantity != 0 && !string.IsNullOrWhiteSpace(p.Instrument))
-            {
-                var inst = p.Instrument.Trim();
-                instrumentsWithPosition.Add(inst);
-                var qty = Math.Abs(p.Quantity);
-                accountQtyByInstrument.TryGetValue(inst, out var existing);
-                accountQtyByInstrument[inst] = existing + qty;
-            }
+                instrumentsWithPosition.Add(p.Instrument.Trim());
         }
 
         var openByInstrument = _journal.GetOpenJournalEntriesByInstrument();
@@ -117,6 +123,64 @@ public sealed class ReconciliationRunner
             {
                 if (gateMode && MatchesGateInstrument(inst, gateInst!))
                     continue;
+
+                var acct = _reconciliationAccountName?.Invoke();
+                var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
+                ReconciliationMismatchGateResult gateResult = new(ReconciliationMismatchGateOutcome.EmitFullAndInvokeCallback, null);
+                if (_reconciliationTracker != null)
+                {
+                    gateResult = _reconciliationTracker.EvaluateRunnerMismatch(
+                        acct, inst, accountQty, journalQty, utcNow, instanceId, _reconciliationDebounceWindow);
+                }
+
+                if (gateResult.Outcome == ReconciliationMismatchGateOutcome.SecondaryInstanceSkip)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_SECONDARY_INSTANCE_SKIPPED", "ENGINE",
+                        new
+                        {
+                            account = acct ?? "",
+                            instrument = inst,
+                            account_qty = accountQty,
+                            journal_qty = journalQty,
+                            owner_instance_id = gateResult.OwnerInstanceId,
+                            current_instance_id = instanceId,
+                            metrics = _reconciliationTracker != null
+                                ? new
+                                {
+                                    reconciliation_mismatch_total = _reconciliationTracker.Metrics.ReconciliationMismatchTotal,
+                                    reconciliation_debounced_total = _reconciliationTracker.Metrics.ReconciliationDebouncedTotal,
+                                    reconciliation_secondary_skipped_total = _reconciliationTracker.Metrics.ReconciliationSecondarySkippedTotal,
+                                    reconciliation_resolved_total = _reconciliationTracker.Metrics.ReconciliationResolvedTotal
+                                }
+                                : null,
+                            note = "Single-writer reconciliation: non-owner chart skipped mismatch pipeline"
+                        }));
+                    continue;
+                }
+
+                if (gateResult.Outcome == ReconciliationMismatchGateOutcome.EmitStillOpenInfoOnly)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_QTY_MISMATCH_STILL_OPEN", "ENGINE",
+                        new
+                        {
+                            account = acct ?? "",
+                            instrument = inst,
+                            account_qty = accountQty,
+                            journal_qty = journalQty,
+                            owner_instance_id = gateResult.OwnerInstanceId,
+                            metrics = _reconciliationTracker != null
+                                ? new
+                                {
+                                    reconciliation_mismatch_total = _reconciliationTracker.Metrics.ReconciliationMismatchTotal,
+                                    reconciliation_debounced_total = _reconciliationTracker.Metrics.ReconciliationDebouncedTotal,
+                                    reconciliation_secondary_skipped_total = _reconciliationTracker.Metrics.ReconciliationSecondarySkippedTotal,
+                                    reconciliation_resolved_total = _reconciliationTracker.Metrics.ReconciliationResolvedTotal
+                                }
+                                : null,
+                            note = "Mismatch unchanged within debounce — recovery not re-requested"
+                        }));
+                    continue;
+                }
 
                 // Emit RECONCILIATION_CONTEXT before RECONCILIATION_QTY_MISMATCH for ops-grade diagnostics
                 var intentIds = new List<string>();
@@ -145,11 +209,15 @@ public sealed class ReconciliationRunner
                 }
                 var taxonomy = journalQty > accountQty ? "journal_ahead" : (accountQty > journalQty ? "broker_ahead" : "unknown");
                 var openInstSummary = openByInstrument.ToDictionary(k => k.Key, v => v.Value.Sum(e => e.Entry.EntryFilledQuantityTotal));
+                var canonicalExposure = BrokerPositionResolver.ResolveFromSnapshots(positions, inst);
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_CONTEXT", "ENGINE",
                     new
                     {
                         instrument = inst,
+                        canonical_broker_key = canonicalExposure.CanonicalKey,
                         broker_qty = accountQty,
+                        broker_exposure_aggregated = canonicalExposure.IsAggregatedMultipleRows,
+                        broker_position_rows = BrokerPositionResolver.ToDiagnosticRows(canonicalExposure),
                         journal_qty = journalQty,
                         intent_ids = intentIds,
                         last_fills = lastFills,
@@ -187,7 +255,7 @@ public sealed class ReconciliationRunner
                         intent_ids = intentIds,
                         note = "Total exposure must match system intent. Critical invariant violated."
                     }));
-                _onQuantityMismatch?.Invoke(inst, utcNow, $"QTY_MISMATCH:account={accountQty},journal={journalQty}");
+                _onQuantityMismatch?.Invoke(inst, utcNow, $"QTY_MISMATCH:account={accountQty},journal={journalQty}", accountQty, journalQty);
             }
         }
 

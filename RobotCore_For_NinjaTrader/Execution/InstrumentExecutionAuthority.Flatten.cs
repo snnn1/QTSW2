@@ -1,6 +1,7 @@
 #if NINJATRADER
 using System;
 using System.Collections.Concurrent;
+using System.Linq;
 using System.Threading;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -87,52 +88,45 @@ public sealed partial class InstrumentExecutionAuthority
 
         try
         {
-            // Position query + decision + submission as one critical section (strategy thread)
-            // Architecture: Account position check FIRST. If flat, skip and never run validator or submit.
-            // Validator runs only when qty != 0; it cannot influence order submission when flat.
-            var (quantity, direction) = Executor.GetAccountPositionForInstrument(instrumentKey);
+            // Canonical exposure: same master-instrument bucket + rows as reconciliation / BrokerPositionResolver.
+            var exposure = Executor.GetBrokerCanonicalExposure(instrumentKey);
+            var netSigned = exposure.Legs.Sum(l => l.SignedQuantity);
+            var absForPolicy = exposure.ReconciliationAbsQuantityTotal;
 
-            if (quantity == 0 || string.IsNullOrEmpty(direction))
+            if (absForPolicy == 0 || exposure.Legs.Count == 0)
             {
                 ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
                 Log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_SKIPPED_ACCOUNT_FLAT", new
                 {
                     instrument = instrumentKey,
+                    canonical_broker_key = exposure.CanonicalKey,
                     requested_reason = reason,
                     caller_context = callerContext,
                     latch_request_id = requestId,
-                    note = "Account flat - no order sent"
+                    note = "Canonical broker bucket flat — no flatten orders sent"
                 }));
                 return FlattenResult.SuccessResult(utcNow);
             }
 
-            var absQty = Math.Abs(quantity);
-            var chosenSide = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
-
-            // Exposure-reduction invariant
-            var (valid, invariantError) = FlattenInvariantValidator.ValidateFlattenReducesExposure(quantity, chosenSide, absQty);
-            if (!valid)
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_CANONICAL_EXPOSURE", state: "ENGINE", new
             {
-                ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
-                Log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_DIRECTION_INVALID", new
-                {
-                    instrument = instrumentKey,
-                    account_quantity = quantity,
-                    account_direction = direction,
-                    chosen_side = chosenSide,
-                    chosen_quantity = absQty,
-                    error = invariantError,
-                    latch_request_id = requestId
-                }));
-                return FlattenResult.FailureResult(invariantError ?? "FLATTEN_DIRECTION_INVALID", utcNow);
-            }
+                logical_instrument = instrumentKey,
+                canonical_broker_key = exposure.CanonicalKey,
+                reconciliation_abs_total = absForPolicy,
+                net_signed_quantity = netSigned,
+                broker_exposure_aggregated = exposure.IsAggregatedMultipleRows,
+                broker_position_rows = BrokerPositionResolver.ToDiagnosticRows(exposure),
+                execution_instrument_key = ExecutionInstrumentKey,
+                latch_request_id = requestId,
+                note = "Flatten targets same rows reconciliation counts (design A: per native Instrument)"
+            }));
 
             var pc = policyContext ?? FlattenPolicyExecutionContext.CreateDefault(reason);
 
             if (pc.PrecheckAllowInstrument.HasValue && !pc.PrecheckAllowInstrument.Value)
             {
                 ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
-                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_INVARIANT_VIOLATION", new
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_POLICY_INVARIANT_VIOLATION", state: "ENGINE", new
                 {
                     note = "P2.6.7: RequestFlatten received context where adapter pre-check disallowed instrument scope",
                     correlation_id = pc.PrecheckCorrelationId,
@@ -141,39 +135,38 @@ public sealed partial class InstrumentExecutionAuthority
                 return FlattenResult.FailureResult("P2.6.7: invalid flatten policy context (precheck disallowed)", utcNow);
             }
 
-            // P2.6.7: Drift detection — pre-cancel snapshot (adapter) vs live read at final gate
-            if (pc.PrecheckBrokerPositionQtyAbs.HasValue && pc.PrecheckBrokerPositionQtyAbs.Value != absQty)
+            if (pc.PrecheckBrokerPositionQtyAbs.HasValue && pc.PrecheckBrokerPositionQtyAbs.Value != absForPolicy)
             {
-                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_POLICY_PREPOST_DRIFT", state: "ENGINE", new
                 {
                     drift_kind = "broker_abs_qty",
                     precheck_abs = pc.PrecheckBrokerPositionQtyAbs.Value,
-                    final_abs = absQty,
+                    final_abs = absForPolicy,
                     correlation_id = pc.PrecheckCorrelationId,
                     precheck_policy_reason = pc.PrecheckPolicyReasonCode,
                     execution_instrument_key = ExecutionInstrumentKey,
-                    note = "Position size changed between ExecuteFlattenInstrument pre-check and RequestFlatten"
+                    note = "Canonical abs qty changed between ExecuteFlattenInstrument pre-check and RequestFlatten"
                 }));
             }
 
-            if (pc.PrecheckBrokerQtySigned.HasValue && quantity != 0 && pc.PrecheckBrokerQtySigned.Value != 0 &&
-                Math.Sign(pc.PrecheckBrokerQtySigned.Value) != Math.Sign(quantity))
+            if (pc.PrecheckBrokerQtySigned.HasValue && netSigned != 0 && pc.PrecheckBrokerQtySigned.Value != 0 &&
+                Math.Sign(pc.PrecheckBrokerQtySigned.Value) != Math.Sign(netSigned))
             {
-                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_POLICY_PREPOST_DRIFT", state: "ENGINE", new
                 {
                     drift_kind = "position_side_flip",
                     precheck_signed_qty = pc.PrecheckBrokerQtySigned.Value,
-                    final_signed_qty = quantity,
+                    final_signed_qty = netSigned,
                     correlation_id = pc.PrecheckCorrelationId,
                     execution_instrument_key = ExecutionInstrumentKey,
                     severity = "CRITICAL",
-                    note = "Long/short sign changed between pre-check and submit — final policy still applies"
+                    note = "Net signed qty sign changed between pre-check and submit — final policy still applies"
                 }));
             }
 
             var triggerResolved = DestructiveTriggerParser.Resolve(pc.ExplicitTrigger, reason);
-            var polInput = pc.ToPolicyInput(ExecutionInstrumentKey, absQty, reason);
-            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_REQUESTED", new
+            var polInput = pc.ToPolicyInput(ExecutionInstrumentKey, absForPolicy, reason);
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_ACTION_REQUESTED", state: "ENGINE", new
             {
                 source = pc.Source.ToString(),
                 trigger = triggerResolved.ToString(),
@@ -183,7 +176,7 @@ public sealed partial class InstrumentExecutionAuthority
                 phase = "pre_submit_request_flatten"
             }));
             var submitDecision = DestructiveActionPolicy.EvaluateDestructiveActionPolicy(polInput);
-            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_DECISION", new
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_ACTION_DECISION", state: "ENGINE", new
             {
                 allowed = submitDecision.AllowInstrumentScope,
                 reason = submitDecision.ReasonCode,
@@ -194,7 +187,7 @@ public sealed partial class InstrumentExecutionAuthority
             if (!submitDecision.AllowInstrumentScope)
             {
                 ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
-                Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_BLOCKED", new
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_ACTION_BLOCKED", state: "ENGINE", new
                 {
                     execution_instrument_key = ExecutionInstrumentKey,
                     instrument = instrumentKey,
@@ -206,46 +199,94 @@ public sealed partial class InstrumentExecutionAuthority
                 return FlattenResult.FailureResult($"Destructive policy denied flatten ({submitDecision.ReasonCode})", utcNow);
             }
 
-            var snapshot = new FlattenDecisionSnapshot
+            OrderSubmissionResult? lastSubmit = null;
+            for (var li = 0; li < exposure.Legs.Count; li++)
             {
-                Instrument = instrumentKey,
-                AccountQuantityAtDecision = quantity,
-                AccountDirectionAtDecision = direction,
-                RequestedReason = reason,
-                CallerContext = callerContext,
-                ChosenSide = chosenSide,
-                ChosenQuantity = absQty,
-                LatchRequestId = requestId,
-                LatchState = "Acquired",
-                DecisionUtc = utcNow
-            };
-
-            var submitResult = Executor.SubmitFlattenOrder(instrumentKey, chosenSide, absQty, snapshot, utcNow);
-            if (!submitResult.Success)
-            {
-                ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Rejected, utcNow);
-                Log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_ORDER_REJECTED", new
+                var leg = exposure.Legs[li];
+                if (leg.SignedQuantity == 0) continue;
+                var quantity = leg.SignedQuantity;
+                var absQty = Math.Abs(quantity);
+                var direction = quantity > 0 ? "Long" : "Short";
+                var chosenSide = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
+                var (valid, invariantError) = FlattenInvariantValidator.ValidateFlattenReducesExposure(quantity, chosenSide, absQty);
+                if (!valid)
                 {
+                    ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Aborted, utcNow);
+                    Log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_DIRECTION_INVALID", new
+                    {
+                        instrument = instrumentKey,
+                        leg_index = li,
+                        contract_label = leg.ContractLabel,
+                        account_quantity = quantity,
+                        account_direction = direction,
+                        chosen_side = chosenSide,
+                        chosen_quantity = absQty,
+                        error = invariantError,
+                        latch_request_id = requestId
+                    }));
+                    return FlattenResult.FailureResult(invariantError ?? "FLATTEN_DIRECTION_INVALID", utcNow);
+                }
+
+                var snapshot = new FlattenDecisionSnapshot
+                {
+                    Instrument = instrumentKey,
+                    AccountQuantityAtDecision = quantity,
+                    AccountDirectionAtDecision = direction,
+                    RequestedReason = reason,
+                    CallerContext = callerContext,
+                    ChosenSide = chosenSide,
+                    ChosenQuantity = absQty,
+                    LatchRequestId = $"{requestId}:L{li}",
+                    LatchState = "Acquired",
+                    DecisionUtc = utcNow,
+                    FlattenLegIndex = li,
+                    CanonicalExposureAbsTotalAtDecision = absForPolicy,
+                    LegContractLabel = leg.ContractLabel
+                };
+
+                lastSubmit = Executor.SubmitFlattenOrder(instrumentKey, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
+                if (!lastSubmit.Success)
+                {
+                    ReleaseFlattenLatch(instrumentKey, FlattenLatchState.Rejected, utcNow);
+                    Log.Write(RobotEvents.ExecutionBase(utcNow, "", instrumentKey, "FLATTEN_ORDER_REJECTED", new
+                    {
+                        instrument = instrumentKey,
+                        leg_index = li,
+                        error = lastSubmit.ErrorMessage,
+                        latch_request_id = requestId
+                    }));
+                    return FlattenResult.FailureResult(lastSubmit.ErrorMessage ?? "Flatten order rejected", utcNow);
+                }
+
+                if (!string.IsNullOrEmpty(lastSubmit.BrokerOrderId))
+                    RegisterFlattenOrder(lastSubmit.BrokerOrderId, instrumentKey, OrderOwnershipStatus.OWNED, "RequestFlatten", utcNow);
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_ORDER_SUBMITTED", state: "ENGINE", new
+                {
+                    execution_instrument_key = ExecutionInstrumentKey,
                     instrument = instrumentKey,
-                    error = submitResult.ErrorMessage,
-                    latch_request_id = requestId
+                    source = pc.Source.ToString(),
+                    trigger = triggerResolved.ToString(),
+                    broker_order_id = lastSubmit.BrokerOrderId,
+                    leg_index = li,
+                    canonical_broker_key = exposure.CanonicalKey,
+                    leg_contract_label = leg.ContractLabel,
+                    phase = "flatten_leg_submitted",
+                    note = "Order submitted; broker flat not confirmed until FLATTEN_BROKER_FLAT_CONFIRMED"
                 }));
-                return FlattenResult.FailureResult(submitResult.ErrorMessage ?? "Flatten order rejected", utcNow);
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "DESTRUCTIVE_ACTION_EXECUTED", state: "ENGINE", new
+                {
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    instrument = instrumentKey,
+                    source = pc.Source.ToString(),
+                    trigger = triggerResolved.ToString(),
+                    broker_order_id = lastSubmit.BrokerOrderId,
+                    phase = "flatten_order_submitted",
+                    leg_index = li
+                }));
             }
 
             entry.State = FlattenLatchState.Sent;
-            entry.OrderId = submitResult.BrokerOrderId;
-            if (!string.IsNullOrEmpty(submitResult.BrokerOrderId))
-                RegisterFlattenOrder(submitResult.BrokerOrderId, instrumentKey, OrderOwnershipStatus.OWNED, "RequestFlatten", utcNow);
-            Log.Write(RobotEvents.EngineBase(utcNow, "", instrumentKey, "DESTRUCTIVE_ACTION_EXECUTED", new
-            {
-                execution_instrument_key = ExecutionInstrumentKey,
-                instrument = instrumentKey,
-                source = pc.Source.ToString(),
-                trigger = triggerResolved.ToString(),
-                broker_order_id = submitResult.BrokerOrderId,
-                phase = "flatten_order_submitted"
-            }));
+            entry.OrderId = lastSubmit?.BrokerOrderId;
             return FlattenResult.SuccessResult(utcNow);
         }
         catch (Exception ex)

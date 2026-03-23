@@ -274,6 +274,32 @@ public sealed partial class InstrumentExecutionAuthority
     private DateTimeOffset NowEvent() => _eventClock?.NowEvent() ?? DateTimeOffset.UtcNow;
     private DateTimeOffset NowWall() => _wallClock?.NowWall() ?? DateTimeOffset.UtcNow;
 
+    /// <summary>Restart adoption / reconciliation: non-convergent broker order quarantine.</summary>
+    private readonly AdoptionReconciliationConvergence _adoptionConvergence = new();
+
+    /// <summary>Lightweight cumulative metrics (logged at end of adoption scan).</summary>
+    private long _metricAdoptionScannedOrdersTotal;
+    private long _metricAdoptionSkippedForeignInstrumentOrdersTotal;
+    private long _metricAdoptionStaleQtsw2OrdersTotal;
+    private long _metricAdoptionSuccessfulAdoptionsTotal;
+    private long _metricAdoptionNonConvergentEscalationsTotal;
+    private long _metricAdoptionSuppressedRechecksTotal;
+
+    private int _foreignInstrumentSkipLogCounter;
+
+    /// <summary>Identical evaluations before quarantine + single escalation.</summary>
+    private const int AdoptionConvergenceUnchangedThreshold = 4;
+
+    /// <summary>Wall-clock cooldown before recheck after quarantine.</summary>
+    private const int AdoptionConvergenceCooldownSeconds = 120;
+
+    /// <summary>
+    /// IEA engine events: <paramref name="eventType"/> must be the semantic name (queryable as JSON <c>event</c> / event_type).
+    /// Fixes mistaken positional EngineBase calls that put instrument into event_type.
+    /// </summary>
+    private void LogIeaEngine(DateTimeOffset utcNow, string eventType, object? data = null) =>
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE", data));
+
     /// <summary>
     /// Gap 1: Enqueue work and block until result. Used for entry submission and flatten.
     /// Deadlock guard: if called from worker thread, executes inline. Fail-fast on queue overflow or timeout.

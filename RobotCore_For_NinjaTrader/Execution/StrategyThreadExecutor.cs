@@ -134,6 +134,9 @@ public sealed class NtFlattenInstrumentCommand : INtAction
     public string? RecoveryPolicySealAttributionScope { get; }
     public IReadOnlyList<string>? ExplicitCancelBrokerOrderIds { get; }
 
+    /// <summary>True when this command is a post-flatten verify retry (coordination + debounce).</summary>
+    public bool IsVerifyRetryFlatten { get; }
+
     public NtFlattenInstrumentCommand(
         string correlationId,
         string? intentId,
@@ -147,7 +150,8 @@ public sealed class NtFlattenInstrumentCommand : INtAction
         bool recoveryPolicySealAllowInstrument = false,
         string? recoveryPolicySealCode = null,
         string? recoveryPolicySealAttributionScope = null,
-        IReadOnlyList<string>? explicitCancelBrokerOrderIds = null)
+        IReadOnlyList<string>? explicitCancelBrokerOrderIds = null,
+        bool isVerifyRetryFlatten = false)
     {
         CorrelationId = correlationId;
         IntentId = intentId;
@@ -163,6 +167,7 @@ public sealed class NtFlattenInstrumentCommand : INtAction
         RecoveryPolicySealCode = recoveryPolicySealCode;
         RecoveryPolicySealAttributionScope = recoveryPolicySealAttributionScope;
         ExplicitCancelBrokerOrderIds = explicitCancelBrokerOrderIds;
+        IsVerifyRetryFlatten = isVerifyRetryFlatten;
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteFlattenInstrument(this);
@@ -316,13 +321,28 @@ public sealed class StrategyThreadExecutor
                         reason = action.Reason
                     }));
                 action.Execute(executor);
+                if (action is NtFlattenInstrumentCommand flattenCmd)
+                {
+                    _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "FLATTEN_COMMAND_COMPLETED", state: "ENGINE",
+                        new
+                        {
+                            correlation_id = flattenCmd.CorrelationId,
+                            action_type = flattenCmd.ActionType,
+                            intent_id = flattenCmd.IntentId,
+                            instrument_key = flattenCmd.InstrumentKey,
+                            note = "NT flatten delegate completed without exception — not broker-flat confirmation; see FLATTEN_BROKER_FLAT_CONFIRMED / FLATTEN_BROKER_POSITION_REMAINS"
+                        }));
+                }
                 _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_SUCCESS", state: "ENGINE",
                     new
                     {
                         correlation_id = action.CorrelationId,
                         action_type = action.ActionType,
                         intent_id = action.IntentId,
-                        instrument_key = action.InstrumentKey
+                        instrument_key = action.InstrumentKey,
+                        note = action is NtFlattenInstrumentCommand
+                            ? "Still emitted for compatibility; flatten semantics split — FLATTEN_COMMAND_COMPLETED + broker verify events"
+                            : null
                     }));
                 executed++;
             }

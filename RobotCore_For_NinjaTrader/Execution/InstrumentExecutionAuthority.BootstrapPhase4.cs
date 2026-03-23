@@ -34,7 +34,7 @@ public sealed partial class InstrumentExecutionAuthority
             var current = _recoveryState;
             if (current != RecoveryState.NORMAL)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_ALREADY_ACTIVE", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_ALREADY_ACTIVE", state: "ENGINE", new
                 {
                     instrument,
                     reason = reason.ToString(),
@@ -56,7 +56,7 @@ public sealed partial class InstrumentExecutionAuthority
             _bootstrapSnapshotStale = false;
             Interlocked.Increment(ref _bootstrapStartedTotal);
 
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_STARTED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_STARTED", state: "ENGINE", new
             {
                 instrument,
                 reason = reason.ToString(),
@@ -83,7 +83,7 @@ public sealed partial class InstrumentExecutionAuthority
             var current = _recoveryState;
             if (current != RecoveryState.BOOTSTRAP_PENDING && current != RecoveryState.SNAPSHOTTING && current != RecoveryState.BOOTSTRAP_DECIDING)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_RESULT_IGNORED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_RESULT_IGNORED", state: "ENGINE", new
                 {
                     instrument,
                     current_state = current.ToString(),
@@ -94,7 +94,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             if (_bootstrapSnapshotStale)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_SNAPSHOT_STALE_RERUN", new { instrument, iea_instance_id = InstanceId }));
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_SNAPSHOT_STALE_RERUN", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                 _bootstrapSnapshotStale = false;
                 _onBootstrapSnapshotRequestedCallback?.Invoke(instrument, BootstrapReason.PLATFORM_RESTART, utcNow);
                 return BootstrapDecision.HALT;
@@ -124,7 +124,7 @@ public sealed partial class InstrumentExecutionAuthority
                 Decision = decision.ToString(),
                 ReportUtc = utcNow
             };
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "STARTUP_RECONCILIATION_REPORT", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "STARTUP_RECONCILIATION_REPORT", state: "ENGINE", new
             {
                 broker_qty = report.BrokerQty,
                 journal_qty = report.JournalQty,
@@ -138,7 +138,7 @@ public sealed partial class InstrumentExecutionAuthority
                 iea_instance_id = InstanceId
             }));
 
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_CLASSIFIED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_CLASSIFIED", state: "ENGINE", new
             {
                 instrument,
                 classification = classification.ToString(),
@@ -156,7 +156,7 @@ public sealed partial class InstrumentExecutionAuthority
                     // Observability: log when RESUME chosen with no broker orders visible (delayed broker risk)
                     if (snapshot.BrokerWorkingOrderCount == 0)
                     {
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_RESUME_NO_BROKER_ORDERS", new
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_RESUME_NO_BROKER_ORDERS", state: "ENGINE", new
                         {
                             instrument,
                             broker_working_count = 0,
@@ -169,8 +169,8 @@ public sealed partial class InstrumentExecutionAuthority
                     {
                         _recoveryState = RecoveryState.RESOLVED;
                         Interlocked.Increment(ref _recoveryResolvedTotal);
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_DECISION_RESUME", new { instrument, iea_instance_id = InstanceId }));
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_READY_TO_RESUME", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_DECISION_RESUME", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_READY_TO_RESUME", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                     }
                     break;
                 case BootstrapDecision.ADOPT:
@@ -178,7 +178,7 @@ public sealed partial class InstrumentExecutionAuthority
                     if (TryTransition(RecoveryState.BOOTSTRAP_DECIDING, RecoveryState.BOOTSTRAP_ADOPTING, utcNow))
                     {
                         _recoveryState = RecoveryState.BOOTSTRAP_ADOPTING;
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_DECISION_ADOPT", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_DECISION_ADOPT", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                     }
                     break;
                 case BootstrapDecision.FLATTEN_THEN_RECONSTRUCT:
@@ -187,7 +187,7 @@ public sealed partial class InstrumentExecutionAuthority
                     if (TryTransition(RecoveryState.BOOTSTRAP_DECIDING, RecoveryState.RECOVERY_ACTION_REQUIRED, utcNow))
                     {
                         _recoveryState = RecoveryState.RECOVERY_ACTION_REQUIRED;
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_DECISION_FLATTEN", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_DECISION_FLATTEN", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                         ExecuteRecoveryFlatten(instrument, "BOOTSTRAP_FLATTEN_THEN_RECONSTRUCT", "BootstrapPhase4", utcNow);
                     }
                     break;
@@ -197,9 +197,9 @@ public sealed partial class InstrumentExecutionAuthority
                     if (TryTransition(RecoveryState.BOOTSTRAP_DECIDING, RecoveryState.HALTED, utcNow))
                     {
                         _recoveryState = RecoveryState.HALTED;
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_DECISION_HALT", new { instrument, iea_instance_id = InstanceId }));
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_HALTED", new { instrument, iea_instance_id = InstanceId }));
-                        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_OPERATOR_ACTION_REQUIRED", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_DECISION_HALT", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_HALTED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+                        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_OPERATOR_ACTION_REQUIRED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
                         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_BOOTSTRAP_HALTS, SupervisorySeverity.HIGH, new { decision = "HALT" }, utcNow);
                     }
                     break;
@@ -218,8 +218,8 @@ public sealed partial class InstrumentExecutionAuthority
             if (!TryTransition(RecoveryState.BOOTSTRAP_ADOPTING, RecoveryState.RESOLVED, utcNow)) return;
             _recoveryState = RecoveryState.RESOLVED;
             Interlocked.Increment(ref _recoveryResolvedTotal);
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_ADOPTION_COMPLETED", new { instrument, iea_instance_id = InstanceId }));
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_READY_TO_RESUME", new { instrument, iea_instance_id = InstanceId }));
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_ADOPTION_COMPLETED", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_READY_TO_RESUME", state: "ENGINE", new { instrument, iea_instance_id = InstanceId }));
         }
     }
 
@@ -228,7 +228,7 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (!IsInBootstrap) return;
         _bootstrapSnapshotStale = true;
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "BOOTSTRAP_SNAPSHOT_STALE", new { iea_instance_id = InstanceId }));
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_SNAPSHOT_STALE", state: "ENGINE", new { iea_instance_id = InstanceId }));
         _onBootstrapSnapshotRequestedCallback?.Invoke(ExecutionInstrumentKey, BootstrapReason.PLATFORM_RESTART, utcNow);
     }
 
@@ -270,7 +270,7 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Emit bootstrap metrics.</summary>
     internal void EmitBootstrapMetrics(DateTimeOffset utcNow)
     {
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "BOOTSTRAP_METRICS", new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "BOOTSTRAP_METRICS", state: "ENGINE", new
         {
             instruments_in_bootstrap = IsInBootstrap ? 1 : 0,
             bootstrap_state = CurrentRecoveryState.ToString(),

@@ -97,7 +97,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             if (current != SupervisoryState.ACTIVE && current != SupervisoryState.COOLDOWN)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "SUPERVISORY_ALREADY_ACTIVE", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_ALREADY_ACTIVE", state: "ENGINE", new
                 {
                     instrument,
                     reason = reason.ToString(),
@@ -136,7 +136,7 @@ public sealed partial class InstrumentExecutionAuthority
                 if (SupervisoryPolicy.ShouldSuppressCooldownEscalation(_lastResumeToActiveUtc, utcNow, MIN_DWELL_BEFORE_COOLDOWN_SECONDS))
                 {
                     var dwellSeconds = _lastResumeToActiveUtc.HasValue ? (utcNow - _lastResumeToActiveUtc.Value).TotalSeconds : 0;
-                    Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "SUPERVISORY_TRIGGER_DWELL_SUPPRESSED", new
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_TRIGGER_DWELL_SUPPRESSED", state: "ENGINE", new
                     {
                         instrument,
                         reason = reason.ToString(),
@@ -157,7 +157,7 @@ public sealed partial class InstrumentExecutionAuthority
                 _supervisoryReason = reason.ToString();
                 _supervisoryReasons.Add(reason.ToString());
 
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "SUPERVISORY_POLICY_APPLIED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_POLICY_APPLIED", state: "ENGINE", new
                 {
                     instrument,
                     reason = reason.ToString(),
@@ -168,24 +168,24 @@ public sealed partial class InstrumentExecutionAuthority
                 }));
 
                 if (target == SupervisoryState.COOLDOWN)
-                    Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_COOLDOWN_STARTED", new { instrument, duration_seconds = COOLDOWN_DURATION_SECONDS, iea_instance_id = InstanceId }));
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INSTRUMENT_COOLDOWN_STARTED", state: "ENGINE", new { instrument, duration_seconds = COOLDOWN_DURATION_SECONDS, iea_instance_id = InstanceId }));
                 else if (target == SupervisoryState.SUSPENDED)
                 {
                     Interlocked.Increment(ref _supervisorySuspendedTotal);
-                    Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_SUSPENDED", new { instrument, reason = reason.ToString(), iea_instance_id = InstanceId }));
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INSTRUMENT_SUSPENDED", state: "ENGINE", new { instrument, reason = reason.ToString(), iea_instance_id = InstanceId }));
                 }
                 else if (target == SupervisoryState.HALTED)
                 {
                     Interlocked.Increment(ref _supervisoryHaltedTotal);
                     _haltReasonUtc = utcNow;
                     var payload = new Dictionary<string, object> { ["instrument"] = instrument, ["reason"] = reason.ToString(), ["iea_instance_id"] = InstanceId };
-                    Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_HALTED", payload));
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INSTRUMENT_HALTED", state: "ENGINE", payload));
                     _onSupervisoryCriticalCallback?.Invoke("INSTRUMENT_HALTED", instrument, payload);
                 }
                 else if (target == SupervisoryState.AWAITING_OPERATOR_ACK)
                 {
                     var payload = new Dictionary<string, object> { ["instrument"] = instrument, ["reason"] = _operatorAckReason ?? "", ["iea_instance_id"] = InstanceId };
-                    Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "OPERATOR_ACK_REQUIRED", payload));
+                    Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPERATOR_ACK_REQUIRED", state: "ENGINE", payload));
                     _onSupervisoryCriticalCallback?.Invoke("OPERATOR_ACK_REQUIRED", instrument, payload);
                 }
             }
@@ -230,7 +230,7 @@ public sealed partial class InstrumentExecutionAuthority
     private bool TrySupervisoryTransition(SupervisoryState from, SupervisoryState to, string instrument, DateTimeOffset utcNow)
     {
         if (ValidSupervisoryTransitions.Contains((from, to))) return true;
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "SUPERVISORY_STATE_TRANSITION_INVALID", new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_STATE_TRANSITION_INVALID", state: "ENGINE", new
         {
             from_state = from.ToString(),
             to_state = to.ToString(),
@@ -246,7 +246,7 @@ public sealed partial class InstrumentExecutionAuthority
         {
             if (_supervisoryState != SupervisoryState.AWAITING_OPERATOR_ACK)
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "OPERATOR_ACK_REJECTED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPERATOR_ACK_REJECTED", state: "ENGINE", new
                 {
                     instrument,
                     reason = "NOT_AWAITING_ACK",
@@ -258,7 +258,7 @@ public sealed partial class InstrumentExecutionAuthority
 
             if (!CanResumeSupervisoryActive(instrument))
             {
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "OPERATOR_ACK_REJECTED", new
+                Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPERATOR_ACK_REJECTED", state: "ENGINE", new
                 {
                     instrument,
                     reason = "RESUME_CRITERIA_NOT_MET",
@@ -275,7 +275,7 @@ public sealed partial class InstrumentExecutionAuthority
             _lastResumeToActiveUtc = utcNow; // Hysteresis: start dwell timer for re-escalation suppression
             Interlocked.Increment(ref _operatorAckReceivedTotal);
 
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "OPERATOR_ACK_RECEIVED", new
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPERATOR_ACK_RECEIVED", state: "ENGINE", new
             {
                 instrument,
                 reason,
@@ -290,7 +290,7 @@ public sealed partial class InstrumentExecutionAuthority
     public void ActivateInstrumentKillSwitch(string instrument, string reason, DateTimeOffset utcNow)
     {
         RequestSupervisoryAction(instrument, SupervisoryTriggerReason.INSTRUMENT_KILL_SWITCH, SupervisorySeverity.CRITICAL, new { reason }, utcNow);
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "INSTRUMENT_KILL_SWITCH_ACTIVATED", new { instrument, reason, iea_instance_id = InstanceId }));
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INSTRUMENT_KILL_SWITCH_ACTIVATED", state: "ENGINE", new { instrument, reason, iea_instance_id = InstanceId }));
     }
 
     /// <summary>Check if instrument may return to ACTIVE. All resume criteria must pass.</summary>
@@ -320,7 +320,7 @@ public sealed partial class InstrumentExecutionAuthority
             if (!CanResumeSupervisoryActive(instrument)) return false;
             if (!TrySupervisoryTransition(SupervisoryState.COOLDOWN, SupervisoryState.ACTIVE, instrument, utcNow)) return false;
             _supervisoryState = SupervisoryState.ACTIVE;
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "SUPERVISORY_RESUME_ALLOWED", new { instrument, from_state = "COOLDOWN", iea_instance_id = InstanceId }));
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_RESUME_ALLOWED", state: "ENGINE", new { instrument, from_state = "COOLDOWN", iea_instance_id = InstanceId }));
             return true;
         }
     }
@@ -331,7 +331,7 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Emit supervisory metrics.</summary>
     internal void EmitSupervisoryMetrics(DateTimeOffset utcNow)
     {
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "SUPERVISORY_METRICS", new
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SUPERVISORY_METRICS", state: "ENGINE", new
         {
             instrument = ExecutionInstrumentKey,
             supervisory_state = CurrentSupervisoryState.ToString(),

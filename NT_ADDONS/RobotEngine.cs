@@ -36,6 +36,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Engine run identifier (GUID per engine Start())
     private string? _runId;
     private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue;
+    /// <summary>Stable id for reconciliation single-writer / debounce (per strategy instance, process-wide coordinator).</summary>
+    private readonly string _reconciliationWriterInstanceId = "eng:" + Guid.NewGuid().ToString("N");
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -1081,7 +1083,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Create reconciliation runner for orphaned journal cleanup + quantity reconciliation
             _reconciliationRunner = new ReconciliationRunner(_executionAdapter, _executionJournal, _log,
-                onQuantityMismatch: (instrument, now, reason) =>
+                onQuantityMismatch: (instrument, now, reason, accountQty, journalQty) =>
                 {
                     if (_executionPolicy?.UseInstrumentExecutionAuthority == true)
                         HandleReconciliationQtyMismatchP2(instrument, now, reason);
@@ -1096,10 +1098,41 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             { "reason", reason },
                             { "note", "Push notification + instrument freeze" }
                         });
+                        ReconciliationStateTracker.Shared.NotifyMismatchHandlingDispatched(_accountName, instrument, accountQty, journalQty, now);
                     }
                 },
                 onReconciliationPassComplete: qtyByInstrument =>
                 {
+                    var resolvedUtc = DateTimeOffset.UtcNow;
+                    foreach (var kv in qtyByInstrument)
+                    {
+                        var rInst = kv.Key;
+                        var (raq, rjq) = kv.Value;
+                        if (ReconciliationStateTracker.Shared.TryMarkResolved(_accountName, rInst, raq, rjq, resolvedUtc,
+                                out var prevOwner, out var prevRecoveryState))
+                        {
+                            LogEvent(RobotEvents.EngineBase(resolvedUtc, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                                eventType: "RECONCILIATION_RESOLVED", state: "ENGINE",
+                                new
+                                {
+                                    account = _accountName ?? "",
+                                    instrument = rInst,
+                                    account_qty = raq,
+                                    journal_qty = rjq,
+                                    owner_instance_id = prevOwner,
+                                    previous_recovery_state = prevRecoveryState.ToString(),
+                                    metrics = new
+                                    {
+                                        reconciliation_mismatch_total = ReconciliationStateTracker.Shared.Metrics.ReconciliationMismatchTotal,
+                                        reconciliation_debounced_total = ReconciliationStateTracker.Shared.Metrics.ReconciliationDebouncedTotal,
+                                        reconciliation_secondary_skipped_total = ReconciliationStateTracker.Shared.Metrics.ReconciliationSecondarySkippedTotal,
+                                        reconciliation_resolved_total = ReconciliationStateTracker.Shared.Metrics.ReconciliationResolvedTotal
+                                    },
+                                    note = "Qty match — reconciliation episode cleared"
+                                }));
+                        }
+                    }
+
                     lock (_engineLock)
                     {
                         foreach (var inst in _frozenInstruments.ToList())
@@ -1117,7 +1150,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             }
                         }
                     }
-                });
+                },
+                reconciliationAccountName: () => _accountName,
+                reconciliationInstanceId: () => _reconciliationWriterInstanceId,
+                reconciliationTracker: ReconciliationStateTracker.Shared,
+                reconciliationDebounceWindow: null);
 
             // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
@@ -1139,7 +1176,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst));
 
             // Gap 4 + P1.5: Mismatch escalation + closed-loop state-consistency gate
-            var stableWindowMsNt = _executionMode == ExecutionMode.SIM
+            var stableWindowMs = _executionMode == ExecutionMode.SIM
                 ? MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM
                 : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
             _mismatchCoordinator = new MismatchEscalationCoordinator(
@@ -1153,13 +1190,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 eventWriter: _eventWriter,
                 runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
                 evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
-                stateConsistencyStableWindowMs: stableWindowMsNt);
+                stateConsistencyStableWindowMs: stableWindowMs);
 
-            if (_executionAdapter is NinjaTraderSimAdapter simP2Nt)
+            // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
+            if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
-                simP2Nt.SetInstrumentMismatchGateEngagedCallback(inst =>
+                simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
-                simP2Nt.SetP2StreamContainmentEngineCallback((attr, now) =>
+                simP2.SetP2StreamContainmentEngineCallback((attr, now) =>
                 {
                     foreach (var streamId in attr.ImplicatedStreams)
                     {
@@ -4733,6 +4771,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>P2 Phase 1: reconciliation qty mismatch — stream scope when attributable to one stream.</summary>
+    /// <remarks>
+    /// <paramref name="instrument"/> is the reconciliation subject (account snapshot / journal row). Logging must use the
+    /// same execution-instrument key as <see cref="NinjaTraderSimAdapter.RequestRecoveryForInstrument"/> (Resolve with no host chart),
+    /// not <see cref="_executionInstrument"/> — otherwise multi-chart accounts log a misleading execution_instrument_key (e.g. MES
+    /// while the mismatch is MNQ). <c>emitter_host_execution_instrument</c> preserves which strategy instance emitted the row.
+    /// </remarks>
     private void HandleReconciliationQtyMismatchP2(string instrument, DateTimeOffset utcNow, string reason)
     {
         var inst = (instrument ?? "").Trim();
@@ -4761,16 +4805,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
         var streamRows = GetStreamOpenExposureForInstrument(inst);
-        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, _executionInstrument);
-        if (string.IsNullOrEmpty(execKey)) execKey = inst.ToUpperInvariant();
+        // IEA registry / recovery routing key for the mismatch instrument (matches RequestRecoveryForInstrument).
+        var mismatchExecutionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, null);
+        if (string.IsNullOrEmpty(mismatchExecutionInstrumentKey)) mismatchExecutionInstrumentKey = inst.ToUpperInvariant();
+        var emitterHostExecutionInstrument = string.IsNullOrWhiteSpace(_executionInstrument)
+            ? null
+            : _executionInstrument.Trim();
         var attribution = RecoveryOwnershipAttributionEvaluator.EvaluateReconciliationQuantityMismatch(
-            execKey, accountQty, journalQty, streamRows);
+            mismatchExecutionInstrumentKey, accountQty, journalQty, streamRows);
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
             eventType: "RECOVERY_SCOPE_CLASSIFIED", state: "ENGINE",
             new
             {
                 instrument = inst,
-                execution_instrument_key = execKey,
+                execution_instrument_key = mismatchExecutionInstrumentKey,
+                emitter_host_execution_instrument = emitterHostExecutionInstrument,
                 context = "RECONCILIATION_QTY_MISMATCH",
                 attributable_scope = attribution.AttributableScope.ToString(),
                 implicated_streams = attribution.ImplicatedStreams,
@@ -4787,7 +4836,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ReconciliationAttribution = attribution,
                 BrokerPositionQty = accountQty,
                 JournalOpenQtySum = journalQty,
-                ExecutionInstrumentKey = execKey,
+                ExecutionInstrumentKey = mismatchExecutionInstrumentKey,
                 ReconstructionActionKind = RecoveryActionKind.Flatten
             });
             if (!reconPol.AllowInstrumentScope)
@@ -4797,7 +4846,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     new
                     {
                         instrument = inst,
-                        execution_instrument_key = execKey,
+                        execution_instrument_key = mismatchExecutionInstrumentKey,
+                        emitter_host_execution_instrument = emitterHostExecutionInstrument,
                         policy_reason = reconPol.ReasonCode,
                         policy_path = reconPol.PolicyPath,
                         note = "P2.6: reconciliation freeze path blocked by destructive policy — falling back to stream stand-down only"
@@ -4808,13 +4858,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         StandDownSingleStreamForOwnershipAmbiguity(streamId, utcNow, attribution);
                 }
                 _executionAdapter?.RequestSupervisoryActionForInstrument(inst, SupervisoryTriggerReason.REPEATED_RECONCILIATION_MISMATCH, SupervisorySeverity.MEDIUM, new { reason, scope = "stream_policy_denied" }, utcNow);
+                ReconciliationStateTracker.Shared.NotifyMismatchHandlingDispatched(_accountName, inst, accountQty, journalQty, utcNow);
                 return;
             }
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
                 eventType: "DESTRUCTIVE_ACTION_EXECUTED", state: "ENGINE",
                 new
                 {
-                    execution_instrument_key = execKey,
+                    instrument = inst,
+                    execution_instrument_key = mismatchExecutionInstrumentKey,
+                    emitter_host_execution_instrument = emitterHostExecutionInstrument,
                     trigger_source = DestructiveActionSource.RECONCILIATION.ToString(),
                     reason_code = reconPol.ReasonCode,
                     policy_path = reconPol.PolicyPath,
@@ -4831,6 +4884,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 { "reason", reason },
                 { "note", "P2: instrument-wide freeze — attribution required broader scope" }
             });
+            ReconciliationStateTracker.Shared.NotifyMismatchHandlingDispatched(_accountName, inst, accountQty, journalQty, utcNow);
             return;
         }
         foreach (var streamId in attribution.ImplicatedStreams)
@@ -4849,6 +4903,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 sibling_streams_preserved = true,
                 note = "P2: single-stream journal attribution — no full instrument freeze"
             }));
+        ReconciliationStateTracker.Shared.NotifyMismatchHandlingDispatched(_accountName, inst, accountQty, journalQty, utcNow);
     }
 
     /// <summary>

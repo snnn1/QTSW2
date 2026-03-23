@@ -613,12 +613,13 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Phase 4: Run adoption for bootstrap ADOPT path. Calls ScanAndAdoptExistingOrders then OnBootstrapAdoptionCompleted.</summary>
     internal void RunBootstrapAdoption(string instrument, DateTimeOffset utcNow)
     {
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_ADOPTION_ATTEMPT", new
+        LogIeaEngine(utcNow, "BOOTSTRAP_ADOPTION_ATTEMPT", new
         {
+            execution_instrument_key = ExecutionInstrumentKey,
             instrument,
             iea_instance_id = InstanceId,
             note = "Running adoption for bootstrap ADOPT path"
-        }));
+        });
         ScanAndAdoptExistingOrders();
         OnBootstrapAdoptionCompleted(instrument, utcNow);
     }
@@ -626,9 +627,10 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>
     /// Gap 4: On first execution update, sync OrderMap with broker reality. Hydration does not mutate broker state.
     /// For each QTSW2 protective (STOP/TARGET) with entry filled per journal, populate OrderMap.
-    /// Phase 2: QTSW2 stop/target with no matching intent → UNOWNED_LIVE_ORDER_DETECTED, register UNOWNED, follow recovery (flatten).
-    /// IEA robustness: Also adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET) so registry never loses orders on restart.
-    /// Adoption-on-restart hardening: Defer UNOWNED when candidates empty but broker has orders (journal load race); retry within grace window.
+    /// Same-instrument QTSW2 stop/target with no journal adoption candidate → STALE_QTSW2_ORDER_DETECTED (UNOWNED registry), recovery/supervisory once per fingerprint; convergence quarantine prevents hot loops.
+    /// Foreign-instrument QTSW2 orders → skipped before adoption/tag work (FOREIGN_INSTRUMENT_QTSW2_ORDER_SKIPPED sample).
+    /// IEA robustness: Adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET) when candidate exists.
+    /// Deferral: when candidates empty but this instrument still has QTSW2 working orders, grace window before stale classification (journal load race).
     /// </summary>
     private void ScanAndAdoptExistingOrders()
     {
@@ -637,97 +639,185 @@ public sealed partial class InstrumentExecutionAuthority
         if (account?.Orders == null) return;
         var activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
         var workingCount = account.Orders.Count(o => o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
-        var qtsw2WorkingCount = 0;
+        var qtsw2SameInstrumentWorking = 0;
         foreach (Order o in account.Orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
-            var tag = Executor.GetOrderTag(o);
-            if (!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
-                qtsw2WorkingCount++;
+            var tagProbe = Executor.GetOrderTag(o);
+            if (string.IsNullOrEmpty(tagProbe) || !tagProbe.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+            var broName = o.Instrument?.MasterInstrument?.Name ?? "";
+            if (AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+                qtsw2SameInstrumentWorking++;
         }
         var utcNow = NowEvent();
         var (journalDir, journalFileCount, journalDirExists) = Executor.GetJournalDiagnostics(ExecutionInstrumentKey);
-        Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_SCAN_START", new
+        LogIeaEngine(utcNow, "ADOPTION_SCAN_START", new
         {
+            execution_instrument_key = ExecutionInstrumentKey,
             adoption_candidate_count = activeIntentIds.Count,
             broker_working_count = workingCount,
-            qtsw2_working_count = qtsw2WorkingCount,
+            qtsw2_working_same_instrument_count = qtsw2SameInstrumentWorking,
             journal_dir = journalDir,
             journal_file_count = journalFileCount,
             journal_dir_exists = journalDirExists,
-            iea_instance_id = InstanceId
-        }));
+            iea_instance_id = InstanceId,
+            scanned_orders_total = Interlocked.Read(ref _metricAdoptionScannedOrdersTotal),
+            skipped_foreign_instrument_orders_total = Interlocked.Read(ref _metricAdoptionSkippedForeignInstrumentOrdersTotal),
+            stale_qtsw2_orders_total = Interlocked.Read(ref _metricAdoptionStaleQtsw2OrdersTotal),
+            successful_adoptions_total = Interlocked.Read(ref _metricAdoptionSuccessfulAdoptionsTotal),
+            non_convergent_orders_total = Interlocked.Read(ref _metricAdoptionNonConvergentEscalationsTotal),
+            suppressed_rechecks_total = Interlocked.Read(ref _metricAdoptionSuppressedRechecksTotal)
+        });
 
-        if (activeIntentIds.Count == 0 && qtsw2WorkingCount > 0)
+        if (activeIntentIds.Count == 0 && qtsw2SameInstrumentWorking > 0)
         {
             _adoptionDeferredCount++;
             _firstAdoptionScanUtc ??= utcNow;
             var elapsedMs = (long)(utcNow - _firstAdoptionScanUtc.Value).TotalMilliseconds;
-            var action = AdoptionDeferralDecision.Evaluate(activeIntentIds.Count, qtsw2WorkingCount, elapsedMs, RestartAdoptionGraceSeconds);
+            var action = AdoptionDeferralDecision.Evaluate(activeIntentIds.Count, qtsw2SameInstrumentWorking, elapsedMs, RestartAdoptionGraceSeconds);
             if (action == AdoptionDeferralAction.Defer)
             {
                 _adoptionDeferred = true;
                 _hasScannedForAdoption = false;
-                Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_DEFERRED_CANDIDATES_EMPTY", new
+                LogIeaEngine(utcNow, "ADOPTION_DEFERRED_CANDIDATES_EMPTY", new
                 {
-                    broker_working_count = qtsw2WorkingCount,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    broker_working_same_instrument_qtsw2 = qtsw2SameInstrumentWorking,
                     journal_dir = journalDir,
                     retry_count = _adoptionDeferredCount,
                     elapsed_since_first_scan_ms = elapsedMs,
                     journal_file_count = journalFileCount,
                     journal_dir_exists = journalDirExists,
                     iea_instance_id = InstanceId,
-                    note = "Candidates empty but broker has QTSW2 orders; defer UNOWNED to allow journal load"
-                }));
+                    note = "Candidates empty but this instrument has QTSW2 working orders; defer UNOWNED to allow journal load"
+                });
                 return;
             }
             _adoptionDeferred = false;
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_GRACE_EXPIRED_UNOWNED", new
+            LogIeaEngine(utcNow, "ADOPTION_GRACE_EXPIRED_UNOWNED", new
             {
-                broker_working_count = qtsw2WorkingCount,
+                execution_instrument_key = ExecutionInstrumentKey,
+                broker_working_same_instrument_qtsw2 = qtsw2SameInstrumentWorking,
                 journal_dir = journalDir,
                 retry_count = _adoptionDeferredCount,
                 elapsed_since_first_scan_ms = elapsedMs,
                 journal_file_count = journalFileCount,
                 journal_dir_exists = journalDirExists,
                 iea_instance_id = InstanceId,
-                note = "Grace window expired; proceeding to UNOWNED"
-            }));
+                note = "Grace window expired; classifying same-instrument QTSW2 orders (stale vs adoptable)"
+            });
         }
-        else if (activeIntentIds.Count == 0 && qtsw2WorkingCount == 0)
+        else if (activeIntentIds.Count == 0 && qtsw2SameInstrumentWorking == 0)
         {
             _hasScannedForAdoption = true;
             _adoptionDeferred = false;
-            Log?.Write(RobotEvents.EngineBase(utcNow, "", ExecutionInstrumentKey, "ADOPTION_CANDIDATES_EMPTY_NO_BROKER_ORDERS", new
+            LogIeaEngine(utcNow, "ADOPTION_CANDIDATES_EMPTY_NO_BROKER_ORDERS", new
             {
+                execution_instrument_key = ExecutionInstrumentKey,
                 journal_dir = journalDir,
                 journal_file_count = journalFileCount,
                 iea_instance_id = InstanceId,
-                note = "Nothing to adopt"
-            }));
+                note = "Nothing to adopt on this instrument"
+            });
             return;
         }
+
+        var scanSeen = 0L;
+        var scanForeign = 0L;
+        var scanStale = 0L;
+        var scanAdopted = 0L;
+        var scanEscalations = 0L;
+        var scanSuppressed = 0L;
 
         foreach (Order o in account.Orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             var tag = Executor.GetOrderTag(o);
             if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var brokerInstrument = o.Instrument?.MasterInstrument?.Name ?? "";
+            if (!AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, brokerInstrument))
+            {
+                Interlocked.Increment(ref _metricAdoptionSkippedForeignInstrumentOrdersTotal);
+                scanForeign++;
+                var n = Interlocked.Increment(ref _foreignInstrumentSkipLogCounter);
+                if (n % 50 == 1)
+                {
+                    LogIeaEngine(utcNow, "FOREIGN_INSTRUMENT_QTSW2_ORDER_SKIPPED", new
+                    {
+                        execution_instrument_key = ExecutionInstrumentKey,
+                        broker_order_instrument = brokerInstrument,
+                        iea_instance_id = InstanceId,
+                        note = "Low-rate sample: QTSW2-tagged order on another instrument — ignored by this IEA before adoption/tag decode cost",
+                        sample_sequence = n
+                    });
+                }
+                continue;
+            }
+
+            scanSeen++;
+            Interlocked.Increment(ref _metricAdoptionScannedOrdersTotal);
+            var orderId = o.OrderId?.ToString() ?? "";
+            if (_adoptionConvergence.IsQuarantined(orderId, utcNow))
+            {
+                Interlocked.Increment(ref _metricAdoptionSuppressedRechecksTotal);
+                scanSuppressed++;
+                continue;
+            }
+
             var intentId = RobotOrderIds.DecodeIntentId(tag);
             var isStop = tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase);
             var isTarget = tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase);
+            var hasCandidate = !string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId);
+            var inRegistry = TryResolveByBrokerOrderId(orderId, out _);
+            var orderStateStr = o.OrderState.ToString();
+            var roleChar = isStop ? "S" : isTarget ? "T" : "E";
+            var fingerprint = $"{orderStateStr}|{inRegistry}|{hasCandidate}|{roleChar}|{intentId ?? ""}";
+
+            _adoptionConvergence.RegisterEvaluation(orderId, utcNow, fingerprint, AdoptionConvergenceUnchangedThreshold, AdoptionConvergenceCooldownSeconds,
+                out var escalateNonConvergence, out var suppressHeavy, out var unchangedStreak);
+            if (escalateNonConvergence)
+            {
+                Interlocked.Increment(ref _metricAdoptionNonConvergentEscalationsTotal);
+                scanEscalations++;
+                _adoptionConvergence.TryGetTimestamps(orderId, out var fs, out var ls);
+                LogIeaEngine(utcNow, "ADOPTION_NON_CONVERGENCE_ESCALATED", new
+                {
+                    broker_order_id = orderId,
+                    instrument = brokerInstrument,
+                    intent_id = intentId,
+                    attempt_count = unchangedStreak,
+                    attempt_threshold = AdoptionConvergenceUnchangedThreshold,
+                    cooldown_seconds = AdoptionConvergenceCooldownSeconds,
+                    first_seen_utc = fs.ToString("o"),
+                    last_seen_utc = ls.ToString("o"),
+                    iea_instance_id = InstanceId,
+                    classification = fingerprint,
+                    execution_instrument_key = ExecutionInstrumentKey
+                });
+            }
+            if (suppressHeavy)
+                continue;
 
             if (isStop || isTarget)
             {
-                if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
+                if (!string.IsNullOrEmpty(intentId) && hasCandidate)
                 {
                     var mapKey = $"{intentId}:{(isStop ? "STOP" : "TARGET")}";
                     if (!OrderMap.TryGetValue(mapKey, out _))
                     {
+                        LogIeaEngine(utcNow, "ADOPTION_CANDIDATE_FOUND", new
+                        {
+                            broker_order_id = orderId,
+                            intent_id = intentId,
+                            execution_instrument_key = ExecutionInstrumentKey,
+                            iea_instance_id = InstanceId,
+                            order_role = isStop ? "STOP" : "TARGET"
+                        });
                         var oi = new OrderInfo
                         {
                             IntentId = intentId,
-                            Instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey,
+                            Instrument = brokerInstrument,
                             OrderId = o.OrderId,
                             OrderType = isStop ? "STOP" : "TARGET",
                             Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
@@ -737,8 +827,11 @@ public sealed partial class InstrumentExecutionAuthority
                         };
                         OrderMap[mapKey] = oi;
                         RegisterAdoptedOrder(o.OrderId, intentId, oi.Instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "RESTART_ADOPTION", oi, NowEvent());
+                        _adoptionConvergence.ClearOrder(orderId);
                         if (isStop)
                             Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
+                        Interlocked.Increment(ref _metricAdoptionSuccessfulAdoptionsTotal);
+                        scanAdopted++;
                         Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, oi.Instrument, "ADOPTION_SUCCESS", new
                         {
                             broker_order_id = o.OrderId,
@@ -751,37 +844,76 @@ public sealed partial class InstrumentExecutionAuthority
                 }
                 else
                 {
-                    // Phase 2: No matching intent - unowned live order
-                    var instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey;
-                    if (!TryResolveByBrokerOrderId(o.OrderId, out _))
+                    if (TryResolveByBrokerOrderId(orderId, out _))
+                        continue;
+
+                    var corrupt = string.IsNullOrWhiteSpace(intentId);
+                    Interlocked.Increment(ref _metricAdoptionStaleQtsw2OrdersTotal);
+                    scanStale++;
+                    if (unchangedStreak == 1)
                     {
-                        RegisterUnownedOrder(o.OrderId, intentId, instrument, "UNOWNED_LIVE_ORDER_DETECTED", NowEvent());
-                        Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId ?? "", instrument, "UNOWNED_LIVE_ORDER_DETECTED", new
+                        LogIeaEngine(utcNow, "ADOPTION_CANDIDATE_NOT_FOUND", new
                         {
-                            broker_order_id = o.OrderId,
+                            broker_order_id = orderId,
                             intent_id = intentId,
-                            instrument,
+                            execution_instrument_key = ExecutionInstrumentKey,
+                            iea_instance_id = InstanceId,
+                            order_role = isStop ? "STOP" : "TARGET"
+                        });
+                        LogIeaEngine(utcNow, "STALE_QTSW2_ORDER_DETECTED", new
+                        {
+                            broker_order_id = orderId,
+                            intent_id = intentId,
+                            instrument = brokerInstrument,
+                            execution_instrument_key = ExecutionInstrumentKey,
                             order_type = isStop ? "STOP" : "TARGET",
-                            note = "Restart scan: QTSW2 protective with no matching active intent",
-                            action = "RECOVERY_PHASE3",
-                            iea_instance_id = InstanceId
-                        }));
-                        RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
-                        RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                            reason = corrupt ? "MALFORMED_OR_EMPTY_INTENT_TAG" : "NO_JOURNAL_ADOPTION_CANDIDATE_FOR_THIS_INSTRUMENT",
+                            iea_instance_id = InstanceId,
+                            policy = "NO_AUTO_ADOPT_WITHOUT_CANDIDATE"
+                        });
+                    }
+
+                    if (!corrupt)
+                    {
+                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                        if (unchangedStreak == 1)
+                        {
+                            RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH,
+                                new { broker_order_id = orderId, intent_id = intentId, classification = "STALE_QTSW2_ORDER_DETECTED" }, utcNow);
+                            RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
+                                new { broker_order_id = orderId, intent_id = intentId, note = "Same-instrument QTSW2 protective without adoption candidate — fail-closed recovery (convergence-guarded)" }, utcNow);
+                        }
+                    }
+                    else
+                    {
+                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                        if (unchangedStreak == 1)
+                        {
+                            RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.CRITICAL,
+                                new { broker_order_id = orderId, reason = "CORRUPT_QTSW2_TAG" }, utcNow);
+                            RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
+                                new { broker_order_id = orderId, intent_id = intentId, note = "Malformed QTSW2 tag — fail-closed recovery" }, utcNow);
+                        }
                     }
                 }
             }
             else
             {
-                // IEA robustness: Adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET). Prevents ORDER_REGISTRY_MISSING on restart.
                 if (TryResolveByBrokerOrderId(o.OrderId, out _)) continue;
-                var instrument = o.Instrument?.MasterInstrument?.Name ?? ExecutionInstrumentKey;
-                if (!string.IsNullOrEmpty(intentId) && activeIntentIds.Contains(intentId))
+                if (!string.IsNullOrEmpty(intentId) && hasCandidate)
                 {
+                    LogIeaEngine(utcNow, "ADOPTION_CANDIDATE_FOUND", new
+                    {
+                        broker_order_id = orderId,
+                        intent_id = intentId,
+                        execution_instrument_key = ExecutionInstrumentKey,
+                        iea_instance_id = InstanceId,
+                        order_role = "ENTRY"
+                    });
                     var oi = new OrderInfo
                     {
                         IntentId = intentId,
-                        Instrument = instrument,
+                        Instrument = brokerInstrument,
                         OrderId = o.OrderId,
                         OrderType = "ENTRY",
                         Price = (decimal?)o.StopPrice ?? (decimal?)o.LimitPrice,
@@ -791,8 +923,11 @@ public sealed partial class InstrumentExecutionAuthority
                         FilledQuantity = 0
                     };
                     OrderMap[intentId] = oi;
-                    RegisterAdoptedOrder(o.OrderId, intentId, instrument, OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", oi, NowEvent());
-                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
+                    RegisterAdoptedOrder(o.OrderId, intentId, brokerInstrument, OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", oi, NowEvent());
+                    _adoptionConvergence.ClearOrder(orderId);
+                    Interlocked.Increment(ref _metricAdoptionSuccessfulAdoptionsTotal);
+                    scanAdopted++;
+                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, brokerInstrument, "ADOPTION_SUCCESS", new
                     {
                         broker_order_id = o.OrderId,
                         intent_id = intentId,
@@ -803,22 +938,63 @@ public sealed partial class InstrumentExecutionAuthority
                 }
                 else
                 {
-                    RegisterUnownedOrder(o.OrderId, intentId, instrument, "UNOWNED_ENTRY_RESTART", NowEvent());
-                    Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId ?? "", instrument, "UNOWNED_LIVE_ORDER_DETECTED", new
+                    if (TryResolveByBrokerOrderId(orderId, out _))
+                        continue;
+                    var corrupt = string.IsNullOrWhiteSpace(intentId);
+                    Interlocked.Increment(ref _metricAdoptionStaleQtsw2OrdersTotal);
+                    scanStale++;
+                    if (unchangedStreak == 1)
                     {
-                        broker_order_id = o.OrderId,
-                        intent_id = intentId,
-                        instrument,
-                        order_type = "ENTRY",
-                            note = "Restart scan: QTSW2 entry with no matching active intent",
-                            action = "RECOVERY_PHASE3",
+                        LogIeaEngine(utcNow, "ADOPTION_CANDIDATE_NOT_FOUND", new
+                        {
+                            broker_order_id = orderId,
+                            intent_id = intentId,
+                            execution_instrument_key = ExecutionInstrumentKey,
+                            iea_instance_id = InstanceId,
+                            order_role = "ENTRY"
+                        });
+                        LogIeaEngine(utcNow, "STALE_QTSW2_ORDER_DETECTED", new
+                        {
+                            broker_order_id = orderId,
+                            intent_id = intentId,
+                            instrument = brokerInstrument,
+                            execution_instrument_key = ExecutionInstrumentKey,
+                            order_type = "ENTRY",
+                            reason = corrupt ? "MALFORMED_OR_EMPTY_INTENT_TAG" : "NO_JOURNAL_ADOPTION_CANDIDATE_FOR_THIS_INSTRUMENT",
                             iea_instance_id = InstanceId
-                        }));
-                    RequestRecovery(instrument, "UNOWNED_LIVE_ORDER_DETECTED", new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
-                    RequestSupervisoryAction(instrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH, new { broker_order_id = o.OrderId, intent_id = intentId }, utcNow);
+                        });
+                    }
+                    RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                    if (unchangedStreak == 1)
+                    {
+                        RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS,
+                            corrupt ? SupervisorySeverity.CRITICAL : SupervisorySeverity.HIGH,
+                            new { broker_order_id = orderId, intent_id = intentId }, utcNow);
+                        RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
+                            new { broker_order_id = orderId, intent_id = intentId, note = "QTSW2 entry without adoption candidate" }, utcNow);
+                    }
                 }
             }
         }
+
+        LogIeaEngine(utcNow, "ADOPTION_SCAN_SUMMARY", new
+        {
+            execution_instrument_key = ExecutionInstrumentKey,
+            iea_instance_id = InstanceId,
+            scan_qtsw2_same_instrument_seen = scanSeen,
+            scan_skipped_foreign = scanForeign,
+            scan_stale_classified = scanStale,
+            scan_adopted = scanAdopted,
+            scan_non_convergence_escalations = scanEscalations,
+            scan_suppressed_rechecks = scanSuppressed,
+            scanned_orders_total = Interlocked.Read(ref _metricAdoptionScannedOrdersTotal),
+            skipped_foreign_instrument_orders_total = Interlocked.Read(ref _metricAdoptionSkippedForeignInstrumentOrdersTotal),
+            stale_qtsw2_orders_total = Interlocked.Read(ref _metricAdoptionStaleQtsw2OrdersTotal),
+            successful_adoptions_total = Interlocked.Read(ref _metricAdoptionSuccessfulAdoptionsTotal),
+            non_convergent_orders_total = Interlocked.Read(ref _metricAdoptionNonConvergentEscalationsTotal),
+            suppressed_rechecks_total = Interlocked.Read(ref _metricAdoptionSuppressedRechecksTotal)
+        });
+
         _hasScannedForAdoption = true;
         _adoptionDeferred = false;
     }
@@ -832,6 +1008,10 @@ public sealed partial class InstrumentExecutionAuthority
         if (Executor == null || o == null) return false;
         var id = o.OrderId?.ToString();
         if (string.IsNullOrEmpty(id) || TryResolveByBrokerOrderId(id, out _)) return false;
+
+        var brokerInstrumentGate = o.Instrument?.MasterInstrument?.Name ?? "";
+        if (!AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, brokerInstrumentGate))
+            return false;
 
         var tag = Executor.GetOrderTag(o);
         if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
@@ -866,6 +1046,7 @@ public sealed partial class InstrumentExecutionAuthority
                     };
                     OrderMap[mapKey] = oi;
                     RegisterAdoptedOrder(o.OrderId, intentId, instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
+                    _adoptionConvergence.ClearOrder(id);
                     if (isStop)
                         Executor?.SetProtectionStateWorkingForAdoptedStop(intentId);
                     Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
@@ -902,6 +1083,7 @@ public sealed partial class InstrumentExecutionAuthority
                 };
                 OrderMap[intentId] = oi;
                 RegisterAdoptedOrder(o.OrderId, intentId, instrument, OrderRole.ENTRY, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
+                _adoptionConvergence.ClearOrder(id);
                 Log?.Write(RobotEvents.ExecutionBase(NowEvent(), intentId, instrument, "ADOPTION_SUCCESS", new
                 {
                     broker_order_id = o.OrderId,

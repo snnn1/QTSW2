@@ -96,17 +96,26 @@ public interface IIEAOrderExecutor
     /// <summary>
     /// IEA Flatten Authority: Get account position for instrument.
     /// Returns (quantity, direction) where direction is "Long", "Short", or "" when flat.
+    /// Derived from <see cref="GetBrokerCanonicalExposure"/> (same canonical bucket as reconciliation).
     /// THREAD/SERIALIZATION: Must be called on strategy thread. Position query + flatten decision + order submission
     /// must run as one critical section (same EnqueueAndWait callback or strategy-thread action).
     /// </summary>
     (int quantity, string direction) GetAccountPositionForInstrument(string instrument);
 
     /// <summary>
+    /// Canonical broker exposure for the instrument key: master-instrument bucket + all matching NT position rows.
+    /// Same identity model as <see cref="BrokerPositionResolver"/> / <see cref="ReconciliationRunner"/>.
+    /// </summary>
+    BrokerCanonicalExposure GetBrokerCanonicalExposure(string instrument);
+
+    /// <summary>
     /// IEA Flatten Authority: Submit position-derived market close order.
     /// Side and quantity must be derived from account position at decision time.
     /// Snapshot is included in FLATTEN_SENT event payload for forensic analysis.
+    /// <paramref name="nativeInstrumentForBrokerOrder"/> when non-null must be the NT Instrument for that position row
+    /// (design A: same row reconciliation counts). When null, falls back to chart-bound instrument (legacy).
     /// </summary>
-    OrderSubmissionResult SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow);
+    OrderSubmissionResult SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow, object? nativeInstrumentForBrokerOrder = null);
 
     /// <summary>Phase 3: Stand down stream (BE failure recovery).</summary>
     void StandDownStream(string streamId, DateTimeOffset utcNow, string reason);

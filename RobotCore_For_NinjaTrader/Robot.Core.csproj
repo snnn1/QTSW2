@@ -32,5 +32,9 @@
     <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
     <Compile Include="..\modules\robot\core\EntryOrderRecoveryTypes.cs" Link="EntryOrderRecoveryTypes.cs" />
     <Compile Include="..\modules\robot\core\Execution\AdoptionDeferralDecision.cs" Link="Execution\AdoptionDeferralDecision.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AdoptionScanInstrumentGate.cs" Link="Execution\AdoptionScanInstrumentGate.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AdoptionReconciliationConvergence.cs" Link="Execution\AdoptionReconciliationConvergence.cs" />
+    <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
+    <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
   </ItemGroup>
 </Project>

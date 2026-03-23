@@ -6,6 +6,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using QTSW2.Robot.Contracts;
@@ -102,6 +103,167 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Gap 5: Set canonical event writer for replay. Call before SetNTContext when using IEA.</summary>
     public void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;
+
+    /// <summary>Cross-chart flatten owner id (align with reconciliation writer / engine instance). When unset, uses nta:&lt;adapter#&gt;.</summary>
+    private string? _flattenCoordinationInstanceIdOverride;
+
+    /// <summary>Set process-stable instance id for flatten coordination (e.g. engine reconciliation writer id).</summary>
+    public void SetFlattenCoordinationInstanceId(string? instanceId) =>
+        _flattenCoordinationInstanceIdOverride = string.IsNullOrWhiteSpace(instanceId) ? null : instanceId.Trim();
+
+    private string GetFlattenCoordinationInstanceId() =>
+        !string.IsNullOrEmpty(_flattenCoordinationInstanceIdOverride)
+            ? _flattenCoordinationInstanceIdOverride!
+            : "nta:" + _adapterInstanceId.ToString(CultureInfo.InvariantCulture);
+
+    private string GetCoordinationAccountName()
+    {
+        if (!string.IsNullOrEmpty(_iea?.AccountName)) return _iea.AccountName;
+        if (!string.IsNullOrEmpty(_ieaAccountName)) return _ieaAccountName;
+        try
+        {
+            if (_ntAccount != null)
+            {
+                dynamic acc = _ntAccount;
+                string? n = acc.Name;
+                if (!string.IsNullOrEmpty(n)) return n;
+            }
+        }
+        catch { }
+        return "UNKNOWN";
+    }
+
+    private string GetHostChartInstrumentName()
+    {
+        try
+        {
+            if (_ntInstrument == null) return "";
+            dynamic inst = _ntInstrument;
+            return inst.FullName ?? "";
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>Enqueue gate: one active flatten owner per (account, canonical_broker_key).</summary>
+    private bool TryCoordinationGateFlattenEnqueue(NtFlattenInstrumentCommand cmd, out string episodeIdFromGate)
+    {
+        episodeIdFromGate = "";
+        var canonical = BrokerPositionResolver.NormalizeCanonicalKey(cmd.Instrument);
+        if (string.IsNullOrEmpty(canonical))
+            return true;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var account = GetCoordinationAccountName();
+        var instId = GetFlattenCoordinationInstanceId();
+        var hostChart = GetHostChartInstrumentName();
+
+        var gate = FlattenCoordinationTracker.Shared.TryRequestFlattenEnqueue(
+            account,
+            cmd.Instrument,
+            instId,
+            hostChart,
+            cmd.CorrelationId,
+            utcNow,
+            cmd.IsVerifyRetryFlatten,
+            out var episodeId,
+            out var prevOwner,
+            out var emitOwnerAssigned,
+            out var emitPersistentStillOpen,
+            out var staleElapsed);
+
+        episodeIdFromGate = episodeId;
+        var m = FlattenCoordinationTracker.Shared.Metrics;
+
+        switch (gate)
+        {
+            case FlattenEnqueueGateOutcome.SecondaryInstanceSkip:
+                FlattenCoordinationTracker.Shared.TryPeekKey(account, cmd.Instrument, out var skipOwner, out var skipEpi, out _);
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_SECONDARY_INSTANCE_SKIPPED", state: "ENGINE",
+                    new
+                    {
+                        account,
+                        canonical_broker_key = canonical,
+                        owner_instance_id = skipOwner,
+                        current_instance_id = instId,
+                        episode_id = skipEpi,
+                        host_chart_instrument = hostChart,
+                        correlation_id = cmd.CorrelationId,
+                        reason = cmd.IsVerifyRetryFlatten ? "verify_retry_non_owner_or_no_episode" : "flatten_enqueue_non_owner_active",
+                        metrics_flatten_secondary_skipped_total = m.FlattenSecondarySkippedTotal
+                    }));
+                return false;
+
+            case FlattenEnqueueGateOutcome.FailedPersistentBlocked:
+                FlattenCoordinationTracker.Shared.TryPeekKey(account, cmd.Instrument, out var fpOwner, out var fpEpi, out _);
+                if (emitPersistentStillOpen)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_FAILED_PERSISTENT_STILL_OPEN", state: "CRITICAL",
+                        new
+                        {
+                            account,
+                            canonical_broker_key = canonical,
+                            owner_instance_id = fpOwner,
+                            current_instance_id = instId,
+                            episode_id = fpEpi,
+                            host_chart_instrument = hostChart,
+                            correlation_id = cmd.CorrelationId,
+                            reason = "persistent_failure_episode_active_coordination_blocked",
+                            metrics_flatten_failed_persistent_still_open_total = m.FlattenFailedPersistentStillOpenTotal
+                        }));
+                }
+                return false;
+
+            case FlattenEnqueueGateOutcome.TakeoverProceed:
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_OWNER_TAKEOVER", state: "ENGINE",
+                    new
+                    {
+                        account,
+                        canonical_broker_key = canonical,
+                        previous_owner_instance_id = prevOwner,
+                        new_owner_instance_id = instId,
+                        elapsed_since_last_update_sec = staleElapsed >= 0 ? (long?)staleElapsed : null,
+                        host_chart_instrument = hostChart,
+                        correlation_id = cmd.CorrelationId,
+                        episode_id = episodeId,
+                        metrics_flatten_owner_takeover_total = m.FlattenOwnerTakeoverTotal
+                    }));
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_COORDINATION_OWNER_ASSIGNED", state: "ENGINE",
+                    new
+                    {
+                        account,
+                        canonical_broker_key = canonical,
+                        owner_instance_id = instId,
+                        current_instance_id = instId,
+                        episode_id = episodeId,
+                        host_chart_instrument = hostChart,
+                        correlation_id = cmd.CorrelationId,
+                        reason = "after_stale_owner_takeover",
+                        metrics_flatten_owner_assigned_total = m.FlattenOwnerAssignedTotal
+                    }));
+                return true;
+
+            case FlattenEnqueueGateOutcome.Proceed:
+                if (emitOwnerAssigned)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_COORDINATION_OWNER_ASSIGNED", state: "ENGINE",
+                        new
+                        {
+                            account,
+                            canonical_broker_key = canonical,
+                            owner_instance_id = instId,
+                            current_instance_id = instId,
+                            episode_id = episodeId,
+                            host_chart_instrument = hostChart,
+                            correlation_id = cmd.CorrelationId,
+                            metrics_flatten_owner_assigned_total = m.FlattenOwnerAssignedTotal
+                        }));
+                }
+                return true;
+
+            default:
+                return true;
+        }
+    }
     private Action<string, string, object>? _onSupervisoryCriticalCallback;
     
     /// <summary>Callback when reentry order fills. Engine invokes HandleReentryFill on matching stream.</summary>
@@ -182,11 +344,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             _nonIeaExecutionDedup.TryRemove(k, out _);
     }
 
-    /// <summary>Flatten verification: instrumentKey -> (requestedUtc, retryCount, deadline, correlationId, instrumentRef).
-    /// instrumentRef: strategy's Instrument instance used for position check (avoids string-resolution ambiguity).</summary>
-    private readonly ConcurrentDictionary<string, (DateTimeOffset RequestedUtc, int RetryCount, DateTimeOffset VerifyDeadlineUtc, string CorrelationId, object? InstrumentRef)> _pendingFlattenVerifications = new();
+    /// <summary>Flatten verification: instrumentKey -> (requestedUtc, verifyDeadline, correlationId, episodeId).
+    /// Post-submit flat check uses <see cref="IIEAOrderExecutor.GetBrokerCanonicalExposure"/> (same model as reconciliation).</summary>
+    private readonly ConcurrentDictionary<string, (DateTimeOffset RequestedUtc, DateTimeOffset VerifyDeadlineUtc, string CorrelationId, string EpisodeId)> _pendingFlattenVerifications = new();
     private const double FLATTEN_VERIFY_WINDOW_SEC = 4.0;
-    private const int FLATTEN_VERIFY_MAX_RETRIES = 4;
+    /// <summary>Aligned with <see cref="FlattenCoordinationTracker.DefaultMaxVerifyRetries"/> (verify-driven retry cap per episode).</summary>
+    private const int FLATTEN_VERIFY_MAX_RETRIES = FlattenCoordinationTracker.DefaultMaxVerifyRetries;
 
     // BE Modify Confirmation: pending requests keyed by stop_order_id. Register BEFORE Change(); confirm via OrderUpdate.
     private readonly ConcurrentDictionary<string, PendingBERequest> _pendingBERequests = new();
@@ -291,6 +454,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     bool IIEAOrderExecutor.EnqueueNtAction(INtAction action)
     {
         if (_ntActionQueue == null) return false;
+        if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
+            return false;
         if (string.Equals(action.ActionType, "SUBMIT_PROTECTIVES", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(action.IntentId))
         {
             SetProtectionState(action.IntentId, ProtectionState.Enqueued);
@@ -462,6 +627,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     private void EnqueueNtActionInternal(INtAction action)
     {
+        if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
+            return;
         if (_ntActionQueue != null)
             _ntActionQueue.EnqueueNtAction(action, out _);
     }
@@ -789,8 +956,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
-            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
-                DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL), out _);
+        EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
+            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL));
         var lockObj = _iea?.EntrySubmissionLock;
         if (lockObj != null)
         {
@@ -1501,8 +1668,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         {
             var cid = $"FAILCLOSED:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
             _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, intentId, intent.Instrument, false, failureReason, utcNow), out _);
-            _ntActionQueue.EnqueueNtAction(new NtFlattenInstrumentCommand(cid + ":F", intentId, intent.Instrument ?? "", failureReason, utcNow,
-                DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED, allowAccountWideCancelFallback: false), out _);
+            EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cid + ":F", intentId, intent.Instrument ?? "", failureReason, utcNow,
+                DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED, allowAccountWideCancelFallback: false));
             _standDownStreamCallback?.Invoke(intent.Stream, utcNow, $"{eventType}: {failureReason}");
             PersistProtectiveFailureIncident(intentId, intent, stopResult, targetResult, FlattenResult.FailureResult("Enqueued for strategy thread", utcNow), utcNow);
             var notificationSvc = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
@@ -2178,7 +2345,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 // P2.6.6: never call RequestFlatten directly from adapter — single funnel via NtFlattenInstrumentCommand.
                 var cmd = new NtFlattenInstrumentCommand($"FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}", intentId, instrument, "FLATTEN_DELEGATED", utcNow,
                     DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, allowAccountWideCancelFallback: false);
-                _ntActionQueue?.EnqueueNtAction(cmd, out _);
+                EnqueueNtActionInternal(cmd);
                 return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
             }
             return FlattenIntentReal(intentId, instrument, utcNow);

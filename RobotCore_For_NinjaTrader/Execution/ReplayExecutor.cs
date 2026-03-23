@@ -37,7 +37,12 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow) => FlattenResult.SuccessResult(utcNow);
     public FlattenResult EmergencyFlatten(string instrument, DateTimeOffset utcNow) => FlattenResult.SuccessResult(utcNow);
     public (int quantity, string direction) GetAccountPositionForInstrument(string instrument) => (0, "");
-    public OrderSubmissionResult SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow) => OrderSubmissionResult.SuccessResult("replay", utcNow);
+
+    public BrokerCanonicalExposure GetBrokerCanonicalExposure(string instrument) =>
+        BrokerCanonicalExposure.Empty(BrokerPositionResolver.NormalizeCanonicalKey(instrument));
+
+    public OrderSubmissionResult SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow, object? nativeInstrumentForBrokerOrder = null) =>
+        OrderSubmissionResult.SuccessResult("replay", utcNow);
     public void StandDownStream(string streamId, DateTimeOffset utcNow, string reason) { }
     public void FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) { }
 

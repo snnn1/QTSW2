@@ -19,6 +19,15 @@ public sealed class FlattenDecisionSnapshot
     public string? LatchState { get; set; }
     public DateTimeOffset DecisionUtc { get; set; }
 
+    /// <summary>When flattening multiple broker rows, 0-based leg index.</summary>
+    public int? FlattenLegIndex { get; set; }
+
+    /// <summary>Total abs qty across canonical bucket at decision (reconciliation-aligned).</summary>
+    public int? CanonicalExposureAbsTotalAtDecision { get; set; }
+
+    /// <summary>Contract label for this leg (e.g. NT FullName).</summary>
+    public string? LegContractLabel { get; set; }
+
     /// <summary>Convert to anonymous object for structured logging (JSONL).</summary>
     public object ToLogPayload()
     {
@@ -33,7 +42,10 @@ public sealed class FlattenDecisionSnapshot
             chosen_quantity = ChosenQuantity,
             latch_request_id = LatchRequestId,
             latch_state = LatchState,
-            decision_utc = DecisionUtc.ToString("o")
+            decision_utc = DecisionUtc.ToString("o"),
+            flatten_leg_index = FlattenLegIndex,
+            canonical_exposure_abs_total_at_decision = CanonicalExposureAbsTotalAtDecision,
+            leg_contract_label = LegContractLabel
         };
     }
 }
