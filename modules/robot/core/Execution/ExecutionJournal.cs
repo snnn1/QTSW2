@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -17,7 +19,18 @@ public sealed class ExecutionJournal
     private readonly string _journalDir;
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
+    private readonly Dictionary<string, bool> _entryFillByStream = new(); // key = "tradingDate_stream", O(1) HasEntryFillForStream
     private readonly object _lock = new object();
+
+    /// <summary>Normalized journal instrument (entry.Instrument root) → adoption-candidate intent ids. Caller must hold <see cref="_lock"/>.</summary>
+    private readonly Dictionary<string, HashSet<string>> _normInstToAdoptionCandidateIntentIds = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Intent id → normalized instrument bucket key for O(1) removal. Caller must hold <see cref="_lock"/>.</summary>
+    private readonly Dictionary<string, string> _adoptionCandidateIntentToNormInst = new(StringComparer.OrdinalIgnoreCase);
+
+    private bool _adoptionCandidateIndexWarmed;
+    private long _adoptionCandidateIndexLookupIndexHits;
+    private long _adoptionCandidateIndexLookupFallbacks;
     
     // Callback for stream stand-down on journal corruption
     private Action<string, string, string, DateTimeOffset>? _onJournalCorruptionCallback;
@@ -31,21 +44,37 @@ public sealed class ExecutionJournal
         Directory.CreateDirectory(_journalDir);
         ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
         _log = log;
+        try
+        {
+            lock (_lock)
+            {
+                RebuildAdoptionCandidateIndexFromDiskLocked();
+            }
+        }
+        catch (Exception ex)
+        {
+            _adoptionCandidateIndexWarmed = false;
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILD_FAILED", "ENGINE",
+                new
+                {
+                    warmed = false,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    note = "Cold rebuild failed — adoption candidate lookups will use full journal scan until next successful rebuild"
+                }));
+        }
     }
-
-    /// <summary>Root directory for persisted journal JSON files (diagnostics).</summary>
-    public string JournalDirectory => _journalDir;
     
     /// <summary>
     /// Phase 3.2: Startup self-check. Verifies journal dir exists and is writable.
-    /// Writes and reads .startup_check; throws on failure (fail closed).
+    /// Uses unique temp file per instance to avoid race when multiple strategies start concurrently.
     /// </summary>
     private void ValidateJournalDirectory()
     {
         if (!Directory.Exists(_journalDir))
             throw new InvalidOperationException($"ExecutionJournal: journal directory does not exist: {_journalDir}");
         
-        var checkPath = Path.Combine(_journalDir, ".startup_check");
+        var checkPath = Path.Combine(_journalDir, $".startup_check_{Guid.NewGuid():N}");
         try
         {
             var testContent = DateTimeOffset.UtcNow.ToString("o");
@@ -61,6 +90,27 @@ public sealed class ExecutionJournal
         }
     }
     
+    /// <summary>Journal directory path (for diagnostics).</summary>
+    public string JournalDirectory => _journalDir;
+
+    /// <summary>
+    /// Get journal visibility diagnostics for adoption deferral logging.
+    /// Returns (directory exists, file count, directory path). FileCount is -1 on read failure.
+    /// </summary>
+    public (bool DirectoryExists, int FileCount, string JournalDir) GetJournalDiagnostics()
+    {
+        try
+        {
+            var exists = Directory.Exists(_journalDir);
+            var files = exists ? Directory.GetFiles(_journalDir, "*.json") : Array.Empty<string>();
+            return (exists, files.Length, _journalDir);
+        }
+        catch
+        {
+            return (false, -1, _journalDir);
+        }
+    }
+
     /// <summary>
     /// Set callback for journal corruption events (stream stand-down).
     /// </summary>
@@ -127,6 +177,8 @@ public sealed class ExecutionJournal
                     if (diskEntry != null)
                     {
                         _cache[key] = diskEntry;
+                        if (TryParseIntentIdFromCacheKey(key, out var sid))
+                            SyncAdoptionCandidateIndexForIntentLocked(sid, diskEntry);
                         return diskEntry.EntrySubmitted || diskEntry.EntryFilled;
                     }
                 }
@@ -384,6 +436,7 @@ public sealed class ExecutionJournal
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
+            _entryFillByStream[$"{tradingDate}_{stream}"] = true;
         }
     }
 
@@ -391,6 +444,9 @@ public sealed class ExecutionJournal
     /// Record entry fill (delta-based, idempotent, cumulative).
     /// Accepts delta fillQuantity only, NOT cumulative filledTotal.
     /// </summary>
+    /// <param name="brokerOrderInstrumentKey">Optional. Instrument from the broker order (e.g. "M2K 03-26").
+    /// When provided, invariant check: journal instrument must equal execution instrument (root).
+    /// Mismatch → CRITICAL JOURNAL_INSTRUMENT_KEY_MISMATCH and fail-closed.</param>
     public void RecordEntryFill(
         string intentId,
         string tradingDate,
@@ -401,10 +457,35 @@ public sealed class ExecutionJournal
         decimal contractMultiplier,
         string direction,
         string executionInstrument,
-        string canonicalInstrument)
+        string canonicalInstrument,
+        string? brokerOrderInstrumentKey = null)
     {
-        lock (_lock)
+        var cacheHit = false;
+        WithLockTiming("RecordEntryFill", tradingDate, () =>
         {
+            // INVARIANT: Journal instrument must equal execution instrument (broker position key).
+            // Prevents silent divergence if canonical instrument is mistakenly used.
+            if (!string.IsNullOrWhiteSpace(brokerOrderInstrumentKey) && !string.IsNullOrWhiteSpace(executionInstrument))
+            {
+                var brokerRoot = GetInstrumentRoot(brokerOrderInstrumentKey);
+                if (!string.Equals(brokerRoot, executionInstrument.Trim(), StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_INSTRUMENT_KEY_MISMATCH", "CRITICAL",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = stream,
+                            journal_instrument = executionInstrument,
+                            broker_order_instrument = brokerOrderInstrumentKey,
+                            broker_root = brokerRoot,
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal instrument must equal execution instrument. Canonical instrument usage would cause reconciliation mismatch. Fail-closed."
+                        }));
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    return; // Fail-closed: do not persist
+                }
+            }
+
             // CRITICAL: Validate key fields - reject empty/whitespace
             if (string.IsNullOrWhiteSpace(tradingDate))
             {
@@ -440,6 +521,7 @@ public sealed class ExecutionJournal
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
+                cacheHit = true;
                 entry = existing;
             }
             else if (File.Exists(journalPath))
@@ -607,7 +689,8 @@ public sealed class ExecutionJournal
             
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
-        }
+            _entryFillByStream[$"{tradingDate}_{stream}"] = true;
+        }, () => new { cache_hit = cacheHit });
     }
     
     /// <summary>
@@ -625,7 +708,8 @@ public sealed class ExecutionJournal
         DateTimeOffset utcNow,
         string? slotInstanceKey = null)  // Optional: slot_instance_key for health sink granularity
     {
-        lock (_lock)
+        var cacheHit = false;
+        WithLockTiming("RecordExitFill", tradingDate, () =>
         {
             // CRITICAL: Validate key fields - reject empty/whitespace
             if (string.IsNullOrWhiteSpace(tradingDate))
@@ -662,6 +746,7 @@ public sealed class ExecutionJournal
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
+                cacheHit = true;
                 entry = existing;
             }
             else if (File.Exists(journalPath))
@@ -1009,7 +1094,7 @@ public sealed class ExecutionJournal
             
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
-        }
+        }, () => new { cache_hit = cacheHit });
     }
 
     /// <summary>
@@ -1230,13 +1315,17 @@ public sealed class ExecutionJournal
     {
         lock (_lock)
         {
-            // Scan journal directory for entries matching tradingDate_stream_*
+            var cacheKey = $"{tradingDate}_{stream}";
+            if (_entryFillByStream.TryGetValue(cacheKey, out var cached))
+                return cached;
+
+            // Cache miss: scan journal directory for entries matching tradingDate_stream_*
             var pattern = $"{tradingDate}_{stream}_*.json";
-            
+            var result = false;
             try
             {
                 if (!Directory.Exists(_journalDir)) return false;
-                
+
                 var files = Directory.GetFiles(_journalDir, pattern);
                 foreach (var file in files)
                 {
@@ -1246,10 +1335,10 @@ public sealed class ExecutionJournal
                         var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                         if (entry != null)
                         {
-                            // Check both legacy EntryFilled flag and new EntryFilledQuantityTotal
                             if (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0)
                             {
-                                return true; // Found at least one filled entry
+                                result = true;
+                                break;
                             }
                         }
                     }
@@ -1258,14 +1347,15 @@ public sealed class ExecutionJournal
                         // Skip corrupted files, continue scanning
                     }
                 }
+                _entryFillByStream[cacheKey] = result;
             }
             catch
             {
                 // Fail-safe: return false on error (assume no fill)
                 return false;
             }
-            
-            return false;
+
+            return result;
         }
     }
 
@@ -1349,6 +1439,8 @@ public sealed class ExecutionJournal
                     if (entry != null)
                     {
                         _cache[key] = entry;
+                        if (TryParseIntentIdFromCacheKey(key, out var gid))
+                            SyncAdoptionCandidateIndexForIntentLocked(gid, entry);
                         return entry;
                     }
                 }
@@ -1365,6 +1457,7 @@ public sealed class ExecutionJournal
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 
+    /// <summary>Extract instrument root (e.g. "M2K 03-26" -> "M2K") for broker/reconciliation key matching.</summary>
     private static string GetInstrumentRoot(string instrumentKey)
     {
         if (string.IsNullOrWhiteSpace(instrumentKey)) return "";
@@ -1375,13 +1468,20 @@ public sealed class ExecutionJournal
 
     /// <summary>
     /// Get all open journal entries (EntryFilled && !TradeCompleted) grouped by execution instrument.
+    /// Used by ReconciliationRunner to find orphaned journals when broker is flat.
     /// </summary>
     public Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> GetOpenJournalEntriesByInstrument()
     {
         var result = new Dictionary<string, List<(string, string, string, ExecutionJournalEntry)>>(StringComparer.OrdinalIgnoreCase);
         string[] files;
-        try { files = Directory.GetFiles(_journalDir, "*.json"); }
-        catch { return result; }
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            return result;
+        }
 
         foreach (var path in files)
         {
@@ -1396,13 +1496,25 @@ public sealed class ExecutionJournal
                 var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
 
                 // Always read from disk for reconciliation - bypass cache to avoid stale data across
-                // multiple RobotEngine instances. See 2026-03-11_MYM_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.
+                // multiple RobotEngine instances (each has its own ExecutionJournal cache). See
+                // docs/robot/incidents/2026-03-11_MYM_RECONCILIATION_QTY_MISMATCH_INVESTIGATION.md
                 ExecutionJournalEntry? entry;
                 lock (_lock)
                 {
-                    var json = File.ReadAllText(path);
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null)
+                    {
+                        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_READ_SKIPPED", "ENGINE",
+                            new { path, error = "Read failed after retries (file lock?)" }));
+                        continue;
+                    }
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                    if (entry != null) _cache[fileName] = entry;
+                    if (entry != null)
+                    {
+                        _cache[fileName] = entry; // Update cache for consistency with disk
+                        if (TryParseIntentIdFromJournalFileName(fileName, out var oid))
+                            SyncAdoptionCandidateIndexForIntentLocked(oid, entry);
+                    }
                 }
 
                 if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;
@@ -1416,8 +1528,14 @@ public sealed class ExecutionJournal
                 }
                 list.Add((tradingDate, stream, intentId, entry));
             }
-            catch { /* Skip corrupt files */ }
+            catch (Exception ex)
+            {
+                // Log read failures (file lock, corrupt JSON) for RECONCILIATION_QTY_MISMATCH diagnostics
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_READ_SKIPPED", "ENGINE",
+                    new { path, error = ex.Message, exception_type = ex.GetType().Name }));
+            }
         }
+
         return result;
     }
 
@@ -1444,17 +1562,110 @@ public sealed class ExecutionJournal
         return false;
     }
 
-    /// <summary>
-    /// Get intent IDs that are adoption candidates for restart recovery.
-    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
-    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
-    /// </summary>
-    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    private static bool IsAdoptionCandidateJournalEntry(ExecutionJournalEntry? entry)
+        => entry != null && entry.EntrySubmitted && !entry.TradeCompleted;
+
+    /// <summary>Parse intent id from journal file basename (tradingDate_stream..._intentId).</summary>
+    private static bool TryParseIntentIdFromJournalFileName(string fileNameWithoutExtension, out string intentId)
+    {
+        intentId = "";
+        var parts = fileNameWithoutExtension.Split('_');
+        if (parts.Length < 3) return false;
+        intentId = parts[parts.Length - 1];
+        return !string.IsNullOrEmpty(intentId);
+    }
+
+    /// <summary>Parse intent id from cache key tradingDate_stream_intentId.</summary>
+    private static bool TryParseIntentIdFromCacheKey(string cacheKey, out string intentId)
+        => TryParseIntentIdFromJournalFileName(cacheKey, out intentId);
+
+    /// <summary>Caller must hold <see cref="_lock"/>.</summary>
+    private void SyncAdoptionCandidateIndexForIntentLocked(string intentId, ExecutionJournalEntry entry)
+    {
+        if (string.IsNullOrWhiteSpace(intentId)) return;
+
+        if (_adoptionCandidateIntentToNormInst.TryGetValue(intentId, out var prevNorm))
+        {
+            if (_normInstToAdoptionCandidateIntentIds.TryGetValue(prevNorm, out var prevSet))
+            {
+                prevSet.Remove(intentId);
+                if (prevSet.Count == 0)
+                    _normInstToAdoptionCandidateIntentIds.Remove(prevNorm);
+            }
+            _adoptionCandidateIntentToNormInst.Remove(intentId);
+        }
+
+        if (!IsAdoptionCandidateJournalEntry(entry)) return;
+
+        var norm = NormalizeJournalInstrumentSymbol(string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument);
+        if (string.IsNullOrEmpty(norm)) norm = "UNKNOWN";
+
+        if (!_normInstToAdoptionCandidateIntentIds.TryGetValue(norm, out var set))
+        {
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _normInstToAdoptionCandidateIntentIds[norm] = set;
+        }
+        set.Add(intentId);
+        _adoptionCandidateIntentToNormInst[intentId] = norm;
+    }
+
+    /// <summary>Caller must hold <see cref="_lock"/>.</summary>
+    private void RebuildAdoptionCandidateIndexFromDiskLocked()
+    {
+        _normInstToAdoptionCandidateIntentIds.Clear();
+        _adoptionCandidateIntentToNormInst.Clear();
+
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            _adoptionCandidateIndexWarmed = false;
+            return;
+        }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                if (!TryParseIntentIdFromJournalFileName(fileName, out var intentId)) continue;
+
+                var json = ReadJournalFileWithRetry(path);
+                if (json == null) continue;
+                var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                if (entry == null) continue;
+                SyncAdoptionCandidateIndexForIntentLocked(intentId, entry);
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        _adoptionCandidateIndexWarmed = true;
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILT", "ENGINE",
+            new
+            {
+                warmed = true,
+                journal_file_total = files.Length,
+                adoption_candidate_intents = _adoptionCandidateIntentToNormInst.Count,
+                note = "Cold rebuild complete — candidate lookups use in-memory index"
+            }));
+    }
+
+    /// <summary>Full disk scan — same semantics as pre-index implementation. Caller must NOT hold <see cref="_lock"/> (method acquires per-file lock).</summary>
+    private HashSet<string> GetAdoptionCandidateIntentIdsForInstrumentFullScan(string executionInstrument, string? canonicalInstrument)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string[] files;
-        try { files = Directory.GetFiles(_journalDir, "*.json"); }
-        catch { return result; }
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            return result;
+        }
 
         foreach (var path in files)
         {
@@ -1469,7 +1680,8 @@ public sealed class ExecutionJournal
                 ExecutionJournalEntry? entry;
                 lock (_lock)
                 {
-                    var json = File.ReadAllText(path);
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null) continue;
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                 }
 
@@ -1487,7 +1699,50 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
-    /// Get adoption candidate journal entry for an intent. EntrySubmitted && !TradeCompleted, instrument match.
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
+    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
+    /// </summary>
+    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        lock (_lock)
+        {
+            if (!_adoptionCandidateIndexWarmed)
+            {
+                _adoptionCandidateIndexLookupFallbacks++;
+                if (_adoptionCandidateIndexLookupFallbacks == 1 || _adoptionCandidateIndexLookupFallbacks % 25 == 0)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_FALLBACK", "ENGINE",
+                        new
+                        {
+                            lookup_source = "full_scan",
+                            fallback_total = _adoptionCandidateIndexLookupFallbacks,
+                            warmed = false,
+                            note = "Adoption candidate index cold or failed — using full journal directory scan"
+                        }));
+                }
+            }
+            else
+            {
+                _adoptionCandidateIndexLookupIndexHits++;
+                var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in _normInstToAdoptionCandidateIntentIds)
+                {
+                    if (!JournalInstrumentMatchesExecutionKey(kvp.Key, executionInstrument, canonicalInstrument))
+                        continue;
+                    foreach (var id in kvp.Value)
+                        result.Add(id);
+                }
+                return result;
+            }
+        }
+
+        return GetAdoptionCandidateIntentIdsForInstrumentFullScan(executionInstrument, canonicalInstrument);
+    }
+
+    /// <summary>
+    /// Try get journal entry for adoption candidate by intentId.
+    /// Used for cross-instance fill resolution when IntentMap may not have the intent yet.
     /// Returns (tradingDate, stream, entry) if found; null otherwise.
     /// </summary>
     public (string TradingDate, string Stream, ExecutionJournalEntry Entry)? TryGetAdoptionCandidateEntry(string intentId, string executionInstrument, string? canonicalInstrument = null)
@@ -1510,7 +1765,8 @@ public sealed class ExecutionJournal
                 ExecutionJournalEntry? entry;
                 lock (_lock)
                 {
-                    var json = File.ReadAllText(path);
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null) continue;
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                 }
                 if (entry == null || !entry.EntrySubmitted || entry.TradeCompleted) continue;
@@ -1521,6 +1777,24 @@ public sealed class ExecutionJournal
             catch { /* skip */ }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Get count of open journal entries for an instrument. Matches execution instrument and optionally canonical.
+    /// </summary>
+    public int GetOpenJournalCountForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var count = 0;
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (string.Equals(key, executionInstrument, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                count += kvp.Value.Count;
+        }
+        return count;
     }
 
     /// <summary>
@@ -1550,7 +1824,101 @@ public sealed class ExecutionJournal
     }
 
     /// <summary>
+    /// Force-close orphan journals for an instrument when operator has confirmed account is correct.
+    /// Use only after verifying broker position matches expectation. Marks journals with RECONCILIATION_MANUAL_OVERRIDE.
+    /// </summary>
+    /// <returns>Number of journals force-closed.</returns>
+    public int ForceReconcileOrphanJournalsForInstrument(string instrument, DateTimeOffset utcNow)
+    {
+        var execVariant = instrument.StartsWith("M") && instrument.Length > 1 ? instrument : "M" + instrument;
+        var byInst = GetOpenJournalEntriesByInstrument();
+        var count = 0;
+
+        foreach (var kvp in byInst)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
+            if (!string.Equals(key, instrument, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(key, execVariant, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            foreach (var (tradingDate, stream, intentId, _) in kvp.Value)
+            {
+                if (ForceReconcileJournal(tradingDate, stream, intentId, utcNow))
+                    count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Force-close a single journal (manual override). Use when operator confirms position was closed externally.
+    /// </summary>
+    private bool ForceReconcileJournal(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            ExecutionJournalEntry? entry;
+            if (_cache.TryGetValue(key, out var existing))
+            {
+                entry = existing;
+            }
+            else if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                        _cache[key] = entry;
+                    else
+                        return false;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                return false;
+            }
+
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted)
+                return false;
+
+            if (entry.EntryFilledQuantityTotal <= 0)
+                return false;
+
+            entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+            entry.ExitAvgFillPrice = null;
+            entry.ExitFillNotional = null;
+            entry.ExitFilledAtUtc = utcNow.ToString("o");
+            entry.ExitOrderType = CompletionReasons.RECONCILIATION_MANUAL_OVERRIDE;
+            entry.TradeCompleted = true;
+            entry.CompletedAtUtc = utcNow.ToString("o");
+            entry.CompletionReason = CompletionReasons.RECONCILIATION_MANUAL_OVERRIDE;
+            entry.RealizedPnLPoints = null;
+            entry.RealizedPnLGross = null;
+            entry.RealizedPnLNet = null;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Record trade completion via reconciliation (broker flat, no exit fill received).
+    /// Sets TradeCompleted, CompletionReason=RECONCILIATION_BROKER_FLAT.
+    /// Exit price and P&L left null so reporting layer can treat reconciled trades specially.
     /// </summary>
     public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
     {
@@ -1564,23 +1932,37 @@ public sealed class ExecutionJournal
 
             ExecutionJournalEntry? entry;
             if (_cache.TryGetValue(key, out var existing))
+            {
                 entry = existing;
+            }
             else if (File.Exists(journalPath))
             {
                 try
                 {
                     var json = File.ReadAllText(journalPath);
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                    if (entry != null) _cache[key] = entry;
-                    else return false;
+                    if (entry != null)
+                        _cache[key] = entry;
+                    else
+                        return false;
                 }
-                catch { return false; }
+                catch
+                {
+                    return false;
+                }
             }
-            else return false;
+            else
+            {
+                return false;
+            }
 
-            if (entry == null || !entry.EntryFilled || entry.TradeCompleted) return false;
-            if (entry.EntryFilledQuantityTotal <= 0) return false;
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted)
+                return false;
 
+            if (entry.EntryFilledQuantityTotal <= 0)
+                return false;
+
+            // Mark closed; exit price and P&L unknown (broker closed externally)
             entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
             entry.ExitAvgFillPrice = null;
             entry.ExitFillNotional = null;
@@ -1599,19 +1981,177 @@ public sealed class ExecutionJournal
         }
     }
 
-    private void SaveJournal(string path, ExecutionJournalEntry entry)
+    /// <summary>
+    /// Pre-load all journal entries for a trading date into cache.
+    /// Call on Realtime transition so BE monitoring never hits disk on first lookup.
+    /// </summary>
+    public void WarmCacheForTradingDate(string tradingDate)
     {
+        if (string.IsNullOrWhiteSpace(tradingDate)) return;
+
+        var prefix = $"{tradingDate.Trim()}_";
+        string[] files;
         try
         {
-            var json = JsonUtil.Serialize(entry);
-            File.WriteAllText(path, json);
+            files = Directory.GetFiles(_journalDir, $"{prefix}*.json");
         }
-        catch (Exception ex)
+        catch
         {
-            // Log error but don't fail execution
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "EXECUTION_JOURNAL_ERROR", "ENGINE",
-                new { error = ex.Message, path }));
+            return; // Directory doesn't exist or inaccessible - no-op
         }
+
+        lock (_lock)
+        {
+            foreach (var path in files)
+            {
+                try
+                {
+                    var key = Path.GetFileNameWithoutExtension(path);
+                    if (_cache.ContainsKey(key)) continue; // Already cached
+
+                    var json = File.ReadAllText(path);
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry != null)
+                    {
+                        _cache[key] = entry;
+                        if (TryParseIntentIdFromCacheKey(key, out var wid))
+                            SyncAdoptionCandidateIndexForIntentLocked(wid, entry);
+                        // Populate entry-fill cache for O(1) HasEntryFillForStream
+                        var parts = key.Split('_');
+                        if (parts.Length >= 3)
+                        {
+                            var date = parts[0];
+                            var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+                            var hasFill = entry.EntryFilled || entry.EntryFilledQuantityTotal > 0;
+                            var fillKey = $"{date}_{stream}";
+                            if (!_entryFillByStream.TryGetValue(fillKey, out var existing) || !existing)
+                                _entryFillByStream[fillKey] = hasFill;
+                            else if (hasFill)
+                                _entryFillByStream[fillKey] = true; // OR: any intent with fill => true
+                        }
+                    }
+                }
+                catch
+                {
+                    // Skip individual file errors - best-effort warm
+                }
+            }
+        }
+    }
+
+    private const int JOURNAL_IO_SLOW_THRESHOLD_MS = 100;
+    private const int JOURNAL_LOCK_SLOW_WAIT_MS = 50;
+    private const int JOURNAL_LOCK_SLOW_HOLD_MS = 100;
+
+    /// <summary>Execute action under journal lock with timing. Logs JOURNAL_LOCK_SLOW when wait or hold exceeds threshold.</summary>
+    /// <param name="extra">Optional extra data (e.g. cache_hit) - invoked after action, merged into log.</param>
+    private void WithLockTiming(string context, string tradingDate, Action action, Func<object?>? extra = null)
+    {
+        var waitSw = Stopwatch.StartNew();
+        lock (_lock)
+        {
+            var waitMs = waitSw.ElapsedMilliseconds;
+            var holdSw = Stopwatch.StartNew();
+            try
+            {
+                action();
+            }
+            finally
+            {
+                var holdMs = holdSw.ElapsedMilliseconds;
+                if (waitMs >= JOURNAL_LOCK_SLOW_WAIT_MS || holdMs >= JOURNAL_LOCK_SLOW_HOLD_MS)
+                {
+                    var ev = new Dictionary<string, object?>
+                    {
+                        ["context"] = context,
+                        ["lock_wait_ms"] = waitMs,
+                        ["lock_hold_ms"] = holdMs,
+                        ["note"] = "Correlate with disconnects"
+                    };
+                    var ex = extra?.Invoke();
+                    if (ex != null)
+                    {
+                        foreach (var p in ex.GetType().GetProperties())
+                            ev[p.Name] = p.GetValue(ex);
+                    }
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate ?? "", "JOURNAL_LOCK_SLOW", "ENGINE", ev));
+                }
+            }
+        }
+    }
+
+    private void SaveJournal(string path, ExecutionJournalEntry entry)
+    {
+        const int maxRetries = 3;
+        const int retryDelayMs = 50;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var json = JsonUtil.Serialize(entry);
+                // FileShare.Read allows concurrent reads during write (avoids RECONCILIATION_QTY_MISMATCH from file lock)
+                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read))
+                using (var swriter = new StreamWriter(fs))
+                {
+                    swriter.Write(json);
+                }
+                sw.Stop();
+                if (sw.ElapsedMilliseconds >= JOURNAL_IO_SLOW_THRESHOLD_MS)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "JOURNAL_IO_SLOW", "ENGINE",
+                        new { op = "write", path, elapsed_ms = sw.ElapsedMilliseconds, attempt, note = "Correlate with disconnects" }));
+                }
+                var fn = Path.GetFileNameWithoutExtension(path);
+                if (TryParseIntentIdFromJournalFileName(fn, out var persistIntentId))
+                    SyncAdoptionCandidateIndexForIntentLocked(persistIntentId, entry);
+                return;
+            }
+            catch (Exception ex)
+            {
+                var isRetryable = ex is IOException;
+                if (attempt < maxRetries && isRetryable)
+                {
+                    Thread.Sleep(retryDelayMs * attempt);
+                    continue;
+                }
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "EXECUTION_JOURNAL_ERROR", "ENGINE",
+                    new { error = ex.Message, path, attempt }));
+                return;
+            }
+        }
+    }
+
+    /// <summary>Read journal file with FileShare.ReadWrite and retry to avoid RECONCILIATION_QTY_MISMATCH from file lock.</summary>
+    private string? ReadJournalFileWithRetry(string path)
+    {
+        const int maxRetries = 3;
+        const int retryDelayMs = 50;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                string content;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs))
+                {
+                    content = sr.ReadToEnd();
+                }
+                sw.Stop();
+                if (sw.ElapsedMilliseconds >= JOURNAL_IO_SLOW_THRESHOLD_MS)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", "JOURNAL_IO_SLOW", "ENGINE",
+                        new { op = "read", path, elapsed_ms = sw.ElapsedMilliseconds, attempt, note = "Correlate with disconnects" }));
+                }
+                return content;
+            }
+            catch (IOException) when (attempt < maxRetries)
+            {
+                Thread.Sleep(retryDelayMs * attempt);
+            }
+        }
+        return null;
     }
 }
 
@@ -1715,10 +2255,17 @@ public class ExecutionJournalEntry
 }
 
 /// <summary>
-/// Canonical completion reason strings for trade closure.
+/// Completion reason constants for execution journal (copy-safe, no enum).
 /// </summary>
 public static class CompletionReasons
 {
+    /// <summary>
+    /// Trade was closed externally; broker position flat; journal reconciled.
+    /// </summary>
     public const string RECONCILIATION_BROKER_FLAT = "RECONCILIATION_BROKER_FLAT";
+
+    /// <summary>
+    /// Operator confirmed account correct; orphan journals force-closed via manual trigger.
+    /// </summary>
     public const string RECONCILIATION_MANUAL_OVERRIDE = "RECONCILIATION_MANUAL_OVERRIDE";
 }

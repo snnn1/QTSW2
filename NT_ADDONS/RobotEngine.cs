@@ -5109,24 +5109,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT", state: "ENGINE",
                         new { instrument = inst, broker_working = brokerWorking, iea_working_before = effectiveLocalWorking }));
                 }
-                var adopted = ieaForRecovery.TryRecoveryAdoption();
-                var localAfter = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
-                if (adopted > 0)
+                if (ieaForRecovery.TryScheduleRecoveryAdoptionScan(out var adoptedSync))
                 {
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS", state: "ENGINE",
-                        new { instrument = inst, adopted_count = adopted, iea_working_after = localAfter }));
-                    var delayMs = _engineStartUtc != DateTimeOffset.MinValue ? (long)(utcNow - _engineStartUtc).TotalMilliseconds : 0;
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STARTUP_RECOVERY_ADOPTION_OCCURRED", state: "ENGINE",
-                        new { instrument = inst, broker_working = brokerWorking, adopted_count = adopted, delay_from_startup_ms = delayMs }));
+                    var localAfter = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
+                    if (adoptedSync > 0)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS", state: "ENGINE",
+                            new { instrument = inst, adopted_count = adoptedSync, iea_working_after = localAfter }));
+                        var delayMs = _engineStartUtc != DateTimeOffset.MinValue ? (long)(utcNow - _engineStartUtc).TotalMilliseconds : 0;
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STARTUP_RECOVERY_ADOPTION_OCCURRED", state: "ENGINE",
+                            new { instrument = inst, broker_working = brokerWorking, adopted_count = adoptedSync, delay_from_startup_ms = delayMs }));
+                    }
+                    if (localAfter == brokerWorking)
+                        continue;
+                    if (adoptedSync > 0)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_PARTIAL", state: "ENGINE",
+                            new { instrument = inst, adopted_count = adoptedSync, broker_working = brokerWorking, iea_working_after = localAfter, note = "Still mismatched after adoption" }));
+                    }
+                    continue;
                 }
-                if (localAfter == brokerWorking)
-                    continue; // Recovery succeeded, no mismatch
-                if (adopted > 0)
-                {
-                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_PARTIAL", state: "ENGINE",
-                        new { instrument = inst, adopted_count = adopted, broker_working = brokerWorking, iea_working_after = localAfter, note = "Still mismatched after adoption" }));
-                }
-                effectiveLocalWorking = localAfter;
+                effectiveLocalWorking = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
             }
 
             // IEA unavailable or disabled with broker working → treat as ORDER_REGISTRY_MISSING (fail closed)
@@ -5261,7 +5264,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             try
             {
-                ieaRecover.TryRecoveryAdoption();
+                ieaRecover.TryScheduleRecoveryAdoptionScan(out _);
             }
             catch
             {

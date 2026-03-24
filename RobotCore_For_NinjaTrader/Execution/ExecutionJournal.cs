@@ -21,6 +21,16 @@ public sealed class ExecutionJournal
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
     private readonly Dictionary<string, bool> _entryFillByStream = new(); // key = "tradingDate_stream", O(1) HasEntryFillForStream
     private readonly object _lock = new object();
+
+    /// <summary>Normalized journal instrument (entry.Instrument root) → adoption-candidate intent ids. Caller must hold <see cref="_lock"/>.</summary>
+    private readonly Dictionary<string, HashSet<string>> _normInstToAdoptionCandidateIntentIds = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Intent id → normalized instrument bucket key for O(1) removal. Caller must hold <see cref="_lock"/>.</summary>
+    private readonly Dictionary<string, string> _adoptionCandidateIntentToNormInst = new(StringComparer.OrdinalIgnoreCase);
+
+    private bool _adoptionCandidateIndexWarmed;
+    private long _adoptionCandidateIndexLookupIndexHits;
+    private long _adoptionCandidateIndexLookupFallbacks;
     
     // Callback for stream stand-down on journal corruption
     private Action<string, string, string, DateTimeOffset>? _onJournalCorruptionCallback;
@@ -34,6 +44,25 @@ public sealed class ExecutionJournal
         Directory.CreateDirectory(_journalDir);
         ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
         _log = log;
+        try
+        {
+            lock (_lock)
+            {
+                RebuildAdoptionCandidateIndexFromDiskLocked();
+            }
+        }
+        catch (Exception ex)
+        {
+            _adoptionCandidateIndexWarmed = false;
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILD_FAILED", "ENGINE",
+                new
+                {
+                    warmed = false,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name,
+                    note = "Cold rebuild failed — adoption candidate lookups will use full journal scan until next successful rebuild"
+                }));
+        }
     }
     
     /// <summary>
@@ -148,6 +177,8 @@ public sealed class ExecutionJournal
                     if (diskEntry != null)
                     {
                         _cache[key] = diskEntry;
+                        if (TryParseIntentIdFromCacheKey(key, out var sid))
+                            SyncAdoptionCandidateIndexForIntentLocked(sid, diskEntry);
                         return diskEntry.EntrySubmitted || diskEntry.EntryFilled;
                     }
                 }
@@ -1408,6 +1439,8 @@ public sealed class ExecutionJournal
                     if (entry != null)
                     {
                         _cache[key] = entry;
+                        if (TryParseIntentIdFromCacheKey(key, out var gid))
+                            SyncAdoptionCandidateIndexForIntentLocked(gid, entry);
                         return entry;
                     }
                 }
@@ -1477,7 +1510,11 @@ public sealed class ExecutionJournal
                     }
                     entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
                     if (entry != null)
+                    {
                         _cache[fileName] = entry; // Update cache for consistency with disk
+                        if (TryParseIntentIdFromJournalFileName(fileName, out var oid))
+                            SyncAdoptionCandidateIndexForIntentLocked(oid, entry);
+                    }
                 }
 
                 if (entry == null || !entry.EntryFilled || entry.TradeCompleted) continue;
@@ -1525,12 +1562,99 @@ public sealed class ExecutionJournal
         return false;
     }
 
-    /// <summary>
-    /// Get intent IDs that are adoption candidates for restart recovery.
-    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
-    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
-    /// </summary>
-    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    private static bool IsAdoptionCandidateJournalEntry(ExecutionJournalEntry? entry)
+        => entry != null && entry.EntrySubmitted && !entry.TradeCompleted;
+
+    /// <summary>Parse intent id from journal file basename (tradingDate_stream..._intentId).</summary>
+    private static bool TryParseIntentIdFromJournalFileName(string fileNameWithoutExtension, out string intentId)
+    {
+        intentId = "";
+        var parts = fileNameWithoutExtension.Split('_');
+        if (parts.Length < 3) return false;
+        intentId = parts[parts.Length - 1];
+        return !string.IsNullOrEmpty(intentId);
+    }
+
+    /// <summary>Parse intent id from cache key tradingDate_stream_intentId.</summary>
+    private static bool TryParseIntentIdFromCacheKey(string cacheKey, out string intentId)
+        => TryParseIntentIdFromJournalFileName(cacheKey, out intentId);
+
+    /// <summary>Caller must hold <see cref="_lock"/>.</summary>
+    private void SyncAdoptionCandidateIndexForIntentLocked(string intentId, ExecutionJournalEntry entry)
+    {
+        if (string.IsNullOrWhiteSpace(intentId)) return;
+
+        if (_adoptionCandidateIntentToNormInst.TryGetValue(intentId, out var prevNorm))
+        {
+            if (_normInstToAdoptionCandidateIntentIds.TryGetValue(prevNorm, out var prevSet))
+            {
+                prevSet.Remove(intentId);
+                if (prevSet.Count == 0)
+                    _normInstToAdoptionCandidateIntentIds.Remove(prevNorm);
+            }
+            _adoptionCandidateIntentToNormInst.Remove(intentId);
+        }
+
+        if (!IsAdoptionCandidateJournalEntry(entry)) return;
+
+        var norm = NormalizeJournalInstrumentSymbol(string.IsNullOrWhiteSpace(entry.Instrument) ? "UNKNOWN" : entry.Instrument);
+        if (string.IsNullOrEmpty(norm)) norm = "UNKNOWN";
+
+        if (!_normInstToAdoptionCandidateIntentIds.TryGetValue(norm, out var set))
+        {
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            _normInstToAdoptionCandidateIntentIds[norm] = set;
+        }
+        set.Add(intentId);
+        _adoptionCandidateIntentToNormInst[intentId] = norm;
+    }
+
+    /// <summary>Caller must hold <see cref="_lock"/>.</summary>
+    private void RebuildAdoptionCandidateIndexFromDiskLocked()
+    {
+        _normInstToAdoptionCandidateIntentIds.Clear();
+        _adoptionCandidateIntentToNormInst.Clear();
+
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            _adoptionCandidateIndexWarmed = false;
+            return;
+        }
+
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                if (!TryParseIntentIdFromJournalFileName(fileName, out var intentId)) continue;
+
+                var json = ReadJournalFileWithRetry(path);
+                if (json == null) continue;
+                var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                if (entry == null) continue;
+                SyncAdoptionCandidateIndexForIntentLocked(intentId, entry);
+            }
+            catch { /* skip corrupt files */ }
+        }
+
+        _adoptionCandidateIndexWarmed = true;
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILT", "ENGINE",
+            new
+            {
+                warmed = true,
+                journal_file_total = files.Length,
+                adoption_candidate_intents = _adoptionCandidateIntentToNormInst.Count,
+                note = "Cold rebuild complete — candidate lookups use in-memory index"
+            }));
+    }
+
+    /// <summary>Full disk scan — same semantics as pre-index implementation. Caller must NOT hold <see cref="_lock"/> (method acquires per-file lock).</summary>
+    private HashSet<string> GetAdoptionCandidateIntentIdsForInstrumentFullScan(string executionInstrument, string? canonicalInstrument)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string[] files;
@@ -1551,9 +1675,7 @@ public sealed class ExecutionJournal
                 var parts = fileName.Split('_');
                 if (parts.Length < 3) continue;
 
-                var tradingDate = parts[0];
                 var intentId = parts[parts.Length - 1];
-                var stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
 
                 ExecutionJournalEntry? entry;
                 lock (_lock)
@@ -1574,6 +1696,48 @@ public sealed class ExecutionJournal
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Get intent IDs that are adoption candidates for restart recovery.
+    /// Includes: EntrySubmitted (unfilled entry stops, filled entries, protectives) and !TradeCompleted.
+    /// Separate from GetActiveIntentsForBEMonitoring which requires EntryFilled — adoption must support unfilled entry stops.
+    /// </summary>
+    public HashSet<string> GetAdoptionCandidateIntentIdsForInstrument(string executionInstrument, string? canonicalInstrument = null)
+    {
+        lock (_lock)
+        {
+            if (!_adoptionCandidateIndexWarmed)
+            {
+                _adoptionCandidateIndexLookupFallbacks++;
+                if (_adoptionCandidateIndexLookupFallbacks == 1 || _adoptionCandidateIndexLookupFallbacks % 25 == 0)
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_FALLBACK", "ENGINE",
+                        new
+                        {
+                            lookup_source = "full_scan",
+                            fallback_total = _adoptionCandidateIndexLookupFallbacks,
+                            warmed = false,
+                            note = "Adoption candidate index cold or failed — using full journal directory scan"
+                        }));
+                }
+            }
+            else
+            {
+                _adoptionCandidateIndexLookupIndexHits++;
+                var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in _normInstToAdoptionCandidateIntentIds)
+                {
+                    if (!JournalInstrumentMatchesExecutionKey(kvp.Key, executionInstrument, canonicalInstrument))
+                        continue;
+                    foreach (var id in kvp.Value)
+                        result.Add(id);
+                }
+                return result;
+            }
+        }
+
+        return GetAdoptionCandidateIntentIdsForInstrumentFullScan(executionInstrument, canonicalInstrument);
     }
 
     /// <summary>
@@ -1850,6 +2014,8 @@ public sealed class ExecutionJournal
                     if (entry != null)
                     {
                         _cache[key] = entry;
+                        if (TryParseIntentIdFromCacheKey(key, out var wid))
+                            SyncAdoptionCandidateIndexForIntentLocked(wid, entry);
                         // Populate entry-fill cache for O(1) HasEntryFillForStream
                         var parts = key.Split('_');
                         if (parts.Length >= 3)
@@ -1936,6 +2102,9 @@ public sealed class ExecutionJournal
                     _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, entry.TradingDate ?? "", "JOURNAL_IO_SLOW", "ENGINE",
                         new { op = "write", path, elapsed_ms = sw.ElapsedMilliseconds, attempt, note = "Correlate with disconnects" }));
                 }
+                var fn = Path.GetFileNameWithoutExtension(path);
+                if (TryParseIntentIdFromJournalFileName(fn, out var persistIntentId))
+                    SyncAdoptionCandidateIndexForIntentLocked(persistIntentId, entry);
                 return;
             }
             catch (Exception ex)

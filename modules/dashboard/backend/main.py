@@ -971,28 +971,88 @@ async def list_timetable_files():
 
 @app.get("/api/timetable/eligibility/status")
 async def get_eligibility_status():
-    """Get latest session eligibility freeze status (most recent by file mtime)."""
+    """
+    Session eligibility freeze status aligned with live execution timetable.
+
+    Prefers eligibility_{trading_date}.json where trading_date matches timetable_current.json
+    (same source of truth as the robot/watchdog). Falls back to most recent eligibility file
+    by mtime only when timetable is missing or no matching eligibility file exists.
+    """
     logger = logging.getLogger(__name__)
     try:
         timetable_dir = QTSW2_ROOT / "data" / "timetable"
         if not timetable_dir.exists():
             return {"status": "none"}
+
+        timetable_path = timetable_dir / "timetable_current.json"
+        timetable_trading_date = None
+        timetable_enabled_count: Optional[int] = None
+        if timetable_path.exists():
+            try:
+                with open(timetable_path, "r", encoding="utf-8") as f:
+                    tc = json.load(f)
+                timetable_trading_date = tc.get("trading_date")
+                tstreams = tc.get("streams") or []
+                if isinstance(tstreams, list):
+                    timetable_enabled_count = sum(
+                        1
+                        for s in tstreams
+                        if isinstance(s, dict) and s.get("enabled") and s.get("stream")
+                    )
+            except Exception as e:
+                logger.warning("ELIGIBILITY_STATUS_TIMETABLE_READ_FAILED: %s", e)
+
+        def _payload_from_eligibility(data: dict, source: str) -> dict:
+            elig_count = data.get("eligible_stream_count", 0)
+            out = {
+                "trading_date": data.get("trading_date", ""),
+                "freeze_time_utc": data.get("freeze_time_utc", ""),
+                "eligible_stream_count": elig_count,
+                "source": source,
+            }
+            if timetable_trading_date:
+                out["timetable_trading_date"] = timetable_trading_date
+            if timetable_enabled_count is not None:
+                out["timetable_enabled_stream_count"] = timetable_enabled_count
+                if elig_count != timetable_enabled_count:
+                    out["eligibility_timetable_count_mismatch"] = True
+            return out
+
+        # Primary: eligibility file for the same trading_date as timetable_current.json
+        if timetable_trading_date:
+            match_path = timetable_dir / f"eligibility_{timetable_trading_date}.json"
+            if match_path.exists():
+                try:
+                    with open(match_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    return _payload_from_eligibility(data, "eligibility_for_timetable_trading_date")
+                except Exception as e:
+                    logger.warning("ELIGIBILITY_STATUS_READ_FAILED: file=%s error=%s", match_path.name, e)
+
+        # Fallback: most recent eligibility_*.json by mtime (legacy / no timetable)
         eligibility_files = sorted(
             timetable_dir.glob("eligibility_*.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
         if not eligibility_files:
+            if timetable_enabled_count is not None:
+                return {
+                    "status": "no_eligibility_file",
+                    "trading_date": timetable_trading_date or "",
+                    "timetable_trading_date": timetable_trading_date,
+                    "timetable_enabled_stream_count": timetable_enabled_count,
+                    "eligible_stream_count": timetable_enabled_count,
+                    "freeze_time_utc": None,
+                    "source": "timetable_only_no_eligibility_json",
+                }
             return {"status": "none"}
+
         for file_path in eligibility_files:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return {
-                    "trading_date": data.get("trading_date", ""),
-                    "freeze_time_utc": data.get("freeze_time_utc", ""),
-                    "eligible_stream_count": data.get("eligible_stream_count", 0),
-                }
+                return _payload_from_eligibility(data, "latest_eligibility_by_mtime")
             except Exception as e:
                 logger.warning("ELIGIBILITY_STATUS_READ_FAILED: file=%s error=%s", file_path.name, e)
                 continue

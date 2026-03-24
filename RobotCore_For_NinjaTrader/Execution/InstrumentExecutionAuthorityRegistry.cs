@@ -71,11 +71,13 @@ public static class InstrumentExecutionAuthorityRegistry
         {
             if (!iea.HasDeferredAdoptionScanPending) continue;
             var enqueued = iea.TryRetryDeferredAdoptionScanIfDeferred();
+            iea.RecordDeferralHeartbeatRetryForProof(utcNow);
             rows.Add(new
             {
                 execution_instrument_key = iea.ExecutionInstrumentKey,
                 iea_instance_id = iea.InstanceId,
-                scan_enqueued = enqueued
+                scan_enqueued = enqueued,
+                adoption_proof = iea.GetAdoptionDeferralRetryProofPayload()
             });
         }
 

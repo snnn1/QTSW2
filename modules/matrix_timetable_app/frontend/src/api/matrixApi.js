@@ -210,8 +210,8 @@ export async function generateTimetable({ date, analyzerRunsDir = 'data/analyzed
 }
 
 /**
- * Get session eligibility freeze status (latest by file mtime)
- * @returns {Promise<{trading_date: string, freeze_time_utc: string, eligible_stream_count: number}|null>}
+ * Get session eligibility freeze status (aligned with timetable_current.json trading_date when possible).
+ * @returns {Promise<{trading_date?: string, freeze_time_utc?: string, eligible_stream_count?: number, status?: string, eligibility_timetable_count_mismatch?: boolean}|null>}
  */
 export async function getEligibilityStatus() {
   const response = await fetch(`${API_BASE}/timetable/eligibility/status`)

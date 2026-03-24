@@ -43,6 +43,8 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test DST: run session close fallback timezone tests (DST boundary weeks)
 // --test TERMINAL_INTENT: run terminal intent hardening tests (IsIntentCompleted, BE exclusion)
 // --test IEA_FLATTEN: run IEA flatten authority tests (exposure-reduction invariant)
+// --test IEA_ADOPTION_GATE: single-flight adoption scan gate state machine (CPU fix helper)
+// --test IEA_ADOPTION_NO_PROGRESS: recovery adoption no-progress skip evaluator (fingerprint + cooldown)
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
 // --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
 // --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
@@ -73,6 +75,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = IeaFlattenAuthorityTests.RunIeaFlattenTests();
         Console.WriteLine(pass ? "PASS: IEA flatten authority tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("IEA_ADOPTION_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = IeaAdoptionScanSingleFlightGateTests.RunIeaAdoptionScanGateTests();
+        Console.WriteLine(pass ? "PASS: IEA adoption scan single-flight gate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("IEA_ADOPTION_NO_PROGRESS", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = AdoptionScanNoProgressGuardTests.RunAdoptionScanNoProgressGuardTests();
+        Console.WriteLine(pass ? "PASS: IEA adoption no-progress guard tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("ORDER_REGISTRY", StringComparison.OrdinalIgnoreCase))

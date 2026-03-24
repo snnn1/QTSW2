@@ -3081,7 +3081,7 @@ public sealed partial class NinjaTraderSimAdapter
     private void DeferUnresolvedExecution(UnresolvedExecutionRecord record)
     {
         if (_useInstrumentExecutionAuthority && _iea != null)
-            _iea.EnqueueRecoveryEssential(() => ProcessUnresolvedRetry(record));
+            _iea.EnqueueRecoveryEssential(() => ProcessUnresolvedRetry(record), "ExecutionUnresolvedRetry");
         else
         {
             lock (_pendingUnresolvedLock)

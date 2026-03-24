@@ -34,6 +34,9 @@
     <Compile Include="..\modules\robot\core\Execution\AdoptionDeferralDecision.cs" Link="Execution\AdoptionDeferralDecision.cs" />
     <Compile Include="..\modules\robot\core\Execution\AdoptionScanInstrumentGate.cs" Link="Execution\AdoptionScanInstrumentGate.cs" />
     <Compile Include="..\modules\robot\core\Execution\AdoptionReconciliationConvergence.cs" Link="Execution\AdoptionReconciliationConvergence.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AdoptionScanSingleFlightGate.cs" Link="Execution\AdoptionScanSingleFlightGate.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AdoptionScanRecoveryFingerprint.cs" Link="Execution\AdoptionScanRecoveryFingerprint.cs" />
+    <Compile Include="..\modules\robot\core\Execution\RecoveryNoProgressSkipEvaluator.cs" Link="Execution\RecoveryNoProgressSkipEvaluator.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
     <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
   </ItemGroup>

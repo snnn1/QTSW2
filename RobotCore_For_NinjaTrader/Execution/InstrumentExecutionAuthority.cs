@@ -24,6 +24,8 @@ public sealed partial class InstrumentExecutionAuthority
     private readonly Thread _workerThread;
     private volatile bool _workerRunning = true;
     private DateTimeOffset _lastMutationUtc = DateTimeOffset.MinValue;
+    /// <summary>When set, <see cref="WorkerLoop"/> applies this as <see cref="_lastMutationUtc"/> instead of UtcNow so a queued recovery adoption scan does not self-invalidate the no-progress guard.</summary>
+    private DateTimeOffset? _pendingRecoveryAdoptionMutationAlignUtc;
     private DateTimeOffset _lastHeartbeatUtc = DateTimeOffset.MinValue;
     private const int HEARTBEAT_INTERVAL_SECONDS = 60;
 
@@ -61,6 +63,28 @@ public sealed partial class InstrumentExecutionAuthority
     private const int POISON_THRESHOLD = 3;
     private DateTimeOffset _lastStallEmittedForStartUtc = DateTimeOffset.MinValue;
     private readonly Timer? _stallCheckTimer;
+
+    // --- Proof instrumentation (CPU / queue / wait pileup) — see IEA_CPU_PROOF_INSTRUMENTATION_PLAN_2026-03-23.md
+    private int _queueDepthHighWater;
+    private long _maxWorkItemAgeMs;
+    private readonly object _rateWindowLock = new();
+    private DateTimeOffset _rateWindowStartUtc = DateTimeOffset.UtcNow;
+    private int _enqueuesInWindow;
+    private int _dequeuesInWindow;
+    private int _lastWindowEnqueueRate10s;
+    private int _lastWindowDequeueRate10s;
+    private DateTimeOffset _lastQueuePressureEmitUtc = DateTimeOffset.MinValue;
+    private int _enqueueWaitTimeoutCount;
+    private int _enqueueWaitSlowCount;
+    private const int QueuePressureDepthThreshold = 35;
+    private const int QueuePressureWorkAgeMsThreshold = 4000;
+    private const int QueuePressureEnqueueDequeueSkew = 28;
+    private const double QueuePressureEmitMinSeconds = 45;
+
+    /// <summary>Recovery adoption: single <see cref="IIEAOrderExecutor.GetAdoptionCandidateIntentIds"/> result reused for fingerprint + scan body (cleared after each gated scan).</summary>
+    private IReadOnlyCollection<string>? _preResolvedAdoptionCandidatesForScan;
+
+    private int? _adoptionScanProofCandidateCountOverride;
 
     /// <summary>Gap 5: Callback when instrument is blocked (notify engine to stand down streams, freeze instrument).</summary>
     private Action<string, DateTimeOffset, string>? _onEnqueueFailureCallback;
@@ -135,6 +159,100 @@ public sealed partial class InstrumentExecutionAuthority
         _stallCheckTimer = new Timer(CheckCommandStall, null, 2000, 2000);
     }
 
+    /// <summary>Volatile snapshot of worker work kind for EnqueueAndWait diagnostics (may be empty between items).</summary>
+    internal string? CurrentWorkTypeSnapshot => string.IsNullOrEmpty(_currentWorkType) ? null : _currentWorkType;
+
+    private void UpdateQueueHighWater(int depth)
+    {
+        int hwm = Volatile.Read(ref _queueDepthHighWater);
+        while (depth > hwm)
+        {
+            if (Interlocked.CompareExchange(ref _queueDepthHighWater, depth, hwm) == hwm)
+                break;
+            hwm = Volatile.Read(ref _queueDepthHighWater);
+        }
+    }
+
+    private void RollRateWindowLocked(DateTimeOffset now)
+    {
+        if ((now - _rateWindowStartUtc).TotalSeconds < 10.0)
+            return;
+        _lastWindowEnqueueRate10s = _enqueuesInWindow;
+        _lastWindowDequeueRate10s = _dequeuesInWindow;
+        _enqueuesInWindow = 0;
+        _dequeuesInWindow = 0;
+        _rateWindowStartUtc = now;
+    }
+
+    private void RecordEnqueueForProof(DateTimeOffset now)
+    {
+        lock (_rateWindowLock)
+        {
+            RollRateWindowLocked(now);
+            _enqueuesInWindow++;
+        }
+
+        var depth = _executionQueue.Count;
+        UpdateQueueHighWater(depth);
+        MaybeEmitQueuePressureDiag(now, depth);
+    }
+
+    private void RecordDequeueForProof(DateTimeOffset now)
+    {
+        lock (_rateWindowLock)
+        {
+            RollRateWindowLocked(now);
+            _dequeuesInWindow++;
+        }
+    }
+
+    private long CurrentWorkItemAgeMsIfBusy(DateTimeOffset now)
+    {
+        var started = _currentWorkStartedUtc;
+        if (started == DateTimeOffset.MinValue) return 0;
+        return (long)(now - started).TotalMilliseconds;
+    }
+
+    private void MaybeEmitQueuePressureDiag(DateTimeOffset now, int queueDepthCurrent)
+    {
+        if (Log == null) return;
+        if (_lastQueuePressureEmitUtc != DateTimeOffset.MinValue &&
+            (now - _lastQueuePressureEmitUtc).TotalSeconds < QueuePressureEmitMinSeconds)
+            return;
+
+        var workAge = CurrentWorkItemAgeMsIfBusy(now);
+        int enR, deR;
+        lock (_rateWindowLock)
+        {
+            enR = _lastWindowEnqueueRate10s;
+            deR = _lastWindowDequeueRate10s;
+        }
+
+        var skewed = enR > deR + QueuePressureEnqueueDequeueSkew;
+        if (queueDepthCurrent < QueuePressureDepthThreshold &&
+            workAge < QueuePressureWorkAgeMsThreshold &&
+            !skewed)
+            return;
+
+        _lastQueuePressureEmitUtc = now;
+        Log.Write(RobotEvents.EngineBase(now, tradingDate: "", eventType: "IEA_QUEUE_PRESSURE_DIAG", state: "ENGINE",
+            new
+            {
+                iea_instance_id = InstanceId,
+                execution_instrument_key = ExecutionInstrumentKey,
+                queue_depth_current = queueDepthCurrent,
+                queue_depth_high_water_mark = Volatile.Read(ref _queueDepthHighWater),
+                current_work_item_age_ms = workAge > 0 ? workAge : (long?)null,
+                max_work_item_age_ms = Interlocked.Read(ref _maxWorkItemAgeMs),
+                enqueue_rate_10s = enR,
+                dequeue_rate_10s = deR,
+                enqueue_wait_timeout_count = Volatile.Read(ref _enqueueWaitTimeoutCount),
+                enqueue_wait_slow_count = Volatile.Read(ref _enqueueWaitSlowCount),
+                current_command_type = CurrentWorkTypeSnapshot,
+                note = "Rate-limited INFO — queue depth, work age, or enqueue>dequeue skew over last completed 10s window"
+            }));
+    }
+
     private void CheckCommandStall(object? _)
     {
         var started = _currentWorkStartedUtc;
@@ -165,20 +283,38 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 if (_executionQueue.TryTake(out var work, 1000))
                 {
-                    _currentWorkStartedUtc = DateTimeOffset.UtcNow;
-                    _currentWorkType = "QueueWork";
+                    var workStartUtc = DateTimeOffset.UtcNow;
+                    _currentWorkStartedUtc = workStartUtc;
                     try
                     {
                         work();
-                        _lastMutationUtc = DateTimeOffset.UtcNow;
+                        if (_pendingRecoveryAdoptionMutationAlignUtc.HasValue)
+                        {
+                            var aligned = _pendingRecoveryAdoptionMutationAlignUtc.Value;
+                            _pendingRecoveryAdoptionMutationAlignUtc = null;
+                            _lastMutationUtc = aligned;
+                        }
+                        else
+                        {
+                            _lastMutationUtc = DateTimeOffset.UtcNow;
+                        }
                         _lastSuccessfulCompletionUtc = _lastMutationUtc;
                         _consecutiveFailures = 0;
                     }
                     finally
                     {
+                        var ageMs = (long)(DateTimeOffset.UtcNow - workStartUtc).TotalMilliseconds;
+                        var prevMax = Interlocked.Read(ref _maxWorkItemAgeMs);
+                        while (ageMs > prevMax)
+                        {
+                            if (Interlocked.CompareExchange(ref _maxWorkItemAgeMs, ageMs, prevMax) == prevMax)
+                                break;
+                            prevMax = Interlocked.Read(ref _maxWorkItemAgeMs);
+                        }
                         _currentWorkStartedUtc = DateTimeOffset.MinValue;
                         _currentWorkType = "";
                     }
+                    RecordDequeueForProof(DateTimeOffset.UtcNow);
                     EmitHeartbeatIfDue();
                 }
             }
@@ -220,18 +356,20 @@ public sealed partial class InstrumentExecutionAuthority
         if (Executor == null) return;
         var o = order;
         var ou = orderUpdate;
-        EnqueueRecoveryEssential(() => Executor.ProcessOrderUpdate(o, ou));
+        EnqueueRecoveryEssential(() => Executor.ProcessOrderUpdate(o, ou), "OrderUpdate");
     }
 
     /// <summary>Enqueue recovery-essential work (execution/order updates). Always allowed; needed for flatten fills, stale snapshot detection, registry lifecycle.</summary>
-    internal void EnqueueRecoveryEssential(Action work)
+    /// <param name="workKind">Semantic label for <c>IEA_HEARTBEAT.current_command_type</c> and stall diagnostics (e.g. ExecutionUpdate, OrderUpdate).</param>
+    internal void EnqueueRecoveryEssential(Action work, string workKind = "RecoveryWork")
     {
         if (Executor == null) return;
-        EnqueueCore(work);
+        EnqueueCore(work, workKind);
     }
 
     /// <summary>Enqueue work for serialized processing. Blocks when IsInRecovery (normal management). Used for BE evaluation.</summary>
-    internal void Enqueue(Action work)
+    /// <param name="workKind">Semantic label for heartbeat / stall diagnostics.</param>
+    internal void Enqueue(Action work, string workKind = "NormalWork")
     {
         if (Executor == null) return;
 #if NINJATRADER
@@ -242,16 +380,18 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         }
 #endif
-        EnqueueCore(work);
+        EnqueueCore(work, workKind);
     }
 
-    private void EnqueueCore(Action work)
+    /// <summary>Per-queue-item work kind for observability (<see cref="EmitHeartbeatIfDue"/>, <see cref="CheckCommandStall"/>).</summary>
+    private void EnqueueCore(Action work, string workKind = "Unknown")
     {
         try
         {
             var seq = Interlocked.Increment(ref _enqueueSequence);
             _executionQueue.Add(() =>
             {
+                _currentWorkType = workKind;
                 try
                 {
                     work();
@@ -259,8 +399,10 @@ public sealed partial class InstrumentExecutionAuthority
                 finally
                 {
                     Interlocked.Exchange(ref _lastProcessedSequence, seq);
+                    _currentWorkType = "";
                 }
             });
+            RecordEnqueueForProof(DateTimeOffset.UtcNow);
         }
         catch (InvalidOperationException) { /* queue completed */ }
     }
@@ -273,6 +415,15 @@ public sealed partial class InstrumentExecutionAuthority
 
     private DateTimeOffset NowEvent() => _eventClock?.NowEvent() ?? DateTimeOffset.UtcNow;
     private DateTimeOffset NowWall() => _wallClock?.NowWall() ?? DateTimeOffset.UtcNow;
+
+    private string ClassifyCallerThreadForWaitDiag(Thread t)
+    {
+        if (t == _workerThread) return "iea_worker";
+        var n = t.Name ?? "";
+        if (n.IndexOf("IEA-", StringComparison.OrdinalIgnoreCase) >= 0) return "iea_named";
+        if (n.IndexOf("NinjaScript", StringComparison.OrdinalIgnoreCase) >= 0) return "ninja_script";
+        return "other";
+    }
 
     /// <summary>Restart adoption / reconciliation: non-convergent broker order quarantine.</summary>
     private readonly AdoptionReconciliationConvergence _adoptionConvergence = new();
@@ -358,6 +509,8 @@ public sealed partial class InstrumentExecutionAuthority
             return (true, work());
         var queueDepthAtStart = QueueDepth;
         var startUtc = NowWall();
+        var callerThread = Thread.CurrentThread;
+        var callerThreadType = ClassifyCallerThreadForWaitDiag(callerThread);
         T? result = default;
         Exception? ex = null;
         var done = new ManualResetEventSlim(false);
@@ -371,12 +524,14 @@ public sealed partial class InstrumentExecutionAuthority
                 }
                 catch (Exception e) { ex = e; }
                 finally { done.Set(); }
-            });
+            }, context ?? "EnqueueAndWait");
             if (!done.Wait(timeoutMs))
             {
+                Interlocked.Increment(ref _enqueueWaitTimeoutCount);
                 _instrumentBlocked = true;
                 var utcNow = NowWall();
                 var elapsedMs = (long)(utcNow - startUtc).TotalMilliseconds;
+                var workerBusy = _currentWorkStartedUtc != DateTimeOffset.MinValue || QueueDepth > 0;
                 Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_TIMEOUT", state: "ENGINE",
                     new
                     {
@@ -387,6 +542,12 @@ public sealed partial class InstrumentExecutionAuthority
                         queue_depth_at_start = queueDepthAtStart,
                         queue_depth_now = QueueDepth,
                         context = context ?? "",
+                        caller_operation = context ?? "",
+                        caller_thread_id = callerThread.ManagedThreadId,
+                        caller_thread_name = callerThread.Name,
+                        caller_thread_type = callerThreadType,
+                        worker_busy_at_timeout = workerBusy,
+                        worker_current_command_type = CurrentWorkTypeSnapshot,
                         enqueue_sequence = Interlocked.Read(ref _enqueueSequence),
                         last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence),
                         policy = "IEA_FAIL_CLOSED_BLOCK_INSTRUMENT",
@@ -399,6 +560,8 @@ public sealed partial class InstrumentExecutionAuthority
             var elapsedMsSuccess = (long)(endUtc - startUtc).TotalMilliseconds;
             if (elapsedMsSuccess >= 1000)
             {
+                Interlocked.Increment(ref _enqueueWaitSlowCount);
+                var workerBusySlow = _currentWorkStartedUtc != DateTimeOffset.MinValue || QueueDepth > 0;
                 Log?.Write(RobotEvents.EngineBase(endUtc, tradingDate: "", eventType: "IEA_ENQUEUE_AND_WAIT_TIMING", state: "ENGINE",
                     new
                     {
@@ -408,8 +571,14 @@ public sealed partial class InstrumentExecutionAuthority
                         queue_depth_at_start = queueDepthAtStart,
                         queue_depth_now = QueueDepth,
                         context = context ?? "",
+                        caller_operation = context ?? "",
+                        caller_thread_id = callerThread.ManagedThreadId,
+                        caller_thread_name = callerThread.Name,
+                        caller_thread_type = callerThreadType,
+                        worker_busy_after_wait = workerBusySlow,
+                        worker_current_command_type = CurrentWorkTypeSnapshot,
                         timeout = false,
-                        note = "Slow EnqueueAndWait — correlate with disconnects"
+                        note = "Slow EnqueueAndWait — correlate with disconnects / long worker items"
                     }));
             }
             if (ex != null) throw ex;
@@ -456,6 +625,12 @@ public sealed partial class InstrumentExecutionAuthority
         var runtimeMs = currentStarted != DateTimeOffset.MinValue
             ? (long)(now - currentStarted).TotalMilliseconds
             : (long?)null;
+        int enR, deR;
+        lock (_rateWindowLock)
+        {
+            enR = _lastWindowEnqueueRate10s;
+            deR = _lastWindowDequeueRate10s;
+        }
         Log?.Write(RobotEvents.EngineBase(now, tradingDate: "", eventType: "IEA_HEARTBEAT", state: "ENGINE",
             new
             {
@@ -463,6 +638,12 @@ public sealed partial class InstrumentExecutionAuthority
                 execution_instrument_key = ExecutionInstrumentKey,
                 account_name = AccountName,
                 queue_depth = QueueDepth,
+                queue_depth_high_water_mark = Volatile.Read(ref _queueDepthHighWater),
+                max_work_item_age_ms = Interlocked.Read(ref _maxWorkItemAgeMs),
+                enqueue_rate_10s_last_window = enR,
+                dequeue_rate_10s_last_window = deR,
+                enqueue_wait_timeout_count = Volatile.Read(ref _enqueueWaitTimeoutCount),
+                enqueue_wait_slow_count = Volatile.Read(ref _enqueueWaitSlowCount),
                 last_mutation_utc = _lastMutationUtc.ToString("o"),
                 enqueue_sequence = Interlocked.Read(ref _enqueueSequence),
                 last_processed_sequence = Interlocked.Read(ref _lastProcessedSequence),

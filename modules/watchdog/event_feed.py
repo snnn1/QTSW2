@@ -10,17 +10,21 @@ import json
 import logging
 import re
 import shutil
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 from datetime import datetime, timezone
 import pytz
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from .config import (
     ROBOT_LOGS_DIR,
     FRONTEND_FEED_FILE,
     LIVE_CRITICAL_EVENT_TYPES,
     ROBOT_LOG_READ_POSITIONS_FILE,
+    WATCHDOG_CPU_DIAG_ENABLED,
+    ORDER_RELATED_EVENT_TYPES,
+    ENGINE_TICK_DIAGNOSTIC_EVENT_TYPES,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,8 @@ class EventFeedGenerator:
         self._event_seq_by_run_id: Dict[str, int] = defaultdict(int)
         self._last_read_positions: Dict[str, int] = {}  # File path -> byte position
         self._load_read_positions()
+        # Filled each process_new_events() for WATCHDOG_CPU_DIAG and API/debug
+        self.last_cycle_metrics: Dict[str, Any] = {}
         # Rate limiting for very frequent events (per run_id)
         self._last_engine_tick_callsite_time: Dict[str, datetime] = {}  # run_id -> last written timestamp
         self._ENGINE_TICK_CALLSITE_RATE_LIMIT_SECONDS = 5  # Only write ENGINE_TICK_CALLSITE every 5 seconds
@@ -481,9 +487,16 @@ class EventFeedGenerator:
         Process new events from robot log files and append to frontend_feed.jsonl.
         Returns number of events processed.
         """
+        cycle_t0 = time.perf_counter()
         log_files = self._find_robot_log_files()
         if not log_files:
             logger.debug("No robot log files found")
+            self.last_cycle_metrics = {
+                "duration_ms": round((time.perf_counter() - cycle_t0) * 1000, 2),
+                "raw_events_read": 0,
+                "events_written_to_feed": 0,
+                "robot_log_files": 0,
+            }
             return 0
         
         # Ensure frontend feed file exists
@@ -511,8 +524,36 @@ class EventFeedGenerator:
             return (ts, path, idx, seq)
         all_events.sort(key=_sort_key)
         all_events = [ev for ev, _, _ in all_events]
-        
-        # Process events and write to frontend feed
+
+        type_counts: Counter = Counter()
+        order_related_raw = 0
+        tick_diag_raw = 0
+        tick_or_alive_in_raw = False
+        if WATCHDOG_CPU_DIAG_ENABLED:
+            for _ev in all_events:
+                et = self._extract_event_type(_ev)
+                type_counts[et] += 1
+                if et in ORDER_RELATED_EVENT_TYPES:
+                    order_related_raw += 1
+                if et in ENGINE_TICK_DIAGNOSTIC_EVENT_TYPES:
+                    tick_diag_raw += 1
+                if not tick_or_alive_in_raw and et in (
+                    "ENGINE_TICK_CALLSITE",
+                    "ENGINE_ALIVE",
+                    "ENGINE_TIMER_HEARTBEAT",
+                ):
+                    tick_or_alive_in_raw = True
+        else:
+            for _ev in all_events:
+                et = self._extract_event_type(_ev)
+                if et in (
+                    "ENGINE_TICK_CALLSITE",
+                    "ENGINE_ALIVE",
+                    "ENGINE_TIMER_HEARTBEAT",
+                ):
+                    tick_or_alive_in_raw = True
+                    break
+
         tick_callsite_written = 0
         with open(FRONTEND_FEED_FILE, 'a', encoding='utf-8') as f:
             for event in all_events:
@@ -522,25 +563,33 @@ class EventFeedGenerator:
                         tick_callsite_written += 1
                     f.write(json.dumps(feed_event) + '\n')
                     processed_count += 1
-        
-        # Diagnostic: Log when ENGINE_TICK_CALLSITE events are written
+
+        # Verbose at INFO: floods when ticks are written; use DEBUG (enable via log level when diagnosing)
         if tick_callsite_written > 0:
-            logger.info(f"EventFeedGenerator: Wrote {tick_callsite_written} ENGINE_TICK_CALLSITE event(s) to feed")
+            logger.debug(
+                "EventFeedGenerator: Wrote %s ENGINE_TICK_CALLSITE event(s) to feed",
+                tick_callsite_written,
+            )
         
         if processed_count > 0:
             logger.debug(f"Processed {processed_count} new events")
         
         # Persist read positions after each cycle (survives watchdog restarts)
         self._save_read_positions()
-        
+
+        duration_ms = round((time.perf_counter() - cycle_t0) * 1000, 2)
+        self.last_cycle_metrics = {
+            "duration_ms": duration_ms,
+            "raw_events_read": len(all_events),
+            "events_written_to_feed": processed_count,
+            "robot_log_files": len(log_files),
+        }
+        if WATCHDOG_CPU_DIAG_ENABLED:
+            self.last_cycle_metrics["order_related_raw_events"] = order_related_raw
+            self.last_cycle_metrics["engine_tick_diagnostic_raw_events"] = tick_diag_raw
+            self.last_cycle_metrics["top_raw_event_types"] = dict(type_counts.most_common(15))
+
         # Diagnostic: Check if tick/heartbeat events are in the raw logs
-        tick_or_alive_in_raw = False
-        for event in all_events:
-            event_type = self._extract_event_type(event)
-            if event_type in ("ENGINE_TICK_CALLSITE", "ENGINE_ALIVE", "ENGINE_TIMER_HEARTBEAT"):
-                tick_or_alive_in_raw = True
-                break
-        
         if tick_or_alive_in_raw:
             logger.debug("ENGINE_TICK_CALLSITE or ENGINE_ALIVE events found in raw robot logs")
         else:
@@ -550,7 +599,7 @@ class EventFeedGenerator:
                     f"Processed {processed_count} events but no ENGINE_TICK_CALLSITE, ENGINE_ALIVE, or ENGINE_TIMER_HEARTBEAT found. "
                     f"This may indicate the robot is not emitting liveness events."
                 )
-        
+
         return processed_count
     
     def get_current_run_id(self) -> Optional[str]:

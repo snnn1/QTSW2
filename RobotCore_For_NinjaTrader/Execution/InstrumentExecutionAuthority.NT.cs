@@ -1,6 +1,7 @@
 #if NINJATRADER
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using NinjaTrader.Cbi;
@@ -531,14 +532,11 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 MarkBootstrapSnapshotStale(NowEvent());
             }
-            // Phase 4: ScanAndAdopt only after bootstrap complete (or was run in ADOPT path)
+            // Phase 4: ScanAndAdopt only after bootstrap complete (or was run in ADOPT path). Single-flight gate; heavy scan runs only on IEA worker.
             if (!_hasScannedForAdoption && !IsInBootstrap && (CurrentRecoveryState == RecoveryState.NORMAL || CurrentRecoveryState == RecoveryState.RESOLVED))
-            {
-                _hasScannedForAdoption = true;
-                ScanAndAdoptExistingOrders();
-            }
+                _ = RequestAdoptionScan(AdoptionScanRequestSource.FirstExecutionUpdate, applyRecoveryThrottle: false, postScanOnWorker: null);
             Executor.ProcessExecutionUpdate(execution, order);
-        });
+        }, "ExecutionUpdate");
     }
 
     /// <summary>Phase 4: True if execution/order represents a critical event (fill or order state change to Working/Filled/Cancelled).</summary>
@@ -561,11 +559,720 @@ public sealed partial class InstrumentExecutionAuthority
         return false;
     }
 
+    private enum AdoptionScanRequestSource
+    {
+        FirstExecutionUpdate,
+        DeferredRetry,
+        RecoveryAdoption,
+        Bootstrap,
+        Other
+    }
+
+    private enum AdoptionScanRequestLogOutcome
+    {
+        AcceptedAndQueued,
+        AcceptedInline,
+        SkippedAlreadyRunning,
+        SkippedAlreadyQueued,
+        SkippedThrottled
+    }
+
+    private readonly struct AdoptionScanRequestDispatchResult
+    {
+        public AdoptionScanRequestLogOutcome Outcome { get; }
+        public int AdoptedDeltaIfInline { get; }
+        public int QueueDepthAtDecision { get; }
+
+        public AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome outcome, int adoptedDeltaIfInline = 0, int queueDepthAtDecision = 0)
+        {
+            Outcome = outcome;
+            AdoptedDeltaIfInline = adoptedDeltaIfInline;
+            QueueDepthAtDecision = queueDepthAtDecision;
+        }
+    }
+
     private bool _hasScannedForAdoption;
     private DateTimeOffset? _firstAdoptionScanUtc;
     private int _adoptionDeferredCount;
     private bool _adoptionDeferred;
-    private volatile bool _adoptionScanInProgress;
+    private readonly AdoptionScanSingleFlightGate _adoptionSingleFlightGate = new();
+    private string? _adoptionScanExecutionEpisodeId;
+    private readonly Dictionary<string, DateTimeOffset> _adoptionScanSkipLogLastUtc = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _adoptionScanSkipLogLock = new();
+
+    /// <summary>Recovery adoption: skip redundant full scans when fingerprint unchanged, last run adopted nothing, within cooldown, and no IEA mutations since last scan.</summary>
+    private const double RecoveryAdoptionNoProgressCooldownSeconds = 20.0;
+    private bool _hasLastRecoveryScanSnapshot;
+    private AdoptionScanRecoveryFingerprint _lastRecoveryScanFingerprint;
+    private int _lastRecoveryScanAdoptedDelta;
+    private DateTimeOffset _lastRecoveryScanCompletedUtc = DateTimeOffset.MinValue;
+
+    /// <summary>Per-phase wall times for IEA_ADOPTION_SCAN_PHASE_TIMING (hot-path audit).</summary>
+    private struct AdoptionScanPhaseTelemetry
+    {
+        public long FingerprintBuildMs;
+        public long CandidatesMs;
+        public long PrecountMs;
+        public long JournalDiagMs;
+        public long PreLoopLogMs;
+        public long MainLoopMs;
+        public long SummaryMs;
+        public int AccountOrdersTotal;
+        public int CandidateIntentCount;
+        public int Qtsw2SameInstrumentWorking;
+        public int MainLoopOrdersSeen;
+        public int ScanAdoptedInLoop;
+    }
+
+    // --- Adoption episode + same-state proof (IEA_CPU_PROOF_INSTRUMENTATION_PLAN_2026-03-23.md)
+    private string? _adoptionEpisodeId;
+    private readonly Dictionary<string, DateTimeOffset> _expensivePathThreadLastLogUtc = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _expensivePathThreadLock = new();
+    private string? _lastAdoptionStateFingerprint;
+    private int _adoptionFingerprintRepeatCount;
+    private DateTimeOffset _adoptionFingerprintWindowStartUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastSameStateRetryEmitUtc = DateTimeOffset.MinValue;
+
+    private void EnsureAdoptionEpisode(string reason)
+    {
+        _ = reason;
+        if (!string.IsNullOrEmpty(_adoptionEpisodeId)) return;
+        _adoptionEpisodeId = Guid.NewGuid().ToString("N");
+    }
+
+    private void EndAdoptionEpisode(string reason)
+    {
+        _ = reason;
+        _adoptionEpisodeId = null;
+    }
+
+    /// <summary>Payload for <see cref="InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount"/> rows.</summary>
+    internal object GetAdoptionDeferralRetryProofPayload() => new
+    {
+        adoption_episode_id = _adoptionEpisodeId,
+        deferred = _adoptionDeferred,
+        adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+        adoption_scan_execution_episode_id = _adoptionScanExecutionEpisodeId,
+        iea_instance_id = InstanceId,
+        execution_instrument_key = ExecutionInstrumentKey
+    };
+
+    internal void RecordDeferralHeartbeatRetryForProof(DateTimeOffset utcNow)
+    {
+        var fp = $"deferral_retry|{ExecutionInstrumentKey}|{_adoptionDeferred}|{_adoptionSingleFlightGate.State}|{_adoptionEpisodeId ?? ""}";
+        TrackAdoptionSameStateRetry(utcNow, fp);
+    }
+
+    private void MaybeLogExpensivePathThread(DateTimeOffset utcNow, string path)
+    {
+        if (Log == null) return;
+        lock (_expensivePathThreadLock)
+        {
+            if (_expensivePathThreadLastLogUtc.TryGetValue(path, out var last) &&
+                (utcNow - last).TotalSeconds < 60)
+                return;
+            _expensivePathThreadLastLogUtc[path] = utcNow;
+        }
+        var t = Thread.CurrentThread;
+        LogIeaEngine(utcNow, "IEA_EXPENSIVE_PATH_THREAD", new
+        {
+            path,
+            thread_id = t.ManagedThreadId,
+            thread_name = t.Name,
+            on_iea_worker = t == _workerThread,
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey
+        });
+    }
+
+    private void TrackAdoptionSameStateRetry(DateTimeOffset utcNow, string fingerprint)
+    {
+        if (Log == null) return;
+        const int repeatThreshold = 5;
+        const double windowSec = 90;
+        if (_adoptionFingerprintWindowStartUtc == DateTimeOffset.MinValue ||
+            (utcNow - _adoptionFingerprintWindowStartUtc).TotalSeconds > windowSec)
+        {
+            _adoptionFingerprintWindowStartUtc = utcNow;
+            _lastAdoptionStateFingerprint = fingerprint;
+            _adoptionFingerprintRepeatCount = 1;
+            return;
+        }
+        if (string.Equals(_lastAdoptionStateFingerprint, fingerprint, StringComparison.Ordinal))
+            _adoptionFingerprintRepeatCount++;
+        else
+        {
+            _lastAdoptionStateFingerprint = fingerprint;
+            _adoptionFingerprintRepeatCount = 1;
+        }
+        if (_adoptionFingerprintRepeatCount < repeatThreshold) return;
+        if (_lastSameStateRetryEmitUtc != DateTimeOffset.MinValue &&
+            (utcNow - _lastSameStateRetryEmitUtc).TotalSeconds < 60)
+            return;
+        _lastSameStateRetryEmitUtc = utcNow;
+        LogIeaEngine(utcNow, "ADOPTION_SAME_STATE_RETRY_WINDOW", new
+        {
+            fingerprint,
+            repeat_count = _adoptionFingerprintRepeatCount,
+            window_sec = windowSec,
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey,
+            adoption_episode_id = _adoptionEpisodeId,
+            note = "Same adoption/recovery fingerprint repeated within rolling window — no material state change"
+        });
+    }
+
+    private void MaybeLogAdoptionScanRequestSkipped(DateTimeOffset utcNow, AdoptionScanRequestSource source, AdoptionScanRequestLogOutcome outcome)
+    {
+        if (Log == null) return;
+        var reason = outcome switch
+        {
+            AdoptionScanRequestLogOutcome.SkippedAlreadyRunning => "skipped_already_running",
+            AdoptionScanRequestLogOutcome.SkippedAlreadyQueued => "skipped_already_queued",
+            AdoptionScanRequestLogOutcome.SkippedThrottled => "skipped_throttled",
+            _ => "unknown"
+        };
+        var key = $"{source}|{reason}";
+        lock (_adoptionScanSkipLogLock)
+        {
+            if (_adoptionScanSkipLogLastUtc.TryGetValue(key, out var last) && (utcNow - last).TotalSeconds < 60)
+                return;
+            _adoptionScanSkipLogLastUtc[key] = utcNow;
+        }
+        var t = Thread.CurrentThread;
+        LogIeaEngine(utcNow, "IEA_ADOPTION_SCAN_REQUEST_SKIPPED", new
+        {
+            scan_request_source = source.ToString(),
+            disposition = reason,
+            adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+            thread_id = t.ManagedThreadId,
+            thread_name = t.Name,
+            on_iea_worker = t == _workerThread,
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey
+        });
+    }
+
+    private void LogAdoptionScanRequestAccepted(DateTimeOffset utcNow, AdoptionScanRequestSource source, string disposition, int queueDepth, bool onWorker)
+    {
+        if (Log == null) return;
+        var t = Thread.CurrentThread;
+        LogIeaEngine(utcNow, "IEA_ADOPTION_SCAN_REQUEST_ACCEPTED", new
+        {
+            scan_request_source = source.ToString(),
+            disposition,
+            queue_depth_at_accept = queueDepth,
+            adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+            thread_id = t.ManagedThreadId,
+            thread_name = t.Name,
+            on_iea_worker = onWorker,
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey
+        });
+    }
+
+    /// <param name="deferWorkerMutationUtcToAlignUtc">
+    /// When true, the IEA worker loop uses the recovery scan completion time for LastMutationUtc instead of UtcNow (queued adoption only).
+    /// Inline adoption must pass false so a pending align is not consumed by the next queue item.
+    /// </param>
+    private void RunGatedAdoptionScanBody(AdoptionScanRequestSource source, Action? postScanOnWorker, string adoptionScanEpisodeId, bool deferWorkerMutationUtcToAlignUtc)
+    {
+        var utcStart = NowEvent();
+        var sw = Stopwatch.StartNew();
+        var before = GetOwnedPlusAdoptedWorkingCount();
+        var heavyScanExecuted = false;
+        var recoveryFpOk = false;
+        AdoptionScanRecoveryFingerprint recoveryFpAtStart = default;
+        var phaseTelemetry = new AdoptionScanPhaseTelemetry();
+        try
+        {
+            _preResolvedAdoptionCandidatesForScan = null;
+            _adoptionScanProofCandidateCountOverride = null;
+
+            if (source == AdoptionScanRequestSource.RecoveryAdoption && Executor != null)
+            {
+                var swCand = Stopwatch.StartNew();
+                _preResolvedAdoptionCandidatesForScan = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+                swCand.Stop();
+                phaseTelemetry.CandidatesMs = swCand.ElapsedMilliseconds;
+                _adoptionScanProofCandidateCountOverride = _preResolvedAdoptionCandidatesForScan.Count;
+            }
+
+            if (source == AdoptionScanRequestSource.RecoveryAdoption)
+            {
+                var swFp = Stopwatch.StartNew();
+                try
+                {
+                    if (TryBuildRecoveryScanFingerprint(out recoveryFpAtStart))
+                    {
+                        recoveryFpOk = true;
+                        if (RecoveryNoProgressSkipEvaluator.ShouldSkipRecoveryNoProgress(
+                                _hasLastRecoveryScanSnapshot,
+                                in recoveryFpAtStart,
+                                in _lastRecoveryScanFingerprint,
+                                _lastRecoveryScanAdoptedDelta,
+                                _lastRecoveryScanCompletedUtc,
+                                utcStart,
+                                RecoveryAdoptionNoProgressCooldownSeconds,
+                                LastMutationUtc))
+                        {
+                            MaybeLogAdoptionScanSkippedNoProgress(utcNow: utcStart, adoptionScanEpisodeId, in recoveryFpAtStart);
+                            return;
+                        }
+
+                        if (_hasLastRecoveryScanSnapshot &&
+                            _lastRecoveryScanAdoptedDelta == 0 &&
+                            AdoptionScanRecoveryFingerprint.CountFieldMismatches(in recoveryFpAtStart, in _lastRecoveryScanFingerprint) <= 1)
+                        {
+                            var noProgDiag = RecoveryNoProgressSkipEvaluator.BuildDiagnosticSnapshot(
+                                scanIsRecovery: true,
+                                _hasLastRecoveryScanSnapshot,
+                                in recoveryFpAtStart,
+                                in _lastRecoveryScanFingerprint,
+                                _lastRecoveryScanAdoptedDelta,
+                                _lastRecoveryScanCompletedUtc,
+                                utcStart,
+                                RecoveryAdoptionNoProgressCooldownSeconds,
+                                LastMutationUtc);
+                            MaybeLogAdoptionScanNoProgressNotSkipped(utcStart, adoptionScanEpisodeId, noProgDiag, in recoveryFpAtStart, in _lastRecoveryScanFingerprint);
+                        }
+                    }
+                }
+                finally
+                {
+                    swFp.Stop();
+                    phaseTelemetry.FingerprintBuildMs = swFp.ElapsedMilliseconds;
+                }
+            }
+
+            LogIeaEngine(utcStart, "IEA_ADOPTION_SCAN_EXECUTION_STARTED", new
+            {
+                adoption_scan_episode_id = adoptionScanEpisodeId,
+                scan_request_source = source.ToString(),
+                iea_instance_id = InstanceId,
+                execution_instrument_key = ExecutionInstrumentKey
+            });
+            ScanAndAdoptExistingOrders(source, ref phaseTelemetry);
+            postScanOnWorker?.Invoke();
+            heavyScanExecuted = true;
+        }
+        finally
+        {
+            _preResolvedAdoptionCandidatesForScan = null;
+            _adoptionScanProofCandidateCountOverride = null;
+
+            sw.Stop();
+            var after = GetOwnedPlusAdoptedWorkingCount();
+            var utcDone = NowEvent();
+            if (heavyScanExecuted)
+            {
+                var adoptedDelta = Math.Max(0, after - before);
+                LogIeaEngine(utcDone, "IEA_ADOPTION_SCAN_EXECUTION_COMPLETED", new
+                {
+                    adoption_scan_episode_id = adoptionScanEpisodeId,
+                    scan_request_source = source.ToString(),
+                    scan_wall_ms = sw.ElapsedMilliseconds,
+                    adopted_delta = adoptedDelta,
+                    account_orders_total = TryGetAccountOrdersTotalForAdoptionProof(),
+                    same_instrument_qtsw2_working_count = TryGetSameInstrumentQtsw2WorkingForAdoptionProof(),
+                    candidate_intent_count = TryGetAdoptionCandidateCountForProof(),
+                    deferred_state = _adoptionDeferred,
+                    iea_instance_id = InstanceId,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    recovery_fingerprint_at_start_account_orders = recoveryFpOk ? recoveryFpAtStart.AccountOrdersTotal : (int?)null,
+                    recovery_fingerprint_at_start_candidate_intent_count = recoveryFpOk ? recoveryFpAtStart.CandidateIntentCount : (int?)null,
+                    recovery_fingerprint_at_start_qtsw2_working = recoveryFpOk ? recoveryFpAtStart.SameInstrumentQtsw2WorkingCount : (int?)null,
+                    recovery_fingerprint_at_start_deferred = recoveryFpOk ? recoveryFpAtStart.DeferredState : (bool?)null,
+                    recovery_fingerprint_at_start_broker_working_exec = recoveryFpOk ? recoveryFpAtStart.BrokerWorkingExecutionInstrumentCount : (int?)null,
+                    recovery_fingerprint_at_start_iea_registry_working = recoveryFpOk ? recoveryFpAtStart.IeaRegistryWorkingCount : (int?)null,
+                    last_scan_completed_utc_before_this_run = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? null : _lastRecoveryScanCompletedUtc.ToString("o")
+                });
+                MaybeLogAdoptionScanPhaseTiming(utcDone, source, adoptionScanEpisodeId, sw.ElapsedMilliseconds, ref phaseTelemetry, adoptedDelta);
+                if (source == AdoptionScanRequestSource.RecoveryAdoption && recoveryFpOk)
+                {
+                    _hasLastRecoveryScanSnapshot = true;
+                    _lastRecoveryScanFingerprint = recoveryFpAtStart;
+                    _lastRecoveryScanAdoptedDelta = adoptedDelta;
+                    _lastRecoveryScanCompletedUtc = utcDone;
+                    // Prevent recovery scan from self-invalidating no-progress guard (WorkerLoop would otherwise set LastMutationUtc ~1–3s later).
+                    var previousLastMutationUtc = _lastMutationUtc;
+                    _lastMutationUtc = _lastRecoveryScanCompletedUtc;
+                    if (deferWorkerMutationUtcToAlignUtc)
+                        _pendingRecoveryAdoptionMutationAlignUtc = _lastRecoveryScanCompletedUtc;
+                    LogIeaEngine(utcDone, "IEA_ADOPTION_SCAN_MUTATION_TIME_ALIGNED", new
+                    {
+                        iea_instance_id = InstanceId,
+                        execution_instrument_key = ExecutionInstrumentKey,
+                        previous_last_mutation_utc = previousLastMutationUtc == DateTimeOffset.MinValue ? null : previousLastMutationUtc.ToString("o"),
+                        new_last_mutation_utc = _lastMutationUtc.ToString("o"),
+                        scan_completed_utc = utcDone.ToString("o")
+                    });
+                }
+            }
+            _adoptionSingleFlightGate.EndRun();
+        }
+    }
+
+    /// <summary>Single pass over account orders for counts used in recovery no-progress fingerprint (no adoption mutations).</summary>
+    private bool TryBuildRecoveryScanFingerprint(out AdoptionScanRecoveryFingerprint fp)
+    {
+        fp = new AdoptionScanRecoveryFingerprint("", -1, -1, -1, false, -1, -1);
+        if (Executor == null) return false;
+        try
+        {
+            if (Executor.GetAccount() is not Account account || account.Orders == null)
+                return false;
+            var accountTotal = account.Orders.Count;
+            var brokerWorkingExec = 0;
+            var qtsw2Same = 0;
+            foreach (Order o in account.Orders)
+            {
+                if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)
+                    continue;
+                var broName = o.Instrument?.MasterInstrument?.Name ?? "";
+                if (!AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+                    continue;
+                brokerWorkingExec++;
+                var tag = Executor.GetOrderTag(o);
+                if (!string.IsNullOrEmpty(tag) && tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+                    qtsw2Same++;
+            }
+            var cand = _preResolvedAdoptionCandidatesForScan != null
+                ? _preResolvedAdoptionCandidatesForScan.Count
+                : Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey).Count;
+            var ieaW = GetOwnedPlusAdoptedWorkingCount();
+            fp = new AdoptionScanRecoveryFingerprint(
+                ExecutionInstrumentKey,
+                accountTotal,
+                cand,
+                qtsw2Same,
+                _adoptionDeferred,
+                brokerWorkingExec,
+                ieaW);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Rate-limited proof of why recovery no-progress skip was not taken when eligibility was borderline (does not change skip logic).</summary>
+    private void MaybeLogAdoptionScanNoProgressNotSkipped(
+        DateTimeOffset utcNow,
+        string adoptionScanEpisodeId,
+        RecoveryNoProgressSkipDiagnosticSnapshot d,
+        in AdoptionScanRecoveryFingerprint current,
+        in AdoptionScanRecoveryFingerprint previous)
+    {
+        if (Log == null) return;
+        var rateKey = $"no_prog_not_skip|{InstanceId}|{d.SkipBlockedReason}|IEA_ADOPTION_SCAN_NO_PROGRESS_NOT_SKIPPED";
+        lock (_adoptionScanSkipLogLock)
+        {
+            if (_adoptionScanSkipLogLastUtc.TryGetValue(rateKey, out var last) && (utcNow - last).TotalSeconds < 50)
+                return;
+            _adoptionScanSkipLogLastUtc[rateKey] = utcNow;
+        }
+
+        LogIeaEngine(utcNow, "IEA_ADOPTION_SCAN_NO_PROGRESS_NOT_SKIPPED", new
+        {
+            adoption_scan_episode_id = adoptionScanEpisodeId,
+            scan_request_source = AdoptionScanRequestSource.RecoveryAdoption.ToString(),
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey,
+            has_last_completed_recovery_scan = d.HasLastCompletedRecoveryScan,
+            last_completed_adopted_delta_zero = d.LastCompletedAdoptedDeltaZero,
+            fingerprint_equal = d.FingerprintEqual,
+            fingerprint_field_mismatch_count = d.FingerprintFieldMismatchCount,
+            cooldown_positive = d.CooldownPositive,
+            last_completed_utc_valid = d.LastCompletedUtcValid,
+            within_cooldown = d.WithinCooldown,
+            last_iea_mutation_lte_last_completed = d.LastIeaMutationLteLastCompleted,
+            skip_blocked_reason = d.SkipBlockedReason,
+            seconds_since_last_completed = d.SecondsSinceLastCompleted,
+            cooldown_sec = RecoveryAdoptionNoProgressCooldownSeconds,
+            last_scan_completed_utc = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? null : _lastRecoveryScanCompletedUtc.ToString("o"),
+            last_iea_mutation_utc = LastMutationUtc == DateTimeOffset.MinValue ? null : LastMutationUtc.ToString("o"),
+            current_account_orders_total = current.AccountOrdersTotal,
+            current_candidate_intent_count = current.CandidateIntentCount,
+            current_same_instrument_qtsw2_working_count = current.SameInstrumentQtsw2WorkingCount,
+            current_deferred_state = current.DeferredState,
+            current_broker_working_execution_instrument = current.BrokerWorkingExecutionInstrumentCount,
+            current_iea_registry_working = current.IeaRegistryWorkingCount,
+            prev_account_orders_total = previous.AccountOrdersTotal,
+            prev_candidate_intent_count = previous.CandidateIntentCount,
+            prev_same_instrument_qtsw2_working_count = previous.SameInstrumentQtsw2WorkingCount,
+            prev_deferred_state = previous.DeferredState,
+            prev_broker_working_execution_instrument = previous.BrokerWorkingExecutionInstrumentCount,
+            prev_iea_registry_working = previous.IeaRegistryWorkingCount
+        });
+    }
+
+    private void MaybeLogAdoptionScanSkippedNoProgress(DateTimeOffset utcNow, string adoptionScanEpisodeId, in AdoptionScanRecoveryFingerprint fp)
+    {
+        if (Log == null) return;
+        const string rateKey = "no_progress_skip|IEA_ADOPTION_SCAN_SKIPPED_NO_PROGRESS";
+        lock (_adoptionScanSkipLogLock)
+        {
+            if (_adoptionScanSkipLogLastUtc.TryGetValue(rateKey, out var last) && (utcNow - last).TotalSeconds < 45)
+                return;
+            _adoptionScanSkipLogLastUtc[rateKey] = utcNow;
+        }
+        double? secSince = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue
+            ? null
+            : (utcNow - _lastRecoveryScanCompletedUtc).TotalSeconds;
+        LogIeaEngine(utcNow, "IEA_ADOPTION_SCAN_SKIPPED_NO_PROGRESS", new
+        {
+            adoption_scan_episode_id = adoptionScanEpisodeId,
+            execution_instrument_key = fp.ExecutionInstrumentKey,
+            account_orders_total = fp.AccountOrdersTotal,
+            candidate_intent_count = fp.CandidateIntentCount,
+            same_instrument_qtsw2_working_count = fp.SameInstrumentQtsw2WorkingCount,
+            deferred_state = fp.DeferredState,
+            broker_working_execution_instrument = fp.BrokerWorkingExecutionInstrumentCount,
+            iea_registry_working = fp.IeaRegistryWorkingCount,
+            last_scan_completed_utc = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? null : _lastRecoveryScanCompletedUtc.ToString("o"),
+            seconds_since_last_scan = secSince,
+            scan_request_source = AdoptionScanRequestSource.RecoveryAdoption.ToString(),
+            cooldown_sec = RecoveryAdoptionNoProgressCooldownSeconds,
+            iea_instance_id = InstanceId
+        });
+    }
+
+    /// <summary>Rate-limited unless <paramref name="totalWallMs"/> &gt; 2000 (always log slow scans).</summary>
+    private void MaybeLogAdoptionScanPhaseTiming(
+        DateTimeOffset utcNow,
+        AdoptionScanRequestSource source,
+        string adoptionScanEpisodeId,
+        long totalWallMs,
+        ref AdoptionScanPhaseTelemetry t,
+        int adoptedDelta)
+    {
+        if (Log == null) return;
+        const int slowThresholdMs = 2000;
+        var rateKey = $"phase_timing|{InstanceId}|IEA_ADOPTION_SCAN_PHASE_TIMING";
+        lock (_adoptionScanSkipLogLock)
+        {
+            if (totalWallMs <= slowThresholdMs &&
+                _adoptionScanSkipLogLastUtc.TryGetValue(rateKey, out var last) &&
+                (utcNow - last).TotalSeconds < 60)
+                return;
+            _adoptionScanSkipLogLastUtc[rateKey] = utcNow;
+        }
+
+        var scanBodySum = t.CandidatesMs + t.PrecountMs + t.JournalDiagMs + t.PreLoopLogMs + t.MainLoopMs + t.SummaryMs;
+        LogIeaEngine(utcNow, "IEA_ADOPTION_SCAN_PHASE_TIMING", new
+        {
+            adoption_scan_episode_id = adoptionScanEpisodeId,
+            scan_request_source = source.ToString(),
+            iea_instance_id = InstanceId,
+            execution_instrument_key = ExecutionInstrumentKey,
+            total_wall_ms = totalWallMs,
+            fingerprint_build_ms = t.FingerprintBuildMs,
+            phase_candidates_ms = t.CandidatesMs,
+            phase_precount_ms = t.PrecountMs,
+            phase_journal_diag_ms = t.JournalDiagMs,
+            phase_pre_loop_log_ms = t.PreLoopLogMs,
+            phase_main_loop_ms = t.MainLoopMs,
+            phase_summary_ms = t.SummaryMs,
+            scan_body_phases_sum_ms = scanBodySum,
+            adopted_delta = adoptedDelta,
+            adopted_in_loop = t.ScanAdoptedInLoop,
+            account_orders_total = t.AccountOrdersTotal,
+            candidate_intent_count = t.CandidateIntentCount,
+            qtsw2_same_instrument_working = t.Qtsw2SameInstrumentWorking,
+            main_loop_orders_seen = t.MainLoopOrdersSeen
+        });
+    }
+
+    private int TryGetAccountOrdersTotalForAdoptionProof()
+    {
+        try
+        {
+            if (Executor?.GetAccount() is Account a && a.Orders != null)
+                return a.Orders.Count;
+        }
+        catch { }
+        return -1;
+    }
+
+    private int TryGetSameInstrumentQtsw2WorkingForAdoptionProof()
+    {
+        try
+        {
+            if (Executor?.GetAccount() is not Account account || account.Orders == null) return -1;
+            var n = 0;
+            foreach (Order o in account.Orders)
+            {
+                if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+                var tagProbe = Executor.GetOrderTag(o);
+                if (string.IsNullOrEmpty(tagProbe) || !tagProbe.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+                var broName = o.Instrument?.MasterInstrument?.Name ?? "";
+                if (AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+                    n++;
+            }
+            return n;
+        }
+        catch { }
+        return -1;
+    }
+
+    private int TryGetAdoptionCandidateCountForProof()
+    {
+        try
+        {
+            if (_adoptionScanProofCandidateCountOverride.HasValue)
+                return _adoptionScanProofCandidateCountOverride.Value;
+            return Executor?.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey).Count ?? -1;
+        }
+        catch { }
+        return -1;
+    }
+
+    private void ExecuteAdoptionScanFromReservedQueueItem(AdoptionScanRequestSource source, Action? postScanOnWorker)
+    {
+        var utc0 = NowEvent();
+        if (!_adoptionSingleFlightGate.TryBeginQueuedRun())
+        {
+            LogIeaEngine(utc0, "IEA_ADOPTION_SCAN_GATE_ANOMALY", new
+            {
+                note = "Worker expected Queued gate state for adoption scan",
+                adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+                scan_request_source = source.ToString(),
+                iea_instance_id = InstanceId,
+                execution_instrument_key = ExecutionInstrumentKey
+            });
+            return;
+        }
+        var ep = Guid.NewGuid().ToString("N");
+        _adoptionScanExecutionEpisodeId = ep;
+        try
+        {
+            RunGatedAdoptionScanBody(source, postScanOnWorker, ep, deferWorkerMutationUtcToAlignUtc: true);
+        }
+        finally
+        {
+            _adoptionScanExecutionEpisodeId = null;
+        }
+    }
+
+    /// <summary>
+    /// Single entry for expensive adoption scans. Off-worker callers enqueue; on-worker may run inline when gate is idle.
+    /// Preserves recovery throttle (10s) for new <see cref="AdoptionScanRequestSource.RecoveryAdoption"/> requests only (not for duplicate gate hits).
+    /// </summary>
+    private AdoptionScanRequestDispatchResult RequestAdoptionScan(AdoptionScanRequestSource source, bool applyRecoveryThrottle, Action? postScanOnWorker)
+    {
+        var utcNow = NowEvent();
+        var onWorker = Thread.CurrentThread == _workerThread;
+        var depth = QueueDepth;
+
+        if (onWorker)
+        {
+            if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+            {
+                if (_lastTryRecoveryAdoptionUtc != DateTimeOffset.MinValue &&
+                    (utcNow - _lastTryRecoveryAdoptionUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
+                {
+                    MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedThrottled);
+                    return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedThrottled, queueDepthAtDecision: depth);
+                }
+            }
+
+            if (!_adoptionSingleFlightGate.TryBeginInlineRun())
+            {
+                var st = _adoptionSingleFlightGate.State;
+                if (st == AdoptionScanGateState.Running)
+                    MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedAlreadyRunning);
+                else if (st == AdoptionScanGateState.Queued)
+                    MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedAlreadyQueued);
+                var o = st == AdoptionScanGateState.Running
+                    ? AdoptionScanRequestLogOutcome.SkippedAlreadyRunning
+                    : AdoptionScanRequestLogOutcome.SkippedAlreadyQueued;
+                return new AdoptionScanRequestDispatchResult(o, queueDepthAtDecision: depth);
+            }
+
+            if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+                _lastTryRecoveryAdoptionUtc = utcNow;
+
+            MaybeLogExpensivePathThread(utcNow, "RequestAdoptionScan_inline");
+            if (source == AdoptionScanRequestSource.RecoveryAdoption)
+                EnsureAdoptionEpisode("try_recovery_adoption");
+
+            var ep = Guid.NewGuid().ToString("N");
+            _adoptionScanExecutionEpisodeId = ep;
+            LogAdoptionScanRequestAccepted(utcNow, source, "accepted_inline", depth, true);
+            var beforeInline = GetOwnedPlusAdoptedWorkingCount();
+            try
+            {
+                RunGatedAdoptionScanBody(source, postScanOnWorker, ep, deferWorkerMutationUtcToAlignUtc: false);
+            }
+            finally
+            {
+                _adoptionScanExecutionEpisodeId = null;
+            }
+            var afterInline = GetOwnedPlusAdoptedWorkingCount();
+            return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.AcceptedInline, Math.Max(0, afterInline - beforeInline), depth);
+        }
+
+        if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+        {
+            if (_lastTryRecoveryAdoptionUtc != DateTimeOffset.MinValue &&
+                (utcNow - _lastTryRecoveryAdoptionUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
+            {
+                MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedThrottled);
+                return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedThrottled, queueDepthAtDecision: depth);
+            }
+        }
+
+        var res = _adoptionSingleFlightGate.TryReserveQueuedSlot();
+        if (res == AdoptionScanEnqueueAttemptOutcome.AlreadyRunning)
+        {
+            MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedAlreadyRunning);
+            return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedAlreadyRunning, queueDepthAtDecision: depth);
+        }
+        if (res == AdoptionScanEnqueueAttemptOutcome.AlreadyQueued)
+        {
+            MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedAlreadyQueued);
+            return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedAlreadyQueued, queueDepthAtDecision: depth);
+        }
+
+        if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+            _lastTryRecoveryAdoptionUtc = utcNow;
+
+        if (source == AdoptionScanRequestSource.RecoveryAdoption)
+        {
+            MaybeLogExpensivePathThread(utcNow, "TryRecoveryAdoption_enqueue");
+            EnsureAdoptionEpisode("try_recovery_adoption");
+        }
+
+        depth = QueueDepth;
+        var workKind = source switch
+        {
+            AdoptionScanRequestSource.Bootstrap => "BootstrapAdoptionScan",
+            AdoptionScanRequestSource.DeferredRetry => "AdoptionDeferredRetry",
+            AdoptionScanRequestSource.RecoveryAdoption => "RecoveryAdoptionScan",
+            AdoptionScanRequestSource.FirstExecutionUpdate => "FirstExecutionAdoptionScan",
+            _ => "AdoptionScan"
+        };
+        try
+        {
+            EnqueueRecoveryEssential(() => ExecuteAdoptionScanFromReservedQueueItem(source, postScanOnWorker), workKind);
+            LogAdoptionScanRequestAccepted(utcNow, source, "accepted_and_queued", depth, false);
+            return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.AcceptedAndQueued, queueDepthAtDecision: depth);
+        }
+        catch
+        {
+            _adoptionSingleFlightGate.AbortQueuedReservation();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Reconciliation / gate recovery: schedules full adoption scan on IEA worker (was synchronous off-worker — CPU amplification).
+    /// Throttle: at most one new recovery scheduling attempt per 10s per IEA (unchanged semantics for accepted requests).
+    /// </summary>
+    private DateTimeOffset _lastTryRecoveryAdoptionUtc = DateTimeOffset.MinValue;
+    private const double TryRecoveryAdoptionMinIntervalSeconds = 10.0;
 
     /// <summary>True when adoption retry is pending (heartbeat / execution paths should consider enqueueing a scan).</summary>
     internal bool HasDeferredAdoptionScanPending => _adoptionDeferred;
@@ -575,42 +1282,46 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>
     /// Retry adoption scan when deferred (candidates empty, broker has orders).
-    /// Call from periodic path (e.g. engine heartbeat) so retry does not depend only on execution updates.
-    /// Enqueues ScanAndAdoptExistingOrders to IEA worker; no-op if not deferred or scan already in flight.
-    /// Guard: at most one adoption scan queued/running at a time.
+    /// Enqueues to IEA worker; single-flight gate collapses duplicates with recovery/bootstrap/first scan.
     /// </summary>
-    /// <returns>True if a scan was enqueued on the IEA worker; false if not deferred, scan already in progress, or enqueue failed.</returns>
+    /// <returns>True if a scan was newly enqueued; false if not deferred, throttled by gate duplicate, or enqueue failed.</returns>
     internal bool TryRetryDeferredAdoptionScanIfDeferred()
     {
         if (!_adoptionDeferred) return false;
-        if (_adoptionScanInProgress) return false;
-        _adoptionScanInProgress = true;
         try
         {
-            EnqueueRecoveryEssential(() =>
-            {
-                try { ScanAndAdoptExistingOrders(); }
-                finally { _adoptionScanInProgress = false; }
-            });
-            return true;
+            var r = RequestAdoptionScan(AdoptionScanRequestSource.DeferredRetry, applyRecoveryThrottle: false, postScanOnWorker: null);
+            return r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued;
         }
         catch
         {
-            _adoptionScanInProgress = false;
             return false;
         }
     }
 
-    /// <summary>Run adoption for late recovery (reconciliation). Returns count of orders adopted.</summary>
-    public int TryRecoveryAdoption()
+    /// <summary>
+    /// Schedules recovery adoption on the IEA worker. Returns true when a scan was queued, ran inline, or is already queued/running (caller may skip immediate mismatch classification).
+    /// Returns false when recovery throttle rejects a new request. <paramref name="adoptedCountIfRanSynchronously"/> is non-zero only if the scan ran inline on the IEA worker (unusual for engine callers).
+    /// </summary>
+    public bool TryScheduleRecoveryAdoptionScan(out int adoptedCountIfRanSynchronously)
     {
-        var before = GetOwnedPlusAdoptedWorkingCount();
-        ScanAndAdoptExistingOrders();
-        var after = GetOwnedPlusAdoptedWorkingCount();
-        return Math.Max(0, after - before);
+        adoptedCountIfRanSynchronously = 0;
+        var r = RequestAdoptionScan(AdoptionScanRequestSource.RecoveryAdoption, applyRecoveryThrottle: true, postScanOnWorker: null);
+        adoptedCountIfRanSynchronously = r.AdoptedDeltaIfInline;
+        return r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued
+               || r.Outcome == AdoptionScanRequestLogOutcome.AcceptedInline
+               || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyRunning
+               || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyQueued;
     }
 
-    /// <summary>Phase 4: Run adoption for bootstrap ADOPT path. Calls ScanAndAdoptExistingOrders then OnBootstrapAdoptionCompleted.</summary>
+    /// <summary>Run adoption for late recovery (reconciliation). Prefer <see cref="TryScheduleRecoveryAdoptionScan"/> for engine paths; this returns adopted count only when the scan ran synchronously on the worker.</summary>
+    public int TryRecoveryAdoption()
+    {
+        TryScheduleRecoveryAdoptionScan(out var adopted);
+        return adopted;
+    }
+
+    /// <summary>Phase 4: Run adoption for bootstrap ADOPT path on IEA worker; then <see cref="OnBootstrapAdoptionCompleted"/>.</summary>
     internal void RunBootstrapAdoption(string instrument, DateTimeOffset utcNow)
     {
         LogIeaEngine(utcNow, "BOOTSTRAP_ADOPTION_ATTEMPT", new
@@ -618,10 +1329,11 @@ public sealed partial class InstrumentExecutionAuthority
             execution_instrument_key = ExecutionInstrumentKey,
             instrument,
             iea_instance_id = InstanceId,
-            note = "Running adoption for bootstrap ADOPT path"
+            note = "Running adoption for bootstrap ADOPT path (queued to IEA worker when not on worker)"
         });
-        ScanAndAdoptExistingOrders();
-        OnBootstrapAdoptionCompleted(instrument, utcNow);
+        var inst = instrument;
+        void Post() => OnBootstrapAdoptionCompleted(inst, NowEvent());
+        _ = RequestAdoptionScan(AdoptionScanRequestSource.Bootstrap, applyRecoveryThrottle: false, Post);
     }
 
     /// <summary>
@@ -632,12 +1344,53 @@ public sealed partial class InstrumentExecutionAuthority
     /// IEA robustness: Adopt entry orders (QTSW2:{intentId} without :STOP/:TARGET) when candidate exists.
     /// Deferral: when candidates empty but this instrument still has QTSW2 working orders, grace window before stale classification (journal load race).
     /// </summary>
-    private void ScanAndAdoptExistingOrders()
+    private void ScanAndAdoptExistingOrders(AdoptionScanRequestSource source, ref AdoptionScanPhaseTelemetry tel)
+    {
+        if (Thread.CurrentThread != _workerThread)
+        {
+            LogIeaEngine(NowEvent(), "IEA_ADOPTION_SCAN_OFF_WORKER_VIOLATION", new
+            {
+                note = "Heavy adoption scan must run on IEA worker only — use RequestAdoptionScan",
+                iea_instance_id = InstanceId,
+                execution_instrument_key = ExecutionInstrumentKey
+            });
+            return;
+        }
+        var savedWorkType = _currentWorkType;
+        _currentWorkType = "AdoptionScan";
+        try
+        {
+            ScanAndAdoptExistingOrdersCore(source, ref tel);
+        }
+        finally
+        {
+            _currentWorkType = savedWorkType;
+        }
+    }
+
+    private void ScanAndAdoptExistingOrdersCore(AdoptionScanRequestSource source, ref AdoptionScanPhaseTelemetry tel)
     {
         if (Executor == null || Log == null) return;
         var account = Executor.GetAccount() as Account;
         if (account?.Orders == null) return;
-        var activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+        var accountOrdersTotal = account.Orders.Count;
+        tel.AccountOrdersTotal = accountOrdersTotal;
+        MaybeLogExpensivePathThread(NowEvent(), "ScanAndAdoptExistingOrders");
+
+        var swPh = Stopwatch.StartNew();
+        IReadOnlyCollection<string> activeIntentIds;
+        if (source == AdoptionScanRequestSource.RecoveryAdoption && _preResolvedAdoptionCandidatesForScan != null)
+        {
+            activeIntentIds = _preResolvedAdoptionCandidatesForScan;
+        }
+        else
+        {
+            activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+            swPh.Stop();
+            tel.CandidatesMs = swPh.ElapsedMilliseconds;
+        }
+
+        swPh.Restart();
         var workingCount = account.Orders.Count(o => o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
         var qtsw2SameInstrumentWorking = 0;
         foreach (Order o in account.Orders)
@@ -649,10 +1402,27 @@ public sealed partial class InstrumentExecutionAuthority
             if (AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
                 qtsw2SameInstrumentWorking++;
         }
+        swPh.Stop();
+        tel.PrecountMs = swPh.ElapsedMilliseconds;
+
+        swPh.Restart();
         var utcNow = NowEvent();
         var (journalDir, journalFileCount, journalDirExists) = Executor.GetJournalDiagnostics(ExecutionInstrumentKey);
+        swPh.Stop();
+        tel.JournalDiagMs = swPh.ElapsedMilliseconds;
+
+        var scanStartFingerprint = $"scan_start|{accountOrdersTotal}|{qtsw2SameInstrumentWorking}|{activeIntentIds.Count}|{_adoptionDeferred}";
+
+        swPh.Restart();
+        TrackAdoptionSameStateRetry(utcNow, scanStartFingerprint);
         LogIeaEngine(utcNow, "ADOPTION_SCAN_START", new
         {
+            adoption_episode_id = _adoptionEpisodeId,
+            account_orders_total = accountOrdersTotal,
+            same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+            candidate_intent_count = activeIntentIds.Count,
+            deferred = _adoptionDeferred,
+            adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
             execution_instrument_key = ExecutionInstrumentKey,
             adoption_candidate_count = activeIntentIds.Count,
             broker_working_count = workingCount,
@@ -668,6 +1438,10 @@ public sealed partial class InstrumentExecutionAuthority
             non_convergent_orders_total = Interlocked.Read(ref _metricAdoptionNonConvergentEscalationsTotal),
             suppressed_rechecks_total = Interlocked.Read(ref _metricAdoptionSuppressedRechecksTotal)
         });
+        swPh.Stop();
+        tel.PreLoopLogMs = swPh.ElapsedMilliseconds;
+        tel.CandidateIntentCount = activeIntentIds.Count;
+        tel.Qtsw2SameInstrumentWorking = qtsw2SameInstrumentWorking;
 
         if (activeIntentIds.Count == 0 && qtsw2SameInstrumentWorking > 0)
         {
@@ -679,8 +1453,15 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 _adoptionDeferred = true;
                 _hasScannedForAdoption = false;
+                EnsureAdoptionEpisode("deferred_candidates_empty");
                 LogIeaEngine(utcNow, "ADOPTION_DEFERRED_CANDIDATES_EMPTY", new
                 {
+                    adoption_episode_id = _adoptionEpisodeId,
+                    account_orders_total = accountOrdersTotal,
+                    same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+                    candidate_intent_count = activeIntentIds.Count,
+                    deferred = _adoptionDeferred,
+                    adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
                     execution_instrument_key = ExecutionInstrumentKey,
                     broker_working_same_instrument_qtsw2 = qtsw2SameInstrumentWorking,
                     journal_dir = journalDir,
@@ -694,8 +1475,16 @@ public sealed partial class InstrumentExecutionAuthority
                 return;
             }
             _adoptionDeferred = false;
+            EndAdoptionEpisode("grace_expired");
+            EnsureAdoptionEpisode("post_grace_scan");
             LogIeaEngine(utcNow, "ADOPTION_GRACE_EXPIRED_UNOWNED", new
             {
+                adoption_episode_id = _adoptionEpisodeId,
+                account_orders_total = accountOrdersTotal,
+                same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+                candidate_intent_count = activeIntentIds.Count,
+                deferred = _adoptionDeferred,
+                adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
                 execution_instrument_key = ExecutionInstrumentKey,
                 broker_working_same_instrument_qtsw2 = qtsw2SameInstrumentWorking,
                 journal_dir = journalDir,
@@ -711,8 +1500,16 @@ public sealed partial class InstrumentExecutionAuthority
         {
             _hasScannedForAdoption = true;
             _adoptionDeferred = false;
+            var episodeNoBroker = _adoptionEpisodeId;
+            EndAdoptionEpisode("no_broker_orders");
             LogIeaEngine(utcNow, "ADOPTION_CANDIDATES_EMPTY_NO_BROKER_ORDERS", new
             {
+                adoption_episode_id = episodeNoBroker,
+                account_orders_total = accountOrdersTotal,
+                same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+                candidate_intent_count = activeIntentIds.Count,
+                deferred = _adoptionDeferred,
+                adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
                 execution_instrument_key = ExecutionInstrumentKey,
                 journal_dir = journalDir,
                 journal_file_count = journalFileCount,
@@ -722,12 +1519,15 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         }
 
+        var swScan = Stopwatch.StartNew();
         var scanSeen = 0L;
         var scanForeign = 0L;
         var scanStale = 0L;
         var scanAdopted = 0L;
         var scanEscalations = 0L;
         var scanSuppressed = 0L;
+        var recoveryRequestsDuringScan = 0;
+        var supervisoryRequestsDuringScan = 0;
 
         foreach (Order o in account.Orders)
         {
@@ -781,8 +1581,16 @@ public sealed partial class InstrumentExecutionAuthority
                 Interlocked.Increment(ref _metricAdoptionNonConvergentEscalationsTotal);
                 scanEscalations++;
                 _adoptionConvergence.TryGetTimestamps(orderId, out var fs, out var ls);
+                var episodeNonConv = _adoptionEpisodeId;
+                EndAdoptionEpisode("non_convergence_escalated");
                 LogIeaEngine(utcNow, "ADOPTION_NON_CONVERGENCE_ESCALATED", new
                 {
+                    adoption_episode_id = episodeNonConv,
+                    account_orders_total = accountOrdersTotal,
+                    same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+                    candidate_intent_count = activeIntentIds.Count,
+                    deferred = _adoptionDeferred,
+                    adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
                     broker_order_id = orderId,
                     instrument = brokerInstrument,
                     intent_id = intentId,
@@ -878,8 +1686,10 @@ public sealed partial class InstrumentExecutionAuthority
                         RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
                         if (unchangedStreak == 1)
                         {
+                            supervisoryRequestsDuringScan++;
                             RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.HIGH,
                                 new { broker_order_id = orderId, intent_id = intentId, classification = "STALE_QTSW2_ORDER_DETECTED" }, utcNow);
+                            recoveryRequestsDuringScan++;
                             RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
                                 new { broker_order_id = orderId, intent_id = intentId, note = "Same-instrument QTSW2 protective without adoption candidate — fail-closed recovery (convergence-guarded)" }, utcNow);
                         }
@@ -889,8 +1699,10 @@ public sealed partial class InstrumentExecutionAuthority
                         RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
                         if (unchangedStreak == 1)
                         {
+                            supervisoryRequestsDuringScan++;
                             RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS, SupervisorySeverity.CRITICAL,
                                 new { broker_order_id = orderId, reason = "CORRUPT_QTSW2_TAG" }, utcNow);
+                            recoveryRequestsDuringScan++;
                             RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
                                 new { broker_order_id = orderId, intent_id = intentId, note = "Malformed QTSW2 tag — fail-closed recovery" }, utcNow);
                         }
@@ -967,9 +1779,11 @@ public sealed partial class InstrumentExecutionAuthority
                     RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
                     if (unchangedStreak == 1)
                     {
+                        supervisoryRequestsDuringScan++;
                         RequestSupervisoryAction(brokerInstrument, SupervisoryTriggerReason.REPEATED_UNOWNED_EXECUTIONS,
                             corrupt ? SupervisorySeverity.CRITICAL : SupervisorySeverity.HIGH,
                             new { broker_order_id = orderId, intent_id = intentId }, utcNow);
+                        recoveryRequestsDuringScan++;
                         RequestRecovery(brokerInstrument, "STALE_QTSW2_ORDER_DETECTED",
                             new { broker_order_id = orderId, intent_id = intentId, note = "QTSW2 entry without adoption candidate" }, utcNow);
                     }
@@ -977,8 +1791,30 @@ public sealed partial class InstrumentExecutionAuthority
             }
         }
 
+        swScan.Stop();
+        tel.MainLoopMs = swScan.ElapsedMilliseconds;
+        tel.MainLoopOrdersSeen = scanSeen > int.MaxValue ? int.MaxValue : (int)scanSeen;
+        tel.ScanAdoptedInLoop = scanAdopted > int.MaxValue ? int.MaxValue : (int)scanAdopted;
+
+        var episodeSummary = _adoptionEpisodeId;
+        var swSummary = Stopwatch.StartNew();
+        if (scanAdopted > 0)
+            EndAdoptionEpisode("adoption_success");
+        else
+            EndAdoptionEpisode("scan_summary_complete");
+
         LogIeaEngine(utcNow, "ADOPTION_SCAN_SUMMARY", new
         {
+            adoption_episode_id = episodeSummary,
+            account_orders_total = accountOrdersTotal,
+            same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+            candidate_intent_count = activeIntentIds.Count,
+            deferred = _adoptionDeferred,
+            adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+            wall_ms = swScan.ElapsedMilliseconds,
+            orders_scanned_loop = scanSeen,
+            recovery_requests_emitted = recoveryRequestsDuringScan,
+            supervisory_requests_emitted = supervisoryRequestsDuringScan,
             execution_instrument_key = ExecutionInstrumentKey,
             iea_instance_id = InstanceId,
             scan_qtsw2_same_instrument_seen = scanSeen,
@@ -992,8 +1828,11 @@ public sealed partial class InstrumentExecutionAuthority
             stale_qtsw2_orders_total = Interlocked.Read(ref _metricAdoptionStaleQtsw2OrdersTotal),
             successful_adoptions_total = Interlocked.Read(ref _metricAdoptionSuccessfulAdoptionsTotal),
             non_convergent_orders_total = Interlocked.Read(ref _metricAdoptionNonConvergentEscalationsTotal),
-            suppressed_rechecks_total = Interlocked.Read(ref _metricAdoptionSuppressedRechecksTotal)
+            suppressed_rechecks_total = Interlocked.Read(ref _metricAdoptionSuppressedRechecksTotal),
+            scan_wall_ms = EngineCpuProfile.IsEnabled() ? swScan.ElapsedMilliseconds : -1L
         });
+        swSummary.Stop();
+        tel.SummaryMs = swSummary.ElapsedMilliseconds;
 
         _hasScannedForAdoption = true;
         _adoptionDeferred = false;
@@ -1237,7 +2076,7 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (Executor == null || Log == null) return;
         var eventTime = tickTimeFromEvent ?? NowEvent();
-        Enqueue(() => Executor.EvaluateBreakEvenCore(tickPrice, eventTime, executionInstrument));
+        Enqueue(() => Executor.EvaluateBreakEvenCore(tickPrice, eventTime, executionInstrument), "BreakEvenEvaluate");
     }
 }
 #endif

@@ -3259,6 +3259,19 @@ function AppContent() {
               {/* Session eligibility freeze notice */}
               <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm">
                 {eligibilityStatus ? (
+                  eligibilityStatus.status === 'no_eligibility_file' ? (
+                    <span className="text-gray-300">
+                      No <code className="text-gray-400">eligibility_*.json</code> freeze for{' '}
+                      <span className="font-semibold text-amber-400">{eligibilityStatus.trading_date || eligibilityStatus.timetable_trading_date}</span>
+                      {eligibilityStatus.eligible_stream_count != null && (
+                        <span className="text-gray-500 ml-2">
+                          (timetable: {eligibilityStatus.eligible_stream_count} enabled)
+                        </span>
+                      )}
+                    </span>
+                  ) : eligibilityStatus.status === 'none' ? (
+                    <span className="text-gray-500">No eligibility data</span>
+                  ) : (
                   <span className="text-gray-300">
                     Session eligibility frozen for <span className="font-semibold text-green-400">{eligibilityStatus.trading_date}</span> at{' '}
                     <span className="font-mono">
@@ -3277,7 +3290,13 @@ function AppContent() {
                     {eligibilityStatus.eligible_stream_count != null && (
                       <span className="text-gray-500 ml-2">({eligibilityStatus.eligible_stream_count} eligible)</span>
                     )}
+                    {eligibilityStatus.eligibility_timetable_count_mismatch && (
+                      <span className="text-amber-400 ml-2" title="eligible_stream_count differs from enabled count in timetable_current.json">
+                        (mismatch vs timetable)
+                      </span>
+                    )}
                   </span>
+                  )
                 ) : (
                   <span className="text-gray-500">No eligibility file yet</span>
                 )}

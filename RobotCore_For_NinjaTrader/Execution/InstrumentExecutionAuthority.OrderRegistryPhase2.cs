@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using NinjaTrader.Cbi;
@@ -11,6 +12,9 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class InstrumentExecutionAuthority
 {
+    private DateTimeOffset _lastVerifyRegistryThreadAttrUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastVerifyRegistryDiagUtc = DateTimeOffset.MinValue;
+
     /// <summary>Phase 2: Terminal order retention window (minutes). Default 10.</summary>
     private const int TerminalRetentionMinutes = 10;
 
@@ -93,21 +97,47 @@ public sealed partial class InstrumentExecutionAuthority
         var account = Executor?.GetAccount() as Account;
         if (account?.Orders == null) return;
 
+        var sw = Stopwatch.StartNew();
+        var accountOrdersTotal = account.Orders.Count;
+        var ordersScannedPass1 = 0;
+        var recoveryRequestsEmitted = 0;
+        var supervisoryRequestsEmitted = 0;
+        var divergenceEventsLogged = 0;
+
+        if (Log != null && (utcNow - _lastVerifyRegistryThreadAttrUtc).TotalSeconds >= 60)
+        {
+            _lastVerifyRegistryThreadAttrUtc = utcNow;
+            var t = Thread.CurrentThread;
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_EXPENSIVE_PATH_THREAD", state: "ENGINE",
+                new
+                {
+                    path = "VerifyRegistryIntegrity",
+                    thread_id = t.ManagedThreadId,
+                    thread_name = t.Name,
+                    on_iea_worker = t == _workerThread,
+                    iea_instance_id = InstanceId,
+                    execution_instrument_key = ExecutionInstrumentKey
+                }));
+        }
+
         var brokerOrderIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (Order o in account.Orders)
         {
+            ordersScannedPass1++;
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             var id = o.OrderId?.ToString();
             if (!string.IsNullOrEmpty(id)) brokerOrderIds.Add(id);
         }
 
         var workingRegistryIds = _orderRegistry.GetWorkingOrderIds().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var registryWorkingCount = workingRegistryIds.Count;
 
         // Registry has WORKING order but broker does not
         foreach (var regId in workingRegistryIds)
         {
             if (!brokerOrderIds.Contains(regId))
             {
+                divergenceEventsLogged++;
                 _orderRegistry.IncrementIntegrityFailure();
                 Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
                 {
@@ -117,19 +147,24 @@ public sealed partial class InstrumentExecutionAuthority
                     iea_instance_id = InstanceId
                 }));
 #if NINJATRADER
+                recoveryRequestsEmitted++;
+                supervisoryRequestsEmitted++;
                 RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = regId, direction = "registry_has_broker_missing" }, utcNow);
                 RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = regId, direction = "registry_has_broker_missing" }, utcNow);
 #endif
             }
         }
 
+        var ordersScannedPass2 = 0;
         // Broker has live order but registry does not — IEA robustness: adopt immediately to restore consistency
         foreach (Order o in account.Orders)
         {
+            ordersScannedPass2++;
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             var brokerId = o.OrderId?.ToString();
             if (string.IsNullOrEmpty(brokerId) || _orderRegistry.Contains(brokerId)) continue;
 
+            divergenceEventsLogged++;
             _orderRegistry.IncrementIntegrityFailure();
             Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
             {
@@ -148,9 +183,40 @@ public sealed partial class InstrumentExecutionAuthority
                 }));
             }
 #if NINJATRADER
+            recoveryRequestsEmitted++;
+            supervisoryRequestsEmitted++;
             RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
             RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
 #endif
+        }
+
+        sw.Stop();
+        var wallMs = sw.ElapsedMilliseconds;
+        var emitDiag = wallMs >= 75
+                       || recoveryRequestsEmitted > 0
+                       || supervisoryRequestsEmitted > 0
+                       || divergenceEventsLogged > 0
+                       || _lastVerifyRegistryDiagUtc == DateTimeOffset.MinValue
+                       || (utcNow - _lastVerifyRegistryDiagUtc).TotalSeconds >= 55;
+        if (Log != null && emitDiag)
+        {
+            _lastVerifyRegistryDiagUtc = utcNow;
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_VERIFY_REGISTRY_INTEGRITY_DIAG", state: "ENGINE",
+                new
+                {
+                    iea_instance_id = InstanceId,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    wall_ms = wallMs,
+                    account_orders_total = accountOrdersTotal,
+                    orders_iterated_pass1 = ordersScannedPass1,
+                    orders_iterated_pass2 = ordersScannedPass2,
+                    registry_working_items = registryWorkingCount,
+                    broker_working_ids_count = brokerOrderIds.Count,
+                    divergence_events_logged = divergenceEventsLogged,
+                    recovery_requests_emitted = recoveryRequestsEmitted,
+                    supervisory_requests_emitted = supervisoryRequestsEmitted,
+                    note = "Rate-limited / thresholded proof diag for VerifyRegistryIntegrity"
+                }));
         }
     }
 

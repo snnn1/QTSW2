@@ -1,6 +1,7 @@
 """
 Watchdog Aggregator Configuration
 """
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -274,3 +275,50 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "EXECUTION_JOURNAL_CORRUPTION",
     "EXECUTION_JOURNAL_ERROR",
 }
+
+# --- CPU / load diagnostics (opt-in; set WATCHDOG_CPU_DIAG=1 on watchdog process) ---
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+WATCHDOG_CPU_DIAG_ENABLED = _env_truthy("WATCHDOG_CPU_DIAG")
+_watchdog_cpu_interval = os.environ.get("WATCHDOG_CPU_DIAG_INTERVAL", "5")
+try:
+    WATCHDOG_CPU_DIAG_INTERVAL_SECONDS = max(1.0, float(_watchdog_cpu_interval or "5"))
+except ValueError:
+    WATCHDOG_CPU_DIAG_INTERVAL_SECONDS = 5.0
+
+# Subset of live-critical types for correlating load with order flow (raw robot logs, one merge batch)
+ORDER_RELATED_EVENT_TYPES = frozenset(
+    {
+        "ORDER_SUBMIT_SUCCESS",
+        "ORDER_ACKNOWLEDGED",
+        "ORDER_REJECTED",
+        "ORDER_CANCELLED",
+        "EXECUTION_FILLED",
+        "EXECUTION_PARTIAL_FILL",
+        "EXECUTION_EXIT_FILL",
+        "EXECUTION_FILL_BLOCKED_TRADING_DATE_NULL",
+        "EXECUTION_FILL_UNMAPPED",
+        "PROTECTIVE_ORDERS_SUBMITTED",
+        "PROTECTIVE_ORDERS_FAILED_FLATTENED",
+        "INTENT_EXPOSURE_REGISTERED",
+        "INTENT_EXPOSURE_CLOSED",
+        "INTENT_EXIT_FILL",
+        "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
+        "BROKER_FLATTEN_FILL_RECOGNIZED",
+    }
+)
+
+# Per-tick diagnostic spam from robot (if enabled in C#) — multiplies ingest work
+ENGINE_TICK_DIAGNOSTIC_EVENT_TYPES = frozenset(
+    {
+        "ENGINE_TICK_EXECUTED",
+        "ENGINE_TICK_BEFORE_LOCK",
+        "ENGINE_TICK_LOCK_ACQUIRED",
+        "ENGINE_TICK_AFTER_LOCK",
+        "ENGINE_TICK_HEARTBEAT",
+    }
+)

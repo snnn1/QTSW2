@@ -39,7 +39,7 @@ public sealed partial class InstrumentExecutionAuthority
             });
             return;
         }
-        EnqueueCore(() => DispatchCommand(command));
+        EnqueueCore(() => DispatchCommand(command), "ExecutionCommand");
     }
 
     private void DispatchCommand(ExecutionCommandBase command)
