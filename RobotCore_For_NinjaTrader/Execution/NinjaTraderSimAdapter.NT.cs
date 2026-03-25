@@ -3216,17 +3216,16 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (retryRecord == null && retryOrderInfo == null)
         {
-            var ordStateDedup = order.OrderState.ToString();
-            if (TrySkipDuplicateExecutionUpdate50ms(instTrace, execIdTrace, fillQtyTrace, ordStateDedup, utcTrace, out var execDedupSkips))
+            var permKey = BuildPermanentExecutionDedupKey(instTrace, execIdTrace, order.OrderId, fillQtyTrace);
+            if (!TryMarkFirstPermanentExecutionProcessing(permKey, out var permSkips))
             {
-                _log.Write(RobotEvents.ExecutionBase(utcTrace, intentTrace, instTrace, "EXECUTION_DEDUP_SKIPPED", new
+                _log.Write(RobotEvents.ExecutionBase(utcTrace, intentTrace, instTrace, "EXECUTION_DEDUP_SKIPPED_PERMANENT", new
                 {
                     execution_id = execIdTrace ?? "",
                     broker_order_id = order.OrderId,
-                    order_state = ordStateDedup,
                     fill_qty = fillQtyTrace,
-                    skipped_count = execDedupSkips,
-                    window_ms = 50
+                    dedup_key = permKey,
+                    skipped_count = permSkips
                 }));
                 return;
             }
@@ -8182,40 +8181,24 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
-    /// <summary>Suppress duplicate NT execution callbacks: same instrument + execution_id, fill_qty, order_state within 50ms.</summary>
-    private bool TrySkipDuplicateExecutionUpdate50ms(string instrument, string? executionId, int fillQty, string orderState, DateTimeOffset utcNow, out long skippedCount)
+    private static string BuildPermanentExecutionDedupKey(string instrument, string? executionId, string? brokerOrderId, int fillQty)
+    {
+        var inst = string.IsNullOrEmpty(instrument) ? "_" : instrument.Trim();
+        var q = fillQty.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (!string.IsNullOrWhiteSpace(executionId))
+            return inst + "|" + executionId.Trim() + "|q:" + q;
+        var oid = brokerOrderId ?? "";
+        return inst + "|noid:" + oid + "|q:" + q;
+    }
+
+    /// <summary>First occurrence of <paramref name="dedupKey"/> returns true (process). Repeats return false (skip) and bump skip counter.</summary>
+    private bool TryMarkFirstPermanentExecutionProcessing(string dedupKey, out long skippedCount)
     {
         skippedCount = 0;
-        var inst = string.IsNullOrEmpty(instrument) ? "_" : instrument.Trim();
-        var execPart = string.IsNullOrWhiteSpace(executionId) ? "noid" : executionId.Trim();
-        var key = inst + "|" + execPart;
-        lock (_callbackDedupLock)
-        {
-            if (_executionCallbackDedup50ms.TryGetValue(key, out var ent))
-            {
-                if (ent.LastFillQty == fillQty &&
-                    string.Equals(ent.LastOrderState, orderState, StringComparison.Ordinal) &&
-                    (utcNow - ent.LastUtc).TotalMilliseconds < 50.0)
-                {
-                    ent.TotalSkips++;
-                    skippedCount = ent.TotalSkips;
-                    return true;
-                }
-                ent.LastFillQty = fillQty;
-                ent.LastOrderState = orderState;
-                ent.LastUtc = utcNow;
-                ent.TotalSkips = 0;
-                return false;
-            }
-            _executionCallbackDedup50ms[key] = new ExecutionCallbackDedupEntry
-            {
-                LastFillQty = fillQty,
-                LastOrderState = orderState,
-                LastUtc = utcNow,
-                TotalSkips = 0
-            };
-            return false;
-        }
+        if (_permanentExecutionProcessed.TryAdd(dedupKey, 0))
+            return true;
+        skippedCount = _permanentExecutionDedupSkipCount.AddOrUpdate(dedupKey, 1L, static (_, v) => v + 1);
+        return false;
     }
 }
 

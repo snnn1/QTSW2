@@ -33,16 +33,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
     private readonly ExecutionTraceWriter? _executionTrace;
 
     private readonly object _callbackDedupLock = new();
-    private readonly Dictionary<string, ExecutionCallbackDedupEntry> _executionCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _permanentExecutionProcessed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _permanentExecutionDedupSkipCount = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, OrderCallbackDedupEntry> _orderCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
-
-    private sealed class ExecutionCallbackDedupEntry
-    {
-        public int LastFillQty;
-        public string LastOrderState = "";
-        public DateTimeOffset LastUtc;
-        public long TotalSkips;
-    }
 
     private sealed class OrderCallbackDedupEntry
     {

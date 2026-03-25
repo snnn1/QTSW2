@@ -38,19 +38,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private readonly ExecutionJournal _executionJournal;
     private readonly ExecutionTraceWriter? _executionTrace;
 
-    /// <summary>50ms duplicate suppression for identical NT execution callbacks (instrument + execution_id).</summary>
-    private readonly object _callbackDedupLock = new();
-    private readonly Dictionary<string, ExecutionCallbackDedupEntry> _executionCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>50ms duplicate suppression for identical NT order updates (instrument + order_id + order_state).</summary>
+    private readonly object _callbackDedupLock = new();
+    /// <summary>Permanent dedup: first-seen (instrument + execution_id + fill_qty) per process; allows distinct partials (different ids or qty).</summary>
+    private readonly ConcurrentDictionary<string, byte> _permanentExecutionProcessed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, long> _permanentExecutionDedupSkipCount = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, OrderCallbackDedupEntry> _orderCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
-
-    private sealed class ExecutionCallbackDedupEntry
-    {
-        public int LastFillQty;
-        public string LastOrderState = "";
-        public DateTimeOffset LastUtc;
-        public long TotalSkips;
-    }
 
     private sealed class OrderCallbackDedupEntry
     {
