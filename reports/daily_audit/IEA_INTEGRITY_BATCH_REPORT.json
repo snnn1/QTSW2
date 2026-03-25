@@ -1,0 +1,378 @@
+{
+  "date_range": {
+    "end": "2026-03-24",
+    "start": "2026-03-13"
+  },
+  "excluded_non_full_days": [],
+  "executive_summary": {
+    "average_reconciliation_avg_efficiency_full_days_non_null": 0.0,
+    "days_iea_integrity_status_critical": 4,
+    "full_days_in_range": 12,
+    "full_days_with_non_null_avg_efficiency": 4,
+    "full_days_with_populated_iea_integrity": 12,
+    "total_cross_iea_duplicate_events": 2,
+    "total_iea_resolution_suspect_count": 3,
+    "total_lifecycle_wrong_adapter_count": 9
+  },
+  "full_days": [
+    {
+      "audit_date": "2026-03-13",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "OK"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-14",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "OK"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-15",
+      "confidence": "HIGH",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "OK"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-16",
+      "confidence": "HIGH",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "OK"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-17",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 1,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 1,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "WARNING"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-18",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "OK"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-19",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 1,
+          "iea_resolution_suspect_count": 1,
+          "lifecycle_wrong_adapter_count": 2,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "WARNING"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-20",
+      "confidence": "HIGH",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 2,
+          "reconciliation_efficiency": {
+            "avg_efficiency": null
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "WARNING"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-21",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": 0.0
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "CRITICAL"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-22",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 0,
+          "reconciliation_efficiency": {
+            "avg_efficiency": 0.0
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "CRITICAL"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-23",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 0,
+          "lifecycle_wrong_adapter_count": 1,
+          "reconciliation_efficiency": {
+            "avg_efficiency": 0.0
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "CRITICAL"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    },
+    {
+      "audit_date": "2026-03-24",
+      "confidence": "MEDIUM",
+      "iea_integrity": {
+        "metrics": {
+          "cross_iea_duplicate_events": 0,
+          "iea_resolution_suspect_count": 2,
+          "lifecycle_wrong_adapter_count": 3,
+          "reconciliation_efficiency": {
+            "avg_efficiency": 0.0
+          },
+          "registry_timing_gap": {
+            "avg_delay_ms": null,
+            "count": 0,
+            "max_delay_ms": null
+          }
+        },
+        "status": "CRITICAL"
+      },
+      "meta": {
+        "audit_mode": "FULL",
+        "engine_full": true
+      },
+      "overall_status": "CRITICAL",
+      "trade_readiness": {
+        "decision": "NO_GO"
+      }
+    }
+  ],
+  "key_observations": [
+    "Resolution suspect signals clustered on 2 days.",
+    "Lifecycle wrong-adapter signals appeared on 5 days.",
+    "Reconciliation efficiency was zero or near-zero (\u2264 0.05, non-null) on 4 days.",
+    "Reconciliation efficiency avg_efficiency was null on 8 FULL day(s).",
+    "Cross-IEA duplication appeared on 2 days.",
+    "iea_integrity.status was CRITICAL on 4 day(s): 2026-03-21, 2026-03-22, 2026-03-23, 2026-03-24."
+  ],
+  "null_counts_full_day_columns": {
+    "confidence": 0,
+    "cross_iea_duplicate_events": 0,
+    "iea_resolution_suspect_count": 0,
+    "iea_status": 0,
+    "lifecycle_wrong_adapter_count": 0,
+    "overall_status": 0,
+    "reconciliation_avg_efficiency": 8,
+    "registry_timing_gap_avg_delay_ms": 12,
+    "registry_timing_gap_count": 0,
+    "registry_timing_gap_max_delay_ms": 12,
+    "trade_readiness_decision": 0
+  },
+  "schema": "iea_integrity_batch_report_v1",
+  "warnings": []
+}

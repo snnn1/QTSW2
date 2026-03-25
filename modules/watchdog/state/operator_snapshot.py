@@ -13,6 +13,7 @@ This means MES 03-26 and MES 06-26 collapse to MES. Risk: unmatched on one contr
 could be incorrectly cleared or ownership marked when the other contract resolves.
 Long-term: move to full contract or include expiry dimension. Acceptable for v1.
 """
+import re
 from typing import Any, Dict, List, Optional, Set
 from datetime import datetime
 
@@ -59,6 +60,33 @@ def _instrument_root(instrument: str) -> str:
     return str(instrument).strip().split()[0].upper()
 
 
+# Execution root -> timetable/canonical root (journals use MYM; streams/timetable use YM / YM1).
+# Do not map MES↔ES or MNQ↔NQ — different contracts; only true aliases belong here.
+_MICRO_TO_CANONICAL_ROOT = {
+    "MYM": "YM",
+}
+
+
+def _operator_instrument_bucket(instrument: str) -> str:
+    """One bucket per product so YM1 + MYM journal + YM events merge (fixes false zero exposure / UNKNOWN)."""
+    r = _instrument_root(instrument)
+    # Strip stream disambiguator: YM1, NQ2, ES1 -> YM, NQ, ES (matches timetable stream_id pattern).
+    m = re.match(r"^([A-Z]{1,6})(\d+)$", r)
+    if m:
+        r = m.group(1)
+    return _MICRO_TO_CANONICAL_ROOT.get(r, r)
+
+
+def _unresolved_affects_instrument(unresolved: Set[str], instrument: str) -> bool:
+    if not unresolved:
+        return False
+    b = _operator_instrument_bucket(instrument)
+    for u in unresolved:
+        if _operator_instrument_bucket(u) == b:
+            return True
+    return False
+
+
 def _collect_instruments(events: List[Dict], state_manager: Any) -> Set[str]:
     """Collect all instruments from state_manager (journals) first, then events."""
     instruments: Set[str] = set()
@@ -66,18 +94,18 @@ def _collect_instruments(events: List[Dict], state_manager: Any) -> Set[str]:
     for exp in getattr(state_manager, "_intent_exposures", {}).values():
         inst = getattr(exp, "instrument", None)
         if inst:
-            instruments.add(_instrument_root(inst))
+            instruments.add(_operator_instrument_bucket(inst))
     for info in getattr(state_manager, "_stream_states", {}).values():
         inst = getattr(info, "execution_instrument", None) or getattr(info, "instrument", None)
         if inst:
-            instruments.add(_instrument_root(inst))
+            instruments.add(_operator_instrument_bucket(inst))
     # SECONDARY: events (for instruments not yet in state)
     for ev in events:
         inst = ev.get("instrument") or (ev.get("data") or {}).get("instrument")
         exec_inst = ev.get("execution_instrument") or (ev.get("data") or {}).get("execution_instrument")
         for x in (inst, exec_inst):
             if x:
-                instruments.add(_instrument_root(x))
+                instruments.add(_operator_instrument_bucket(x))
     return instruments
 
 
@@ -91,13 +119,14 @@ def _event_affects_instrument(ev: Dict, instrument: str, state_manager: Any = No
     data = ev.get("data") or {}
     inst = ev.get("instrument") or data.get("instrument")
     exec_inst = ev.get("execution_instrument") or data.get("execution_instrument")
+    bucket = _operator_instrument_bucket(instrument)
     for x in (inst, exec_inst):
-        if x and _instrument_root(x) == instrument:
+        if x and _operator_instrument_bucket(x) == bucket:
             return True
     intent_id = data.get("intent_id") or ev.get("intent_id")
     if intent_id and state_manager:
         exp = getattr(state_manager, "_intent_exposures", {}).get(intent_id)
-        if exp and _instrument_root(getattr(exp, "instrument", "")) == instrument:
+        if exp and _operator_instrument_bucket(getattr(exp, "instrument", "")) == bucket:
             return True
     return False
 
@@ -122,7 +151,7 @@ def _journal_exposure_for_instrument(state_manager: Any, instrument: str) -> int
     for exp in getattr(state_manager, "_intent_exposures", {}).values():
         if getattr(exp, "state", "") != "ACTIVE":
             continue
-        if _instrument_root(getattr(exp, "instrument", "")) != instrument:
+        if _operator_instrument_bucket(getattr(exp, "instrument", "")) != _operator_instrument_bucket(instrument):
             continue
         entry = getattr(exp, "entry_filled_qty", 0) or 0
         exit_qty = getattr(exp, "exit_filled_qty", 0) or 0
@@ -162,7 +191,7 @@ def _intent_has_protective_submitted(state_manager: Any, instrument: str) -> boo
     for intent_id, exp in getattr(state_manager, "_intent_exposures", {}).items():
         if getattr(exp, "state", "") != "ACTIVE":
             continue
-        if _instrument_root(getattr(exp, "instrument", "")) != instrument:
+        if _operator_instrument_bucket(getattr(exp, "instrument", "")) != _operator_instrument_bucket(instrument):
             continue
         if getattr(state_manager, "_protective_events", {}).get(intent_id):
             return True
@@ -227,7 +256,7 @@ def _derive_confidence(
     unresolved = getattr(state_manager, "_unresolved_unmatched_instruments", set())
 
     # HIGH: explicit critical events or persistent watchdog state
-    if instrument in unresolved:
+    if _unresolved_affects_instrument(unresolved, instrument):
         return "HIGH"
     if "RECOVERY_POSITION_UNMATCHED" in event_types:
         return "HIGH"
@@ -279,10 +308,15 @@ def _derive_snapshot_for_instrument(
     qty = _journal_exposure_for_instrument(state_manager, instrument)
     exposure = {"quantity": qty, "source": "journal"}
 
-    # C. ownership — STRICT: only ADOPTION_SUCCESS/RECONCILIATION_RECOVERY_ADOPTION_SUCCESS → PROVEN
-    if "RECOVERY_POSITION_UNMATCHED" in event_types or instrument in getattr(state_manager, "_unresolved_unmatched_instruments", set()):
+    # C. ownership — UNMATCHED → UNKNOWN; adoption → PROVEN; active journal exposure → PROVEN (robot-tracked).
+    #    Previously only adoption events set PROVEN, so normal YM1/MYM fills stayed UNKNOWN and hit
+    #    CRITICAL via _derive_status(ownership UNKNOWN + qty > 0).
+    unresolved = getattr(state_manager, "_unresolved_unmatched_instruments", set())
+    if "RECOVERY_POSITION_UNMATCHED" in event_types or _unresolved_affects_instrument(unresolved, instrument):
         ownership = "UNKNOWN"
     elif "ADOPTION_SUCCESS" in event_types or "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS" in event_types:
+        ownership = "PROVEN"
+    elif qty > 0:
         ownership = "PROVEN"
     else:
         ownership = "UNKNOWN"
@@ -301,8 +335,7 @@ def _derive_snapshot_for_instrument(
             break
 
     # F. action_required — PERSISTENT from state_manager first, then events
-    unresolved = getattr(state_manager, "_unresolved_unmatched_instruments", set())
-    if instrument in unresolved:
+    if _unresolved_affects_instrument(unresolved, instrument):
         action_required = "FLATTEN"
     elif "FORCED_FLATTEN_FAILED" in event_types or "FORCED_FLATTEN_EXPOSURE_REMAINING" in event_types or "MANUAL_FLATTEN_REQUIRED" in event_types:
         action_required = "FLATTEN"

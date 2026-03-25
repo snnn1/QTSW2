@@ -1,0 +1,5583 @@
+{
+  "audit_date": "2026-03-19",
+  "confidence": "MEDIUM",
+  "confidence_enforced_status": "CRITICAL",
+  "domains": {
+    "connectivity": {
+      "metrics": {
+        "disconnects": 4,
+        "max_downtime_s": 0.0
+      },
+      "status": "UNSTABLE",
+      "timeline_refs": []
+    },
+    "execution": {
+      "metrics": {
+        "adoption_scan_max_ms": 0,
+        "max_queue_wait_ms": 0,
+        "timeouts_or_overflow": 0
+      },
+      "status": "HEALTHY",
+      "timeline_refs": []
+    },
+    "performance": {
+      "metrics": {
+        "cpu_profile_samples": 0,
+        "dominant_subsystem": null,
+        "parallelism_normalized_max": null,
+        "parallelism_raw_max": null,
+        "subsystem_pct_mean": null
+      },
+      "status": "NORMAL",
+      "timeline_refs": []
+    },
+    "protection": {
+      "metrics": {
+        "protective_failed": 42,
+        "protective_ok": 0
+      },
+      "status": "ISSUES DETECTED",
+      "timeline_refs": []
+    },
+    "reconciliation": {
+      "metrics": {
+        "converged": 0,
+        "convergence_rate_pct": 0.0,
+        "oscillation_events": 0,
+        "passes": 1230,
+        "stuck_events": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    },
+    "safety": {
+      "critical_findings": [],
+      "metrics": {
+        "fail_closed_count": 161,
+        "gate_engaged_count": 0,
+        "registry_divergence_count": 24,
+        "total_mismatch_signals": 342
+      },
+      "status": "CRITICAL",
+      "timeline_refs": []
+    },
+    "supervisory": {
+      "metrics": {
+        "escalated": 0,
+        "invalid_transitions": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    }
+  },
+  "drift": {
+    "cpu_trend": "STABLE",
+    "mismatch_rate_trend": "STABLE",
+    "notes": [
+      "baseline_history_insufficient_or_not_implemented"
+    ],
+    "queue_wait_trend": "STABLE",
+    "recovery_time_trend": "STABLE",
+    "window_days": 14
+  },
+  "drift_risk": "NONE",
+  "engine_load_analysis": {
+    "average_events_per_second": 3.1317,
+    "bucket_seconds": 5.0,
+    "classification_notes": [
+      "loop_detected_and_high_eps_force_critical",
+      "reconciliation_storm_duration_gt_15.0s_force_critical"
+    ],
+    "classification_thresholds": {
+      "peak_eps_critical": 90.0,
+      "peak_eps_high": 45.0,
+      "peak_eps_low": 8.0,
+      "peak_eps_moderate": 20.0,
+      "reconciliation_ratio_upgrade": 0.5,
+      "reconciliation_storm_duration_critical_seconds": 15.0
+    },
+    "dense_windows_note": "Non-empty buckets; top by peak_subwindow_eps then coarse EPS (see engine_load_max_dense_windows_export)",
+    "load_classification": "CRITICAL",
+    "loop_signatures": [
+      {
+        "loop_classification": "RECONCILIATION_LOOP",
+        "max_repeats_in_window": 104,
+        "peak_window_end_audit_tz": "2026-03-19 17:45:00 CDT",
+        "peak_window_end_utc": "2026-03-19T22:45:00Z",
+        "peak_window_start_audit_tz": "2026-03-19 17:44:00 CDT",
+        "peak_window_start_utc": "2026-03-19T22:44:00Z",
+        "subtype": "MISMATCH_FAMILY",
+        "window_sec": 60.0
+      }
+    ],
+    "loop_thresholds": {
+      "min_repeats_adoption": 8,
+      "min_repeats_gate": 20,
+      "min_repeats_mismatch": 15,
+      "window_sec": 60.0
+    },
+    "nonzero_bucket_count": 5525,
+    "peak_events_per_second": 6584.4,
+    "peak_subwindow_eps": 11322.0,
+    "reconciliation_event_ratio": 0.063476,
+    "reconciliation_events_total": 17175,
+    "storm_thresholds": {
+      "events_per_second_gt": 35.0,
+      "min_consecutive_windows": 3,
+      "reconciliation_storm_duration_critical_seconds": 15.0,
+      "total_time_escalate_seconds": 120.0
+    },
+    "storms": [
+      {
+        "adoption_event_count": 0,
+        "avg_eps": 921.1333,
+        "consecutive_windows": 3,
+        "duration_seconds": 15.0,
+        "end_time_audit_tz": "2026-03-19 08:08:55 CDT",
+        "end_time_utc": "2026-03-19T13:08:55Z",
+        "events_in_storm": 13817,
+        "loop_counts_inside_storm": {
+          "adoption_loop_count": 0,
+          "reconciliation_loop_count": 0
+        },
+        "loop_events_adoption_non_convergence": 0,
+        "loop_events_gate_result": 0,
+        "loop_events_reconciliation_mismatch": 0,
+        "max_eps": 1328.8,
+        "overlap_connection_lost": false,
+        "overlap_engine_tick_stall": false,
+        "peak_reconciliation_ratio": 0.000507,
+        "reconciliation_event_count": 7,
+        "start_time_audit_tz": "2026-03-19 08:08:40 CDT",
+        "start_time_utc": "2026-03-19T13:08:40Z",
+        "storm_classification": "RECONCILIATION_STORM",
+        "storm_type": "RECONCILIATION"
+      },
+      {
+        "adoption_event_count": 2,
+        "avg_eps": 668.05,
+        "consecutive_windows": 4,
+        "duration_seconds": 20.0,
+        "end_time_audit_tz": "2026-03-19 09:10:20 CDT",
+        "end_time_utc": "2026-03-19T14:10:20Z",
+        "events_in_storm": 13361,
+        "loop_counts_inside_storm": {
+          "adoption_loop_count": 0,
+          "reconciliation_loop_count": 14
+        },
+        "loop_events_adoption_non_convergence": 0,
+        "loop_events_gate_result": 0,
+        "loop_events_reconciliation_mismatch": 14,
+        "max_eps": 1759.6,
+        "overlap_connection_lost": false,
+        "overlap_engine_tick_stall": false,
+        "peak_reconciliation_ratio": 0.002769,
+        "reconciliation_event_count": 37,
+        "start_time_audit_tz": "2026-03-19 09:10:00 CDT",
+        "start_time_utc": "2026-03-19T14:10:00Z",
+        "storm_classification": "RECONCILIATION_STORM",
+        "storm_type": "RECONCILIATION"
+      },
+      {
+        "adoption_event_count": 0,
+        "avg_eps": 348.1333,
+        "consecutive_windows": 3,
+        "duration_seconds": 15.0,
+        "end_time_audit_tz": "2026-03-19 18:08:15 CDT",
+        "end_time_utc": "2026-03-19T23:08:15Z",
+        "events_in_storm": 5222,
+        "loop_counts_inside_storm": {
+          "adoption_loop_count": 0,
+          "reconciliation_loop_count": 15
+        },
+        "loop_events_adoption_non_convergence": 0,
+        "loop_events_gate_result": 0,
+        "loop_events_reconciliation_mismatch": 15,
+        "max_eps": 705.8,
+        "overlap_connection_lost": false,
+        "overlap_engine_tick_stall": false,
+        "peak_reconciliation_ratio": 0.010341,
+        "reconciliation_event_count": 54,
+        "start_time_audit_tz": "2026-03-19 18:08:00 CDT",
+        "start_time_utc": "2026-03-19T23:08:00Z",
+        "storm_classification": "RECONCILIATION_STORM",
+        "storm_type": "RECONCILIATION"
+      }
+    ],
+    "subwindow_seconds": 1.0,
+    "top_dense_buckets": [
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:40:05Z",
+        "events_per_second": 5060.6,
+        "peak_subwindow_eps": 11322.0,
+        "reconciliation_events": 16,
+        "start_time_utc": "2026-03-19T22:40:00Z",
+        "total_events": 25303,
+        "window_index": 12720
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:40:10Z",
+        "events_per_second": 6448.8,
+        "peak_subwindow_eps": 10656.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T22:40:05Z",
+        "total_events": 32244,
+        "window_index": 12721
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:42:10Z",
+        "events_per_second": 6584.4,
+        "peak_subwindow_eps": 8297.0,
+        "reconciliation_events": 10,
+        "start_time_utc": "2026-03-19T22:42:05Z",
+        "total_events": 32922,
+        "window_index": 12745
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:42:05Z",
+        "events_per_second": 1541.8,
+        "peak_subwindow_eps": 6995.0,
+        "reconciliation_events": 9,
+        "start_time_utc": "2026-03-19T22:42:00Z",
+        "total_events": 7709,
+        "window_index": 12744
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:41:40Z",
+        "events_per_second": 1693.0,
+        "peak_subwindow_eps": 5552.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T22:41:35Z",
+        "total_events": 8465,
+        "window_index": 12739
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:41:55Z",
+        "events_per_second": 1686.2,
+        "peak_subwindow_eps": 5041.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T22:41:50Z",
+        "total_events": 8431,
+        "window_index": 12742
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:14:35Z",
+        "events_per_second": 1633.2,
+        "peak_subwindow_eps": 4819.0,
+        "reconciliation_events": 5,
+        "start_time_utc": "2026-03-19T11:14:30Z",
+        "total_events": 8166,
+        "window_index": 4494
+      },
+      {
+        "adoption_events": 2,
+        "end_time_utc": "2026-03-19T14:10:10Z",
+        "events_per_second": 1759.6,
+        "peak_subwindow_eps": 4156.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-19T14:10:05Z",
+        "total_events": 8798,
+        "window_index": 6601
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:08:55Z",
+        "events_per_second": 1328.8,
+        "peak_subwindow_eps": 3181.0,
+        "reconciliation_events": 4,
+        "start_time_utc": "2026-03-19T13:08:50Z",
+        "total_events": 6644,
+        "window_index": 5866
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:55:25Z",
+        "events_per_second": 876.2,
+        "peak_subwindow_eps": 3159.0,
+        "reconciliation_events": 7,
+        "start_time_utc": "2026-03-19T23:55:20Z",
+        "total_events": 4381,
+        "window_index": 13624
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:07:35Z",
+        "events_per_second": 578.8,
+        "peak_subwindow_eps": 2886.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-20T02:07:30Z",
+        "total_events": 2894,
+        "window_index": 15210
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:08:50Z",
+        "events_per_second": 900.2,
+        "peak_subwindow_eps": 2356.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T13:08:45Z",
+        "total_events": 4501,
+        "window_index": 5865
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:14:30Z",
+        "events_per_second": 790.0,
+        "peak_subwindow_eps": 2269.0,
+        "reconciliation_events": 2,
+        "start_time_utc": "2026-03-19T11:14:25Z",
+        "total_events": 3950,
+        "window_index": 4493
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:47:00Z",
+        "events_per_second": 807.0,
+        "peak_subwindow_eps": 1992.0,
+        "reconciliation_events": 17,
+        "start_time_utc": "2026-03-19T22:46:55Z",
+        "total_events": 4035,
+        "window_index": 12803
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:08:45Z",
+        "events_per_second": 534.4,
+        "peak_subwindow_eps": 1952.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-19T13:08:40Z",
+        "total_events": 2672,
+        "window_index": 5864
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:10:05Z",
+        "events_per_second": 292.4,
+        "peak_subwindow_eps": 1261.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T14:10:00Z",
+        "total_events": 1462,
+        "window_index": 6600
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:12:05Z",
+        "events_per_second": 642.8,
+        "peak_subwindow_eps": 1227.0,
+        "reconciliation_events": 7,
+        "start_time_utc": "2026-03-19T23:12:00Z",
+        "total_events": 3214,
+        "window_index": 13104
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T01:10:10Z",
+        "events_per_second": 535.6,
+        "peak_subwindow_eps": 1156.0,
+        "reconciliation_events": 4,
+        "start_time_utc": "2026-03-20T01:10:05Z",
+        "total_events": 2678,
+        "window_index": 14521
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:23:40Z",
+        "events_per_second": 945.8,
+        "peak_subwindow_eps": 1145.0,
+        "reconciliation_events": 36,
+        "start_time_utc": "2026-03-19T23:23:35Z",
+        "total_events": 4729,
+        "window_index": 13243
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:08:10Z",
+        "events_per_second": 705.8,
+        "peak_subwindow_eps": 1138.0,
+        "reconciliation_events": 8,
+        "start_time_utc": "2026-03-19T23:08:05Z",
+        "total_events": 3529,
+        "window_index": 13057
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:10:15Z",
+        "events_per_second": 280.2,
+        "peak_subwindow_eps": 1004.0,
+        "reconciliation_events": 2,
+        "start_time_utc": "2026-03-19T14:10:10Z",
+        "total_events": 1401,
+        "window_index": 6602
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:08:15Z",
+        "events_per_second": 296.2,
+        "peak_subwindow_eps": 999.0,
+        "reconciliation_events": 39,
+        "start_time_utc": "2026-03-19T23:08:10Z",
+        "total_events": 1481,
+        "window_index": 13058
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:12:10Z",
+        "events_per_second": 348.0,
+        "peak_subwindow_eps": 974.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T23:12:05Z",
+        "total_events": 1740,
+        "window_index": 13105
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:10:20Z",
+        "events_per_second": 340.0,
+        "peak_subwindow_eps": 966.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T14:10:15Z",
+        "total_events": 1700,
+        "window_index": 6603
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:00:05Z",
+        "events_per_second": 202.0,
+        "peak_subwindow_eps": 928.0,
+        "reconciliation_events": 23,
+        "start_time_utc": "2026-03-19T14:00:00Z",
+        "total_events": 1010,
+        "window_index": 6480
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T01:10:15Z",
+        "events_per_second": 217.2,
+        "peak_subwindow_eps": 769.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-20T01:10:10Z",
+        "total_events": 1086,
+        "window_index": 14522
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:46:55Z",
+        "events_per_second": 157.0,
+        "peak_subwindow_eps": 680.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-19T22:46:50Z",
+        "total_events": 785,
+        "window_index": 12802
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T15:30:05Z",
+        "events_per_second": 51.0,
+        "peak_subwindow_eps": 219.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T15:30:00Z",
+        "total_events": 255,
+        "window_index": 7560
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:07:30Z",
+        "events_per_second": 43.4,
+        "peak_subwindow_eps": 216.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-20T02:07:25Z",
+        "total_events": 217,
+        "window_index": 15209
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:23:35Z",
+        "events_per_second": 76.4,
+        "peak_subwindow_eps": 164.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-19T23:23:30Z",
+        "total_events": 382,
+        "window_index": 13242
+      },
+      {
+        "adoption_events": 2,
+        "end_time_utc": "2026-03-19T14:30:05Z",
+        "events_per_second": 42.2,
+        "peak_subwindow_eps": 142.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T14:30:00Z",
+        "total_events": 211,
+        "window_index": 6840
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:48:35Z",
+        "events_per_second": 35.0,
+        "peak_subwindow_eps": 142.0,
+        "reconciliation_events": 3,
+        "start_time_utc": "2026-03-19T23:48:30Z",
+        "total_events": 175,
+        "window_index": 13542
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:07:20Z",
+        "events_per_second": 23.6,
+        "peak_subwindow_eps": 118.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-20T02:07:15Z",
+        "total_events": 118,
+        "window_index": 15207
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:10:05Z",
+        "events_per_second": 25.6,
+        "peak_subwindow_eps": 103.0,
+        "reconciliation_events": 32,
+        "start_time_utc": "2026-03-19T23:10:00Z",
+        "total_events": 128,
+        "window_index": 13080
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:11:05Z",
+        "events_per_second": 33.8,
+        "peak_subwindow_eps": 101.0,
+        "reconciliation_events": 8,
+        "start_time_utc": "2026-03-19T14:11:00Z",
+        "total_events": 169,
+        "window_index": 6612
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:52:40Z",
+        "events_per_second": 31.6,
+        "peak_subwindow_eps": 100.0,
+        "reconciliation_events": 10,
+        "start_time_utc": "2026-03-19T23:52:35Z",
+        "total_events": 158,
+        "window_index": 13591
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:08:05Z",
+        "events_per_second": 42.4,
+        "peak_subwindow_eps": 97.0,
+        "reconciliation_events": 7,
+        "start_time_utc": "2026-03-19T23:08:00Z",
+        "total_events": 212,
+        "window_index": 13056
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T01:10:05Z",
+        "events_per_second": 22.2,
+        "peak_subwindow_eps": 96.0,
+        "reconciliation_events": 7,
+        "start_time_utc": "2026-03-20T01:10:00Z",
+        "total_events": 111,
+        "window_index": 14520
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:08:00Z",
+        "events_per_second": 37.4,
+        "peak_subwindow_eps": 95.0,
+        "reconciliation_events": 2,
+        "start_time_utc": "2026-03-20T02:07:55Z",
+        "total_events": 187,
+        "window_index": 15215
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:16:05Z",
+        "events_per_second": 31.4,
+        "peak_subwindow_eps": 95.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T14:16:00Z",
+        "total_events": 157,
+        "window_index": 6672
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:15:05Z",
+        "events_per_second": 21.6,
+        "peak_subwindow_eps": 93.0,
+        "reconciliation_events": 9,
+        "start_time_utc": "2026-03-19T14:15:00Z",
+        "total_events": 108,
+        "window_index": 6660
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:29:05Z",
+        "events_per_second": 20.6,
+        "peak_subwindow_eps": 93.0,
+        "reconciliation_events": 25,
+        "start_time_utc": "2026-03-20T00:29:00Z",
+        "total_events": 103,
+        "window_index": 14028
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:41:05Z",
+        "events_per_second": 19.0,
+        "peak_subwindow_eps": 88.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T22:41:00Z",
+        "total_events": 95,
+        "window_index": 12732
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:13:05Z",
+        "events_per_second": 32.6,
+        "peak_subwindow_eps": 86.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-19T23:13:00Z",
+        "total_events": 163,
+        "window_index": 13116
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:45:05Z",
+        "events_per_second": 29.4,
+        "peak_subwindow_eps": 85.0,
+        "reconciliation_events": 25,
+        "start_time_utc": "2026-03-19T11:45:00Z",
+        "total_events": 147,
+        "window_index": 4860
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:26:05Z",
+        "events_per_second": 24.2,
+        "peak_subwindow_eps": 82.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-19T13:26:00Z",
+        "total_events": 121,
+        "window_index": 6072
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:09:05Z",
+        "events_per_second": 32.4,
+        "peak_subwindow_eps": 81.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T23:09:00Z",
+        "total_events": 162,
+        "window_index": 13068
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:54:50Z",
+        "events_per_second": 35.0,
+        "peak_subwindow_eps": 75.0,
+        "reconciliation_events": 10,
+        "start_time_utc": "2026-03-19T23:54:45Z",
+        "total_events": 175,
+        "window_index": 13617
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:02:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 72.0,
+        "reconciliation_events": 23,
+        "start_time_utc": "2026-03-20T00:02:00Z",
+        "total_events": 97,
+        "window_index": 13704
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:22:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 72.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-20T00:22:00Z",
+        "total_events": 97,
+        "window_index": 13944
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:57:05Z",
+        "events_per_second": 16.4,
+        "peak_subwindow_eps": 72.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T23:57:00Z",
+        "total_events": 82,
+        "window_index": 13644
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:29:05Z",
+        "events_per_second": 20.2,
+        "peak_subwindow_eps": 71.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:29:00Z",
+        "total_events": 101,
+        "window_index": 6108
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:24:05Z",
+        "events_per_second": 18.2,
+        "peak_subwindow_eps": 71.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-20T00:24:00Z",
+        "total_events": 91,
+        "window_index": 13968
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:14:05Z",
+        "events_per_second": 21.6,
+        "peak_subwindow_eps": 70.0,
+        "reconciliation_events": 16,
+        "start_time_utc": "2026-03-19T13:14:00Z",
+        "total_events": 108,
+        "window_index": 5928
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:47:05Z",
+        "events_per_second": 31.6,
+        "peak_subwindow_eps": 69.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-19T22:47:00Z",
+        "total_events": 158,
+        "window_index": 12804
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:24:05Z",
+        "events_per_second": 30.2,
+        "peak_subwindow_eps": 69.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T23:24:00Z",
+        "total_events": 151,
+        "window_index": 13248
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:44:05Z",
+        "events_per_second": 25.2,
+        "peak_subwindow_eps": 69.0,
+        "reconciliation_events": 27,
+        "start_time_utc": "2026-03-19T22:44:00Z",
+        "total_events": 126,
+        "window_index": 12768
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:00:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 69.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-20T00:00:00Z",
+        "total_events": 92,
+        "window_index": 13680
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:00:05Z",
+        "events_per_second": 17.0,
+        "peak_subwindow_eps": 69.0,
+        "reconciliation_events": 30,
+        "start_time_utc": "2026-03-19T23:00:00Z",
+        "total_events": 85,
+        "window_index": 12960
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:06:05Z",
+        "events_per_second": 22.2,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 25,
+        "start_time_utc": "2026-03-20T00:06:00Z",
+        "total_events": 111,
+        "window_index": 13752
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:26:05Z",
+        "events_per_second": 21.8,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 25,
+        "start_time_utc": "2026-03-20T00:26:00Z",
+        "total_events": 109,
+        "window_index": 13992
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:34:05Z",
+        "events_per_second": 20.8,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:34:00Z",
+        "total_events": 104,
+        "window_index": 6168
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:45:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:45:00Z",
+        "total_events": 97,
+        "window_index": 6300
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:05:05Z",
+        "events_per_second": 18.6,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-20T00:05:00Z",
+        "total_events": 93,
+        "window_index": 13740
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:07:05Z",
+        "events_per_second": 17.2,
+        "peak_subwindow_eps": 68.0,
+        "reconciliation_events": 21,
+        "start_time_utc": "2026-03-20T00:07:00Z",
+        "total_events": 86,
+        "window_index": 13764
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:31:05Z",
+        "events_per_second": 21.0,
+        "peak_subwindow_eps": 67.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:31:00Z",
+        "total_events": 105,
+        "window_index": 6132
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:40:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 67.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:40:00Z",
+        "total_events": 97,
+        "window_index": 6240
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:48:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 67.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T13:48:00Z",
+        "total_events": 97,
+        "window_index": 6336
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:52:05Z",
+        "events_per_second": 20.2,
+        "peak_subwindow_eps": 66.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:52:00Z",
+        "total_events": 101,
+        "window_index": 6384
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:32:05Z",
+        "events_per_second": 20.0,
+        "peak_subwindow_eps": 66.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T13:32:00Z",
+        "total_events": 100,
+        "window_index": 6144
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:18:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 66.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:18:00Z",
+        "total_events": 97,
+        "window_index": 5976
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:56:05Z",
+        "events_per_second": 19.2,
+        "peak_subwindow_eps": 66.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:56:00Z",
+        "total_events": 96,
+        "window_index": 6432
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:55:05Z",
+        "events_per_second": 17.2,
+        "peak_subwindow_eps": 66.0,
+        "reconciliation_events": 26,
+        "start_time_utc": "2026-03-19T23:55:00Z",
+        "total_events": 86,
+        "window_index": 13620
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:21:05Z",
+        "events_per_second": 19.4,
+        "peak_subwindow_eps": 65.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:21:00Z",
+        "total_events": 97,
+        "window_index": 6012
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:06:35Z",
+        "events_per_second": 28.0,
+        "peak_subwindow_eps": 64.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-20T02:06:30Z",
+        "total_events": 140,
+        "window_index": 15198
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:20:05Z",
+        "events_per_second": 22.8,
+        "peak_subwindow_eps": 64.0,
+        "reconciliation_events": 16,
+        "start_time_utc": "2026-03-19T13:20:00Z",
+        "total_events": 114,
+        "window_index": 6000
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:27:05Z",
+        "events_per_second": 21.6,
+        "peak_subwindow_eps": 64.0,
+        "reconciliation_events": 17,
+        "start_time_utc": "2026-03-19T13:27:00Z",
+        "total_events": 108,
+        "window_index": 6084
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:01:05Z",
+        "events_per_second": 18.8,
+        "peak_subwindow_eps": 64.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-20T00:01:00Z",
+        "total_events": 94,
+        "window_index": 13692
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:50:05Z",
+        "events_per_second": 16.6,
+        "peak_subwindow_eps": 64.0,
+        "reconciliation_events": 30,
+        "start_time_utc": "2026-03-19T22:50:00Z",
+        "total_events": 83,
+        "window_index": 12840
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:37:05Z",
+        "events_per_second": 21.8,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:37:00Z",
+        "total_events": 109,
+        "window_index": 6204
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:11:05Z",
+        "events_per_second": 20.8,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:11:00Z",
+        "total_events": 104,
+        "window_index": 5892
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:09:05Z",
+        "events_per_second": 20.8,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 24,
+        "start_time_utc": "2026-03-20T00:09:00Z",
+        "total_events": 104,
+        "window_index": 13788
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:23:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:23:00Z",
+        "total_events": 98,
+        "window_index": 6036
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:30:05Z",
+        "events_per_second": 19.2,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:30:00Z",
+        "total_events": 96,
+        "window_index": 6120
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:41:05Z",
+        "events_per_second": 18.8,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:41:00Z",
+        "total_events": 94,
+        "window_index": 6252
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:54:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T13:54:00Z",
+        "total_events": 92,
+        "window_index": 6408
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:58:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T13:58:00Z",
+        "total_events": 92,
+        "window_index": 6456
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:30:05Z",
+        "events_per_second": 17.2,
+        "peak_subwindow_eps": 63.0,
+        "reconciliation_events": 21,
+        "start_time_utc": "2026-03-20T00:30:00Z",
+        "total_events": 86,
+        "window_index": 14040
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:39:05Z",
+        "events_per_second": 20.0,
+        "peak_subwindow_eps": 62.0,
+        "reconciliation_events": 16,
+        "start_time_utc": "2026-03-19T13:39:00Z",
+        "total_events": 100,
+        "window_index": 6228
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:33:05Z",
+        "events_per_second": 19.8,
+        "peak_subwindow_eps": 62.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:33:00Z",
+        "total_events": 99,
+        "window_index": 6156
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:53:05Z",
+        "events_per_second": 18.2,
+        "peak_subwindow_eps": 62.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T13:53:00Z",
+        "total_events": 91,
+        "window_index": 6396
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:28:05Z",
+        "events_per_second": 15.4,
+        "peak_subwindow_eps": 62.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-20T00:28:00Z",
+        "total_events": 77,
+        "window_index": 14016
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T02:07:55Z",
+        "events_per_second": 13.0,
+        "peak_subwindow_eps": 62.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-20T02:07:50Z",
+        "total_events": 65,
+        "window_index": 15214
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:25:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:25:00Z",
+        "total_events": 98,
+        "window_index": 6060
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:36:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:36:00Z",
+        "total_events": 98,
+        "window_index": 6192
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:51:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:51:00Z",
+        "total_events": 92,
+        "window_index": 6372
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:13:05Z",
+        "events_per_second": 18.2,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:13:00Z",
+        "total_events": 91,
+        "window_index": 5916
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:44:05Z",
+        "events_per_second": 18.0,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:44:00Z",
+        "total_events": 90,
+        "window_index": 6288
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:59:05Z",
+        "events_per_second": 16.2,
+        "peak_subwindow_eps": 61.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T23:59:00Z",
+        "total_events": 81,
+        "window_index": 13668
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:59:05Z",
+        "events_per_second": 20.6,
+        "peak_subwindow_eps": 60.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:59:00Z",
+        "total_events": 103,
+        "window_index": 6468
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:16:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 60.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:16:00Z",
+        "total_events": 98,
+        "window_index": 5952
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:35:05Z",
+        "events_per_second": 19.2,
+        "peak_subwindow_eps": 60.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:35:00Z",
+        "total_events": 96,
+        "window_index": 6180
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:33:05Z",
+        "events_per_second": 17.0,
+        "peak_subwindow_eps": 60.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-20T00:33:00Z",
+        "total_events": 85,
+        "window_index": 14076
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:42:05Z",
+        "events_per_second": 20.0,
+        "peak_subwindow_eps": 59.0,
+        "reconciliation_events": 23,
+        "start_time_utc": "2026-03-19T11:42:00Z",
+        "total_events": 100,
+        "window_index": 4824
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:44:05Z",
+        "events_per_second": 15.2,
+        "peak_subwindow_eps": 59.0,
+        "reconciliation_events": 11,
+        "start_time_utc": "2026-03-19T14:44:00Z",
+        "total_events": 76,
+        "window_index": 7008
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:48:30Z",
+        "events_per_second": 32.0,
+        "peak_subwindow_eps": 58.0,
+        "reconciliation_events": 6,
+        "start_time_utc": "2026-03-19T23:48:25Z",
+        "total_events": 160,
+        "window_index": 13541
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T22:43:05Z",
+        "events_per_second": 29.8,
+        "peak_subwindow_eps": 58.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T22:43:00Z",
+        "total_events": 149,
+        "window_index": 12756
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:46:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 58.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:46:00Z",
+        "total_events": 98,
+        "window_index": 6312
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:11:05Z",
+        "events_per_second": 21.2,
+        "peak_subwindow_eps": 57.0,
+        "reconciliation_events": 26,
+        "start_time_utc": "2026-03-20T00:11:00Z",
+        "total_events": 106,
+        "window_index": 13812
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:43:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 57.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-19T11:43:00Z",
+        "total_events": 98,
+        "window_index": 4836
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:49:05Z",
+        "events_per_second": 19.0,
+        "peak_subwindow_eps": 57.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:49:00Z",
+        "total_events": 95,
+        "window_index": 6348
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:28:05Z",
+        "events_per_second": 18.2,
+        "peak_subwindow_eps": 57.0,
+        "reconciliation_events": 11,
+        "start_time_utc": "2026-03-19T13:28:00Z",
+        "total_events": 91,
+        "window_index": 6096
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:19:05Z",
+        "events_per_second": 15.4,
+        "peak_subwindow_eps": 57.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-20T00:19:00Z",
+        "total_events": 77,
+        "window_index": 13908
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:25:05Z",
+        "events_per_second": 28.8,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 34,
+        "start_time_utc": "2026-03-19T23:25:00Z",
+        "total_events": 144,
+        "window_index": 13260
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:10:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 17,
+        "start_time_utc": "2026-03-19T13:10:00Z",
+        "total_events": 98,
+        "window_index": 5880
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:50:05Z",
+        "events_per_second": 19.6,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:50:00Z",
+        "total_events": 98,
+        "window_index": 6360
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:24:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T13:24:00Z",
+        "total_events": 92,
+        "window_index": 6048
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:52:25Z",
+        "events_per_second": 18.0,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 6,
+        "start_time_utc": "2026-03-19T23:52:20Z",
+        "total_events": 90,
+        "window_index": 13588
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:23:05Z",
+        "events_per_second": 14.8,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-20T00:23:00Z",
+        "total_events": 74,
+        "window_index": 13956
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:14:05Z",
+        "events_per_second": 14.0,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 17,
+        "start_time_utc": "2026-03-20T00:14:00Z",
+        "total_events": 70,
+        "window_index": 13848
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:32:05Z",
+        "events_per_second": 12.6,
+        "peak_subwindow_eps": 56.0,
+        "reconciliation_events": 17,
+        "start_time_utc": "2026-03-20T00:32:00Z",
+        "total_events": 63,
+        "window_index": 14064
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:44:05Z",
+        "events_per_second": 24.8,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-19T11:44:00Z",
+        "total_events": 124,
+        "window_index": 4848
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:54:45Z",
+        "events_per_second": 21.2,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 9,
+        "start_time_utc": "2026-03-19T23:54:40Z",
+        "total_events": 106,
+        "window_index": 13616
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:55:05Z",
+        "events_per_second": 19.8,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:55:00Z",
+        "total_events": 99,
+        "window_index": 6420
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:42:05Z",
+        "events_per_second": 18.8,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 11,
+        "start_time_utc": "2026-03-19T13:42:00Z",
+        "total_events": 94,
+        "window_index": 6264
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:19:05Z",
+        "events_per_second": 18.4,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-19T13:19:00Z",
+        "total_events": 92,
+        "window_index": 5988
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:04:05Z",
+        "events_per_second": 18.0,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 21,
+        "start_time_utc": "2026-03-20T00:04:00Z",
+        "total_events": 90,
+        "window_index": 13728
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T15:23:05Z",
+        "events_per_second": 15.8,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T15:23:00Z",
+        "total_events": 79,
+        "window_index": 7476
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:50:05Z",
+        "events_per_second": 12.2,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T23:50:00Z",
+        "total_events": 61,
+        "window_index": 13560
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:52:05Z",
+        "events_per_second": 11.8,
+        "peak_subwindow_eps": 55.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-19T23:52:00Z",
+        "total_events": 59,
+        "window_index": 13584
+      },
+      {
+        "adoption_events": 1,
+        "end_time_utc": "2026-03-19T23:23:45Z",
+        "events_per_second": 26.6,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 5,
+        "start_time_utc": "2026-03-19T23:23:40Z",
+        "total_events": 133,
+        "window_index": 13244
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:17:05Z",
+        "events_per_second": 21.4,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:17:00Z",
+        "total_events": 107,
+        "window_index": 5964
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:49:05Z",
+        "events_per_second": 20.2,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 21,
+        "start_time_utc": "2026-03-19T11:49:00Z",
+        "total_events": 101,
+        "window_index": 4908
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:01:05Z",
+        "events_per_second": 16.0,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 26,
+        "start_time_utc": "2026-03-19T23:01:00Z",
+        "total_events": 80,
+        "window_index": 12972
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T15:28:05Z",
+        "events_per_second": 15.6,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 10,
+        "start_time_utc": "2026-03-19T15:28:00Z",
+        "total_events": 78,
+        "window_index": 7536
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:27:05Z",
+        "events_per_second": 13.0,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 16,
+        "start_time_utc": "2026-03-20T00:27:00Z",
+        "total_events": 65,
+        "window_index": 14004
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:26:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:26:00Z",
+        "total_events": 54,
+        "window_index": 3912
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:31:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:31:00Z",
+        "total_events": 54,
+        "window_index": 3972
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:36:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:36:00Z",
+        "total_events": 54,
+        "window_index": 4032
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:41:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:41:00Z",
+        "total_events": 54,
+        "window_index": 4092
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:46:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:46:00Z",
+        "total_events": 54,
+        "window_index": 4152
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:51:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:51:00Z",
+        "total_events": 54,
+        "window_index": 4212
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:01:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T11:01:00Z",
+        "total_events": 54,
+        "window_index": 4332
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:06:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T11:06:00Z",
+        "total_events": 54,
+        "window_index": 4392
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:11:05Z",
+        "events_per_second": 10.8,
+        "peak_subwindow_eps": 54.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T11:11:00Z",
+        "total_events": 54,
+        "window_index": 4452
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:12:05Z",
+        "events_per_second": 20.0,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-19T13:12:00Z",
+        "total_events": 100,
+        "window_index": 5904
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:28:05Z",
+        "events_per_second": 16.4,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T14:28:00Z",
+        "total_events": 82,
+        "window_index": 6816
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:27:05Z",
+        "events_per_second": 15.4,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 12,
+        "start_time_utc": "2026-03-19T14:27:00Z",
+        "total_events": 77,
+        "window_index": 6804
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-20T00:17:05Z",
+        "events_per_second": 15.0,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-20T00:17:00Z",
+        "total_events": 75,
+        "window_index": 13884
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:17:05Z",
+        "events_per_second": 14.4,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 11,
+        "start_time_utc": "2026-03-19T14:17:00Z",
+        "total_events": 72,
+        "window_index": 6684
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:01:05Z",
+        "events_per_second": 10.6,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:01:00Z",
+        "total_events": 53,
+        "window_index": 3612
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:06:05Z",
+        "events_per_second": 10.6,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:06:00Z",
+        "total_events": 53,
+        "window_index": 3672
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:11:05Z",
+        "events_per_second": 10.6,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:11:00Z",
+        "total_events": 53,
+        "window_index": 3732
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T10:16:05Z",
+        "events_per_second": 10.6,
+        "peak_subwindow_eps": 53.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T10:16:00Z",
+        "total_events": 53,
+        "window_index": 3792
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T11:46:05Z",
+        "events_per_second": 26.2,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-19T11:46:00Z",
+        "total_events": 131,
+        "window_index": 4872
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T13:22:05Z",
+        "events_per_second": 22.2,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-19T13:22:00Z",
+        "total_events": 111,
+        "window_index": 6024
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:48:45Z",
+        "events_per_second": 18.8,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 5,
+        "start_time_utc": "2026-03-19T23:48:40Z",
+        "total_events": 94,
+        "window_index": 13544
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T23:52:30Z",
+        "events_per_second": 16.6,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 5,
+        "start_time_utc": "2026-03-19T23:52:25Z",
+        "total_events": 83,
+        "window_index": 13589
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T14:23:05Z",
+        "events_per_second": 14.8,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 13,
+        "start_time_utc": "2026-03-19T14:23:00Z",
+        "total_events": 74,
+        "window_index": 6756
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:01:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:01:00Z",
+        "total_events": 52,
+        "window_index": 12
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:06:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:06:00Z",
+        "total_events": 52,
+        "window_index": 72
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:11:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:11:00Z",
+        "total_events": 52,
+        "window_index": 132
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:16:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:16:00Z",
+        "total_events": 52,
+        "window_index": 192
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:21:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:21:00Z",
+        "total_events": 52,
+        "window_index": 252
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:26:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:26:00Z",
+        "total_events": 52,
+        "window_index": 312
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:36:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:36:00Z",
+        "total_events": 52,
+        "window_index": 432
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:41:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:41:00Z",
+        "total_events": 52,
+        "window_index": 492
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:46:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:46:00Z",
+        "total_events": 52,
+        "window_index": 552
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:51:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:51:00Z",
+        "total_events": 52,
+        "window_index": 612
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T05:56:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T05:56:00Z",
+        "total_events": 52,
+        "window_index": 672
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:06:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:06:00Z",
+        "total_events": 52,
+        "window_index": 792
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:11:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:11:00Z",
+        "total_events": 52,
+        "window_index": 852
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:16:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:16:00Z",
+        "total_events": 52,
+        "window_index": 912
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:21:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:21:00Z",
+        "total_events": 52,
+        "window_index": 972
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:26:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:26:00Z",
+        "total_events": 52,
+        "window_index": 1032
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:31:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:31:00Z",
+        "total_events": 52,
+        "window_index": 1092
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:36:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:36:00Z",
+        "total_events": 52,
+        "window_index": 1152
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:41:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:41:00Z",
+        "total_events": 52,
+        "window_index": 1212
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:46:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:46:00Z",
+        "total_events": 52,
+        "window_index": 1272
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T06:51:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 20,
+        "start_time_utc": "2026-03-19T06:51:00Z",
+        "total_events": 52,
+        "window_index": 1332
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:00:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:00:00Z",
+        "total_events": 52,
+        "window_index": 1440
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:01:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:01:00Z",
+        "total_events": 52,
+        "window_index": 1452
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:06:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:06:00Z",
+        "total_events": 52,
+        "window_index": 1512
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:11:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:11:00Z",
+        "total_events": 52,
+        "window_index": 1572
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:16:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:16:00Z",
+        "total_events": 52,
+        "window_index": 1632
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:21:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:21:00Z",
+        "total_events": 52,
+        "window_index": 1692
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:26:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:26:00Z",
+        "total_events": 52,
+        "window_index": 1752
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:31:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:31:00Z",
+        "total_events": 52,
+        "window_index": 1812
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:36:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:36:00Z",
+        "total_events": 52,
+        "window_index": 1872
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:41:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:41:00Z",
+        "total_events": 52,
+        "window_index": 1932
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:46:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:46:00Z",
+        "total_events": 52,
+        "window_index": 1992
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T07:56:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T07:56:00Z",
+        "total_events": 52,
+        "window_index": 2112
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:01:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:01:00Z",
+        "total_events": 52,
+        "window_index": 2172
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:06:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:06:00Z",
+        "total_events": 52,
+        "window_index": 2232
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:11:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:11:00Z",
+        "total_events": 52,
+        "window_index": 2292
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:16:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:16:00Z",
+        "total_events": 52,
+        "window_index": 2352
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:21:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:21:00Z",
+        "total_events": 52,
+        "window_index": 2412
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:26:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:26:00Z",
+        "total_events": 52,
+        "window_index": 2472
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:31:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:31:00Z",
+        "total_events": 52,
+        "window_index": 2532
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-19T08:36:05Z",
+        "events_per_second": 10.4,
+        "peak_subwindow_eps": 52.0,
+        "reconciliation_events": 19,
+        "start_time_utc": "2026-03-19T08:36:00Z",
+        "total_events": 52,
+        "window_index": 2592
+      }
+    ],
+    "total_events_in_window": 270576,
+    "total_storm_time_seconds": 50.0
+  },
+  "generated_at_utc": "2026-03-25T00:05:09.829784Z",
+  "iea_integrity": {
+    "findings": [],
+    "metrics": {
+      "cross_iea_duplicate_events": 1,
+      "iea_resolution_suspect_count": 1,
+      "lifecycle_wrong_adapter_count": 2,
+      "reconciliation_efficiency": {
+        "avg_efficiency": null,
+        "low_efficiency_instruments": []
+      },
+      "registry_timing_gap": {
+        "avg_delay_ms": null,
+        "count": 0,
+        "max_delay_ms": null
+      }
+    },
+    "status": "WARNING"
+  },
+  "incident_chains": [
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T12:38:52.426761Z",
+      "events": [
+        {
+          "event": "CONNECTION_LOST",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.410006Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.410006Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.424180Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.425206Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.425719Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.425719Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.426761Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T12:38:52.426761Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 1,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T12:38:52.410006Z",
+      "trigger_event": "CONNECTION_LOST",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T12:38:52.410006Z"
+    },
+    {
+      "classification": "NORMAL",
+      "classification_detail": "NORMAL RECOVERY",
+      "end_utc": "2026-03-19T14:02:53.231140Z",
+      "events": [
+        {
+          "event": "CONNECTION_LOST",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.925654Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.925654Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.926655Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.926655Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.927655Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.934030Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.935031Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:01:48.935031Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 2,
+      "resolution_time_ms": 64305,
+      "start_utc": "2026-03-19T14:01:48.925654Z",
+      "trigger_event": "CONNECTION_LOST",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T14:01:48.925654Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T14:03:23.330901Z",
+      "events": [
+        {
+          "event": "CONNECTION_LOST",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:04.471934Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:19.480498Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:20.458629Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:21.492832Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:21.495841Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:03:23.330901Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 3,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T14:03:04.471934Z",
+      "trigger_event": "CONNECTION_LOST",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T14:03:04.471934Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T14:10:08.273461Z",
+      "events": [
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:03.548749Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:03.548749Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:03.980505Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:03.980505Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:05.124864Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:05.447716Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:05.848055Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.179873Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.179873Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.436315Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.436315Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.843901Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.843901Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:06.843901Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MGC",
+          "ts_utc": "2026-03-19T14:10:06.843901Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.870436Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:06.870436Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:06.870436Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MGC",
+          "ts_utc": "2026-03-19T14:10:06.870436Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:07.845284Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:07.845284Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:08.027823Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:08.027823Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:08.273461Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T14:10:08.273461Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T14:10:08.273461Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MGC",
+          "ts_utc": "2026-03-19T14:10:08.273461Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 4,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T14:10:03.548749Z",
+      "trigger_event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T14:10:03.548749Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T15:07:00.423911Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:06:58.805138Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:06:59.819717Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:06:59.819717Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:06:59.819717Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:06:59.819717Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T15:07:00.423911Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 5,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T15:06:58.805138Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MES",
+      "trigger_ts_utc": "2026-03-19T15:06:58.805138Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T15:36:17.600416Z",
+      "events": [
+        {
+          "event": "CONNECTION_LOST",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.576603Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.576603Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.598891Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.598891Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.600416Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.600416Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.600416Z"
+        },
+        {
+          "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:36:17.600416Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 6,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T15:36:17.576603Z",
+      "trigger_event": "CONNECTION_LOST",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T15:36:17.576603Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T15:44:13.048613Z",
+      "events": [
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:43:51.924302Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:43:54.113867Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:43:54.520084Z"
+        },
+        {
+          "event": "ENGINE_TICK_STALL_RECOVERED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:44:13.048613Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 7,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T15:43:51.924302Z",
+      "trigger_event": "ENGINE_TICK_STALL_RUNTIME",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T15:43:51.924302Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T15:47:19.757035Z",
+      "events": [
+        {
+          "event": "ENGINE_TICK_STALL_RUNTIME",
+          "instrument": "",
+          "ts_utc": "2026-03-19T15:47:19.757035Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 8,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T15:47:19.757035Z",
+      "trigger_event": "ENGINE_TICK_STALL_RUNTIME",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T15:47:19.757035Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T22:40:05.272207Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:40:04.992838Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:40:05.272207Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 9,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T22:40:04.992838Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MES",
+      "trigger_ts_utc": "2026-03-19T22:40:04.992838Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T22:44:41.422143Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:00.767109Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:03.479666Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:03.479666Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:03.804020Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:03.804020Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:04.555313Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:04.555313Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:05.483139Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:05.483139Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:05.781806Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:06.077085Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:06.077085Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:07.366956Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:07.366956Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:07.366956Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:08.481142Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:08.803502Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:09.559932Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:10.483738Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:10.792229Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:11.203198Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:30.820163Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:33.504716Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:33.504716Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:33.832108Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:33.832108Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:34.592789Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:34.592789Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:35.511225Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:35.511225Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:35.822628Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:36.412183Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:36.412183Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:37.423156Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:44:37.423156Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:44:37.423156Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:38.504909Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:38.846271Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:39.605963Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:40.522282Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:40.834304Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:44:41.422143Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 10,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T22:44:00.767109Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MCL",
+      "trigger_ts_utc": "2026-03-19T22:44:00.767109Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T22:47:44.701023Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:46:59.285090Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:00.204279Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:02.523061Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:02.750300Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:03.612736Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:04.213004Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:04.249284Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:09.215984Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:09.662631Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:10.318655Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:10.318655Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:12.312109Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:12.312109Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:12.523331Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:12.523331Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:14.225176Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:14.670287Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:29.681076Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:30.347986Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:34.242747Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:34.242747Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:37.337066Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:37.337066Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T22:47:37.554205Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:39.245174Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:39.700915Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:40.356764Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:40.356764Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:42.352061Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:42.352061Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:42.555786Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T22:47:42.555786Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:44.246864Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T22:47:44.701023Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 11,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T22:46:59.285090Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MES",
+      "trigger_ts_utc": "2026-03-19T22:46:59.285090Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T23:09:24.374128Z",
+      "events": [
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.130496Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.130496Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.130496Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.133774Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.133774Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.133774Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.276594Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.276594Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.276594Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.701547Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.701547Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:09.701547Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:09.701547Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.118320Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.118320Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.118320Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:10.118320Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:10.118320Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.507428Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.507428Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:10.507428Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:10.507428Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:10.507428Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:13.355545Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:13.492642Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:13.505009Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:13.618198Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.133559Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.133559Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.133559Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:14.133559Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.287537Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.287537Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:08:14.287537Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "M2K",
+          "ts_utc": "2026-03-19T23:08:14.287537Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:14.712843Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:19.136732Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:19.289858Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:40.166777Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:40.538256Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:44.761270Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:49.199187Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:08:49.323216Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:09:19.809958Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:09:20.229668Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:09:20.615583Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:09:24.272620Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:09:24.374128Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 12,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T23:08:09.130496Z",
+      "trigger_event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T23:08:09.130496Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T23:13:33.414778Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:00.947689Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:00.947689Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:01.896885Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:01.896885Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:02.053645Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:02.053645Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:02.545818Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:02.545818Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:02.951509Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:02.951509Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:03.385272Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:03.385272Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:30.991416Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:30.991416Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:31.931628Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:31.931628Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:32.072560Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:32.072560Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:32.588774Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:32.588774Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:32.990743Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:32.990743Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:13:33.414778Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:13:33.414778Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 13,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T23:13:00.947689Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MCL",
+      "trigger_ts_utc": "2026-03-19T23:13:00.947689Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T23:25:24.397935Z",
+      "events": [
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.202314Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.202314Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.204818Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.204818Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.618767Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:37.618767Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-19T23:23:37.618767Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:39.266821Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:39.266821Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:39.266821Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-19T23:23:39.266821Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:41.421240Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-19T23:23:41.487625Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:42.194828Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:42.194828Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:42.194828Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-19T23:23:42.194828Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:42.626997Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-19T23:23:42.626997Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:42.905986Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:44.281588Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:44.282589Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:47.196707Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:23:47.639548Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:09.321941Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:12.235747Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:14.322998Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:14.322998Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:17.240425Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-19T23:24:17.663463Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:24:52.271839Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:24:52.680647Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:24:54.365796Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:25:22.288939Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:25:22.715607Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:25:24.397935Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 14,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T23:23:37.202314Z",
+      "trigger_event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-19T23:23:37.202314Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T23:49:15.336330Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:48:29.782815Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:48:37.132617Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:48:45.287522Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:48:59.805206Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:49:07.147746Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:49:15.336330Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 15,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T23:48:29.782815Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MCL",
+      "trigger_ts_utc": "2026-03-19T23:48:29.782815Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": "2026-03-19T23:55:15.855507Z",
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:52:25.334855Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:52:33.542048Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:52:42.272259Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:52:55.368086Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:53:03.568796Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:53:12.307227Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:54:45.830293Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:54:52.444465Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MCL",
+          "ts_utc": "2026-03-19T23:55:15.855507Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 16,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-19T23:52:25.334855Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MCL",
+      "trigger_ts_utc": "2026-03-19T23:52:25.334855Z"
+    },
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": null,
+      "events": [
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:09.890522Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:09.890522Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:09.894038Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:09.894038Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:10.010350Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:10.010350Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:10.413451Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:10.413451Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:10.775612Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:10.775612Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:11.083661Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:11.083661Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:14.886539Z"
+        },
+        {
+          "event": "UNOWNED_LIVE_ORDER_DETECTED",
+          "instrument": "MES",
+          "ts_utc": "2026-03-20T01:10:15.013037Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:15.023085Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:15.422211Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:15.787384Z"
+        },
+        {
+          "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+          "instrument": "",
+          "ts_utc": "2026-03-20T01:10:16.087713Z"
+        }
+      ],
+      "events_truncated": false,
+      "id": 17,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-20T01:10:09.890522Z",
+      "trigger_event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+      "trigger_instrument": "",
+      "trigger_ts_utc": "2026-03-20T01:10:09.890522Z"
+    }
+  ],
+  "meta": {
+    "audit_mode": "FULL",
+    "domains_complete": true,
+    "drift_disabled_reason": null,
+    "engine_active": true,
+    "engine_activity_detected": true,
+    "engine_full": true,
+    "engine_lines_in_window": 245592,
+    "events_deduped": 192426,
+    "events_used": 270576,
+    "files_read": 66,
+    "journal_snapshots_used": 5,
+    "lines_read": 463002,
+    "logical_processor_count": 12,
+    "min_engine_full_days_for_drift": 5,
+    "parallelism_normalized_max": 0.0,
+    "parse_error_rate": 0.00365,
+    "parse_errors_count": 1690,
+    "partial_reason": null,
+    "prior_engine_full_days": 6,
+    "source_fallback": false,
+    "source_fallback_reason": null,
+    "source_primary": "robot",
+    "timeline_compressed_lines": 156,
+    "timeline_max_entries": 400,
+    "timeline_raw_events": 294,
+    "timeline_truncated": false,
+    "watchdog_crosscheck": {
+      "available": true,
+      "divergence": true,
+      "max_count_delta": 135,
+      "pairs_compared": [
+        "CONNECTION_LOST",
+        "ENGINE_STALLED",
+        "RECONCILIATION_QTY_MISMATCH"
+      ]
+    }
+  },
+  "overall_status": "CRITICAL",
+  "schema_version": "1.0",
+  "silent_failure": {
+    "detected": true,
+    "signals": [
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "engine_active_but_no_cpu_profiles",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-19T05:00:00Z"
+      },
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "engine_active_but_no_reco_exec_lifecycle_for_T_silent",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-19T14:42:01.841353Z"
+      },
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "engine_timer_heartbeat_gap_exceeds_T_heartbeat",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-19T14:42:32.553834Z"
+      },
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "no_engine_cpu_profile_for_T_profile_gap",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-19T05:00:00Z"
+      }
+    ],
+    "signals_before_dedupe": 4
+  },
+  "summary": {
+    "dominant_subsystem": null,
+    "first_failure": {
+      "chain_id": 4,
+      "event": "RECONCILIATION_MISMATCH_DETECTED",
+      "instrument": "MES",
+      "ts_chicago": "09:10:03",
+      "ts_utc": "2026-03-19T14:10:03.548749Z"
+    },
+    "max_cpu_parallelism_normalized": 0.0,
+    "max_cpu_parallelism_raw": 0.0,
+    "recovery_quality": {
+      "avg_recovery_time_ms": 64305,
+      "chains_classified_degraded": 0,
+      "chains_classified_failed": 16,
+      "chains_classified_normal": 1,
+      "failed_recoveries": 16,
+      "max_recovery_time_ms": 64305,
+      "mismatch_to_recovery_max_ms": null,
+      "mismatch_to_recovery_median_ms": null,
+      "successful_recoveries": 1
+    },
+    "total_disconnects": 4,
+    "total_mismatches": 342,
+    "total_trades": null
+  },
+  "timeline": {
+    "compressed_entries": [
+      {
+        "critical": false,
+        "display_end_chicago": "07:38:52",
+        "display_start_chicago": "07:38:52",
+        "end_utc": "2026-03-19T12:38:52.410006Z",
+        "event": "CONNECTION_LOST",
+        "instrument": "",
+        "start_utc": "2026-03-19T12:38:52.410006Z",
+        "summary": "CONNECTION_LOST"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "07:38:52",
+        "display_start_chicago": "07:38:52",
+        "end_utc": "2026-03-19T12:38:52.410006Z",
+        "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "instrument": "",
+        "start_utc": "2026-03-19T12:38:52.410006Z",
+        "summary": "DISCONNECT_FAIL_CLOSED_ENTERED (\u00d77 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:01:48",
+        "display_start_chicago": "09:01:48",
+        "end_utc": "2026-03-19T14:01:48.925654Z",
+        "event": "CONNECTION_LOST",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:01:48.925654Z",
+        "summary": "CONNECTION_LOST"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:01:48",
+        "display_start_chicago": "09:01:48",
+        "end_utc": "2026-03-19T14:01:48.925654Z",
+        "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:01:48.925654Z",
+        "summary": "DISCONNECT_FAIL_CLOSED_ENTERED (\u00d77 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:02:53",
+        "display_start_chicago": "09:02:53",
+        "end_utc": "2026-03-19T14:02:53.231140Z",
+        "event": "CONNECTION_RECOVERED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:02:53.231140Z",
+        "summary": "CONNECTION_RECOVERED (\u00d74 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:03:04",
+        "display_start_chicago": "09:03:04",
+        "end_utc": "2026-03-19T14:03:04.471934Z",
+        "event": "CONNECTION_LOST",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:03:04.471934Z",
+        "summary": "CONNECTION_LOST"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:03:19",
+        "display_start_chicago": "09:03:19",
+        "end_utc": "2026-03-19T14:03:19.480498Z",
+        "event": "ENGINE_TICK_STALL_RUNTIME",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:03:19.480498Z",
+        "summary": "ENGINE_TICK_STALL_RUNTIME (\u00d75 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:10:03",
+        "display_start_chicago": "09:10:03",
+        "end_utc": "2026-03-19T14:10:03.548749Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:10:03.548749Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:03",
+        "display_start_chicago": "09:10:03",
+        "end_utc": "2026-03-19T14:10:03.548749Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:03.548749Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:10:03",
+        "display_start_chicago": "09:10:03",
+        "end_utc": "2026-03-19T14:10:03.980505Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:10:03.980505Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:03",
+        "display_start_chicago": "09:10:03",
+        "end_utc": "2026-03-19T14:10:03.980505Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:03.980505Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:05",
+        "display_start_chicago": "09:10:05",
+        "end_utc": "2026-03-19T14:10:05.124864Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:05.124864Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:10:05",
+        "display_start_chicago": "09:10:05",
+        "end_utc": "2026-03-19T14:10:05.848055Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:10:05.848055Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d77 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:06",
+        "display_start_chicago": "09:10:06",
+        "end_utc": "2026-03-19T14:10:06.843901Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:06.843901Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:06",
+        "display_start_chicago": "09:10:06",
+        "end_utc": "2026-03-19T14:10:06.843901Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MGC",
+        "start_utc": "2026-03-19T14:10:06.843901Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:10:06",
+        "display_start_chicago": "09:10:06",
+        "end_utc": "2026-03-19T14:10:06.870436Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:10:06.870436Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:06",
+        "display_start_chicago": "09:10:06",
+        "end_utc": "2026-03-19T14:10:06.870436Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:06.870436Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:06",
+        "display_start_chicago": "09:10:06",
+        "end_utc": "2026-03-19T14:10:06.870436Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MGC",
+        "start_utc": "2026-03-19T14:10:06.870436Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "09:10:07",
+        "display_start_chicago": "09:10:07",
+        "end_utc": "2026-03-19T14:10:07.845284Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T14:10:07.845284Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d76 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:08",
+        "display_start_chicago": "09:10:08",
+        "end_utc": "2026-03-19T14:10:08.273461Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T14:10:08.273461Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "09:10:08",
+        "display_start_chicago": "09:10:08",
+        "end_utc": "2026-03-19T14:10:08.273461Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MGC",
+        "start_utc": "2026-03-19T14:10:08.273461Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "10:00:05",
+        "display_start_chicago": "10:00:05",
+        "end_utc": "2026-03-19T15:00:05.659758Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T15:00:05.659758Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "10:06:58",
+        "display_start_chicago": "10:06:58",
+        "end_utc": "2026-03-19T15:06:58.805138Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T15:06:58.805138Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "10:06:59",
+        "display_start_chicago": "10:06:59",
+        "end_utc": "2026-03-19T15:06:59.819717Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T15:06:59.819717Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d75 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "10:30:06",
+        "display_start_chicago": "10:30:06",
+        "end_utc": "2026-03-19T15:30:06.168077Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T15:30:06.168077Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "10:36:17",
+        "display_start_chicago": "10:36:17",
+        "end_utc": "2026-03-19T15:36:17.576603Z",
+        "event": "CONNECTION_LOST",
+        "instrument": "",
+        "start_utc": "2026-03-19T15:36:17.576603Z",
+        "summary": "CONNECTION_LOST"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "10:36:17",
+        "display_start_chicago": "10:36:17",
+        "end_utc": "2026-03-19T15:36:17.576603Z",
+        "event": "DISCONNECT_FAIL_CLOSED_ENTERED",
+        "instrument": "",
+        "start_utc": "2026-03-19T15:36:17.576603Z",
+        "summary": "DISCONNECT_FAIL_CLOSED_ENTERED (\u00d77 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "10:43:51",
+        "display_start_chicago": "10:43:51",
+        "end_utc": "2026-03-19T15:43:51.924302Z",
+        "event": "ENGINE_TICK_STALL_RUNTIME",
+        "instrument": "",
+        "start_utc": "2026-03-19T15:43:51.924302Z",
+        "summary": "ENGINE_TICK_STALL_RUNTIME (\u00d73 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "10:44:13",
+        "display_start_chicago": "10:44:13",
+        "end_utc": "2026-03-19T15:44:13.048613Z",
+        "event": "ENGINE_TICK_STALL_RECOVERED",
+        "instrument": "",
+        "start_utc": "2026-03-19T15:44:13.048613Z",
+        "summary": "ENGINE_TICK_STALL_RECOVERED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "10:47:19",
+        "display_start_chicago": "10:47:19",
+        "end_utc": "2026-03-19T15:47:19.757035Z",
+        "event": "ENGINE_TICK_STALL_RUNTIME",
+        "instrument": "",
+        "start_utc": "2026-03-19T15:47:19.757035Z",
+        "summary": "ENGINE_TICK_STALL_RUNTIME"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:40:04",
+        "display_start_chicago": "17:40:04",
+        "end_utc": "2026-03-19T22:40:04.992838Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:40:04.992838Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:00",
+        "display_start_chicago": "17:44:00",
+        "end_utc": "2026-03-19T22:44:00.767109Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:00.767109Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:03",
+        "display_start_chicago": "17:44:03",
+        "end_utc": "2026-03-19T22:44:03.479666Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:03.479666Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:03",
+        "display_start_chicago": "17:44:03",
+        "end_utc": "2026-03-19T22:44:03.804020Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:03.804020Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:03",
+        "display_start_chicago": "17:44:03",
+        "end_utc": "2026-03-19T22:44:03.804020Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:03.804020Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:04",
+        "display_start_chicago": "17:44:04",
+        "end_utc": "2026-03-19T22:44:04.555313Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:04.555313Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:04",
+        "display_start_chicago": "17:44:04",
+        "end_utc": "2026-03-19T22:44:04.555313Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:04.555313Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:05",
+        "display_start_chicago": "17:44:05",
+        "end_utc": "2026-03-19T22:44:05.483139Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:05.483139Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:05",
+        "display_start_chicago": "17:44:05",
+        "end_utc": "2026-03-19T22:44:05.483139Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:05.483139Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:06",
+        "display_start_chicago": "17:44:06",
+        "end_utc": "2026-03-19T22:44:06.077085Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:06.077085Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:06",
+        "display_start_chicago": "17:44:06",
+        "end_utc": "2026-03-19T22:44:06.077085Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:06.077085Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:07",
+        "display_start_chicago": "17:44:07",
+        "end_utc": "2026-03-19T22:44:07.366956Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:44:07.366956Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:07",
+        "display_start_chicago": "17:44:07",
+        "end_utc": "2026-03-19T22:44:07.366956Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:07.366956Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:07",
+        "display_start_chicago": "17:44:07",
+        "end_utc": "2026-03-19T22:44:07.366956Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:07.366956Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:44:08",
+        "display_start_chicago": "17:44:08",
+        "end_utc": "2026-03-19T22:44:08.481142Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:44:08.481142Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d76 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:30",
+        "display_start_chicago": "17:44:30",
+        "end_utc": "2026-03-19T22:44:30.820163Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:30.820163Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:33",
+        "display_start_chicago": "17:44:33",
+        "end_utc": "2026-03-19T22:44:33.504716Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:33.504716Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:33",
+        "display_start_chicago": "17:44:33",
+        "end_utc": "2026-03-19T22:44:33.832108Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:33.832108Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:33",
+        "display_start_chicago": "17:44:33",
+        "end_utc": "2026-03-19T22:44:33.832108Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:33.832108Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:34",
+        "display_start_chicago": "17:44:34",
+        "end_utc": "2026-03-19T22:44:34.592789Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:34.592789Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:34",
+        "display_start_chicago": "17:44:34",
+        "end_utc": "2026-03-19T22:44:34.592789Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:34.592789Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:35",
+        "display_start_chicago": "17:44:35",
+        "end_utc": "2026-03-19T22:44:35.511225Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:35.511225Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:35",
+        "display_start_chicago": "17:44:35",
+        "end_utc": "2026-03-19T22:44:35.511225Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:35.511225Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:36",
+        "display_start_chicago": "17:44:36",
+        "end_utc": "2026-03-19T22:44:36.412183Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:36.412183Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:36",
+        "display_start_chicago": "17:44:36",
+        "end_utc": "2026-03-19T22:44:36.412183Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:36.412183Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:37",
+        "display_start_chicago": "17:44:37",
+        "end_utc": "2026-03-19T22:44:37.423156Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:44:37.423156Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:37",
+        "display_start_chicago": "17:44:37",
+        "end_utc": "2026-03-19T22:44:37.423156Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:44:37.423156Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:37",
+        "display_start_chicago": "17:44:37",
+        "end_utc": "2026-03-19T22:44:37.423156Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:44:37.423156Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:44:38",
+        "display_start_chicago": "17:44:38",
+        "end_utc": "2026-03-19T22:44:38.504909Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:44:38.504909Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d76 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:46:59",
+        "display_start_chicago": "17:46:59",
+        "end_utc": "2026-03-19T22:46:59.285090Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:46:59.285090Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d77 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:09",
+        "display_start_chicago": "17:47:09",
+        "end_utc": "2026-03-19T22:47:09.215984Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:09.215984Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:10",
+        "display_start_chicago": "17:47:10",
+        "end_utc": "2026-03-19T22:47:10.318655Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:10.318655Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:10",
+        "display_start_chicago": "17:47:10",
+        "end_utc": "2026-03-19T22:47:10.318655Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:10.318655Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:12",
+        "display_start_chicago": "17:47:12",
+        "end_utc": "2026-03-19T22:47:12.312109Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:12.312109Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:12",
+        "display_start_chicago": "17:47:12",
+        "end_utc": "2026-03-19T22:47:12.312109Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:12.312109Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:12",
+        "display_start_chicago": "17:47:12",
+        "end_utc": "2026-03-19T22:47:12.523331Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:12.523331Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:12",
+        "display_start_chicago": "17:47:12",
+        "end_utc": "2026-03-19T22:47:12.523331Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:12.523331Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "17:47:14",
+        "display_start_chicago": "17:47:14",
+        "end_utc": "2026-03-19T22:47:14.225176Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:14.225176Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:29",
+        "display_start_chicago": "17:47:29",
+        "end_utc": "2026-03-19T22:47:29.681076Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T22:47:29.681076Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d77 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:39",
+        "display_start_chicago": "17:47:39",
+        "end_utc": "2026-03-19T22:47:39.245174Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:39.245174Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:40",
+        "display_start_chicago": "17:47:40",
+        "end_utc": "2026-03-19T22:47:40.356764Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:40.356764Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:40",
+        "display_start_chicago": "17:47:40",
+        "end_utc": "2026-03-19T22:47:40.356764Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:40.356764Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:42",
+        "display_start_chicago": "17:47:42",
+        "end_utc": "2026-03-19T22:47:42.352061Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:42.352061Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:42",
+        "display_start_chicago": "17:47:42",
+        "end_utc": "2026-03-19T22:47:42.352061Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:42.352061Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:42",
+        "display_start_chicago": "17:47:42",
+        "end_utc": "2026-03-19T22:47:42.555786Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:42.555786Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:42",
+        "display_start_chicago": "17:47:42",
+        "end_utc": "2026-03-19T22:47:42.555786Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T22:47:42.555786Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "17:47:44",
+        "display_start_chicago": "17:47:44",
+        "end_utc": "2026-03-19T22:47:44.246864Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T22:47:44.246864Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:09",
+        "display_start_chicago": "18:08:09",
+        "end_utc": "2026-03-19T23:08:09.130496Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:08:09.130496Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d712 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:09",
+        "display_start_chicago": "18:08:09",
+        "end_utc": "2026-03-19T23:08:09.701547Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:09.701547Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.118320Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:08:10.118320Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.118320Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:10.118320Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.118320Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:10.118320Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.507428Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:08:10.507428Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.507428Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:10.507428Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:10",
+        "display_start_chicago": "18:08:10",
+        "end_utc": "2026-03-19T23:08:10.507428Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:10.507428Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:13",
+        "display_start_chicago": "18:08:13",
+        "end_utc": "2026-03-19T23:08:13.355545Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:13.355545Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:13",
+        "display_start_chicago": "18:08:13",
+        "end_utc": "2026-03-19T23:08:13.492642Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:13.492642Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:13",
+        "display_start_chicago": "18:08:13",
+        "end_utc": "2026-03-19T23:08:13.505009Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:13.505009Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:14",
+        "display_start_chicago": "18:08:14",
+        "end_utc": "2026-03-19T23:08:14.133559Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:08:14.133559Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:14",
+        "display_start_chicago": "18:08:14",
+        "end_utc": "2026-03-19T23:08:14.133559Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:14.133559Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:14",
+        "display_start_chicago": "18:08:14",
+        "end_utc": "2026-03-19T23:08:14.287537Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:08:14.287537Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:14",
+        "display_start_chicago": "18:08:14",
+        "end_utc": "2026-03-19T23:08:14.287537Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "M2K",
+        "start_utc": "2026-03-19T23:08:14.287537Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:08:14",
+        "display_start_chicago": "18:08:14",
+        "end_utc": "2026-03-19T23:08:14.712843Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:14.712843Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d73 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:08:40",
+        "display_start_chicago": "18:08:40",
+        "end_utc": "2026-03-19T23:08:40.166777Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:08:40.166777Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d75 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:09:19",
+        "display_start_chicago": "18:09:19",
+        "end_utc": "2026-03-19T23:09:19.809958Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:09:19.809958Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d75 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:00",
+        "display_start_chicago": "18:13:00",
+        "end_utc": "2026-03-19T23:13:00.947689Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:00.947689Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:00",
+        "display_start_chicago": "18:13:00",
+        "end_utc": "2026-03-19T23:13:00.947689Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:00.947689Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:01",
+        "display_start_chicago": "18:13:01",
+        "end_utc": "2026-03-19T23:13:01.896885Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:01.896885Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:01",
+        "display_start_chicago": "18:13:01",
+        "end_utc": "2026-03-19T23:13:01.896885Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:01.896885Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.053645Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:02.053645Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.053645Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:02.053645Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.545818Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:02.545818Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.545818Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:02.545818Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.951509Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:02.951509Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:02",
+        "display_start_chicago": "18:13:02",
+        "end_utc": "2026-03-19T23:13:02.951509Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:02.951509Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:03",
+        "display_start_chicago": "18:13:03",
+        "end_utc": "2026-03-19T23:13:03.385272Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:03.385272Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:13:03",
+        "display_start_chicago": "18:13:03",
+        "end_utc": "2026-03-19T23:13:03.385272Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:03.385272Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:30",
+        "display_start_chicago": "18:13:30",
+        "end_utc": "2026-03-19T23:13:30.991416Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:30.991416Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:30",
+        "display_start_chicago": "18:13:30",
+        "end_utc": "2026-03-19T23:13:30.991416Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:30.991416Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:31",
+        "display_start_chicago": "18:13:31",
+        "end_utc": "2026-03-19T23:13:31.931628Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:31.931628Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:31",
+        "display_start_chicago": "18:13:31",
+        "end_utc": "2026-03-19T23:13:31.931628Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:31.931628Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.072560Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:32.072560Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.072560Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:32.072560Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.588774Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:32.588774Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.588774Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:32.588774Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.990743Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:32.990743Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:32",
+        "display_start_chicago": "18:13:32",
+        "end_utc": "2026-03-19T23:13:32.990743Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:32.990743Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:33",
+        "display_start_chicago": "18:13:33",
+        "end_utc": "2026-03-19T23:13:33.414778Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:13:33.414778Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:13:33",
+        "display_start_chicago": "18:13:33",
+        "end_utc": "2026-03-19T23:13:33.414778Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:13:33.414778Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:23:37",
+        "display_start_chicago": "18:23:37",
+        "end_utc": "2026-03-19T23:23:37.202314Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:23:37.202314Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d76 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:37",
+        "display_start_chicago": "18:23:37",
+        "end_utc": "2026-03-19T23:23:37.618767Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-19T23:23:37.618767Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:23:39",
+        "display_start_chicago": "18:23:39",
+        "end_utc": "2026-03-19T23:23:39.266821Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:23:39.266821Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:39",
+        "display_start_chicago": "18:23:39",
+        "end_utc": "2026-03-19T23:23:39.266821Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:23:39.266821Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:39",
+        "display_start_chicago": "18:23:39",
+        "end_utc": "2026-03-19T23:23:39.266821Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-19T23:23:39.266821Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:41",
+        "display_start_chicago": "18:23:41",
+        "end_utc": "2026-03-19T23:23:41.421240Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:23:41.421240Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:41",
+        "display_start_chicago": "18:23:41",
+        "end_utc": "2026-03-19T23:23:41.487625Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-19T23:23:41.487625Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:23:42",
+        "display_start_chicago": "18:23:42",
+        "end_utc": "2026-03-19T23:23:42.194828Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:23:42.194828Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:42",
+        "display_start_chicago": "18:23:42",
+        "end_utc": "2026-03-19T23:23:42.194828Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:23:42.194828Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:42",
+        "display_start_chicago": "18:23:42",
+        "end_utc": "2026-03-19T23:23:42.194828Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-19T23:23:42.194828Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:23:42",
+        "display_start_chicago": "18:23:42",
+        "end_utc": "2026-03-19T23:23:42.626997Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-19T23:23:42.626997Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:42",
+        "display_start_chicago": "18:23:42",
+        "end_utc": "2026-03-19T23:23:42.905986Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:23:42.905986Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:23:44",
+        "display_start_chicago": "18:23:44",
+        "end_utc": "2026-03-19T23:23:44.281588Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:23:44.281588Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d74 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:24:09",
+        "display_start_chicago": "18:24:09",
+        "end_utc": "2026-03-19T23:24:09.321941Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MES",
+        "start_utc": "2026-03-19T23:24:09.321941Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d76 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:24:52",
+        "display_start_chicago": "18:24:52",
+        "end_utc": "2026-03-19T23:24:52.271839Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:24:52.271839Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d73 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:25:22",
+        "display_start_chicago": "18:25:22",
+        "end_utc": "2026-03-19T23:25:22.288939Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:25:22.288939Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:48:29",
+        "display_start_chicago": "18:48:29",
+        "end_utc": "2026-03-19T23:48:29.782815Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:48:29.782815Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d73 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:48:59",
+        "display_start_chicago": "18:48:59",
+        "end_utc": "2026-03-19T23:48:59.805206Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:48:59.805206Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:52:25",
+        "display_start_chicago": "18:52:25",
+        "end_utc": "2026-03-19T23:52:25.334855Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:52:25.334855Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d73 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:52:55",
+        "display_start_chicago": "18:52:55",
+        "end_utc": "2026-03-19T23:52:55.368086Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:52:55.368086Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "18:54:45",
+        "display_start_chicago": "18:54:45",
+        "end_utc": "2026-03-19T23:54:45.830293Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:54:45.830293Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED (\u00d72 in 120s)"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "18:55:15",
+        "display_start_chicago": "18:55:15",
+        "end_utc": "2026-03-19T23:55:15.855507Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MCL",
+        "start_utc": "2026-03-19T23:55:15.855507Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:09",
+        "display_start_chicago": "20:10:09",
+        "end_utc": "2026-03-20T01:10:09.890522Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:09.890522Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:09",
+        "display_start_chicago": "20:10:09",
+        "end_utc": "2026-03-20T01:10:09.890522Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:09.890522Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:09",
+        "display_start_chicago": "20:10:09",
+        "end_utc": "2026-03-20T01:10:09.894038Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:09.894038Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:09",
+        "display_start_chicago": "20:10:09",
+        "end_utc": "2026-03-20T01:10:09.894038Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:09.894038Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.010350Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:10.010350Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.010350Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:10.010350Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.413451Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:10.413451Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.413451Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:10.413451Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.775612Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:10.775612Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:10",
+        "display_start_chicago": "20:10:10",
+        "end_utc": "2026-03-20T01:10:10.775612Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:10.775612Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:11",
+        "display_start_chicago": "20:10:11",
+        "end_utc": "2026-03-20T01:10:11.083661Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:11.083661Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:11",
+        "display_start_chicago": "20:10:11",
+        "end_utc": "2026-03-20T01:10:11.083661Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:11.083661Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:14",
+        "display_start_chicago": "20:10:14",
+        "end_utc": "2026-03-20T01:10:14.886539Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:14.886539Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "20:10:15",
+        "display_start_chicago": "20:10:15",
+        "end_utc": "2026-03-20T01:10:15.013037Z",
+        "event": "UNOWNED_LIVE_ORDER_DETECTED",
+        "instrument": "MES",
+        "start_utc": "2026-03-20T01:10:15.013037Z",
+        "summary": "UNOWNED_LIVE_ORDER_DETECTED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "20:10:15",
+        "display_start_chicago": "20:10:15",
+        "end_utc": "2026-03-20T01:10:15.023085Z",
+        "event": "ORDER_REGISTRY_MISSING_FAIL_CLOSED",
+        "instrument": "",
+        "start_utc": "2026-03-20T01:10:15.023085Z",
+        "summary": "ORDER_REGISTRY_MISSING_FAIL_CLOSED (\u00d74 in 120s)"
+      }
+    ],
+    "critical_periods": []
+  },
+  "timezone": "chicago",
+  "trade_readiness": {
+    "blocking_factors": [
+      "SAFETY_CRITICAL",
+      "SILENT_FAILURE",
+      "CONFIDENCE_ENFORCED_CRITICAL",
+      "OVERALL_CRITICAL"
+    ],
+    "decision": "NO_GO",
+    "reason": "Blocking safety, execution, silent failure, or confidence-enforced critical path."
+  }
+}

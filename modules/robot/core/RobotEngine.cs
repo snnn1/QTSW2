@@ -7,6 +7,7 @@ using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
+using QTSW2.Robot.Core.Diagnostics;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Core.Notifications;
 
@@ -33,6 +34,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Engine run identifier (GUID per engine Start())
     private string? _runId;
+    private RuntimeAuditHub? _runtimeAudit;
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -517,6 +519,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // CRITICAL: Set run_id before any Start-path logs
         _runId = Guid.NewGuid().ToString("N");
         _log.SetRunId(_runId);
+        _runtimeAudit = new RuntimeAuditHub(_log, () => _runId ?? "");
+        RuntimeAuditHubRef.Active = _runtimeAudit;
 
         var utcNow = DateTimeOffset.UtcNow;
 
@@ -845,7 +849,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 isRecoveryInProgress: _ => false,
                 isInstrumentBlocked: _ => false,
                 log: _log,
-                eventWriter: _eventWriter);
+                eventWriter: _eventWriter,
+                runtimeAudit: _runtimeAudit);
 
             // Gap 4 + P1.5: modules/harness — same gate FSM; IEA/registry may be absent (evaluate uses journal fallback).
             var stableWindowMsHarness = _executionMode == ExecutionMode.SIM
@@ -862,7 +867,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 eventWriter: _eventWriter,
                 runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
                 evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
-                stateConsistencyStableWindowMs: stableWindowMsHarness);
+                stateConsistencyStableWindowMs: stableWindowMsHarness,
+                runtimeAudit: _runtimeAudit);
 
             _riskGate = new RiskGate(_spec, _time, _log, _killSwitch, guard: this,
                 isInstrumentFrozen: inst => (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false) || (_mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) ?? false));
@@ -897,6 +903,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 
                 // Wire coordinator to adapter
                 simAdapter.SetCoordinator(coordinator);
+                simAdapter.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
+                    _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d));
             }
 
             // Log execution mode and adapter
@@ -1196,6 +1204,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
+        _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
+        RuntimeAuditHubRef.Active = null;
         
         // PHASE 3.1: Release canonical market lock on shutdown
         _canonicalMarketLock?.Release(utcNow);
@@ -1258,6 +1268,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
     {
+        var tickTotalStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        try
+        {
         // PHASE 3.1: Periodic identity invariants check (rate-limited). Skip during Historical - Realtime-only.
         if (!isHistorical)
             CheckIdentityInvariantsIfNeeded(utcNow);
@@ -1285,6 +1298,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         lock (_engineLock)
         {
+            var lockRegionStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+            try
+            {
             // HEARTBEAT: Emit unconditionally for process liveness (before any early returns)
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
             
@@ -1379,8 +1395,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // SLOT EXPIRY: Run stream.Tick BEFORE forced flatten so slot expiry (at NextSlotTimeUtc)
             // can run and commit streams before forced flatten. Otherwise forced flatten would
             // commit pre-entry streams first, and reentry streams would never reach slot expiry.
+            var streamLoopStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             foreach (var s in _streams.Values)
+            {
+                var ts = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
                 s.Tick(utcNow);
+                if (ts != 0)
+                {
+                    _runtimeAudit?.CpuEnd(ts, RuntimeAuditSubsystem.EngineTickPerStream, s.Instrument, s.Stream, onIeaWorker: false);
+                    var sid = string.IsNullOrEmpty(s.Stream) ? s.Instrument : s.Stream;
+                    _runtimeAudit?.RecordStreamTick(sid, RuntimeAuditHub.CpuElapsedMs(ts));
+                }
+            }
+            if (streamLoopStart != 0)
+            {
+                var loopMs = RuntimeAuditHub.CpuElapsedMs(streamLoopStart);
+                _runtimeAudit?.CpuEnd(streamLoopStart, RuntimeAuditSubsystem.StreamLoop);
+                _runtimeAudit?.RecordStreamLoopAggregate(_streams.Count, loopMs);
+            }
 
             // Second reconciliation trigger (lightweight safety net): run once, ~5 min after recovery
             if (_recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE &&
@@ -1536,10 +1568,30 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _healthMonitor?.Evaluate(utcNow);
 
             // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
+            var emProt = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             _protectiveCoordinator?.EmitMetrics(utcNow);
+            if (emProt != 0)
+                _runtimeAudit?.CpuEnd(emProt, RuntimeAuditSubsystem.EmitMetricsProtective);
 
             // Gap 4: Mismatch escalation metrics
+            var emMis = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             _mismatchCoordinator?.EmitMetrics(utcNow);
+            if (emMis != 0)
+                _runtimeAudit?.CpuEnd(emMis, RuntimeAuditSubsystem.EmitMetricsMismatch);
+
+            _runtimeAudit?.TryEmitPeriodicWallClock(DateTimeOffset.UtcNow);
+            }
+            finally
+            {
+                if (lockRegionStart != 0)
+                    _runtimeAudit?.CpuEnd(lockRegionStart, RuntimeAuditSubsystem.EngineLockRegion);
+            }
+        }
+        }
+        finally
+        {
+            if (tickTotalStart != 0)
+                _runtimeAudit?.CpuEnd(tickTotalStart, RuntimeAuditSubsystem.EngineTickTotal);
         }
     }
 
@@ -4064,6 +4116,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private IReadOnlyList<MismatchObservation> AssembleMismatchObservations(AccountSnapshot snap, DateTimeOffset utcNow)
     {
+        var asmStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        try
+        {
         var list = new List<MismatchObservation>();
         if (_executionAdapter == null) return list;
 
@@ -4131,6 +4186,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         return list;
+        }
+        finally
+        {
+            if (asmStart != 0)
+                _runtimeAudit?.CpuEnd(asmStart, RuntimeAuditSubsystem.AssembleMismatch);
+        }
     }
 
     private static int CountBrokerWorkingOrders(AccountSnapshot? snap, string instrument)

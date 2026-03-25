@@ -10,6 +10,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using QTSW2.Robot.Contracts;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -35,7 +36,28 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
     private readonly ExecutionJournal _executionJournal;
-    
+    private readonly ExecutionTraceWriter? _executionTrace;
+
+    /// <summary>50ms duplicate suppression for identical NT execution callbacks (instrument + execution_id).</summary>
+    private readonly object _callbackDedupLock = new();
+    private readonly Dictionary<string, ExecutionCallbackDedupEntry> _executionCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>50ms duplicate suppression for identical NT order updates (instrument + order_id + order_state).</summary>
+    private readonly Dictionary<string, OrderCallbackDedupEntry> _orderCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class ExecutionCallbackDedupEntry
+    {
+        public int LastFillQty;
+        public string LastOrderState = "";
+        public DateTimeOffset LastUtc;
+        public long TotalSkips;
+    }
+
+    private sealed class OrderCallbackDedupEntry
+    {
+        public DateTimeOffset LastUtc;
+        public long TotalSkips;
+    }
+
     // Order tracking: intentId -> NT order info (or IEA's when use_instrument_execution_authority)
     private readonly ConcurrentDictionary<string, OrderInfo> _orderMap = new();
     
@@ -88,6 +110,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>P2 Phase 1: engine callback after IEA chooses stream containment (no instrument flatten).</summary>
     public void SetP2StreamContainmentEngineCallback(Action<StateOwnershipAttributionResult, DateTimeOffset>? callback) =>
         _p2StreamContainmentEngineCallback = callback;
+
+    /// <summary>Optional: notify mismatch gate coordinator of structured execution activity.</summary>
+    private Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? _onMismatchExecutionTrigger;
+
+    /// <summary>Wires execution/fill activity to <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/> (optional).</summary>
+    public void SetMismatchExecutionTriggerCallback(Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? callback) =>
+        _onMismatchExecutionTrigger = callback;
     
     // PHASE 2: Callback to get notification service for alerts
     private Func<object?>? _getNotificationServiceCallback;
@@ -655,6 +684,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _projectRoot = projectRoot;
         _log = log;
         _executionJournal = executionJournal;
+        _executionTrace = ExecutionTraceWriter.TryCreate(projectRoot);
         
         // Note: SIM account verification happens when NT context is set via SetNTContext()
         // Mock mode has been removed - only real NT API execution is supported
@@ -1608,7 +1638,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 total_filled_quantity = totalFilledQuantity,  // Cumulative total for protective orders
                 note = "Protective orders submitted for total filled quantity (covers entire position for incremental fills)"
             }));
-        
+
+        _onMismatchExecutionTrigger?.Invoke(intent.Instrument!.Trim(), utcNow, new MismatchExecutionTriggerDetails
+        {
+            IntentId = intentId,
+            EntryToProtectivesTransition = true
+        });
+
         // Check for unprotected positions after protective order submission
         CheckUnprotectedPositions(utcNow);
         

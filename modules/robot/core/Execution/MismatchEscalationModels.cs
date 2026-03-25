@@ -3,6 +3,7 @@
 // Bounded detection and escalation only; no retry loops or auto-repair in first pass.
 
 using System;
+using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -90,6 +91,9 @@ public sealed class MismatchInstrumentState
     public DateTimeOffset LastReleaseUtc { get; set; }
     public DateTimeOffset LastGateEngagedUtc { get; set; }
     public int StableWindowMsApplied { get; set; }
+
+    /// <summary>Progress-aware throttling for expensive gate reconciliation (local to coordinator).</summary>
+    public GateReconciliationProgressState GateProgress { get; } = new GateReconciliationProgressState();
 }
 
 /// <summary>Policy thresholds for mismatch escalation.</summary>
@@ -115,4 +119,383 @@ public static class MismatchEscalationPolicy
 
     /// <summary>P1.5-C: Slightly longer window when snapshots/noise warrant (sim / harness).</summary>
     public const int STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM = 12_000;
+
+    // --- Progress-aware gate reconciliation throttle (no zero-progress CPU loops) ---
+
+    /// <summary>First N expensive gate reconciliation passes run at full audit frequency (no iteration-based throttle).</summary>
+    public const int GATE_PROGRESS_WARMUP_EXPENSIVE_PASSES = 2;
+
+    /// <summary>Consecutive no-progress expensive passes before iteration-based throttle can apply (after warmup).</summary>
+    public const int GATE_NO_PROGRESS_ITERATION_THRESHOLD = 3;
+
+    /// <summary>Time without measurable progress (ms) before throttle can apply.</summary>
+    public const int GATE_NO_PROGRESS_TIME_THRESHOLD_MS = 12_000;
+
+    /// <summary>Minimum spacing between expensive reconciliations once throttled (base; multiplied by backoff).</summary>
+    public const int GATE_RECONCILIATION_MIN_INTERVAL_MS = 6_000;
+
+    /// <summary>Backoff multiplier applied per active throttle step (stepped exponential).</summary>
+    public const double GATE_RECONCILIATION_BACKOFF_MULTIPLIER = 1.5;
+
+    /// <summary>Maximum spacing cap for throttled reconciliation (ms).</summary>
+    public const int GATE_RECONCILIATION_MAX_INTERVAL_MS = 60_000;
+
+    // --- Progress-bounded execution + hard reconciliation limits ---
+
+    /// <summary>Max expensive gate reconciliations per execution burst (reset when execution gap exceeds <see cref="GATE_EXECUTION_TRIGGER_RESET_GAP_MS"/>).</summary>
+    public const int GATE_EXECUTION_RECONCILIATION_CAP = 5;
+
+    /// <summary>Fallback: reset execution burst counter when no trigger for this long (ms) and no structured details supplied.</summary>
+    public const int GATE_EXECUTION_TRIGGER_RESET_GAP_MS = 1000;
+
+    /// <summary>Max expensive gate reconciliations for the whole time the gate is engaged (progress-independent ceiling).</summary>
+    public const int GATE_ABSOLUTE_MAX_EXPENSIVE_RECONCILIATIONS = 10;
+
+    /// <summary>Hard stop when no measurable progress for this many consecutive expensive passes (after warmup).</summary>
+    public const int GATE_HARD_STOP_NO_PROGRESS_ITERATIONS = 5;
+
+    /// <summary>Hard stop also requires at least this long since last measurable progress (ms).</summary>
+    public const int GATE_HARD_STOP_NO_PROGRESS_TIME_MS = 15_000;
+
+    /// <summary>Duration to force skip expensive reconciliation after hard stop (ms).</summary>
+    public const int GATE_HARD_STOP_DURATION_MS = 30_000;
+
+    /// <summary>Minimum gap between expensive passes to block hot re-entry (ms).</summary>
+    public const int GATE_REENTRY_BLOCK_MS = 50;
+}
+
+/// <summary>
+/// Structured execution activity for <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/>.
+/// Resets the per-burst execution reconciliation counter on intent change, entry→protectives transition,
+/// non-zero fill delta, or broker position quantity change — not only on time gaps.
+/// </summary>
+public readonly struct MismatchExecutionTriggerDetails : IEquatable<MismatchExecutionTriggerDetails>
+{
+    public string? IntentId { get; init; }
+    /// <summary>Signed fill delta for this execution event (0 if N/A).</summary>
+    public int FillDelta { get; init; }
+    /// <summary>Current account position quantity for the instrument (optional; used to detect net position changes).</summary>
+    public int? InstrumentPositionQty { get; init; }
+    /// <summary>True once when protective stop+target are successfully submitted after an entry fill.</summary>
+    public bool EntryToProtectivesTransition { get; init; }
+
+    public static MismatchExecutionTriggerDetails Default => default;
+
+    public bool Equals(MismatchExecutionTriggerDetails other) =>
+        IntentId == other.IntentId &&
+        FillDelta == other.FillDelta &&
+        InstrumentPositionQty == other.InstrumentPositionQty &&
+        EntryToProtectivesTransition == other.EntryToProtectivesTransition;
+
+    public override bool Equals(object? obj) => obj is MismatchExecutionTriggerDetails o && Equals(o);
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            var h = IntentId != null ? StringComparer.OrdinalIgnoreCase.GetHashCode(IntentId) : 0;
+            h = (h * 397) ^ FillDelta;
+            h = (h * 397) ^ (InstrumentPositionQty?.GetHashCode() ?? 0);
+            h = (h * 397) ^ (EntryToProtectivesTransition ? 1 : 0);
+            return h;
+        }
+    }
+}
+
+/// <summary>Compact, stable progress signature for gate reconciliation (no timestamps).</summary>
+public readonly struct GateProgressSignature : IEquatable<GateProgressSignature>
+{
+    public GateProgressSignature(
+        GateLifecyclePhase gatePhase,
+        MismatchType mismatchType,
+        int brokerWorking,
+        int localOwnedWorking,
+        bool releaseReady,
+        int unexplainedWorkingGap)
+    {
+        GatePhase = gatePhase;
+        MismatchType = mismatchType;
+        BrokerWorking = brokerWorking;
+        LocalOwnedWorking = localOwnedWorking;
+        ReleaseReady = releaseReady;
+        UnexplainedWorkingGap = unexplainedWorkingGap;
+    }
+
+    public GateLifecyclePhase GatePhase { get; }
+    public MismatchType MismatchType { get; }
+    public int BrokerWorking { get; }
+    public int LocalOwnedWorking { get; }
+    public bool ReleaseReady { get; }
+    /// <summary>max(0, brokerWorking - localOwnedWorking) when both meaningful.</summary>
+    public int UnexplainedWorkingGap { get; }
+
+    public bool Equals(GateProgressSignature other) =>
+        GatePhase == other.GatePhase &&
+        MismatchType == other.MismatchType &&
+        BrokerWorking == other.BrokerWorking &&
+        LocalOwnedWorking == other.LocalOwnedWorking &&
+        ReleaseReady == other.ReleaseReady &&
+        UnexplainedWorkingGap == other.UnexplainedWorkingGap;
+
+    public override bool Equals(object? obj) => obj is GateProgressSignature o && Equals(o);
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            var h = (int)GatePhase;
+            h = (h * 397) ^ (int)MismatchType;
+            h = (h * 397) ^ BrokerWorking;
+            h = (h * 397) ^ LocalOwnedWorking;
+            h = (h * 397) ^ (ReleaseReady ? 1 : 0);
+            h = (h * 397) ^ UnexplainedWorkingGap;
+            return h;
+        }
+    }
+
+    public static bool operator ==(GateProgressSignature a, GateProgressSignature b) => a.Equals(b);
+    public static bool operator !=(GateProgressSignature a, GateProgressSignature b) => !a.Equals(b);
+}
+
+/// <summary>Per-instrument progress throttle state (coordinator-owned; gate path only).</summary>
+public sealed class GateReconciliationProgressState
+{
+    public GateProgressSignature? LastProgressSignature { get; set; }
+    public int NoProgressIterations { get; set; }
+    public DateTimeOffset NextAllowedExpensiveReconciliationUtc { get; set; } = DateTimeOffset.MinValue;
+    public int BackoffLevel { get; set; }
+    public ulong LastExternalFingerprint { get; set; }
+    public DateTimeOffset LastExpensiveReconciliationUtc { get; set; } = DateTimeOffset.MinValue;
+    public int ExpensivePassesCompleted { get; set; }
+    public DateTimeOffset LastThrottleEmitUtc { get; set; } = DateTimeOffset.MinValue;
+    public string? LastEmittedThrottleKind { get; set; }
+
+    /// <summary>UTC of last measurable progress; null until first progress event.</summary>
+    public DateTimeOffset? LastMeasurableProgressUtc { get; set; }
+
+    public DateTimeOffset LastNoProgressEmitUtc { get; set; } = DateTimeOffset.MinValue;
+
+    /// <summary>Expensive reconciliations since last execution burst boundary (see <see cref="LastExecutionTriggerUtc"/>).</summary>
+    public int ReconciliationCyclesThisExecution { get; set; }
+
+    /// <summary>Last execution/fill activity UTC for this instrument (gate path).</summary>
+    public DateTimeOffset LastExecutionTriggerUtc { get; set; } = DateTimeOffset.MinValue;
+
+    /// <summary>When true and before <see cref="ProgressHardStopUntilUtc"/>, expensive reconciliation is skipped.</summary>
+    public bool ProgressHardStopped { get; set; }
+
+    public DateTimeOffset ProgressHardStopUntilUtc { get; set; } = DateTimeOffset.MinValue;
+
+    /// <summary>True while inside expensive gate reconciliation (reentrancy guard).</summary>
+    public bool InReconciliationLoop { get; set; }
+
+    public DateTimeOffset LastReconciliationExitUtc { get; set; } = DateTimeOffset.MinValue;
+
+    public DateTimeOffset LastExecutionCapEmitUtc { get; set; } = DateTimeOffset.MinValue;
+
+    public DateTimeOffset LastReentryBlockEmitUtc { get; set; } = DateTimeOffset.MinValue;
+
+    /// <summary>Expensive reconciliations since this gate engagement (not reset by throttle backoff; reset on gate release / new engagement).</summary>
+    public int TotalExpensiveSinceGateEngaged { get; set; }
+
+    /// <summary>Last intent id seen for execution-cap burst tracking.</summary>
+    public string? LastTriggerIntentId { get; set; }
+
+    /// <summary>Last broker position qty snapshot for execution-cap burst tracking.</summary>
+    public int? LastTriggerPositionQty { get; set; }
+
+    /// <summary>Baseline for meaningful external drift (throttle reset only when these change).</summary>
+    public bool ThrottleBaselineInitialized { get; set; }
+    public int ThrottleBaselinePositionQty { get; set; }
+    public int ThrottleBaselineBrokerWorking { get; set; }
+    public int ThrottleBaselineLocalWorking { get; set; }
+    public MismatchType ThrottleBaselineMismatchType { get; set; }
+
+    public void Reset()
+    {
+        LastProgressSignature = null;
+        NoProgressIterations = 0;
+        NextAllowedExpensiveReconciliationUtc = DateTimeOffset.MinValue;
+        BackoffLevel = 0;
+        LastExternalFingerprint = 0;
+        LastExpensiveReconciliationUtc = DateTimeOffset.MinValue;
+        ExpensivePassesCompleted = 0;
+        LastThrottleEmitUtc = DateTimeOffset.MinValue;
+        LastEmittedThrottleKind = null;
+        LastMeasurableProgressUtc = null;
+        LastNoProgressEmitUtc = DateTimeOffset.MinValue;
+        ReconciliationCyclesThisExecution = 0;
+        LastExecutionTriggerUtc = DateTimeOffset.MinValue;
+        ProgressHardStopped = false;
+        ProgressHardStopUntilUtc = DateTimeOffset.MinValue;
+        InReconciliationLoop = false;
+        LastReconciliationExitUtc = DateTimeOffset.MinValue;
+        LastExecutionCapEmitUtc = DateTimeOffset.MinValue;
+        LastReentryBlockEmitUtc = DateTimeOffset.MinValue;
+        TotalExpensiveSinceGateEngaged = 0;
+        LastTriggerIntentId = null;
+        LastTriggerPositionQty = null;
+        ThrottleBaselineInitialized = false;
+        ThrottleBaselinePositionQty = 0;
+        ThrottleBaselineBrokerWorking = 0;
+        ThrottleBaselineLocalWorking = 0;
+        ThrottleBaselineMismatchType = default;
+    }
+}
+
+/// <summary>Builds fingerprints and decides measurable progress for gate reconciliation (stable fields only).</summary>
+public static class GateProgressEvaluator
+{
+    /// <summary>Lower rank = less severe mismatch type for throttle purposes.</summary>
+    public static int MismatchSeverityRank(MismatchType t) => t switch
+    {
+        MismatchType.BROKER_AHEAD => 10,
+        MismatchType.JOURNAL_AHEAD => 20,
+        MismatchType.POSITION_QTY_MISMATCH => 30,
+        MismatchType.ORDER_REGISTRY_MISSING => 40,
+        MismatchType.PROTECTIVE_STATE_DIVERGENCE => 35,
+        MismatchType.UNKNOWN_EXECUTION_PERSISTENT => 50,
+        MismatchType.RESTART_RECONCILIATION_UNRESOLVED => 45,
+        MismatchType.LIFECYCLE_BROKER_DIVERGENCE => 42,
+        MismatchType.UNCLASSIFIED_CRITICAL_MISMATCH => 60,
+        _ => 55
+    };
+
+    public static ulong BuildExternalFingerprint(string instrument, AccountSnapshot snapshot, MismatchObservation? obs)
+    {
+        var inst = instrument?.Trim() ?? "";
+        var pos = 0;
+        if (snapshot.Positions != null)
+        {
+            var p = snapshot.Positions.FirstOrDefault(x =>
+                string.Equals(x.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+            if (p != null)
+                pos = p.Quantity;
+        }
+
+        var wo = 0;
+        if (snapshot.WorkingOrders != null)
+            wo = snapshot.WorkingOrders.Count(w =>
+                string.Equals(w.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+
+        var oBQ = obs?.BrokerQty ?? 0;
+        var oLQ = obs?.LocalQty ?? 0;
+        var oBW = obs?.BrokerWorkingOrderCount ?? 0;
+        var oLW = obs?.LocalWorkingOrderCount ?? 0;
+        unchecked
+        {
+            ulong h = 1469598103934665603UL;
+            void Mix(ulong x)
+            {
+                h ^= x;
+                h *= 1099511628211UL;
+            }
+
+            Mix((ulong)(uint)pos);
+            Mix((ulong)(uint)wo);
+            Mix((ulong)(uint)oBQ);
+            Mix((ulong)(uint)oLQ);
+            Mix((ulong)(uint)oBW);
+            Mix((ulong)(uint)oLW);
+            return h;
+        }
+    }
+
+    /// <param name="overrideGatePhase">When set, used instead of <see cref="MismatchInstrumentState.GateLifecyclePhase"/> for the signature (projected phase after readiness evaluation).</param>
+    public static GateProgressSignature BuildSignature(
+        MismatchInstrumentState state,
+        MismatchObservation? obs,
+        StateConsistencyReleaseReadinessResult readiness,
+        GateReconciliationResult? recon,
+        GateLifecyclePhase? overrideGatePhase = null)
+    {
+        var phase = overrideGatePhase ?? state.GateLifecyclePhase;
+        var mt = state.MismatchType;
+        var bw = obs?.BrokerWorkingOrderCount ?? 0;
+        var lw = obs?.LocalWorkingOrderCount ?? 0;
+        if (recon != null)
+        {
+            bw = recon.BrokerWorkingCountAfter;
+            lw = recon.IeaOwnedCountAfter;
+        }
+
+        var rr = readiness.ReleaseReady;
+        var gap = Math.Max(0, bw - lw);
+        return new GateProgressSignature(phase, mt, bw, lw, rr, gap);
+    }
+
+    public static bool IsMeasurableProgress(GateProgressSignature prev, GateProgressSignature next)
+    {
+        if (next.ReleaseReady && !prev.ReleaseReady)
+            return true;
+
+        if (IsForwardGatePhaseMove(prev.GatePhase, next.GatePhase))
+            return true;
+
+        if (MismatchSeverityRank(next.MismatchType) < MismatchSeverityRank(prev.MismatchType))
+            return true;
+
+        if (next.UnexplainedWorkingGap < prev.UnexplainedWorkingGap)
+            return true;
+
+        if (next.LocalOwnedWorking > prev.LocalOwnedWorking && next.BrokerWorking <= prev.BrokerWorking + 1)
+            return true;
+
+        if (next.BrokerWorking < prev.BrokerWorking && next.UnexplainedWorkingGap <= prev.UnexplainedWorkingGap)
+            return true;
+
+        return false;
+    }
+
+    private static bool IsForwardGatePhaseMove(GateLifecyclePhase a, GateLifecyclePhase b)
+    {
+        if (a == b)
+            return false;
+        if (b == GateLifecyclePhase.PersistentMismatch || b == GateLifecyclePhase.FailClosed)
+            return false;
+        return b == GateLifecyclePhase.Reconciling && a == GateLifecyclePhase.DetectedBlocked
+               || (b == GateLifecyclePhase.StablePendingRelease &&
+                   (a == GateLifecyclePhase.Reconciling || a == GateLifecyclePhase.DetectedBlocked));
+    }
+
+    public static int ComputeSignatureHash32(GateProgressSignature s) => s.GetHashCode();
+
+    public static int CurrentBackoffIntervalMs(int backoffLevel)
+    {
+        var min = MismatchEscalationPolicy.GATE_RECONCILIATION_MIN_INTERVAL_MS;
+        var mult = MismatchEscalationPolicy.GATE_RECONCILIATION_BACKOFF_MULTIPLIER;
+        var max = MismatchEscalationPolicy.GATE_RECONCILIATION_MAX_INTERVAL_MS;
+        double acc = min;
+        for (var i = 0; i < backoffLevel; i++)
+            acc = Math.Min(max, acc * mult);
+        return (int)Math.Round(acc);
+    }
+
+    /// <summary>
+    /// Project gate phase after this tick's release readiness (mirrors AdvanceStateConsistencyGate release branch, without mutating state).
+    /// </summary>
+    public static GateLifecyclePhase ProjectGatePhaseForProgressSignature(
+        MismatchInstrumentState st,
+        StateConsistencyReleaseReadinessResult readiness)
+    {
+        if (st.EscalationState == MismatchEscalationState.FAIL_CLOSED ||
+            st.GateLifecyclePhase == GateLifecyclePhase.FailClosed)
+            return GateLifecyclePhase.FailClosed;
+
+        if (st.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH ||
+            st.GateLifecyclePhase == GateLifecyclePhase.PersistentMismatch)
+            return GateLifecyclePhase.PersistentMismatch;
+
+        if (!readiness.ReleaseReady)
+        {
+            if (st.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
+                return GateLifecyclePhase.Reconciling;
+            return st.GateLifecyclePhase;
+        }
+
+        if (st.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
+            return GateLifecyclePhase.StablePendingRelease;
+
+        return GateLifecyclePhase.StablePendingRelease;
+    }
 }

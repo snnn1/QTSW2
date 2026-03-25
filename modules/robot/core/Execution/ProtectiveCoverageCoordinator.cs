@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -27,6 +28,7 @@ public sealed class ProtectiveCoverageCoordinator
     private readonly Func<string, DateTimeOffset, FlattenResult>? _emergencyFlatten;
     private readonly RobotLogger? _log;
     private readonly ExecutionEventWriter? _eventWriter;
+    private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly Timer _auditTimer;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
 
@@ -48,7 +50,8 @@ public sealed class ProtectiveCoverageCoordinator
         RobotLogger? log,
         Func<ProtectiveCorrectiveRequest, ProtectiveCorrectiveResult>? submitCorrective = null,
         Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
-        ExecutionEventWriter? eventWriter = null)
+        ExecutionEventWriter? eventWriter = null,
+        RuntimeAuditHub? runtimeAudit = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -59,6 +62,7 @@ public sealed class ProtectiveCoverageCoordinator
         _emergencyFlatten = emergencyFlatten;
         _log = log;
         _eventWriter = eventWriter;
+        _runtimeAudit = runtimeAudit;
 
         _auditTimer = new Timer(OnAuditTick, null, ProtectiveAuditPolicy.PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS, ProtectiveAuditPolicy.PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS);
     }
@@ -80,9 +84,10 @@ public sealed class ProtectiveCoverageCoordinator
 
     private void OnAuditTick(object? _)
     {
+        var utcNow = DateTimeOffset.UtcNow;
+        var cpu = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
-            var utcNow = DateTimeOffset.UtcNow;
             var snapshot = _getSnapshot();
             var instruments = _getActiveInstruments();
 
@@ -121,6 +126,11 @@ public sealed class ProtectiveCoverageCoordinator
         {
             _log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "PROTECTIVE_AUDIT_FAILED", state: "ENGINE",
                 new { error = ex.Message, context = "ProtectiveCoverageCoordinator.OnAuditTick" }));
+        }
+        finally
+        {
+            if (cpu != 0)
+                _runtimeAudit?.CpuEnd(cpu, RuntimeAuditSubsystem.ProtectiveTimerTotal, instrument: "", stream: "", onIeaWorker: false);
         }
     }
 

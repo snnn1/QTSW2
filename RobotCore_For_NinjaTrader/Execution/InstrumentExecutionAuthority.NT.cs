@@ -7,6 +7,7 @@ using System.Threading;
 using NinjaTrader.Cbi;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -1360,7 +1361,16 @@ public sealed partial class InstrumentExecutionAuthority
         _currentWorkType = "AdoptionScan";
         try
         {
-            ScanAndAdoptExistingOrdersCore(source, ref tel);
+            var scanCpu = RuntimeAuditHubRef.Active != null ? RuntimeAuditHub.CpuStart() : 0L;
+            try
+            {
+                ScanAndAdoptExistingOrdersCore(source, ref tel);
+            }
+            finally
+            {
+                if (scanCpu != 0)
+                    RuntimeAuditHubRef.Active?.CpuEnd(scanCpu, RuntimeAuditSubsystem.IeaScan, ExecutionInstrumentKey, stream: "", onIeaWorker: true);
+            }
         }
         finally
         {

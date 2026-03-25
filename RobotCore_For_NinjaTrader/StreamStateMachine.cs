@@ -3163,13 +3163,14 @@ public sealed class StreamStateMachine
         // regardless of stream state. State should only gate decisions (e.g., range computation, execution),
         // not data ingestion. Bar timestamps represent bar end time for range window comparisons.
         
-        // DIAGNOSTIC: Log bar reception details (only if diagnostic logs enabled)
+        // DIAGNOSTIC: Log bar reception + admission proof (only if diagnostic logs enabled, rate-limited).
+        // BAR_ADMISSION_PROOF was previously unconditional and dominated log volume during busy windows.
         bool shouldLogBar = false;
         if (_enableDiagnosticLogs)
         {
-            shouldLogBar = !_lastBarDiagnosticTime.HasValue || 
+            shouldLogBar = !_lastBarDiagnosticTime.HasValue ||
                           (utcNow - _lastBarDiagnosticTime.Value).TotalSeconds >= _barDiagnosticRateLimitSeconds;
-            
+
             if (shouldLogBar)
             {
                 _lastBarDiagnosticTime = utcNow;
@@ -3189,6 +3190,28 @@ public sealed class StreamStateMachine
                         in_range_window = inRange,
                         bar_buffer_count = _barBuffer.Count,
                         time_until_slot_seconds = (SlotTimeUtc - utcNow).TotalSeconds
+                    }));
+
+                var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
+                var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_ADMISSION_PROOF", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
+                        instrument = Instrument,
+                        bar_time_raw_utc = barUtc.ToString("o"),
+                        bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
+                        bar_time_chicago = barChicagoTime.ToString("o"),
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        comparison_result = comparisonResult,
+                        comparison_detail = comparisonResult
+                            ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago <= slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
+                            : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss})]",
+                        bar_source = barSourceStr,
+                        note = "Diagnostic proof log (gated + rate-limited with BAR_RECEIVED_DIAGNOSTIC)"
                     }));
             }
         }
@@ -3228,31 +3251,7 @@ public sealed class StreamStateMachine
         // Range window is defined in Chicago time to match trading session semantics
         // State-independent buffering: Always buffer bars within range window regardless of state
         // CRITICAL FIX: Include slot_time bar (<= instead of <) so range lock check runs when slot_time bar arrives
-        
-        // DIAGNOSTIC: Proof log for 1-minute boundary investigation
-        // Log every bar admission decision with raw timestamp, Chicago time, comparison result, and source
-        var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
-        var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "BAR_ADMISSION_PROOF", State.ToString(),
-            new
-            {
-                stream_id = Stream,
-                canonical_instrument = CanonicalInstrument,
-                instrument = Instrument,
-                bar_time_raw_utc = barUtc.ToString("o"),
-                bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
-                bar_time_chicago = barChicagoTime.ToString("o"),
-                range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
-                comparison_result = comparisonResult,
-                comparison_detail = comparisonResult 
-                    ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago <= slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
-                    : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss})]",
-                bar_source = barSourceStr,
-                note = "Diagnostic proof log - bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)"
-            }));
-        
+
         if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime)
         {
                 // DEFENSIVE: Validate bar data before buffering

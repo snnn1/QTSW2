@@ -4,8 +4,10 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -23,6 +25,7 @@ public sealed class MismatchEscalationCoordinator
     private readonly Func<string, bool> _isRecoveryInProgress;
     private readonly RobotLogger? _log;
     private readonly ExecutionEventWriter? _eventWriter;
+    private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly Func<string, DateTimeOffset, GateReconciliationResult?>? _runInstrumentGateReconciliation;
     private readonly Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? _evaluateReleaseReadiness;
     private readonly int _stableWindowMs;
@@ -41,6 +44,20 @@ public sealed class MismatchEscalationCoordinator
     private int _mismatchRegistryMissingCount;
     private int _mismatchProtectiveDivergenceCount;
 
+    private readonly record struct GateReconciliationResultTelemetry(
+        bool ExpensiveInvoked,
+        bool ThrottleSuppressedExpensive,
+        int NoProgressIterations,
+        double? TimeSinceLastProgressMs,
+        bool WarmupDone,
+        string? NextAllowedExpensiveUtc,
+        int ProgressSignatureHash,
+        bool ExternalFingerprintChanged,
+        string? SkipReason,
+        int ExecutionCycleCount,
+        bool HardStopActive,
+        int TotalExpensiveSinceGateEngaged);
+
     public MismatchEscalationCoordinator(
         Func<AccountSnapshot> getSnapshot,
         Func<IReadOnlyList<string>> getActiveInstruments,
@@ -52,7 +69,8 @@ public sealed class MismatchEscalationCoordinator
         ExecutionEventWriter? eventWriter = null,
         Func<string, DateTimeOffset, GateReconciliationResult?>? runInstrumentGateReconciliation = null,
         Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? evaluateReleaseReadiness = null,
-        int stateConsistencyStableWindowMs = 0)
+        int stateConsistencyStableWindowMs = 0,
+        RuntimeAuditHub? runtimeAudit = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -62,6 +80,7 @@ public sealed class MismatchEscalationCoordinator
         _isRecoveryInProgress = isRecoveryInProgress ?? (_ => false);
         _log = log;
         _eventWriter = eventWriter;
+        _runtimeAudit = runtimeAudit;
         _runInstrumentGateReconciliation = runInstrumentGateReconciliation;
         _evaluateReleaseReadiness = evaluateReleaseReadiness;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
@@ -91,11 +110,58 @@ public sealed class MismatchEscalationCoordinator
         return _stateByInstrument.TryGetValue(instrument.Trim(), out var s) ? s.GateLifecyclePhase : GateLifecyclePhase.None;
     }
 
+    /// <summary>
+    /// Call from execution fills / order updates. Resets the per-burst expensive counter on structured state changes
+    /// (intent, fill delta, position qty change, entry→protectives); time-gap fallback only when <paramref name="details"/> is default.
+    /// </summary>
+    public void NotifyExecutionTrigger(string instrument, DateTimeOffset utcNow,
+        MismatchExecutionTriggerDetails details = default)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        var inst = instrument.Trim();
+        if (!_stateByInstrument.TryGetValue(inst, out var state)) return;
+        if (state.GateLifecyclePhase == GateLifecyclePhase.None) return;
+        var gp = state.GateProgress;
+
+        var resetBurst = false;
+        if (details.EntryToProtectivesTransition)
+            resetBurst = true;
+        if (!string.IsNullOrEmpty(details.IntentId))
+        {
+            if (!string.IsNullOrEmpty(gp.LastTriggerIntentId) &&
+                !string.Equals(details.IntentId, gp.LastTriggerIntentId, StringComparison.OrdinalIgnoreCase))
+                resetBurst = true;
+            gp.LastTriggerIntentId = details.IntentId;
+        }
+
+        if (details.FillDelta != 0)
+            resetBurst = true;
+
+        if (details.InstrumentPositionQty.HasValue)
+        {
+            if (gp.LastTriggerPositionQty.HasValue &&
+                gp.LastTriggerPositionQty.Value != details.InstrumentPositionQty.Value)
+                resetBurst = true;
+            gp.LastTriggerPositionQty = details.InstrumentPositionQty.Value;
+        }
+
+        if (!resetBurst && details.Equals(default) && gp.LastExecutionTriggerUtc != default &&
+            (utcNow - gp.LastExecutionTriggerUtc).TotalMilliseconds >
+            MismatchEscalationPolicy.GATE_EXECUTION_TRIGGER_RESET_GAP_MS)
+            resetBurst = true;
+
+        if (resetBurst)
+            gp.ReconciliationCyclesThisExecution = 0;
+
+        gp.LastExecutionTriggerUtc = utcNow;
+    }
+
     private void OnAuditTick(object? _)
     {
+        var utcNow = DateTimeOffset.UtcNow;
+        var cpu = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
-            var utcNow = DateTimeOffset.UtcNow;
             var snapshot = _getSnapshot();
             var instruments = _getActiveInstruments();
 
@@ -133,7 +199,10 @@ public sealed class MismatchEscalationCoordinator
             }
 
             foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
-                AdvanceStateConsistencyGate(inst, snapshot, utcNow);
+            {
+                obsByInstrument.TryGetValue(inst, out var gateObs);
+                AdvanceStateConsistencyGate(inst, snapshot, utcNow, gateObs);
+            }
 
             _lastAuditUtc = utcNow;
         }
@@ -141,6 +210,11 @@ public sealed class MismatchEscalationCoordinator
         {
             _log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
                 new { error = ex.Message, context = "MismatchEscalationCoordinator.OnAuditTick" }));
+        }
+        finally
+        {
+            if (cpu != 0)
+                _runtimeAudit?.CpuEnd(cpu, RuntimeAuditSubsystem.MismatchTimerTotal, instrument: "", stream: "", onIeaWorker: false);
         }
     }
 
@@ -214,6 +288,7 @@ public sealed class MismatchEscalationCoordinator
             state.StableWindowMsApplied = _stableWindowMs;
             state.FirstConsistentUtc = default;
             state.LastConsistentUtc = default;
+            state.GateProgress.Reset();
             _mismatchDetectedCount++;
             IncrementTypeMetric(obs.MismatchType);
             var detectedPayload = ToGatePayload(state, inst, utcNow, obs, null, null);
@@ -264,7 +339,8 @@ public sealed class MismatchEscalationCoordinator
         }
     }
 
-    private void AdvanceStateConsistencyGate(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow)
+    private void AdvanceStateConsistencyGate(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
+        MismatchObservation? latestObs)
     {
         if (!_stateByInstrument.TryGetValue(inst, out var state))
             return;
@@ -272,6 +348,15 @@ public sealed class MismatchEscalationCoordinator
             return;
         if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED)
             return;
+
+        var obsForSig = CoalesceGateObservation(inst, state, latestObs, utcNow);
+        var gp = state.GateProgress;
+
+        if (gp.ProgressHardStopped && utcNow >= gp.ProgressHardStopUntilUtc)
+        {
+            gp.ProgressHardStopped = false;
+            gp.ProgressHardStopUntilUtc = DateTimeOffset.MinValue;
+        }
 
         state.PersistenceMs = state.FirstDetectedUtc != default
             ? (long)(utcNow - state.FirstDetectedUtc).TotalMilliseconds
@@ -285,7 +370,7 @@ public sealed class MismatchEscalationCoordinator
             state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
             state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
             _mismatchPersistentCount++;
-            var p = ToGatePayload(state, inst, utcNow, null, null, null);
+            var p = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "ERROR");
         }
@@ -293,20 +378,149 @@ public sealed class MismatchEscalationCoordinator
         if (state.GateLifecyclePhase == GateLifecyclePhase.DetectedBlocked)
         {
             state.GateLifecyclePhase = GateLifecyclePhase.Reconciling;
-            var startPayload = ToGatePayload(state, inst, utcNow, null, null, null);
+            gp.TotalExpensiveSinceGateEngaged = 0;
+            var startPayload = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED", startPayload));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED", utcNow, startPayload, "INFO");
         }
 
-        GateReconciliationResult? recon = null;
+        // --- External fingerprint: reset throttle only on meaningful snapshot/mismatch change (hash can jitter on noise) ---
+        GetThrottleBaselineComponents(inst, snapshot, obsForSig, state, out var posQty, out var bwObs, out var lwObs,
+            out var mismatchType);
+        var fpNow = GateProgressEvaluator.BuildExternalFingerprint(inst, snapshot, obsForSig);
+        var externalFingerprintChanged = gp.LastExternalFingerprint != 0 && fpNow != gp.LastExternalFingerprint;
+        if (externalFingerprintChanged)
+        {
+            if (IsMeaningfulThrottleBaselineChange(gp, posQty, bwObs, lwObs, mismatchType))
+            {
+                EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_THROTTLE_RESET", new
+                {
+                    reason = "meaningful_external_change",
+                    signature_hash = GateProgressEvaluator.ComputeSignatureHash32(
+                        GateProgressEvaluator.BuildSignature(state, obsForSig,
+                            StateConsistencyReleaseEvaluator.Indeterminate(inst), null)),
+                    no_progress_iterations = gp.NoProgressIterations,
+                    backoff_level = gp.BackoffLevel
+                });
+                ResetGateThrottle(gp);
+                CaptureThrottleBaseline(gp, posQty, bwObs, lwObs, mismatchType);
+            }
+            else
+            {
+                EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_THROTTLE_PRESERVED", new
+                {
+                    reason = "noise_fingerprint_change",
+                    last_external_fingerprint = gp.LastExternalFingerprint,
+                    new_external_fingerprint = fpNow,
+                    no_progress_iterations = gp.NoProgressIterations,
+                    next_allowed_expensive_utc = gp.NextAllowedExpensiveReconciliationUtc != DateTimeOffset.MinValue
+                        ? gp.NextAllowedExpensiveReconciliationUtc.ToString("o")
+                        : null
+                });
+            }
+        }
+
+        gp.LastExternalFingerprint = fpNow;
+        if (!gp.ThrottleBaselineInitialized)
+            CaptureThrottleBaseline(gp, posQty, bwObs, lwObs, mismatchType);
+
+        StateConsistencyReleaseReadinessResult readinessProbe;
         try
         {
-            recon = _runInstrumentGateReconciliation?.Invoke(inst, utcNow);
+            readinessProbe = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
+                             ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
         }
         catch (Exception ex)
         {
             _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
-                new { error = ex.Message, context = "runInstrumentGateReconciliation", instrument = inst }));
+                new { error = ex.Message, context = "evaluateReleaseReadiness_probe", instrument = inst }));
+            readinessProbe = StateConsistencyReleaseEvaluator.Indeterminate(inst, "evaluate_exception");
+        }
+
+        var phaseProbe = GateProgressEvaluator.ProjectGatePhaseForProgressSignature(state, readinessProbe);
+        var sigProbe = GateProgressEvaluator.BuildSignature(state, obsForSig, readinessProbe, null, phaseProbe);
+        var warmupDone = gp.ExpensivePassesCompleted >= MismatchEscalationPolicy.GATE_PROGRESS_WARMUP_EXPENSIVE_PASSES;
+        var refProgressTime = gp.LastMeasurableProgressUtc ?? state.LastGateEngagedUtc;
+        var timeSinceProgressMs = refProgressTime != default
+            ? (utcNow - refProgressTime).TotalMilliseconds
+            : 0;
+        var noProgressTimeExceeded = warmupDone && timeSinceProgressMs >= MismatchEscalationPolicy.GATE_NO_PROGRESS_TIME_THRESHOLD_MS;
+        var noProgressIterExceeded = warmupDone &&
+                                     gp.NoProgressIterations >= MismatchEscalationPolicy.GATE_NO_PROGRESS_ITERATION_THRESHOLD;
+        var throttleScheduleActive = noProgressTimeExceeded || noProgressIterExceeded;
+        if (warmupDone && throttleScheduleActive && gp.NextAllowedExpensiveReconciliationUtc == DateTimeOffset.MinValue)
+        {
+            var interval = GateProgressEvaluator.CurrentBackoffIntervalMs(gp.BackoffLevel);
+            gp.NextAllowedExpensiveReconciliationUtc = utcNow.AddMilliseconds(interval);
+        }
+
+        var inCooldown = gp.NextAllowedExpensiveReconciliationUtc != DateTimeOffset.MinValue &&
+                         utcNow < gp.NextAllowedExpensiveReconciliationUtc;
+        var throttleScheduleSkip = warmupDone && throttleScheduleActive && inCooldown;
+        var hardStopSkip = gp.ProgressHardStopped && utcNow < gp.ProgressHardStopUntilUtc;
+        var executionCycleCapReached =
+            gp.ReconciliationCyclesThisExecution >= MismatchEscalationPolicy.GATE_EXECUTION_RECONCILIATION_CAP;
+        var reentryLoopNested = gp.InReconciliationLoop;
+        var reentryTooSoon = gp.LastReconciliationExitUtc != default &&
+                             (utcNow - gp.LastReconciliationExitUtc).TotalMilliseconds <
+                             MismatchEscalationPolicy.GATE_REENTRY_BLOCK_MS;
+        var reentrySkip = reentryLoopNested || reentryTooSoon;
+
+        var skipExpensive = throttleScheduleSkip || hardStopSkip || executionCycleCapReached || reentrySkip;
+
+        string? skipReason = null;
+        if (skipExpensive)
+        {
+            if (reentryLoopNested || reentryTooSoon)
+                skipReason = "reentry_loop_blocked";
+            else if (hardStopSkip)
+                skipReason = gp.TotalExpensiveSinceGateEngaged >=
+                             MismatchEscalationPolicy.GATE_ABSOLUTE_MAX_EXPENSIVE_RECONCILIATIONS
+                    ? "absolute_gate_lifetime_cap"
+                    : "hard_stop_active";
+            else if (executionCycleCapReached)
+                skipReason = "execution_cycle_cap_reached";
+            else if (throttleScheduleSkip)
+                skipReason = "throttle_cooldown";
+            else
+                skipReason = "skipped";
+        }
+
+        if (skipExpensive && executionCycleCapReached)
+            EmitExecutionCapIfNeeded(inst, utcNow, state, gp);
+        if (skipExpensive && (reentryLoopNested || reentryTooSoon))
+            EmitReentryBlockedIfNeeded(inst, utcNow, state, gp, reentryLoopNested, reentryTooSoon);
+
+        GateReconciliationResult? recon = null;
+        if (!skipExpensive)
+        {
+            try
+            {
+                gp.InReconciliationLoop = true;
+                try
+                {
+                    recon = _runInstrumentGateReconciliation?.Invoke(inst, utcNow);
+                }
+                catch (Exception ex)
+                {
+                    _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                        new { error = ex.Message, context = "runInstrumentGateReconciliation", instrument = inst }));
+                }
+            }
+            finally
+            {
+                gp.InReconciliationLoop = false;
+                gp.LastReconciliationExitUtc = utcNow;
+            }
+
+            gp.ExpensivePassesCompleted++;
+            gp.LastExpensiveReconciliationUtc = utcNow;
+            gp.ReconciliationCyclesThisExecution++;
+            gp.TotalExpensiveSinceGateEngaged++;
+        }
+        else if (throttleScheduleSkip)
+        {
+            EmitThrottledIfNeeded(inst, utcNow, state, gp, sigProbe);
         }
 
         StateConsistencyReleaseReadinessResult readiness;
@@ -325,7 +539,40 @@ public sealed class MismatchEscalationCoordinator
         if (recon != null)
             recon.ReleaseReadyAfter = readiness.ReleaseReady;
 
-        var resultPayload = ToGatePayload(state, inst, utcNow, null, recon, readiness);
+        GateProgressSignature? sigAfterNullable = null;
+        if (!skipExpensive)
+        {
+            var phaseForProgress = GateProgressEvaluator.ProjectGatePhaseForProgressSignature(state, readiness);
+            var sigAfter = GateProgressEvaluator.BuildSignature(state, obsForSig, readiness, recon, phaseForProgress);
+            sigAfterNullable = sigAfter;
+            UpdateProgressAfterExpensivePass(inst, utcNow, state, gp, sigAfter);
+        }
+
+        var refProgressForTelemetry = gp.LastMeasurableProgressUtc ?? state.LastGateEngagedUtc;
+        var timeSinceProgressTelemetryMs = refProgressForTelemetry != default
+            ? (utcNow - refProgressForTelemetry).TotalMilliseconds
+            : (double?)null;
+        var progressSigHash = GateProgressEvaluator.ComputeSignatureHash32(
+            sigAfterNullable ?? sigProbe);
+        var hardStopActive = gp.ProgressHardStopped && utcNow < gp.ProgressHardStopUntilUtc;
+        var resultTelemetry = new GateReconciliationResultTelemetry(
+            ExpensiveInvoked: !skipExpensive,
+            ThrottleSuppressedExpensive: skipExpensive,
+            NoProgressIterations: gp.NoProgressIterations,
+            TimeSinceLastProgressMs: timeSinceProgressTelemetryMs,
+            WarmupDone: warmupDone,
+            NextAllowedExpensiveUtc: gp.NextAllowedExpensiveReconciliationUtc != DateTimeOffset.MinValue
+                ? gp.NextAllowedExpensiveReconciliationUtc.ToString("o")
+                : null,
+            ProgressSignatureHash: progressSigHash,
+            ExternalFingerprintChanged: externalFingerprintChanged,
+            SkipReason: skipReason,
+            ExecutionCycleCount: gp.ReconciliationCyclesThisExecution,
+            HardStopActive: hardStopActive,
+            TotalExpensiveSinceGateEngaged: gp.TotalExpensiveSinceGateEngaged);
+
+        var resultPayload = ToGatePayloadWithResultTelemetry(state, inst, utcNow, obsForSig, recon, readiness, skipExpensive,
+            resultTelemetry);
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", resultPayload));
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", utcNow, resultPayload, "INFO");
 
@@ -346,7 +593,7 @@ public sealed class MismatchEscalationCoordinator
             {
                 var resetPayload = new
                 {
-                    gate = ToGatePayload(state, inst, utcNow, null, recon, readiness),
+                    gate = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness),
                     stable_reset_reason = readiness.Summary
                 };
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RESTABILIZATION_RESET", resetPayload));
@@ -363,7 +610,7 @@ public sealed class MismatchEscalationCoordinator
         {
             state.GateLifecyclePhase = GateLifecyclePhase.StablePendingRelease;
             state.FirstConsistentUtc = utcNow;
-            var spPayload = ToGatePayload(state, inst, utcNow, null, recon, readiness);
+            var spPayload = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", spPayload));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", utcNow, spPayload, "INFO");
             return;
@@ -384,17 +631,219 @@ public sealed class MismatchEscalationCoordinator
         state.FirstConsistentUtc = default;
         state.ConsecutiveCleanPassCount = 0;
         state.MismatchStillPresent = false;
+        state.GateProgress.Reset();
         _mismatchClearedCount++;
 
         var releasedPayload = new
         {
-            gate = ToGatePayload(state, inst, utcNow, null, recon, readiness),
+            gate = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness),
             stable_for_ms = stableMs,
             stable_window_ms = windowMs
         };
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RELEASED", releasedPayload));
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASED", utcNow, releasedPayload, "INFO");
-        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED", ToGatePayload(state, inst, utcNow, null, null, null)));
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED", ToGatePayload(state, inst, utcNow, obsForSig, null, null)));
+    }
+
+    private static MismatchObservation CoalesceGateObservation(string inst, MismatchInstrumentState state,
+        MismatchObservation? latest, DateTimeOffset utcNow)
+    {
+        if (latest != null)
+            return latest;
+        return new MismatchObservation
+        {
+            Instrument = inst,
+            MismatchType = state.MismatchType,
+            Present = state.MismatchStillPresent,
+            ObservedUtc = utcNow,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0
+        };
+    }
+
+    private void ResetGateThrottle(GateReconciliationProgressState gp)
+    {
+        gp.NoProgressIterations = 0;
+        gp.BackoffLevel = 0;
+        gp.NextAllowedExpensiveReconciliationUtc = DateTimeOffset.MinValue;
+        gp.LastProgressSignature = null;
+        gp.ReconciliationCyclesThisExecution = 0;
+        gp.ProgressHardStopped = false;
+        gp.ProgressHardStopUntilUtc = DateTimeOffset.MinValue;
+    }
+
+    private void EmitExecutionCapIfNeeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state,
+        GateReconciliationProgressState gp)
+    {
+        const int minEmitGapMs = 5000;
+        if (gp.LastExecutionCapEmitUtc != DateTimeOffset.MinValue &&
+            (utcNow - gp.LastExecutionCapEmitUtc).TotalMilliseconds < minEmitGapMs)
+            return;
+        EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_EXECUTION_CAP_REACHED", new
+        {
+            cap = MismatchEscalationPolicy.GATE_EXECUTION_RECONCILIATION_CAP,
+            reconciliation_cycles_this_execution = gp.ReconciliationCyclesThisExecution
+        });
+        gp.LastExecutionCapEmitUtc = utcNow;
+    }
+
+    private void EmitReentryBlockedIfNeeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state,
+        GateReconciliationProgressState gp, bool nested, bool tooSoon)
+    {
+        const int minEmitGapMs = 2000;
+        if (gp.LastReentryBlockEmitUtc != DateTimeOffset.MinValue &&
+            (utcNow - gp.LastReentryBlockEmitUtc).TotalMilliseconds < minEmitGapMs)
+            return;
+        EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_REENTRY_BLOCKED", new
+        {
+            nested_reconciliation_loop = nested,
+            within_reentry_window_ms = tooSoon,
+            reentry_block_ms = MismatchEscalationPolicy.GATE_REENTRY_BLOCK_MS
+        });
+        gp.LastReentryBlockEmitUtc = utcNow;
+    }
+
+    private void EmitThrottledIfNeeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state,
+        GateReconciliationProgressState gp, GateProgressSignature sigProbe)
+    {
+        const int minEmitGapMs = 5000;
+        if (gp.LastEmittedThrottleKind == "RECONCILIATION_THROTTLED" &&
+            (utcNow - gp.LastThrottleEmitUtc).TotalMilliseconds < minEmitGapMs)
+            return;
+
+        var nextMs = (gp.NextAllowedExpensiveReconciliationUtc - utcNow).TotalMilliseconds;
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            signature_hash = GateProgressEvaluator.ComputeSignatureHash32(sigProbe),
+            no_progress_iterations = gp.NoProgressIterations,
+            time_since_last_progress_ms = gp.LastMeasurableProgressUtc != null
+                ? (utcNow - gp.LastMeasurableProgressUtc.Value).TotalMilliseconds
+                : (double?)null,
+            backoff_interval_ms = GateProgressEvaluator.CurrentBackoffIntervalMs(gp.BackoffLevel),
+            next_allowed_in_ms = nextMs,
+            next_allowed_expensive_utc = gp.NextAllowedExpensiveReconciliationUtc != DateTimeOffset.MinValue
+                ? gp.NextAllowedExpensiveReconciliationUtc.ToString("o")
+                : null,
+            backoff_level = gp.BackoffLevel
+        };
+        EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_THROTTLED", payload);
+        gp.LastThrottleEmitUtc = utcNow;
+        gp.LastEmittedThrottleKind = "RECONCILIATION_THROTTLED";
+    }
+
+    private void UpdateProgressAfterExpensivePass(string inst, DateTimeOffset utcNow, MismatchInstrumentState state,
+        GateReconciliationProgressState gp, GateProgressSignature sigAfter)
+    {
+        var hash = GateProgressEvaluator.ComputeSignatureHash32(sigAfter);
+        if (gp.LastProgressSignature == null)
+        {
+            gp.LastProgressSignature = sigAfter;
+            return;
+        }
+
+        var prev = gp.LastProgressSignature.Value;
+        if (GateProgressEvaluator.IsMeasurableProgress(prev, sigAfter))
+        {
+            gp.LastMeasurableProgressUtc = utcNow;
+            gp.NoProgressIterations = 0;
+            gp.BackoffLevel = 0;
+            gp.NextAllowedExpensiveReconciliationUtc = DateTimeOffset.MinValue;
+            gp.ProgressHardStopped = false;
+            gp.ProgressHardStopUntilUtc = DateTimeOffset.MinValue;
+            gp.LastProgressSignature = sigAfter;
+            EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_PROGRESS_OBSERVED", new
+            {
+                kind = "measurable",
+                signature_hash = hash,
+                gate_phase = state.GateLifecyclePhase.ToString(),
+                no_progress_iterations = 0,
+                prior_signature_hash = GateProgressEvaluator.ComputeSignatureHash32(prev)
+            });
+            EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_THROTTLE_BACKOFF_UPDATED", new
+            {
+                backoff_level = 0,
+                next_interval_ms = MismatchEscalationPolicy.GATE_RECONCILIATION_MIN_INTERVAL_MS,
+                reason = "progress"
+            });
+            return;
+        }
+
+        gp.NoProgressIterations++;
+        gp.LastProgressSignature = sigAfter;
+        var warmupDone = gp.ExpensivePassesCompleted >= MismatchEscalationPolicy.GATE_PROGRESS_WARMUP_EXPENSIVE_PASSES;
+        var refProgressTime = gp.LastMeasurableProgressUtc ?? state.LastGateEngagedUtc;
+        var timeSinceProgressMs = refProgressTime != default
+            ? (utcNow - refProgressTime).TotalMilliseconds
+            : 0;
+        var noProgressTimeExceeded = warmupDone && timeSinceProgressMs >= MismatchEscalationPolicy.GATE_NO_PROGRESS_TIME_THRESHOLD_MS;
+        var noProgressIterExceeded = warmupDone &&
+                                     gp.NoProgressIterations >= MismatchEscalationPolicy.GATE_NO_PROGRESS_ITERATION_THRESHOLD;
+
+        const int noProgressEmitMinGapMs = 4000;
+        if (gp.LastNoProgressEmitUtc == DateTimeOffset.MinValue ||
+            (utcNow - gp.LastNoProgressEmitUtc).TotalMilliseconds >= noProgressEmitMinGapMs)
+        {
+            EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_NO_PROGRESS_DETECTED", new
+            {
+                signature_hash = hash,
+                no_progress_iterations = gp.NoProgressIterations,
+                time_since_last_progress_ms = timeSinceProgressMs,
+                iteration_threshold_hit = noProgressIterExceeded,
+                time_threshold_hit = noProgressTimeExceeded
+            });
+            gp.LastNoProgressEmitUtc = utcNow;
+        }
+
+        if (warmupDone && (noProgressIterExceeded || noProgressTimeExceeded))
+        {
+            var interval = GateProgressEvaluator.CurrentBackoffIntervalMs(gp.BackoffLevel);
+            gp.NextAllowedExpensiveReconciliationUtc = utcNow.AddMilliseconds(interval);
+            EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_THROTTLE_BACKOFF_UPDATED", new
+            {
+                backoff_level = gp.BackoffLevel,
+                next_interval_ms = interval,
+                next_allowed_utc = gp.NextAllowedExpensiveReconciliationUtc.ToString("o"),
+                reason = noProgressIterExceeded ? "no_progress_iterations" : "no_progress_time"
+            });
+            gp.BackoffLevel = Math.Min(gp.BackoffLevel + 1, 12);
+        }
+
+        if (warmupDone &&
+            gp.NoProgressIterations >= MismatchEscalationPolicy.GATE_HARD_STOP_NO_PROGRESS_ITERATIONS &&
+            timeSinceProgressMs >= MismatchEscalationPolicy.GATE_HARD_STOP_NO_PROGRESS_TIME_MS)
+        {
+            if (!gp.ProgressHardStopped)
+            {
+                gp.ProgressHardStopped = true;
+                gp.ProgressHardStopUntilUtc =
+                    utcNow.AddMilliseconds(MismatchEscalationPolicy.GATE_HARD_STOP_DURATION_MS);
+                EmitGateProgressControlEvent(inst, utcNow, state, "RECONCILIATION_HARD_STOPPED", new
+                {
+                    no_progress_iterations = gp.NoProgressIterations,
+                    time_since_last_progress_ms = timeSinceProgressMs,
+                    hard_stop_until_utc = gp.ProgressHardStopUntilUtc.ToString("o"),
+                    duration_ms = MismatchEscalationPolicy.GATE_HARD_STOP_DURATION_MS
+                });
+            }
+        }
+    }
+
+    private void EmitGateProgressControlEvent(string inst, DateTimeOffset utcNow, MismatchInstrumentState state,
+        string eventType, object payload)
+    {
+        var merged = new Dictionary<string, object?>
+        {
+            ["instrument"] = inst,
+            ["gate_phase"] = state.GateLifecyclePhase.ToString(),
+            ["timestamp_utc"] = utcNow.ToString("o")
+        };
+        foreach (var p in payload.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            merged[p.Name] = p.GetValue(payload);
+
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, eventType, merged));
+        EmitCanonical(inst, eventType, utcNow, merged, "INFO");
     }
 
     private object ToGatePayload(
@@ -403,7 +852,8 @@ public sealed class MismatchEscalationCoordinator
         DateTimeOffset utcNow,
         MismatchObservation? obs,
         GateReconciliationResult? recon,
-        StateConsistencyReleaseReadinessResult? readiness)
+        StateConsistencyReleaseReadinessResult? readiness,
+        bool gateReconciliationThrottled = false)
     {
         var mismatchAge = state.FirstDetectedUtc != default
             ? (long)(utcNow - state.FirstDetectedUtc).TotalMilliseconds
@@ -456,8 +906,125 @@ public sealed class MismatchEscalationCoordinator
             mismatch_type = state.MismatchType.ToString(),
             persistence_ms = state.PersistenceMs,
             timestamp_utc = utcNow.ToString("o"),
-            gate_action_policy = StateConsistencyGateActionPolicy.PolicyNote
+            gate_action_policy = StateConsistencyGateActionPolicy.PolicyNote,
+            gate_reconciliation_throttled = gateReconciliationThrottled
         };
+    }
+
+    private object ToGatePayloadWithResultTelemetry(
+        MismatchInstrumentState state,
+        string instrument,
+        DateTimeOffset utcNow,
+        MismatchObservation? obs,
+        GateReconciliationResult? recon,
+        StateConsistencyReleaseReadinessResult? readiness,
+        bool gateReconciliationThrottled,
+        GateReconciliationResultTelemetry telemetry)
+    {
+        var mismatchAge = state.FirstDetectedUtc != default
+            ? (long)(utcNow - state.FirstDetectedUtc).TotalMilliseconds
+            : 0L;
+        var stableFor = state.FirstConsistentUtc != default && state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease
+            ? (long)(utcNow - state.FirstConsistentUtc).TotalMilliseconds
+            : 0L;
+
+        return new
+        {
+            instrument,
+            gate_state = state.GateLifecyclePhase.ToString(),
+            escalation_state = state.EscalationState.ToString(),
+            mismatch_age_ms = mismatchAge,
+            blocked = state.Blocked,
+            block_reason = state.BlockReason,
+            broker_position_qty = obs?.BrokerQty ?? 0,
+            broker_working_count = obs?.BrokerWorkingOrderCount ?? 0,
+            iea_owned_count = obs?.LocalWorkingOrderCount,
+            iea_adopted_count = (int?)null,
+            pending_adoption_count = (int?)null,
+            unexplained_working_count = readiness?.UnexplainedBrokerWorkingCount,
+            unexplained_position_qty = readiness?.UnexplainedBrokerPositionQty,
+            release_ready = readiness?.ReleaseReady,
+            stable_for_ms = stableFor,
+            stable_window_ms = state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs,
+            reconciliation_outcome = recon == null
+                ? null
+                : new
+                {
+                    recon.Mode,
+                    recon.OutcomeStatus,
+                    recon.BrokerWorkingCountBefore,
+                    recon.BrokerWorkingCountAfter,
+                    recon.IeaOwnedCountBefore,
+                    recon.IeaOwnedCountAfter,
+                    recon.AdoptionCandidateCountBefore,
+                    recon.AdoptionCandidateCountAfter,
+                    recon.UnexplainedWorkingCountAfter,
+                    recon.UnexplainedPositionQtyAfter,
+                    recon.ReleaseReadyAfter,
+                    recon.Reason,
+                    recon.DurationMs,
+                    recon.RunnerInvoked
+                },
+            readiness_summary = readiness?.Summary,
+            readiness_contradictions = readiness?.Contradictions,
+            broker_qty = obs?.BrokerQty ?? 0,
+            local_qty = obs?.LocalQty ?? 0,
+            mismatch_type = state.MismatchType.ToString(),
+            persistence_ms = state.PersistenceMs,
+            timestamp_utc = utcNow.ToString("o"),
+            gate_action_policy = StateConsistencyGateActionPolicy.PolicyNote,
+            gate_reconciliation_throttled = gateReconciliationThrottled,
+            expensive_invoked = telemetry.ExpensiveInvoked,
+            throttle_suppressed_expensive = telemetry.ThrottleSuppressedExpensive,
+            skip_reason = telemetry.SkipReason,
+            no_progress_iterations = telemetry.NoProgressIterations,
+            time_since_last_progress_ms = telemetry.TimeSinceLastProgressMs,
+            warmup_done = telemetry.WarmupDone,
+            next_allowed_expensive_utc = telemetry.NextAllowedExpensiveUtc,
+            progress_signature_hash = telemetry.ProgressSignatureHash,
+            external_fingerprint_changed = telemetry.ExternalFingerprintChanged,
+            execution_cycle_count = telemetry.ExecutionCycleCount,
+            hard_stop_active = telemetry.HardStopActive,
+            total_expensive_since_gate_engaged = telemetry.TotalExpensiveSinceGateEngaged
+        };
+    }
+
+    private static void GetThrottleBaselineComponents(string inst, AccountSnapshot snapshot, MismatchObservation? obs,
+        MismatchInstrumentState st, out int posQty, out int bw, out int lw, out MismatchType mt)
+    {
+        posQty = 0;
+        if (snapshot.Positions != null)
+        {
+            var p = snapshot.Positions.FirstOrDefault(x =>
+                string.Equals(x.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+            if (p != null)
+                posQty = p.Quantity;
+        }
+
+        bw = obs?.BrokerWorkingOrderCount ?? 0;
+        lw = obs?.LocalWorkingOrderCount ?? 0;
+        mt = st.MismatchType;
+    }
+
+    private static bool IsMeaningfulThrottleBaselineChange(GateReconciliationProgressState gp, int posQty, int bw, int lw,
+        MismatchType mt)
+    {
+        if (!gp.ThrottleBaselineInitialized)
+            return false;
+        return posQty != gp.ThrottleBaselinePositionQty
+            || bw != gp.ThrottleBaselineBrokerWorking
+            || lw != gp.ThrottleBaselineLocalWorking
+            || mt != gp.ThrottleBaselineMismatchType;
+    }
+
+    private static void CaptureThrottleBaseline(GateReconciliationProgressState gp, int posQty, int bw, int lw,
+        MismatchType mt)
+    {
+        gp.ThrottleBaselinePositionQty = posQty;
+        gp.ThrottleBaselineBrokerWorking = bw;
+        gp.ThrottleBaselineLocalWorking = lw;
+        gp.ThrottleBaselineMismatchType = mt;
+        gp.ThrottleBaselineInitialized = true;
     }
 
     private void IncrementTypeMetric(MismatchType type)
@@ -482,7 +1049,7 @@ public sealed class MismatchEscalationCoordinator
 
     /// <summary>For P1.5 tests: advance gate for one instrument (same as audit tail).</summary>
     internal void AdvanceStateConsistencyGateForTest(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow) =>
-        AdvanceStateConsistencyGate(instrument.Trim(), snapshot, utcNow);
+        AdvanceStateConsistencyGate(instrument.Trim(), snapshot, utcNow, null);
 
     internal void SetStableWindowForTest(int ms)
     {

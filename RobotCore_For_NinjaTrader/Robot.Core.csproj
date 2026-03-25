@@ -39,5 +39,7 @@
     <Compile Include="..\modules\robot\core\Execution\RecoveryNoProgressSkipEvaluator.cs" Link="Execution\RecoveryNoProgressSkipEvaluator.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
     <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
+    <Compile Include="..\modules\robot\core\Diagnostics\RuntimeAudit.cs" Link="Diagnostics\RuntimeAudit.cs" />
+    <Compile Include="..\modules\robot\core\Diagnostics\ExecutionTraceWriter.cs" Link="Diagnostics\ExecutionTraceWriter.cs" />
   </ItemGroup>
 </Project>

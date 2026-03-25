@@ -14,6 +14,7 @@ using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
 using NinjaTrader.Cbi;
 using NinjaTrader.NinjaScript;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -973,10 +974,26 @@ public sealed partial class NinjaTraderSimAdapter
         // Get tag/name (try Tag first, fallback to Name)
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
-        if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
-
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
+        var instrumentTrace = order.Instrument?.MasterInstrument?.Name ?? "";
+        var orderIdTrace = order.OrderId ?? "";
+        _executionTrace?.WriteExecutionTrace(utcNow, "OnOrderUpdate", "raw_callback", instrumentTrace, intentId ?? "",
+            orderIdTrace, "", 0, orderState.ToString());
+
+        if (TrySkipDuplicateOrderUpdate50ms(instrumentTrace, orderIdTrace, orderState.ToString(), utcNow, out var orderDedupSkips))
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrumentTrace, "ORDER_UPDATE_DEDUP_SKIPPED", new
+            {
+                order_id = orderIdTrace,
+                order_state = orderState.ToString(),
+                skipped_count = orderDedupSkips,
+                window_ms = 50
+            }));
+            return;
+        }
+
+        if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
 
         // ORPHAN DETECTION: Order update for protective order whose intent is already completed
         var isProtective = !string.IsNullOrEmpty(encodedTag) &&
@@ -1016,6 +1033,12 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
             return;
         }
+
+        _onMismatchExecutionTrigger?.Invoke(orderInfo.Instrument.Trim(), utcNow, new MismatchExecutionTriggerDetails
+        {
+            IntentId = intentId,
+            FillDelta = 0
+        });
 
         // Update journal based on order state
         if (orderState == OrderState.Accepted)
@@ -1548,8 +1571,30 @@ public sealed partial class NinjaTraderSimAdapter
 
         var encodedTag = GetOrderTag(order);
         var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
+        string? execIdTrace = null;
+        try { dynamic dex = execution; execIdTrace = dex.ExecutionId as string; } catch { }
+        int fillQtyTrace = 0;
+        try { fillQtyTrace = (int)execution.Quantity; } catch { }
         var utcNow = DateTimeOffset.UtcNow;
-        
+        var instTrace = order.Instrument?.MasterInstrument?.Name ?? "";
+        _executionTrace?.WriteExecutionTrace(utcNow, "OnExecutionUpdate", "raw_callback", instTrace, intentId ?? "",
+            order.OrderId ?? "", execIdTrace ?? "", fillQtyTrace, order.OrderState.ToString());
+
+        var ordStateDedup = order.OrderState.ToString();
+        if (TrySkipDuplicateExecutionUpdate50ms(instTrace, execIdTrace, fillQtyTrace, ordStateDedup, utcNow, out var execDedupSkips))
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instTrace, "EXECUTION_DEDUP_SKIPPED", new
+            {
+                execution_id = execIdTrace ?? "",
+                broker_order_id = order.OrderId,
+                order_state = ordStateDedup,
+                fill_qty = fillQtyTrace,
+                skipped_count = execDedupSkips,
+                window_ms = 50
+            }));
+            return;
+        }
+
         var fillPrice = (decimal)execution.Price;
         var fillQuantity = execution.Quantity;
         
@@ -1878,6 +1923,22 @@ public sealed partial class NinjaTraderSimAdapter
                 return; // Fail-closed: don't process untracked fill
             }
         }
+
+        var instFill = orderInfo.Instrument.Trim();
+        var bid = order.OrderId ?? "";
+        string? brokerExecIdFill = null;
+        try { dynamic d = execution; brokerExecIdFill = d.ExecutionId as string; } catch { }
+        _executionTrace?.WriteExecutionTrace(utcNow, "Fill", "raw_callback", instFill, intentId, bid,
+            brokerExecIdFill ?? "", fillQuantity, order.OrderState.ToString());
+        _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "before_notify", instFill, intentId, bid,
+            brokerExecIdFill ?? "", fillQuantity, order.OrderState.ToString());
+        _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
+        {
+            IntentId = intentId,
+            FillDelta = fillQuantity
+        });
+        _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId, bid,
+            brokerExecIdFill ?? "", fillQuantity, order.OrderState.ToString());
 
         // Track cumulative fills for partial-fill safety
         orderInfo.FilledQuantity += fillQuantity;
@@ -4850,6 +4911,66 @@ public sealed partial class NinjaTraderSimAdapter
         catch
         {
             return 0;
+        }
+    }
+
+    private bool TrySkipDuplicateOrderUpdate50ms(string instrument, string orderId, string orderState, DateTimeOffset utcNow, out long skippedCount)
+    {
+        skippedCount = 0;
+        var inst = string.IsNullOrEmpty(instrument) ? "_" : instrument.Trim();
+        var oid = orderId ?? "";
+        var key = inst + "|" + oid + "|" + orderState;
+        lock (_callbackDedupLock)
+        {
+            if (_orderCallbackDedup50ms.TryGetValue(key, out var ent))
+            {
+                if ((utcNow - ent.LastUtc).TotalMilliseconds < 50.0)
+                {
+                    ent.TotalSkips++;
+                    skippedCount = ent.TotalSkips;
+                    return true;
+                }
+                ent.LastUtc = utcNow;
+                ent.TotalSkips = 0;
+                return false;
+            }
+            _orderCallbackDedup50ms[key] = new OrderCallbackDedupEntry { LastUtc = utcNow, TotalSkips = 0 };
+            return false;
+        }
+    }
+
+    private bool TrySkipDuplicateExecutionUpdate50ms(string instrument, string? executionId, int fillQty, string orderState, DateTimeOffset utcNow, out long skippedCount)
+    {
+        skippedCount = 0;
+        var inst = string.IsNullOrEmpty(instrument) ? "_" : instrument.Trim();
+        var execPart = string.IsNullOrWhiteSpace(executionId) ? "noid" : executionId.Trim();
+        var key = inst + "|" + execPart;
+        lock (_callbackDedupLock)
+        {
+            if (_executionCallbackDedup50ms.TryGetValue(key, out var ent))
+            {
+                if (ent.LastFillQty == fillQty &&
+                    string.Equals(ent.LastOrderState, orderState, StringComparison.Ordinal) &&
+                    (utcNow - ent.LastUtc).TotalMilliseconds < 50.0)
+                {
+                    ent.TotalSkips++;
+                    skippedCount = ent.TotalSkips;
+                    return true;
+                }
+                ent.LastFillQty = fillQty;
+                ent.LastOrderState = orderState;
+                ent.LastUtc = utcNow;
+                ent.TotalSkips = 0;
+                return false;
+            }
+            _executionCallbackDedup50ms[key] = new ExecutionCallbackDedupEntry
+            {
+                LastFillQty = fillQty,
+                LastOrderState = orderState,
+                LastUtc = utcNow,
+                TotalSkips = 0
+            };
+            return false;
         }
     }
 }

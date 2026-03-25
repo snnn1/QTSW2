@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -151,6 +152,11 @@ public sealed partial class InstrumentExecutionAuthority
                 Interlocked.Increment(ref _supervisoryCooldownTotal);
             }
 
+            // Already in target (e.g. COOLDOWN + repeated cooldown escalation): ValidSupervisoryTransitions
+            // does not include (COOLDOWN, COOLDOWN) — skip rather than emitting SUPERVISORY_STATE_TRANSITION_INVALID.
+            if (current == target)
+                return;
+
             if (TrySupervisoryTransition(current, target, instrument, utcNow))
             {
                 _supervisoryState = target;
@@ -236,6 +242,7 @@ public sealed partial class InstrumentExecutionAuthority
             to_state = to.ToString(),
             iea_instance_id = InstanceId
         }));
+        RuntimeAuditHubRef.Active?.NotifySupervisoryStateTransitionInvalid(utcNow);
         return false;
     }
 

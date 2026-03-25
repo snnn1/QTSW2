@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -281,13 +282,26 @@ public sealed partial class InstrumentExecutionAuthority
         {
             try
             {
+                var waitStart = RuntimeAuditHubRef.Active != null ? RuntimeAuditHub.CpuStart() : 0L;
                 if (_executionQueue.TryTake(out var work, 1000))
                 {
+                    if (waitStart != 0)
+                        RuntimeAuditHubRef.Active?.RecordIeaIdleMs(RuntimeAuditHub.CpuElapsedMs(waitStart));
+                    RuntimeAuditHubRef.Active?.NotifyIeaDequeue();
                     var workStartUtc = DateTimeOffset.UtcNow;
                     _currentWorkStartedUtc = workStartUtc;
                     try
                     {
-                        work();
+                        var ieaCpu = RuntimeAuditHubRef.Active != null ? RuntimeAuditHub.CpuStart() : 0L;
+                        try
+                        {
+                            work();
+                        }
+                        finally
+                        {
+                            if (ieaCpu != 0)
+                                RuntimeAuditHubRef.Active?.CpuEnd(ieaCpu, RuntimeAuditSubsystem.IeaWorkTotal, ExecutionInstrumentKey, stream: "", onIeaWorker: true);
+                        }
                         if (_pendingRecoveryAdoptionMutationAlignUtc.HasValue)
                         {
                             var aligned = _pendingRecoveryAdoptionMutationAlignUtc.Value;
@@ -317,6 +331,8 @@ public sealed partial class InstrumentExecutionAuthority
                     RecordDequeueForProof(DateTimeOffset.UtcNow);
                     EmitHeartbeatIfDue();
                 }
+                else if (waitStart != 0)
+                    RuntimeAuditHubRef.Active?.RecordIeaIdleMs(RuntimeAuditHub.CpuElapsedMs(waitStart));
             }
             catch (Exception ex)
             {
@@ -402,6 +418,7 @@ public sealed partial class InstrumentExecutionAuthority
                     _currentWorkType = "";
                 }
             });
+            RuntimeAuditHubRef.Active?.NotifyIeaEnqueue();
             RecordEnqueueForProof(DateTimeOffset.UtcNow);
         }
         catch (InvalidOperationException) { /* queue completed */ }

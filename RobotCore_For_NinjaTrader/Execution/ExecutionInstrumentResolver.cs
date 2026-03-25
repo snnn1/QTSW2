@@ -51,6 +51,7 @@ public static class ExecutionInstrumentResolver
     /// INVARIANT: Matching logic only. NEVER use for IEA registry keying or authority scoping.
     /// Registry key is (accountName, executionInstrumentKey) — exact string from ResolveExecutionInstrumentKey.
     /// MNQ IEA and NQ IEA are separate authorities; IsSameInstrument must not merge them.
+    /// Pairing is explicit in <see cref="GetCanonicalForInstrumentMatch"/> (micro vs root only) — unrelated symbols do not collide.
     /// </summary>
     public static bool IsSameInstrument(string? a, string? b)
     {

@@ -1,0 +1,159 @@
+{
+  "audit_date": "2026-01-01",
+  "confidence": "LOW",
+  "confidence_enforced_status": "WARNING",
+  "domains": {
+    "connectivity": {
+      "metrics": {
+        "disconnects": 0,
+        "max_downtime_s": 0.0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    },
+    "execution": {
+      "metrics": {
+        "adoption_scan_max_ms": 0,
+        "max_queue_wait_ms": 0,
+        "timeouts_or_overflow": 0
+      },
+      "status": "HEALTHY",
+      "timeline_refs": []
+    },
+    "performance": {
+      "metrics": null,
+      "status": "UNKNOWN",
+      "timeline_refs": []
+    },
+    "protection": {
+      "metrics": {
+        "protective_failed": 0,
+        "protective_ok": 0
+      },
+      "status": "OK",
+      "timeline_refs": []
+    },
+    "reconciliation": {
+      "metrics": {
+        "converged": 0,
+        "convergence_rate_pct": null,
+        "oscillation_events": 0,
+        "passes": 0,
+        "stuck_events": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    },
+    "safety": {
+      "critical_findings": [],
+      "metrics": {
+        "fail_closed_count": 0,
+        "gate_engaged_count": 0,
+        "registry_divergence_count": 0,
+        "total_mismatch_signals": 0
+      },
+      "status": "OK",
+      "timeline_refs": []
+    },
+    "supervisory": {
+      "metrics": {
+        "escalated": 0,
+        "invalid_transitions": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    }
+  },
+  "drift": null,
+  "drift_risk": "NONE",
+  "generated_at_utc": "2026-03-24T22:12:52.742076Z",
+  "incident_chains": [],
+  "meta": {
+    "audit_mode": "PARTIAL",
+    "domains_complete": false,
+    "drift_disabled_reason": "prior_engine_full_days_below_min",
+    "engine_active": false,
+    "engine_activity_detected": false,
+    "engine_full": false,
+    "engine_lines_in_window": 0,
+    "events_deduped": 0,
+    "events_used": 2,
+    "files_read": 66,
+    "journal_snapshots_used": 2,
+    "lines_read": 0,
+    "logical_processor_count": 12,
+    "min_engine_full_days_for_drift": 5,
+    "parallelism_normalized_max": null,
+    "parse_error_rate": 1690.0,
+    "parse_errors_count": 1690,
+    "partial_reason": "insufficient_engine_lines_or_activity",
+    "prior_engine_full_days": 0,
+    "source_fallback": false,
+    "source_fallback_reason": null,
+    "source_primary": "robot",
+    "timeline_compressed_lines": 1,
+    "timeline_max_entries": 400,
+    "timeline_raw_events": 2,
+    "timeline_truncated": false,
+    "watchdog_crosscheck": {
+      "available": true,
+      "divergence": false,
+      "max_count_delta": 0,
+      "pairs_compared": [
+        "CONNECTION_LOST",
+        "ENGINE_STALLED",
+        "RECONCILIATION_QTY_MISMATCH"
+      ]
+    }
+  },
+  "overall_status": "OK",
+  "schema_version": "1.0",
+  "silent_failure": {
+    "detected": false,
+    "signals": []
+  },
+  "summary": {
+    "dominant_subsystem": null,
+    "first_failure": null,
+    "max_cpu_parallelism_normalized": null,
+    "max_cpu_parallelism_raw": null,
+    "recovery_quality": {
+      "avg_recovery_time_ms": null,
+      "chains_classified_degraded": 0,
+      "chains_classified_failed": 0,
+      "chains_classified_normal": 0,
+      "failed_recoveries": 0,
+      "max_recovery_time_ms": null,
+      "mismatch_to_recovery_max_ms": null,
+      "mismatch_to_recovery_median_ms": null,
+      "successful_recoveries": 0
+    },
+    "total_disconnects": 0,
+    "total_mismatches": 0,
+    "total_trades": null
+  },
+  "timeline": {
+    "compressed_entries": [
+      {
+        "critical": false,
+        "display_end_chicago": "11:00:00",
+        "display_start_chicago": "11:00:00",
+        "end_utc": "2026-01-01T17:00:00Z",
+        "event": "EXECUTION_JOURNAL_SNAPSHOT",
+        "instrument": "",
+        "start_utc": "2026-01-01T17:00:00Z",
+        "summary": "journal_snapshot (\u00d72 in 120s)"
+      }
+    ],
+    "critical_periods": []
+  },
+  "timezone": "chicago",
+  "trade_readiness": {
+    "blocking_factors": [
+      "CONFIDENCE_ENFORCED_WARNING",
+      "PARTIAL_AUDIT_MODE"
+    ],
+    "decision": "CAUTION",
+    "reason": "Elevated risk: review enforced status, execution, or drift."
+  }
+}

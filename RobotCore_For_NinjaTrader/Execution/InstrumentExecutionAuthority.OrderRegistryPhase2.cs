@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using NinjaTrader.Cbi;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -97,6 +98,9 @@ public sealed partial class InstrumentExecutionAuthority
         var account = Executor?.GetAccount() as Account;
         if (account?.Orders == null) return;
 
+        var regCpu = RuntimeAuditHubRef.Active != null ? RuntimeAuditHub.CpuStart() : 0L;
+        try
+        {
         var sw = Stopwatch.StartNew();
         var accountOrdersTotal = account.Orders.Count;
         var ordersScannedPass1 = 0;
@@ -217,6 +221,12 @@ public sealed partial class InstrumentExecutionAuthority
                     supervisory_requests_emitted = supervisoryRequestsEmitted,
                     note = "Rate-limited / thresholded proof diag for VerifyRegistryIntegrity"
                 }));
+        }
+        }
+        finally
+        {
+            if (regCpu != 0)
+                RuntimeAuditHubRef.Active?.CpuEnd(regCpu, RuntimeAuditSubsystem.RegistryVerify, ExecutionInstrumentKey, stream: "", onIeaWorker: true);
         }
     }
 

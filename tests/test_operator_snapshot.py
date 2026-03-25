@@ -166,13 +166,23 @@ class TestOperatorSnapshot:
         assert snap["MES"]["exposure"]["quantity"] == 1
         assert snap["MES"]["exposure"]["source"] == "journal"
 
-    def test_ownership_strict_journal_not_proven(self):
-        """Journal exposure alone does NOT imply PROVEN (restart/adoption-failed case)."""
+    def test_journal_open_exposure_implies_proven_ownership(self):
+        """Active journal exposure means robot-tracked → PROVEN (avoids false CRITICAL on open trades)."""
         state = _mk_state(intent_exposures={"i1": _mk_exposure("MES", 1, 0)})
         events = []  # No ADOPTION_SUCCESS
         snap = build_operator_snapshot(events, state)
         assert "MES" in snap
-        assert snap["MES"]["ownership"] == "UNKNOWN"
+        assert snap["MES"]["ownership"] == "PROVEN"
+
+    def test_ym_mym_buckets_merge_exposure(self):
+        """MYM journal + YM1-style events collapse to YM bucket so exposure is not zero on one row."""
+        exp = _mk_exposure("MYM 03-26", 1, 0)
+        state = _mk_state(intent_exposures={"i1": exp})
+        events = [_mk_event("STREAM_STATE_TRANSITION", "YM1", new_state="RANGE_LOCKED")]
+        snap = build_operator_snapshot(events, state)
+        assert "YM" in snap
+        assert snap["YM"]["exposure"]["quantity"] == 1
+        assert snap["YM"]["ownership"] == "PROVEN"
 
     def test_recovery_started(self):
         events = [_mk_event("DISCONNECT_RECOVERY_STARTED")]
@@ -279,14 +289,14 @@ class TestOperatorSnapshotPhase2:
         assert snap["MES"]["action_label"] == "FLATTEN NOW"
         assert snap["MES"]["confidence"] == "HIGH"
 
-    def test_phase2_unknown_ownership_with_exposure_critical(self):
-        """Unknown ownership with exposure → CRITICAL."""
+    def test_phase2_journal_exposure_proven_warning_protectives_unknown(self):
+        """Journal-backed open trade: PROVEN ownership; protectives unknown + qty>0 → WARNING (not CRITICAL)."""
         state = _mk_state(intent_exposures={"i1": _mk_exposure("MES", 1, 0)})
         events = []  # No ADOPTION_SUCCESS
         snap = build_operator_snapshot(events, state)
-        assert snap["MES"]["ownership"] == "UNKNOWN"
+        assert snap["MES"]["ownership"] == "PROVEN"
         assert snap["MES"]["exposure"]["quantity"] == 1
-        assert snap["MES"]["status"] == "CRITICAL"
+        assert snap["MES"]["status"] == "WARNING"
 
     def test_phase2_unknown_ownership_without_exposure_safe(self):
         """Unknown ownership without exposure → SAFE (rule removed per Fix 1)."""

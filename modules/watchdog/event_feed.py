@@ -122,12 +122,12 @@ class EventFeedGenerator:
             return None
         
         # Filter out initialization STREAM_STATE_TRANSITION events (UNKNOWN -> *)
-        # These are noise - we only care about runtime state transitions
+        # Robot/C# emits previous_state (not old_state); empty old_state used to drop *all* transitions,
+        # so watchdog never saw ARMED/RANGE_BUILDING from the feed and relied only on slot journals.
         if event_type == "STREAM_STATE_TRANSITION":
-            data = event.get("data", {})
-            old_state = data.get("old_state", "")
-            # Skip initialization transitions (UNKNOWN -> anything)
-            if old_state == "UNKNOWN" or old_state == "":
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            prev = (data.get("old_state") or data.get("previous_state") or "").strip()
+            if prev == "UNKNOWN":
                 return None
         
         run_id = self._extract_run_id(event)

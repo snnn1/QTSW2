@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -22,6 +23,8 @@ public sealed class ReconciliationRunner
     private readonly Func<string>? _reconciliationInstanceId;
     private readonly ReconciliationStateTracker? _reconciliationTracker;
     private readonly TimeSpan _reconciliationDebounceWindow;
+    private readonly RuntimeAuditHub? _runtimeAudit;
+    private readonly ReconciliationConvergenceTracker? _convergenceTracker;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
@@ -32,7 +35,9 @@ public sealed class ReconciliationRunner
         Func<string?>? reconciliationAccountName = null,
         Func<string>? reconciliationInstanceId = null,
         ReconciliationStateTracker? reconciliationTracker = null,
-        TimeSpan? reconciliationDebounceWindow = null)
+        TimeSpan? reconciliationDebounceWindow = null,
+        RuntimeAuditHub? runtimeAudit = null,
+        ReconciliationConvergenceTracker? convergenceTracker = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -43,6 +48,8 @@ public sealed class ReconciliationRunner
         _reconciliationInstanceId = reconciliationInstanceId;
         _reconciliationTracker = reconciliationTracker;
         _reconciliationDebounceWindow = reconciliationDebounceWindow ?? ReconciliationStateTracker.DefaultDebounceWindow;
+        _runtimeAudit = runtimeAudit;
+        _convergenceTracker = convergenceTracker;
     }
 
     /// <summary>
@@ -83,6 +90,8 @@ public sealed class ReconciliationRunner
     private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
         _lastRunUtc = utcNow;
+        _runtimeAudit?.NotifyReconciliationRunCompleted();
+        var cpuStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         var gateInst = options?.GateRecoveryInstrument?.Trim();
         var gateMode = !string.IsNullOrEmpty(gateInst);
 
@@ -93,13 +102,17 @@ public sealed class ReconciliationRunner
         }
         catch (Exception ex)
         {
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
             _log.Write(RobotEvents.EngineBase(utcNow, "", "ACCOUNT_SNAPSHOT_ERROR", "ENGINE",
                 new { error = ex.Message, context = "ReconciliationRunner" }));
             return;
         }
 
         if (snap == null)
+        {
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
             return;
+        }
 
         var positions = snap.Positions ?? new List<PositionSnapshot>();
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
@@ -266,6 +279,8 @@ public sealed class ReconciliationRunner
         {
             _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_PASS_SUMMARY", "ENGINE",
                 new { instruments_checked = 0, journals_reconciled = 0, note = "No open journals to reconcile" }));
+            EmitConvergenceSamples(utcNow, workingOrders, accountQtyByInstrument, openByInstrument);
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
             return;
         }
 
@@ -325,8 +340,61 @@ public sealed class ReconciliationRunner
                 note = "Reconciliation pass complete"
             }));
 
+        EmitConvergenceSamples(utcNow, workingOrders, accountQtyByInstrument, openByInstrument);
+
         // Notify engine of qty by instrument (for unfreezing when mismatch resolved)
         _onReconciliationPassComplete?.Invoke(BuildQtyByInstrument(accountQtyByInstrument));
+
+        if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+    }
+
+    private void EmitConvergenceSamples(
+        DateTimeOffset utcNow,
+        List<WorkingOrderSnapshot> workingOrders,
+        Dictionary<string, int> accountQtyByInstrument,
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument)
+    {
+        if (_convergenceTracker == null) return;
+
+        var instSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in accountQtyByInstrument.Keys)
+            if (!string.IsNullOrWhiteSpace(k)) instSet.Add(k.Trim());
+        foreach (var k in openByInstrument.Keys)
+            if (!string.IsNullOrWhiteSpace(k)) instSet.Add(k.Trim());
+
+        foreach (var inst in instSet)
+        {
+            var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
+            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var openOrders = CountWorkingForInstrument(workingOrders, inst);
+            var intentCount = CountJournalIntents(openByInstrument, inst, execVariant);
+            var hasMismatch = accountQty != journalQty;
+            _convergenceTracker.OnInstrumentReconciliationSample(utcNow, inst, accountQty, journalQty, openOrders, intentCount, hasMismatch, accountQty - journalQty);
+        }
+    }
+
+    private static int CountWorkingForInstrument(List<WorkingOrderSnapshot> workingOrders, string instrument)
+    {
+        var n = 0;
+        foreach (var w in workingOrders)
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            if (string.Equals(w.Instrument.Trim(), instrument, StringComparison.OrdinalIgnoreCase))
+                n++;
+        }
+        return n;
+    }
+
+    private static int CountJournalIntents(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        string inst,
+        string execVariant)
+    {
+        var n = 0;
+        if (openByInstrument.TryGetValue(inst, out var e1)) n += e1.Count;
+        if (openByInstrument.TryGetValue(execVariant, out var e2)) n += e2.Count;
+        return n;
     }
 
     private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)

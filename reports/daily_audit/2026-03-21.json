@@ -1,0 +1,3626 @@
+{
+  "audit_date": "2026-03-21",
+  "confidence": "MEDIUM",
+  "confidence_enforced_status": "CRITICAL",
+  "domains": {
+    "connectivity": {
+      "metrics": {
+        "disconnects": 0,
+        "max_downtime_s": 0.0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    },
+    "execution": {
+      "metrics": {
+        "adoption_scan_max_ms": 0,
+        "max_queue_wait_ms": 0,
+        "timeouts_or_overflow": 0
+      },
+      "status": "HEALTHY",
+      "timeline_refs": []
+    },
+    "performance": {
+      "metrics": {
+        "cpu_profile_samples": 0,
+        "dominant_subsystem": null,
+        "parallelism_normalized_max": null,
+        "parallelism_raw_max": null,
+        "subsystem_pct_mean": null
+      },
+      "status": "NORMAL",
+      "timeline_refs": []
+    },
+    "protection": {
+      "metrics": {
+        "protective_failed": 12,
+        "protective_ok": 0
+      },
+      "status": "ISSUES DETECTED",
+      "timeline_refs": []
+    },
+    "reconciliation": {
+      "metrics": {
+        "converged": 0,
+        "convergence_rate_pct": 0.0,
+        "oscillation_events": 0,
+        "passes": 24,
+        "stuck_events": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    },
+    "safety": {
+      "critical_findings": [],
+      "metrics": {
+        "fail_closed_count": 14,
+        "gate_engaged_count": 10,
+        "registry_divergence_count": 0,
+        "total_mismatch_signals": 44
+      },
+      "status": "CRITICAL",
+      "timeline_refs": []
+    },
+    "supervisory": {
+      "metrics": {
+        "escalated": 0,
+        "invalid_transitions": 0
+      },
+      "status": "STABLE",
+      "timeline_refs": []
+    }
+  },
+  "drift": {
+    "cpu_trend": "STABLE",
+    "mismatch_rate_trend": "STABLE",
+    "notes": [
+      "baseline_history_insufficient_or_not_implemented"
+    ],
+    "queue_wait_trend": "STABLE",
+    "recovery_time_trend": "STABLE",
+    "window_days": 14
+  },
+  "drift_risk": "NONE",
+  "engine_load_analysis": {
+    "average_events_per_second": 0.0335,
+    "bucket_seconds": 5.0,
+    "classification_notes": [
+      "loop_detected_and_high_eps_force_critical"
+    ],
+    "classification_thresholds": {
+      "peak_eps_critical": 90.0,
+      "peak_eps_high": 45.0,
+      "peak_eps_low": 8.0,
+      "peak_eps_moderate": 20.0,
+      "reconciliation_ratio_upgrade": 0.5,
+      "reconciliation_storm_duration_critical_seconds": 15.0
+    },
+    "dense_windows_note": "Non-empty buckets; top by peak_subwindow_eps then coarse EPS (see engine_load_max_dense_windows_export)",
+    "load_classification": "CRITICAL",
+    "loop_signatures": [
+      {
+        "loop_classification": "RECONCILIATION_LOOP",
+        "max_repeats_in_window": 39,
+        "peak_window_end_audit_tz": "2026-03-21 21:29:16 CDT",
+        "peak_window_end_utc": "2026-03-22T02:29:16.225434Z",
+        "peak_window_start_audit_tz": "2026-03-21 21:28:34 CDT",
+        "peak_window_start_utc": "2026-03-22T02:28:34.898458Z",
+        "subtype": "GATE_RESULT",
+        "window_sec": 60.0
+      },
+      {
+        "loop_classification": "RECONCILIATION_LOOP",
+        "max_repeats_in_window": 44,
+        "peak_window_end_audit_tz": "2026-03-21 21:29:26 CDT",
+        "peak_window_end_utc": "2026-03-22T02:29:26.777740Z",
+        "peak_window_start_audit_tz": "2026-03-21 21:28:34 CDT",
+        "peak_window_start_utc": "2026-03-22T02:28:34.898458Z",
+        "subtype": "MISMATCH_FAMILY",
+        "window_sec": 60.0
+      }
+    ],
+    "loop_thresholds": {
+      "min_repeats_adoption": 8,
+      "min_repeats_gate": 20,
+      "min_repeats_mismatch": 15,
+      "window_sec": 60.0
+    },
+    "nonzero_bucket_count": 416,
+    "peak_events_per_second": 92.4,
+    "peak_subwindow_eps": 200.0,
+    "reconciliation_event_ratio": 0.062954,
+    "reconciliation_events_total": 182,
+    "storm_thresholds": {
+      "events_per_second_gt": 35.0,
+      "min_consecutive_windows": 3,
+      "reconciliation_storm_duration_critical_seconds": 15.0,
+      "total_time_escalate_seconds": 120.0
+    },
+    "storms": [],
+    "subwindow_seconds": 1.0,
+    "top_dense_buckets": [
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:35Z",
+        "events_per_second": 92.4,
+        "peak_subwindow_eps": 200.0,
+        "reconciliation_events": 18,
+        "start_time_utc": "2026-03-22T02:28:30Z",
+        "total_events": 462,
+        "window_index": 15462
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:30Z",
+        "events_per_second": 56.6,
+        "peak_subwindow_eps": 141.0,
+        "reconciliation_events": 2,
+        "start_time_utc": "2026-03-22T02:28:25Z",
+        "total_events": 283,
+        "window_index": 15461
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:25Z",
+        "events_per_second": 33.4,
+        "peak_subwindow_eps": 117.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:28:20Z",
+        "total_events": 167,
+        "window_index": 15460
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:40Z",
+        "events_per_second": 24.2,
+        "peak_subwindow_eps": 36.0,
+        "reconciliation_events": 33,
+        "start_time_utc": "2026-03-22T02:28:35Z",
+        "total_events": 121,
+        "window_index": 15463
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:50Z",
+        "events_per_second": 5.2,
+        "peak_subwindow_eps": 23.0,
+        "reconciliation_events": 14,
+        "start_time_utc": "2026-03-22T02:28:45Z",
+        "total_events": 26,
+        "window_index": 15465
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:28:45Z",
+        "events_per_second": 13.2,
+        "peak_subwindow_eps": 22.0,
+        "reconciliation_events": 22,
+        "start_time_utc": "2026-03-22T02:28:40Z",
+        "total_events": 66,
+        "window_index": 15464
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:25Z",
+        "events_per_second": 8.2,
+        "peak_subwindow_eps": 16.0,
+        "reconciliation_events": 10,
+        "start_time_utc": "2026-03-22T02:29:20Z",
+        "total_events": 41,
+        "window_index": 15472
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:20Z",
+        "events_per_second": 6.4,
+        "peak_subwindow_eps": 13.0,
+        "reconciliation_events": 15,
+        "start_time_utc": "2026-03-22T02:29:15Z",
+        "total_events": 32,
+        "window_index": 15471
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:30Z",
+        "events_per_second": 6.0,
+        "peak_subwindow_eps": 12.0,
+        "reconciliation_events": 2,
+        "start_time_utc": "2026-03-22T02:29:25Z",
+        "total_events": 30,
+        "window_index": 15473
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:40Z",
+        "events_per_second": 2.4,
+        "peak_subwindow_eps": 12.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:29:35Z",
+        "total_events": 12,
+        "window_index": 15475
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:15Z",
+        "events_per_second": 2.2,
+        "peak_subwindow_eps": 11.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:49:10Z",
+        "total_events": 11,
+        "window_index": 15710
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:35Z",
+        "events_per_second": 2.0,
+        "peak_subwindow_eps": 10.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:34:30Z",
+        "total_events": 10,
+        "window_index": 15534
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:40:50Z",
+        "events_per_second": 2.0,
+        "peak_subwindow_eps": 10.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:40:45Z",
+        "total_events": 10,
+        "window_index": 15609
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:25Z",
+        "events_per_second": 2.0,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:34:20Z",
+        "total_events": 10,
+        "window_index": 15532
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:10Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:34:05Z",
+        "total_events": 9,
+        "window_index": 15529
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:40Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:34:35Z",
+        "total_events": 9,
+        "window_index": 15535
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:45Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:48:40Z",
+        "total_events": 9,
+        "window_index": 15704
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:20Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:55:15Z",
+        "total_events": 9,
+        "window_index": 15783
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:00:35Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:00:30Z",
+        "total_events": 9,
+        "window_index": 15846
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:01:35Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 9.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:01:30Z",
+        "total_events": 9,
+        "window_index": 15858
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:35Z",
+        "events_per_second": 1.6,
+        "peak_subwindow_eps": 8.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:29:30Z",
+        "total_events": 8,
+        "window_index": 15474
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:35Z",
+        "events_per_second": 1.6,
+        "peak_subwindow_eps": 8.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:33:30Z",
+        "total_events": 8,
+        "window_index": 15522
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:35Z",
+        "events_per_second": 1.6,
+        "peak_subwindow_eps": 8.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:49:30Z",
+        "total_events": 8,
+        "window_index": 15714
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:45Z",
+        "events_per_second": 2.6,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:29:40Z",
+        "total_events": 13,
+        "window_index": 15476
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:20Z",
+        "events_per_second": 2.2,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:58:15Z",
+        "total_events": 11,
+        "window_index": 15819
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:56:40Z",
+        "events_per_second": 2.0,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:56:35Z",
+        "total_events": 10,
+        "window_index": 15799
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:40Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:58:35Z",
+        "total_events": 9,
+        "window_index": 15823
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:55Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:33:50Z",
+        "total_events": 7,
+        "window_index": 15526
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:15Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:10Z",
+        "total_events": 7,
+        "window_index": 15578
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:55Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:50Z",
+        "total_events": 7,
+        "window_index": 15586
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:40:55Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:40:50Z",
+        "total_events": 7,
+        "window_index": 15610
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:20Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:48:15Z",
+        "total_events": 7,
+        "window_index": 15699
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:00Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:49:55Z",
+        "total_events": 7,
+        "window_index": 15719
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:25Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:50:20Z",
+        "total_events": 7,
+        "window_index": 15724
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:15Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:55:10Z",
+        "total_events": 7,
+        "window_index": 15782
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:57:35Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:57:30Z",
+        "total_events": 7,
+        "window_index": 15810
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:15Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:58:10Z",
+        "total_events": 7,
+        "window_index": 15818
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:35Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:58:30Z",
+        "total_events": 7,
+        "window_index": 15822
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:10Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:59:05Z",
+        "total_events": 7,
+        "window_index": 15829
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:30Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:59:25Z",
+        "total_events": 7,
+        "window_index": 15833
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:35Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:59:30Z",
+        "total_events": 7,
+        "window_index": 15834
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:55Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:59:50Z",
+        "total_events": 7,
+        "window_index": 15838
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:35Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:02:30Z",
+        "total_events": 7,
+        "window_index": 15870
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:45Z",
+        "events_per_second": 1.4,
+        "peak_subwindow_eps": 7.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:02:40Z",
+        "total_events": 7,
+        "window_index": 15872
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:55Z",
+        "events_per_second": 2.4,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:02:50Z",
+        "total_events": 12,
+        "window_index": 15874
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:56:35Z",
+        "events_per_second": 2.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:56:30Z",
+        "total_events": 11,
+        "window_index": 15798
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:30Z",
+        "total_events": 6,
+        "window_index": 15498
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:32:50Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:32:45Z",
+        "total_events": 6,
+        "window_index": 15513
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:20Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:33:15Z",
+        "total_events": 6,
+        "window_index": 15519
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:50Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:34:45Z",
+        "total_events": 6,
+        "window_index": 15537
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:35:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:35:30Z",
+        "total_events": 6,
+        "window_index": 15546
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:36:20Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:36:15Z",
+        "total_events": 6,
+        "window_index": 15555
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:37:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:37:30Z",
+        "total_events": 6,
+        "window_index": 15570
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:30Z",
+        "total_events": 6,
+        "window_index": 15582
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:40:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:40:30Z",
+        "total_events": 6,
+        "window_index": 15606
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:20Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:41:15Z",
+        "total_events": 6,
+        "window_index": 15615
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:44:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:44:30Z",
+        "total_events": 6,
+        "window_index": 15654
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:45:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:45:30Z",
+        "total_events": 6,
+        "window_index": 15666
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:46:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:46:30Z",
+        "total_events": 6,
+        "window_index": 15678
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:48:30Z",
+        "total_events": 6,
+        "window_index": 15702
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:50:30Z",
+        "total_events": 6,
+        "window_index": 15726
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:55Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:50:50Z",
+        "total_events": 6,
+        "window_index": 15730
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:35Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:54:30Z",
+        "total_events": 6,
+        "window_index": 15774
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:00Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:54:55Z",
+        "total_events": 6,
+        "window_index": 15779
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:05Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:59:00Z",
+        "total_events": 6,
+        "window_index": 15828
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:25Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:59:20Z",
+        "total_events": 6,
+        "window_index": 15832
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:00:25Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 6.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:00:20Z",
+        "total_events": 6,
+        "window_index": 15844
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:10Z",
+        "events_per_second": 1.6,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:54:05Z",
+        "total_events": 8,
+        "window_index": 15769
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:25Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:20Z",
+        "total_events": 6,
+        "window_index": 15496
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:32:25Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:32:20Z",
+        "total_events": 6,
+        "window_index": 15508
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:25Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:41:20Z",
+        "total_events": 6,
+        "window_index": 15616
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:05Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:33:00Z",
+        "total_events": 5,
+        "window_index": 15516
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:36:05Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:36:00Z",
+        "total_events": 5,
+        "window_index": 15552
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:00Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:37:55Z",
+        "total_events": 5,
+        "window_index": 15575
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:05Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:00Z",
+        "total_events": 5,
+        "window_index": 15576
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:10Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:05Z",
+        "total_events": 5,
+        "window_index": 15577
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:05Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:41:00Z",
+        "total_events": 5,
+        "window_index": 15612
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:10Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:41:05Z",
+        "total_events": 5,
+        "window_index": 15613
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:55Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:41:50Z",
+        "total_events": 5,
+        "window_index": 15622
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:44:50Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:44:45Z",
+        "total_events": 5,
+        "window_index": 15657
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:45:50Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:45:45Z",
+        "total_events": 5,
+        "window_index": 15669
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:46:20Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:46:15Z",
+        "total_events": 5,
+        "window_index": 15675
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:47:50Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:47:45Z",
+        "total_events": 5,
+        "window_index": 15693
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:00Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:47:55Z",
+        "total_events": 5,
+        "window_index": 15695
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:15Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:48:10Z",
+        "total_events": 5,
+        "window_index": 15698
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:48:20Z",
+        "total_events": 5,
+        "window_index": 15700
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:20Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:49:15Z",
+        "total_events": 5,
+        "window_index": 15711
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:49:20Z",
+        "total_events": 5,
+        "window_index": 15712
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:40Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:49:35Z",
+        "total_events": 5,
+        "window_index": 15715
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:20Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:50:15Z",
+        "total_events": 5,
+        "window_index": 15723
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:50:40Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:50:35Z",
+        "total_events": 5,
+        "window_index": 15727
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:51:15Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:51:10Z",
+        "total_events": 5,
+        "window_index": 15734
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:51:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:51:20Z",
+        "total_events": 5,
+        "window_index": 15736
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:52:40Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:52:35Z",
+        "total_events": 5,
+        "window_index": 15751
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:50Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:54:45Z",
+        "total_events": 5,
+        "window_index": 15777
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:10Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:55:05Z",
+        "total_events": 5,
+        "window_index": 15781
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:57:10Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:57:05Z",
+        "total_events": 5,
+        "window_index": 15805
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:59:50Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:59:45Z",
+        "total_events": 5,
+        "window_index": 15837
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:00:10Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:00:05Z",
+        "total_events": 5,
+        "window_index": 15841
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:00:20Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:00:15Z",
+        "total_events": 5,
+        "window_index": 15843
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:01:40Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 5.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:01:35Z",
+        "total_events": 5,
+        "window_index": 15859
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:50Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:29:45Z",
+        "total_events": 6,
+        "window_index": 15477
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:56:30Z",
+        "events_per_second": 1.2,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:56:25Z",
+        "total_events": 6,
+        "window_index": 15797
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:44:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:44:20Z",
+        "total_events": 5,
+        "window_index": 15652
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:45:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:45:20Z",
+        "total_events": 5,
+        "window_index": 15664
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:46:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:46:20Z",
+        "total_events": 5,
+        "window_index": 15676
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:47:25Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:47:20Z",
+        "total_events": 5,
+        "window_index": 15688
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:30:15Z",
+        "total_events": 4,
+        "window_index": 15483
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:30Z",
+        "total_events": 4,
+        "window_index": 15486
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:30:45Z",
+        "total_events": 4,
+        "window_index": 15489
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:31:15Z",
+        "total_events": 4,
+        "window_index": 15495
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:31:45Z",
+        "total_events": 4,
+        "window_index": 15501
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:32:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:32:15Z",
+        "total_events": 4,
+        "window_index": 15507
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:32:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:32:30Z",
+        "total_events": 4,
+        "window_index": 15510
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:33:45Z",
+        "total_events": 4,
+        "window_index": 15525
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:34:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:34:15Z",
+        "total_events": 4,
+        "window_index": 15531
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:35:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:35:15Z",
+        "total_events": 4,
+        "window_index": 15543
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:35:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:35:45Z",
+        "total_events": 4,
+        "window_index": 15549
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:36:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:36:30Z",
+        "total_events": 4,
+        "window_index": 15558
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:36:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:36:45Z",
+        "total_events": 4,
+        "window_index": 15561
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:37:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:37:15Z",
+        "total_events": 4,
+        "window_index": 15567
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:37:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:37:45Z",
+        "total_events": 4,
+        "window_index": 15573
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:38:15Z",
+        "total_events": 4,
+        "window_index": 15579
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:38:45Z",
+        "total_events": 4,
+        "window_index": 15585
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:39:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:39:15Z",
+        "total_events": 4,
+        "window_index": 15591
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:39:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:39:30Z",
+        "total_events": 4,
+        "window_index": 15594
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:39:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:39:45Z",
+        "total_events": 4,
+        "window_index": 15597
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:40:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:40:15Z",
+        "total_events": 4,
+        "window_index": 15603
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:41:30Z",
+        "total_events": 4,
+        "window_index": 15618
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:41:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:41:45Z",
+        "total_events": 4,
+        "window_index": 15621
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:42:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:42:15Z",
+        "total_events": 4,
+        "window_index": 15627
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:42:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:42:30Z",
+        "total_events": 4,
+        "window_index": 15630
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:42:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:42:45Z",
+        "total_events": 4,
+        "window_index": 15633
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:43:20Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:43:15Z",
+        "total_events": 4,
+        "window_index": 15639
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:43:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:43:30Z",
+        "total_events": 4,
+        "window_index": 15642
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:43:50Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:43:45Z",
+        "total_events": 4,
+        "window_index": 15645
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:44:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:44:50Z",
+        "total_events": 4,
+        "window_index": 15658
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:45:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:45:50Z",
+        "total_events": 4,
+        "window_index": 15670
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:46:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:46:50Z",
+        "total_events": 4,
+        "window_index": 15682
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:47:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:47:30Z",
+        "total_events": 4,
+        "window_index": 15690
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:47:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:47:50Z",
+        "total_events": 4,
+        "window_index": 15694
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:48:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:48:50Z",
+        "total_events": 4,
+        "window_index": 15706
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:49:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:49:50Z",
+        "total_events": 4,
+        "window_index": 15718
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:51:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:51:30Z",
+        "total_events": 4,
+        "window_index": 15738
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:51:55Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:51:50Z",
+        "total_events": 4,
+        "window_index": 15742
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:52:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:52:20Z",
+        "total_events": 4,
+        "window_index": 15748
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:52:30Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:52:25Z",
+        "total_events": 4,
+        "window_index": 15749
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:52:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:52:30Z",
+        "total_events": 4,
+        "window_index": 15750
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:53:00Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:52:55Z",
+        "total_events": 4,
+        "window_index": 15755
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:53:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:53:20Z",
+        "total_events": 4,
+        "window_index": 15760
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:53:30Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:53:25Z",
+        "total_events": 4,
+        "window_index": 15761
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:53:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:53:30Z",
+        "total_events": 4,
+        "window_index": 15762
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:00Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:53:55Z",
+        "total_events": 4,
+        "window_index": 15767
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:54:20Z",
+        "total_events": 4,
+        "window_index": 15772
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:30Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:54:25Z",
+        "total_events": 4,
+        "window_index": 15773
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:55:20Z",
+        "total_events": 4,
+        "window_index": 15784
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:30Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:55:25Z",
+        "total_events": 4,
+        "window_index": 15785
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:55:35Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:55:30Z",
+        "total_events": 4,
+        "window_index": 15786
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:56:00Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:55:55Z",
+        "total_events": 4,
+        "window_index": 15791
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:56:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:56:20Z",
+        "total_events": 4,
+        "window_index": 15796
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:57:05Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:57:00Z",
+        "total_events": 4,
+        "window_index": 15804
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:57:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:57:20Z",
+        "total_events": 4,
+        "window_index": 15808
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:05Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T02:58:00Z",
+        "total_events": 4,
+        "window_index": 15816
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:58:20Z",
+        "total_events": 4,
+        "window_index": 15820
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:00:05Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:00:00Z",
+        "total_events": 4,
+        "window_index": 15840
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:01:05Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:01:00Z",
+        "total_events": 4,
+        "window_index": 15852
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:01:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:01:20Z",
+        "total_events": 4,
+        "window_index": 15856
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:05Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 1,
+        "start_time_utc": "2026-03-22T03:02:00Z",
+        "total_events": 4,
+        "window_index": 15864
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 4.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:02:20Z",
+        "total_events": 4,
+        "window_index": 15868
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T03:02:50Z",
+        "events_per_second": 1.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T03:02:45Z",
+        "total_events": 9,
+        "window_index": 15873
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:00Z",
+        "events_per_second": 1.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:28:55Z",
+        "total_events": 8,
+        "window_index": 15467
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:54:15Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:54:10Z",
+        "total_events": 5,
+        "window_index": 15770
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:58:30Z",
+        "events_per_second": 1.0,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:58:25Z",
+        "total_events": 5,
+        "window_index": 15821
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:20Z",
+        "total_events": 4,
+        "window_index": 15484
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:33:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:33:20Z",
+        "total_events": 4,
+        "window_index": 15520
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:35:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:35:20Z",
+        "total_events": 4,
+        "window_index": 15544
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:36:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:36:20Z",
+        "total_events": 4,
+        "window_index": 15556
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:37:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:37:20Z",
+        "total_events": 4,
+        "window_index": 15568
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:38:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:38:20Z",
+        "total_events": 4,
+        "window_index": 15580
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:39:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:39:20Z",
+        "total_events": 4,
+        "window_index": 15592
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:40:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:40:20Z",
+        "total_events": 4,
+        "window_index": 15604
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:42:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:42:20Z",
+        "total_events": 4,
+        "window_index": 15628
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:43:25Z",
+        "events_per_second": 0.8,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:43:20Z",
+        "total_events": 4,
+        "window_index": 15640
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:29:55Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:29:50Z",
+        "total_events": 3,
+        "window_index": 15478
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:00Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:29:55Z",
+        "total_events": 3,
+        "window_index": 15479
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:05Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:00Z",
+        "total_events": 3,
+        "window_index": 15480
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:10Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:05Z",
+        "total_events": 3,
+        "window_index": 15481
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:15Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:10Z",
+        "total_events": 3,
+        "window_index": 15482
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:30Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:25Z",
+        "total_events": 3,
+        "window_index": 15485
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:40Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:35Z",
+        "total_events": 3,
+        "window_index": 15487
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:45Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:40Z",
+        "total_events": 3,
+        "window_index": 15488
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:30:55Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:50Z",
+        "total_events": 3,
+        "window_index": 15490
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:00Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:30:55Z",
+        "total_events": 3,
+        "window_index": 15491
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:05Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:00Z",
+        "total_events": 3,
+        "window_index": 15492
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:10Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:05Z",
+        "total_events": 3,
+        "window_index": 15493
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:15Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:10Z",
+        "total_events": 3,
+        "window_index": 15494
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:30Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:25Z",
+        "total_events": 3,
+        "window_index": 15497
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:40Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:35Z",
+        "total_events": 3,
+        "window_index": 15499
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:45Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:40Z",
+        "total_events": 3,
+        "window_index": 15500
+      },
+      {
+        "adoption_events": 0,
+        "end_time_utc": "2026-03-22T02:31:55Z",
+        "events_per_second": 0.6,
+        "peak_subwindow_eps": 3.0,
+        "reconciliation_events": 0,
+        "start_time_utc": "2026-03-22T02:31:50Z",
+        "total_events": 3,
+        "window_index": 15502
+      }
+    ],
+    "total_events_in_window": 2891,
+    "total_storm_time_seconds": 0
+  },
+  "generated_at_utc": "2026-03-25T00:06:30.816205Z",
+  "iea_integrity": {
+    "findings": [
+      "Low avg reconciliation efficiency (0.0) vs gate runs (total_gate_runs=39)"
+    ],
+    "metrics": {
+      "cross_iea_duplicate_events": 0,
+      "iea_resolution_suspect_count": 0,
+      "lifecycle_wrong_adapter_count": 0,
+      "reconciliation_efficiency": {
+        "avg_efficiency": 0.0,
+        "low_efficiency_instruments": [
+          {
+            "efficiency": 0.0,
+            "gate_runs": 21,
+            "instrument": "MNQ"
+          },
+          {
+            "efficiency": 0.0,
+            "gate_runs": 18,
+            "instrument": "MYM"
+          }
+        ]
+      },
+      "registry_timing_gap": {
+        "avg_delay_ms": null,
+        "count": 0,
+        "max_delay_ms": null
+      }
+    },
+    "status": "CRITICAL"
+  },
+  "incident_chains": [
+    {
+      "classification": "FAILED",
+      "classification_detail": "UNSTABLE SYSTEM",
+      "end_utc": null,
+      "events": [
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:34.898458Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.354583Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:35.949344Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.402114Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_DETECTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:36.680814Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:39.905940Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:40.357607Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:40.357607Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:40.952935Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:40.952935Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:41.402104Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:41.402104Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:41.690339Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:41.690339Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:44.905320Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:45.368270Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:45.368270Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:45.368270Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:45.368270Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:45.959907Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:45.959907Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:28:45.959907Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:28:45.959907Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:15.578194Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:29:15.578194Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:15.578194Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:16.225434Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:29:16.225434Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:16.225434Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:18.760379Z"
+        },
+        {
+          "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:29:18.760379Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+          "instrument": "MNQ",
+          "ts_utc": "2026-03-22T02:29:18.760379Z"
+        },
+        {
+          "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+          "instrument": "MYM",
+          "ts_utc": "2026-03-22T02:29:18.760379Z"
+        }
+      ],
+      "events_truncated": true,
+      "id": 1,
+      "resolution_time_ms": null,
+      "start_utc": "2026-03-22T02:28:34.898458Z",
+      "trigger_event": "RECONCILIATION_MISMATCH_DETECTED",
+      "trigger_instrument": "MNQ",
+      "trigger_ts_utc": "2026-03-22T02:28:34.898458Z"
+    }
+  ],
+  "meta": {
+    "audit_mode": "FULL",
+    "domains_complete": true,
+    "drift_disabled_reason": null,
+    "engine_active": true,
+    "engine_activity_detected": true,
+    "engine_full": true,
+    "engine_lines_in_window": 2731,
+    "events_deduped": 7120,
+    "events_used": 2891,
+    "files_read": 66,
+    "journal_snapshots_used": 0,
+    "lines_read": 10011,
+    "logical_processor_count": 12,
+    "min_engine_full_days_for_drift": 5,
+    "parallelism_normalized_max": 0.0,
+    "parse_error_rate": 0.168814,
+    "parse_errors_count": 1690,
+    "partial_reason": null,
+    "prior_engine_full_days": 8,
+    "source_fallback": false,
+    "source_fallback_reason": null,
+    "source_primary": "robot",
+    "timeline_compressed_lines": 93,
+    "timeline_max_entries": 400,
+    "timeline_raw_events": 104,
+    "timeline_truncated": false,
+    "watchdog_crosscheck": {
+      "available": true,
+      "divergence": false,
+      "max_count_delta": 0,
+      "pairs_compared": [
+        "CONNECTION_LOST",
+        "ENGINE_STALLED",
+        "RECONCILIATION_QTY_MISMATCH"
+      ]
+    }
+  },
+  "overall_status": "CRITICAL",
+  "schema_version": "1.0",
+  "silent_failure": {
+    "detected": true,
+    "signals": [
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "engine_active_but_no_cpu_profiles",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-21T05:00:00Z"
+      },
+      {
+        "code": "SILENT_FAILURE_DETECTED",
+        "instrument": "",
+        "reason": "no_engine_cpu_profile_for_T_profile_gap",
+        "severity": "WARNING",
+        "ts_utc": "2026-03-21T05:00:00Z"
+      }
+    ],
+    "signals_before_dedupe": 2
+  },
+  "summary": {
+    "dominant_subsystem": null,
+    "first_failure": {
+      "chain_id": 1,
+      "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+      "instrument": "MNQ",
+      "ts_chicago": "21:28:34",
+      "ts_utc": "2026-03-22T02:28:34.898458Z"
+    },
+    "max_cpu_parallelism_normalized": 0.0,
+    "max_cpu_parallelism_raw": 0.0,
+    "recovery_quality": {
+      "avg_recovery_time_ms": null,
+      "chains_classified_degraded": 0,
+      "chains_classified_failed": 1,
+      "chains_classified_normal": 0,
+      "failed_recoveries": 1,
+      "max_recovery_time_ms": null,
+      "mismatch_to_recovery_max_ms": null,
+      "mismatch_to_recovery_median_ms": null,
+      "successful_recoveries": 0
+    },
+    "total_disconnects": 0,
+    "total_mismatches": 44,
+    "total_trades": null
+  },
+  "timeline": {
+    "compressed_entries": [
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:34",
+        "display_start_chicago": "21:28:34",
+        "end_utc": "2026-03-22T02:28:34.898458Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:34.898458Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.354583Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.354583Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:35",
+        "display_start_chicago": "21:28:35",
+        "end_utc": "2026-03-22T02:28:35.949344Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:35.949344Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.402114Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.402114Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "RECONCILIATION_MISMATCH_DETECTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "RECONCILIATION_MISMATCH_DETECTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_ENGAGED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_ENGAGED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:36",
+        "display_start_chicago": "21:28:36",
+        "end_utc": "2026-03-22T02:28:36.680814Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:36.680814Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_STARTED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:39",
+        "display_start_chicago": "21:28:39",
+        "end_utc": "2026-03-22T02:28:39.905940Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:39.905940Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:39",
+        "display_start_chicago": "21:28:39",
+        "end_utc": "2026-03-22T02:28:39.905940Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:39.905940Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:40",
+        "display_start_chicago": "21:28:40",
+        "end_utc": "2026-03-22T02:28:40.357607Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:40.357607Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:40",
+        "display_start_chicago": "21:28:40",
+        "end_utc": "2026-03-22T02:28:40.357607Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:40.357607Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:40",
+        "display_start_chicago": "21:28:40",
+        "end_utc": "2026-03-22T02:28:40.952935Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:40.952935Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:40",
+        "display_start_chicago": "21:28:40",
+        "end_utc": "2026-03-22T02:28:40.952935Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:40.952935Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:41",
+        "display_start_chicago": "21:28:41",
+        "end_utc": "2026-03-22T02:28:41.402104Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:41.402104Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:41",
+        "display_start_chicago": "21:28:41",
+        "end_utc": "2026-03-22T02:28:41.402104Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:41.402104Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:41",
+        "display_start_chicago": "21:28:41",
+        "end_utc": "2026-03-22T02:28:41.690339Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:41.690339Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:41",
+        "display_start_chicago": "21:28:41",
+        "end_utc": "2026-03-22T02:28:41.690339Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:41.690339Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:44",
+        "display_start_chicago": "21:28:44",
+        "end_utc": "2026-03-22T02:28:44.905320Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:44.905320Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:44",
+        "display_start_chicago": "21:28:44",
+        "end_utc": "2026-03-22T02:28:44.905320Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:44.905320Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:44",
+        "display_start_chicago": "21:28:44",
+        "end_utc": "2026-03-22T02:28:44.905320Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:44.905320Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d73 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:44",
+        "display_start_chicago": "21:28:44",
+        "end_utc": "2026-03-22T02:28:44.905320Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:44.905320Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT (\u00d72 in 120s)"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.368270Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:45.368270Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.368270Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:45.368270Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.368270Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:45.368270Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.368270Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:45.368270Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.959907Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:45.959907Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.959907Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:45.959907Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.959907Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:28:45.959907Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:28:45",
+        "display_start_chicago": "21:28:45",
+        "end_utc": "2026-03-22T02:28:45.959907Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:28:45.959907Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:15",
+        "display_start_chicago": "21:29:15",
+        "end_utc": "2026-03-22T02:29:15.578194Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:15.578194Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:15",
+        "display_start_chicago": "21:29:15",
+        "end_utc": "2026-03-22T02:29:15.578194Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:15.578194Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:15",
+        "display_start_chicago": "21:29:15",
+        "end_utc": "2026-03-22T02:29:15.578194Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:15.578194Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:16",
+        "display_start_chicago": "21:29:16",
+        "end_utc": "2026-03-22T02:29:16.225434Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:16.225434Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:16",
+        "display_start_chicago": "21:29:16",
+        "end_utc": "2026-03-22T02:29:16.225434Z",
+        "event": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:16.225434Z",
+        "summary": "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:16",
+        "display_start_chicago": "21:29:16",
+        "end_utc": "2026-03-22T02:29:16.225434Z",
+        "event": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:16.225434Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:18",
+        "display_start_chicago": "21:29:18",
+        "end_utc": "2026-03-22T02:29:18.760379Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:18.760379Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:18",
+        "display_start_chicago": "21:29:18",
+        "end_utc": "2026-03-22T02:29:18.760379Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:18.760379Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:18",
+        "display_start_chicago": "21:29:18",
+        "end_utc": "2026-03-22T02:29:18.760379Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:18.760379Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:18",
+        "display_start_chicago": "21:29:18",
+        "end_utc": "2026-03-22T02:29:18.760379Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:18.760379Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:20",
+        "display_start_chicago": "21:29:20",
+        "end_utc": "2026-03-22T02:29:20.479363Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:20.479363Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:20",
+        "display_start_chicago": "21:29:20",
+        "end_utc": "2026-03-22T02:29:20.479363Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:20.479363Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:20",
+        "display_start_chicago": "21:29:20",
+        "end_utc": "2026-03-22T02:29:20.479363Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:20.479363Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:20",
+        "display_start_chicago": "21:29:20",
+        "end_utc": "2026-03-22T02:29:20.479363Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:20.479363Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:21",
+        "display_start_chicago": "21:29:21",
+        "end_utc": "2026-03-22T02:29:21.770723Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:21.770723Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:21",
+        "display_start_chicago": "21:29:21",
+        "end_utc": "2026-03-22T02:29:21.770723Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:21.770723Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:21",
+        "display_start_chicago": "21:29:21",
+        "end_utc": "2026-03-22T02:29:21.770723Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:21.770723Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:21",
+        "display_start_chicago": "21:29:21",
+        "end_utc": "2026-03-22T02:29:21.770723Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:21.770723Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.227429Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:23.227429Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.227429Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:23.227429Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.227429Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:23.227429Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.227429Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:23.227429Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.306319Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:23.306319Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.306319Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:23.306319Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.306319Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:23.306319Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:23",
+        "display_start_chicago": "21:29:23",
+        "end_utc": "2026-03-22T02:29:23.306319Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:23.306319Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:24",
+        "display_start_chicago": "21:29:24",
+        "end_utc": "2026-03-22T02:29:24.119854Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:24.119854Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:24",
+        "display_start_chicago": "21:29:24",
+        "end_utc": "2026-03-22T02:29:24.119854Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:24.119854Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:24",
+        "display_start_chicago": "21:29:24",
+        "end_utc": "2026-03-22T02:29:24.119854Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:24.119854Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:24",
+        "display_start_chicago": "21:29:24",
+        "end_utc": "2026-03-22T02:29:24.119854Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:24.119854Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:26",
+        "display_start_chicago": "21:29:26",
+        "end_utc": "2026-03-22T02:29:26.777740Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:26.777740Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": true,
+        "display_end_chicago": "21:29:26",
+        "display_start_chicago": "21:29:26",
+        "end_utc": "2026-03-22T02:29:26.777740Z",
+        "event": "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:26.777740Z",
+        "summary": "RECONCILIATION_MISMATCH_FAIL_CLOSED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:26",
+        "display_start_chicago": "21:29:26",
+        "end_utc": "2026-03-22T02:29:26.777740Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MNQ",
+        "start_utc": "2026-03-22T02:29:26.777740Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      },
+      {
+        "critical": false,
+        "display_end_chicago": "21:29:26",
+        "display_start_chicago": "21:29:26",
+        "end_utc": "2026-03-22T02:29:26.777740Z",
+        "event": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        "instrument": "MYM",
+        "start_utc": "2026-03-22T02:29:26.777740Z",
+        "summary": "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
+      }
+    ],
+    "critical_periods": []
+  },
+  "timezone": "chicago",
+  "trade_readiness": {
+    "blocking_factors": [
+      "SAFETY_CRITICAL",
+      "SILENT_FAILURE",
+      "CONFIDENCE_ENFORCED_CRITICAL",
+      "OVERALL_CRITICAL"
+    ],
+    "decision": "NO_GO",
+    "reason": "Blocking safety, execution, silent failure, or confidence-enforced critical path."
+  }
+}

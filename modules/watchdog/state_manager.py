@@ -1976,15 +1976,18 @@ class WatchdogStateManager:
             engine_activity_classification = "STALLED"
 
         # Feed health classification: DATA_FLOWING | DATA_STALLED | MARKET_CLOSED
+        # MARKET_CLOSED must only mean CME session is closed (not bar gaps / UNKNOWN / acceptable silence).
+        # Previously ACCEPTABLE_SILENCE and UNKNOWN while market_open mapped to MARKET_CLOSED, which made
+        # the header show "MARKET CLOSED" during live sessions.
         if smoothed_data_status == "FLOWING":
             feed_health_classification = "DATA_FLOWING"
         elif smoothed_data_status == "STALLED":
             feed_health_classification = "DATA_STALLED"
-        elif not market_open or smoothed_data_status == "ACCEPTABLE_SILENCE":
+        elif not market_open:
             feed_health_classification = "MARKET_CLOSED"
         else:
-            # UNKNOWN: market open but no bar data yet - treat as MARKET_CLOSED (no alarm)
-            feed_health_classification = "MARKET_CLOSED"
+            # market open: UNKNOWN, ACCEPTABLE_SILENCE, etc. — use engine liveness, not "market closed"
+            feed_health_classification = "DATA_FLOWING" if engine_alive else "DATA_STALLED"
         
         return {
             "engine_alive": engine_alive,
