@@ -135,7 +135,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>
     /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
-    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// Timer fires every 1s to drive RuntimeAuditHub sampling; ENGINE_CPU_PROFILE emits at the hub interval (5s wall window); ENGINE_TIMER_HEARTBEAT stays every 5s for watchdog volume parity.
     /// </summary>
     public void StartEngineHeartbeatTimer()
     {
@@ -144,11 +144,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _engineHeartbeatTimer?.Dispose();
             _engineHeartbeatTimer = null;
             _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatWallTick = 0;
             _engineHeartbeatTimer = new Timer(
                 _ => EmitTimerHeartbeatUnsafe(),
                 null,
-                TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(5));
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
         }
     }
 
@@ -172,9 +173,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         try
         {
             var utcNow = DateTimeOffset.UtcNow;
-            var tradingDate = _heartbeatTradingDateCache ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
             _runtimeAudit?.TryEmitPeriodicWallClock(utcNow);
+            var tick = Interlocked.Increment(ref _engineHeartbeatWallTick);
+            if (tick % 5 == 0)
+            {
+                var tradingDate = _heartbeatTradingDateCache ?? "";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            }
             if (_executionPolicy?.UseInstrumentExecutionAuthority == true && !string.IsNullOrEmpty(_accountName))
                 InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(_accountName!, _log);
             else
@@ -332,7 +337,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private long _cpuProfileOnBarLockMsAccum;
     private int _cpuProfileOnBarCount;
     private DateTimeOffset _lastEngineCpuProfileUtc = DateTimeOffset.MinValue;
-    private const double EngineCpuProfileEmitIntervalSeconds = 10.0;
+    private const double EngineCpuProfileEmitIntervalSeconds = 5.0;
     
     // Account/environment info for startup banner (set by strategy host)
     private string? _accountName;
@@ -387,7 +392,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
     private Timer? _engineHeartbeatTimer;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
-    
+    private int _engineHeartbeatWallTick;
+
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
     {
@@ -1607,7 +1613,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
         var cpuProf = EngineCpuProfile.IsEnabled();
         Stopwatch? swPreLock = cpuProf ? Stopwatch.StartNew() : null;
-
         // PHASE 3.1: Periodic identity invariants check (rate-limited). Skip during Historical - Realtime-only.
         if (!isHistorical)
             CheckIdentityInvariantsIfNeeded(utcNow);
@@ -1989,6 +1994,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _runtimeAudit?.CpuEnd(emMis, RuntimeAuditSubsystem.EmitMetricsMismatch);
 
             _runtimeAudit?.TryEmitPeriodicWallClock(nowWall);
+
+            if (_executionAdapter is NinjaTraderSimAdapter ingressAdapter)
+                ingressAdapter.DrainCallbackIngress(nowWall);
 
             tailCoordinatorsMs = wTail?.ElapsedMilliseconds ?? 0;
             if (cpuProf && !isHistorical &&
@@ -3692,19 +3700,37 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
                     source = "TIMETABLE",
                     timetable_path = _timetablePath,
-                    note = "Trading date locked from timetable - immutable for this engine run"
+                    note = "Trading date locked from timetable; rolls forward when timetable trading_date advances (TRADING_DATE_ROLLED_FORWARD)"
                 }));
         }
         else if (_activeTradingDate.Value != timetableTradingDate.Value)
         {
-            // Trading date already locked and differs from timetable - keep existing (immutable)
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
-                new
-                {
-                    locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
-                    timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
-                    note = "Timetable trading_date differs from locked date - keeping existing (immutable)"
-                }));
+            if (timetableTradingDate.Value > _activeTradingDate.Value)
+            {
+                var previousLocked = _activeTradingDate.Value;
+                _activeTradingDate = timetableTradingDate.Value;
+                var clearedStreams = _streams.Count;
+                _streams.Clear();
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TRADING_DATE_ROLLED_FORWARD", state: "ENGINE",
+                    new
+                    {
+                        previous_trading_date = previousLocked.ToString("yyyy-MM-dd"),
+                        new_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        streams_cleared = clearedStreams,
+                        timetable_path = _timetablePath,
+                        note = "Timetable advanced to a later session day - adopting new trading_date and clearing streams for rebuild"
+                    }));
+            }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
+                    new
+                    {
+                        locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                        note = "Timetable trading_date is earlier than locked date - keeping existing lock (no backward roll)"
+                    }));
+            }
         }
 
         if (timetable.timezone != "America/Chicago")
@@ -3723,8 +3749,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
-        // Session Eligibility Freeze: load eligibility_<trading_date>.json — fail closed if missing
-        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{timetableTradingDate.Value:yyyy-MM-dd}.json");
+        // Session Eligibility Freeze: file must match authoritative session day (locked or rolled _activeTradingDate),
+        // not only the timetable file text — avoids wrong-day JSON when timetable and lock disagree.
+        var sessionTradingDate = _activeTradingDate!.Value;
+        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{sessionTradingDate:yyyy-MM-dd}.json");
         EligibilityContract? eligibility = null;
         try
         {
@@ -3732,7 +3760,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         catch (Exception ex)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
                 new { path = eligibilityPath, error = ex.Message, note = "Eligibility file load failed - engine will stand down" }));
             StandDown();
             return;
@@ -3741,11 +3769,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (eligibility == null)
         {
             // Startup safety: machine may have been offline at 18:00 CT — try to generate eligibility
-            var tradingDateStr = timetableTradingDate.Value.ToString("yyyy-MM-dd");
+            var tradingDateStr = sessionTradingDate.ToString("yyyy-MM-dd");
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
                 new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found - attempting startup generation" }));
 
-            var generated = TryGenerateEligibilityAtStartup(timetableTradingDate.Value, utcNow);
+            var generated = TryGenerateEligibilityAtStartup(sessionTradingDate, utcNow);
             if (generated)
             {
                 eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
@@ -3760,10 +3788,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
 
+        if (!string.IsNullOrWhiteSpace(eligibility.trading_date))
+        {
+            try
+            {
+                var eligibilityFileDate = DateOnly.Parse(eligibility.trading_date);
+                if (eligibilityFileDate != sessionTradingDate)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_TRADING_DATE_MISMATCH", state: "ENGINE",
+                        new
+                        {
+                            path = eligibilityPath,
+                            session_trading_date = sessionTradingDate.ToString("yyyy-MM-dd"),
+                            eligibility_trading_date = eligibility.trading_date,
+                            timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                            note = "Eligibility JSON trading_date does not match session - wrong or stale file; standing down"
+                        }));
+                    StandDown();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_TRADING_DATE_INVALID", state: "ENGINE",
+                    new { path = eligibilityPath, eligibility_trading_date = eligibility.trading_date, error = ex.Message, note = "Cannot parse eligibility.trading_date - standing down" }));
+                StandDown();
+                return;
+            }
+        }
+
         _eligibleSet = eligibility.GetEligibleStreamSet();
         var eligibleCount = _eligibleSet.Count;
         var eligibilityHash = ComputeFileHash(eligibilityPath);
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
             new { path = eligibilityPath, eligible_count = eligibleCount, eligibility_hash = eligibilityHash, matrix_hash = eligibility.source_matrix_hash }));
 
         var isReplayTimetable = timetable.metadata?.replay == true;
@@ -3854,13 +3911,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var timetableTradingDate = DateOnly.Parse(timetable.trading_date);
                 if (_activeTradingDate.Value != timetableTradingDate)
                 {
-                    // Timetable trading_date differs from locked date - log warning but keep existing (immutable)
+                    // Timetable trading_date differs from session lock (e.g. stale file); session/eligibility use lock — see ReloadTimetableIfChanged.
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
                         new
                         {
                             locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
                             timetable_trading_date = timetableTradingDate.ToString("yyyy-MM-dd"),
-                            note = "Timetable trading_date differs from locked date - keeping existing (immutable)"
+                            note = "Timetable trading_date differs from locked date - applying timetable using session lock"
                         }));
                 }
             }

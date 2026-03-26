@@ -9,6 +9,7 @@ using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
+using QTSW2.Robot.Core.Diagnostics;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Core.Notifications;
 
@@ -38,6 +39,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue;
     /// <summary>Stable id for reconciliation single-writer / debounce (per strategy instance, process-wide coordinator).</summary>
     private readonly string _reconciliationWriterInstanceId = "eng:" + Guid.NewGuid().ToString("N");
+    private DateTimeOffset _lastAssembleMismatchDiagUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastAssembleMismatchThreadAttrUtc = DateTimeOffset.MinValue;
+    private RuntimeAuditHub? _runtimeAudit;
+    private ReconciliationConvergenceTracker? _reconciliationConvergence;
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -130,7 +135,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>
     /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
-    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// Timer fires every 1s to drive RuntimeAuditHub sampling; ENGINE_CPU_PROFILE emits at the hub interval (5s wall window); ENGINE_TIMER_HEARTBEAT stays every 5s for watchdog volume parity.
     /// </summary>
     public void StartEngineHeartbeatTimer()
     {
@@ -139,11 +144,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _engineHeartbeatTimer?.Dispose();
             _engineHeartbeatTimer = null;
             _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatWallTick = 0;
             _engineHeartbeatTimer = new Timer(
                 _ => EmitTimerHeartbeatUnsafe(),
                 null,
-                TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(5));
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
         }
     }
 
@@ -167,8 +173,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         try
         {
             var utcNow = DateTimeOffset.UtcNow;
-            var tradingDate = _heartbeatTradingDateCache ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            _runtimeAudit?.TryEmitPeriodicWallClock(utcNow);
+            var tick = Interlocked.Increment(ref _engineHeartbeatWallTick);
+            if (tick % 5 == 0)
+            {
+                var tradingDate = _heartbeatTradingDateCache ?? "";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            }
             if (_executionPolicy?.UseInstrumentExecutionAuthority == true && !string.IsNullOrEmpty(_accountName))
                 InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(_accountName!, _log);
             else
@@ -186,9 +197,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
     {
-        RunPendingForceReconcile(utcNow);
-        if (!IsBrokerConnected) return;
-        _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+        var rt = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        try
+        {
+            RunPendingForceReconcile(utcNow);
+            if (!IsBrokerConnected) return;
+            _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+        }
+        finally
+        {
+            if (rt != 0)
+                _runtimeAudit?.CpuEnd(rt, RuntimeAuditSubsystem.ReconciliationThrottle);
+        }
     }
 
     private const string PENDING_FORCE_RECONCILE_FILE = "pending_force_reconcile.json";
@@ -312,6 +332,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, BarRejectionStats> _barRejectionStats = new Dictionary<string, BarRejectionStats>();
     private DateTimeOffset? _lastBarRejectionSummaryUtc = null;
     private const double BAR_REJECTION_SUMMARY_INTERVAL_MINUTES = 5.0;
+
+    // ENGINE_CPU_PROFILE (data/engine_cpu_profile.enabled): accumulate OnBar lock hold time between tick emissions
+    private long _cpuProfileOnBarLockMsAccum;
+    private int _cpuProfileOnBarCount;
+    private DateTimeOffset _lastEngineCpuProfileUtc = DateTimeOffset.MinValue;
+    private const double EngineCpuProfileEmitIntervalSeconds = 5.0;
     
     // Account/environment info for startup banner (set by strategy host)
     private string? _accountName;
@@ -366,7 +392,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
     private Timer? _engineHeartbeatTimer;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
-    
+    private int _engineHeartbeatWallTick;
+
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
     {
@@ -525,6 +552,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public RobotEngine(string projectRoot, TimeSpan timetablePollInterval, ExecutionMode executionMode = ExecutionMode.DRYRUN, string? customLogDir = null, string? customTimetablePath = null, string? instrument = null, string? masterInstrumentName = null, bool useAsyncLogging = true)
     {
         _root = projectRoot;
+        EngineCpuProfile.SetRoot(projectRoot);
         _executionMode = executionMode;
         _executionInstrument = instrument;
         _masterInstrumentName = masterInstrumentName; // Store MasterInstrument.Name for explicit canonical matching
@@ -683,6 +711,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _runId = Guid.NewGuid().ToString("N");
         _engineStartUtc = DateTimeOffset.UtcNow;
         _log.SetRunId(_runId);
+        _runtimeAudit = new RuntimeAuditHub(_log, () => _runId ?? "");
+        RuntimeAuditHubRef.Active = _runtimeAudit;
+        _reconciliationConvergence = new ReconciliationConvergenceTracker(_log, () => _runId ?? "");
 
         var utcNow = _engineStartUtc;
 
@@ -1021,6 +1052,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
                 simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
                 simAdapter.SetEventWriter(_eventWriter);
+                simAdapter.SetFlattenCoordinationInstanceId(_reconciliationWriterInstanceId);
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
@@ -1154,7 +1186,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 reconciliationAccountName: () => _accountName,
                 reconciliationInstanceId: () => _reconciliationWriterInstanceId,
                 reconciliationTracker: ReconciliationStateTracker.Shared,
-                reconciliationDebounceWindow: null);
+                reconciliationDebounceWindow: null,
+                runtimeAudit: _runtimeAudit,
+                convergenceTracker: _reconciliationConvergence);
 
             // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
@@ -1173,7 +1207,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         ?? FlattenResult.FailureResult("No adapter", utcNow);
                 },
                 eventWriter: _eventWriter,
-                getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst));
+                getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst),
+                runtimeAudit: _runtimeAudit);
 
             // Gap 4 + P1.5: Mismatch escalation + closed-loop state-consistency gate
             var stableWindowMs = _executionMode == ExecutionMode.SIM
@@ -1190,11 +1225,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 eventWriter: _eventWriter,
                 runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
                 evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
-                stateConsistencyStableWindowMs: stableWindowMs);
+                stateConsistencyStableWindowMs: stableWindowMs,
+                runtimeAudit: _runtimeAudit);
 
             // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
+                simP2.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
+                    _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d));
                 simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
                 simP2.SetP2StreamContainmentEngineCallback((attr, now) =>
@@ -1506,6 +1544,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
+        _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
+        RuntimeAuditHubRef.Active = null;
 
         string? summaryPathToWrite = null;
         string? summaryJson = null;
@@ -1568,6 +1608,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
     {
+        var tickTotalStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        try
+        {
+        var cpuProf = EngineCpuProfile.IsEnabled();
+        Stopwatch? swPreLock = cpuProf ? Stopwatch.StartNew() : null;
         // PHASE 3.1: Periodic identity invariants check (rate-limited). Skip during Historical - Realtime-only.
         if (!isHistorical)
             CheckIdentityInvariantsIfNeeded(utcNow);
@@ -1594,6 +1639,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var nowWall = DateTimeOffset.UtcNow;
         var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(nowWall);
         var parsed = shouldPoll ? PollAndParseTimetable(nowWall) : default;
+
+        var preLockMs = swPreLock?.ElapsedMilliseconds ?? 0;
         
         // Diagnostic: log once per engine when we skip poll during Historical (confirms fix is deployed)
         if (isHistorical && !_loggedHistoricalPollSkip)
@@ -1605,6 +1652,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         lock (_engineLock)
         {
+            var lockRegionStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+            try
+            {
+            Stopwatch? wPreRecon = cpuProf ? Stopwatch.StartNew() : null;
+            long preReconMs = 0;
+            long reconciliationRunnerMs = 0;
+            long timetableReloadMs = 0;
+            long streamTickMs = 0;
+            long secondReconciliationMs = 0;
+            long forcedFlattenMs = 0;
+            long tailCoordinatorsMs = 0;
+
             // HEARTBEAT: Emit unconditionally for process liveness (before any early returns)
             // This ensures watchdog always sees engine liveness, regardless of trading readiness
             
@@ -1693,9 +1752,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 RunRecovery(utcNow, _accountName ?? "");
             }
 
+            preReconMs = wPreRecon?.ElapsedMilliseconds ?? 0;
+            Stopwatch? wRecon = cpuProf ? Stopwatch.StartNew() : null;
+
             // Reconciliation: periodic orphaned journal cleanup (throttled). Skip during Historical - no live account.
             if (!isHistorical)
                 RunReconciliationPeriodicThrottle(utcNow);
+
+            reconciliationRunnerMs = wRecon?.ElapsedMilliseconds ?? 0;
+            Stopwatch? wTimetableStream = cpuProf ? Stopwatch.StartNew() : null;
 
             // Timetable reactivity (disk I/O already completed outside lock)
             if (shouldPoll)
@@ -1706,12 +1771,37 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
             }
 
+            timetableReloadMs = shouldPoll ? (wTimetableStream?.ElapsedMilliseconds ?? 0) : 0;
+            if (cpuProf && wTimetableStream != null)
+                wTimetableStream.Restart();
+
             // SLOT EXPIRY: Run stream.Tick BEFORE forced flatten so slot expiry (at NextSlotTimeUtc)
             // can run and commit streams before forced flatten. Otherwise forced flatten would
             // commit pre-entry streams first, and reentry streams would never reach slot expiry.
+            var streamLoopStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             foreach (var s in _streams.Values)
+            {
+                var ts = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
                 s.Tick(utcNow);
+                if (ts != 0)
+                {
+                    _runtimeAudit?.CpuEnd(ts, RuntimeAuditSubsystem.EngineTickPerStream, s.Instrument, s.Stream, onIeaWorker: false);
+                    var sid = string.IsNullOrEmpty(s.Stream) ? s.Instrument : s.Stream;
+                    _runtimeAudit?.RecordStreamTick(sid, RuntimeAuditHub.CpuElapsedMs(ts));
+                }
+            }
+            if (streamLoopStart != 0)
+            {
+                var loopMs = RuntimeAuditHub.CpuElapsedMs(streamLoopStart);
+                _runtimeAudit?.CpuEnd(streamLoopStart, RuntimeAuditSubsystem.StreamLoop);
+                _runtimeAudit?.RecordStreamLoopAggregate(_streams.Count, loopMs);
+            }
 
+            streamTickMs = wTimetableStream?.ElapsedMilliseconds ?? 0;
+            if (cpuProf && wTimetableStream != null)
+                wTimetableStream.Restart();
+
+            Stopwatch? wSecondRecon = null;
             // Second reconciliation trigger (lightweight safety net): run once, ~5 min after recovery
             if (_recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE &&
                 _recoveryCompletedUtc.HasValue &&
@@ -1719,6 +1809,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _executionAdapter != null &&
                 (utcNow - _recoveryCompletedUtc.Value).TotalMinutes >= SECOND_RECONCILIATION_DELAY_MINUTES)
             {
+                if (cpuProf)
+                    wSecondRecon = Stopwatch.StartNew();
                 try
                 {
                     var snap = _executionAdapter.GetAccountSnapshot(utcNow);
@@ -1751,6 +1843,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     _secondReconciliationRunUtc = utcNow; // Don't retry
                 }
             }
+
+            secondReconciliationMs = wSecondRecon?.ElapsedMilliseconds ?? 0;
+            if (cpuProf && wTimetableStream != null)
+                wTimetableStream.Restart();
+
+            Stopwatch? wForcedFlatten = cpuProf ? Stopwatch.StartNew() : null;
 
             // Forced flatten block — per sessionClass (runs after slot expiry so both can work)
             var tradingDateStr = TradingDateString;
@@ -1837,6 +1935,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }
             }
 
+            forcedFlattenMs = wForcedFlatten?.ElapsedMilliseconds ?? 0;
+            Stopwatch? wTail = cpuProf ? Stopwatch.StartNew() : null;
+
             // Periodic stream status summary (diagnostic only, rate-limited to every 5 minutes)
             if (_loggingConfig.DiagnosticsEnabled && _streams.Count > 0)
             {
@@ -1883,8 +1984,61 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _healthMonitor?.Evaluate(utcNow);
 
             // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
+            var emProt = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             _protectiveCoordinator?.EmitMetrics(utcNow);
+            if (emProt != 0)
+                _runtimeAudit?.CpuEnd(emProt, RuntimeAuditSubsystem.EmitMetricsProtective);
+            var emMis = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
             _mismatchCoordinator?.EmitMetrics(utcNow);
+            if (emMis != 0)
+                _runtimeAudit?.CpuEnd(emMis, RuntimeAuditSubsystem.EmitMetricsMismatch);
+
+            _runtimeAudit?.TryEmitPeriodicWallClock(nowWall);
+
+            if (_executionAdapter is NinjaTraderSimAdapter ingressAdapter)
+                ingressAdapter.DrainCallbackIngress(nowWall);
+
+            tailCoordinatorsMs = wTail?.ElapsedMilliseconds ?? 0;
+            if (cpuProf && !isHistorical &&
+                (_lastEngineCpuProfileUtc == DateTimeOffset.MinValue ||
+                 (nowWall - _lastEngineCpuProfileUtc).TotalSeconds >= EngineCpuProfileEmitIntervalSeconds))
+            {
+                _lastEngineCpuProfileUtc = nowWall;
+                var obMs = Interlocked.Exchange(ref _cpuProfileOnBarLockMsAccum, 0L);
+                var obCnt = Interlocked.Exchange(ref _cpuProfileOnBarCount, 0);
+                var lockSumMs = preReconMs + reconciliationRunnerMs + timetableReloadMs + streamTickMs +
+                                secondReconciliationMs + forcedFlattenMs + tailCoordinatorsMs;
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_CPU_PROFILE_LOCK_SLICES", state: "ENGINE",
+                    new
+                    {
+                        pre_lock_ms = preLockMs,
+                        pre_reconciliation_ms = preReconMs,
+                        reconciliation_runner_ms = reconciliationRunnerMs,
+                        timetable_reload_ms = timetableReloadMs,
+                        stream_tick_ms = streamTickMs,
+                        second_reconciliation_ms = secondReconciliationMs,
+                        forced_flatten_ms = forcedFlattenMs,
+                        tail_coordinators_ms = tailCoordinatorsMs,
+                        lock_sum_ms = lockSumMs,
+                        stream_count = _streams.Count,
+                        onbar_lock_ms_window = obMs,
+                        onbar_calls_window = obCnt,
+                        onbar_avg_lock_ms = obCnt > 0 ? Math.Round((double)obMs / obCnt, 2) : 0,
+                        note = "Wall-clock slices inside engine lock + OnBar totals since last emit; touch data/engine_cpu_profile.enabled to enable. Subsystem ENGINE_CPU_PROFILE is emitted by RuntimeAuditHub."
+                    }));
+            }
+            }
+            finally
+            {
+                if (lockRegionStart != 0)
+                    _runtimeAudit?.CpuEnd(lockRegionStart, RuntimeAuditSubsystem.EngineLockRegion);
+            }
+        }
+        }
+        finally
+        {
+            if (tickTotalStart != 0)
+                _runtimeAudit?.CpuEnd(tickTotalStart, RuntimeAuditSubsystem.EngineTickTotal);
         }
     }
 
@@ -1904,6 +2058,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         lock (_engineLock)
         {
+            var cpuBarWatch = EngineCpuProfile.IsEnabled() ? Stopwatch.StartNew() : null;
+            try
+            {
             if (_spec is null || _time is null) return;
 
         // CRITICAL: Reject future bars and validate bar timing
@@ -2296,6 +2453,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Log bar delivery summary periodically (rate-limited)
         LogBarDeliverySummaryIfNeeded(utcNow, instrument, streamsReceivingBar, streamsFilteredOut);
         
+            }
+            finally
+            {
+                if (cpuBarWatch != null)
+                {
+                    Interlocked.Add(ref _cpuProfileOnBarLockMsAccum, cpuBarWatch.ElapsedMilliseconds);
+                    Interlocked.Increment(ref _cpuProfileOnBarCount);
+                }
+            }
         } // Close lock (_engineLock)
     }
     
@@ -3534,19 +3700,37 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
                     source = "TIMETABLE",
                     timetable_path = _timetablePath,
-                    note = "Trading date locked from timetable - immutable for this engine run"
+                    note = "Trading date locked from timetable; rolls forward when timetable trading_date advances (TRADING_DATE_ROLLED_FORWARD)"
                 }));
         }
         else if (_activeTradingDate.Value != timetableTradingDate.Value)
         {
-            // Trading date already locked and differs from timetable - keep existing (immutable)
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
-                new
-                {
-                    locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
-                    timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
-                    note = "Timetable trading_date differs from locked date - keeping existing (immutable)"
-                }));
+            if (timetableTradingDate.Value > _activeTradingDate.Value)
+            {
+                var previousLocked = _activeTradingDate.Value;
+                _activeTradingDate = timetableTradingDate.Value;
+                var clearedStreams = _streams.Count;
+                _streams.Clear();
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TRADING_DATE_ROLLED_FORWARD", state: "ENGINE",
+                    new
+                    {
+                        previous_trading_date = previousLocked.ToString("yyyy-MM-dd"),
+                        new_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        streams_cleared = clearedStreams,
+                        timetable_path = _timetablePath,
+                        note = "Timetable advanced to a later session day - adopting new trading_date and clearing streams for rebuild"
+                    }));
+            }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
+                    new
+                    {
+                        locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                        note = "Timetable trading_date is earlier than locked date - keeping existing lock (no backward roll)"
+                    }));
+            }
         }
 
         if (timetable.timezone != "America/Chicago")
@@ -3565,8 +3749,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return;
         }
 
-        // Session Eligibility Freeze: load eligibility_<trading_date>.json — fail closed if missing
-        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{timetableTradingDate.Value:yyyy-MM-dd}.json");
+        // Session Eligibility Freeze: file must match authoritative session day (locked or rolled _activeTradingDate),
+        // not only the timetable file text — avoids wrong-day JSON when timetable and lock disagree.
+        var sessionTradingDate = _activeTradingDate!.Value;
+        var eligibilityPath = Path.Combine(_root, "data", "timetable", $"eligibility_{sessionTradingDate:yyyy-MM-dd}.json");
         EligibilityContract? eligibility = null;
         try
         {
@@ -3574,7 +3760,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         catch (Exception ex)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOAD_FAILED", state: "ENGINE",
                 new { path = eligibilityPath, error = ex.Message, note = "Eligibility file load failed - engine will stand down" }));
             StandDown();
             return;
@@ -3583,11 +3769,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (eligibility == null)
         {
             // Startup safety: machine may have been offline at 18:00 CT — try to generate eligibility
-            var tradingDateStr = timetableTradingDate.Value.ToString("yyyy-MM-dd");
+            var tradingDateStr = sessionTradingDate.ToString("yyyy-MM-dd");
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_ELIGIBILITY_MISSING", state: "ENGINE",
                 new { path = eligibilityPath, trading_date = tradingDateStr, note = "Eligibility file not found - attempting startup generation" }));
 
-            var generated = TryGenerateEligibilityAtStartup(timetableTradingDate.Value, utcNow);
+            var generated = TryGenerateEligibilityAtStartup(sessionTradingDate, utcNow);
             if (generated)
             {
                 eligibility = EligibilityContract.LoadFromFile(eligibilityPath);
@@ -3602,10 +3788,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
 
+        if (!string.IsNullOrWhiteSpace(eligibility.trading_date))
+        {
+            try
+            {
+                var eligibilityFileDate = DateOnly.Parse(eligibility.trading_date);
+                if (eligibilityFileDate != sessionTradingDate)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_TRADING_DATE_MISMATCH", state: "ENGINE",
+                        new
+                        {
+                            path = eligibilityPath,
+                            session_trading_date = sessionTradingDate.ToString("yyyy-MM-dd"),
+                            eligibility_trading_date = eligibility.trading_date,
+                            timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                            note = "Eligibility JSON trading_date does not match session - wrong or stale file; standing down"
+                        }));
+                    StandDown();
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_TRADING_DATE_INVALID", state: "ENGINE",
+                    new { path = eligibilityPath, eligibility_trading_date = eligibility.trading_date, error = ex.Message, note = "Cannot parse eligibility.trading_date - standing down" }));
+                StandDown();
+                return;
+            }
+        }
+
         _eligibleSet = eligibility.GetEligibleStreamSet();
         var eligibleCount = _eligibleSet.Count;
         var eligibilityHash = ComputeFileHash(eligibilityPath);
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: timetableTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: sessionTradingDate.ToString("yyyy-MM-dd"), eventType: "SESSION_ELIGIBILITY_LOADED", state: "ENGINE",
             new { path = eligibilityPath, eligible_count = eligibleCount, eligibility_hash = eligibilityHash, matrix_hash = eligibility.source_matrix_hash }));
 
         var isReplayTimetable = timetable.metadata?.replay == true;
@@ -3696,13 +3911,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var timetableTradingDate = DateOnly.Parse(timetable.trading_date);
                 if (_activeTradingDate.Value != timetableTradingDate)
                 {
-                    // Timetable trading_date differs from locked date - log warning but keep existing (immutable)
+                    // Timetable trading_date differs from session lock (e.g. stale file); session/eligibility use lock — see ReloadTimetableIfChanged.
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
                         new
                         {
                             locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
                             timetable_trading_date = timetableTradingDate.ToString("yyyy-MM-dd"),
-                            note = "Timetable trading_date differs from locked date - keeping existing (immutable)"
+                            note = "Timetable trading_date differs from locked date - applying timetable using session lock"
                         }));
                 }
             }
@@ -4947,9 +5162,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private bool IsIeaQueueHealthyForInstrument(string instrument)
     {
         var account = _accountName ?? "";
-        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, instrument, null);
-        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
-        if (InstrumentExecutionAuthorityRegistry.TryGet(account, execKey, out var iea))
+        if (ReconciliationIeaLookup.TryResolve(account, instrument, 0, GetExecutionInstrument, out var iea) && iea != null)
             return !iea.IsInstrumentBlocked;
         return true;
     }
@@ -5006,6 +5219,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (snap.Positions == null && snap.WorkingOrders == null)
             return list;
 
+        var swAssemble = Stopwatch.StartNew();
+        var rtAssemble = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        if ((utcNow - _lastAssembleMismatchThreadAttrUtc).TotalSeconds >= 60)
+        {
+            _lastAssembleMismatchThreadAttrUtc = utcNow;
+            var t = Thread.CurrentThread;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "IEA_EXPENSIVE_PATH_THREAD", state: "ENGINE",
+                new
+                {
+                    path = "AssembleMismatchObservations",
+                    thread_id = t.ManagedThreadId,
+                    thread_name = t.Name,
+                    on_iea_worker = false,
+                    note = "Engine reconciliation path — not IEA worker thread"
+                }));
+        }
+
         var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var brokerWorkingByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -5037,6 +5267,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
         var account = _accountName ?? "";
+        var recoveryAdoptionInvocations = 0;
 
         foreach (var inst in allInstruments)
         {
@@ -5054,7 +5285,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (openByInst.TryGetValue(execVariant, out var entriesM))
                 journalWorking += entriesM.Count;
 
-            if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var iea))
+            if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, brokerWorking, GetExecutionInstrument, out var iea) && iea != null)
             {
                 localWorking = iea.GetOwnedPlusAdoptedWorkingCount();
                 // Diagnostic: log when broker_working != iea_working to catch ORDER_REGISTRY_MISSING root causes
@@ -5085,7 +5316,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // ORDER_REGISTRY_MISSING recovery: attempt adoption before fail-closed
             if (brokerWorking > 0 && effectiveLocalWorking == 0 && useIea &&
-                InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaForRecovery))
+                ReconciliationIeaLookup.TryResolve(account, inst, brokerWorking, GetExecutionInstrument, out var ieaForRecovery) && ieaForRecovery != null)
             {
                 var throttleKey = $"{inst}_{brokerWorking}_{effectiveLocalWorking}";
                 var shouldLogAttempt = true;
@@ -5109,6 +5340,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_ATTEMPT", state: "ENGINE",
                         new { instrument = inst, broker_working = brokerWorking, iea_working_before = effectiveLocalWorking }));
                 }
+                recoveryAdoptionInvocations++;
                 if (ieaForRecovery.TryScheduleRecoveryAdoptionScan(out var adoptedSync))
                 {
                     var localAfter = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
@@ -5121,14 +5353,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             new { instrument = inst, broker_working = brokerWorking, adopted_count = adoptedSync, delay_from_startup_ms = delayMs }));
                     }
                     if (localAfter == brokerWorking)
-                        continue;
+                        continue; // Recovery succeeded, no mismatch
                     if (adoptedSync > 0)
                     {
                         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_RECOVERY_ADOPTION_PARTIAL", state: "ENGINE",
                             new { instrument = inst, adopted_count = adoptedSync, broker_working = brokerWorking, iea_working_after = localAfter, note = "Still mismatched after adoption" }));
                     }
-                    continue;
+                    continue; // Scan queued or in flight — skip mismatch this assembly pass
                 }
+                // Recovery throttle: no new scan scheduled — classify mismatch using current IEA working count
                 effectiveLocalWorking = ieaForRecovery.GetOwnedPlusAdoptedWorkingCount();
             }
 
@@ -5156,6 +5389,36 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ObservedUtc = utcNow,
                 Severity = "CRITICAL"
             });
+        }
+
+        swAssemble.Stop();
+        if (rtAssemble != 0)
+            _runtimeAudit?.CpuEnd(rtAssemble, RuntimeAuditSubsystem.AssembleMismatch);
+
+        var instrumentsScanned = allInstruments.Count;
+        var mismatchCount = list.Count;
+        var emitAssembleDiag = swAssemble.ElapsedMilliseconds >= 50
+                               || recoveryAdoptionInvocations > 0
+                               || mismatchCount > 0
+                               || _lastAssembleMismatchDiagUtc == DateTimeOffset.MinValue
+                               || (utcNow - _lastAssembleMismatchDiagUtc).TotalSeconds >= 55;
+        if (emitAssembleDiag)
+        {
+            var tDiag = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+            _lastAssembleMismatchDiagUtc = utcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "RECONCILIATION_ASSEMBLE_MISMATCH_DIAG", state: "ENGINE",
+                new
+                {
+                    wall_ms = swAssemble.ElapsedMilliseconds,
+                    instruments_scanned = instrumentsScanned,
+                    recovery_adoption_invocations = recoveryAdoptionInvocations,
+                    mismatch_observations_emitted = mismatchCount,
+                    working_orders_in_snapshot = snap.WorkingOrders?.Count ?? 0,
+                    positions_in_snapshot = snap.Positions?.Count ?? 0,
+                    note = "Proof diag for AssembleMismatchObservations — recovery uses TryScheduleRecoveryAdoptionScan (worker-serialized adoption)"
+                }));
+            if (tDiag != 0)
+                _runtimeAudit?.CpuEnd(tDiag, RuntimeAuditSubsystem.MismatchDiagnostics);
         }
 
         return list;
@@ -5206,7 +5469,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var useIea = input.UseInstrumentExecutionAuthority;
         var account = _accountName ?? "";
-        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var iea))
+        if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, input.BrokerWorkingCount, GetExecutionInstrument, out var iea) && iea != null)
         {
             input.IeaOwnedPlusAdoptedWorking = iea.GetOwnedPlusAdoptedWorkingCount();
             input.PendingAdoptionCandidateCount = iea.Executor?.GetAdoptionCandidateIntentIds(iea.ExecutionInstrumentKey).Count ?? 0;
@@ -5247,7 +5510,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
         var account = _accountName ?? "";
-        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaBeforeProbe))
+        if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, result.BrokerWorkingCountBefore, GetExecutionInstrument, out var ieaBeforeProbe) && ieaBeforeProbe != null)
         {
             result.IeaOwnedCountBefore = ieaBeforeProbe.GetOwnedPlusAdoptedWorkingCount();
             result.AdoptionCandidateCountBefore = ieaBeforeProbe.Executor?.GetAdoptionCandidateIntentIds(ieaBeforeProbe.ExecutionInstrumentKey).Count ?? 0;
@@ -5260,7 +5523,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         _reconciliationRunner?.ForceRunGateRecoveryForInstrument(utcNow, inst);
 
-        if (InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaRecover))
+        if (ReconciliationIeaLookup.TryResolve(account, inst, result.BrokerWorkingCountBefore, GetExecutionInstrument, out var ieaRecover) && ieaRecover != null)
         {
             try
             {
@@ -5287,7 +5550,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         result.BrokerWorkingCountAfter = CountBrokerWorkingOrders(snapAfter, inst);
-        if (useIea && InstrumentExecutionAuthorityRegistry.TryGet(account, ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, inst, null), out var ieaAfterProbe))
+        if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, result.BrokerWorkingCountAfter, GetExecutionInstrument, out var ieaAfterProbe) && ieaAfterProbe != null)
         {
             result.IeaOwnedCountAfter = ieaAfterProbe.GetOwnedPlusAdoptedWorkingCount();
             result.AdoptionCandidateCountAfter = ieaAfterProbe.Executor?.GetAdoptionCandidateIntentIds(ieaAfterProbe.ExecutionInstrumentKey).Count ?? 0;

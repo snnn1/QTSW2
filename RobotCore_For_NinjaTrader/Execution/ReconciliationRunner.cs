@@ -89,11 +89,11 @@ public sealed class ReconciliationRunner
 
     private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
+        var gateInst = options?.GateRecoveryInstrument?.Trim();
+        var gateMode = !string.IsNullOrEmpty(gateInst);
         _lastRunUtc = utcNow;
         _runtimeAudit?.NotifyReconciliationRunCompleted();
         var cpuStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
-        var gateInst = options?.GateRecoveryInstrument?.Trim();
-        var gateMode = !string.IsNullOrEmpty(gateInst);
 
         AccountSnapshot snap;
         try

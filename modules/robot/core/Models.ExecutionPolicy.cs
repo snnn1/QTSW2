@@ -14,15 +14,27 @@ public sealed class ExecutionPolicy
     
     public Dictionary<string, CanonicalMarketPolicy> canonical_markets => _canonicalMarkets;
     
+    /// <summary>When true, use InstrumentExecutionAuthority (IEA) — single broker authority per instrument.</summary>
+    public bool UseInstrumentExecutionAuthority { get; }
+    
     /// <summary>When true, canonical market lock is disabled (multiple instances per market allowed).</summary>
     public bool DisableCanonicalMarketLock { get; }
 
+    /// <summary>Phase 2: Aggregation/bracket policy. Null = use defaults.</summary>
+    public AggregationPolicy? Aggregation { get; }
+
+    /// <summary>Phase 3: Break-even policy. Null = use defaults.</summary>
+    public BreakEvenPolicy? BreakEven { get; }
+
     // Private constructor - use LoadFromFile
-    private ExecutionPolicy(Dictionary<string, CanonicalMarketPolicy> canonicalMarkets, string schema, bool disableCanonicalMarketLock)
+    private ExecutionPolicy(Dictionary<string, CanonicalMarketPolicy> canonicalMarkets, string schema, bool useInstrumentExecutionAuthority, bool disableCanonicalMarketLock, AggregationPolicy? aggregation, BreakEvenPolicy? breakEven)
     {
         _canonicalMarkets = canonicalMarkets;
         this.schema = schema;
+        UseInstrumentExecutionAuthority = useInstrumentExecutionAuthority;
         DisableCanonicalMarketLock = disableCanonicalMarketLock;
+        Aggregation = aggregation;
+        BreakEven = breakEven;
     }
     
     public static ExecutionPolicy LoadFromFile(string path)
@@ -74,9 +86,29 @@ public sealed class ExecutionPolicy
             normalizedCanonicalMarkets[canonicalKey] = new CanonicalMarketPolicy(normalizedExecInstruments);
         }
         
-        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "", rawPolicy.disable_canonical_market_lock);
+        var aggregation = ParseAggregation(rawPolicy.aggregation);
+        var breakEven = ParseBreakEven(rawPolicy.break_even);
+        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "", rawPolicy.use_instrument_execution_authority, rawPolicy.disable_canonical_market_lock, aggregation, breakEven);
         policy.ValidateOrThrow();
         return policy;
+    }
+
+    private static AggregationPolicy? ParseAggregation(AggregationPolicyRaw? raw)
+    {
+        if (raw == null) return null;
+        return new AggregationPolicy(
+            stopPolicy: raw.bracket_policy?.stop ?? "TIGHTEST",
+            targetPolicy: raw.bracket_policy?.target ?? "TIGHTEST",
+            requireIdenticalBracket: raw.require_identical_bracket,
+            bracketToleranceTicks: raw.bracket_tolerance_ticks);
+    }
+
+    private static BreakEvenPolicy? ParseBreakEven(BreakEvenPolicyRaw? raw)
+    {
+        if (raw == null) return null;
+        return new BreakEvenPolicy(
+            triggerPolicy: raw.trigger_policy ?? "FIRST_TO_TRIGGER",
+            stopPricePolicy: raw.stop_price_policy ?? "TIGHTEST");
     }
     
     public void ValidateOrThrow()
@@ -172,9 +204,64 @@ public sealed class ExecutionPolicy
 internal sealed class ExecutionPolicyRaw
 {
     public string? schema { get; set; }
+    /// <summary>When true, use InstrumentExecutionAuthority (IEA) — single broker authority per instrument. Default: true.</summary>
+    public bool use_instrument_execution_authority { get; set; } = true;
     public Dictionary<string, CanonicalMarketPolicyRaw>? canonical_markets { get; set; }
     /// <summary>When true, skip canonical market lock (allow multiple instances per market). Default: false.</summary>
     public bool disable_canonical_market_lock { get; set; }
+    /// <summary>Phase 2: Aggregation/bracket policy. Optional.</summary>
+    public AggregationPolicyRaw? aggregation { get; set; }
+    /// <summary>Phase 3: Break-even policy. Optional.</summary>
+    public BreakEvenPolicyRaw? break_even { get; set; }
+}
+
+/// <summary>Phase 2: Bracket/aggregation policy for IEA.</summary>
+public sealed class AggregationPolicy
+{
+    public string StopPolicy { get; }
+    public string TargetPolicy { get; }
+    public bool RequireIdenticalBracket { get; }
+    public int BracketToleranceTicks { get; }
+
+    public AggregationPolicy(string stopPolicy, string targetPolicy, bool requireIdenticalBracket, int bracketToleranceTicks)
+    {
+        StopPolicy = stopPolicy ?? "TIGHTEST";
+        TargetPolicy = targetPolicy ?? "TIGHTEST";
+        RequireIdenticalBracket = requireIdenticalBracket;
+        BracketToleranceTicks = bracketToleranceTicks;
+    }
+}
+
+internal sealed class AggregationPolicyRaw
+{
+    public BracketPolicyRaw? bracket_policy { get; set; }
+    public bool require_identical_bracket { get; set; } = true;
+    public int bracket_tolerance_ticks { get; set; } = 1;
+}
+
+/// <summary>Phase 3: Break-even policy for IEA.</summary>
+public sealed class BreakEvenPolicy
+{
+    public string TriggerPolicy { get; }
+    public string StopPricePolicy { get; }
+
+    public BreakEvenPolicy(string triggerPolicy, string stopPricePolicy)
+    {
+        TriggerPolicy = triggerPolicy ?? "FIRST_TO_TRIGGER";
+        StopPricePolicy = stopPricePolicy ?? "TIGHTEST";
+    }
+}
+
+internal sealed class BreakEvenPolicyRaw
+{
+    public string? trigger_policy { get; set; }
+    public string? stop_price_policy { get; set; }
+}
+
+internal sealed class BracketPolicyRaw
+{
+    public string? stop { get; set; }
+    public string? target { get; set; }
 }
 
 internal sealed class CanonicalMarketPolicyRaw

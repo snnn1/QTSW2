@@ -131,6 +131,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Flatten coordination tracker (cross-chart owner + verify debounce)" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("FLATTEN_FILL_JOURNAL", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = FlattenFillJournalRoutingTests.RunFlattenFillJournalRoutingTests();
+        Console.WriteLine(pass ? "PASS: Flatten fill journal routing (tag decode + RecordExitFill FLATTEN)" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("P2_6_DESTRUCTIVE_POLICY_TESTS", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = P2_6DestructivePolicyTests.RunP2_6DestructivePolicyTests();

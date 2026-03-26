@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
@@ -108,8 +110,63 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Execution instrument key (e.g., MNQ, MGC).</summary>
     public string ExecutionInstrumentKey { get; }
 
-    /// <summary>Order executor for NT operations (adapter implements).</summary>
-    internal readonly IIEAOrderExecutor? Executor;
+    /// <summary>Order executor for NT operations (adapter implements). Rebound on strategy restart — see <see cref="RebindExecutor"/>.</summary>
+    private volatile IIEAOrderExecutor? _executor;
+
+    internal IIEAOrderExecutor? Executor => _executor;
+
+    /// <summary>
+    /// Point this IEA at the current <see cref="NinjaTraderSimAdapter"/> after <see cref="InstrumentExecutionAuthorityRegistry.GetOrCreate"/>
+    /// returns a cached IEA from a prior strategy run. Otherwise SIM verification runs on the new adapter while submissions still use the old one.
+    /// </summary>
+    /// <param name="strategyInstanceIdForAudit">Strategy host instance id (investigation / RUNTIME_FINGERPRINT alignment).</param>
+    internal void RebindExecutor(IIEAOrderExecutor executor, string? strategyInstanceIdForAudit = null)
+    {
+        var newEx = executor ?? throw new ArgumentNullException(nameof(executor));
+        if (ReferenceEquals(_executor, newEx))
+            return;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var oldEx = _executor;
+
+        static string AuditExecutorId(IIEAOrderExecutor? ex)
+        {
+            if (ex == null) return "";
+            if (ex is NinjaTraderSimAdapter sim)
+                return "nta:" + sim.InvestigationAdapterInstanceId.ToString(CultureInfo.InvariantCulture);
+            if (ex is ReplayExecutor)
+                return "replay:0";
+            return "exe:" + RuntimeHelpers.GetHashCode(ex).ToString("x8", CultureInfo.InvariantCulture);
+        }
+
+        _executor = newEx;
+        var oldId = AuditExecutorId(oldEx);
+        var newId = AuditExecutorId(newEx);
+        Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTOR_REBOUND", state: "ENGINE",
+            new
+            {
+                old_executor_id = string.IsNullOrEmpty(oldId) ? null : oldId,
+                new_executor_id = newId,
+                strategy_instance_id = strategyInstanceIdForAudit ?? "",
+                iea_instance_id = _instanceId,
+                account_name = AccountName,
+                execution_instrument_key = ExecutionInstrumentKey,
+                timestamp = utcNow.ToString("o")
+            }));
+
+        if (oldEx != null)
+        {
+            Log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_OWNERSHIP_CHANGED", state: "ENGINE",
+                new
+                {
+                    iea_id = _instanceId,
+                    old_owner = oldId,
+                    new_owner = newId,
+                    account_name = AccountName,
+                    execution_instrument_key = ExecutionInstrumentKey
+                }));
+        }
+    }
 
     /// <summary>Logger for audit events.</summary>
     internal readonly RobotLogger? Log;
@@ -148,7 +205,7 @@ public sealed partial class InstrumentExecutionAuthority
     {
         AccountName = accountName ?? "";
         ExecutionInstrumentKey = (executionInstrumentKey ?? "").Trim().ToUpperInvariant();
-        Executor = executor;
+        _executor = executor;
         Log = log;
         AggregationPolicy = aggregationPolicy;
         _eventClock = eventClock;
@@ -369,7 +426,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Gap 2: Enqueue order update for serialized processing. Uses EnqueueRecoveryEssential so order state changes are processed during recovery (registry lifecycle).</summary>
     internal void EnqueueOrderUpdate(object order, object orderUpdate)
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
         var o = order;
         var ou = orderUpdate;
         EnqueueRecoveryEssential(() => Executor.ProcessOrderUpdate(o, ou), "OrderUpdate");
@@ -379,7 +437,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="workKind">Semantic label for <c>IEA_HEARTBEAT.current_command_type</c> and stall diagnostics (e.g. ExecutionUpdate, OrderUpdate).</param>
     internal void EnqueueRecoveryEssential(Action work, string workKind = "RecoveryWork")
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
         EnqueueCore(work, workKind);
     }
 
@@ -387,7 +446,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="workKind">Semantic label for heartbeat / stall diagnostics.</param>
     internal void Enqueue(Action work, string workKind = "NormalWork")
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
 #if NINJATRADER
         if (IsInRecovery)
         {
@@ -475,7 +535,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="context">Optional caller context for IEA_ENQUEUE_AND_WAIT_TIMING diagnostics.</param>
     internal (bool success, T? result) EnqueueAndWait<T>(Func<T> work, int timeoutMs = 5000, string? context = null)
     {
-        if (Executor == null) return (false, default);
+        if (Executor == null)
+            return (false, default);
         if (!_workerRunning) return (false, default);
 
 #if NINJATRADER

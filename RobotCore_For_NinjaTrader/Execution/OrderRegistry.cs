@@ -14,6 +14,8 @@ public sealed class OrderRegistry
 {
     private readonly ConcurrentDictionary<string, OrderRegistryEntry> _byBrokerOrderId = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _aliasToBrokerOrderId = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Alternate native/broker id -> canonical id stored at Register (pre-ack vs post-ack Sim transition).</summary>
+    private readonly ConcurrentDictionary<string, string> _brokerOrderIdAliasToCanonical = new(StringComparer.OrdinalIgnoreCase);
 
     private int _unownedOrdersDetected;
     private int _registryIntegrityFailures;
@@ -47,6 +49,13 @@ public sealed class OrderRegistry
         if (_byBrokerOrderId.TryGetValue(brokerOrderId, out var e))
         {
             e.LastResolutionPath = "DirectId";
+            entry = e;
+            return true;
+        }
+        if (_brokerOrderIdAliasToCanonical.TryGetValue(brokerOrderId, out var canonicalId) &&
+            _byBrokerOrderId.TryGetValue(canonicalId, out e))
+        {
+            e.LastResolutionPath = "BrokerOrderIdAlias";
             entry = e;
             return true;
         }
@@ -90,10 +99,28 @@ public sealed class OrderRegistry
         _aliasToBrokerOrderId[alias] = brokerOrderId;
     }
 
+    /// <summary>
+    /// Link a broker-native order id observed after submit (e.g. Sim post-ack) to the canonical id used at <see cref="Register"/>.
+    /// Keeps intent aliases separate — uses a dedicated map so intent strings never resolve as broker ids.
+    /// </summary>
+    public bool LinkBrokerOrderIdAlias(string alternateBrokerOrderId, string canonicalBrokerOrderId)
+    {
+        if (string.IsNullOrEmpty(alternateBrokerOrderId) || string.IsNullOrEmpty(canonicalBrokerOrderId)) return false;
+        if (string.Equals(alternateBrokerOrderId, canonicalBrokerOrderId, StringComparison.OrdinalIgnoreCase)) return false;
+        if (!_byBrokerOrderId.ContainsKey(canonicalBrokerOrderId)) return false;
+        _brokerOrderIdAliasToCanonical[alternateBrokerOrderId] = canonicalBrokerOrderId;
+        return true;
+    }
+
     /// <summary>Update lifecycle state. Returns false if transition invalid (caller should emit ORDER_LIFECYCLE_TRANSITION_INVALID).</summary>
     public bool UpdateLifecycle(string brokerOrderId, OrderLifecycleState newState, DateTimeOffset? terminalUtc = null)
     {
-        if (!_byBrokerOrderId.TryGetValue(brokerOrderId, out var entry)) return true; // not found, no validation
+        OrderRegistryEntry? entry = null;
+        if (_byBrokerOrderId.TryGetValue(brokerOrderId, out var e))
+            entry = e;
+        else if (_brokerOrderIdAliasToCanonical.TryGetValue(brokerOrderId, out var canon) && _byBrokerOrderId.TryGetValue(canon, out e))
+            entry = e;
+        if (entry == null) return true; // not found, no validation
         var current = entry.LifecycleState;
         if (!ValidateLifecycleTransition(current, newState))
             return false;
@@ -154,6 +181,8 @@ public sealed class OrderRegistry
             _byBrokerOrderId.TryRemove(k, out _);
             foreach (var alias in _aliasToBrokerOrderId.Where(x => x.Value == k).Select(x => x.Key).ToList())
                 _aliasToBrokerOrderId.TryRemove(alias, out _);
+            foreach (var alt in _brokerOrderIdAliasToCanonical.Where(x => x.Value == k).Select(x => x.Key).ToList())
+                _brokerOrderIdAliasToCanonical.TryRemove(alt, out _);
         }
         return toRemove.Count;
     }

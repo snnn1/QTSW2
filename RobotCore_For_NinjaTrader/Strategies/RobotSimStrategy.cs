@@ -41,7 +41,9 @@ namespace NinjaTrader.NinjaScript.Strategies
     {
         // FUTURE HARDENING: Track active instances to prevent duplicate deployments
         // Key: (accountName, executionInstrumentFullName) - must be unique per account
-        private static readonly HashSet<(string account, string instrument)> _activeInstances = new();
+        /// <summary>One strategy instance id per (account, execution instrument full name).</summary>
+        private static readonly Dictionary<(string account, string instrument), string> _activeInstanceOwnerByKey =
+            new Dictionary<(string, string), string>();
         private static readonly object _activeInstancesLock = new object();
         
         // Instance identifier for forensics (logged once at startup)
@@ -296,7 +298,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     
                     lock (_activeInstancesLock)
                     {
-                        if (_activeInstances.Contains(instanceKey))
+                        if (_activeInstanceOwnerByKey.TryGetValue(instanceKey, out var existingInstanceId))
                         {
                             // CRITICAL: Duplicate instance detected - fail closed
                             var errorMsg = $"CRITICAL: Duplicate strategy instance detected. " +
@@ -313,6 +315,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                             {
                                 try
                                 {
+                                    var dupInstances = new List<string> { existingInstanceId, _instanceId };
+                                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DUPLICATE_STRATEGY_INSTANCE_DETECTED", new Dictionary<string, object>
+                                    {
+                                        ["instances"] = dupInstances,
+                                        ["account"] = accountName,
+                                        ["execution_instrument"] = executionInstrumentFullName,
+                                        ["invariant"] = "One execution instrument → one strategy instance per account"
+                                    });
                                     // Use engine's logging (not temporary logger)
                                     _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DUPLICATE_INSTANCE_DETECTED", new Dictionary<string, object>
                                     {
@@ -320,6 +330,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         ["account"] = accountName,
                                         ["execution_instrument"] = executionInstrumentFullName,
                                         ["instance_id"] = _instanceId,
+                                        ["existing_instance_id"] = existingInstanceId,
                                         ["action"] = "STAND_DOWN",
                                         ["invariant"] = "One execution instrument → one strategy instance per account"
                                     });
@@ -346,7 +357,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         
                         // Register this instance
-                        _activeInstances.Add(instanceKey);
+                        _activeInstanceOwnerByKey[instanceKey] = _instanceId;
                     }
                     
                     // FUTURE HARDENING: Log instance ID once at startup for forensics
@@ -826,7 +837,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     
                     lock (_activeInstancesLock)
                     {
-                        _activeInstances.Remove(instanceKey);
+                        if (_activeInstanceOwnerByKey.TryGetValue(instanceKey, out var owner) &&
+                            string.Equals(owner, _instanceId, StringComparison.Ordinal))
+                            _activeInstanceOwnerByKey.Remove(instanceKey);
                     }
                     
                     // Log filtered callback counts if any occurred (useful signal for misconfiguration)
@@ -1313,6 +1326,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 _adapter = simAdapter;
                 var engineExecutionInstrument = _engine?.GetExecutionInstrument();
+                simAdapter.SetInvestigationRuntimeContext(_instanceId);
                 simAdapter.SetNTContext(Account, Instrument, engineExecutionInstrument);
             }
             // LIVE: NinjaTraderLiveAdapter - SetNTContext for GetCurrentMarketPrice (breakout validity gate)

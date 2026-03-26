@@ -157,7 +157,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
     private Timer? _engineHeartbeatTimer;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
-    
+    private int _engineHeartbeatWallTick;
+
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
     {
@@ -170,7 +171,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>
     /// Start timer-based engine heartbeat. Called when strategy enters Realtime.
-    /// Emits ENGINE_TIMER_HEARTBEAT every 5 seconds so watchdog sees ENGINE ALIVE when market closed (no ticks).
+    /// Timer fires every 1s for ENGINE_CPU_PROFILE wall-clock emission when idle; ENGINE_TIMER_HEARTBEAT stays every 5s.
     /// </summary>
     public void StartEngineHeartbeatTimer()
     {
@@ -179,11 +180,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _engineHeartbeatTimer?.Dispose();
             _engineHeartbeatTimer = null;
             _heartbeatTradingDateCache = TradingDateString;
+            _engineHeartbeatWallTick = 0;
             _engineHeartbeatTimer = new Timer(
                 _ => EmitTimerHeartbeatUnsafe(),
                 null,
-                TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(5));
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
         }
     }
 
@@ -207,8 +209,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         try
         {
             var utcNow = DateTimeOffset.UtcNow;
-            var tradingDate = _heartbeatTradingDateCache ?? "";
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            _runtimeAudit?.TryEmitPeriodicWallClock(utcNow);
+            var tick = Interlocked.Increment(ref _engineHeartbeatWallTick);
+            if (tick % 5 == 0)
+            {
+                var tradingDate = _heartbeatTradingDateCache ?? "";
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE", new { source = "engine_timer" }));
+            }
         }
         catch (Exception ex)
         {
@@ -1580,6 +1587,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _runtimeAudit?.CpuEnd(emMis, RuntimeAuditSubsystem.EmitMetricsMismatch);
 
             _runtimeAudit?.TryEmitPeriodicWallClock(DateTimeOffset.UtcNow);
+
+            var nowWallIngress = DateTimeOffset.UtcNow;
+            if (_executionAdapter is NinjaTraderSimAdapter ingressAdapter)
+                ingressAdapter.DrainCallbackIngress(nowWallIngress);
             }
             finally
             {
@@ -3126,19 +3137,37 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
                     source = "TIMETABLE",
                     timetable_path = _timetablePath,
-                    note = "Trading date locked from timetable - immutable for this engine run"
+                    note = "Trading date locked from timetable; rolls forward when timetable trading_date advances (TRADING_DATE_ROLLED_FORWARD)"
                 }));
         }
         else if (_activeTradingDate.Value != timetableTradingDate.Value)
         {
-            // Trading date already locked and differs from timetable - keep existing (immutable)
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
-                new
-                {
-                    locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
-                    timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
-                    note = "Timetable trading_date differs from locked date - keeping existing (immutable)"
-                }));
+            if (timetableTradingDate.Value > _activeTradingDate.Value)
+            {
+                var previousLocked = _activeTradingDate.Value;
+                _activeTradingDate = timetableTradingDate.Value;
+                var clearedStreams = _streams.Count;
+                _streams.Clear();
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TRADING_DATE_ROLLED_FORWARD", state: "ENGINE",
+                    new
+                    {
+                        previous_trading_date = previousLocked.ToString("yyyy-MM-dd"),
+                        new_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        streams_cleared = clearedStreams,
+                        timetable_path = _timetablePath,
+                        note = "Timetable advanced to a later session day - adopting new trading_date and clearing streams for rebuild"
+                    }));
+            }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TIMETABLE_TRADING_DATE_MISMATCH", state: "ENGINE",
+                    new
+                    {
+                        locked_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
+                        timetable_trading_date = timetableTradingDate.Value.ToString("yyyy-MM-dd"),
+                        note = "Timetable trading_date is earlier than locked date - keeping existing lock (no backward roll)"
+                    }));
+            }
         }
 
         if (timetable.timezone != "America/Chicago")

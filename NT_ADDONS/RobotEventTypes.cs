@@ -107,6 +107,7 @@ public static class RobotEventTypes
         ["TIMETABLE_INVALID_TRADING_DATE"] = "ERROR",
         ["TIMETABLE_MISSING_TRADING_DATE"] = "ERROR",
         ["TIMETABLE_TRADING_DATE_MISMATCH"] = "ERROR",
+        ["TRADING_DATE_ROLLED_FORWARD"] = "INFO",
         ["TIMETABLE_APPLY_SKIPPED"] = "INFO",
         ["TIMETABLE_PARSING_COMPLETE"] = "INFO",
         ["TIMETABLE_POLL_STALL_DETECTED"] = "ERROR",
@@ -114,6 +115,8 @@ public static class RobotEventTypes
         
         // Trading date
         ["TRADING_DATE_LOCKED"] = "INFO",
+        ["SESSION_ELIGIBILITY_TRADING_DATE_MISMATCH"] = "ERROR",
+        ["SESSION_ELIGIBILITY_TRADING_DATE_INVALID"] = "ERROR",
         
         // Streams
         ["STREAMS_CREATED"] = "INFO",
@@ -400,6 +403,7 @@ public static class RobotEventTypes
         
         // Trading date
         "TRADING_DATE_LOCKED",
+        "SESSION_ELIGIBILITY_TRADING_DATE_MISMATCH", "SESSION_ELIGIBILITY_TRADING_DATE_INVALID",
         
         // Streams
         "STREAMS_CREATED", "STREAMS_CREATION_FAILED", "STREAMS_CREATION_SKIPPED",

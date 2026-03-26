@@ -1,0 +1,9 @@
+Callback ingress / drain — quick validation checklist (non-IEA path)
+==================================================================
+
+1) Deploy Robot.Core, restart NinjaTrader, run one controlled entry+protective in Sim.
+2) execution_trace.jsonl: raw OnExecutionUpdate / OnOrderUpdate lines should still show bursts.
+3) robot jsonl: look for CALLBACK_DRAIN_SUMMARY / CALLBACKS_PROCESSED_PER_DRAIN — processed counts per tick should be bounded (caps: 10 exec + 10 order per instrument, 50 total per drain call).
+4) analysis: tools/analyze_execution_trace_by_execution_id.py — execution_id should still show many raw callbacks; business-path logs should show one fill handling per intent (no duplicate INTENT_FILL_UPDATE / terminalization storms from the same execution key).
+5) CALLBACK_QUEUE_HIGH / CALLBACK_QUEUE_CRITICAL should be absent in normal Sim; if they appear, backlog is real — depth should trend down across ticks.
+6) IEA mode: behavior unchanged for HandleExecutionUpdate → IEA queue; ingress/drain is skipped when use_instrument_execution_authority is on.

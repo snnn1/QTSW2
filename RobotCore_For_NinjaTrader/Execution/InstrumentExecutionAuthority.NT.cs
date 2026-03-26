@@ -522,10 +522,11 @@ public sealed partial class InstrumentExecutionAuthority
         Executor.EnqueueNtAction(cmd);
     }
 
-    /// <summary>Enqueue execution update for serialized processing. Uses EnqueueRecoveryEssential so fills and order updates are processed during recovery (flatten completion, stale snapshot detection).</summary>
+    /// <summary>Enqueue execution update for serialized processing. Uses EnqueueRecoveryEssential. Runs <see cref="IIEAOrderExecutor.ProcessExecutionUpdate"/> before first-adoption <c>RequestAdoptionScan</c> so the live event updates state first.</summary>
     public void EnqueueExecutionUpdate(object execution, object order)
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
         EnqueueRecoveryEssential(() =>
         {
             // Phase 4: Critical event during bootstrap marks snapshot stale (fill or order state change)
@@ -533,10 +534,11 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 MarkBootstrapSnapshotStale(NowEvent());
             }
-            // Phase 4: ScanAndAdopt only after bootstrap complete (or was run in ADOPT path). Single-flight gate; heavy scan runs only on IEA worker.
+            // Process broker execution FIRST so fills/order state advance immediately; adoption is a follow-on consistency pass.
+            Executor.ProcessExecutionUpdate(execution, order);
+            // Phase 4: ScanAndAdopt after bootstrap complete (or was run in ADOPT path). Single-flight gate; runs on IEA worker after real execution handling.
             if (!_hasScannedForAdoption && !IsInBootstrap && (CurrentRecoveryState == RecoveryState.NORMAL || CurrentRecoveryState == RecoveryState.RESOLVED))
                 _ = RequestAdoptionScan(AdoptionScanRequestSource.FirstExecutionUpdate, applyRecoveryThrottle: false, postScanOnWorker: null);
-            Executor.ProcessExecutionUpdate(execution, order);
         }, "ExecutionUpdate");
     }
 

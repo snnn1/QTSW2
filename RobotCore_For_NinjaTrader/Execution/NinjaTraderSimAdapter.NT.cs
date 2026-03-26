@@ -72,6 +72,14 @@ public sealed partial class NinjaTraderSimAdapter
         return (null, "None");
     }
 
+    private static bool IsRobotOwnedFlattenByTag(string? encodedTag) =>
+        !string.IsNullOrEmpty(encodedTag) &&
+        encodedTag.StartsWith($"{RobotOrderIds.Prefix}FLATTEN:", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsRobotOwnedFlattenOrder(string? encodedTag, OrderInfo? orderFromMap) =>
+        IsRobotOwnedFlattenByTag(encodedTag) ||
+        (orderFromMap != null && string.Equals(orderFromMap.OrderType, "FLATTEN", StringComparison.OrdinalIgnoreCase));
+
     /// <summary>
     /// Helper method to safely set order tag/name using dynamic typing.
     /// </summary>
@@ -2289,18 +2297,15 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
-    /// STEP 3: Handle real NT OrderUpdate event.
-    /// Called from public HandleOrderUpdate() method in main adapter.
+    /// Non-IEA ingress: trace + dedup + enqueue only (NinjaTrader order-update fan-out). Drained on strategy thread.
     /// </summary>
-    private void HandleOrderUpdateReal(object orderObj, object orderUpdateObj)
+    private void HandleOrderIngressFromNt(object orderObj, object orderUpdateObj)
     {
         var order = orderObj as Order;
-        // OrderUpdate is the event args type, use dynamic to access it
         dynamic orderUpdate = orderUpdateObj;
         if (order == null) return;
 
-        // Get tag/name with source (Tag, Name, FromEntrySignal, SignalName)
-        var (encodedTag, tagSource) = GetOrderTagWithSource(order);
+        var (encodedTag, _) = GetOrderTagWithSource(order);
         var parsed = RobotOrderIds.ParseTag(encodedTag);
         var intentId = parsed.IntentId ?? RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
@@ -2322,7 +2327,128 @@ public sealed partial class NinjaTraderSimAdapter
             return;
         }
 
+        if (string.IsNullOrEmpty(intentId)) return;
+
+        var eff = BuildOrderIngressEffectiveStateKey(order);
+        EnqueueOrCoalesceOrderIngress(orderObj, orderUpdateObj, order, orderIdTrace, eff);
+    }
+
+    /// <summary>
+    /// Non-IEA ingress: trace + permanent / non-IEA dedup + enqueue only. Drained on strategy thread.
+    /// </summary>
+    private void HandleExecutionIngressFromNt(object executionObj, object orderObj)
+    {
+        dynamic execution = executionObj;
+        var order = orderObj as Order;
+        if (execution == null || order == null) return;
+
+        string? execIdTrace = null;
+        try { dynamic dex = execution; execIdTrace = dex.ExecutionId as string; } catch { }
+        var fillQtyTrace = 0;
+        try { fillQtyTrace = (int)execution.Quantity; } catch { }
+        var tagTrace = GetOrderTag(order);
+        var intentTrace = RobotOrderIds.DecodeIntentId(tagTrace) ?? "";
+        var utcTrace = DateTimeOffset.UtcNow;
+        var instTrace = order.Instrument?.MasterInstrument?.Name ?? "";
+        _executionTrace?.WriteExecutionTrace(utcTrace, "OnExecutionUpdate", "raw_callback", instTrace, intentTrace,
+            order.OrderId ?? "", execIdTrace ?? "", fillQtyTrace, order.OrderState.ToString());
+
+        var permKey = BuildPermanentExecutionDedupKey(instTrace, execIdTrace, order.OrderId, fillQtyTrace);
+        if (!TryMarkFirstPermanentExecutionProcessing(permKey, out var permSkips))
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcTrace, intentTrace, instTrace, "EXECUTION_DEDUP_SKIPPED_PERMANENT", new
+            {
+                execution_id = execIdTrace ?? "",
+                broker_order_id = order.OrderId,
+                fill_qty = fillQtyTrace,
+                dedup_key = permKey,
+                skipped_count = permSkips
+            }));
+            return;
+        }
+
+        var dedupKey = BuildNonIeaDedupKey(execution, order);
+        if (TryMarkAndCheckDuplicateNonIea(dedupKey))
+        {
+            string? execId = null;
+            try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
+            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_DETECTED",
+                new { broker_order_id = order.OrderId, execution_id = execId, note = "Duplicate execution callback skipped (dedup)" }));
+            return;
+        }
+
+        EnqueueExecutionIngressNormal(executionObj, orderObj, instTrace);
+    }
+
+    /// <summary>
+    /// When NT reports a post-ack broker/native id on <see cref="Order.OrderId"/> while IEA registered the pre-submit id,
+    /// bind the new id to the existing registry row before lifecycle/execution paths resolve by broker id.
+    /// </summary>
+    private void TryLinkBrokerOrderIdFromOrderUpdate(Order order, string intentId, string? encodedTag, string? tagLeg, DateTimeOffset utcNow)
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return;
+        if (string.IsNullOrEmpty(encodedTag) || !encodedTag.StartsWith(RobotOrderIds.Prefix, StringComparison.OrdinalIgnoreCase)) return;
+
+        var incomingId = order.OrderId ?? "";
+        if (string.IsNullOrEmpty(incomingId)) return;
+        if (_iea.TryResolveByBrokerOrderId(incomingId, out _)) return;
+
+        if (!OrderMap.TryGetValue(intentId, out var orderInfo) || orderInfo == null) return;
+
+        var legForResolve = tagLeg == "STOP" || tagLeg == "TARGET" ? tagLeg : null;
+        if (!_iea.TryResolveForExecutionUpdate(orderInfo.OrderId ?? "", intentId, legForResolve, out var regEntry, out _) || regEntry == null)
+            return;
+
+        var canonical = regEntry.BrokerOrderId ?? "";
+        if (string.IsNullOrEmpty(canonical) || string.Equals(incomingId, canonical, StringComparison.OrdinalIgnoreCase)) return;
+
+        var instrument = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument ?? "";
+        if (!_iea.LinkBrokerOrderIdAlias(incomingId, canonical, utcNow, intentId, instrument)) return;
+
+        orderInfo.OrderId = incomingId;
+    }
+
+    /// <summary>
+    /// STEP 3: Handle real NT OrderUpdate event.
+    /// Called from public HandleOrderUpdate() method in main adapter.
+    /// </summary>
+    private void HandleOrderUpdateReal(object orderObj, object orderUpdateObj, bool beginAfterIngress = false)
+    {
+        var order = orderObj as Order;
+        // OrderUpdate is the event args type, use dynamic to access it
+        dynamic orderUpdate = orderUpdateObj;
+        if (order == null) return;
+
+        // Get tag/name with source (Tag, Name, FromEntrySignal, SignalName)
+        var (encodedTag, tagSource) = GetOrderTagWithSource(order);
+        var parsed = RobotOrderIds.ParseTag(encodedTag);
+        var intentId = parsed.IntentId ?? RobotOrderIds.DecodeIntentId(encodedTag);
+        var utcNow = DateTimeOffset.UtcNow;
+        var orderState = order.OrderState;
+        var instrumentTrace = order.Instrument?.MasterInstrument?.Name ?? "";
+        var orderIdTrace = order.OrderId ?? "";
+        if (!beginAfterIngress)
+        {
+            _executionTrace?.WriteExecutionTrace(utcNow, "OnOrderUpdate", "raw_callback", instrumentTrace, intentId ?? "",
+                orderIdTrace, "", 0, orderState.ToString());
+
+            if (TrySkipDuplicateOrderUpdate50ms(instrumentTrace, orderIdTrace, orderState.ToString(), utcNow, out var orderDedupSkips))
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrumentTrace, "ORDER_UPDATE_DEDUP_SKIPPED", new
+                {
+                    order_id = orderIdTrace,
+                    order_state = orderState.ToString(),
+                    skipped_count = orderDedupSkips,
+                    window_ms = 50
+                }));
+                return;
+            }
+        }
+
         if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
+
+        // Pre-ack / post-ack: Sim may report a new OrderId on the Order while registry + OrderMap still key the id from submit.
+        TryLinkBrokerOrderIdFromOrderUpdate(order, intentId, encodedTag, parsed.Leg, utcNow);
 
         // Phase 1 Execution Ownership: Resolve via registry and update lifecycle
         if (_useInstrumentExecutionAuthority && _iea != null && _iea.TryResolveByBrokerOrderId(order.OrderId, out var regEntry))
@@ -2429,6 +2555,9 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (!OrderMap.TryGetValue(intentId, out var orderInfo))
         {
+            if (IsRobotOwnedFlattenByTag(encodedTag))
+                return;
+
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             // Phase 2: Order update for order not in registry or OrderMap - manual/external order policy
             if (_useInstrumentExecutionAuthority && _iea != null && !_iea.TryResolveByBrokerOrderId(order.OrderId, out _))
@@ -3130,7 +3259,10 @@ public sealed partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_DEFERRED_RESOLVED",
                 new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, elapsed_ms = elapsed, retry_count = record.RetryCount }));
-            HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+            if (_useInstrumentExecutionAuthority && _iea != null)
+                HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+            else
+                EnqueueExecutionIngressRetry(record, orderInfo);
             return;
         }
         if (_useInstrumentExecutionAuthority && _iea != null && !string.IsNullOrEmpty(record.BrokerOrderId))
@@ -3141,7 +3273,10 @@ public sealed partial class NinjaTraderSimAdapter
                 orderInfo = regEntry!.OrderInfo;
                 _log.Write(RobotEvents.ExecutionBase(utcNow, record.IntentId, record.Instrument, "EXECUTION_DEFERRED_RESOLVED",
                     new { account_name = accountName, execution_instrument_key = execInstKey, intent_id = record.IntentId, execution_id = record.ExecutionId, broker_order_id = record.BrokerOrderId, elapsed_ms = elapsed, retry_count = record.RetryCount, resolution_path = resolutionPath }));
-                HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+                if (_useInstrumentExecutionAuthority && _iea != null)
+                    HandleExecutionUpdateReal(record.Execution, record.Order, record, orderInfo);
+                else
+                    EnqueueExecutionIngressRetry(record, orderInfo);
                 return;
             }
         }
@@ -3165,6 +3300,21 @@ public sealed partial class NinjaTraderSimAdapter
         var order = record.Order as Order;
         var intentId = record.IntentId;
         var instrument = record.Instrument;
+        if (IsRobotOwnedFlattenByTag(record.EncodedTag) && order != null && record.FillQuantity != 0)
+        {
+            string? execIdRec = null;
+            try { dynamic d = record.Execution; execIdRec = d.ExecutionId as string; } catch { }
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "FLATTEN_EXECUTION_RECOVERED", new
+            {
+                broker_order_id = order.OrderId,
+                execution_id = execIdRec,
+                reason = "registry_miss_but_tag_matched"
+            }));
+            ProcessBrokerFlattenFill(record.Execution, instrument, record.FillPrice, record.FillQuantity, utcNow, order.OrderId, order);
+            CheckAllInstrumentsForFlatPositions(utcNow);
+            return;
+        }
+
         EmitUnmappedFill(instrument, "UNKNOWN_ORDER_AFTER_GRACE", record.FillPrice, record.FillQuantity, utcNow, order?.OrderId, order, tag: record.EncodedTag);
         LogCriticalWithIeaContext(utcNow, intentId, instrument, "EXECUTION_UPDATE_UNKNOWN_ORDER_CRITICAL",
             new { error = "Order not found in map after 500ms grace", broker_order_id = order?.OrderId, intent_id = intentId, fill_price = record.FillPrice, fill_quantity = record.FillQuantity, account_name = _iea?.AccountName });
@@ -3196,67 +3346,75 @@ public sealed partial class NinjaTraderSimAdapter
     /// STEP 3: Handle real NT ExecutionUpdate event.
     /// Called from public HandleExecutionUpdate() method.
     /// </summary>
-    private void HandleExecutionUpdateReal(object executionObj, object orderObj, UnresolvedExecutionRecord? retryRecord = null, OrderInfo? retryOrderInfo = null)
+    private void HandleExecutionUpdateReal(object executionObj, object orderObj, UnresolvedExecutionRecord? retryRecord = null, OrderInfo? retryOrderInfo = null, bool beginAtFillPath = false)
     {
         // Use dynamic for Execution type to avoid namespace conflicts
         dynamic execution = retryRecord != null ? retryRecord.Execution : executionObj;
         var order = (retryRecord != null ? retryRecord.Order : orderObj) as Order;
         if (execution == null || order == null) return;
 
-        string? execIdTrace = null;
-        try { dynamic dex = execution; execIdTrace = dex.ExecutionId as string; } catch { }
-        var fillQtyTrace = 0;
-        try { fillQtyTrace = (int)execution.Quantity; } catch { }
-        var tagTrace = GetOrderTag(order);
-        var intentTrace = RobotOrderIds.DecodeIntentId(tagTrace) ?? "";
-        var utcTrace = DateTimeOffset.UtcNow;
-        var instTrace = order.Instrument?.MasterInstrument?.Name ?? "";
-        _executionTrace?.WriteExecutionTrace(utcTrace, "OnExecutionUpdate", "raw_callback", instTrace, intentTrace,
-            order.OrderId ?? "", execIdTrace ?? "", fillQtyTrace, order.OrderState.ToString());
-
-        if (retryRecord == null && retryOrderInfo == null)
+        if (!beginAtFillPath)
         {
-            var permKey = BuildPermanentExecutionDedupKey(instTrace, execIdTrace, order.OrderId, fillQtyTrace);
-            if (!TryMarkFirstPermanentExecutionProcessing(permKey, out var permSkips))
+            string? execIdTrace = null;
+            try { dynamic dex = execution; execIdTrace = dex.ExecutionId as string; } catch { }
+            var fillQtyTrace = 0;
+            try { fillQtyTrace = (int)execution.Quantity; } catch { }
+            var tagTrace = GetOrderTag(order);
+            var intentTrace = RobotOrderIds.DecodeIntentId(tagTrace) ?? "";
+            var utcTrace = DateTimeOffset.UtcNow;
+            var instTrace = order.Instrument?.MasterInstrument?.Name ?? "";
+            _executionTrace?.WriteExecutionTrace(utcTrace, "OnExecutionUpdate", "raw_callback", instTrace, intentTrace,
+                order.OrderId ?? "", execIdTrace ?? "", fillQtyTrace, order.OrderState.ToString());
+
+            if (retryRecord == null && retryOrderInfo == null)
             {
-                _log.Write(RobotEvents.ExecutionBase(utcTrace, intentTrace, instTrace, "EXECUTION_DEDUP_SKIPPED_PERMANENT", new
+                // Non-IEA only: permanent dedup keys can collide when ExecutionId is empty; IEA dedup runs below.
+                if (_iea == null)
                 {
-                    execution_id = execIdTrace ?? "",
-                    broker_order_id = order.OrderId,
-                    fill_qty = fillQtyTrace,
-                    dedup_key = permKey,
-                    skipped_count = permSkips
-                }));
+                    var permKey = BuildPermanentExecutionDedupKey(instTrace, execIdTrace, order.OrderId, fillQtyTrace);
+                    if (!TryMarkFirstPermanentExecutionProcessing(permKey, out var permSkips))
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcTrace, intentTrace, instTrace, "EXECUTION_DEDUP_SKIPPED_PERMANENT", new
+                        {
+                            execution_id = execIdTrace ?? "",
+                            broker_order_id = order.OrderId,
+                            fill_qty = fillQtyTrace,
+                            dedup_key = permKey,
+                            skipped_count = permSkips
+                        }));
+                        return;
+                    }
+                }
+            }
+
+            if (retryRecord != null && retryOrderInfo != null)
+            {
+                ProcessExecutionUpdateContinuation(retryRecord, retryOrderInfo);
+                return;
+            }
+
+            // Gap 3 / Step 5: Deduplicate execution callbacks before any state mutation (multi-forwarding from router)
+            bool isDuplicate = false;
+            if (_useInstrumentExecutionAuthority && _iea != null)
+                isDuplicate = _iea.TryMarkAndCheckDuplicate(executionObj, orderObj);
+            else
+            {
+                var dedupKey = BuildNonIeaDedupKey(execution, order);
+                isDuplicate = TryMarkAndCheckDuplicateNonIea(dedupKey);
+            }
+            if (isDuplicate)
+            {
+                string? execId = null;
+                try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
+                _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_DETECTED",
+                    new { broker_order_id = order.OrderId, execution_id = execId, note = "Duplicate execution callback skipped (dedup)" }));
                 return;
             }
         }
 
-        if (retryRecord != null && retryOrderInfo != null)
-        {
-            ProcessExecutionUpdateContinuation(retryRecord, retryOrderInfo);
-            return;
-        }
-
-        // Gap 3 / Step 5: Deduplicate execution callbacks before any state mutation (multi-forwarding from router)
-        bool isDuplicate = false;
-        if (_useInstrumentExecutionAuthority && _iea != null)
-            isDuplicate = _iea.TryMarkAndCheckDuplicate(executionObj, orderObj);
-        else
-        {
-            var dedupKey = BuildNonIeaDedupKey(execution, order);
-            isDuplicate = TryMarkAndCheckDuplicateNonIea(dedupKey);
-        }
-        if (isDuplicate)
-        {
-            string? execId = null;
-            try { dynamic d = execution; execId = d.ExecutionId as string; } catch { }
-            _log.Write(RobotEvents.ExecutionBase(DateTimeOffset.UtcNow, "", order.Instrument?.MasterInstrument?.Name ?? "", "EXECUTION_DUPLICATE_DETECTED",
-                new { broker_order_id = order.OrderId, execution_id = execId, note = "Duplicate execution callback skipped (dedup)" }));
-            return;
-        }
-
         var fillPathSw = Stopwatch.StartNew();
         string? fillPathIntentId = null;
+
         try
         {
         var encodedTag = GetOrderTag(order);
@@ -3291,6 +3449,23 @@ public sealed partial class NinjaTraderSimAdapter
                 orderTypeFromTag = "TARGET";
                 isProtectiveOrder = true;
             }
+        }
+
+        // Robot-owned flatten: broker OrderId may not match IEA registry yet; route by tag before OrderMap/registry resolution.
+        if (IsRobotOwnedFlattenByTag(encodedTag) && fillQuantity != 0)
+        {
+            var instrumentFlatten = order.Instrument?.MasterInstrument?.Name ?? _iea?.ExecutionInstrumentKey ?? "UNKNOWN";
+            string? execIdRec = null;
+            try { dynamic d = execution; execIdRec = d.ExecutionId as string; } catch { }
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrumentFlatten, "FLATTEN_EXECUTION_RECOVERED", new
+            {
+                broker_order_id = order.OrderId,
+                execution_id = execIdRec,
+                reason = "registry_miss_but_tag_matched"
+            }));
+            ProcessBrokerFlattenFill(execution, instrumentFlatten, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+            CheckAllInstrumentsForFlatPositions(utcNow);
+            return;
         }
         
         // CRITICAL FIX: Fail-closed behavior for untracked fills
@@ -3547,6 +3722,9 @@ public sealed partial class NinjaTraderSimAdapter
         // If still no orderInfo, handle as untracked
         if (orderInfo == null)
         {
+            if (IsRobotOwnedFlattenByTag(encodedTag))
+                return;
+
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             var orderState = order.OrderState;
 
@@ -3592,7 +3770,9 @@ public sealed partial class NinjaTraderSimAdapter
                             : "Order not in map and we have no orders for this instrument - likely wrong instance (multiple charts), skipping to let submitting instance handle"
                     }));
                 if (!_useInstrumentExecutionAuthority)
+                {
                     return;
+                }
             }
 
             // Phase 1: Non-blocking deferred retry (no Thread.Sleep). Enqueue for retry; max retries with 50-100ms interval.
@@ -3698,6 +3878,14 @@ public sealed partial class NinjaTraderSimAdapter
                 { "last_fill_qty", fillQuantity },
                 { "reason", "Fill exceeded expected quantity" }
             });
+        }
+
+        // Robot flatten orders: tag decodes to pseudo intentId "FLATTEN" — skip IntentMap and journal via coordinator path.
+        if (IsRobotOwnedFlattenOrder(encodedTag, orderInfo) && order != null)
+        {
+            var flattenInst = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument?.Trim() ?? "UNKNOWN";
+            ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+            return;
         }
         
         // CRITICAL: Resolve intent context before any journal call

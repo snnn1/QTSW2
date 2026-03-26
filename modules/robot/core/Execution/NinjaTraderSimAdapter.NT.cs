@@ -1975,6 +1975,17 @@ public sealed partial class NinjaTraderSimAdapter
                 { "reason", "Fill exceeded expected quantity" }
             });
         }
+
+        // Robot flatten orders: tag decodes to pseudo intentId "FLATTEN" — skip IntentMap and journal via coordinator path.
+        var isRobotFlattenOrder = string.Equals(orderInfo.OrderType, "FLATTEN", StringComparison.OrdinalIgnoreCase)
+            || (!string.IsNullOrEmpty(encodedTag) &&
+                encodedTag.StartsWith($"{RobotOrderIds.Prefix}FLATTEN:", StringComparison.OrdinalIgnoreCase));
+        if (isRobotFlattenOrder && order != null)
+        {
+            var flattenInst = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument?.Trim() ?? "UNKNOWN";
+            ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+            return;
+        }
         
         // CRITICAL: Resolve intent context before any journal call
         // Use orderTypeFromTag if available (from tag), otherwise use orderInfo.OrderType

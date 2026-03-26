@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj": {}
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj": {}
   },
   "projects": {
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "projectName": "Robot.Contracts",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -65,14 +65,14 @@
         }
       }
     },
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
         "projectName": "Robot.Core",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -87,8 +87,8 @@
           "net8.0": {
             "targetAlias": "net8.0",
             "projectReferences": {
-              "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
-                "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
+              "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+                "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
               }
             }
           }
@@ -133,14 +133,14 @@
         }
       }
     },
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
         "projectName": "Robot.Harness",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\Robot.Harness.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\harness\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -155,8 +155,8 @@
           "net8.0": {
             "targetAlias": "net8.0",
             "projectReferences": {
-              "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
-                "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj"
+              "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj": {
+                "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj"
               }
             }
           }

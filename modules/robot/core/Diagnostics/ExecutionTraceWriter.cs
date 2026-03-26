@@ -35,8 +35,11 @@ public sealed class ExecutionTraceWriter
     private ExecutionTraceWriter(string path) => _path = path;
 
     /// <summary>Creates writer for logs/robot/execution_trace.jsonl under project root; returns null if path invalid.</summary>
+    /// <remarks>Off by default; set env <c>QTSW2_EXECUTION_TRACE=1</c> to enable file I/O.</remarks>
     public static ExecutionTraceWriter? TryCreate(string projectRoot)
     {
+        if (!string.Equals(Environment.GetEnvironmentVariable("QTSW2_EXECUTION_TRACE"), "1", StringComparison.Ordinal))
+            return null;
         if (string.IsNullOrWhiteSpace(projectRoot)) return null;
         try
         {

@@ -70,8 +70,10 @@ public static class RuntimeAuditHubRef
 public sealed class RuntimeAuditHub
 {
     private const int SubsystemCount = 16;
+    /// <summary>Wall-clock minimum between ENGINE_CPU_PROFILE emissions (diagnostic: 1s cadence, idle or active).</summary>
     private const double ProfileIntervalSeconds = 5.0;
-    private const int SixtySecondSlots = 12;
+    /// <summary>Ring holds one slot per profile window; 60 x 1s = 60s rolling totals.</summary>
+    private const int SixtySecondSlots = 60;
 
     private readonly RobotLogger _log;
     private readonly Func<string?> _getRunId;
@@ -512,7 +514,7 @@ public sealed class RuntimeAuditHub
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_CPU_PROFILE", state: "ENGINE",
             new
             {
-                window_seconds = 5,
+                window_seconds = (int)Math.Round(ProfileIntervalSeconds),
                 wall_window_ms = wallWindowMs,
                 sum_subsystem_ms = sumParallelMs,
                 sum_subsystem_ms_note = "Sum of ENGINE_TICK_TOTAL + MISMATCH_TIMER_TOTAL + PROTECTIVE_TIMER_TOTAL + IEA_WORK_TOTAL + NT_ACTION_DRAIN (overlap-aware)",

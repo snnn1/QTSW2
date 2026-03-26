@@ -1,11 +1,11 @@
-// CRITICAL: Define NINJATRADER for NinjaTrader's compiler
-// NinjaTrader compiles to tmp folder and may not respect .csproj DefineConstants
+// Local define so #if !NINJATRADER guards in this file do not fight with outer scopes (CS0136) when global NINJATRADER is off.
 #define NINJATRADER
 
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core.Diagnostics;
 
@@ -25,8 +25,11 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor
 {
+    private static int _adapterInstanceCounter;
+    private readonly int _adapterInstanceId;
+
     private readonly RobotLogger _log;
     private readonly string _projectRoot;
     private readonly ExecutionJournal _executionJournal;
@@ -93,10 +96,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
         _log = log;
         _executionJournal = executionJournal;
         _executionTrace = ExecutionTraceWriter.TryCreate(projectRoot);
-        
+        _adapterInstanceId = Interlocked.Increment(ref _adapterInstanceCounter);
+
         // Note: SIM account verification happens when NT context is set via SetNTContext()
         // Mock mode has been removed - only real NT API execution is supported
     }
+
+    /// <summary>Stable executor id for investigation logs (matches flatten coordination prefix).</summary>
+    public int InvestigationAdapterInstanceId => _adapterInstanceId;
+
     
     /// <summary>
     /// PHASE 2: Set callbacks for stream stand-down and notification service access.
@@ -1671,55 +1679,5 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter
 
         // Use retry logic for FlattenIntent as well
         return FlattenWithRetry(intentId, instrument, utcNow);
-    }
-
-    /// <summary>
-    /// Order tracking info for callback correlation.
-    /// </summary>
-    private partial class OrderInfo
-    {
-        public string IntentId { get; set; } = "";
-        public string Instrument { get; set; } = "";
-        public string OrderId { get; set; } = "";
-        public string OrderType { get; set; } = ""; // ENTRY, STOP, TARGET
-        public string Direction { get; set; } = "";
-        public int Quantity { get; set; }
-        public decimal? Price { get; set; }
-        public string State { get; set; } = ""; // SUBMITTED, FILLED, REJECTED, CANCELLED
-
-        // Classification: true for entry intents (ENTRY and ENTRY_STOP)
-        public bool IsEntryOrder { get; set; }
-
-        // Partial fill handling
-        public int FilledQuantity { get; set; }
-        
-        // Watchdog tracking for unprotected positions
-        public DateTimeOffset? EntryFillTime { get; set; }
-        public bool ProtectiveStopAcknowledged { get; set; }
-        public bool ProtectiveTargetAcknowledged { get; set; }
-        
-        // Policy expectation snapshot (copied from _intentPolicy when OrderInfo is created)
-        public int ExpectedQuantity { get; set; }
-        public int MaxQuantity { get; set; }
-        public string PolicySource { get; set; } = "";
-        public string CanonicalInstrument { get; set; } = "";
-        public string ExecutionInstrument { get; set; } = "";
-        
-        // NT-specific: Store NT Order object for callbacks (only when NINJATRADER is defined)
-#if NINJATRADER
-        public object? NTOrder { get; set; } // NinjaTrader.Cbi.Order
-#endif
-    }
-    
-    /// <summary>
-    /// Intent policy expectation model for quantity invariant tracking.
-    /// </summary>
-    private sealed class IntentPolicyExpectation
-    {
-        public int ExpectedQuantity { get; set; }
-        public int MaxQuantity { get; set; }
-        public string PolicySource { get; set; } = "EXECUTION_POLICY_FILE";
-        public string CanonicalInstrument { get; set; } = "";
-        public string ExecutionInstrument { get; set; } = "";
     }
 }

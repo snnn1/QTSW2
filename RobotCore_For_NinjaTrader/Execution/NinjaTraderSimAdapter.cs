@@ -5,6 +5,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Globalization;
 using System.Security.Cryptography;
@@ -70,6 +72,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private string? _ieaAccountName;
     private string? _ieaEngineExecutionInstrument;
     private readonly Dictionary<string, DateTimeOffset> _lastIeaExecUpdateRoutedUtc = new();
+    
+    /// <summary>Investigation: NinjaTrader strategy instance id (set by host before SetNTContext).</summary>
+    private string? _strategyInstanceIdForAudit;
+    private bool _investigationRuntimeFingerprintEmitted;
     
     /// <summary>Effective order map: IEA's when enabled, else adapter's.</summary>
     private ConcurrentDictionary<string, OrderInfo> OrderMap => _useInstrumentExecutionAuthority && _iea != null ? _iea.OrderMap : _orderMap;
@@ -137,6 +143,63 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         !string.IsNullOrEmpty(_flattenCoordinationInstanceIdOverride)
             ? _flattenCoordinationInstanceIdOverride!
             : "nta:" + _adapterInstanceId.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>Stable executor id for investigation logs (matches flatten coordination prefix).</summary>
+    public int InvestigationAdapterInstanceId => _adapterInstanceId;
+
+    /// <summary>Set strategy instance id for RUNTIME_FINGERPRINT / EXECUTOR_REBOUND correlation. Call before SetNTContext.</summary>
+    public void SetInvestigationRuntimeContext(string? strategyInstanceId) =>
+        _strategyInstanceIdForAudit = string.IsNullOrWhiteSpace(strategyInstanceId) ? null : strategyInstanceId.Trim();
+
+    private static string TryComputeRobotCoreAssemblyFingerprint()
+    {
+        try
+        {
+            var a = typeof(NinjaTraderSimAdapter).Assembly;
+            var loc = a.Location;
+            if (!string.IsNullOrEmpty(loc) && File.Exists(loc))
+            {
+                using var sha = SHA256.Create();
+                using var fs = File.OpenRead(loc);
+                var h = sha.ComputeHash(fs);
+                var hex = BitConverter.ToString(h).Replace("-", "");
+                return hex.Length >= 24 ? hex.Substring(0, 24).ToLowerInvariant() : hex.ToLowerInvariant();
+            }
+            return a.FullName ?? "unknown_no_location";
+        }
+        catch
+        {
+            return "assembly_hash_error";
+        }
+    }
+
+    private void TryEmitInvestigationRuntimeFingerprint(string accountName, string executionInstrumentKey)
+    {
+        if (_investigationRuntimeFingerprintEmitted) return;
+        _investigationRuntimeFingerprintEmitted = true;
+        var utc = DateTimeOffset.UtcNow;
+        string procStart;
+        try
+        {
+            procStart = Process.GetCurrentProcess().StartTime.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            procStart = "";
+        }
+        int? ieaId = _iea?.InstanceId;
+        _log.Write(RobotEvents.EngineBase(utc, tradingDate: "", eventType: "RUNTIME_FINGERPRINT", state: "ENGINE",
+            new
+            {
+                assembly_hash = TryComputeRobotCoreAssemblyFingerprint(),
+                process_start_time = procStart,
+                strategy_instance_id = _strategyInstanceIdForAudit ?? "",
+                executor_id = "nta:" + _adapterInstanceId.ToString(CultureInfo.InvariantCulture),
+                iea_instance_id = ieaId,
+                account = accountName ?? "",
+                instrument = executionInstrumentKey ?? ""
+            }));
+    }
 
     private string GetCoordinationAccountName()
     {
@@ -740,6 +803,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             _ieaAccountName = accountName;
             _iea = InstrumentExecutionAuthorityRegistry.GetOrCreate(accountName, executionInstrumentKey,
                 () => new InstrumentExecutionAuthority(accountName, executionInstrumentKey, this, _log, _aggregationPolicy));
+            // Registry caches IEA across strategy restarts; always bind to this adapter instance (SIM verify is on this, not the stale executor).
+            _iea.RebindExecutor(this, _strategyInstanceIdForAudit);
             _iea.SetEventWriter(_eventWriter);
             _iea.SetOnEnqueueFailureCallback(_blockInstrumentCallback);
             _iea.SetOnRecoveryRequestedCallback(OnRecoveryRequested);
@@ -784,6 +849,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         {
             _iea.BeginBootstrapForInstrument(executionInstrumentKey, BootstrapReason.STRATEGY_START, DateTimeOffset.UtcNow);
         }
+
+        TryEmitInvestigationRuntimeFingerprint(accountName, executionInstrumentKey);
     }
 
     /// <summary>
@@ -1355,7 +1422,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
         else
         {
-            HandleOrderUpdateReal(order, orderUpdate);
+            HandleOrderIngressFromNt(order, orderUpdate);
         }
     }
 
@@ -1387,7 +1454,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
         else
         {
-            HandleExecutionUpdateReal(execution, order);
+            HandleExecutionIngressFromNt(execution, order);
         }
     }
 

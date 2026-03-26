@@ -189,6 +189,23 @@ public sealed partial class InstrumentExecutionAuthority
     internal void AddAlias(string alias, string brokerOrderId) =>
         _orderRegistry.AddAlias(alias, brokerOrderId);
 
+    /// <summary>
+    /// When NT/Sim reports a new native order id on updates while <see cref="RegisterOrder"/> used the pre-ack id,
+    /// link the new id to the canonical registry row so <see cref="TryResolveByBrokerOrderId"/> and lifecycle updates match.
+    /// </summary>
+    internal bool LinkBrokerOrderIdAlias(string alternateBrokerOrderId, string canonicalBrokerOrderId, DateTimeOffset utcNow, string intentId, string instrument)
+    {
+        if (!_orderRegistry.LinkBrokerOrderIdAlias(alternateBrokerOrderId, canonicalBrokerOrderId)) return false;
+        Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "ORDER_REGISTRY_BROKER_ID_LINKED", new
+        {
+            canonical_broker_order_id = canonicalBrokerOrderId,
+            broker_order_id = alternateBrokerOrderId,
+            intent_id = intentId,
+            iea_instance_id = InstanceId
+        }));
+        return true;
+    }
+
     /// <summary>Register an adopted order (restart protectives). Ownership = ADOPTED.</summary>
     internal void RegisterAdoptedOrder(
         string brokerOrderId,
