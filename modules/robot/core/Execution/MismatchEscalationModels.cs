@@ -58,6 +58,16 @@ public sealed class MismatchObservation
     public int LocalQty { get; set; }
     public int BrokerWorkingOrderCount { get; set; }
     public int LocalWorkingOrderCount { get; set; }
+    /// <summary>Open journal rows (intents) for this instrument keys; for audit "journal_orders".</summary>
+    public int JournalOpenEntryCount { get; set; }
+    /// <summary>Comma-separated intent ids from open journal for this instrument (audit linkage).</summary>
+    public string? IntentIdsCsv { get; set; }
+    /// <summary>Optional: IEA-derived or engine position when plumbed; else omit for TSV "na".</summary>
+    public int? RegistryPositionQty { get; set; }
+    /// <summary>Optional: stream/runtime expected position when plumbed; else TSV "na".</summary>
+    public int? RuntimePositionQty { get; set; }
+    /// <summary>Optional: runtime working-order proxy when plumbed; else TSV "na".</summary>
+    public int? RuntimeOrderCount { get; set; }
     public string? LifecycleState { get; set; }
     public string? JournalState { get; set; }
     public DateTimeOffset ObservedUtc { get; set; }
@@ -94,6 +104,83 @@ public sealed class MismatchInstrumentState
 
     /// <summary>Progress-aware throttling for expensive gate reconciliation (local to coordinator).</summary>
     public GateReconciliationProgressState GateProgress { get; } = new GateReconciliationProgressState();
+
+    /// <summary>Bounded convergence episode for this instrument (broker-truth escalation).</summary>
+    public ReconciliationConvergenceEpisodeTracker ConvergenceEpisode { get; } = new();
+
+    /// <summary>Suppress expensive gate reconciliation until this UTC (post forced alignment hysteresis).</summary>
+    public DateTimeOffset ReconciliationHysteresisUntilUtc { get; set; }
+
+    /// <summary>Mismatch class at hysteresis start — new class clears hysteresis early.</summary>
+    public MismatchType? HysteresisMismatchTypeAtFreeze { get; set; }
+
+    /// <summary>Broker snapshot fingerprint after successful forced alignment; stall expensive while unchanged.</summary>
+    public ulong PostForcedConvergenceFingerprint { get; set; }
+
+    public bool ForcedConvergenceSucceeded { get; set; }
+}
+
+/// <summary>Per-instrument reconciliation episode (attempt / no-progress bounds).</summary>
+public sealed class ReconciliationConvergenceEpisodeTracker
+{
+    public ulong EpisodeId { get; private set; }
+    public int AttemptCount { get; set; }
+    public int NoProgressStreak { get; set; }
+    public DateTimeOffset FirstSeenUtc { get; private set; }
+    public DateTimeOffset? LastProgressUtc { get; set; }
+    public string? LastActionAttempted { get; set; }
+    /// <summary>Intent scope for this episode (<see cref="MismatchObservation.IntentIdsCsv"/>).</summary>
+    public string? EpisodeIntentKey { get; private set; }
+
+    public void StartNew(ulong episodeId, DateTimeOffset utcNow, string? intentKey = null)
+    {
+        EpisodeId = episodeId;
+        AttemptCount = 0;
+        NoProgressStreak = 0;
+        FirstSeenUtc = utcNow;
+        LastProgressUtc = null;
+        LastActionAttempted = null;
+        EpisodeIntentKey = intentKey;
+    }
+
+    public void Clear()
+    {
+        EpisodeId = 0;
+        AttemptCount = 0;
+        NoProgressStreak = 0;
+        FirstSeenUtc = default;
+        LastProgressUtc = null;
+        LastActionAttempted = null;
+        EpisodeIntentKey = null;
+    }
+}
+
+/// <summary>Input to broker-truth forced alignment (engine provides implementation).</summary>
+public sealed class ReconciliationForcedConvergenceContext
+{
+    public string Instrument { get; init; } = "";
+    public string? IntentIdsCsv { get; init; }
+    public string LimitReason { get; init; } = "";
+    public int Attempts { get; init; }
+    public int NoProgressCount { get; init; }
+}
+
+/// <summary>Result of broker-authoritative convergence attempt.</summary>
+public sealed class ReconciliationForcedConvergenceResult
+{
+    public bool AlignedWithBroker { get; init; }
+    public string? FailureReason { get; init; }
+    public ulong PostAlignmentFingerprint { get; init; }
+
+    public static ReconciliationForcedConvergenceResult Succeeded(ulong fingerprint) =>
+        new() { AlignedWithBroker = true, PostAlignmentFingerprint = fingerprint };
+
+    public static ReconciliationForcedConvergenceResult Failed(string reason) =>
+        new() { AlignedWithBroker = false, FailureReason = reason };
+
+    /// <summary>Harness / no handler: soft success — no fail-closed.</summary>
+    public static ReconciliationForcedConvergenceResult NoHandler() =>
+        new() { AlignedWithBroker = true, FailureReason = "no_alignment_handler", PostAlignmentFingerprint = 0 };
 }
 
 /// <summary>Policy thresholds for mismatch escalation.</summary>
@@ -162,6 +249,20 @@ public static class MismatchEscalationPolicy
 
     /// <summary>Minimum gap between expensive passes to block hot re-entry (ms).</summary>
     public const int GATE_REENTRY_BLOCK_MS = 50;
+
+    // --- Reconciliation convergence engine (bounded episodes; broker as authority) ---
+
+    /// <summary>Max expensive gate reconciliations per episode before broker-truth escalation.</summary>
+    public const int RECONCILIATION_CONVERGENCE_MAX_ATTEMPTS = 5;
+
+    /// <summary>Max consecutive expensive passes without progress-signature change before escalation.</summary>
+    public const int RECONCILIATION_CONVERGENCE_MAX_NO_PROGRESS = 3;
+
+    /// <summary>Max episode wall duration before escalation (ms).</summary>
+    public const int RECONCILIATION_CONVERGENCE_MAX_DURATION_MS = 2000;
+
+    /// <summary>After forced convergence, block expensive reconciliation briefly (anti-oscillation).</summary>
+    public const int RECONCILIATION_CONVERGENCE_HYSTERESIS_MS = 1500;
 }
 
 /// <summary>

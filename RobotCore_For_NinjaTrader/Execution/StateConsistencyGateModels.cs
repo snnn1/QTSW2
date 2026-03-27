@@ -43,6 +43,9 @@ public sealed class ReconciliationRunOptions
     /// <summary>When set, qty-mismatch callbacks and destructive orphan journal closure are skipped for this instrument.</summary>
     public string? GateRecoveryInstrument { get; set; }
 
+    /// <summary>When true, periodic redundancy fast-path does not skip this pass (e.g. <see cref="ReconciliationRunner.ForceRunNow"/>).</summary>
+    public bool BypassRedundancySuppression { get; set; }
+
     public ReconciliationRunMode Mode =>
         string.IsNullOrWhiteSpace(GateRecoveryInstrument) ? ReconciliationRunMode.Normal : ReconciliationRunMode.GateRecovery;
 }
@@ -57,7 +60,21 @@ public sealed class StateConsistencyReleaseEvaluationInput
     public int JournalOpenQty { get; set; }
     /// <summary>IEA owned+adopted working count, or -1 if unavailable / fail-closed.</summary>
     public int IeaOwnedPlusAdoptedWorking { get; set; }
+    /// <summary>
+    /// Release-blocking pending adoption rows (excludes stale journal intents:
+    /// broker flat, no QTSW2 working ref for intent, no open journal qty). Built by RobotEngine from ExecutionJournal.
+    /// </summary>
     public int PendingAdoptionCandidateCount { get; set; }
+
+    /// <summary>64-bit sorted blocking adoption intent set surrogate (release suppression; not logged as raw ids).</summary>
+    public long BlockingAdoptionIntentSetHash { get; set; }
+
+    /// <summary>64-bit mismatch-trusted registry intent set surrogate.</summary>
+    public long RegistryMismatchTrustedIntentSetHash { get; set; }
+
+    /// <summary>64-bit open journal intent set surrogate (remaining qty &gt; 0).</summary>
+    public long JournalOpenIntentSetHash { get; set; }
+
     public bool SnapshotSufficient { get; set; } = true;
     public bool UseInstrumentExecutionAuthority { get; set; }
 }

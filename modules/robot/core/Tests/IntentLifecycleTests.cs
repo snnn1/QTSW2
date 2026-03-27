@@ -94,6 +94,26 @@ public static class IntentLifecycleTests
         if (IntentLifecycleValidator.IsFlattenIntentAllowed(IntentLifecycleState.TERMINAL))
             return (false, "FlattenIntent not allowed in TERMINAL");
 
+        // --- Adoption reconstruction mapping (registry/broker truth → intent state) ---
+        if (IntentLifecycleValidator.MapAdoptionEntryReconstructionState(0, 1, false) != IntentLifecycleState.ENTRY_WORKING)
+            return (false, "Adoption: unfilled entry should map to ENTRY_WORKING");
+        if (IntentLifecycleValidator.MapAdoptionEntryReconstructionState(1, 3, false) != IntentLifecycleState.ENTRY_PARTIALLY_FILLED)
+            return (false, "Adoption: partial fill should map to ENTRY_PARTIALLY_FILLED");
+        if (IntentLifecycleValidator.MapAdoptionEntryReconstructionState(3, 3, false) != IntentLifecycleState.ENTRY_FILLED)
+            return (false, "Adoption: full fill without protectives should map to ENTRY_FILLED");
+        if (IntentLifecycleValidator.MapAdoptionEntryReconstructionState(3, 3, true) != IntentLifecycleState.PROTECTIVES_ACTIVE)
+            return (false, "Adoption: full fill with live protectives should map to PROTECTIVES_ACTIVE");
+
+        // --- Idempotent replay (post-adoption / duplicate broker events) ---
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.ENTRY_FILLED))
+            return (false, "ENTRY_FILLED + ENTRY_FILLED replay should be idempotent");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED))
+            return (false, "ENTRY_PARTIALLY_FILLED + partial replay should be idempotent");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_ACCEPTED))
+            return (false, "ENTRY_WORKING + ENTRY_ACCEPTED replay should be idempotent");
+        if (IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_FILLED))
+            return (false, "CREATED + ENTRY_FILLED should not be treated as idempotent replay");
+
         return (true, null);
     }
 

@@ -8,6 +8,10 @@ namespace QTSW2.Robot.Core.Execution;
 /// Execution adapter interface for broker-agnostic order placement.
 /// RobotEngine calls adapters when it wants to place/modify orders.
 /// Adapters handle broker-specific details.
+///
+/// AUDIT RULE: Strategy layers should NOT call adapter.Flatten, adapter.SubmitEntryOrders,
+/// or adapter.CancelOrders directly. Use EnqueueExecutionCommand instead so execution flows
+/// through the IEA as the single authority. The adapter is transport-only; IEA orchestrates.
 /// </summary>
 public interface IExecutionAdapter
 {
@@ -119,16 +123,16 @@ public interface IExecutionAdapter
         string intentId,
         string instrument,
         DateTimeOffset utcNow);
-
+    
     /// <summary>
-    /// Emergency flatten by instrument when IEA is blocked or for unmatched-position policy. Bypasses IEA queue — calls broker directly.
-    /// Used when EnqueueAndWait times out or when RECOVERY_POSITION_UNMATCHED policy chooses FLATTEN.
+    /// Emergency flatten by instrument when IEA is blocked. Bypasses IEA queue — calls broker directly.
+    /// Used when EnqueueAndWait times out to prevent leaving position unprotected.
     /// </summary>
     /// <param name="instrument">Execution instrument key (e.g. MYM, MNQ)</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Flatten result</returns>
     FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow);
-    
+
     /// <summary>
     /// Get account snapshot (positions and working orders) for recovery reconciliation.
     /// </summary>
@@ -137,9 +141,7 @@ public interface IExecutionAdapter
     AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow);
 
     /// <summary>
-    /// Get current market bid/ask for breakout validity gate (recovery).
-    /// Returns (null, null) if unavailable — gate skips (fail open).
-    /// Long invalid: ask >= brkLong + tolerance. Short invalid: bid <= brkShort - tolerance.
+    /// Get current market bid/ask for breakout validity gate. Returns (null, null) when unavailable (gate skips, fail open).
     /// </summary>
     (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow);
     
@@ -151,11 +153,35 @@ public interface IExecutionAdapter
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
 
     /// <summary>
-    /// Cancel specific orders by order ID. Used for stream-scoped entry order cancellation during recovery (CancelAndRebuild).
+    /// Cancel specific orders by broker order IDs (stream-scoped recovery, e.g. CancelAndRebuild).
     /// </summary>
     /// <param name="orderIds">Broker order IDs to cancel</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Phase 3: Evaluate break-even triggers. When IEA enabled, delegates to IEA. Uses tick de-dupe when tickTimeFromEvent provided.
+    /// </summary>
+    /// <param name="tickPrice">Current tick price</param>
+    /// <param name="tickTimeFromEvent">Event timestamp from market data (for de-dupe). Null = use UtcNow fallback.</param>
+    /// <param name="executionInstrument">Execution instrument filter (e.g. MNQ, MGC)</param>
+    void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument);
+
+    /// <summary>
+    /// Phase 1: Process pending unresolved executions (non-blocking grace retry). Called from strategy thread on OnBarUpdate/OnMarketData.
+    /// Non-IEA path only; IEA uses queue-based retry.
+    /// </summary>
+    void ProcessPendingUnresolvedExecutions();
+
+    /// <summary>
+    /// Phase 3: Request recovery for instrument. Routes to IEA when bound. No-op for adapters without IEA.
+    /// </summary>
+    void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Phase 5: Request supervisory action for instrument. Routes to IEA when bound. No-op for adapters without IEA.
+    /// </summary>
+    void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow);
 
     /// <summary>
     /// Enqueue execution command for IEA processing. Strategy layers should use this instead of calling
@@ -164,9 +190,30 @@ public interface IExecutionAdapter
     void EnqueueExecutionCommand(ExecutionCommandBase command);
 
     /// <summary>
-    /// Session-close immediate flatten: enqueue cancel+flatten and drain in same cycle.
+    /// Intent IDs relevant to protective audit + registry retention for this instrument:
+    /// union of BE-monitoring actives (filled, open) and adoption candidates (EntrySubmitted, !TradeCompleted).
+    /// Aligns expected intent context with state-consistency release semantics.
+    /// </summary>
+    IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
+
+    /// <summary>
+    /// Retry deferred adoption scan when candidates were empty but broker had orders (journal load race).
+    /// Call from periodic path (e.g. reconciliation) so retry does not depend only on execution updates.
+    /// No-op for adapters without IEA.
+    /// </summary>
+    void TryRetryDeferredAdoptionScan();
+
+    /// <summary>
+    /// Before mismatch assembly: all IEAs for this instrument reclassify recoverable UNOWNED rows and attempt broker-id alias links from snapshot.
+    /// Does not submit, modify, or cancel orders. No-op when registry unavailable.
+    /// </summary>
+    void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Session-close immediate flatten: enqueue cancel+flatten NtActions and drain in same cycle.
     /// Guarantees same-cycle execution before session close. Use for forced flatten when next-bar delay is unacceptable.
     /// Returns null if not supported (caller should use EmergencyFlatten fallback).
+    /// MUST be called from strategy thread.
     /// </summary>
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
 }

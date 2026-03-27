@@ -20,6 +20,7 @@ internal sealed class OrderInfo
     public bool IsEntryOrder { get; set; }
     public int FilledQuantity { get; set; }
     public DateTimeOffset? EntryFillTime { get; set; }
+    public DateTimeOffset? BrokerLastEventUtc { get; set; }
     public bool ProtectiveStopAcknowledged { get; set; }
     public bool ProtectiveTargetAcknowledged { get; set; }
     public int ExpectedQuantity { get; set; }

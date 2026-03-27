@@ -591,6 +591,8 @@ public sealed class ReconciliationConvergenceTracker
     };
 
     private const int StuckThresholdPasses = 5;
+    private static readonly TimeSpan StuckLogResurfaceInterval = TimeSpan.FromSeconds(60);
+    private const int StuckLogMilestoneIncrement = 10;
 
     private readonly RobotLogger _log;
     private readonly Func<string?> _getRunId;
@@ -609,6 +611,8 @@ public sealed class ReconciliationConvergenceTracker
         public int HashPrev1;
         public int HashCurr;
         public DateTimeOffset? FirstMismatchUtc;
+        public DateTimeOffset? LastStuckLogUtc;
+        public int LastStuckLogAtConsecutive;
     }
 
     public ReconciliationConvergenceTracker(RobotLogger log, Func<string?> getRunId)
@@ -654,6 +658,8 @@ public sealed class ReconciliationConvergenceTracker
                     st.HashCurr = hash;
                     st.LastChangeUtc = utcNow;
                     st.ConsecutiveSameHash = 1;
+                    st.LastStuckLogUtc = null;
+                    st.LastStuckLogAtConsecutive = 0;
                 }
                 else
                 {
@@ -668,23 +674,35 @@ public sealed class ReconciliationConvergenceTracker
 
                 if (hasMismatch && st.ConsecutiveSameHash >= StuckThresholdPasses)
                 {
-                    Interlocked.Increment(ref _sessionStuck);
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_STUCK", state: "ENGINE",
-                        new
-                        {
-                            instrument = inst,
-                            signature_name = "reconciliation_pass",
-                            state_signature_hash = hash,
-                            consecutive_same_state_count = st.ConsecutiveSameHash,
-                            last_change_ts = st.LastChangeUtc.ToString("o"),
-                            account_qty = accountQty,
-                            journal_qty = journalQty,
-                            open_orders_count = openOrdersCount,
-                            intent_count = intentCount,
-                            qty_delta = qtyDelta,
-                            first_mismatch_ts = st.FirstMismatchUtc?.ToString("o"),
-                            run_id = _getRunId()
-                        }));
+                    var crossedThreshold = st.ConsecutiveSameHash == StuckThresholdPasses;
+                    var milestone =
+                        st.ConsecutiveSameHash >= st.LastStuckLogAtConsecutive + StuckLogMilestoneIncrement;
+                    var resurface = st.LastStuckLogUtc == null ||
+                                    (utcNow - st.LastStuckLogUtc.Value) >= StuckLogResurfaceInterval;
+                    var shouldLogStuck = crossedThreshold || milestone || resurface;
+
+                    if (shouldLogStuck)
+                    {
+                        st.LastStuckLogUtc = utcNow;
+                        st.LastStuckLogAtConsecutive = st.ConsecutiveSameHash;
+                        Interlocked.Increment(ref _sessionStuck);
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_STUCK", state: "ENGINE",
+                            new
+                            {
+                                instrument = inst,
+                                signature_name = "reconciliation_pass",
+                                state_signature_hash = hash,
+                                consecutive_same_state_count = st.ConsecutiveSameHash,
+                                last_change_ts = st.LastChangeUtc.ToString("o"),
+                                account_qty = accountQty,
+                                journal_qty = journalQty,
+                                open_orders_count = openOrdersCount,
+                                intent_count = intentCount,
+                                qty_delta = qtyDelta,
+                                first_mismatch_ts = st.FirstMismatchUtc?.ToString("o"),
+                                run_id = _getRunId()
+                            }));
+                    }
                 }
 
                 if (hasMismatch && st.HashPrev2 != 0 && st.HashCurr == st.HashPrev2 && st.HashPrev1 != 0 && st.HashCurr != st.HashPrev1)
@@ -727,6 +745,8 @@ public sealed class ReconciliationConvergenceTracker
                     st.OscillationCount = 0;
                     st.HashPrev2 = st.HashPrev1 = st.HashCurr = 0;
                     st.FirstMismatchUtc = null;
+                    st.LastStuckLogUtc = null;
+                    st.LastStuckLogAtConsecutive = 0;
                 }
                 else if (hasMismatch)
                     st.HadMismatch = true;

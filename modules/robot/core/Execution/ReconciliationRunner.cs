@@ -25,9 +25,30 @@ public sealed class ReconciliationRunner
     private readonly TimeSpan _reconciliationDebounceWindow;
     private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly ReconciliationConvergenceTracker? _convergenceTracker;
+    private readonly ReleaseReconciliationRedundancySuppression? _redundancySuppression;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
+
+    private sealed class SecondaryMismatchFastPathEntry
+    {
+        public int AccountQty;
+        public int CachedJournalQty;
+        public long ActivityGeneration;
+        public DateTimeOffset LastFullVerifyUtc;
+        public DateTimeOffset LastSecondarySkipLogUtc;
+    }
+
+    private readonly Dictionary<string, SecondaryMismatchFastPathEntry> _secondaryMismatchFastPath =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly TimeSpan SecondaryMismatchFastPathMaxStale =
+        ReconciliationStateTracker.DefaultDebounceWindow;
+
+    private static readonly TimeSpan SecondarySkipLogCoalesce = TimeSpan.FromSeconds(60);
+
+    private readonly Dictionary<string, (int AccountQty, int JournalQty, long ActivityGen, DateTimeOffset LastSampleUtc)>
+        _nonOwnerConvergenceThrottle = new(StringComparer.OrdinalIgnoreCase);
 
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
         Action<string, DateTimeOffset, string, int, int>? onQuantityMismatch = null,
@@ -37,7 +58,8 @@ public sealed class ReconciliationRunner
         ReconciliationStateTracker? reconciliationTracker = null,
         TimeSpan? reconciliationDebounceWindow = null,
         RuntimeAuditHub? runtimeAudit = null,
-        ReconciliationConvergenceTracker? convergenceTracker = null)
+        ReconciliationConvergenceTracker? convergenceTracker = null,
+        ReleaseReconciliationRedundancySuppression? redundancySuppression = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -50,6 +72,7 @@ public sealed class ReconciliationRunner
         _reconciliationDebounceWindow = reconciliationDebounceWindow ?? ReconciliationStateTracker.DefaultDebounceWindow;
         _runtimeAudit = runtimeAudit;
         _convergenceTracker = convergenceTracker;
+        _redundancySuppression = redundancySuppression;
     }
 
     /// <summary>
@@ -75,7 +98,7 @@ public sealed class ReconciliationRunner
     /// </summary>
     public void ForceRunNow(DateTimeOffset utcNow)
     {
-        RunInternal(utcNow, null);
+        RunInternal(utcNow, new ReconciliationRunOptions { BypassRedundancySuppression = true });
     }
 
     /// <summary>
@@ -91,6 +114,7 @@ public sealed class ReconciliationRunner
     {
         var gateInst = options?.GateRecoveryInstrument?.Trim();
         var gateMode = !string.IsNullOrEmpty(gateInst);
+        var bypassRedundancy = options?.BypassRedundancySuppression ?? false;
         _lastRunUtc = utcNow;
         _runtimeAudit?.NotifyReconciliationRunCompleted();
         var cpuStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
@@ -125,20 +149,91 @@ public sealed class ReconciliationRunner
                 instrumentsWithPosition.Add(p.Instrument.Trim());
         }
 
+        try
+        {
+            var closedRecovery = _journal.CloseUntrackedFillRecoveryMarkersWhenBrokerFlat(accountQtyByInstrument, utcNow);
+            if (closedRecovery > 0)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_CLOSED_BROKER_FLAT", "ENGINE",
+                    new { count = closedRecovery, note = "Broker snapshot flat for instrument(s) with recovery marker" }));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_CLOSE_ERROR", "ENGINE",
+                new { error = ex.Message, exception_type = ex.GetType().Name }));
+        }
+
         var openByInstrument = _journal.GetOpenJournalEntriesByInstrument();
+        var passSignature = ReleaseReconciliationRedundancySuppression.BuildPeriodicPassSignature(accountQtyByInstrument, openByInstrument);
+        if (_redundancySuppression != null && !gateMode && !bypassRedundancy &&
+            _redundancySuppression.TrySkipRedundantPeriodicPass(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow))
+        {
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+            return;
+        }
+
         foreach (var kvp in accountQtyByInstrument)
         {
             var inst = kvp.Key;
             var accountQty = kvp.Value;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+
+            var acct = _reconciliationAccountName?.Invoke();
+            var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
+            var actGen = _redundancySuppression?.ExecutionActivityGeneration ?? 0;
+
+            var allowSecondaryFastPath = !gateMode && !bypassRedundancy && _reconciliationTracker != null;
+            if (allowSecondaryFastPath &&
+                _secondaryMismatchFastPath.TryGetValue(inst, out var fp) &&
+                fp.AccountQty == accountQty &&
+                fp.ActivityGeneration == actGen &&
+                (utcNow - fp.LastFullVerifyUtc) < SecondaryMismatchFastPathMaxStale &&
+                _reconciliationTracker.TryPeekSecondaryStableMismatchFastPath(acct, inst, instanceId, accountQty, out var peekJq,
+                    out var peekOwner) &&
+                fp.CachedJournalQty == peekJq)
+            {
+                var shouldLog = (utcNow - fp.LastSecondarySkipLogUtc) >= SecondarySkipLogCoalesce;
+                if (shouldLog)
+                    fp.LastSecondarySkipLogUtc = utcNow;
+                if (shouldLog)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_SECONDARY_INSTANCE_SKIPPED", "ENGINE",
+                        new
+                        {
+                            account = acct ?? "",
+                            instrument = inst,
+                            account_qty = accountQty,
+                            journal_qty = peekJq,
+                            owner_instance_id = peekOwner,
+                            current_instance_id = instanceId,
+                            suppressed_repeat = true,
+                            metrics = new
+                            {
+                                reconciliation_mismatch_total = _reconciliationTracker.Metrics.ReconciliationMismatchTotal,
+                                reconciliation_debounced_total = _reconciliationTracker.Metrics.ReconciliationDebouncedTotal,
+                                reconciliation_secondary_skipped_total = _reconciliationTracker.Metrics.ReconciliationSecondarySkippedTotal,
+                                reconciliation_resolved_total = _reconciliationTracker.Metrics.ReconciliationResolvedTotal
+                            },
+                            note =
+                                "Single-writer reconciliation: non-owner chart skipped mismatch pipeline (pre-gate fast path; full verify on timer/activity)"
+                        }));
+                }
+                continue;
+            }
+
             var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            if (journalQty == accountQty)
+            {
+                _secondaryMismatchFastPath.Remove(inst);
+                continue;
+            }
+
             if (journalQty != accountQty)
             {
                 if (gateMode && MatchesGateInstrument(inst, gateInst!))
                     continue;
 
-                var acct = _reconciliationAccountName?.Invoke();
-                var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
                 ReconciliationMismatchGateResult gateResult = new(ReconciliationMismatchGateOutcome.EmitFullAndInvokeCallback, null);
                 if (_reconciliationTracker != null)
                 {
@@ -148,6 +243,17 @@ public sealed class ReconciliationRunner
 
                 if (gateResult.Outcome == ReconciliationMismatchGateOutcome.SecondaryInstanceSkip)
                 {
+                    if (allowSecondaryFastPath)
+                    {
+                        _secondaryMismatchFastPath[inst] = new SecondaryMismatchFastPathEntry
+                        {
+                            AccountQty = accountQty,
+                            CachedJournalQty = journalQty,
+                            ActivityGeneration = actGen,
+                            LastFullVerifyUtc = utcNow,
+                            LastSecondarySkipLogUtc = utcNow
+                        };
+                    }
                     _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_SECONDARY_INSTANCE_SKIPPED", "ENGINE",
                         new
                         {
@@ -170,6 +276,8 @@ public sealed class ReconciliationRunner
                         }));
                     continue;
                 }
+
+                _secondaryMismatchFastPath.Remove(inst);
 
                 if (gateResult.Outcome == ReconciliationMismatchGateOutcome.EmitStillOpenInfoOnly)
                 {
@@ -281,6 +389,8 @@ public sealed class ReconciliationRunner
                 new { instruments_checked = 0, journals_reconciled = 0, note = "No open journals to reconcile" }));
             EmitConvergenceSamples(utcNow, workingOrders, accountQtyByInstrument, openByInstrument);
             if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+            if (_redundancySuppression != null && !gateMode)
+                _redundancySuppression.NotifyPeriodicReconciliationPassCompleted(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow);
             return;
         }
 
@@ -346,6 +456,8 @@ public sealed class ReconciliationRunner
         _onReconciliationPassComplete?.Invoke(BuildQtyByInstrument(accountQtyByInstrument));
 
         if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+        if (_redundancySuppression != null && !gateMode)
+            _redundancySuppression.NotifyPeriodicReconciliationPassCompleted(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow);
     }
 
     private void EmitConvergenceSamples(
@@ -355,6 +467,10 @@ public sealed class ReconciliationRunner
         Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument)
     {
         if (_convergenceTracker == null) return;
+
+        var acct = _reconciliationAccountName?.Invoke();
+        var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
+        var actGen = _redundancySuppression?.ExecutionActivityGeneration ?? 0;
 
         var instSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var k in accountQtyByInstrument.Keys)
@@ -370,7 +486,25 @@ public sealed class ReconciliationRunner
             var openOrders = CountWorkingForInstrument(workingOrders, inst);
             var intentCount = CountJournalIntents(openByInstrument, inst, execVariant);
             var hasMismatch = accountQty != journalQty;
+            var nonOwnerConv = hasMismatch && _reconciliationTracker != null &&
+                _reconciliationTracker.TryPeekNonOwnerWithStableQtyMismatchEpisode(acct, inst, instanceId, accountQty,
+                    journalQty, out _);
+            if (nonOwnerConv)
+            {
+                if (_nonOwnerConvergenceThrottle.TryGetValue(inst, out var throttle) &&
+                    throttle.AccountQty == accountQty && throttle.JournalQty == journalQty &&
+                    throttle.ActivityGen == actGen &&
+                    (utcNow - throttle.LastSampleUtc).TotalSeconds <
+                    ReconciliationStateTracker.DefaultDebounceWindow.TotalSeconds)
+                    continue;
+            }
+
             _convergenceTracker.OnInstrumentReconciliationSample(utcNow, inst, accountQty, journalQty, openOrders, intentCount, hasMismatch, accountQty - journalQty);
+
+            if (nonOwnerConv)
+                _nonOwnerConvergenceThrottle[inst] = (accountQty, journalQty, actGen, utcNow);
+            else
+                _nonOwnerConvergenceThrottle.Remove(inst);
         }
     }
 

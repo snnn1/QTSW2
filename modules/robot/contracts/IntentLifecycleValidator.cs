@@ -46,4 +46,37 @@ public static class IntentLifecycleValidator
 
     /// <summary>Check if FlattenIntentCommand is allowed in the given state.</summary>
     public static bool IsFlattenIntentAllowed(IntentLifecycleState state) => state != IntentLifecycleState.TERMINAL;
+
+    /// <summary>
+    /// Maps broker/registry truth for an adopted ENTRY order to the intent lifecycle state.
+    /// Used only for adoption reconstruction (direct set), not for normal FSM transitions.
+    /// </summary>
+    public static IntentLifecycleState MapAdoptionEntryReconstructionState(int filledQty, int orderQty, bool hasProtectives)
+    {
+        if (filledQty <= 0)
+            return IntentLifecycleState.ENTRY_WORKING;
+        if (orderQty > 0 && filledQty < orderQty)
+            return IntentLifecycleState.ENTRY_PARTIALLY_FILLED;
+        if (orderQty > 0 && filledQty >= orderQty)
+            return hasProtectives ? IntentLifecycleState.PROTECTIVES_ACTIVE : IntentLifecycleState.ENTRY_FILLED;
+        if (filledQty > 0)
+            return hasProtectives ? IntentLifecycleState.PROTECTIVES_ACTIVE : IntentLifecycleState.ENTRY_FILLED;
+        return IntentLifecycleState.ENTRY_WORKING;
+    }
+
+    /// <summary>
+    /// True when a transition event is a duplicate replay: already at the post-transition state.
+    /// Suppresses INTENT_LIFECYCLE_TRANSITION_INVALID after adoption reconstruction or fill replay.
+    /// </summary>
+    public static bool IsIdempotentIntentReplay(IntentLifecycleState current, IntentLifecycleTransition transition) =>
+        (current, transition) switch
+        {
+            (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.ENTRY_FILLED) => true,
+            (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED) => true,
+            (IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_ACCEPTED) => true,
+            (IntentLifecycleState.PROTECTIVES_ACTIVE, IntentLifecycleTransition.PROTECTIVES_PLACED) => true,
+            (IntentLifecycleState.EXIT_PENDING, IntentLifecycleTransition.EXIT_STARTED) => true,
+            (IntentLifecycleState.TERMINAL, IntentLifecycleTransition.INTENT_COMPLETED) => true,
+            _ => false
+        };
 }

@@ -190,8 +190,9 @@ public interface IExecutionAdapter
     void EnqueueExecutionCommand(ExecutionCommandBase command);
 
     /// <summary>
-    /// Get active intent IDs for protective audit (intents with filled entries, !TradeCompleted).
-    /// Used by ProtectiveCoverageCoordinator to pass expected intents to audit. Returns empty when not available.
+    /// Intent IDs relevant to protective audit + registry retention for this instrument:
+    /// union of BE-monitoring actives (filled, open) and adoption candidates (EntrySubmitted, !TradeCompleted).
+    /// Aligns expected intent context with state-consistency release semantics.
     /// </summary>
     IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
 
@@ -201,6 +202,12 @@ public interface IExecutionAdapter
     /// No-op for adapters without IEA.
     /// </summary>
     void TryRetryDeferredAdoptionScan();
+
+    /// <summary>
+    /// Before mismatch assembly: all IEAs for this instrument reclassify recoverable UNOWNED rows and attempt broker-id alias links from snapshot.
+    /// Does not submit, modify, or cancel orders. No-op when registry unavailable.
+    /// </summary>
+    void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow);
 
     /// <summary>
     /// Session-close immediate flatten: enqueue cancel+flatten NtActions and drain in same cycle.

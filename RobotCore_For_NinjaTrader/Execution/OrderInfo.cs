@@ -20,6 +20,8 @@ internal sealed class OrderInfo
     public bool IsEntryOrder { get; set; }
     public int FilledQuantity { get; set; }
     public DateTimeOffset? EntryFillTime { get; set; }
+    /// <summary>Best-effort last broker-reported change (e.g. NT order time); fuels ADOPTION_TIMING_AUDIT.</summary>
+    public DateTimeOffset? BrokerLastEventUtc { get; set; }
     public bool ProtectiveStopAcknowledged { get; set; }
     public bool ProtectiveTargetAcknowledged { get; set; }
     public int ExpectedQuantity { get; set; }

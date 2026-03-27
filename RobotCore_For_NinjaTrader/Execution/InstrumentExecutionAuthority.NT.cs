@@ -23,10 +23,27 @@ public sealed partial class InstrumentExecutionAuthority
             return true;
         foreach (var e in _orderRegistry.GetAllEntries())
         {
-            if (e.LifecycleState == OrderLifecycleState.WORKING && e.OwnershipStatus == OrderOwnershipStatus.UNOWNED)
+            if (e.LifecycleState == OrderLifecycleState.WORKING &&
+                (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED ||
+                 e.OwnershipStatus == OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED))
                 return true;
         }
         return IsInRecovery;
+    }
+
+    private static DateTimeOffset? TryGetBrokerOrderTimeUtc(Order o)
+    {
+        if (o == null) return null;
+        try
+        {
+            var t = o.Time;
+            if (t == default) return null;
+            return t.Kind == DateTimeKind.Utc ? new DateTimeOffset(t) : new DateTimeOffset(DateTime.SpecifyKind(t, DateTimeKind.Local));
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Phase 3: Trap G - queue serialization (replaces BE-specific lock; queue handles all mutations)
@@ -1642,8 +1659,10 @@ public sealed partial class InstrumentExecutionAuthority
                             OrderType = isStop ? "STOP" : "TARGET",
                             Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
                             Quantity = o.Quantity,
+                            FilledQuantity = o.Filled,
                             State = "WORKING",
-                            IsEntryOrder = false
+                            IsEntryOrder = false,
+                            BrokerLastEventUtc = TryGetBrokerOrderTimeUtc(o)
                         };
                         OrderMap[mapKey] = oi;
                         RegisterAdoptedOrder(o.OrderId, intentId, oi.Instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "RESTART_ADOPTION", oi, NowEvent());
@@ -1695,7 +1714,8 @@ public sealed partial class InstrumentExecutionAuthority
 
                     if (!corrupt)
                     {
-                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent(),
+                            classAsRecoverableRobotOwned: true);
                         if (unchangedStreak == 1)
                         {
                             supervisoryRequestsDuringScan++;
@@ -1708,7 +1728,8 @@ public sealed partial class InstrumentExecutionAuthority
                     }
                     else
                     {
-                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                        RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent(),
+                            classAsRecoverableRobotOwned: true);
                         if (unchangedStreak == 1)
                         {
                             supervisoryRequestsDuringScan++;
@@ -1744,7 +1765,8 @@ public sealed partial class InstrumentExecutionAuthority
                         Quantity = o.Quantity,
                         State = "WORKING",
                         IsEntryOrder = true,
-                        FilledQuantity = 0
+                        FilledQuantity = o.Filled,
+                        BrokerLastEventUtc = TryGetBrokerOrderTimeUtc(o)
                     };
                     OrderMap[intentId] = oi;
                     RegisterAdoptedOrder(o.OrderId, intentId, brokerInstrument, OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", oi, NowEvent());
@@ -1788,7 +1810,8 @@ public sealed partial class InstrumentExecutionAuthority
                             iea_instance_id = InstanceId
                         });
                     }
-                    RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent());
+                    RegisterUnownedOrder(orderId, intentId, brokerInstrument, "STALE_QTSW2_ORDER_DETECTED", NowEvent(),
+                        classAsRecoverableRobotOwned: true);
                     if (unchangedStreak == 1)
                     {
                         supervisoryRequestsDuringScan++;
@@ -1892,8 +1915,10 @@ public sealed partial class InstrumentExecutionAuthority
                         OrderType = isStop ? "STOP" : "TARGET",
                         Price = isStop ? (decimal?)o.StopPrice : (decimal?)o.LimitPrice,
                         Quantity = o.Quantity,
+                        FilledQuantity = o.Filled,
                         State = "WORKING",
-                        IsEntryOrder = false
+                        IsEntryOrder = false,
+                        BrokerLastEventUtc = TryGetBrokerOrderTimeUtc(o)
                     };
                     OrderMap[mapKey] = oi;
                     RegisterAdoptedOrder(o.OrderId, intentId, instrument, isStop ? OrderRole.STOP : OrderRole.TARGET, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
@@ -1913,7 +1938,8 @@ public sealed partial class InstrumentExecutionAuthority
             }
             else
             {
-                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: false);
+                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: false,
+                    classAsRecoverableRobotOwned: true);
             }
         }
         else
@@ -1930,7 +1956,8 @@ public sealed partial class InstrumentExecutionAuthority
                     Quantity = o.Quantity,
                     State = "WORKING",
                     IsEntryOrder = true,
-                    FilledQuantity = 0
+                    FilledQuantity = o.Filled,
+                    BrokerLastEventUtc = TryGetBrokerOrderTimeUtc(o)
                 };
                 OrderMap[intentId] = oi;
                 RegisterAdoptedOrder(o.OrderId, intentId, instrument, OrderRole.ENTRY, "BROKER_REGISTRY_MISSING_ADOPT", oi, NowEvent());
@@ -1947,7 +1974,8 @@ public sealed partial class InstrumentExecutionAuthority
             }
             else
             {
-                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: true);
+                RegisterUnownedOrder(o.OrderId, intentId, instrument, "BROKER_REGISTRY_MISSING_UNOWNED", NowEvent(), isEntryOrder: true,
+                    classAsRecoverableRobotOwned: true);
             }
         }
         return false;

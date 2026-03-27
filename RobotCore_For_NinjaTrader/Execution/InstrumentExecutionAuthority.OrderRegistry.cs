@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -57,6 +58,7 @@ public sealed partial class InstrumentExecutionAuthority
             source_context = sourceContext,
             iea_instance_id = InstanceId
         }));
+        NotifyReleaseSuppressionActivity();
     }
 
     /// <summary>
@@ -111,9 +113,17 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     /// <summary>Count of owned+adopted orders in SUBMITTED, WORKING, or PART_FILLED.
-    /// Used for ORDER_REGISTRY_MISSING reconciliation — broker working vs IEA registry, NOT journal.</summary>
+    /// Used for legacy displays — prefer <see cref="GetMismatchTrustedWorkingCount"/> for broker-vs-IEA assembly.</summary>
     internal int GetOwnedPlusAdoptedWorkingCount() =>
         _orderRegistry.GetOwnedPlusAdoptedWorkingCount();
+
+    /// <summary>OWNED + ADOPTED + RECOVERABLE_ROBOT_OWNED live orders — single source for mismatch assembly.</summary>
+    internal int GetMismatchTrustedWorkingCount() =>
+        _orderRegistry.GetMismatchTrustedWorkingCount();
+
+    /// <summary>Intent ids with mismatch-trusted working rows — used to scope release-blocking adoption noise when broker is non-flat.</summary>
+    internal HashSet<string> GetMismatchTrustedWorkingIntentIds() =>
+        _orderRegistry.GetMismatchTrustedWorkingIntentIds();
 
     /// <summary>Try resolve by broker order id first (canonical path).</summary>
     internal bool TryResolveByBrokerOrderId(string brokerOrderId, out OrderRegistryEntry? entry) =>
@@ -159,6 +169,8 @@ public sealed partial class InstrumentExecutionAuthority
         if (!TryResolveByBrokerOrderId(brokerOrderId, out var entry)) return;
 
         var prev = entry!.LifecycleState;
+        if (prev == newState)
+            return;
         if (!_orderRegistry.UpdateLifecycle(brokerOrderId, newState, utcNow))
         {
             _orderRegistry.IncrementIntegrityFailure();
@@ -183,6 +195,7 @@ public sealed partial class InstrumentExecutionAuthority
             ownership_status = entry.OwnershipStatus.ToString(),
             iea_instance_id = InstanceId
         }));
+        NotifyReleaseSuppressionActivity();
     }
 
     /// <summary>Add alias for an existing registry entry (e.g. when adopting).</summary>
@@ -252,5 +265,30 @@ public sealed partial class InstrumentExecutionAuthority
             source_context = sourceContext,
             iea_instance_id = InstanceId
         }));
+
+        if (orderRole == OrderRole.ENTRY)
+            ReconstructIntentLifecycleAfterEntryAdoption(intentId, instrument ?? "", orderInfo, utcNow);
+
+        var brokerEv = orderInfo.BrokerLastEventUtc ?? orderInfo.EntryFillTime;
+        long delayMs = 0;
+        if (brokerEv.HasValue)
+            delayMs = (long)Math.Max(0, (utcNow - brokerEv.Value).TotalMilliseconds);
+        Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument ?? "", "ADOPTION_TIMING_AUDIT",
+            new
+            {
+                timestamp_utc = utcNow.ToString("o"),
+                intent_id = intentId,
+                instrument,
+                broker_order_id = brokerOrderId,
+                order_role = orderRole.ToString(),
+                broker_event_time = brokerEv.HasValue ? brokerEv.Value.ToString("o") : null,
+                registry_created_time = utcNow.ToString("o"),
+                adoption_attempt_time = utcNow.ToString("o"),
+                adoption_success_time = utcNow.ToString("o"),
+                delay_ms = delayMs,
+                filled_qty = orderInfo.FilledQuantity,
+                note = "Synchronous RegisterAdoptedOrder; broker_event_time from OrderInfo.BrokerLastEventUtc or EntryFillTime when set"
+            }));
+        NotifyReleaseSuppressionActivity();
     }
 }

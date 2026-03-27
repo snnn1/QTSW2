@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -42,7 +44,7 @@ public static class ReconciliationIeaLookup
             ExecutionInstrumentResolver.IsSameInstrument(hintNorm, brokerInstrument) &&
             InstrumentExecutionAuthorityRegistry.TryGet(account, hintNorm, out var hintIea))
         {
-            if (brokerWorking == 0 || hintIea!.GetOwnedPlusAdoptedWorkingCount() > 0)
+            if (brokerWorking == 0 || hintIea!.GetMismatchTrustedWorkingCount() > 0)
             {
                 iea = hintIea;
                 return true;
@@ -57,7 +59,7 @@ public static class ReconciliationIeaLookup
         {
             if (iea == null || IsBetterReconciliationCandidate(direct, iea, brokerWorking))
                 iea = direct;
-            if (brokerWorking == 0 || iea!.GetOwnedPlusAdoptedWorkingCount() > 0)
+            if (brokerWorking == 0 || iea!.GetMismatchTrustedWorkingCount() > 0)
                 return true;
         }
 
@@ -84,14 +86,73 @@ public static class ReconciliationIeaLookup
     }
 
     /// <summary>
+    /// Mismatch assembly: resolve IEA for broker instrument; sets <paramref name="ownershipAmbiguous"/> when multiple IEAs
+    /// tie on mismatch-trusted distance to <paramref name="brokerWorking"/> (cross-IEA risk).
+    /// </summary>
+    public static bool TryResolveForMismatchAssembly(
+        string account,
+        string brokerInstrument,
+        int brokerWorking,
+        Func<string?> getExecutionInstrumentHint,
+        out InstrumentExecutionAuthority? iea,
+        out bool ownershipAmbiguous)
+    {
+        ownershipAmbiguous = false;
+        iea = null;
+        brokerInstrument = brokerInstrument?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(account) || string.IsNullOrEmpty(brokerInstrument))
+            return false;
+
+        var candidates = new List<InstrumentExecutionAuthority>();
+        foreach (var x in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(x.ExecutionInstrumentKey, brokerInstrument))
+                candidates.Add(x);
+        }
+
+        if (candidates.Count == 0)
+            return TryResolve(account, brokerInstrument, brokerWorking, getExecutionInstrumentHint, out iea) && iea != null;
+
+        if (candidates.Count == 1)
+        {
+            iea = candidates[0];
+            return true;
+        }
+
+        var scored = candidates
+            .Select(x => (iea: x, dist: Math.Abs(x.GetMismatchTrustedWorkingCount() - brokerWorking)))
+            .ToList();
+        var minDist = scored.Min(s => s.dist);
+        var tied = scored.Where(s => s.dist == minDist).Select(s => s.iea).ToList();
+        if (tied.Count > 1 && brokerWorking > 0)
+            ownershipAmbiguous = true;
+
+        var hint = getExecutionInstrumentHint?.Invoke()?.Trim();
+        if (!string.IsNullOrEmpty(hint))
+        {
+            var hintNorm = hint.ToUpperInvariant();
+            var byHint = candidates.FirstOrDefault(c =>
+                string.Equals(c.ExecutionInstrumentKey, hintNorm, StringComparison.OrdinalIgnoreCase));
+            if (byHint != null && (!ownershipAmbiguous || tied.Contains(byHint)))
+            {
+                iea = byHint;
+                return true;
+            }
+        }
+
+        iea = tied[0];
+        return iea != null;
+    }
+
+    /// <summary>
     /// Prefer <paramref name="candidate"/> over <paramref name="current"/> when its owned+adopted working count
     /// is closer to <paramref name="brokerWorking"/> (broker truth). On tie distance, prefer fewer local orders
     /// (less likely stale accumulation). Avoids selecting an IEA solely because it has more registry rows.
     /// </summary>
     internal static bool IsBetterReconciliationCandidate(InstrumentExecutionAuthority candidate, InstrumentExecutionAuthority current, int brokerWorking)
     {
-        var cc = candidate.GetOwnedPlusAdoptedWorkingCount();
-        var cur = current.GetOwnedPlusAdoptedWorkingCount();
+        var cc = candidate.GetMismatchTrustedWorkingCount();
+        var cur = current.GetMismatchTrustedWorkingCount();
         return IsBetterCountTowardsBroker(cc, cur, brokerWorking);
     }
 

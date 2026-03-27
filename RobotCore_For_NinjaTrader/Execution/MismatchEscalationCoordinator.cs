@@ -28,11 +28,20 @@ public sealed class MismatchEscalationCoordinator
     private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly Func<string, DateTimeOffset, GateReconciliationResult?>? _runInstrumentGateReconciliation;
     private readonly Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? _evaluateReleaseReadiness;
+    private readonly Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? _runForcedBrokerAlignment;
+    private readonly Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>?
+        _onForcedConvergenceFailure;
     private readonly int _stableWindowMs;
     private readonly Timer _auditTimer;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
+    private ulong _nextConvergenceEpisodeId;
 
     private readonly ConcurrentDictionary<string, MismatchInstrumentState> _stateByInstrument = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Coalesce identical gate telemetry when expensive reconciliation is skipped (same signatures + skip reason).</summary>
+    private readonly Dictionary<string, (int Hash, DateTimeOffset Utc)> _quietGateTelemetry = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int QuietGateTelemetrySeconds = 30;
 
     private int _mismatchDetectedCount;
     private int _mismatchPersistentCount;
@@ -70,7 +79,10 @@ public sealed class MismatchEscalationCoordinator
         Func<string, DateTimeOffset, GateReconciliationResult?>? runInstrumentGateReconciliation = null,
         Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? evaluateReleaseReadiness = null,
         int stateConsistencyStableWindowMs = 0,
-        RuntimeAuditHub? runtimeAudit = null)
+        RuntimeAuditHub? runtimeAudit = null,
+        Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? runForcedBrokerAlignment = null,
+        Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? onForcedConvergenceFailure =
+            null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -83,6 +95,8 @@ public sealed class MismatchEscalationCoordinator
         _runtimeAudit = runtimeAudit;
         _runInstrumentGateReconciliation = runInstrumentGateReconciliation;
         _evaluateReleaseReadiness = evaluateReleaseReadiness;
+        _runForcedBrokerAlignment = runForcedBrokerAlignment;
+        _onForcedConvergenceFailure = onForcedConvergenceFailure;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
             ? stateConsistencyStableWindowMs
             : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
@@ -289,6 +303,11 @@ public sealed class MismatchEscalationCoordinator
             state.FirstConsistentUtc = default;
             state.LastConsistentUtc = default;
             state.GateProgress.Reset();
+            state.ConvergenceEpisode.Clear();
+            state.ReconciliationHysteresisUntilUtc = default;
+            state.HysteresisMismatchTypeAtFreeze = null;
+            state.PostForcedConvergenceFingerprint = 0;
+            state.ForcedConvergenceSucceeded = false;
             _mismatchDetectedCount++;
             IncrementTypeMetric(obs.MismatchType);
             var detectedPayload = ToGatePayload(state, inst, utcNow, obs, null, null);
@@ -297,6 +316,10 @@ public sealed class MismatchEscalationCoordinator
             var gatePayload = ToGatePayload(state, inst, utcNow, obs, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_ENGAGED", gatePayload));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_ENGAGED", utcNow, gatePayload, "WARN");
+            var tsv = StateConsistencyAuditFormat.BuildFourStateTsvLine(utcNow, inst, obs, state.MismatchType);
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_FOUR_STATE_TSV",
+                new { four_state_tsv = tsv, note = "Tab-separated; columns match STATE_CONSISTENCY_GATE audit spec" }));
+            EmitCanonical(inst, "STATE_CONSISTENCY_GATE_FOUR_STATE_TSV", utcNow, new { four_state_tsv = tsv }, "INFO");
             return;
         }
 
@@ -351,6 +374,8 @@ public sealed class MismatchEscalationCoordinator
 
         var obsForSig = CoalesceGateObservation(inst, state, latestObs, utcNow);
         var gp = state.GateProgress;
+
+        EnsureConvergenceEpisodeStarted(state, obsForSig, utcNow);
 
         if (gp.ProgressHardStopped && utcNow >= gp.ProgressHardStopUntilUtc)
         {
@@ -466,12 +491,28 @@ public sealed class MismatchEscalationCoordinator
                              MismatchEscalationPolicy.GATE_REENTRY_BLOCK_MS;
         var reentrySkip = reentryLoopNested || reentryTooSoon;
 
-        var skipExpensive = throttleScheduleSkip || hardStopSkip || executionCycleCapReached || reentrySkip;
+        var hysteresisSkip = state.ReconciliationHysteresisUntilUtc != default &&
+                             utcNow < state.ReconciliationHysteresisUntilUtc &&
+                             state.HysteresisMismatchTypeAtFreeze.HasValue &&
+                             state.HysteresisMismatchTypeAtFreeze.Value == obsForSig.MismatchType;
+
+        var postAlignmentStallSkip = state.ForcedConvergenceSucceeded &&
+                                     state.PostForcedConvergenceFingerprint != 0 &&
+                                     fpNow == state.PostForcedConvergenceFingerprint;
+
+        var antiOscillationSkip = hysteresisSkip || postAlignmentStallSkip;
+
+        var skipExpensive = throttleScheduleSkip || hardStopSkip || executionCycleCapReached || reentrySkip ||
+                            antiOscillationSkip;
 
         string? skipReason = null;
         if (skipExpensive)
         {
-            if (reentryLoopNested || reentryTooSoon)
+            if (postAlignmentStallSkip)
+                skipReason = "post_alignment_stall";
+            else if (hysteresisSkip)
+                skipReason = "reconciliation_hysteresis";
+            else if (reentryLoopNested || reentryTooSoon)
                 skipReason = "reentry_loop_blocked";
             else if (hardStopSkip)
                 skipReason = gp.TotalExpensiveSinceGateEngaged >=
@@ -494,6 +535,12 @@ public sealed class MismatchEscalationCoordinator
         GateReconciliationResult? recon = null;
         if (!skipExpensive)
         {
+            {
+                var epRun = state.ConvergenceEpisode;
+                epRun.LastActionAttempted = "gate_recovery_runner_and_adoption_scan";
+                epRun.AttemptCount++;
+            }
+
             try
             {
                 gp.InReconciliationLoop = true;
@@ -524,16 +571,21 @@ public sealed class MismatchEscalationCoordinator
         }
 
         StateConsistencyReleaseReadinessResult readiness;
-        try
+        if (skipExpensive)
+            readiness = readinessProbe;
+        else
         {
-            readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
-                        ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
-        }
-        catch (Exception ex)
-        {
-            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
-                new { error = ex.Message, context = "evaluateReleaseReadiness", instrument = inst }));
-            readiness = StateConsistencyReleaseEvaluator.Indeterminate(inst, "evaluate_exception");
+            try
+            {
+                readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
+                            ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "evaluateReleaseReadiness", instrument = inst }));
+                readiness = StateConsistencyReleaseEvaluator.Indeterminate(inst, "evaluate_exception");
+            }
         }
 
         if (recon != null)
@@ -571,10 +623,108 @@ public sealed class MismatchEscalationCoordinator
             HardStopActive: hardStopActive,
             TotalExpensiveSinceGateEngaged: gp.TotalExpensiveSinceGateEngaged);
 
+        var preSigHash = GateProgressEvaluator.ComputeSignatureHash32(sigProbe);
+        var postSig = sigAfterNullable ?? sigProbe;
+        var postSigHash = GateProgressEvaluator.ComputeSignatureHash32(postSig);
+        var progressChanged = preSigHash != postSigHash;
+        var progressChangeType = skipExpensive
+            ? $"skip:{skipReason ?? "unspecified"}"
+            : StateConsistencyAuditFormat.DescribeProgressChange(sigProbe, postSig);
+
+        var suppressQuietGateTelemetry = false;
+        if (skipExpensive && !progressChanged)
+        {
+            var quietHash = unchecked((((StringComparer.OrdinalIgnoreCase.GetHashCode(inst) * 397) ^ preSigHash) * 397 ^ postSigHash) * 397 ^
+                                      (skipReason != null ? StringComparer.Ordinal.GetHashCode(skipReason) : 0));
+            if (_quietGateTelemetry.TryGetValue(inst, out var prevQuiet) && prevQuiet.Hash == quietHash &&
+                (utcNow - prevQuiet.Utc).TotalSeconds < QuietGateTelemetrySeconds)
+                suppressQuietGateTelemetry = true;
+            else
+                _quietGateTelemetry[inst] = (quietHash, utcNow);
+        }
+
+        if (!suppressQuietGateTelemetry)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_PROGRESS_DELTA",
+                new
+                {
+                    timestamp_utc = utcNow.ToString("o"),
+                    instrument = inst,
+                    intent_id = obsForSig.IntentIdsCsv ?? "",
+                    pre_state_hash = preSigHash,
+                    post_state_hash = postSigHash,
+                    state_changed = progressChanged,
+                    change_type = progressChangeType,
+                    expensive_invoked = !skipExpensive
+                }));
+            EmitCanonical(inst, "RECONCILIATION_PROGRESS_DELTA", utcNow,
+                new
+                {
+                    pre_state_hash = preSigHash,
+                    post_state_hash = postSigHash,
+                    state_changed = progressChanged,
+                    change_type = progressChangeType
+                }, "INFO");
+        }
+
+        var attemptSuccess = !skipExpensive && recon != null &&
+                             recon.OutcomeStatus == ReconciliationOutcomeStatus.Success;
+        string? failReason = skipExpensive
+            ? skipReason
+            : recon?.Reason;
+        if (!skipExpensive && recon != null && recon.OutcomeStatus != ReconciliationOutcomeStatus.Success)
+            failReason = string.IsNullOrEmpty(failReason) ? recon.OutcomeStatus.ToString() : failReason;
+        if (!suppressQuietGateTelemetry)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_ATTEMPT_AUDIT",
+                new
+                {
+                    timestamp_utc = utcNow.ToString("o"),
+                    instrument = inst,
+                    intent_id = obsForSig.IntentIdsCsv ?? "",
+                    mismatch_detected_type = state.MismatchType.ToString(),
+                    action_attempted = skipExpensive ? "skip_expensive_reconciliation" : "gate_recovery_runner_and_adoption_scan",
+                    target_layer = skipExpensive ? "n/a" : "registry+journal_via_runner",
+                    expected_result = "converge_working_counts_or_release_ready",
+                    actual_result = skipExpensive
+                        ? "not_run"
+                        : (recon?.OutcomeStatus.ToString() ?? "null_recon"),
+                    success = attemptSuccess,
+                    reason_if_failed = attemptSuccess ? null : failReason,
+                    gate_phase = state.GateLifecyclePhase.ToString(),
+                    broker_working_before = recon?.BrokerWorkingCountBefore,
+                    broker_working_after = recon?.BrokerWorkingCountAfter,
+                    iea_owned_after = recon?.IeaOwnedCountAfter
+                }));
+            EmitCanonical(inst, "RECONCILIATION_ATTEMPT_AUDIT", utcNow,
+                new
+                {
+                    action_attempted = skipExpensive ? "skip" : "gate_recovery",
+                    success = attemptSuccess
+                }, !attemptSuccess && !skipExpensive ? "WARN" : "INFO");
+        }
+
+        if (!skipExpensive)
+        {
+            var ep = state.ConvergenceEpisode;
+            if (progressChanged)
+            {
+                ep.NoProgressStreak = 0;
+                ep.LastProgressUtc = utcNow;
+            }
+            else
+                ep.NoProgressStreak++;
+        }
+
+        TryInvokeForcedConvergenceIfLimitsExceeded(inst, state, gp, obsForSig, utcNow, fpNow);
+
         var resultPayload = ToGatePayloadWithResultTelemetry(state, inst, utcNow, obsForSig, recon, readiness, skipExpensive,
             resultTelemetry);
-        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", resultPayload));
-        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", utcNow, resultPayload, "INFO");
+        if (!suppressQuietGateTelemetry)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", resultPayload));
+            EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", utcNow, resultPayload, "INFO");
+        }
 
         if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED ||
             state.GateLifecyclePhase == GateLifecyclePhase.FailClosed)
@@ -632,6 +782,11 @@ public sealed class MismatchEscalationCoordinator
         state.ConsecutiveCleanPassCount = 0;
         state.MismatchStillPresent = false;
         state.GateProgress.Reset();
+        state.ConvergenceEpisode.Clear();
+        state.ReconciliationHysteresisUntilUtc = default;
+        state.HysteresisMismatchTypeAtFreeze = null;
+        state.PostForcedConvergenceFingerprint = 0;
+        state.ForcedConvergenceSucceeded = false;
         _mismatchClearedCount++;
 
         var releasedPayload = new
@@ -1025,6 +1180,108 @@ public sealed class MismatchEscalationCoordinator
         gp.ThrottleBaselineLocalWorking = lw;
         gp.ThrottleBaselineMismatchType = mt;
         gp.ThrottleBaselineInitialized = true;
+    }
+
+    private void EnsureConvergenceEpisodeStarted(MismatchInstrumentState state, MismatchObservation obs, DateTimeOffset utcNow)
+    {
+        if (state.GateLifecyclePhase == GateLifecyclePhase.None)
+            return;
+        var key = obs.IntentIdsCsv ?? "";
+        var ep = state.ConvergenceEpisode;
+        if (ep.EpisodeId == 0)
+        {
+            ep.StartNew(++_nextConvergenceEpisodeId, utcNow, key);
+            return;
+        }
+
+        if (!string.Equals(ep.EpisodeIntentKey, key, StringComparison.Ordinal))
+            ep.StartNew(++_nextConvergenceEpisodeId, utcNow, key);
+    }
+
+    private void TryInvokeForcedConvergenceIfLimitsExceeded(
+        string inst,
+        MismatchInstrumentState state,
+        GateReconciliationProgressState gp,
+        MismatchObservation obsForSig,
+        DateTimeOffset utcNow,
+        ulong fpNow)
+    {
+        if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED)
+            return;
+        if (state.GateLifecyclePhase == GateLifecyclePhase.None)
+            return;
+        var ep = state.ConvergenceEpisode;
+        if (ep.EpisodeId == 0)
+            return;
+
+        var durationMs = ep.FirstSeenUtc != default
+            ? (utcNow - ep.FirstSeenUtc).TotalMilliseconds
+            : 0;
+        string? limitReason = null;
+        if (ep.AttemptCount >= MismatchEscalationPolicy.RECONCILIATION_CONVERGENCE_MAX_ATTEMPTS)
+            limitReason = "max_attempts";
+        else if (ep.NoProgressStreak >= MismatchEscalationPolicy.RECONCILIATION_CONVERGENCE_MAX_NO_PROGRESS)
+            limitReason = "no_progress";
+        else if (durationMs >= MismatchEscalationPolicy.RECONCILIATION_CONVERGENCE_MAX_DURATION_MS)
+            limitReason = "timeout";
+
+        if (limitReason == null)
+            return;
+
+        var ctx = new ReconciliationForcedConvergenceContext
+        {
+            Instrument = inst,
+            IntentIdsCsv = obsForSig.IntentIdsCsv,
+            LimitReason = limitReason,
+            Attempts = ep.AttemptCount,
+            NoProgressCount = ep.NoProgressStreak
+        };
+
+        var result = _runForcedBrokerAlignment?.Invoke(ctx) ?? ReconciliationForcedConvergenceResult.NoHandler();
+
+        var eventPayload = new
+        {
+            instrument = inst,
+            intent_id = obsForSig.IntentIdsCsv ?? "",
+            reason = limitReason,
+            attempts = ep.AttemptCount,
+            no_progress_count = ep.NoProgressStreak,
+            final_action = "broker_alignment",
+            aligned = result.AlignedWithBroker,
+            failure_reason = result.FailureReason
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_FORCED_CONVERGENCE", eventPayload));
+        EmitCanonical(inst, "RECONCILIATION_FORCED_CONVERGENCE", utcNow, eventPayload,
+            result.AlignedWithBroker ? "WARN" : "CRITICAL");
+
+        if (result.AlignedWithBroker)
+        {
+            ep.StartNew(++_nextConvergenceEpisodeId, utcNow, obsForSig.IntentIdsCsv);
+            state.ForcedConvergenceSucceeded = true;
+            state.PostForcedConvergenceFingerprint = result.PostAlignmentFingerprint != 0
+                ? result.PostAlignmentFingerprint
+                : fpNow;
+            state.ReconciliationHysteresisUntilUtc =
+                utcNow.AddMilliseconds(MismatchEscalationPolicy.RECONCILIATION_CONVERGENCE_HYSTERESIS_MS);
+            state.HysteresisMismatchTypeAtFreeze = state.MismatchType;
+            ResetGateThrottle(gp);
+            gp.LastExternalFingerprint = fpNow;
+            return;
+        }
+
+        state.EscalationState = MismatchEscalationState.FAIL_CLOSED;
+        state.GateLifecyclePhase = GateLifecyclePhase.FailClosed;
+        state.Blocked = true;
+        state.BlockReason = string.IsNullOrEmpty(result.FailureReason)
+            ? MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH
+            : $"FORCED_CONVERGENCE:{result.FailureReason}";
+        _mismatchFailClosedCount++;
+        var failPayload = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_FAIL_CLOSED", failPayload));
+        EmitCanonical(inst, ExecutionEventTypes.MISMATCH_FAIL_CLOSED, utcNow, failPayload, "CRITICAL");
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", failPayload));
+        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", utcNow, failPayload, "CRITICAL");
+        _onForcedConvergenceFailure?.Invoke(inst, ctx, result);
     }
 
     private void IncrementTypeMetric(MismatchType type)

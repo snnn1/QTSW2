@@ -20,6 +20,14 @@ namespace QTSW2.Robot.Core.Execution;
 public sealed partial class InstrumentExecutionAuthority
 {
     private static int _instanceCounter;
+    private static Action? _releaseSuppressionActivityNotify;
+
+    /// <summary>Bumps release-readiness redundancy suppression activity (RobotEngine wires <see cref="ReleaseReconciliationRedundancySuppression.NotifyExecutionActivity"/>).</summary>
+    public static void SetReleaseSuppressionActivityNotify(Action? notify) =>
+        _releaseSuppressionActivityNotify = notify;
+
+    private static void NotifyReleaseSuppressionActivity() => _releaseSuppressionActivityNotify?.Invoke();
+
     private readonly int _instanceId;
 
     /// <summary>Per-instrument execution queue. Serializes fills, BE, bracket mutations.</summary>
@@ -111,7 +119,7 @@ public sealed partial class InstrumentExecutionAuthority
     public string ExecutionInstrumentKey { get; }
 
     /// <summary>Order executor for NT operations (adapter implements). Rebound on strategy restart — see <see cref="RebindExecutor"/>.</summary>
-    private IIEAOrderExecutor? _executor;
+    private volatile IIEAOrderExecutor? _executor;
 
     internal IIEAOrderExecutor? Executor => _executor;
 
@@ -426,7 +434,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Gap 2: Enqueue order update for serialized processing. Uses EnqueueRecoveryEssential so order state changes are processed during recovery (registry lifecycle).</summary>
     internal void EnqueueOrderUpdate(object order, object orderUpdate)
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
         var o = order;
         var ou = orderUpdate;
         EnqueueRecoveryEssential(() => Executor.ProcessOrderUpdate(o, ou), "OrderUpdate");
@@ -436,7 +445,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="workKind">Semantic label for <c>IEA_HEARTBEAT.current_command_type</c> and stall diagnostics (e.g. ExecutionUpdate, OrderUpdate).</param>
     internal void EnqueueRecoveryEssential(Action work, string workKind = "RecoveryWork")
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
         EnqueueCore(work, workKind);
     }
 
@@ -444,7 +454,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="workKind">Semantic label for heartbeat / stall diagnostics.</param>
     internal void Enqueue(Action work, string workKind = "NormalWork")
     {
-        if (Executor == null) return;
+        if (Executor == null)
+            return;
 #if NINJATRADER
         if (IsInRecovery)
         {
@@ -532,7 +543,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// <param name="context">Optional caller context for IEA_ENQUEUE_AND_WAIT_TIMING diagnostics.</param>
     internal (bool success, T? result) EnqueueAndWait<T>(Func<T> work, int timeoutMs = 5000, string? context = null)
     {
-        if (Executor == null) return (false, default);
+        if (Executor == null)
+            return (false, default);
         if (!_workerRunning) return (false, default);
 
 #if NINJATRADER
@@ -687,10 +699,15 @@ public sealed partial class InstrumentExecutionAuthority
         TryExpireCooldown(ExecutionInstrumentKey, now);
         EmitSupervisoryMetrics(now);
 #endif
-        // Phase 2: Registry cleanup and integrity verification
-        var activeIntentIds = Executor != null
-            ? new HashSet<string>(Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey).Select(x => x.intentId), StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Phase 2: Registry cleanup — match protective audit: BE actives ∪ adoption candidates (instrument scope)
+        var activeIntentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (Executor != null)
+        {
+            foreach (var x in Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey))
+                activeIntentIds.Add(x.intentId);
+            foreach (var id in Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey))
+                activeIntentIds.Add(id);
+        }
         RunRegistryCleanup(now, id => activeIntentIds.Contains(id));
         VerifyRegistryIntegrity(now);
         EmitRegistryMetrics(now);

@@ -1,0 +1,117 @@
+{
+  "schema": "qtsw2.execution_policy",
+  "use_instrument_execution_authority": true,
+  "disable_canonical_market_lock": true,
+  "aggregation": {
+    "bracket_policy": {
+      "stop": "TIGHTEST",
+      "target": "TIGHTEST"
+    },
+    "require_identical_bracket": true,
+    "bracket_tolerance_ticks": 1
+  },
+  "break_even": {
+    "trigger_policy": "FIRST_TO_TRIGGER",
+    "stop_price_policy": "TIGHTEST"
+  },
+  "canonical_markets": {
+    "ES": {
+      "execution_instruments": {
+        "ES": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "MES": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    },
+    "NQ": {
+      "execution_instruments": {
+        "NQ": {
+          "enabled": true,
+          "base_size": 1,
+          "max_size": 1
+        },
+        "MNQ": {
+          "enabled": false,
+          "base_size": 1,
+          "max_size": 1
+        }
+      }
+    },
+    "YM": {
+      "execution_instruments": {
+        "YM": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "MYM": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    },
+    "RTY": {
+      "execution_instruments": {
+        "RTY": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "M2K": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    },
+    "CL": {
+      "execution_instruments": {
+        "CL": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "MCL": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    },
+    "GC": {
+      "execution_instruments": {
+        "GC": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "MGC": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    },
+    "NG": {
+      "execution_instruments": {
+        "NG": {
+          "enabled": true,
+          "base_size": 2,
+          "max_size": 2
+        },
+        "MNG": {
+          "enabled": false,
+          "base_size": 2,
+          "max_size": 2
+        }
+      }
+    }
+  }
+}

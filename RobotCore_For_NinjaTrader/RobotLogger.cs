@@ -351,13 +351,16 @@ public sealed class RobotLogger
                 tradingDate = tdStr;
         }
 
-        // Include additional context fields in data (but exclude standardized top-level fields)
+        // Include additional context fields in data (but exclude standardized top-level fields).
+        // intent_id MUST be preserved: ExecutionBase puts it at dict top-level (not inside extra),
+        // and RobotLogEvent has no intent_id property — excluding it dropped PROTECTIVE_ORDERS_SUBMITTED
+        // correlation and caused false "unprotected" in the watchdog.
         foreach (var kvp in dict)
         {
             if (kvp.Key != "ts_utc" && kvp.Key != "ts_chicago" && kvp.Key != "event_type" && 
                 kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream" &&
                 kvp.Key != "trading_date" && kvp.Key != "session" && kvp.Key != "slot_time_chicago" &&
-                kvp.Key != "slot_time_utc" && kvp.Key != "state" && kvp.Key != "intent_id")
+                kvp.Key != "slot_time_utc" && kvp.Key != "state")
             {
                 data[kvp.Key] = kvp.Value;
             }

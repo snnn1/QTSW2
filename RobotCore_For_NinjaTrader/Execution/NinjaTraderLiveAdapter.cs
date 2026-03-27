@@ -340,6 +340,11 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
         // LIVE adapter: No IEA, no-op
     }
 
+    public void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        // LIVE adapter: No IEA registry sync on this path
+    }
+
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
     {
         return Array.Empty<string>();

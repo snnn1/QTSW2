@@ -122,6 +122,8 @@ public sealed class OrderRegistry
             entry = e;
         if (entry == null) return true; // not found, no validation
         var current = entry.LifecycleState;
+        if (current == newState)
+            return true;
         if (!ValidateLifecycleTransition(current, newState))
             return false;
         entry.LifecycleState = newState;
@@ -159,6 +161,47 @@ public sealed class OrderRegistry
                 count++;
         }
         return count;
+    }
+
+    /// <summary>
+    /// Trusted working count for mismatch assembly: OWNED + ADOPTED + <see cref="OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED"/>.
+    /// </summary>
+    public int GetMismatchTrustedWorkingCount()
+    {
+        var entries = _byBrokerOrderId.Values;
+        var count = 0;
+        foreach (var e in entries)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                continue;
+            if (e.LifecycleState == OrderLifecycleState.SUBMITTED || e.LifecycleState == OrderLifecycleState.WORKING || e.LifecycleState == OrderLifecycleState.PART_FILLED)
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Intent ids for mismatch-trusted live orders (owned/adopted/recoverable, non-terminal), for release-time journal/adoption filtering.
+    /// </summary>
+    public HashSet<string> GetMismatchTrustedWorkingIntentIds()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in _byBrokerOrderId.Values)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                continue;
+            if (e.LifecycleState != OrderLifecycleState.SUBMITTED &&
+                e.LifecycleState != OrderLifecycleState.WORKING &&
+                e.LifecycleState != OrderLifecycleState.PART_FILLED)
+                continue;
+            if (!string.IsNullOrWhiteSpace(e.IntentId))
+                set.Add(e.IntentId);
+        }
+        return set;
     }
 
     /// <summary>Phase 2: Remove terminal entries older than retention cutoff. Returns count removed.</summary>

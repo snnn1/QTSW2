@@ -262,7 +262,9 @@ public sealed partial class InstrumentExecutionAuthority
         if (CurrentRecoveryState != RecoveryState.RESOLVED) return false;
         if (_bootstrapSnapshotStale) return false;
         if (_flattenLatchByInstrument.ContainsKey(instrument)) return false;
-        var workingUnowned = _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING && e.OwnershipStatus == OrderOwnershipStatus.UNOWNED).ToList();
+        var workingUnowned = _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING &&
+                                                                        (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED ||
+                                                                         e.OwnershipStatus == OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)).ToList();
         if (workingUnowned.Count > 0) return false;
         return true;
     }

@@ -881,9 +881,14 @@ class EventProcessor:
             self._state_manager.record_protective_failure(timestamp_utc)
         
         elif event_type == "PROTECTIVE_ORDERS_SUBMITTED":
-            intent_id = data.get("intent_id")
+            intent_id = data.get("intent_id") or event.get("intent_id")
             if intent_id:
-                self._state_manager.record_protective_order_submitted(intent_id, timestamp_utc)
+                self._state_manager.record_protective_order_submitted(str(intent_id), timestamp_utc)
+        elif event_type == "PROTECTIVES_PLACED":
+            # Proof event logged immediately after PROTECTIVE_ORDERS_SUBMITTED; intent_id is in data.
+            intent_id = data.get("intent_id") or event.get("intent_id")
+            if intent_id:
+                self._state_manager.record_protective_order_submitted(str(intent_id), timestamp_utc)
         
         elif event_type == "INTENT_EXPOSURE_REGISTERED":
             intent_id = data.get("intent_id")

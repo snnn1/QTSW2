@@ -205,6 +205,28 @@ public static class OrderRegistryTests
         if (reg4.GetOwnedPlusAdoptedWorkingCount() != 1)
             return (false, $"Duplicate adoption: Register same broker id twice should overwrite, count=1, got {reg4.GetOwnedPlusAdoptedWorkingCount()}");
 
+        // 20. FILLED -> FILLED lifecycle update is idempotent (no invalid transition)
+        var reg5 = new OrderRegistry();
+        var fillOi = new MinimalOrderInfo { OrderId = "broker-fill-twice", Instrument = "MNQ" };
+        reg5.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "broker-fill-twice",
+            IntentId = "i-fill",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.WORKING,
+            CreatedUtc = utc,
+            OrderInfo = fillOi
+        });
+        reg5.UpdateLifecycle("broker-fill-twice", OrderLifecycleState.FILLED, utc.AddSeconds(1));
+        if (!reg5.TryResolveByBrokerOrderId("broker-fill-twice", out var fillEntry) || fillEntry == null || fillEntry.LifecycleState != OrderLifecycleState.FILLED)
+            return (false, "First FILLED transition failed");
+        if (!reg5.UpdateLifecycle("broker-fill-twice", OrderLifecycleState.FILLED, utc.AddSeconds(2)))
+            return (false, "Duplicate FILLED -> FILLED should be no-op success, not rejected");
+        if (!reg5.TryResolveByBrokerOrderId("broker-fill-twice", out fillEntry) || fillEntry == null || fillEntry.LifecycleState != OrderLifecycleState.FILLED)
+            return (false, "State should remain FILLED after duplicate update");
+
         return (true, null);
     }
 }

@@ -1360,6 +1360,24 @@ public sealed partial class NinjaTraderSimAdapter
                         current_instance_id = coordInst,
                         episode_id = pendingEpisodeId
                     }));
+                try
+                {
+                    var uDone = _executionJournal.CompleteOpenUntrackedFillRecoveryForInstrument(
+                        instrumentKey,
+                        string.IsNullOrEmpty(canonicalForKey) ? null : canonicalForKey,
+                        utcNow,
+                        CompletionReasons.UNTRACKED_FILL_RECOVERY_FLAT);
+                    if (uDone > 0)
+                    {
+                        _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_COMPLETED_VERIFY", "ENGINE",
+                            new { instrument = instrumentKey, count = uDone, correlation_id = correlationId }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_COMPLETE_ERROR", "ENGINE",
+                        new { instrument = instrumentKey, error = ex.Message, exception_type = ex.GetType().Name }));
+                }
                 toRemove.Add(instrumentKey);
                 continue;
             }
@@ -2562,7 +2580,8 @@ public sealed partial class NinjaTraderSimAdapter
             // Phase 2: Order update for order not in registry or OrderMap - manual/external order policy
             if (_useInstrumentExecutionAuthority && _iea != null && !_iea.TryResolveByBrokerOrderId(order.OrderId, out _))
             {
-                _iea.RegisterUnownedOrder(order.OrderId, intentId, instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", utcNow);
+                _iea.RegisterUnownedOrder(order.OrderId, intentId, instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", utcNow,
+                    classAsRecoverableRobotOwned: true);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "MANUAL_OR_EXTERNAL_ORDER_DETECTED", new
                 {
                     broker_order_id = order.OrderId,
@@ -3505,12 +3524,36 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "CRITICAL: Fill happened but can't be tracked. Flattening position immediately (fail-closed) to prevent unprotected accumulation.",
                     account_name = _iea?.AccountName
                 });
+
+            var brokerOrderIdUntracked = order.OrderId?.ToString() ?? "";
+            var untrackedFlattenCorrelationId = $"UNTrackED_FILL:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+            try
+            {
+                _executionJournal.UpsertUntrackedFillRecoveryJournal(
+                    instrument,
+                    brokerOrderIdUntracked,
+                    fillQuantity,
+                    fillPrice,
+                    utcNow,
+                    _useInstrumentExecutionAuthority && _ntActionQueue != null ? untrackedFlattenCorrelationId : null);
+            }
+            catch (Exception ex)
+            {
+                LogCriticalWithIeaContext(utcNow, "", instrument, "UNTRACKED_FILL_RECOVERY_JOURNAL_UPSERT_FAILED",
+                    new
+                    {
+                        error = ex.Message,
+                        exception_type = ex.GetType().Name,
+                        broker_order_id = brokerOrderIdUntracked,
+                        note = "Flatten still proceeds (fail-closed); reconciliation may be impaired until journal writable"
+                    });
+            }
             
             // CRITICAL: Flatten position immediately (fail-closed)
             // NT THREADING FIX: Worker MUST NOT call account.Flatten. Enqueue for strategy thread.
             if (_useInstrumentExecutionAuthority && _ntActionQueue != null)
             {
-                var cid = $"UNTrackED_FILL:{instrument}:{utcNow:yyyyMMddHHmmssfff}";
+                var cid = untrackedFlattenCorrelationId;
                 EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cid, null, instrument, "UNTrackED_FILL", utcNow,
                     DestructiveActionSource.FAIL_CLOSED, DestructiveTriggerReason.FAIL_CLOSED));
                 LogCriticalWithIeaContext(utcNow, "", instrument, "UNTrackED_FILL_FLATTEN_ENQUEUED",

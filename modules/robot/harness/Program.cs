@@ -24,6 +24,10 @@ static void PrintUsage()
     Console.WriteLine("  --log-dir DIR           Custom log directory (default: logs/robot/)");
     Console.WriteLine("  --timetable-path PATH   Custom timetable file path (default: data/timetable/timetable_current.json)");
     Console.WriteLine();
+    Console.WriteLine("Environment:");
+    Console.WriteLine("  QTSW2_EXECUTION_POLICY_PATH   Optional relative (to project root) or absolute path to execution_policy JSON.");
+    Console.WriteLine("                                For --replay with data/translated/<root>/ parquets, use configs/execution_policy_harness_root_symbols.json");
+    Console.WriteLine();
     Console.WriteLine("Notes:");
     Console.WriteLine("- Engine reads ONLY from:");
     Console.WriteLine("  configs/analyzer_robot_parity.json");

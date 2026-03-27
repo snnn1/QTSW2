@@ -25,6 +25,11 @@ public enum OrderOwnershipStatus
     OWNED,    // Submitted by current runtime
     ADOPTED,  // Discovered and intentionally taken over (e.g. restart protectives)
     UNOWNED,  // Known anomaly, not under robot ownership
+    /// <summary>
+    /// Robot-tagged broker order in registry but not yet promoted to ADOPTED (e.g. adoption pending, id remap).
+    /// Counted toward mismatch-assembly trusted working so ORDER_REGISTRY_MISSING_FAIL_CLOSED does not fire on recoverable drift alone.
+    /// </summary>
+    RECOVERABLE_ROBOT_OWNED,
     TERMINAL  // Completed/canceled/rejected, no longer live
 }
 

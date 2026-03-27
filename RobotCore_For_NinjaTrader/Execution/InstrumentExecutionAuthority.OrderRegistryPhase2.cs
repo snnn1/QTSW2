@@ -19,24 +19,31 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Phase 2: Terminal order retention window (minutes). Default 10.</summary>
     private const int TerminalRetentionMinutes = 10;
 
-    /// <summary>Phase 2: Register an unowned order (manual/external). Classifies as UNOWNED.</summary>
+    /// <summary>Phase 2: Register an unowned order (manual/external). Default UNOWNED; robot-recoverable paths may use RECOVERABLE_ROBOT_OWNED.</summary>
     /// <param name="isEntryOrder">True when order is an entry order from adoption path — enables fill journaling.</param>
+    /// <param name="classAsRecoverableRobotOwned">When true, ownership is RECOVERABLE_ROBOT_OWNED (robot-tagged / adoption-pending — counts toward mismatch-trusted working).</param>
     internal void RegisterUnownedOrder(
         string brokerOrderId,
         string? intentId,
         string instrument,
         string? sourceContext,
         DateTimeOffset utcNow,
-        bool isEntryOrder = false)
+        bool isEntryOrder = false,
+        bool classAsRecoverableRobotOwned = false)
     {
         if (string.IsNullOrEmpty(brokerOrderId)) return;
+
+        var ownership = classAsRecoverableRobotOwned
+            ? OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED
+            : OrderOwnershipStatus.UNOWNED;
+        var stateLabel = classAsRecoverableRobotOwned ? "RECOVERABLE_ROBOT_OWNED" : "UNOWNED";
 
         var orderInfo = new OrderInfo
         {
             OrderId = brokerOrderId,
             Instrument = instrument ?? "",
             OrderType = "UNKNOWN",
-            State = "UNOWNED",
+            State = stateLabel,
             IsEntryOrder = isEntryOrder,
             Quantity = 0,
             FilledQuantity = 0
@@ -49,7 +56,7 @@ public sealed partial class InstrumentExecutionAuthority
             Instrument = instrument ?? "",
             Stream = null,
             OrderRole = OrderRole.EXTERNAL,
-            OwnershipStatus = OrderOwnershipStatus.UNOWNED,
+            OwnershipStatus = ownership,
             LifecycleState = OrderLifecycleState.WORKING,
             SourceContext = sourceContext ?? "MANUAL_OR_EXTERNAL",
             CreatedUtc = utcNow,
@@ -58,7 +65,8 @@ public sealed partial class InstrumentExecutionAuthority
         };
 
         _orderRegistry.Register(entry);
-        _orderRegistry.IncrementUnownedDetected();
+        if (!classAsRecoverableRobotOwned)
+            _orderRegistry.IncrementUnownedDetected();
 
         if (!string.IsNullOrEmpty(intentId))
             SharedAdoptedOrderRegistry.Register(brokerOrderId, intentId, instrument ?? "", null, null, isEntryOrder);
@@ -68,10 +76,112 @@ public sealed partial class InstrumentExecutionAuthority
             broker_order_id = brokerOrderId,
             intent_id = intentId,
             instrument,
-            ownership_status = OrderOwnershipStatus.UNOWNED.ToString(),
+            ownership_status = ownership.ToString(),
             source_context = sourceContext,
             iea_instance_id = InstanceId
         }));
+        if (classAsRecoverableRobotOwned)
+        {
+            Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "ORDER_REGISTRY_RECOVERABLE_UNOWNED_DETECTED", new
+            {
+                broker_order_id = brokerOrderId,
+                intent_id = intentId,
+                instrument,
+                source_context = sourceContext,
+                iea_instance_id = InstanceId,
+                note = "Classified recoverable robot-owned pending adoption / id remap"
+            }));
+        }
+
+        NotifyReleaseSuppressionActivity();
+    }
+
+    /// <summary>
+    /// Mismatch assembly ordering: reclassify UNOWNED→RECOVERABLE when snapshot shows QTSW2 tag; attempt pre-ack→post-ack alias link via OrderMap.
+    /// </summary>
+    internal void PrepareRegistryForMismatchAssemblyFromSnapshot(string instrument, AccountSnapshot? snap, DateTimeOffset utcNow)
+    {
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return;
+        var inst = instrument.Trim();
+        foreach (var w in snap.WorkingOrders)
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(inst, w.Instrument.Trim())) continue;
+            if (string.IsNullOrEmpty(w.OrderId)) continue;
+            if (!IsRobotTaggedWorkingSnapshot(w)) continue;
+
+            if (TryResolveByBrokerOrderId(w.OrderId, out var entry) && entry != null &&
+                entry.OwnershipStatus == OrderOwnershipStatus.UNOWNED &&
+                (entry.LifecycleState == OrderLifecycleState.WORKING ||
+                 entry.LifecycleState == OrderLifecycleState.SUBMITTED ||
+                 entry.LifecycleState == OrderLifecycleState.PART_FILLED))
+            {
+                entry.OwnershipStatus = OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED;
+                entry.OrderInfo.State = "RECOVERABLE_ROBOT_OWNED";
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, entry.IntentId ?? "", inst, "ORDER_REGISTRY_OWNERSHIP_RECLASSIFIED", new
+                {
+                    broker_order_id = w.OrderId,
+                    intent_id = entry.IntentId,
+                    instrument = inst,
+                    from_ownership = OrderOwnershipStatus.UNOWNED.ToString(),
+                    to_ownership = OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED.ToString(),
+                    iea_instance_id = InstanceId
+                }));
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, entry.IntentId ?? "", inst, "ORDER_REGISTRY_RECOVERABLE_UNOWNED_DETECTED", new
+                {
+                    broker_order_id = w.OrderId,
+                    tag = w.Tag,
+                    instrument = inst,
+                    iea_instance_id = InstanceId,
+                    note = "Reclassified from UNOWNED using broker snapshot tag"
+                }));
+                NotifyReleaseSuppressionActivity();
+            }
+
+            var tag = w.Tag ?? "";
+            if (!tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+            var parsed = RobotOrderIds.ParseTag(tag);
+            var baseIntent = parsed.IntentId ?? RobotOrderIds.DecodeIntentId(tag);
+            if (string.IsNullOrEmpty(baseIntent)) continue;
+            var leg = parsed.Leg == "STOP" || parsed.Leg == "TARGET" ? parsed.Leg : null;
+            TryLinkBrokerOrderIdAliasIfResolvable(w.OrderId, baseIntent, leg, inst, utcNow);
+        }
+    }
+
+    private static bool IsRobotTaggedWorkingSnapshot(WorkingOrderSnapshot w) =>
+        (!string.IsNullOrEmpty(w.Tag) && w.Tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) ||
+        (!string.IsNullOrEmpty(w.OcoGroup) && w.OcoGroup.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Mirror of NinjaTraderSimAdapter TryLinkBrokerOrderIdFromOrderUpdate — resolves canonical from OrderMap and links incoming broker id.</summary>
+    internal bool TryLinkBrokerOrderIdAliasIfResolvable(string incomingBrokerOrderId, string baseIntentId, string? leg,
+        string instrument, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(incomingBrokerOrderId)) return false;
+        if (TryResolveByBrokerOrderId(incomingBrokerOrderId, out _)) return false;
+
+        OrderInfo? orderInfo = null;
+        if (OrderMap.TryGetValue(baseIntentId, out var oi0) && oi0 != null)
+            orderInfo = oi0;
+        else if (leg == "STOP" && OrderMap.TryGetValue($"{baseIntentId}:STOP", out var oi1) && oi1 != null)
+            orderInfo = oi1;
+        else if (leg == "TARGET" && OrderMap.TryGetValue($"{baseIntentId}:TARGET", out var oi2) && oi2 != null)
+            orderInfo = oi2;
+
+        if (orderInfo == null) return false;
+
+        var legForResolve = leg == "STOP" || leg == "TARGET" ? leg : null;
+        if (!TryResolveForExecutionUpdate(orderInfo.OrderId ?? "", baseIntentId, legForResolve, out var regEntry, out _) ||
+            regEntry == null)
+            return false;
+
+        var canonical = regEntry.BrokerOrderId ?? "";
+        if (string.IsNullOrEmpty(canonical) ||
+            string.Equals(incomingBrokerOrderId, canonical, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!LinkBrokerOrderIdAlias(incomingBrokerOrderId, canonical, utcNow, baseIntentId, instrument)) return false;
+        orderInfo.OrderId = incomingBrokerOrderId;
+        return true;
     }
 
     /// <summary>Phase 2: Run registry cleanup. Removes terminal orders older than retention window.</summary>
@@ -88,6 +198,7 @@ public sealed partial class InstrumentExecutionAuthority
                 retention_minutes = TerminalRetentionMinutes,
                 iea_instance_id = InstanceId
             }));
+            NotifyReleaseSuppressionActivity();
         }
         return removed;
     }

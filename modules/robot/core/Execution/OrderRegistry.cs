@@ -7,6 +7,7 @@ namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
 /// Canonical runtime order registry. Order-centric; broker order id is primary identity.
+/// Intent-based aliases are secondary for compatibility.
 /// Phase 2: Lifecycle validation, cleanup, integrity.
 /// </summary>
 public sealed class OrderRegistry
@@ -15,16 +16,18 @@ public sealed class OrderRegistry
     private readonly ConcurrentDictionary<string, string> _aliasToBrokerOrderId = new(StringComparer.OrdinalIgnoreCase);
     /// <summary>Alternate native/broker id -> canonical id stored at Register (pre-ack vs post-ack Sim transition).</summary>
     private readonly ConcurrentDictionary<string, string> _brokerOrderIdAliasToCanonical = new(StringComparer.OrdinalIgnoreCase);
+
     private int _unownedOrdersDetected;
     private int _registryIntegrityFailures;
 
+    /// <summary>Phase 2: Validate lifecycle transition. Returns true if allowed.</summary>
     public static bool ValidateLifecycleTransition(OrderLifecycleState current, OrderLifecycleState next)
     {
         return (current, next) switch
         {
             (OrderLifecycleState.CREATED, OrderLifecycleState.SUBMITTED) => true,
             (OrderLifecycleState.SUBMITTED, OrderLifecycleState.WORKING) => true,
-            (OrderLifecycleState.SUBMITTED, OrderLifecycleState.FILLED) => true,
+            (OrderLifecycleState.SUBMITTED, OrderLifecycleState.FILLED) => true,  // Fast fill before WORKING
             (OrderLifecycleState.SUBMITTED, OrderLifecycleState.REJECTED) => true,
             (OrderLifecycleState.WORKING, OrderLifecycleState.PART_FILLED) => true,
             (OrderLifecycleState.WORKING, OrderLifecycleState.FILLED) => true,
@@ -38,6 +41,7 @@ public sealed class OrderRegistry
         };
     }
 
+    /// <summary>Try resolve by broker order id (canonical path).</summary>
     public bool TryResolveByBrokerOrderId(string brokerOrderId, out OrderRegistryEntry? entry)
     {
         entry = null;
@@ -58,6 +62,7 @@ public sealed class OrderRegistry
         return false;
     }
 
+    /// <summary>Try resolve by alias (intentId, intentId:STOP, intentId:TARGET).</summary>
     public bool TryResolveByAlias(string alias, out OrderRegistryEntry? entry)
     {
         entry = null;
@@ -71,6 +76,7 @@ public sealed class OrderRegistry
         return false;
     }
 
+    /// <summary>Register order. Returns true if added.</summary>
     public bool Register(OrderRegistryEntry entry)
     {
         if (string.IsNullOrEmpty(entry.BrokerOrderId)) return false;
@@ -86,6 +92,7 @@ public sealed class OrderRegistry
         return true;
     }
 
+    /// <summary>Add alias for existing entry.</summary>
     public void AddAlias(string alias, string brokerOrderId)
     {
         if (string.IsNullOrEmpty(alias) || string.IsNullOrEmpty(brokerOrderId)) return;
@@ -94,6 +101,7 @@ public sealed class OrderRegistry
 
     /// <summary>
     /// Link a broker-native order id observed after submit (e.g. Sim post-ack) to the canonical id used at <see cref="Register"/>.
+    /// Keeps intent aliases separate — uses a dedicated map so intent strings never resolve as broker ids.
     /// </summary>
     public bool LinkBrokerOrderIdAlias(string alternateBrokerOrderId, string canonicalBrokerOrderId)
     {
@@ -104,6 +112,7 @@ public sealed class OrderRegistry
         return true;
     }
 
+    /// <summary>Update lifecycle state. Returns false if transition invalid (caller should emit ORDER_LIFECYCLE_TRANSITION_INVALID).</summary>
     public bool UpdateLifecycle(string brokerOrderId, OrderLifecycleState newState, DateTimeOffset? terminalUtc = null)
     {
         OrderRegistryEntry? entry = null;
@@ -111,8 +120,12 @@ public sealed class OrderRegistry
             entry = e;
         else if (_brokerOrderIdAliasToCanonical.TryGetValue(brokerOrderId, out var canon) && _byBrokerOrderId.TryGetValue(canon, out e))
             entry = e;
-        if (entry == null) return true;
-        if (!ValidateLifecycleTransition(entry.LifecycleState, newState)) return false;
+        if (entry == null) return true; // not found, no validation
+        var current = entry.LifecycleState;
+        if (current == newState)
+            return true;
+        if (!ValidateLifecycleTransition(current, newState))
+            return false;
         entry.LifecycleState = newState;
         if (terminalUtc.HasValue || newState == OrderLifecycleState.FILLED || newState == OrderLifecycleState.CANCELED || newState == OrderLifecycleState.REJECTED)
         {
@@ -122,12 +135,15 @@ public sealed class OrderRegistry
         return true;
     }
 
+    /// <summary>Check if broker order id is registered.</summary>
     public bool Contains(string brokerOrderId) =>
         !string.IsNullOrEmpty(brokerOrderId) && _byBrokerOrderId.ContainsKey(brokerOrderId);
 
+    /// <summary>Phase 2: Get all entries for integrity/cleanup.</summary>
     public IReadOnlyList<OrderRegistryEntry> GetAllEntries() =>
         _byBrokerOrderId.Values.ToList();
 
+    /// <summary>Phase 2: Get broker order ids of WORKING orders.</summary>
     public IReadOnlyList<string> GetWorkingOrderIds() =>
         _byBrokerOrderId.Where(kvp => kvp.Value.LifecycleState == OrderLifecycleState.WORKING).Select(kvp => kvp.Key).ToList();
 
@@ -147,6 +163,48 @@ public sealed class OrderRegistry
         return count;
     }
 
+    /// <summary>
+    /// Trusted working count for mismatch assembly: OWNED + ADOPTED + <see cref="OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED"/>.
+    /// </summary>
+    public int GetMismatchTrustedWorkingCount()
+    {
+        var entries = _byBrokerOrderId.Values;
+        var count = 0;
+        foreach (var e in entries)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                continue;
+            if (e.LifecycleState == OrderLifecycleState.SUBMITTED || e.LifecycleState == OrderLifecycleState.WORKING || e.LifecycleState == OrderLifecycleState.PART_FILLED)
+                count++;
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Intent ids for mismatch-trusted live orders (owned/adopted/recoverable, non-terminal), for release-time journal/adoption filtering.
+    /// </summary>
+    public HashSet<string> GetMismatchTrustedWorkingIntentIds()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in _byBrokerOrderId.Values)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                continue;
+            if (e.LifecycleState != OrderLifecycleState.SUBMITTED &&
+                e.LifecycleState != OrderLifecycleState.WORKING &&
+                e.LifecycleState != OrderLifecycleState.PART_FILLED)
+                continue;
+            if (!string.IsNullOrWhiteSpace(e.IntentId))
+                set.Add(e.IntentId);
+        }
+        return set;
+    }
+
+    /// <summary>Phase 2: Remove terminal entries older than retention cutoff. Returns count removed.</summary>
     public int CleanupTerminalOrders(DateTimeOffset cutoffUtc, Func<string, bool>? excludeIfReferencedByIntent = null)
     {
         var toRemove = new List<string>();
@@ -172,9 +230,13 @@ public sealed class OrderRegistry
         return toRemove.Count;
     }
 
+    /// <summary>Phase 2: Increment unowned counter.</summary>
     public void IncrementUnownedDetected() => System.Threading.Interlocked.Increment(ref _unownedOrdersDetected);
+
+    /// <summary>Phase 2: Increment integrity failure counter.</summary>
     public void IncrementIntegrityFailure() => System.Threading.Interlocked.Increment(ref _registryIntegrityFailures);
 
+    /// <summary>Phase 2: Get metrics snapshot.</summary>
     public OrderRegistryMetrics GetMetrics()
     {
         var entries = _byBrokerOrderId.Values.ToList();
@@ -189,6 +251,7 @@ public sealed class OrderRegistry
     }
 }
 
+/// <summary>Phase 2: Registry metrics for observability.</summary>
 public sealed class OrderRegistryMetrics
 {
     public int OwnedOrdersActive { get; set; }

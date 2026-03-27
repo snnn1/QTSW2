@@ -1037,6 +1037,22 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
+    /// All IEAs for this instrument: reclassify recoverable UNOWNED + attempt broker-id alias links from snapshot before mismatch assembly.
+    /// </summary>
+    public void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        if (!_useInstrumentExecutionAuthority) return;
+        var account = GetCoordinationAccountName();
+        if (string.IsNullOrEmpty(account) || string.IsNullOrWhiteSpace(instrument) || snap == null) return;
+        var inst = instrument.Trim();
+        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, inst))
+                iea.PrepareRegistryForMismatchAssemblyFromSnapshot(inst, snap, utcNow);
+        }
+    }
+
+    /// <summary>
     /// Enqueue execution command. Forwards to IEA when bound; no-op when IEA not enabled.
     /// Strategy layers should use this instead of calling adapter.Flatten/SubmitOrders/CancelOrders directly.
     /// </summary>
@@ -2513,11 +2529,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         return snap;
     }
 
-    /// <summary>Get active intent IDs for protective audit (engine/journal-backed, filled entries).</summary>
+    /// <summary>
+    /// Releasable / protective-relevant intent union: BE monitoring actives plus adoption candidates (same instrument scope).
+    /// </summary>
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
     {
-        var active = GetActiveIntentsForBEMonitoring(instrument);
-        return active.Select(x => x.intentId).ToList();
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrEmpty(instrument))
+        {
+            foreach (var x in GetActiveIntentsForBEMonitoring(instrument))
+                set.Add(x.intentId);
+            foreach (var id in GetAdoptionCandidateIntentIds(instrument))
+                set.Add(id);
+        }
+        return set.Count == 0 ? Array.Empty<string>() : set.ToList();
     }
 
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)

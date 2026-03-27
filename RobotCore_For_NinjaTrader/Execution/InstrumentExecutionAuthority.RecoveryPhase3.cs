@@ -488,7 +488,9 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (_recoveryState != RecoveryState.RESOLVED) return false;
         if (_flattenLatchByInstrument.ContainsKey(instrument)) return false;
-        var workingUnowned = _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING && e.OwnershipStatus == OrderOwnershipStatus.UNOWNED).ToList();
+        var workingUnowned = _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING &&
+                                                                       (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED ||
+                                                                        e.OwnershipStatus == OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)).ToList();
         if (workingUnowned.Count > 0) return false;
         return true;
     }
@@ -513,7 +515,9 @@ public sealed partial class InstrumentExecutionAuthority
     {
         var entries = _orderRegistry.GetAllEntries();
         var working = entries.Where(e => e.LifecycleState == OrderLifecycleState.WORKING).ToList();
-        var unownedLive = working.Count(e => e.OwnershipStatus == OrderOwnershipStatus.UNOWNED);
+        var unownedLive = working.Count(e =>
+            e.OwnershipStatus == OrderOwnershipStatus.UNOWNED ||
+            e.OwnershipStatus == OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED);
         return new RecoveryRegistrySnapshot
         {
             WorkingOrderIds = working.Select(e => e.BrokerOrderId).ToList(),
@@ -575,7 +579,8 @@ public sealed partial class InstrumentExecutionAuthority
 
         foreach (var e in _orderRegistry.GetAllEntries().Where(e => e.LifecycleState == OrderLifecycleState.WORKING))
         {
-            if (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED) unowned++;
+            if (e.OwnershipStatus == OrderOwnershipStatus.UNOWNED ||
+                e.OwnershipStatus == OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED) unowned++;
             snap.RegistryWorking.Add(new RecoveryAttributionRegistryRow
             {
                 BrokerOrderId = e.BrokerOrderId,

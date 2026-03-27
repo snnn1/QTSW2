@@ -20,6 +20,14 @@ namespace QTSW2.Robot.Core.Execution;
 public sealed partial class InstrumentExecutionAuthority
 {
     private static int _instanceCounter;
+    private static Action? _releaseSuppressionActivityNotify;
+
+    /// <summary>Bumps release-readiness redundancy suppression activity (RobotEngine wires <see cref="ReleaseReconciliationRedundancySuppression.NotifyExecutionActivity"/>).</summary>
+    public static void SetReleaseSuppressionActivityNotify(Action? notify) =>
+        _releaseSuppressionActivityNotify = notify;
+
+    private static void NotifyReleaseSuppressionActivity() => _releaseSuppressionActivityNotify?.Invoke();
+
     private readonly int _instanceId;
 
     /// <summary>Per-instrument execution queue. Serializes fills, BE, bracket mutations.</summary>
@@ -691,10 +699,15 @@ public sealed partial class InstrumentExecutionAuthority
         TryExpireCooldown(ExecutionInstrumentKey, now);
         EmitSupervisoryMetrics(now);
 #endif
-        // Phase 2: Registry cleanup and integrity verification
-        var activeIntentIds = Executor != null
-            ? new HashSet<string>(Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey).Select(x => x.intentId), StringComparer.OrdinalIgnoreCase)
-            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Phase 2: Registry cleanup — match protective audit: BE actives ∪ adoption candidates (instrument scope)
+        var activeIntentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (Executor != null)
+        {
+            foreach (var x in Executor.GetActiveIntentsForBEMonitoring(ExecutionInstrumentKey))
+                activeIntentIds.Add(x.intentId);
+            foreach (var id in Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey))
+                activeIntentIds.Add(id);
+        }
         RunRegistryCleanup(now, id => activeIntentIds.Contains(id));
         VerifyRegistryIntegrity(now);
         EmitRegistryMetrics(now);

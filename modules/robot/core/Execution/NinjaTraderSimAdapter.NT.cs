@@ -1635,6 +1635,29 @@ public sealed partial class NinjaTraderSimAdapter
                     action = "FLATTEN_IMMEDIATELY",
                     note = "CRITICAL: Fill happened but can't be tracked. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
                 }));
+
+            var brokerOrderIdUntracked = order.OrderId?.ToString() ?? "";
+            try
+            {
+                _executionJournal?.UpsertUntrackedFillRecoveryJournal(
+                    instrument,
+                    brokerOrderIdUntracked,
+                    fillQuantity,
+                    fillPrice,
+                    utcNow,
+                    correlationId: null);
+            }
+            catch (Exception jEx)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "UNTRACKED_FILL_RECOVERY_JOURNAL_UPSERT_FAILED",
+                    new
+                    {
+                        error = jEx.Message,
+                        exception_type = jEx.GetType().Name,
+                        broker_order_id = brokerOrderIdUntracked,
+                        note = "Flatten still proceeds (fail-closed)"
+                    }));
+            }
             
             // CRITICAL: Flatten position immediately (fail-closed)
             // The fill happened in NinjaTrader, so we must flatten to prevent unprotected position

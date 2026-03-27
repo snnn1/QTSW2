@@ -327,12 +327,13 @@ public sealed class RobotLogger
         }
 
         // Include additional context fields in data (but exclude standardized top-level fields)
+        // intent_id MUST be preserved for ExecutionBase (see modules/robot/core/RobotLogger.cs).
         foreach (var kvp in dict)
         {
             if (kvp.Key != "ts_utc" && kvp.Key != "ts_chicago" && kvp.Key != "event_type" && 
                 kvp.Key != "instrument" && kvp.Key != "data" && kvp.Key != "stream" &&
                 kvp.Key != "trading_date" && kvp.Key != "session" && kvp.Key != "slot_time_chicago" &&
-                kvp.Key != "slot_time_utc" && kvp.Key != "state" && kvp.Key != "intent_id")
+                kvp.Key != "slot_time_utc" && kvp.Key != "state")
             {
                 data[kvp.Key] = kvp.Value;
             }

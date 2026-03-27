@@ -181,6 +181,11 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         // DRYRUN: No-op
     }
 
+    public void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        // DRYRUN: No-op
+    }
+
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "SESSION_CLOSE_FLATTEN_DRYRUN", new { note = "DRYRUN - immediate flatten not placed" }));

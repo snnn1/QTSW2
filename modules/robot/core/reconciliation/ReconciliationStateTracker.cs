@@ -103,6 +103,81 @@ public sealed class ReconciliationStateTracker
         (NormAccount(account).ToUpperInvariant(), NormInstrument(instrument).ToUpperInvariant());
 
     /// <summary>
+    /// Non-owner charts: if the shared tracker already holds an active mismatch for this instrument owned by
+    /// another instance, and broker quantity still matches the last quantities recorded in the episode, the
+    /// runner may skip re-querying the journal until the fast-path stale window expires.
+    /// Does not mutate tracker state or metrics (pre-gate probe only).
+    /// </summary>
+    public bool TryPeekSecondaryStableMismatchFastPath(
+        string? account,
+        string instrument,
+        string currentInstanceId,
+        int accountQty,
+        out int lastTrackedJournalQty,
+        out string? ownerInstanceId)
+    {
+        lastTrackedJournalQty = 0;
+        ownerInstanceId = null;
+
+        var acct = NormAccount(account);
+        var inst = NormInstrument(instrument);
+        if (string.IsNullOrEmpty(inst)) return false;
+
+        var id = string.IsNullOrWhiteSpace(currentInstanceId) ? "UNKNOWN_INSTANCE" : currentInstanceId.Trim();
+
+        lock (_lock)
+        {
+            if (!_entries.TryGetValue(CanonKey(acct, inst), out var e)) return false;
+            if (!e.IsActive) return false;
+            if (string.IsNullOrEmpty(e.OwnerInstanceId) || string.Equals(e.OwnerInstanceId, id, StringComparison.Ordinal))
+                return false;
+            if (e.LastAccountQty == int.MinValue || e.LastJournalQty == int.MinValue) return false;
+            if (e.LastAccountQty != accountQty) return false;
+            if (e.LastAccountQty == e.LastJournalQty) return false;
+
+            lastTrackedJournalQty = e.LastJournalQty;
+            ownerInstanceId = e.OwnerInstanceId;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Mismatch assembly pre-gate: another strategy instance already owns the active qty-mismatch writer episode
+    /// for this account/instrument, and broker vs journal quantities still match the episode snapshot.
+    /// Read-only; does not mutate metrics.
+    /// </summary>
+    public bool TryPeekNonOwnerWithStableQtyMismatchEpisode(
+        string? account,
+        string instrument,
+        string currentInstanceId,
+        int brokerPositionQty,
+        int journalOpenQty,
+        out string? ownerInstanceId)
+    {
+        ownerInstanceId = null;
+
+        var acct = NormAccount(account);
+        var inst = NormInstrument(instrument);
+        if (string.IsNullOrEmpty(inst)) return false;
+
+        var id = string.IsNullOrWhiteSpace(currentInstanceId) ? "UNKNOWN_INSTANCE" : currentInstanceId.Trim();
+
+        lock (_lock)
+        {
+            if (!_entries.TryGetValue(CanonKey(acct, inst), out var e)) return false;
+            if (!e.IsActive) return false;
+            if (string.IsNullOrEmpty(e.OwnerInstanceId) || string.Equals(e.OwnerInstanceId, id, StringComparison.Ordinal))
+                return false;
+            if (e.LastAccountQty == int.MinValue || e.LastJournalQty == int.MinValue) return false;
+            if (e.LastAccountQty == e.LastJournalQty) return false;
+            if (e.LastAccountQty != brokerPositionQty || e.LastJournalQty != journalOpenQty) return false;
+
+            ownerInstanceId = e.OwnerInstanceId;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Runner calls this before logging RECONCILIATION_QTY_MISMATCH / context / drift events.
     /// </summary>
     public ReconciliationMismatchGateResult EvaluateRunnerMismatch(

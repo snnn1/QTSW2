@@ -35,6 +35,8 @@ public sealed partial class InstrumentExecutionAuthority
             var (valid, newState) = IntentLifecycleValidator.TryGetTransition(current, transition);
             if (!valid)
             {
+                if (IntentLifecycleValidator.IsIdempotentIntentReplay(current, transition))
+                    return true;
                 Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, ExecutionInstrumentKey, "INTENT_LIFECYCLE_TRANSITION_INVALID",
                     new { intentId, currentState = current.ToString(), attemptedTransition = transition.ToString(), commandId, timestampUtc = utcNow }));
                 return false;
@@ -55,6 +57,71 @@ public sealed partial class InstrumentExecutionAuthority
             if (!_intentLifecycleByIntentId.ContainsKey(intentId))
                 _intentLifecycleByIntentId[intentId] = IntentLifecycleState.CREATED;
         }
+    }
+
+    /// <summary>
+    /// After ENTRY adoption, sets intent lifecycle from broker/registry truth (not implicit CREATED).
+    /// Idempotent: same reconstructed state leaves storage unchanged and does not re-log.
+    /// </summary>
+    internal void ReconstructIntentLifecycleAfterEntryAdoption(string intentId, string instrument, OrderInfo orderInfo, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(intentId) || orderInfo == null) return;
+
+        var filledQty = orderInfo.FilledQuantity;
+        var orderQty = orderInfo.Quantity > 0 ? orderInfo.Quantity : orderInfo.ExpectedQuantity;
+        var hasProtectives = HasLiveProtectiveRegistryOrdersForIntent(intentId);
+        var target = IntentLifecycleValidator.MapAdoptionEntryReconstructionState(filledQty, orderQty, hasProtectives);
+        SetIntentLifecycleStateDirect(intentId, target, instrument, filledQty, orderQty, hasProtectives, utcNow);
+    }
+
+    private static bool IsLiveProtectiveOrderEntry(OrderRegistryEntry? e)
+    {
+        if (e == null) return false;
+        return e.LifecycleState == OrderLifecycleState.CREATED ||
+               e.LifecycleState == OrderLifecycleState.SUBMITTED ||
+               e.LifecycleState == OrderLifecycleState.WORKING ||
+               e.LifecycleState == OrderLifecycleState.PART_FILLED;
+    }
+
+    private bool HasLiveProtectiveRegistryOrdersForIntent(string intentId)
+    {
+        var stopLive = TryResolveByAlias($"{intentId}:STOP", out var stop) && IsLiveProtectiveOrderEntry(stop);
+        var targetLive = TryResolveByAlias($"{intentId}:TARGET", out var tgt) && IsLiveProtectiveOrderEntry(tgt);
+        return stopLive || targetLive;
+    }
+
+    /// <summary>Direct lifecycle set for adoption reconstruction only. Does not validate FSM edges.</summary>
+    private void SetIntentLifecycleStateDirect(
+        string intentId,
+        IntentLifecycleState targetState,
+        string instrument,
+        int filledQty,
+        int orderQty,
+        bool hasProtectives,
+        DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(intentId)) return;
+        lock (_lifecycleLock)
+        {
+            var cur = _intentLifecycleByIntentId.TryGetValue(intentId, out var s) ? s : IntentLifecycleState.CREATED;
+            if (cur == targetState)
+                return;
+            _intentLifecycleByIntentId[intentId] = targetState;
+        }
+
+        Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, ExecutionInstrumentKey, "INTENT_LIFECYCLE_RECONSTRUCTED",
+            new
+            {
+                intent_id = intentId,
+                instrument,
+                reconstructed_state = targetState.ToString(),
+                reason = "adoption_reconstruction",
+                source = "adoption",
+                filled_qty = filledQty,
+                order_qty = orderQty,
+                has_protectives = hasProtectives,
+                timestampUtc = utcNow
+            }));
     }
 }
 #endif
