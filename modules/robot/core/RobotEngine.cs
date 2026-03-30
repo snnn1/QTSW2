@@ -5063,7 +5063,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 accountQty += Math.Abs(p.Quantity);
             }
         }
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+        var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openJournalMap, inst, execVariant);
         var streamRows = GetStreamOpenExposureForInstrument(inst);
         // IEA registry / recovery routing key for the mismatch instrument (matches RequestRecoveryForInstrument).
         var mismatchExecutionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, null);
@@ -5336,7 +5337,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
             var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInst, inst, execVariant);
             var actGen = _releaseReconRedundancy.ExecutionActivityGeneration;
 
             var nonOwnerAssembleGate = useIea &&
@@ -6042,6 +6043,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow, forceFullEvaluation: true);
+        // Bounded second probe: journal/registry may update synchronously during gate recovery; fresh snapshot avoids waiting for next 5s gate tick.
+        if (!readiness.ReleaseReady)
+        {
+            try
+            {
+                var snapRecheck = _executionAdapter.GetAccountSnapshot(utcNow);
+                if (snapRecheck != null)
+                    readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapRecheck, utcNow, forceFullEvaluation: true);
+            }
+            catch
+            {
+                // keep prior readiness
+            }
+        }
+
         result.ReleaseReadyAfter = readiness.ReleaseReady;
         result.UnexplainedWorkingCountAfter = readiness.UnexplainedBrokerWorkingCount;
         result.UnexplainedPositionQtyAfter = readiness.UnexplainedBrokerPositionQty;

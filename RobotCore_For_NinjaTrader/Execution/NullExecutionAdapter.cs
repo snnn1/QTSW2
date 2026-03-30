@@ -197,6 +197,13 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         return Array.Empty<string>();
     }
 
+    public bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail)
+    {
+        resultCode = "NULL_ADAPTER";
+        detail = null;
+        return false;
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         // DRYRUN: No-op

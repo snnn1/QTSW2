@@ -111,6 +111,8 @@ public static class IntentLifecycleTests
             return (false, "ENTRY_PARTIALLY_FILLED + partial replay should be idempotent");
         if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_ACCEPTED))
             return (false, "ENTRY_WORKING + ENTRY_ACCEPTED replay should be idempotent");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.SUBMIT_ENTRY))
+            return (false, "ENTRY_SUBMITTED + SUBMIT_ENTRY replay should be idempotent (IEA + adapter boundary)");
         if (IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_FILLED))
             return (false, "CREATED + ENTRY_FILLED should not be treated as idempotent replay");
 

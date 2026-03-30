@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj": {}
+    "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj": {}
   },
   "projects": {
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "projectName": "Robot.Contracts",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -65,14 +65,14 @@
         }
       }
     },
-    "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
         "projectName": "Robot.Core",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\Robot.Core.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\RobotCore_For_NinjaTrader\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -87,8 +87,8 @@
           "net48": {
             "targetAlias": "net48",
             "projectReferences": {
-              "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
-                "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
+              "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+                "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
               }
             }
           }

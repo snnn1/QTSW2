@@ -2282,6 +2282,8 @@ public sealed partial class NinjaTraderSimAdapter
 
             orderInfo.OrderId = order.OrderId ?? orderInfo.OrderId;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
+            // Execution boundary: SUBMIT_ENTRY must precede ORDER_ACKNOWLEDGED → ENTRY_ACCEPTED (validator: ENTRY_SUBMITTED only).
+            _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.SUBMIT_ENTRY, null, acknowledgedAt);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {
@@ -3978,12 +3980,29 @@ public sealed partial class NinjaTraderSimAdapter
                 ? _iea.AllocateFillToIntents(intentIdsToUpdate, fillQuantity, orderInfo)
                 : AllocateFillToIntents(intentIdsToUpdate, fillQuantity, orderInfo);
 
+            var entryFillJournalRecordedQty = 0;
             foreach (var alloc in allocations)
             {
                 var allocIntentId = alloc.Item1;
                 var allocQty = alloc.Item2;
                 if (allocQty <= 0) continue;
-                if (!IntentMap.TryGetValue(allocIntentId, out Intent? allocIntent) || allocIntent == null) continue;
+                if (!IntentMap.TryGetValue(allocIntentId, out Intent? allocIntent) || allocIntent == null)
+                {
+                    var posHint = 0;
+                    try { posHint = Math.Abs(GetCurrentPositionReal(orderInfo.Instrument.Trim())); } catch { /* best-effort */ }
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, allocIntentId, orderInfo.Instrument,
+                        "TAGGED_ENTRY_FILL_JOURNAL_SKIPPED", new
+                        {
+                            reason = "INTENTMAP_MISS",
+                            intent_id = allocIntentId,
+                            fill_qty = allocQty,
+                            trading_date = (string?)null,
+                            broker_position_abs_hint = posHint,
+                            iea_active = _iea != null,
+                            order_broker_id = brokerOrderId
+                        }));
+                    continue;
+                }
                 var allocContext = new IntentContext
                 {
                     IntentId = allocIntentId,
@@ -4007,7 +4026,30 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.ExecutionInstrument,
                     allocContext.CanonicalInstrument,
                     brokerOrderInstrumentKey: orderInfo.Instrument);
+                entryFillJournalRecordedQty += allocQty;
                 _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, allocContext.ExecutionInstrument, allocContext.Direction ?? "", utcNow);
+            }
+
+            if (isEntryFill && fillQuantity > 0 && entryFillJournalRecordedQty == 0 && allocations.Count > 0)
+            {
+                var posAbs = 0;
+                try { posAbs = Math.Abs(GetCurrentPositionReal(orderInfo.Instrument.Trim())); } catch { }
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                    "TAGGED_ENTRY_FILL_JOURNAL_RECORDED_ZERO", new
+                    {
+                        reason = "ALL_ALLOCATION_PATHS_SKIPPED_OR_EMPTY",
+                        intent_id = intentId,
+                        fill_qty = fillQuantity,
+                        allocation_count = allocations.Count,
+                        broker_position_abs_hint = posAbs,
+                        iea_active = _iea != null,
+                        note = "Downstream TAGGED_BROKER_WITHOUT_JOURNAL repair may run from reconciliation / protective"
+                    }));
+                if (posAbs > 0 &&
+                    _executionJournal.GetOpenJournalQuantitySumForInstrument(orderInfo.Instrument.Trim(), null) == 0)
+                {
+                    _ = TryRepairTaggedBrokerWithoutJournalCore(orderInfo.Instrument.Trim(), posAbs, 0, utcNow, out _, out _);
+                }
             }
 
             if (isAggregated && allocations.Count > 0)
@@ -8330,6 +8372,10 @@ public sealed partial class NinjaTraderSimAdapter
             expectedEntryPrice: null, entryPrice: intentEntryPrice, stopPrice: intentStopPrice ?? stopPrice,
             targetPrice: intentTargetPrice, direction: intentDirection ?? direction, ocoGroup: ocoGroupVal ?? ocoGroup);
 
+        orderInfo.OrderId = order.OrderId ?? orderInfo.OrderId;
+        _iea?.RegisterOrder(order.OrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitStopEntryOrder", orderInfo, acknowledgedAt);
+        _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.SUBMIT_ENTRY, null, acknowledgedAt);
+
         _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
         {
             broker_order_id = order.OrderId, order_type = "ENTRY_STOP", direction, stop_price = stopPrice,
@@ -8337,6 +8383,243 @@ public sealed partial class NinjaTraderSimAdapter
         }));
 
         return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
+    }
+
+    /// <summary>
+    /// Tagged broker exposure without open journal row: upsert recovery journal when ownership evidence is strong.
+    /// </summary>
+    private bool TryRepairTaggedBrokerWithoutJournalCore(
+        string instrument,
+        int accountQtyAbs,
+        int journalOpenQtySum,
+        DateTimeOffset utcNow,
+        out string resultCode,
+        out string? detail)
+    {
+        resultCode = "";
+        detail = null;
+        if (journalOpenQtySum > 0)
+        {
+            resultCode = "SKIP_JOURNAL_ALREADY_OPEN";
+            return false;
+        }
+        if (accountQtyAbs <= 0)
+        {
+            resultCode = "SKIP_NO_ACCOUNT_EXPOSURE";
+            return false;
+        }
+        if (!_ntContextSet)
+        {
+            resultCode = "NT_CONTEXT";
+            return false;
+        }
+
+        var instTrim = (instrument ?? "").Trim();
+        if (string.IsNullOrEmpty(instTrim))
+        {
+            resultCode = "INSTRUMENT_EMPTY";
+            return false;
+        }
+
+        if (TrySuppressTaggedRepairRepeatedFailure(instTrim, accountQtyAbs, journalOpenQtySum, utcNow, out resultCode))
+        {
+            detail = null;
+            return false;
+        }
+
+        AccountSnapshot snap;
+        try
+        {
+            snap = GetAccountSnapshotReal(utcNow);
+        }
+        catch (Exception ex)
+        {
+            resultCode = "SNAPSHOT_ERROR";
+            detail = ex.Message;
+            return false;
+        }
+
+        PrepareOrderRegistryForMismatchAssembly(instTrim, snap, utcNow);
+
+        var positions = snap.Positions ?? new List<PositionSnapshot>();
+        var exposure = BrokerPositionResolver.ResolveFromSnapshots(positions, instTrim);
+        if (exposure.ReconciliationAbsQuantityTotal <= 0)
+        {
+            resultCode = "SNAPSHOT_ZERO_POSITION";
+            RecordTaggedRepairFailureForCooldown(instTrim, accountQtyAbs, journalOpenQtySum, utcNow, resultCode);
+            return false;
+        }
+
+        var repairQty = Math.Min(accountQtyAbs, exposure.ReconciliationAbsQuantityTotal);
+        if (repairQty <= 0)
+            repairQty = accountQtyAbs;
+
+        var signedSum = 0;
+        foreach (var leg in exposure.Legs)
+            signedSum += leg.SignedQuantity;
+        var direction = signedSum > 0 ? "Long" : "Short";
+
+        decimal? avgFill = null;
+        foreach (var p in positions)
+        {
+            if (p.Quantity == 0 || string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            if (!string.Equals(p.Instrument.Trim(), instTrim, StringComparison.OrdinalIgnoreCase)) continue;
+            avgFill = p.AveragePrice;
+            break;
+        }
+
+        var robotWorkingOnInst = 0;
+        var brokerOrderIds = new List<string>();
+        foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrEmpty(w.Tag) || !w.Tag.StartsWith(RobotOrderIds.Prefix, StringComparison.Ordinal)) continue;
+            var wInst = (w.Instrument ?? "").Trim();
+            if (!string.Equals(wInst, instTrim, StringComparison.OrdinalIgnoreCase) &&
+                !ExecutionInstrumentResolver.IsSameInstrument(wInst, instTrim))
+                continue;
+            robotWorkingOnInst++;
+            if (!string.IsNullOrEmpty(w.OrderId))
+                brokerOrderIds.Add(w.OrderId);
+        }
+
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var id in GetActiveIntentIdsForProtectiveAudit(instTrim))
+            candidates.Add(id);
+        foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrEmpty(w.Tag) || !w.Tag.StartsWith(RobotOrderIds.Prefix, StringComparison.Ordinal)) continue;
+            var wInst = (w.Instrument ?? "").Trim();
+            if (!string.Equals(wInst, instTrim, StringComparison.OrdinalIgnoreCase) &&
+                !ExecutionInstrumentResolver.IsSameInstrument(wInst, instTrim))
+                continue;
+            var dec = RobotOrderIds.DecodeIntentId(w.Tag);
+            if (!string.IsNullOrEmpty(dec))
+                candidates.Add(dec);
+        }
+        foreach (var kv in OrderMap)
+        {
+            var oi = kv.Value;
+            if (!oi.IsEntryOrder) continue;
+            var oInst = (oi.Instrument ?? "").Trim();
+            if (!string.Equals(oInst, instTrim, StringComparison.OrdinalIgnoreCase) &&
+                !ExecutionInstrumentResolver.IsSameInstrument(oInst, instTrim))
+                continue;
+            candidates.Add(kv.Key);
+        }
+
+        var candidateList = candidates.Count > 0 ? candidates.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList() : new List<string>();
+        if (candidateList.Count == 0)
+        {
+            resultCode = "NO_OWNERSHIP_EVIDENCE";
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "TAGGED_BROKER_WITHOUT_JOURNAL_DETECTED", "ENGINE",
+                new
+                {
+                    instrument = instTrim,
+                    account_qty = accountQtyAbs,
+                    journal_qty = journalOpenQtySum,
+                    intent_ids = Array.Empty<string>(),
+                    registry_owned_working_count = robotWorkingOnInst,
+                    broker_order_ids_sample = brokerOrderIds.Take(8).ToList(),
+                    repair_action = "NONE",
+                    repair_result = resultCode,
+                    reason = "TAGGED_ORPHAN_POSITION_RECOVERY"
+                }));
+            RecordTaggedRepairFailureForCooldown(instTrim, accountQtyAbs, journalOpenQtySum, utcNow, resultCode);
+            return false;
+        }
+
+        string? bestId = null;
+        Intent? bestIntent = null;
+        foreach (var cid in candidateList)
+        {
+            if (!IntentMap.TryGetValue(cid, out var intn) || intn == null) continue;
+            if (string.IsNullOrWhiteSpace(intn.TradingDate) || string.IsNullOrWhiteSpace(intn.Stream)) continue;
+            var idir = intn.Direction ?? "";
+            if (!string.IsNullOrEmpty(idir) && !idir.Equals(direction, StringComparison.OrdinalIgnoreCase))
+                continue;
+            bestId = cid;
+            bestIntent = intn;
+            break;
+        }
+        if (bestId == null)
+        {
+            foreach (var cid in candidateList)
+            {
+                if (!IntentMap.TryGetValue(cid, out var intn) || intn == null) continue;
+                if (string.IsNullOrWhiteSpace(intn.TradingDate) || string.IsNullOrWhiteSpace(intn.Stream)) continue;
+                bestId = cid;
+                bestIntent = intn;
+                break;
+            }
+        }
+
+        if (bestId == null || bestIntent == null)
+        {
+            resultCode = "NO_QUALIFYING_INTENT_CONTEXT";
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "TAGGED_BROKER_WITHOUT_JOURNAL_DETECTED", "ENGINE",
+                new
+                {
+                    instrument = instTrim,
+                    account_qty = accountQtyAbs,
+                    journal_qty = journalOpenQtySum,
+                    intent_ids = candidateList,
+                    registry_owned_working_count = robotWorkingOnInst,
+                    broker_order_ids_sample = brokerOrderIds.Take(8).ToList(),
+                    repair_action = "NONE",
+                    repair_result = resultCode,
+                    reason = "TAGGED_ORPHAN_POSITION_RECOVERY"
+                }));
+            RecordTaggedRepairFailureForCooldown(instTrim, accountQtyAbs, journalOpenQtySum, utcNow, resultCode);
+            return false;
+        }
+
+        var (_, _, _, intentStop, intentTarget, intentDir, _) = GetIntentInfo(bestId);
+        var useDir = string.IsNullOrEmpty(intentDir) ? direction : intentDir!;
+        var brokerOid = OrderMap.TryGetValue(bestId, out var oMap) ? oMap.OrderId : null;
+
+        _log.Write(RobotEvents.EngineBase(utcNow, bestIntent.TradingDate ?? "", "TAGGED_BROKER_WITHOUT_JOURNAL_DETECTED", "ENGINE",
+            new
+            {
+                instrument = instTrim,
+                account_qty = accountQtyAbs,
+                journal_qty = journalOpenQtySum,
+                intent_ids = candidateList,
+                chosen_intent_id = bestId,
+                registry_owned_working_count = robotWorkingOnInst,
+                broker_order_ids_sample = brokerOrderIds.Take(8).ToList(),
+                repair_action = "TAGGED_BROKER_EXPOSURE_RECOVERY_JOURNAL_UPSERT",
+                repair_result = "ATTEMPTING",
+                reason = "TAGGED_ORPHAN_POSITION_RECOVERY"
+            }));
+
+        var correl = $"TAGGED_RECOVERY:{instTrim}:{utcNow:yyyyMMddHHmmssfff}";
+        _executionJournal.UpsertTaggedBrokerExposureRecoveryJournal(
+            bestId,
+            bestIntent.TradingDate!,
+            bestIntent.Stream!,
+            bestIntent.ExecutionInstrument ?? bestIntent.Instrument ?? instTrim,
+            brokerOid,
+            repairQty,
+            useDir,
+            avgFill,
+            intentStop,
+            intentTarget,
+            utcNow,
+            correl);
+
+        ClearTaggedRepairFailureCooldown(instTrim);
+        resultCode = "REPAIR_UPSERT_OK";
+        detail = bestId;
+        _log.Write(RobotEvents.EngineBase(utcNow, bestIntent.TradingDate ?? "", "TAGGED_BROKER_WITHOUT_JOURNAL_REPAIR_COMPLETE", "ENGINE",
+            new
+            {
+                instrument = instTrim,
+                intent_id = bestId,
+                open_journal_qty = repairQty,
+                correlation_id = correl,
+                result = resultCode
+            }));
+        return true;
     }
 
     /// <summary>

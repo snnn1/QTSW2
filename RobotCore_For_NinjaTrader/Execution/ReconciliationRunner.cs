@@ -102,7 +102,9 @@ public sealed class ReconciliationRunner
     }
 
     /// <summary>
-    /// P1.5-D: Instrument-scoped gate recovery — skips qty-mismatch freeze callbacks and destructive orphan journal closure for this instrument.
+    /// P1.5-D: Instrument-scoped gate recovery — skips <c>RECONCILIATION_QTY_MISMATCH</c> / freeze callbacks for the gated instrument
+    /// when broker and journal disagree with risk on the broker side, but still runs the same broker-flat open-journal closure path
+    /// when the account is flat and there are no working orders (local journal alignment only; no broker flatten).
     /// </summary>
     public void ForceRunGateRecoveryForInstrument(DateTimeOffset utcNow, string instrument)
     {
@@ -222,7 +224,15 @@ public sealed class ReconciliationRunner
                 continue;
             }
 
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+
+            if (accountQty > 0 && journalQty == 0 &&
+                _adapter.TryRepairTaggedBrokerWithoutJournal(inst, accountQty, journalQty, utcNow, out _, out _))
+            {
+                openByInstrument = _journal.GetOpenJournalEntriesByInstrument();
+                journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+            }
+
             if (journalQty == accountQty)
             {
                 _secondaryMismatchFastPath.Remove(inst);
@@ -382,6 +392,7 @@ public sealed class ReconciliationRunner
 
         var instrumentsChecked = openByInstrument.Count;
         var journalsReconciled = 0;
+        var gateBrokerFlatJournalsClosed = 0;
 
         if (instrumentsChecked == 0)
         {
@@ -400,9 +411,6 @@ public sealed class ReconciliationRunner
             var entries = kvp.Value;
 
             if (entries.Count == 0) continue;
-
-            if (gateMode && MatchesGateInstrument(instrument, gateInst!))
-                continue;
 
             var brokerFlat = !instrumentsWithPosition.Contains(instrument);
             var hasWorkingOrders = workingOrders.Any(w =>
@@ -428,6 +436,8 @@ public sealed class ReconciliationRunner
                 if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow))
                 {
                     journalsReconciled++;
+                    if (gateMode && !string.IsNullOrEmpty(gateInst) && MatchesGateInstrument(instrument, gateInst))
+                        gateBrokerFlatJournalsClosed++;
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TRADE_RECONCILED", "ENGINE",
                         new
                         {
@@ -440,6 +450,18 @@ public sealed class ReconciliationRunner
                         }));
                 }
             }
+        }
+
+        if (gateBrokerFlatJournalsClosed > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "GATE_RECOVERY_BROKER_FLAT_JOURNAL_CLOSURE", "ENGINE",
+                new
+                {
+                    gate_instrument = gateInst,
+                    journals_closed = gateBrokerFlatJournalsClosed,
+                    note =
+                        "P1.5 gate recovery: allowed broker-flat journal closure (no position, no working orders) so release readiness can converge"
+                }));
         }
 
         _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_PASS_SUMMARY", "ENGINE",
@@ -482,7 +504,7 @@ public sealed class ReconciliationRunner
         {
             var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
             var openOrders = CountWorkingForInstrument(workingOrders, inst);
             var intentCount = CountJournalIntents(openByInstrument, inst, execVariant);
             var hasMismatch = accountQty != journalQty;
@@ -534,8 +556,9 @@ public sealed class ReconciliationRunner
     private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)
     {
         var result = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase);
+        var openByInstrument = _journal.GetOpenJournalEntriesByInstrument();
         var allInstruments = new HashSet<string>(accountQtyByInstrument.Keys, StringComparer.OrdinalIgnoreCase);
-        foreach (var inst in _journal.GetOpenJournalEntriesByInstrument().Keys)
+        foreach (var inst in openByInstrument.Keys)
         {
             if (!string.IsNullOrWhiteSpace(inst))
                 allInstruments.Add(inst.Trim());
@@ -544,7 +567,7 @@ public sealed class ReconciliationRunner
         {
             var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
             result[inst] = (accountQty, journalQty);
         }
         return result;

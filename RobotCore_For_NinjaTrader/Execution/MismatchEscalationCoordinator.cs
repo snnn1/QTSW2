@@ -43,6 +43,12 @@ public sealed class MismatchEscalationCoordinator
 
     private const int QuietGateTelemetrySeconds = 30;
 
+    /// <summary>Rate-limit identical post-flat release-blocker payloads per instrument.</summary>
+    private readonly Dictionary<string, (int Hash, DateTimeOffset Utc)> _releaseBlockedAfterFlatTelemetry =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const int ReleaseBlockedAfterFlatQuietSeconds = 30;
+
     private int _mismatchDetectedCount;
     private int _mismatchPersistentCount;
     private int _mismatchFailClosedCount;
@@ -249,6 +255,56 @@ public sealed class MismatchEscalationCoordinator
             Source = "MismatchEscalationCoordinator",
             Payload = payload
         });
+    }
+
+    private static bool HasResidualReleaseBlocker(StateConsistencyReleaseReadinessResult r) =>
+        r.PendingAdoptionExists || !r.BrokerPositionExplainable || !r.BrokerWorkingExplainable || !r.LocalStateCoherent;
+
+    /// <summary>
+    /// Broker is flat (per release diagnostics) but gate cannot release — log structured blockers for ops.
+    /// </summary>
+    private void TryEmitReleaseBlockedAfterFlat(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchInstrumentState state,
+        StateConsistencyReleaseReadinessResult readiness,
+        GateReconciliationResult? recon,
+        bool skipExpensive)
+    {
+        if (_log == null) return;
+        if (readiness.ReleaseReady || !readiness.SnapshotSufficient) return;
+        if (readiness.DiagnosticBrokerPositionQty != 0) return;
+        if (!HasResidualReleaseBlocker(readiness)) return;
+
+        var contradictions = string.Join(";", readiness.Contradictions ?? new List<string>());
+        var quietHash = unchecked((StringComparer.OrdinalIgnoreCase.GetHashCode(inst) * 397) ^
+                                  (contradictions != null ? StringComparer.Ordinal.GetHashCode(contradictions) : 0));
+        if (_releaseBlockedAfterFlatTelemetry.TryGetValue(inst, out var prev) && prev.Hash == quietHash &&
+            (utcNow - prev.Utc).TotalSeconds < ReleaseBlockedAfterFlatQuietSeconds)
+            return;
+        _releaseBlockedAfterFlatTelemetry[inst] = (quietHash, utcNow);
+
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            broker_position_qty = readiness.DiagnosticBrokerPositionQty,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            broker_working_count = readiness.DiagnosticBrokerWorkingCount,
+            iea_owned_plus_adopted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+            pending_adoption_candidate_count = readiness.DiagnosticPendingAdoptionCandidateCount,
+            release_ready = readiness.ReleaseReady,
+            contradictions,
+            release_summary = readiness.Summary,
+            safe_cleanup_attempted = !skipExpensive,
+            gate_reconciliation_outcome = recon?.OutcomeStatus.ToString(),
+            gate_reconciliation_release_ready_after = recon?.ReleaseReadyAfter,
+            gate_reconciliation_reason = recon?.Reason,
+            gate_reconciliation_duration_ms = recon?.DurationMs,
+            note = "Gate active, broker flat per release probe, but ReleaseReady false — residual journal/adoption/working/IEA coherence"
+        };
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RELEASE_BLOCKED_AFTER_FLAT", payload));
+        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASE_BLOCKED_AFTER_FLAT", utcNow, payload, "WARN");
     }
 
     /// <summary>P1.5-H: Clean signal absent does not clear gate; only stability release clears.</summary>
@@ -739,6 +795,7 @@ public sealed class MismatchEscalationCoordinator
 
         if (!readiness.ReleaseReady)
         {
+            TryEmitReleaseBlockedAfterFlat(inst, utcNow, state, readiness, recon, skipExpensive);
             if (state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
             {
                 var resetPayload = new

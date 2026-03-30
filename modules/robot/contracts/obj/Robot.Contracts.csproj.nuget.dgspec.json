@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {}
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {}
   },
   "projects": {
-    "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+    "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "projectName": "Robot.Contracts",
-        "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
+        "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj",
         "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
+        "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"

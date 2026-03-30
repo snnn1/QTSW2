@@ -350,6 +350,13 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
         return Array.Empty<string>();
     }
 
+    public bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail)
+    {
+        resultCode = "LIVE_ADAPTER_UNSUPPORTED";
+        detail = null;
+        return false;
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         // LIVE adapter: No-op (stub - IEA not yet bound)

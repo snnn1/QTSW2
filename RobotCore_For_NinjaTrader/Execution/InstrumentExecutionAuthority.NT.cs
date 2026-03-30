@@ -242,6 +242,7 @@ public sealed partial class InstrumentExecutionAuthority
                 OrderMap[oppId] = oppOi;
                 RegisterOrder(Executor.GetOrderId(oppOrder), oppId, instrument, oppIntent.Stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "TryAggregateWithExistingOrders_Opposite", oppOi, utcNow);
                 Executor.RecordSubmission(oppId, oppIntent.TradingDate ?? "", oppIntent.Stream ?? "", instrument, $"ENTRY_STOP_{oppositeDirection}", Executor.GetOrderId(oppOrder), utcNow);
+                TryTransitionIntentLifecycle(oppId, IntentLifecycleTransition.SUBMIT_ENTRY, null, utcNow);
             }
 
             Executor.SubmitOrders(ordersToSubmit);
@@ -251,6 +252,9 @@ public sealed partial class InstrumentExecutionAuthority
                 if (IntentMap.TryGetValue(id, out var intent))
                     Executor.RecordSubmission(id, intent.TradingDate ?? "", intent.Stream ?? "", instrument, $"ENTRY_STOP_{direction}", Executor.GetOrderId(order), utcNow);
             }
+
+            foreach (var id in allIntentIds)
+                TryTransitionIntentLifecycle(id, IntentLifecycleTransition.SUBMIT_ENTRY, null, utcNow);
 
             Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENTRY_AGGREGATION_SUCCESS", state: "ENGINE",
                 new

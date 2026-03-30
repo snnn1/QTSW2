@@ -2508,6 +2508,104 @@ public sealed class ExecutionJournal
             }));
     }
 
+    /// <summary>
+    /// Robot-tagged exposure reconciliation: persist an open filled journal row when broker shows position but
+    /// normal <see cref="RecordEntryFill"/> did not (lifecycle/fill path failure). Distinct from untracked-fill recovery.
+    /// Uses the intent's real trading_date + stream + intent_id key so protectives and reconciliation align.
+    /// </summary>
+    public void UpsertTaggedBrokerExposureRecoveryJournal(
+        string intentId,
+        string tradingDate,
+        string stream,
+        string executionInstrument,
+        string? brokerOrderId,
+        int openQtyAbs,
+        string direction,
+        decimal? avgFillPrice,
+        decimal? stopPrice,
+        decimal? targetPrice,
+        DateTimeOffset utcNow,
+        string? correlationId = null)
+    {
+        if (string.IsNullOrWhiteSpace(intentId) || string.IsNullOrWhiteSpace(tradingDate) ||
+            string.IsNullOrWhiteSpace(stream) || openQtyAbs <= 0)
+            return;
+        var inst = string.IsNullOrWhiteSpace(executionInstrument) ? "UNKNOWN" : executionInstrument.Trim();
+        var key = $"{tradingDate}_{stream}_{intentId}";
+        var journalPath = GetJournalPath(tradingDate, stream, intentId);
+        var dRaw = direction?.Trim() ?? "";
+        var normDir = dRaw.Length == 0 ? ""
+            : (dRaw.Length == 1 ? dRaw.ToUpperInvariant()
+                : char.ToUpperInvariant(dRaw[0]) + dRaw.Substring(1).ToLowerInvariant());
+
+        lock (_lock)
+        {
+            ExecutionJournalEntry? entry = null;
+            if (_cache.TryGetValue(key, out var cached))
+                entry = cached;
+            else if (File.Exists(journalPath))
+            {
+                var json = ReadJournalFileWithRetry(journalPath);
+                if (json != null)
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+            }
+
+            entry ??= new ExecutionJournalEntry
+            {
+                IntentId = intentId,
+                TradingDate = tradingDate,
+                Stream = stream,
+                Instrument = inst
+            };
+
+            entry.IntentId = intentId;
+            entry.TradingDate = tradingDate;
+            entry.Stream = stream;
+            if (string.IsNullOrWhiteSpace(entry.Instrument)) entry.Instrument = inst;
+
+            entry.EntrySubmitted = true;
+            entry.EntrySubmittedAt ??= utcNow.ToString("o");
+            entry.EntryFilled = true;
+            entry.EntryFilledAt ??= utcNow.ToString("o");
+            entry.EntryFilledAtUtc ??= utcNow.ToString("o");
+            entry.EntryOrderType = "TAGGED_BROKER_EXPOSURE_RECOVERY";
+            if (!string.IsNullOrEmpty(brokerOrderId))
+                entry.BrokerOrderId = brokerOrderId;
+
+            entry.EntryFilledQuantityTotal = Math.Max(entry.EntryFilledQuantityTotal, openQtyAbs);
+            if (avgFillPrice.HasValue)
+            {
+                entry.EntryAvgFillPrice = avgFillPrice;
+                entry.FillPrice = avgFillPrice;
+                entry.ActualFillPrice = avgFillPrice;
+            }
+            entry.FillQuantity = entry.EntryFilledQuantityTotal;
+            if (!string.IsNullOrEmpty(normDir))
+                entry.Direction = normDir;
+            if (stopPrice.HasValue && !entry.StopPrice.HasValue)
+                entry.StopPrice = stopPrice;
+            if (targetPrice.HasValue && !entry.TargetPrice.HasValue)
+                entry.TargetPrice = targetPrice;
+
+            entry.TradeCompleted = false;
+
+            _cache[key] = entry;
+            SaveJournal(journalPath, entry);
+            BumpReleaseSuppressionActivity();
+        }
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TAGGED_BROKER_EXPOSURE_RECOVERY_JOURNAL_UPSERT", "ENGINE",
+            new
+            {
+                instrument = inst,
+                intent_id = intentId,
+                broker_order_id = brokerOrderId,
+                open_journal_qty = openQtyAbs,
+                correlation_id = correlationId,
+                note = "TAGGED_ORPHAN_POSITION_RECOVERY — sibling to UNTRACKED; uses real stream/date"
+            }));
+    }
+
     private bool TryCompleteUntrackedFillRecoveryEntry(string tradingDate, string stream, string intentId,
         DateTimeOffset utcNow, string completionReason)
     {
@@ -2645,12 +2743,22 @@ public sealed class ExecutionJournal
     /// Open exposure sum plus stable hash of intent ids with remaining open quantity &gt; 0 (release suppression).
     /// </summary>
     public (int OpenQtySum, long OpenIntentSetHash) GetOpenJournalStructuralStateForInstrument(string executionInstrument,
+        string? canonicalInstrument = null) =>
+        GetOpenJournalStructuralStateForInstrumentFromMap(GetOpenJournalEntriesByInstrument(), executionInstrument,
+            canonicalInstrument);
+
+    /// <summary>
+    /// Same as <see cref="GetOpenJournalStructuralStateForInstrument"/> but reuses a single
+    /// <see cref="GetOpenJournalEntriesByInstrument"/> result for a whole reconciliation/mismatch pass (avoids O(instruments×files) disk replay).
+    /// </summary>
+    public (int OpenQtySum, long OpenIntentSetHash) GetOpenJournalStructuralStateForInstrumentFromMap(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        string executionInstrument,
         string? canonicalInstrument = null)
     {
-        var byInst = GetOpenJournalEntriesByInstrument();
         var sum = 0;
         var openIntentIds = new List<string>();
-        foreach (var kvp in byInst)
+        foreach (var kvp in openByInstrument)
         {
             var key = kvp.Key?.Trim() ?? "";
             if (string.IsNullOrEmpty(key)) continue;
@@ -2671,6 +2779,13 @@ public sealed class ExecutionJournal
         openIntentIds.Sort(StringComparer.OrdinalIgnoreCase);
         return (sum, ReleaseReconciliationRedundancySuppression.ComputeStableOrderedStringSetHashFromSortedList(openIntentIds));
     }
+
+    /// <inheritdoc cref="GetOpenJournalQuantitySumForInstrument"/>
+    public int GetOpenJournalQuantitySumForInstrumentFromMap(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        string executionInstrument,
+        string? canonicalInstrument = null) =>
+        GetOpenJournalStructuralStateForInstrumentFromMap(openByInstrument, executionInstrument, canonicalInstrument).OpenQtySum;
 
     /// <summary>
     /// Force-close orphan journals for an instrument when operator has confirmed account is correct.

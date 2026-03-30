@@ -94,6 +94,16 @@ public sealed class StateConsistencyReleaseReadinessResult
     public int UnexplainedBrokerWorkingCount { get; set; }
     public List<string> Contradictions { get; set; } = new();
     public string Summary { get; set; } = "";
+
+    /// <summary>False when evaluation returned before full inputs (e.g. snapshot missing).</summary>
+    public bool SnapshotSufficient { get; set; }
+
+    /// <summary>Mirrors inputs used for Evaluate (diagnostics / gate telemetry).</summary>
+    public int DiagnosticBrokerPositionQty { get; set; }
+    public int DiagnosticJournalOpenQty { get; set; }
+    public int DiagnosticBrokerWorkingCount { get; set; }
+    public int DiagnosticIeaOwnedPlusAdoptedWorking { get; set; }
+    public int DiagnosticPendingAdoptionCandidateCount { get; set; }
 }
 
 /// <summary>P1.5-E: Structured result after an instrument-scoped gate reconciliation pass.</summary>
@@ -126,6 +136,7 @@ public static class StateConsistencyReleaseEvaluator
 
         if (!i.SnapshotSufficient)
         {
+            r.SnapshotSufficient = false;
             r.Summary = "snapshot_insufficient";
             r.Contradictions.Add("NO_SNAPSHOT");
             return r;
@@ -172,6 +183,13 @@ public static class StateConsistencyReleaseEvaluator
         r.Summary = r.ReleaseReady
             ? "release_ready"
             : string.Join(";", r.Contradictions);
+
+        r.SnapshotSufficient = true;
+        r.DiagnosticBrokerPositionQty = i.BrokerPositionQty;
+        r.DiagnosticJournalOpenQty = i.JournalOpenQty;
+        r.DiagnosticBrokerWorkingCount = i.BrokerWorkingCount;
+        r.DiagnosticIeaOwnedPlusAdoptedWorking = i.IeaOwnedPlusAdoptedWorking;
+        r.DiagnosticPendingAdoptionCandidateCount = i.PendingAdoptionCandidateCount;
         return r;
     }
 
@@ -180,6 +198,7 @@ public static class StateConsistencyReleaseEvaluator
         return new StateConsistencyReleaseReadinessResult
         {
             Instrument = instrument?.Trim() ?? "",
+            SnapshotSufficient = false,
             Summary = reason,
             Contradictions = new List<string> { reason }
         };

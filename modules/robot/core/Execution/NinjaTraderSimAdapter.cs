@@ -53,6 +53,64 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         public long TotalSkips;
     }
 
+    /// <summary>Avoid immediate repeat of tagged repair when broker/journal evidence unchanged (e.g. non-owning charts).</summary>
+    private sealed class TaggedRepairCooldownEntry
+    {
+        public DateTimeOffset LastFailureUtc;
+        public int AccountQty;
+        public int JournalQty;
+        public string LastFailureResultCode = "";
+    }
+
+    private readonly object _taggedRepairCooldownLock = new();
+    private readonly Dictionary<string, TaggedRepairCooldownEntry> _taggedRepairCooldownByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan TaggedRepairFailureCooldownWindow = TimeSpan.FromSeconds(3);
+
+    private static bool IsTaggedRepairFailureCooldownEligible(string code) =>
+        string.Equals(code, "NO_QUALIFYING_INTENT_CONTEXT", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(code, "NO_OWNERSHIP_EVIDENCE", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(code, "SNAPSHOT_ZERO_POSITION", StringComparison.OrdinalIgnoreCase);
+
+    private bool TrySuppressTaggedRepairRepeatedFailure(string instTrim, int accountQtyAbs, int journalOpenQtySum,
+        DateTimeOffset utcNow, out string resultCode)
+    {
+        resultCode = "";
+        lock (_taggedRepairCooldownLock)
+        {
+            if (!_taggedRepairCooldownByInstrument.TryGetValue(instTrim, out var prev)) return false;
+            if (!IsTaggedRepairFailureCooldownEligible(prev.LastFailureResultCode)) return false;
+            if (prev.AccountQty != accountQtyAbs || prev.JournalQty != journalOpenQtySum) return false;
+            if ((utcNow - prev.LastFailureUtc) >= TaggedRepairFailureCooldownWindow) return false;
+            resultCode = "SUPPRESSED_TAGGED_REPAIR_COOLDOWN";
+            return true;
+        }
+    }
+
+    private void RecordTaggedRepairFailureForCooldown(string instTrim, int accountQtyAbs, int journalOpenQtySum,
+        DateTimeOffset utcNow, string failureResultCode)
+    {
+        if (!IsTaggedRepairFailureCooldownEligible(failureResultCode)) return;
+        lock (_taggedRepairCooldownLock)
+        {
+            _taggedRepairCooldownByInstrument[instTrim] = new TaggedRepairCooldownEntry
+            {
+                LastFailureUtc = utcNow,
+                AccountQty = accountQtyAbs,
+                JournalQty = journalOpenQtySum,
+                LastFailureResultCode = failureResultCode
+            };
+        }
+    }
+
+    private void ClearTaggedRepairFailureCooldown(string instTrim)
+    {
+        lock (_taggedRepairCooldownLock)
+        {
+            _taggedRepairCooldownByInstrument.Remove(instTrim);
+        }
+    }
+
     // Order tracking: intentId -> NT order info (or IEA's when use_instrument_execution_authority)
     private readonly ConcurrentDictionary<string, OrderInfo> _orderMap = new();
     
@@ -2543,6 +2601,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 set.Add(id);
         }
         return set.Count == 0 ? Array.Empty<string>() : set.ToList();
+    }
+
+    /// <inheritdoc cref="IExecutionAdapter.TryRepairTaggedBrokerWithoutJournal"/>
+    public bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail)
+    {
+#if !NINJATRADER
+        resultCode = "NOT_NINJATRADER_BUILD";
+        detail = null;
+        return false;
+#else
+        return TryRepairTaggedBrokerWithoutJournalCore(instrument, accountQtyAbs, journalOpenQtySum, utcNow, out resultCode, out detail);
+#endif
     }
 
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)

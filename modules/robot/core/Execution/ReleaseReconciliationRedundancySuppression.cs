@@ -366,7 +366,13 @@ public sealed class ReleaseReconciliationRedundancySuppression
             UnexplainedBrokerPositionQty = r.UnexplainedBrokerPositionQty,
             UnexplainedBrokerWorkingCount = r.UnexplainedBrokerWorkingCount,
             Contradictions = r.Contradictions != null ? new List<string>(r.Contradictions) : new List<string>(),
-            Summary = r.Summary ?? ""
+            Summary = r.Summary ?? "",
+            SnapshotSufficient = r.SnapshotSufficient,
+            DiagnosticBrokerPositionQty = r.DiagnosticBrokerPositionQty,
+            DiagnosticJournalOpenQty = r.DiagnosticJournalOpenQty,
+            DiagnosticBrokerWorkingCount = r.DiagnosticBrokerWorkingCount,
+            DiagnosticIeaOwnedPlusAdoptedWorking = r.DiagnosticIeaOwnedPlusAdoptedWorking,
+            DiagnosticPendingAdoptionCandidateCount = r.DiagnosticPendingAdoptionCandidateCount
         };
     }
 

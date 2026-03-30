@@ -5063,7 +5063,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 accountQty += Math.Abs(p.Quantity);
             }
         }
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+        var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openJournalMap, inst, execVariant);
         var streamRows = GetStreamOpenExposureForInstrument(inst);
         // IEA registry / recovery routing key for the mismatch instrument (matches RequestRecoveryForInstrument).
         var mismatchExecutionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, null);
@@ -5336,7 +5337,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
             var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
             var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInst, inst, execVariant);
             var actGen = _releaseReconRedundancy.ExecutionActivityGeneration;
 
             // Non-owner single-writer: skip expensive mismatch assembly while another instance owns the active
@@ -6045,6 +6046,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow, forceFullEvaluation: true);
+        // Bounded second probe: journal/registry may update synchronously during gate recovery; fresh snapshot avoids waiting for next 5s gate tick.
+        if (!readiness.ReleaseReady)
+        {
+            try
+            {
+                var snapRecheck = _executionAdapter.GetAccountSnapshot(utcNow);
+                if (snapRecheck != null)
+                    readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapRecheck, utcNow, forceFullEvaluation: true);
+            }
+            catch
+            {
+                // keep prior readiness
+            }
+        }
+
         result.ReleaseReadyAfter = readiness.ReleaseReady;
         result.UnexplainedWorkingCountAfter = readiness.UnexplainedBrokerWorkingCount;
         result.UnexplainedPositionQtyAfter = readiness.UnexplainedBrokerPositionQty;
@@ -6199,13 +6215,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_ADAPTER" };
 
         var byInst = _executionJournal.GetOpenJournalEntriesByInstrument();
-        if (!byInst.TryGetValue(req.Instrument, out var entries) || entries.Count == 0)
+        List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>? entries = null;
+        string? canonKey = null;
+        if (byInst.TryGetValue(req.Instrument, out var el0) && el0.Count > 0)
+            entries = el0;
+        else
         {
-            // Fallback: match by canonical instrument (e.g. ES vs MES)
-            var key = byInst.Keys.FirstOrDefault(k => ExecutionInstrumentResolver.IsSameInstrument(k, req.Instrument));
-            if (key == null || !byInst.TryGetValue(key, out entries) || entries.Count == 0)
-                return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_JOURNAL_ENTRY" };
+            canonKey = byInst.Keys.FirstOrDefault(k => ExecutionInstrumentResolver.IsSameInstrument(k, req.Instrument));
+            if (canonKey != null && byInst.TryGetValue(canonKey, out var el1) && el1.Count > 0)
+                entries = el1;
         }
+        if (entries == null || entries.Count == 0)
+        {
+            var bAbs = Math.Abs(req.BrokerPositionQty);
+            if (bAbs > 0)
+                _executionAdapter.TryRepairTaggedBrokerWithoutJournal(req.Instrument, bAbs, 0, DateTimeOffset.UtcNow, out _, out _);
+            byInst = _executionJournal.GetOpenJournalEntriesByInstrument();
+            if (byInst.TryGetValue(req.Instrument, out el0) && el0.Count > 0)
+                entries = el0;
+            else
+            {
+                canonKey = byInst.Keys.FirstOrDefault(k => ExecutionInstrumentResolver.IsSameInstrument(k, req.Instrument));
+                if (canonKey != null && byInst.TryGetValue(canonKey, out var elRetry) && elRetry.Count > 0)
+                    entries = elRetry;
+            }
+        }
+        if (entries == null || entries.Count == 0)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_JOURNAL_ENTRY" };
 
         // Match by direction; pick first with matching direction and sufficient qty
         var match = entries.FirstOrDefault(e =>

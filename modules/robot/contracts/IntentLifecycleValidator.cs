@@ -71,6 +71,8 @@ public static class IntentLifecycleValidator
     public static bool IsIdempotentIntentReplay(IntentLifecycleState current, IntentLifecycleTransition transition) =>
         (current, transition) switch
         {
+            // IEA SubmitEntryIntentCommand may apply SUBMIT_ENTRY before adapter boundary; stream path applies at submit.
+            (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
             (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.ENTRY_FILLED) => true,
             (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED) => true,
             (IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_ACCEPTED) => true,

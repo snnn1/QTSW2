@@ -197,6 +197,13 @@ public interface IExecutionAdapter
     IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
 
     /// <summary>
+    /// Broker shows open position but journal open filled sum is zero: attempt tagged recovery journal upsert when
+    /// robot ownership evidence is strong (tags, OrderMap, adoption candidates). Not used for empty decoded intent (untracked path).
+    /// </summary>
+    /// <returns>True when a qualifying journal row was written.</returns>
+    bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail);
+
+    /// <summary>
     /// Retry deferred adoption scan when candidates were empty but broker had orders (journal load race).
     /// Call from periodic path (e.g. reconciliation) so retry does not depend only on execution updates.
     /// No-op for adapters without IEA.
