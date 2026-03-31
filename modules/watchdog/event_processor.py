@@ -122,6 +122,8 @@ class EventProcessor:
             # Phase 7-8: Clear pending orders on new run (avoids stale stuck detection)
             if hasattr(self._state_manager, "_pending_orders"):
                 self._state_manager._pending_orders.clear()
+            if hasattr(self._state_manager, "clear_broker_order_id_links"):
+                self._state_manager.clear_broker_order_id_links()
             # Clear ALL streams on engine start (new run) - they will be re-initialized
             # This prevents showing stale ARMED/RANGE_BUILDING states from previous runs
             # CRITICAL: Use timetable's trading_date (authoritative), not event's trading_date
@@ -880,7 +882,10 @@ class EventProcessor:
         elif event_type == "PROTECTIVE_ORDERS_FAILED_FLATTENED":
             self._state_manager.record_protective_failure(timestamp_utc)
         
-        elif event_type == "PROTECTIVE_ORDERS_SUBMITTED":
+        elif event_type in (
+            "PROTECTIVE_ORDERS_SUBMITTED",
+            "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE",
+        ):
             intent_id = data.get("intent_id") or event.get("intent_id")
             if intent_id:
                 self._state_manager.record_protective_order_submitted(str(intent_id), timestamp_utc)
@@ -957,6 +962,24 @@ class EventProcessor:
                 logger.info(
                     f"TRADE_RECONCILED: Stream {canonical_stream} ({trading_date}) -> DONE "
                     f"(intent_id={intent_id}, reason={completion_reason})"
+                )
+
+        elif event_type == "TRADE_COMPLETED":
+            # StreamStateMachine terminal (injects + normal completions); align exposure/stream with robot.
+            intent_id = data.get("intent_id") or event.get("intent_id")
+            stream = data.get("stream") or event.get("stream")
+            trading_date = event.get("trading_date") or data.get("trading_date")
+            if intent_id and str(intent_id) in self._state_manager._intent_exposures:
+                self._state_manager._intent_exposures[str(intent_id)].state = "CLOSED"
+            if trading_date and stream:
+                instrument = data.get("instrument") or event.get("instrument") or ""
+                execution_instrument = event.get("execution_instrument") or instrument
+                canonical_stream = canonicalize_stream(stream, execution_instrument) if execution_instrument else stream
+                completion_reason = data.get("completion_reason") or data.get("exit_reason") or "TRADE_COMPLETED"
+                self._state_manager.update_stream_state(
+                    trading_date, canonical_stream, "DONE",
+                    committed=True, commit_reason=str(completion_reason),
+                    state_entry_time_utc=timestamp_utc
                 )
         
         elif event_type == "INTENT_EXIT_FILL":
@@ -1114,21 +1137,30 @@ class EventProcessor:
             # RECONCILIATION_PASS_SUMMARY and SESSION_FORCED_FLATTENED are global/ambiguous —
             # do NOT use to clear per-instrument unmatched state
 
+        elif event_type == "ORDER_REGISTRY_BROKER_ID_LINKED":
+            canon = (data.get("canonical_broker_order_id") or data.get("canonical") or "").strip()
+            alt = (data.get("broker_order_id") or "").strip()
+            if canon and alt:
+                self._state_manager.record_broker_order_id_link(canon, alt)
+
         elif event_type == "ORDER_SUBMIT_SUCCESS":
             # Phase 7-8: Track for stuck order and latency spike detection
             broker_order_id = data.get("broker_order_id") or event.get("broker_order_id")
             if broker_order_id:
                 order_type = str(data.get("order_type", "entry") or "entry").upper()
-                if "PROTECTIVE" in order_type and "TARGET" in order_type:
+                if "TARGET" in order_type:
                     role = "target"
-                elif "PROTECTIVE" in order_type and "STOP" in order_type:
+                elif "STOP" in order_type or "PROTECTIVE" in order_type:
                     role = "stop"
                 else:
                     role = "entry"
+                intent_id_submit = (data.get("intent_id") or event.get("intent_id") or "").strip()
+                if role in ("stop", "target") and intent_id_submit:
+                    self._state_manager.record_protective_order_submitted(intent_id_submit, timestamp_utc)
                 self._state_manager.record_order_submitted(
                     broker_order_id=broker_order_id,
                     submitted_at=timestamp_utc,
-                    intent_id=data.get("intent_id", "") or event.get("intent_id", ""),
+                    intent_id=intent_id_submit,
                     instrument=data.get("instrument", "") or event.get("instrument", ""),
                     role=role,
                     stream_key=data.get("stream_key", "") or data.get("stream", "") or event.get("stream_id", ""),
@@ -1136,28 +1168,73 @@ class EventProcessor:
 
         elif event_type == "EXECUTION_FILLED":
             # Phase 8: Check latency spike on fill
-            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
-            if broker_order_id:
+            broker_order_id = (data.get("broker_order_id") or event.get("broker_order_id") or "").strip()
+            order_id_alt = (data.get("order_id") or "").strip()
+            primary = broker_order_id or order_id_alt or event.get("broker_order_id") or event.get("order_id") or ""
+            if primary:
                 qty = data.get("quantity") or data.get("qty") or data.get("fill_quantity")
                 price = data.get("price") or data.get("fill_price") or data.get("avg_fill_price")
+                inst = (data.get("instrument") or event.get("instrument") or "").strip()
+                iid = (data.get("intent_id") or event.get("intent_id") or "").strip()
                 self._state_manager.record_order_filled(
-                    broker_order_id=broker_order_id,
+                    broker_order_id=broker_order_id or primary,
                     filled_at=timestamp_utc,
                     qty=qty,
                     price=float(price) if price is not None else None,
+                    order_id_alt=order_id_alt if order_id_alt else None,
+                    instrument=inst,
+                    intent_id=iid,
                 )
+
+        elif event_type == "EXECUTION_PARTIAL_FILL":
+            rem = data.get("remaining_qty")
+            try:
+                rem_int = int(rem) if rem is not None and rem != "" else None
+            except (TypeError, ValueError):
+                rem_int = None
+            if rem_int == 0:
+                broker_order_id = (data.get("broker_order_id") or event.get("broker_order_id") or "").strip()
+                order_id_alt = (data.get("order_id") or "").strip()
+                primary = broker_order_id or order_id_alt or event.get("broker_order_id") or ""
+                if primary:
+                    inst = (data.get("instrument") or event.get("instrument") or "").strip()
+                    iid = (data.get("intent_id") or event.get("intent_id") or "").strip()
+                    qty = data.get("fill_quantity") or data.get("quantity") or data.get("qty")
+                    price = data.get("fill_price") or data.get("price")
+                    self._state_manager.record_order_filled(
+                        broker_order_id=broker_order_id or primary,
+                        filled_at=timestamp_utc,
+                        qty=qty,
+                        price=float(price) if price is not None else None,
+                        order_id_alt=order_id_alt if order_id_alt else None,
+                        instrument=inst,
+                        intent_id=iid,
+                    )
 
         elif event_type == "ORDER_CANCELLED":
             # Phase 7-8: Remove from pending
-            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
-            if broker_order_id:
-                self._state_manager.record_order_cancelled(broker_order_id)
+            broker_order_id = (data.get("broker_order_id") or event.get("broker_order_id") or "").strip()
+            order_id_alt = (data.get("order_id") or "").strip()
+            primary = broker_order_id or order_id_alt
+            if primary:
+                self._state_manager.record_order_cancelled(
+                    broker_order_id=broker_order_id or primary,
+                    order_id_alt=order_id_alt if order_id_alt and order_id_alt != (broker_order_id or primary) else None,
+                    timestamp_utc=timestamp_utc,
+                )
 
         elif event_type == "ORDER_REJECTED":
             # Phase 7-8: Remove from pending (rejected orders never fill/cancel; were falsely triggering ORDER_STUCK_DETECTED)
-            broker_order_id = data.get("broker_order_id") or data.get("order_id") or event.get("broker_order_id")
-            if broker_order_id:
-                self._state_manager.record_order_cancelled(broker_order_id)
+            broker_order_id = (data.get("broker_order_id") or event.get("broker_order_id") or "").strip()
+            order_id_alt = (data.get("order_id") or "").strip()
+            primary = broker_order_id or order_id_alt
+            if primary:
+                self._state_manager.record_order_cancelled(
+                    broker_order_id=broker_order_id or primary,
+                    order_id_alt=order_id_alt if order_id_alt and order_id_alt != (broker_order_id or primary) else None,
+                    timestamp_utc=timestamp_utc,
+                    event_type="ORDER_REJECTED",
+                )
 
         elif event_type == "EXECUTION_POLICY_VALIDATION_FAILED":
             # Extract execution policy validation failure information

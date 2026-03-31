@@ -24,9 +24,11 @@ Write-Host ""
 
 # Stage 2: Deploy to NinjaTrader
 Write-Host "Deploying Robot to NinjaTrader..." -ForegroundColor Yellow
-$deployArgs = @()
-if ($ForceCacheClear) { $deployArgs += "-ForceCacheClear" }
-& "$projectRoot\scripts\deploy_to_ninjatrader.ps1" @deployArgs
+if ($ForceCacheClear) {
+    & "$projectRoot\scripts\deploy_to_ninjatrader.ps1" -ForceCacheClear
+} else {
+    & "$projectRoot\scripts\deploy_to_ninjatrader.ps1"
+}
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[FAIL] Deploy failed" -ForegroundColor Red
     exit 1

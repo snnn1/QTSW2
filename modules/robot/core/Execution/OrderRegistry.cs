@@ -27,13 +27,17 @@ public sealed class OrderRegistry
         {
             (OrderLifecycleState.CREATED, OrderLifecycleState.SUBMITTED) => true,
             (OrderLifecycleState.SUBMITTED, OrderLifecycleState.WORKING) => true,
+            (OrderLifecycleState.SUBMITTED, OrderLifecycleState.PART_FILLED) => true,
             (OrderLifecycleState.SUBMITTED, OrderLifecycleState.FILLED) => true,  // Fast fill before WORKING
+            (OrderLifecycleState.SUBMITTED, OrderLifecycleState.CANCELED) => true,
             (OrderLifecycleState.SUBMITTED, OrderLifecycleState.REJECTED) => true,
             (OrderLifecycleState.WORKING, OrderLifecycleState.PART_FILLED) => true,
             (OrderLifecycleState.WORKING, OrderLifecycleState.FILLED) => true,
             (OrderLifecycleState.WORKING, OrderLifecycleState.CANCELED) => true,
+            (OrderLifecycleState.WORKING, OrderLifecycleState.REJECTED) => true,
             (OrderLifecycleState.PART_FILLED, OrderLifecycleState.FILLED) => true,
             (OrderLifecycleState.PART_FILLED, OrderLifecycleState.CANCELED) => true,
+            (OrderLifecycleState.PART_FILLED, OrderLifecycleState.REJECTED) => true,
             (OrderLifecycleState.FILLED, _) => false,
             (OrderLifecycleState.CANCELED, _) => false,
             (OrderLifecycleState.REJECTED, _) => false,
@@ -146,6 +150,43 @@ public sealed class OrderRegistry
     /// <summary>Phase 2: Get broker order ids of WORKING orders.</summary>
     public IReadOnlyList<string> GetWorkingOrderIds() =>
         _byBrokerOrderId.Where(kvp => kvp.Value.LifecycleState == OrderLifecycleState.WORKING).Select(kvp => kvp.Key).ToList();
+
+    /// <summary>
+    /// Canonical id plus any alternate native ids linked via <see cref="LinkBrokerOrderIdAlias"/> (for broker object lookup).
+    /// </summary>
+    public IReadOnlyList<string> GetBrokerOrderIdVariants(string canonicalBrokerOrderId)
+    {
+        var list = new List<string>();
+        if (string.IsNullOrEmpty(canonicalBrokerOrderId)) return list;
+        list.Add(canonicalBrokerOrderId);
+        foreach (var kvp in _brokerOrderIdAliasToCanonical)
+        {
+            if (string.Equals(kvp.Value, canonicalBrokerOrderId, StringComparison.OrdinalIgnoreCase))
+                list.Add(kvp.Key);
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// OWNED / ADOPTED / RECOVERABLE rows in SUBMITTED, WORKING, or PART_FILLED — integrity sweep input.
+    /// </summary>
+    public IReadOnlyList<OrderRegistryEntry> GetMismatchTrustedLiveEntries()
+    {
+        var list = new List<OrderRegistryEntry>();
+        foreach (var e in _byBrokerOrderId.Values)
+        {
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                continue;
+            if (e.LifecycleState != OrderLifecycleState.SUBMITTED &&
+                e.LifecycleState != OrderLifecycleState.WORKING &&
+                e.LifecycleState != OrderLifecycleState.PART_FILLED)
+                continue;
+            list.Add(e);
+        }
+        return list;
+    }
 
     /// <summary>Count of owned+adopted orders in SUBMITTED, WORKING, or PART_FILLED (non-terminal live).
     /// Used for ORDER_REGISTRY_MISSING reconciliation — avoids false positives during SUBMITTED→WORKING transition.</summary>

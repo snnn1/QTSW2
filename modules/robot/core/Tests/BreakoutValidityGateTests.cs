@@ -1,8 +1,9 @@
-// Unit tests for breakout validity gate during recovery.
+// Unit tests for post-lock breakout excursion during recovery.
 // Run: dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --test BREAKOUT_VALIDITY_GATE
 //
-// Verifies: ExecutePendingRecoveryAction blocks resubmit when price has crossed breakout,
-// within tolerance still allowed, recovery action cleared when blocked.
+// Verifies: ExecutePendingRecoveryAction blocks resubmit when a post-slot bar touches either breakout
+// (bar path, not bid/ask snapshot); inside-range bars allow resubmit; snapshot-only cross without
+// bar touch allows resubmit; recovery clears after commit.
 
 using System;
 using System.Collections.Generic;
@@ -16,7 +17,7 @@ namespace QTSW2.Robot.Core.Tests;
 public static class BreakoutValidityGateTests
 {
     /// <summary>Mock adapter with configurable bid/ask for breakout validity tests.</summary>
-    private sealed class MockPriceAdapter : IExecutionAdapter
+    public sealed class MockPriceAdapter : IExecutionAdapter
     {
         private readonly NullExecutionAdapter _base;
         public decimal? TestBid { get; set; }
@@ -87,21 +88,25 @@ public static class BreakoutValidityGateTests
             var (sm, adapter) = CreateStreamWithPendingResubmit(tempRoot);
             if (sm == null) return (true, null);
 
-            // brkLong=4501, tolerance=2*0.25=0.5, invalid if ask >= 4501.5
+            // brkLong=4501 — post-slot bar high >= 4501 invalidates setup (path-based).
             adapter.TestBid = 4500m;
-            adapter.TestAsk = 4502m; // Above 4501.5 - long invalid
+            adapter.TestAsk = 4500.5m;
+            var postSlot = sm.SlotTimeUtc.AddMinutes(1);
+            sm.OnBar(postSlot, 4500m, 4501m, 4499.5m, 4500m, DateTimeOffset.UtcNow, true);
+
+            if (!sm.Committed)
+                return (false, "Long bar touch: expected stream committed");
+            if (sm.CommitReason != "NO_TRADE_BREAKOUT_ALREADY_OCCURRED")
+                return (false, "Long bar touch: expected NO_TRADE_BREAKOUT_ALREADY_OCCURRED commit reason");
 
             var snap = new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 0 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
-
             var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
             if (executed)
-                return (false, "Long crossed: expected ExecutePendingRecoveryAction=false (blocked)");
-            if (!sm.Committed)
-                return (false, "Long crossed: expected stream committed as NO_TRADE");
+                return (false, "Long bar touch: expected ExecutePendingRecoveryAction=false after commit");
             return (true, null);
         }
         finally
@@ -118,21 +123,24 @@ public static class BreakoutValidityGateTests
             var (sm, adapter) = CreateStreamWithPendingResubmit(tempRoot);
             if (sm == null) return (true, null);
 
-            // brkShort=4494, tolerance=0.5, invalid if bid <= 4493.5
-            adapter.TestBid = 4493m; // Below 4493.5 - short invalid
-            adapter.TestAsk = 4500m;
+            adapter.TestBid = 4495m;
+            adapter.TestAsk = 4496m;
+            var postSlot = sm.SlotTimeUtc.AddMinutes(1);
+            sm.OnBar(postSlot, 4495m, 4495.5m, 4494m, 4494.75m, DateTimeOffset.UtcNow, true);
+
+            if (!sm.Committed)
+                return (false, "Short bar touch: expected stream committed");
+            if (sm.CommitReason != "NO_TRADE_BREAKOUT_ALREADY_OCCURRED")
+                return (false, "Short bar touch: expected NO_TRADE_BREAKOUT_ALREADY_OCCURRED commit reason");
 
             var snap = new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 0 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
-
             var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
             if (executed)
-                return (false, "Short crossed: expected ExecutePendingRecoveryAction=false (blocked)");
-            if (!sm.Committed)
-                return (false, "Short crossed: expected stream committed as NO_TRADE");
+                return (false, "Short bar touch: expected ExecutePendingRecoveryAction=false after commit");
             return (true, null);
         }
         finally
@@ -149,9 +157,14 @@ public static class BreakoutValidityGateTests
             var (sm, adapter) = CreateStreamWithPendingResubmit(tempRoot);
             if (sm == null) return (true, null);
 
-            // Within tolerance: ask=4501.25 (< 4501.5), bid=4494.25 (> 4493.5)
             adapter.TestBid = 4494.25m;
             adapter.TestAsk = 4501.25m;
+
+            // Post-slot bar stays inside breakouts (high < brkLong, low > brkShort)
+            var postSlot = sm.SlotTimeUtc.AddMinutes(1);
+            sm.OnBar(postSlot, 4496m, 4500m, 4495m, 4498m, DateTimeOffset.UtcNow, true);
+            if (sm.Committed)
+                return (false, "Inside bar path: expected stream not committed before recovery");
 
             var snap = new AccountSnapshot
             {
@@ -179,9 +192,14 @@ public static class BreakoutValidityGateTests
             var (sm, adapter) = CreateStreamWithPendingResubmit(tempRoot);
             if (sm == null) return (true, null);
 
-            // Both crossed beyond tolerance
+            // Snapshot would fail old unified gate, but no post-lock bar path → recovery still allowed.
             adapter.TestBid = 4492m;
             adapter.TestAsk = 4503m;
+
+            var postSlot = sm.SlotTimeUtc.AddMinutes(1);
+            sm.OnBar(postSlot, 4496m, 4500m, 4495m, 4498m, DateTimeOffset.UtcNow, true);
+            if (sm.Committed)
+                return (false, "Snapshot-only cross: did not expect commit from bar path");
 
             var snap = new AccountSnapshot
             {
@@ -190,8 +208,8 @@ public static class BreakoutValidityGateTests
             };
 
             var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
-            if (executed)
-                return (false, "Beyond tolerance: expected blocked");
+            if (!executed)
+                return (false, "Snapshot-only cross: expected recovery submit (bar path clean)");
             return (true, null);
         }
         finally
@@ -208,8 +226,10 @@ public static class BreakoutValidityGateTests
             var (sm, adapter) = CreateStreamWithPendingResubmit(tempRoot);
             if (sm == null) return (true, null);
 
-            adapter.TestBid = 4493m;
-            adapter.TestAsk = 4502m;
+            adapter.TestBid = 4495m;
+            adapter.TestAsk = 4496m;
+            var postSlot = sm.SlotTimeUtc.AddMinutes(1);
+            sm.OnBar(postSlot, 4495m, 4495.5m, 4494m, 4494.25m, DateTimeOffset.UtcNow, true);
 
             var snap = new AccountSnapshot
             {
@@ -288,17 +308,17 @@ public static class BreakoutValidityGateTests
         }
     }
 
-    private static (StreamStateMachine? sm, MockPriceAdapter adapter) CreateStreamWithPendingResubmit(string tempRoot)
+    public static (StreamStateMachine? sm, MockPriceAdapter adapter) CreateStreamWithPendingResubmit(string tempRoot)
     {
-        var tradingDate = DateOnly.FromDateTime(DateTime.UtcNow);
+        var tradingDate = new DateOnly(2026, 6, 3);
         var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
         var streamId = "ES1";
 
         var rangesDir = Path.Combine(tempRoot, "logs", "robot");
         Directory.CreateDirectory(rangesDir);
-        var rangesFile = Path.Combine(rangesDir, $"ranges_{tradingDateStr}.jsonl");
-        var rangeJson = $"{{\"event_type\":\"RANGE_LOCKED\",\"trading_day\":\"{tradingDateStr}\",\"stream_id\":\"{streamId}\",\"canonical_instrument\":\"ES\",\"execution_instrument\":\"ES\",\"range_high\":4500.25,\"range_low\":4495.00,\"range_size\":5.25,\"freeze_close\":4500.00,\"range_high_rounded\":4500.25,\"range_low_rounded\":4495.00,\"breakout_long\":4501.00,\"breakout_short\":4494.00,\"range_start_time_chicago\":\"07:00\",\"range_start_time_utc\":\"2026-03-12T12:00:00Z\",\"range_end_time_chicago\":\"07:30\",\"range_end_time_utc\":\"2026-03-12T12:30:00Z\",\"locked_at_chicago\":\"07:30\",\"locked_at_utc\":\"2026-03-12T12:30:00Z\"}}";
-        File.AppendAllText(rangesFile, rangeJson + Environment.NewLine);
+        var hydrationFile = Path.Combine(rangesDir, $"hydration_{tradingDateStr}.jsonl");
+        var hydrationJson = "{\"event_type\":\"RANGE_LOCKED\",\"trading_day\":\"" + tradingDateStr + "\",\"stream_id\":\"" + streamId + "\",\"canonical_instrument\":\"ES\",\"execution_instrument\":\"ES\",\"session\":\"S1\",\"slot_time_chicago\":\"07:30\",\"timestamp_utc\":\"2026-06-03T12:30:00.0000000+00:00\",\"timestamp_chicago\":\"2026-06-03T07:30:00-05:00\",\"state\":\"RANGE_LOCKED\",\"data\":{\"range_high\":4500.25,\"range_low\":4495.00,\"freeze_close\":4500.00,\"breakout_long\":4501.00,\"breakout_short\":4494.00}}";
+        File.AppendAllText(hydrationFile, hydrationJson + Environment.NewLine);
 
         var spec = OrderReconciliationRecoveryTests.LoadMinimalSpecForTests();
         var time = new TimeService(spec.timezone);

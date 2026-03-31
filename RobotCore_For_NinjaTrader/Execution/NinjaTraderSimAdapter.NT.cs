@@ -2400,6 +2400,46 @@ public sealed partial class NinjaTraderSimAdapter
         EnqueueExecutionIngressNormal(executionObj, orderObj, instTrace);
     }
 
+    /// <summary>Resolve OrderInfo for entry or protective leg (OrderMap keys differ for STOP/TARGET).</summary>
+    private bool TryGetOrderInfoForIntentAndLeg(string intentId, string? tagLeg, out OrderInfo? orderInfo)
+    {
+        orderInfo = null;
+        if (OrderMap.TryGetValue(intentId, out var oi) && oi != null)
+        {
+            orderInfo = oi;
+            return true;
+        }
+        if (string.Equals(tagLeg, "STOP", StringComparison.OrdinalIgnoreCase) &&
+            OrderMap.TryGetValue($"{intentId}:STOP", out oi) && oi != null)
+        {
+            orderInfo = oi;
+            return true;
+        }
+        if (string.Equals(tagLeg, "TARGET", StringComparison.OrdinalIgnoreCase) &&
+            OrderMap.TryGetValue($"{intentId}:TARGET", out oi) && oi != null)
+        {
+            orderInfo = oi;
+            return true;
+        }
+        return false;
+    }
+
+    private static string? LegTagFromOrderTypeForIeResolution(string? orderTypeFromTag)
+    {
+        if (string.Equals(orderTypeFromTag, "STOP", StringComparison.OrdinalIgnoreCase)) return "STOP";
+        if (string.Equals(orderTypeFromTag, "TARGET", StringComparison.OrdinalIgnoreCase)) return "TARGET";
+        return null;
+    }
+
+    private string ResolveCanonicalBrokerOrderIdForIeLifecycle(string brokerIdFromEvent, string intentId, string? legTag)
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return brokerIdFromEvent;
+        if (string.IsNullOrEmpty(brokerIdFromEvent)) return brokerIdFromEvent;
+        if (_iea.TryResolveForExecutionUpdate(brokerIdFromEvent, intentId, legTag, out var re, out _) && re != null)
+            return re.BrokerOrderId ?? brokerIdFromEvent;
+        return brokerIdFromEvent;
+    }
+
     /// <summary>
     /// When NT reports a post-ack broker/native id on <see cref="Order.OrderId"/> while IEA registered the pre-submit id,
     /// bind the new id to the existing registry row before lifecycle/execution paths resolve by broker id.
@@ -2413,19 +2453,27 @@ public sealed partial class NinjaTraderSimAdapter
         if (string.IsNullOrEmpty(incomingId)) return;
         if (_iea.TryResolveByBrokerOrderId(incomingId, out _)) return;
 
-        if (!OrderMap.TryGetValue(intentId, out var orderInfo) || orderInfo == null) return;
-
         var legForResolve = tagLeg == "STOP" || tagLeg == "TARGET" ? tagLeg : null;
-        if (!_iea.TryResolveForExecutionUpdate(orderInfo.OrderId ?? "", intentId, legForResolve, out var regEntry, out _) || regEntry == null)
-            return;
+        OrderRegistryEntry? regEntry = null;
+        if (!_iea.TryResolveForExecutionUpdate(incomingId, intentId, legForResolve, out regEntry, out _) || regEntry == null)
+        {
+            if (!TryGetOrderInfoForIntentAndLeg(intentId, tagLeg, out var oiLookup) || oiLookup == null) return;
+            if (!_iea.TryResolveForExecutionUpdate(oiLookup.OrderId ?? "", intentId, legForResolve, out regEntry, out _) ||
+                regEntry == null)
+                return;
+        }
 
         var canonical = regEntry.BrokerOrderId ?? "";
         if (string.IsNullOrEmpty(canonical) || string.Equals(incomingId, canonical, StringComparison.OrdinalIgnoreCase)) return;
 
-        var instrument = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument ?? "";
+        var instrument = order.Instrument?.MasterInstrument?.Name ?? "";
+        if (TryGetOrderInfoForIntentAndLeg(intentId, tagLeg, out var oiInst) && oiInst != null && !string.IsNullOrEmpty(oiInst.Instrument))
+            instrument = oiInst.Instrument ?? instrument;
+
         if (!_iea.LinkBrokerOrderIdAlias(incomingId, canonical, utcNow, intentId, instrument)) return;
 
-        orderInfo.OrderId = incomingId;
+        if (TryGetOrderInfoForIntentAndLeg(intentId, tagLeg, out var oiBump) && oiBump != null)
+            oiBump.OrderId = incomingId;
     }
 
     /// <summary>
@@ -2470,16 +2518,40 @@ public sealed partial class NinjaTraderSimAdapter
         // Pre-ack / post-ack: Sim may report a new OrderId on the Order while registry + OrderMap still key the id from submit.
         TryLinkBrokerOrderIdFromOrderUpdate(order, intentId, encodedTag, parsed.Leg, utcNow);
 
-        // Phase 1 Execution Ownership: Resolve via registry and update lifecycle
-        if (_useInstrumentExecutionAuthority && _iea != null && _iea.TryResolveByBrokerOrderId(order.OrderId, out var regEntry))
+        // Phase 1 Execution Ownership: resolve row by incoming id OR intent/leg alias, then lifecycle on canonical id.
+        string? legR = parsed.Leg == "STOP" || parsed.Leg == "TARGET" ? parsed.Leg : null;
+        if (_useInstrumentExecutionAuthority && _iea != null &&
+            _iea.TryResolveForExecutionUpdate(order.OrderId ?? "", intentId, legR, out var regEntryLifecycle, out _) &&
+            regEntryLifecycle != null)
         {
             var lifecycleState = orderState == OrderState.Filled ? OrderLifecycleState.FILLED
                 : orderState == OrderState.Cancelled || orderState == OrderState.CancelPending ? OrderLifecycleState.CANCELED
                 : orderState == OrderState.Rejected ? OrderLifecycleState.REJECTED
                 : orderState == OrderState.Working || orderState == OrderState.Accepted ? OrderLifecycleState.WORKING
+                : orderState == OrderState.PartFilled ? OrderLifecycleState.PART_FILLED
                 : (OrderLifecycleState?)null;
-            if (lifecycleState.HasValue && lifecycleState.Value != regEntry!.LifecycleState)
-                _iea.UpdateOrderLifecycle(order.OrderId, lifecycleState.Value, utcNow);
+            if (lifecycleState.HasValue && lifecycleState.Value != regEntryLifecycle.LifecycleState)
+            {
+                var canonicalLc = regEntryLifecycle.BrokerOrderId ?? order.OrderId ?? "";
+                var incomingLc = order.OrderId ?? "";
+                var terminal = lifecycleState.Value is OrderLifecycleState.FILLED or OrderLifecycleState.CANCELED
+                    or OrderLifecycleState.REJECTED;
+                var usedAlias = terminal && !string.Equals(incomingLc, canonicalLc, StringComparison.OrdinalIgnoreCase);
+                _iea.UpdateOrderLifecycle(canonicalLc, lifecycleState.Value, utcNow);
+                if (usedAlias && _log != null)
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrumentTrace,
+                        "ORDER_REGISTRY_TERMINAL_LIFECYCLE_RESOLVED_BY_ALIAS", new
+                        {
+                            incoming_broker_order_id = incomingLc,
+                            canonical_broker_order_id = canonicalLc,
+                            lifecycle_target = lifecycleState.Value.ToString(),
+                            intent_id = intentId,
+                            instrument = instrumentTrace,
+                            iea_instance_id = _iea.InstanceId
+                        }));
+                }
+            }
         }
 
         // ORPHAN DETECTION: Order update for protective order whose intent is already completed
@@ -3748,7 +3820,7 @@ public sealed partial class NinjaTraderSimAdapter
                             trading_date = tradingDate,
                             stream = stream
                         }));
-                        _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, context.ExecutionInstrument, context.Direction ?? "", utcNow);
+                        _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, context.CanonicalInstrument ?? context.ExecutionInstrument, context.Direction ?? "", utcNow);
                         _iea?.HandleEntryFill(adoptedRecord.IntentId, intent, fillPrice, fillQuantity, fillQuantity, utcNow);
                         return;
                         }
@@ -4027,7 +4099,8 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.CanonicalInstrument,
                     brokerOrderInstrumentKey: orderInfo.Instrument);
                 entryFillJournalRecordedQty += allocQty;
-                _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, allocContext.ExecutionInstrument, allocContext.Direction ?? "", utcNow);
+                var exposureInstrument = allocContext.CanonicalInstrument ?? allocIntent.Instrument ?? allocContext.ExecutionInstrument;
+                _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);
             }
 
             if (isEntryFill && fillQuantity > 0 && entryFillJournalRecordedQty == 0 && allocations.Count > 0)
@@ -4077,7 +4150,25 @@ public sealed partial class NinjaTraderSimAdapter
             if (!isPartial)
             {
                 orderInfo.State = "FILLED";
-                _iea?.UpdateOrderLifecycle(orderInfo.OrderId, OrderLifecycleState.FILLED, utcNow);
+                var legLc = LegTagFromOrderTypeForIeResolution(orderTypeFromTag);
+                var incomingOid = order?.OrderId?.ToString() ?? "";
+                var oidLc = ResolveCanonicalBrokerOrderIdForIeLifecycle(
+                    string.IsNullOrEmpty(incomingOid) ? (orderInfo.OrderId ?? "") : incomingOid, intentId, legLc);
+                _iea?.UpdateOrderLifecycle(oidLc, OrderLifecycleState.FILLED, utcNow);
+                if (_iea != null && _log != null && !string.IsNullOrEmpty(incomingOid) &&
+                    !string.Equals(incomingOid, oidLc, StringComparison.OrdinalIgnoreCase))
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                        "ORDER_REGISTRY_TERMINAL_LIFECYCLE_RESOLVED_BY_ALIAS", new
+                        {
+                            incoming_broker_order_id = incomingOid,
+                            canonical_broker_order_id = oidLc,
+                            lifecycle_target = OrderLifecycleState.FILLED.ToString(),
+                            intent_id = intentId,
+                            instrument = orderInfo.Instrument,
+                            iea_instance_id = _iea.InstanceId
+                        }));
+                }
             }
 
             // Intent lifecycle: entry fill transitions
@@ -4164,11 +4255,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else if (IntentMap.TryGetValue(intentId, out var entryIntent))
             {
-                // Non-aggregated: single intent
-                if (!isAggregated)
-                {
-                    _coordinator?.OnEntryFill(intentId, fillQuantity, entryIntent.Stream, entryIntent.Instrument, entryIntent.Direction ?? "", utcNow);
-                }
+                // Non-aggregated: coordinator OnEntryFill is already invoked once per allocation in the loop above (canonical instrument).
 
                 CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
 
@@ -4282,7 +4369,25 @@ public sealed partial class NinjaTraderSimAdapter
             PruneIntentState(intentId, "exit_fill");
             // Intent exit: purge pending BE (target/stop fill)
             PurgePendingBEForIntent(intentId, utcNow, orderInfo.Instrument, "exit_fill");
-            _iea?.UpdateOrderLifecycle(order.OrderId, OrderLifecycleState.FILLED, utcNow);
+            var exitLeg = orderTypeForContext == "STOP" ? "STOP" : orderTypeForContext == "TARGET" ? "TARGET" : null;
+            var exitIncoming = order?.OrderId?.ToString() ?? "";
+            var exitOid = ResolveCanonicalBrokerOrderIdForIeLifecycle(
+                string.IsNullOrEmpty(exitIncoming) ? (orderInfo.OrderId ?? "") : exitIncoming, intentId, exitLeg);
+            _iea?.UpdateOrderLifecycle(exitOid, OrderLifecycleState.FILLED, utcNow);
+            if (_iea != null && _log != null && !string.IsNullOrEmpty(exitIncoming) &&
+                !string.Equals(exitIncoming, exitOid, StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                    "ORDER_REGISTRY_TERMINAL_LIFECYCLE_RESOLVED_BY_ALIAS", new
+                    {
+                        incoming_broker_order_id = exitIncoming,
+                        canonical_broker_order_id = exitOid,
+                        lifecycle_target = OrderLifecycleState.FILLED.ToString(),
+                        intent_id = intentId,
+                        instrument = orderInfo.Instrument,
+                        iea_instance_id = _iea.InstanceId
+                    }));
+            }
             _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
             // Exit fill
             // CRITICAL FIX: Use orderTypeForContext (from tag) instead of orderInfo.OrderType

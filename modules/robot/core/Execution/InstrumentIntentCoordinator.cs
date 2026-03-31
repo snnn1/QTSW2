@@ -45,7 +45,7 @@ public sealed class InstrumentIntentCoordinator
     /// <param name="intentId">Intent identifier</param>
     /// <param name="qty">Quantity filled</param>
     /// <param name="streamId">Stream ID (e.g., "NQ1")</param>
-    /// <param name="instrument">Instrument symbol (e.g., "NQ")</param>
+    /// <param name="instrument">Canonical timetable instrument (e.g. "NQ"), not execution micro (e.g. "MNQ").</param>
     /// <param name="direction">Direction ("Long" or "Short")</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     public void OnEntryFill(string intentId, int qty, string streamId, string instrument, string direction, DateTimeOffset utcNow)

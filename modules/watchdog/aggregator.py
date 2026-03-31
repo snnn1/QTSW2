@@ -2594,7 +2594,8 @@ class WatchdogAggregator:
     def _add_derived_event_to_buffer(self, event_type: str, data: Dict) -> None:
         """Phase 9: Add watchdog-derived event to ring buffer (e.g. RECOVERY_LOOP_DETECTED)."""
         if event_type in (
-            "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "RECOVERY_LOOP_DETECTED",
+            "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "WATCHDOG_PENDING_ORDER_CLEARED_BY_ALIAS",
+            "RECOVERY_LOOP_DETECTED",
         ) and not self._skip_anomaly_counting:
             self._record_anomaly_timestamp(event_type, datetime.now(timezone.utc))
         self._event_seq_counter += 1
@@ -2687,8 +2688,10 @@ class WatchdogAggregator:
             "IEA_ENQUEUE_AND_WAIT_TIMEOUT",
             "RECONCILIATION_PASS_SUMMARY",
             "RECONCILIATION_QTY_MISMATCH",
+            "TRADE_COMPLETED",
             # Protective orders
             "PROTECTIVE_ORDERS_SUBMITTED",
+            "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE",
             "PROTECTIVE_ORDERS_FAILED_FLATTENED",
             "PROTECTIVE_DRIFT_DETECTED",
             # Connectivity / engine / stream (existing)
@@ -2711,6 +2714,7 @@ class WatchdogAggregator:
             "POSITION_DRIFT_DETECTED",
             "ORDER_STUCK_DETECTED",
             "EXECUTION_LATENCY_SPIKE_DETECTED",
+            "WATCHDOG_PENDING_ORDER_CLEARED_BY_ALIAS",
             "RECOVERY_LOOP_DETECTED",
             "EXPOSURE_INTEGRITY_VIOLATION",
             "ORDER_LIFECYCLE_TRANSITION_INVALID",
@@ -2740,7 +2744,8 @@ class WatchdogAggregator:
                 "EXECUTION_GHOST_FILL_DETECTED", "PROTECTIVE_DRIFT_DETECTED", "ORPHAN_ORDER_DETECTED",
                 "MANUAL_OR_EXTERNAL_ORDER_DETECTED", "UNOWNED_LIVE_ORDER_DETECTED",
                 "DUPLICATE_ORDER_SUBMISSION_DETECTED", "POSITION_DRIFT_DETECTED", "EXPOSURE_INTEGRITY_VIOLATION",
-                "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "RECOVERY_LOOP_DETECTED",
+                "ORDER_STUCK_DETECTED", "EXECUTION_LATENCY_SPIKE_DETECTED", "WATCHDOG_PENDING_ORDER_CLEARED_BY_ALIAS",
+                "RECOVERY_LOOP_DETECTED",
                 "RECONCILIATION_QTY_MISMATCH", "ORDER_LIFECYCLE_TRANSITION_INVALID",
             }
             if event_type in anomaly_types and not self._skip_anomaly_counting:

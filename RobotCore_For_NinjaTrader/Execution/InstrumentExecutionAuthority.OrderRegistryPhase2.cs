@@ -244,29 +244,125 @@ public sealed partial class InstrumentExecutionAuthority
             if (!string.IsNullOrEmpty(id)) brokerOrderIds.Add(id);
         }
 
-        var workingRegistryIds = _orderRegistry.GetWorkingOrderIds().ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var registryWorkingCount = workingRegistryIds.Count;
-
-        // Registry has WORKING order but broker does not
-        foreach (var regId in workingRegistryIds)
+        static Order? FindOrderByBrokerId(Account acct, string orderId)
         {
-            if (!brokerOrderIds.Contains(regId))
+            if (string.IsNullOrEmpty(orderId) || acct.Orders == null) return null;
+            foreach (Order o in acct.Orders)
+            {
+                if (string.Equals(o.OrderId?.ToString(), orderId, StringComparison.OrdinalIgnoreCase))
+                    return o;
+            }
+            return null;
+        }
+
+        var trustedLive = _orderRegistry.GetMismatchTrustedLiveEntries();
+        var registryWorkingCount = trustedLive.Count;
+
+        // Sweep mismatch-trusted SUBMITTED / WORKING / PART_FILLED vs full broker Order collection.
+        // Safe rule: never terminalize when a matching broker Order exists in Working/Accepted/PartFilled (active path).
+        // Terminal broker state -> sync registry lifecycle (stops ghosts when OrderUpdate was missed).
+        // No broker Order for any id variant -> ORDER_REGISTRY_GHOST_ROW_TERMINALIZED (CANCELED); no recovery spam.
+        foreach (var regEntry in trustedLive)
+        {
+            var canonical = regEntry.BrokerOrderId ?? "";
+            if (string.IsNullOrEmpty(canonical)) continue;
+
+            Order? matched = null;
+            foreach (var vid in _orderRegistry.GetBrokerOrderIdVariants(canonical))
+            {
+                matched = FindOrderByBrokerId(account, vid);
+                if (matched != null) break;
+            }
+
+            if (matched == null)
             {
                 divergenceEventsLogged++;
-                _orderRegistry.IncrementIntegrityFailure();
-                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
-                {
-                    broker_order_id = regId,
-                    direction = "registry_has_broker_missing",
-                    note = "Registry has WORKING order but broker does not",
-                    iea_instance_id = InstanceId
-                }));
-#if NINJATRADER
-                recoveryRequestsEmitted++;
-                supervisoryRequestsEmitted++;
-                RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = regId, direction = "registry_has_broker_missing" }, utcNow);
-                RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = regId, direction = "registry_has_broker_missing" }, utcNow);
-#endif
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, regEntry.IntentId ?? "", regEntry.Instrument, "ORDER_REGISTRY_GHOST_ROW_TERMINALIZED",
+                    new
+                    {
+                        broker_order_id = canonical,
+                        intent_id = regEntry.IntentId,
+                        lifecycle_before = regEntry.LifecycleState.ToString(),
+                        note = "No Account.Orders row for canonical or linked ids — local terminalize CANCELED",
+                        ownership_status = regEntry.OwnershipStatus.ToString(),
+                        iea_instance_id = InstanceId
+                    }));
+                UpdateOrderLifecycle(canonical, OrderLifecycleState.CANCELED, utcNow);
+                continue;
+            }
+
+            var os = matched.OrderState;
+            if (os == OrderState.Working || os == OrderState.Accepted)
+            {
+                if (regEntry.LifecycleState == OrderLifecycleState.SUBMITTED)
+                    UpdateOrderLifecycle(canonical, OrderLifecycleState.WORKING, utcNow);
+                continue;
+            }
+
+            if (os == OrderState.PartFilled &&
+                (regEntry.LifecycleState == OrderLifecycleState.SUBMITTED ||
+                 regEntry.LifecycleState == OrderLifecycleState.WORKING))
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, regEntry.IntentId ?? "", regEntry.Instrument, "ORDER_REGISTRY_LIFECYCLE_BROKER_SYNC",
+                    new
+                    {
+                        broker_order_id = canonical,
+                        intent_id = regEntry.IntentId,
+                        broker_order_state = os.ToString(),
+                        target_lifecycle = OrderLifecycleState.PART_FILLED.ToString(),
+                        previous_lifecycle = regEntry.LifecycleState.ToString(),
+                        iea_instance_id = InstanceId
+                    }));
+                UpdateOrderLifecycle(canonical, OrderLifecycleState.PART_FILLED, utcNow);
+                continue;
+            }
+
+            if (os == OrderState.Filled && regEntry.LifecycleState != OrderLifecycleState.FILLED)
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, regEntry.IntentId ?? "", regEntry.Instrument, "ORDER_REGISTRY_LIFECYCLE_BROKER_SYNC",
+                    new
+                    {
+                        broker_order_id = canonical,
+                        intent_id = regEntry.IntentId,
+                        broker_order_state = os.ToString(),
+                        target_lifecycle = OrderLifecycleState.FILLED.ToString(),
+                        previous_lifecycle = regEntry.LifecycleState.ToString(),
+                        iea_instance_id = InstanceId
+                    }));
+                UpdateOrderLifecycle(canonical, OrderLifecycleState.FILLED, utcNow);
+                continue;
+            }
+
+            if ((os == OrderState.Cancelled || os == OrderState.CancelPending) &&
+                regEntry.LifecycleState != OrderLifecycleState.CANCELED)
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, regEntry.IntentId ?? "", regEntry.Instrument, "ORDER_REGISTRY_LIFECYCLE_BROKER_SYNC",
+                    new
+                    {
+                        broker_order_id = canonical,
+                        intent_id = regEntry.IntentId,
+                        broker_order_state = os.ToString(),
+                        target_lifecycle = OrderLifecycleState.CANCELED.ToString(),
+                        previous_lifecycle = regEntry.LifecycleState.ToString(),
+                        iea_instance_id = InstanceId
+                    }));
+                UpdateOrderLifecycle(canonical, OrderLifecycleState.CANCELED, utcNow);
+                continue;
+            }
+
+            if (os == OrderState.Rejected && regEntry.LifecycleState != OrderLifecycleState.REJECTED)
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, regEntry.IntentId ?? "", regEntry.Instrument, "ORDER_REGISTRY_LIFECYCLE_BROKER_SYNC",
+                    new
+                    {
+                        broker_order_id = canonical,
+                        intent_id = regEntry.IntentId,
+                        broker_order_state = os.ToString(),
+                        target_lifecycle = OrderLifecycleState.REJECTED.ToString(),
+                        previous_lifecycle = regEntry.LifecycleState.ToString(),
+                        iea_instance_id = InstanceId
+                    }));
+                UpdateOrderLifecycle(canonical, OrderLifecycleState.REJECTED, utcNow);
             }
         }
 

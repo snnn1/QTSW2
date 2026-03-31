@@ -62,6 +62,7 @@ public sealed class StreamStateMachine
 
     public StreamState State { get; private set; } = StreamState.PRE_HYDRATION; // Initial state, will be set in constructor based on execution mode
     public bool Committed => _journal.Committed;
+    public string? CommitReason => _journal.CommitReason;
     public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
@@ -2558,6 +2559,8 @@ public sealed class StreamStateMachine
     /// </summary>
     private void HandleRangeLockedState(DateTimeOffset utcNow)
     {
+        EnsureCommittedForPostLockExcursion(utcNow);
+
         // Phase B: Execute pending recovery action (invariant-based model)
         if (_entryOrderRecoveryState.IsPending && _executionAdapter != null)
         {
@@ -2599,7 +2602,11 @@ public sealed class StreamStateMachine
             
             if (!alreadySubmitted)
             {
-                if (LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RESTART", failClosedOnMissingQuotes: true))
+                if (IsPostLockBreakoutSetupExpired())
+                {
+                    Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                }
+                else
                 {
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
@@ -2612,10 +2619,6 @@ public sealed class StreamStateMachine
                             note = "Retrying stop bracket placement on restart after previous failure"
                         }));
                     SubmitStopEntryBracketsAtLock(utcNow);
-                }
-                else
-                {
-                    Commit(utcNow, "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED");
                 }
             }
         }
@@ -2993,6 +2996,12 @@ public sealed class StreamStateMachine
             ClearRecoveryAction(utcNow);
             return false;
         }
+        if (IsPostLockBreakoutSetupExpired())
+        {
+            ClearRecoveryAction(utcNow);
+            Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+            return false;
+        }
         var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
         if (posQty != 0)
         {
@@ -3008,13 +3017,6 @@ public sealed class StreamStateMachine
                 "ENTRY_ORDER_SET_RESUBMIT_SKIPPED_VALID_EXISTS", State.ToString(),
                 new { stream_id = Stream }));
             ClearRecoveryAction(utcNow);
-            return false;
-        }
-
-        if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RECOVERY", failClosedOnMissingQuotes: true))
-        {
-            ClearRecoveryAction(utcNow);
-            Commit(utcNow, "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED");
             return false;
         }
 
@@ -3083,6 +3085,7 @@ public sealed class StreamStateMachine
                 // Force transition to correct state
                 Transition(utcNow, StreamState.RANGE_LOCKED, "RANGE_LOCKED_RESTORED_FIX");
             }
+            EnsureCommittedForPostLockExcursion(utcNow);
             // Skip normal flow - restoration already completed
             return;
         }
@@ -3588,6 +3591,10 @@ public sealed class StreamStateMachine
         // Handle RANGE_LOCKED state separately (bars at/after slot time for breakout detection)
         if (State == StreamState.RANGE_LOCKED)
         {
+            ApplyPostLockBreakoutExcursionFromBar(high, low, barUtc, utcNow);
+            if (_journal.Committed)
+                return;
+
             // DIAGNOSTIC: Log execution gate evaluation (rate-limited, only if diagnostics enabled)
             if (_enableDiagnosticLogs)
             {
@@ -3827,8 +3834,77 @@ public sealed class StreamStateMachine
         { 
             return (false, "RANGE_VALUES_MISSING", new { range_high_has_value = RangeHigh.HasValue, range_low_has_value = RangeLow.HasValue }); 
         }
+
+        if (IsPostLockBreakoutSetupExpired())
+        {
+            return (false, "POST_LOCK_BREAKOUT_ALREADY_OCCURRED", new
+            {
+                post_lock_long = _journal.PostLockLongBreakoutTouched,
+                post_lock_short = _journal.PostLockShortBreakoutTouched
+            });
+        }
         
         return (true, "OK", null);
+    }
+
+    /// <summary>
+    /// True after RANGE_LOCK if bar path shows either breakout was touched before entry brackets were armed.
+    /// Strict product rule: touching either side expires the entire setup (no stop-entry brackets on either side).
+    /// </summary>
+    public bool IsPostLockBreakoutSetupExpired()
+        => _journal.PostLockLongBreakoutTouched || _journal.PostLockShortBreakoutTouched;
+
+    /// <summary>
+    /// Deterministic post-lock excursion: bar must be strictly after slot end; uses bar high/low vs rounded breakout stops.
+    /// On first touch, persists journal flags, emits audit event, and commits NO_TRADE_BREAKOUT_ALREADY_OCCURRED.
+    /// </summary>
+    private void ApplyPostLockBreakoutExcursionFromBar(decimal high, decimal low, DateTimeOffset barUtc, DateTimeOffset utcNow)
+    {
+        if (!_rangeLocked || State != StreamState.RANGE_LOCKED) return;
+        if (_journal.Committed) return;
+        if (_stopBracketsSubmittedAtLock || _journal.StopBracketsSubmittedAtLock) return;
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return;
+        if (barUtc <= SlotTimeUtc) return;
+
+        var brkL = _brkLongRounded.Value;
+        var brkS = _brkShortRounded.Value;
+        var longTouch = high >= brkL;
+        var shortTouch = low <= brkS;
+        if (!longTouch && !shortTouch) return;
+
+        var priorL = _journal.PostLockLongBreakoutTouched;
+        var priorS = _journal.PostLockShortBreakoutTouched;
+        if (longTouch) _journal.PostLockLongBreakoutTouched = true;
+        if (shortTouch) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "ENTRY_INVALIDATED_POST_LOCK_EXCURSION", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                bar_utc = barUtc.ToString("o"),
+                breakout_long = brkL,
+                breakout_short = brkS,
+                bar_high = high,
+                bar_low = low,
+                long_touched = longTouch || priorL,
+                short_touched = shortTouch || priorS,
+                note = "Breakout touched on post-lock bar path before entry brackets armed — setup expired (strict)"
+            }));
+
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+    }
+
+    /// <summary>
+    /// Restart safety: journal persisted excursion flags but commit did not complete (e.g. crash). Finish NO_TRADE.
+    /// </summary>
+    private void EnsureCommittedForPostLockExcursion(DateTimeOffset utcNow)
+    {
+        if (_journal.Committed || State != StreamState.RANGE_LOCKED) return;
+        if (!IsPostLockBreakoutSetupExpired()) return;
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
     }
 
     /// <summary>
@@ -3862,6 +3938,10 @@ public sealed class StreamStateMachine
         var canSubmitResult = CanSubmitStopBrackets(utcNow);
         if (!canSubmitResult.CanSubmit)
         {
+            if (canSubmitResult.Reason == "POST_LOCK_BREAKOUT_ALREADY_OCCURRED")
+            {
+                Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+            }
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
                 new { reason = canSubmitResult.Reason, details = canSubmitResult.Details }));
@@ -5229,10 +5309,20 @@ public sealed class StreamStateMachine
             }
             else if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
-                // P2.10: unified breakout validity (breakout_validity_tolerance_ticks only; fail-open if quotes missing).
-                if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "FIRST_LOCK", failClosedOnMissingQuotes: false))
+                // Post-lock breakout opportunity uses bar path only (not snapshot bid/ask). At first lock,
+                // no post-slot bar has been processed yet, so excursion flags are false unless restored from journal.
+                if (IsPostLockBreakoutSetupExpired())
                 {
-                    Commit(utcNow, "NO_TRADE_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_UNIFIED_BREAKOUT_INVALID");
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "INITIAL_SUBMISSION_BLOCKED_POST_LOCK_EXCURSION", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            post_lock_long = _journal.PostLockLongBreakoutTouched,
+                            post_lock_short = _journal.PostLockShortBreakoutTouched,
+                            note = "Journal/history shows post-lock breakout touch before brackets — no initial submission"
+                        }));
+                    Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
                 }
                 else
                 {

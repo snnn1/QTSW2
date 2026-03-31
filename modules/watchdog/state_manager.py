@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, time, timezone, timedelta
 from collections import defaultdict, deque
 import pytz
@@ -204,6 +204,8 @@ class WatchdogStateManager:
         # broker_order_id -> {submitted_at, intent_id, instrument, role, stream_key}
         self._pending_orders: Dict[str, Dict[str, Any]] = {}
         self._pending_derived_events: List[Dict[str, Any]] = []
+        # Robot ORDER_REGISTRY_BROKER_ID_LINKED pairs (canonical <-> post-ack id) for pending-order cluster clears
+        self._broker_order_id_link_pairs: List[Tuple[str, str]] = []
 
         # Phase 1: Unresolved RECOVERY_POSITION_UNMATCHED (persists until resolution)
         # instrument root -> True (action_required=FLATTEN until cleared)
@@ -300,6 +302,75 @@ class WatchdogStateManager:
             }
         return None
 
+    def record_broker_order_id_link(self, canonical_broker_order_id: str, alternate_broker_order_id: str) -> None:
+        """Track pre-ack vs post-ack (or remap) ids from robot so EXECUTION_FILLED clears the submit key."""
+        c = (canonical_broker_order_id or "").strip()
+        a = (alternate_broker_order_id or "").strip()
+        if not c or not a or c.casefold() == a.casefold():
+            return
+        self._broker_order_id_link_pairs.append((c, a))
+
+    def clear_broker_order_id_links(self) -> None:
+        self._broker_order_id_link_pairs.clear()
+
+    def _broker_id_cluster_members(self, seed: str) -> Set[str]:
+        """Union cluster via undirected edges from ORDER_REGISTRY_BROKER_ID_LINKED pairs."""
+        s = (seed or "").strip()
+        if not s:
+            return set()
+        out: Set[str] = {s}
+        changed = True
+        while changed:
+            changed = False
+            for a, b in self._broker_order_id_link_pairs:
+                if a in out and b not in out:
+                    out.add(b)
+                    changed = True
+                elif b in out and a not in out:
+                    out.add(a)
+                    changed = True
+        return out
+
+    def _pop_pending_matching_terminal_event(
+        self,
+        broker_order_id: Optional[str],
+        order_id_alt: Optional[str],
+        event_type: str,
+        timestamp_utc: datetime,
+        instrument_hint: str = "",
+        intent_hint: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Pop first pending order in the cluster of broker ids (submit key ∪ linked ids).
+        Emits WATCHDOG_PENDING_ORDER_CLEARED_BY_ALIAS when cleared key != primary event id.
+        """
+        seeds = {x.strip() for x in (broker_order_id, order_id_alt) if x and str(x).strip()}
+        cluster: Set[str] = set()
+        for s in seeds:
+            cluster |= self._broker_id_cluster_members(s)
+        cluster |= seeds
+        cluster_cf = {c.casefold() for c in cluster}
+        primary = (broker_order_id or order_id_alt or "").strip()
+        for k in list(self._pending_orders.keys()):
+            if k in cluster or k.casefold() in cluster_cf:
+                info = self._pending_orders.pop(k)
+                seeds_cf = {s.casefold() for s in seeds if s}
+                if k.casefold() not in seeds_cf:
+                    self._pending_derived_events.append({
+                        "event_type": "WATCHDOG_PENDING_ORDER_CLEARED_BY_ALIAS",
+                        "data": {
+                            "original_pending_key": k,
+                            "event_primary_broker_order_id": primary,
+                            "event_type": event_type,
+                            "instrument": instrument_hint or info.get("instrument", ""),
+                            "intent_id": intent_hint or info.get("intent_id", ""),
+                            "cleared_at_utc": timestamp_utc.isoformat(),
+                            "note": "Pending cleared via linked-id cluster or alternate order id (not exact submit key)",
+                        },
+                    })
+                return info
+        return None
+
     def record_order_submitted(
         self,
         broker_order_id: str,
@@ -326,14 +397,30 @@ class WatchdogStateManager:
         filled_at: datetime,
         qty: Optional[int] = None,
         price: Optional[float] = None,
+        order_id_alt: Optional[str] = None,
+        instrument: str = "",
+        intent_id: str = "",
     ) -> None:
         """
         Phase 8: Record fill and check for latency spike.
         If threshold exceeded, appends EXECUTION_LATENCY_SPIKE_DETECTED to _pending_derived_events.
         """
-        if not broker_order_id:
+        a = (broker_order_id or "").strip()
+        b = (order_id_alt or "").strip()
+        primary = a or b
+        if not primary:
             return
-        info = self._pending_orders.pop(broker_order_id, None)
+        secondary: Optional[str] = None
+        if a and b and a.casefold() != b.casefold():
+            secondary = b
+        info = self._pop_pending_matching_terminal_event(
+            primary,
+            secondary,
+            "EXECUTION_FILLED",
+            filled_at,
+            instrument_hint=instrument,
+            intent_hint=intent_id,
+        )
         if not info:
             return
         submitted_at = info.get("submitted_at")
@@ -344,8 +431,8 @@ class WatchdogStateManager:
             self._pending_derived_events.append({
                 "event_type": "EXECUTION_LATENCY_SPIKE_DETECTED",
                 "data": {
-                    "order_id": broker_order_id,
-                    "broker_order_id": broker_order_id,
+                    "order_id": broker_order_id or order_id_alt,
+                    "broker_order_id": broker_order_id or order_id_alt,
                     "intent_id": info.get("intent_id", ""),
                     "instrument": info.get("instrument", ""),
                     "stream_key": info.get("stream_key", ""),
@@ -359,10 +446,29 @@ class WatchdogStateManager:
                 },
             })
 
-    def record_order_cancelled(self, broker_order_id: str) -> None:
-        """Phase 7-8: Remove from pending when order cancelled."""
-        if broker_order_id:
-            self._pending_orders.pop(broker_order_id, None)
+    def record_order_cancelled(
+        self,
+        broker_order_id: str,
+        order_id_alt: Optional[str] = None,
+        timestamp_utc: Optional[datetime] = None,
+        event_type: str = "ORDER_CANCELLED",
+    ) -> None:
+        """Phase 7-8: Remove from pending when order cancelled or rejected."""
+        a = (broker_order_id or "").strip()
+        b = (order_id_alt or "").strip()
+        primary = a or b
+        if not primary:
+            return
+        secondary_cn: Optional[str] = None
+        if a and b and a.casefold() != b.casefold():
+            secondary_cn = b
+        ts = timestamp_utc or datetime.now(timezone.utc)
+        self._pop_pending_matching_terminal_event(
+            primary,
+            secondary_cn,
+            event_type,
+            ts,
+        )
 
     def check_stuck_orders(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """

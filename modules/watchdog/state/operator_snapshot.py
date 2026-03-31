@@ -40,6 +40,7 @@ _INSTRUMENT_SNAPSHOT_EVENTS = frozenset({
     "FORCED_FLATTEN_EXPOSURE_REMAINING",
     "MANUAL_FLATTEN_REQUIRED",
     "PROTECTIVE_ORDERS_SUBMITTED",
+    "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE",
     "PROTECTIVE_ORDERS_FAILED_FLATTENED",
     "PROTECTIVE_DRIFT_DETECTED",
     "RECOVERY_DECISION_RESUME",
@@ -177,8 +178,33 @@ def _protective_status_for_instrument(
         t = ev.get("event_type") or ev.get("event", "")
         if t == "PROTECTIVE_ORDERS_FAILED_FLATTENED" or t == "PROTECTIVE_DRIFT_DETECTED":
             failed = True
-        elif t == "PROTECTIVE_ORDERS_SUBMITTED":
+        elif t in ("PROTECTIVE_ORDERS_SUBMITTED", "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE"):
             valid = True
+    if not valid and not failed:
+        bucket = _operator_instrument_bucket(instrument)
+        for ev in events:
+            t = ev.get("event_type") or ev.get("event", "")
+            if t != "ORDER_SUBMIT_SUCCESS":
+                continue
+            ed = ev.get("data") or {}
+            ot = str(ed.get("order_type", "") or "").upper()
+            if not ("TARGET" in ot or "STOP" in ot or "PROTECTIVE" in ot):
+                continue
+            inst = ev.get("instrument") or ed.get("instrument")
+            exec_inst = ev.get("execution_instrument") or ed.get("execution_instrument")
+            matched = False
+            for x in (inst, exec_inst):
+                if x and _operator_instrument_bucket(x) == bucket:
+                    matched = True
+                    break
+            iid = ed.get("intent_id") or ev.get("intent_id")
+            if not matched and iid and state_manager:
+                exp = getattr(state_manager, "_intent_exposures", {}).get(str(iid))
+                if exp and _operator_instrument_bucket(getattr(exp, "instrument", "")) == bucket:
+                    matched = True
+            if matched:
+                valid = True
+                break
     if failed:
         return "FAILED"
     if valid:

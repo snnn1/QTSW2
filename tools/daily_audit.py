@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
 
 from log_audit import NormEvent, normalize_event, resolve_log_dir as resolve_robot_log_dir
 
+from daily_audit_convergence import analyze_convergence_failure_explanations, render_convergence_markdown
 from daily_audit_engine_load import compute_engine_load_analysis
 from daily_audit_iea_integrity import analyze_iea_integrity
 
@@ -105,6 +106,8 @@ def load_thresholds(project_root: Path) -> Dict[str, Any]:
         "iea_root_cause_min_storms_for_throughput": 2,
         "iea_integrity_observability_gap_warn_seconds": 300,
         "iea_integrity_correlation_mismatch_spike_min": 15,
+        "convergence_significant_min_cycles": 5,
+        "convergence_failure_max_episodes_export": 25,
     }
     if p.is_file():
         try:
@@ -1765,6 +1768,11 @@ def run_audit(args: argparse.Namespace) -> int:
             audit_window_start=day_start,
             audit_window_end=day_end,
         ),
+        "convergence_failure_explanation": analyze_convergence_failure_explanations(
+            events,
+            chains,
+            thresholds,
+        ),
     }
 
     json_path = Path(args.json_out) if args.json_out else reports_dir / f"{audit_date.isoformat()}.json"
@@ -2015,6 +2023,13 @@ def render_markdown(o: Dict[str, Any]) -> List[str]:
         lines.append("")
         lines.append("Key finding:")
         lines.append(key_line)
+    lines.append("")
+    cfe = o.get("convergence_failure_explanation")
+    if isinstance(cfe, dict) and cfe:
+        lines.extend(render_convergence_markdown(cfe, str(o.get("timezone") or "chicago")))
+    else:
+        lines.append("[CONVERGENCE FAILURE EXPLANATION]")
+        lines.append("(none)")
     lines.append("")
     lines.append("[TIMELINE]")
     if meta.get("timeline_truncated"):

@@ -58,5 +58,7 @@
   "iea_integrity_throttle_no_progress_time_ms": 12000,
   "iea_integrity_throttle_warn_missed": 1,
   "iea_integrity_progress_revert_window_ms": 10000,
-  "iea_integrity_progress_quality_warn": 0.2
+  "iea_integrity_progress_quality_warn": 0.2,
+  "convergence_significant_min_cycles": 5,
+  "convergence_failure_max_episodes_export": 25
 }

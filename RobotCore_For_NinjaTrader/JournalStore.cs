@@ -141,7 +141,7 @@ public sealed class JournalStore
                 if (File.Exists(path)) File.Delete(path);
                 File.Move(tempPath, path);
             }
-            catch (IOException ex)
+            catch (IOException)
             {
                 Thread.Sleep(10);
                 try
@@ -269,6 +269,18 @@ public sealed class StreamJournal
     
     // RESTART RECOVERY: Persist order submission state
     public bool StopBracketsSubmittedAtLock { get; set; } = false;
+
+    /// <summary>
+    /// Post RANGE_LOCKED: a 1m bar's high reached the long stop-entry level (high &gt;= breakout_long)
+    /// before entry brackets were armed. Strict product rule: either side touched expires the whole setup.
+    /// </summary>
+    public bool PostLockLongBreakoutTouched { get; set; }
+
+    /// <summary>
+    /// Post RANGE_LOCKED: a bar's low reached the short stop-entry level (low &lt;= breakout_short)
+    /// before entry brackets were armed.
+    /// </summary>
+    public bool PostLockShortBreakoutTouched { get; set; }
     
     // RESTART RECOVERY: Persist entry detection state (backup to execution journal)
     public bool EntryDetected { get; set; } = false;
@@ -295,22 +307,6 @@ public sealed class StreamJournal
     /// When forced flatten occurred (optional).
     /// </summary>
     public DateTimeOffset? ForcedFlattenTimestamp { get; set; }
-
-    /// <summary>
-    /// When queued forced flatten was requested (IEA command path). Used for two-phase completion.
-    /// Cleared when flatten completes and ExecutionInterruptedByClose is set.
-    /// </summary>
-    public DateTimeOffset? ForcedFlattenEnqueuedAtUtc { get; set; }
-
-    /// <summary>
-    /// Trading day when forced flatten ran (for re-entry gate).
-    /// </summary>
-    public string? TradingDayAtFlatten { get; set; }
-
-    /// <summary>
-    /// Session index within day when forced flatten ran (for re-entry gate).
-    /// </summary>
-    public int? SessionIndexAtFlatten { get; set; }
     
     /// <summary>
     /// Reference to locate canonical ExecutionJournalEntry (contains bracket levels).
@@ -344,20 +340,12 @@ public sealed class StreamJournal
     /// </summary>
     public string? PriorJournalKey { get; set; }
 
-    /// <summary>
-    /// Entry-order recovery action (ResubmitClean, CancelAndRebuild, None).
-    /// Persisted for restart recovery.
-    /// </summary>
+    // ENTRY-ORDER RECOVERY: Invariant-based recovery action (persisted)
+    /// <summary>Recovery action: "None", "ResubmitClean", "CancelAndRebuild".</summary>
     public string? RecoveryAction { get; set; }
-
-    /// <summary>
-    /// Reason for recovery action (e.g. missing, partial).
-    /// </summary>
+    /// <summary>Reason for recovery action (e.g. "missing", "broken_partial").</summary>
     public string? RecoveryActionReason { get; set; }
-
-    /// <summary>
-    /// When recovery action was issued (ISO 8601).
-    /// </summary>
+    /// <summary>When recovery action was issued (ISO format).</summary>
     public string? RecoveryActionIssuedUtc { get; set; }
 }
 

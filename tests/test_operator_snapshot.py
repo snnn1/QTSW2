@@ -121,6 +121,20 @@ class TestOperatorSnapshot:
         assert "MES" in snap
         assert snap["MES"]["protectives"] == "VALID"
 
+    def test_order_submit_success_protective_stop_counts_as_valid(self):
+        """Robot often emits ORDER_SUBMIT_SUCCESS(PROTECTIVE_STOP) instead of PROTECTIVE_ORDERS_SUBMITTED."""
+        events = [_mk_event(
+            "ORDER_SUBMIT_SUCCESS",
+            "MES",
+            intent_id="i1",
+            order_type="PROTECTIVE_STOP",
+            broker_order_id="b1",
+        )]
+        state = _mk_state(intent_exposures={"i1": _mk_exposure("MES", 1, 0)})
+        snap = build_operator_snapshot(events, state)
+        assert "MES" in snap
+        assert snap["MES"]["protectives"] == "VALID"
+
     def test_protective_drift_detected(self):
         events = [_mk_event("PROTECTIVE_DRIFT_DETECTED", "MES")]
         state = _mk_state(intent_exposures={"i1": _mk_exposure("MES", 1, 0)})

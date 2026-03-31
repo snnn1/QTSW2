@@ -291,6 +291,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Breakout validity gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("POST_LOCK_EXCURSION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = PostLockBreakoutExcursionTests.RunPostLockBreakoutExcursionTests();
+        Console.WriteLine(pass ? "PASS: Post-lock breakout excursion tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("CHAOS", StringComparison.OrdinalIgnoreCase))
     {
         RunChaosTests();
