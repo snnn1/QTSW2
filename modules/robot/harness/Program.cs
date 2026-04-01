@@ -57,6 +57,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
 // --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
+// --test JOURNAL_REOPEN_EXPOSURE_REHYDRATE: tagged broker journal reopen normalization + exposure rehydration
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
@@ -278,6 +279,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = ReleaseBlockingAdoptionTests.RunReleaseBlockingAdoptionTests();
         Console.WriteLine(pass ? "PASS: Release-blocking adoption candidate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("JOURNAL_REOPEN_EXPOSURE_REHYDRATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = JournalReopenAndExposureRehydrateTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Journal reopen + exposure rehydrate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("EXECUTION_EVENT_REPLAY", StringComparison.OrdinalIgnoreCase))

@@ -69,6 +69,9 @@ public sealed class ExecutionJournal
     // Callback for recording execution costs in ExecutionSummary
     private Action<string, decimal, decimal?, decimal?>? _onExecutionCostCallback;
 
+    /// <summary>RobotEngine wires: after tagged-broker journal reopen, rehydrate <see cref="InstrumentIntentCoordinator"/> for live qty.</summary>
+    private Action<string, string, string, string, string, int, int, DateTimeOffset>? _onTaggedBrokerJournalRehydrationCallback;
+
     private Action? _onReleaseSuppressionActivityNotify;
 
     /// <summary>Wired by RobotEngine to <see cref="ReleaseReconciliationRedundancySuppression.NotifyExecutionActivity"/>.</summary>
@@ -164,6 +167,16 @@ public sealed class ExecutionJournal
     public void SetExecutionCostCallback(Action<string, decimal, decimal?, decimal?> callback)
     {
         _onExecutionCostCallback = callback;
+    }
+
+    /// <summary>
+    /// Optional: invoked after <see cref="UpsertTaggedBrokerExposureRecoveryJournal"/> when the row has open journal qty.
+    /// Parameters: intentId, tradingDate, stream, executionInstrument, direction, entryFilledQty, exitFilledQty, utcNow.
+    /// </summary>
+    public void SetTaggedBrokerJournalRehydrationCallback(
+        Action<string, string, string, string, string, int, int, DateTimeOffset>? callback)
+    {
+        _onTaggedBrokerJournalRehydrationCallback = callback;
     }
 
     /// <summary>
@@ -2293,7 +2306,8 @@ public sealed class ExecutionJournal
 
             var take = Math.Min(remLeft, excess);
             if (take <= 0) continue;
-            if (!TryApplyJournalPositionAlignmentExitQty(r.TradingDate, r.Stream, r.IntentId, take, utcNow))
+            if (!TryApplyJournalPositionAlignmentExitQty(r.TradingDate, r.Stream, r.IntentId, take, utcNow,
+                    brokerPositionQtyAbs, robotTaggedIntentIdsOnInstrument, registryMismatchTrustedIntentIds))
                 continue;
 
             remLeftByRow[rk] = remLeft - take;
@@ -2333,7 +2347,83 @@ public sealed class ExecutionJournal
         return writes;
     }
 
-    private bool TryApplyJournalPositionAlignmentExitQty(string tradingDate, string stream, string intentId, int exitQty, DateTimeOffset utcNow)
+    private static bool TryParseJournalIsoUtc(string? s, out DateTimeOffset dto)
+    {
+        dto = default;
+        if (string.IsNullOrWhiteSpace(s)) return false;
+        return DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out dto);
+    }
+
+    private static DateTimeOffset AlignmentExitTimestampUtc(ExecutionJournalEntry entry, DateTimeOffset utcNow)
+    {
+        if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryAt) && utcNow < entryAt)
+            return entryAt;
+        return utcNow;
+    }
+
+    /// <summary>
+    /// Caps virtual alignment exit so we do not mark <see cref="ExecutionJournalEntry.TradeCompleted"/> while the broker
+    /// still shows exposure, while intent is tied to working/tag state, or while exit timestamps would precede entry.
+    /// </summary>
+    private static int MaxVirtualExitFilledTotalForAlignment(
+        ExecutionJournalEntry entry,
+        DateTimeOffset utcNow,
+        int brokerPositionQtyAbs,
+        string intentId,
+        IReadOnlyCollection<string> robotTaggedIntentIdsOnInstrument,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds,
+        out string reason)
+    {
+        reason = "";
+        var entryTotal = entry.EntryFilledQuantityTotal;
+        if (entryTotal <= 0)
+        {
+            reason = "no_entry_qty";
+            return 0;
+        }
+
+        var tagSet = robotTaggedIntentIdsOnInstrument as HashSet<string> ??
+                     new HashSet<string>(robotTaggedIntentIdsOnInstrument ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        var regSet = registryMismatchTrustedIntentIds as HashSet<string> ??
+                     new HashSet<string>(registryMismatchTrustedIntentIds ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+
+        if (brokerPositionQtyAbs > 0)
+        {
+            reason = "broker_not_flat";
+            return Math.Max(0, entryTotal - 1);
+        }
+
+        if (tagSet.Contains(intentId) || (regSet.Count > 0 && regSet.Contains(intentId)))
+        {
+            reason = "intent_tagged_or_registry_trusted_working";
+            return Math.Max(0, entryTotal - 1);
+        }
+
+        if (!TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryAt))
+        {
+            reason = "entry_timestamp_missing_or_unparseable";
+            return Math.Max(0, entryTotal - 1);
+        }
+
+        if (utcNow < entryAt)
+        {
+            reason = "alignment_clock_before_entry_fill";
+            return Math.Max(0, entryTotal - 1);
+        }
+
+        return entryTotal;
+    }
+
+    private bool TryApplyJournalPositionAlignmentExitQty(
+        string tradingDate,
+        string stream,
+        string intentId,
+        int exitQty,
+        DateTimeOffset utcNow,
+        int brokerPositionQtyAbs,
+        IReadOnlyCollection<string> robotTaggedIntentIdsOnInstrument,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds)
     {
         if (exitQty <= 0 || string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) ||
             string.IsNullOrWhiteSpace(intentId))
@@ -2371,16 +2461,67 @@ public sealed class ExecutionJournal
             if (remaining <= 0)
                 return false;
 
-            var apply = Math.Min(exitQty, remaining);
-            entry.ExitFilledQuantityTotal += apply;
-            entry.ExitOrderType = CompletionReasons.RECONCILIATION_POSITION_ALIGNMENT;
-            entry.ExitFilledAtUtc ??= utcNow.ToString("o");
+            var requestedApply = Math.Min(exitQty, remaining);
+            if (requestedApply <= 0)
+                return false;
 
-            if (entry.ExitFilledQuantityTotal >= entry.EntryFilledQuantityTotal)
+            var exitBefore = entry.ExitFilledQuantityTotal;
+            var maxExitTotal = MaxVirtualExitFilledTotalForAlignment(
+                entry, utcNow, brokerPositionQtyAbs, intentId,
+                robotTaggedIntentIdsOnInstrument, registryMismatchTrustedIntentIds,
+                out var guardReason);
+            var cappedApply = Math.Min(requestedApply, Math.Max(0, maxExitTotal - exitBefore));
+            if (cappedApply <= 0)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "JOURNAL_COMPLETION_BLOCKED_ALIGNMENT_INVALID", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        entry_qty = entry.EntryFilledQuantityTotal,
+                        exit_qty = exitBefore,
+                        broker_position_qty = brokerPositionQtyAbs,
+                        reason = guardReason.Length > 0 ? guardReason : "virtual_exit_would_exceed_allowed_cap"
+                    }));
+                return false;
+            }
+
+            if (cappedApply < requestedApply)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "JOURNAL_COMPLETION_BLOCKED_ALIGNMENT_INVALID", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        entry_qty = entry.EntryFilledQuantityTotal,
+                        exit_qty = exitBefore,
+                        broker_position_qty = brokerPositionQtyAbs,
+                        reason = "apply_capped:" + (guardReason.Length > 0 ? guardReason : "avoid_false_trade_completed")
+                    }));
+            }
+
+            entry.ExitFilledQuantityTotal += cappedApply;
+            var exitStamp = AlignmentExitTimestampUtc(entry, utcNow);
+            entry.ExitOrderType = CompletionReasons.RECONCILIATION_POSITION_ALIGNMENT;
+
+            var fullyClosed = entry.ExitFilledQuantityTotal >= entry.EntryFilledQuantityTotal;
+            if (fullyClosed)
+                entry.ExitFilledAtUtc = exitStamp.ToString("o");
+            else
+                entry.ExitFilledAtUtc ??= exitStamp.ToString("o");
+
+            if (fullyClosed)
             {
                 entry.TradeCompleted = true;
-                entry.CompletedAtUtc = utcNow.ToString("o");
+                entry.CompletedAtUtc = exitStamp.ToString("o");
                 entry.CompletionReason = CompletionReasons.RECONCILIATION_POSITION_ALIGNMENT;
+                entry.RealizedPnLPoints = null;
+                entry.RealizedPnLGross = null;
+                entry.RealizedPnLNet = null;
+            }
+            else
+            {
+                entry.TradeCompleted = false;
+                entry.CompletedAtUtc = null;
+                entry.CompletionReason = CompletionReasons.RECONCILIATION_ALIGNMENT_PENDING;
                 entry.RealizedPnLPoints = null;
                 entry.RealizedPnLGross = null;
                 entry.RealizedPnLNet = null;
@@ -2573,6 +2714,17 @@ public sealed class ExecutionJournal
             : (dRaw.Length == 1 ? dRaw.ToUpperInvariant()
                 : char.ToUpperInvariant(dRaw[0]) + dRaw.Substring(1).ToLowerInvariant());
 
+        var didNormalizeReopen = false;
+        var logPriorEntry = 0;
+        var logPriorExit = 0;
+        var logNewExit = 0;
+        string? logPriorCompletionReason = null;
+        var finalEntryQty = 0;
+        var finalExitQty = 0;
+        var finalRemainingAfterUpsert = 0;
+        var finalTradeCompletedAfterUpsert = false;
+        string? finalDirection = null;
+
         lock (_lock)
         {
             ExecutionJournalEntry? entry = null;
@@ -2622,12 +2774,108 @@ public sealed class ExecutionJournal
             if (targetPrice.HasValue && !entry.TargetPrice.HasValue)
                 entry.TargetPrice = targetPrice;
 
-            entry.TradeCompleted = false;
+            logPriorEntry = entry.EntryFilledQuantityTotal;
+            logPriorExit = entry.ExitFilledQuantityTotal;
+            logPriorCompletionReason = entry.CompletionReason;
+            var priorTradeCompleted = entry.TradeCompleted;
+            var numericallyFullyExited = logPriorEntry > 0 && logPriorExit >= logPriorEntry;
+
+            // Reopening for live broker exposure must not leave terminal exit cumulatives from a prior cycle.
+            if (priorTradeCompleted || numericallyFullyExited)
+            {
+                didNormalizeReopen = true;
+                entry.ExitFilledQuantityTotal = 0;
+                entry.ExitOrderType = null;
+                entry.ExitAvgFillPrice = null;
+                entry.ExitFillNotional = null;
+                entry.ExitFilledAtUtc = null;
+                entry.CompletedAtUtc = null;
+                entry.CompletionReason = null;
+                entry.RealizedPnLGross = null;
+                entry.RealizedPnLNet = null;
+                entry.RealizedPnLPoints = null;
+                logNewExit = 0;
+            }
+            else
+            {
+                logNewExit = entry.ExitFilledQuantityTotal;
+            }
+
+            // Post-upsert open-state invariant: GetOpenJournalEntriesByInstrument requires
+            // EntryFilled && !TradeCompleted && EntryFilledQuantityTotal > 0. Tagged-broker
+            // recovery must never leave exit totals or TradeCompleted in a state that hides
+            // a live broker-open row from aggregation/rehydration.
+            entry.EntryFilled = true;
+            entry.EntryFilledQuantityTotal = Math.Max(entry.EntryFilledQuantityTotal, openQtyAbs);
+            if (entry.EntryFilledQuantityTotal > 0 &&
+                entry.ExitFilledQuantityTotal > entry.EntryFilledQuantityTotal)
+            {
+                entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+            }
+
+            var remainingQty = entry.EntryFilledQuantityTotal - entry.ExitFilledQuantityTotal;
+            if (openQtyAbs > 0 && remainingQty <= 0 && entry.EntryFilledQuantityTotal > 0)
+            {
+                entry.ExitFilledQuantityTotal = Math.Max(0, entry.EntryFilledQuantityTotal - openQtyAbs);
+                if (entry.EntryFilledQuantityTotal > entry.ExitFilledQuantityTotal)
+                {
+                    entry.ExitOrderType = null;
+                    entry.ExitAvgFillPrice = null;
+                    entry.ExitFillNotional = null;
+                    entry.ExitFilledAtUtc = null;
+                    entry.CompletedAtUtc = null;
+                    entry.CompletionReason = null;
+                    entry.RealizedPnLGross = null;
+                    entry.RealizedPnLNet = null;
+                    entry.RealizedPnLPoints = null;
+                }
+            }
+
+            if (entry.EntryFilledQuantityTotal > entry.ExitFilledQuantityTotal)
+            {
+                entry.TradeCompleted = false;
+                entry.CompletedAtUtc = null;
+                entry.CompletionReason = null;
+            }
+
+            entry.FillQuantity = entry.EntryFilledQuantityTotal;
+            finalEntryQty = entry.EntryFilledQuantityTotal;
+            finalExitQty = entry.ExitFilledQuantityTotal;
+            finalDirection = entry.Direction;
+            finalRemainingAfterUpsert = finalEntryQty - finalExitQty;
+            finalTradeCompletedAfterUpsert = entry.TradeCompleted;
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
             BumpReleaseSuppressionActivity();
         }
+
+        if (didNormalizeReopen)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_REOPEN_NORMALIZED", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    prior_entry_qty = logPriorEntry,
+                    prior_exit_qty = logPriorExit,
+                    new_exit_qty = logNewExit,
+                    prior_completion_reason = logPriorCompletionReason,
+                    broker_open_qty = openQtyAbs,
+                    note = "Tagged broker recovery reopened row; cleared terminal exit-side state so journal open qty is not falsely exhausted"
+                }));
+        }
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_ROW_NORMALIZED_OPEN_AFTER_UPSERT", "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                instrument = inst,
+                entry_qty = finalEntryQty,
+                exit_qty = finalExitQty,
+                remaining = finalRemainingAfterUpsert,
+                trade_completed = finalTradeCompletedAfterUpsert,
+                correlation_id = correlationId
+            }));
 
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TAGGED_BROKER_EXPOSURE_RECOVERY_JOURNAL_UPSERT", "ENGINE",
             new
@@ -2639,6 +2887,15 @@ public sealed class ExecutionJournal
                 correlation_id = correlationId,
                 note = "TAGGED_ORPHAN_POSITION_RECOVERY — sibling to UNTRACKED; uses real stream/date"
             }));
+
+        if (finalEntryQty > finalExitQty)
+        {
+            var dirForRehydration = string.IsNullOrWhiteSpace(finalDirection)
+                ? (direction?.Trim() ?? "Long")
+                : finalDirection!;
+            _onTaggedBrokerJournalRehydrationCallback?.Invoke(
+                intentId, tradingDate, stream, inst, dirForRehydration, finalEntryQty, finalExitQty, utcNow);
+        }
     }
 
     private bool TryCompleteUntrackedFillRecoveryEntry(string tradingDate, string stream, string intentId,
@@ -3352,6 +3609,12 @@ public static class CompletionReasons
     /// Does not remove tagged/registry-attributed rows first; trim order is unprotected before protected.
     /// </summary>
     public const string RECONCILIATION_POSITION_ALIGNMENT = "RECONCILIATION_POSITION_ALIGNMENT";
+
+    /// <summary>Virtual alignment trimmed exit qty but row cannot be marked complete (broker exposure, tags, or clock).</summary>
+    public const string RECONCILIATION_ALIGNMENT_PENDING = "RECONCILIATION_ALIGNMENT_PENDING";
+
+    /// <summary>Journal row requires recovery path; do not treat as flat-completed.</summary>
+    public const string RECOVERY_REQUIRED = "RECOVERY_REQUIRED";
 
     /// <summary>
     /// Untracked / untagged fill recovery marker closed after broker flat was verified (flatten verify pass or reconciliation snapshot).

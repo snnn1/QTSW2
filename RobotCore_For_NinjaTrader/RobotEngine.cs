@@ -319,6 +319,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private readonly ExecutionJournal _executionJournal;
+    private InstrumentIntentCoordinator? _intentExposureCoordinator;
     private readonly ExecutionEventWriter _eventWriter;
     private ReconciliationRunner? _reconciliationRunner;
     private ProtectiveCoverageCoordinator? _protectiveCoordinator;
@@ -1100,6 +1101,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 _executionSummary.RecordExecutionCost(intentId, slippageDollars, commission, fees);
             });
+            _executionJournal.SetTaggedBrokerJournalRehydrationCallback(
+                (iid, td, stream, execInst, dir, eQty, xQty, utc) =>
+                    TryRehydrateSingleIntentExposureFromDurableJournal(iid, td, stream, execInst, dir, eQty, xQty, utc,
+                        "tagged_broker_recovery"));
 
             // Create intent exposure coordinator
             var coordinator = new InstrumentIntentCoordinator(
@@ -1108,6 +1113,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 (streamId, now, reason) => StandDownStream(streamId, now, reason),
                 (intentId, instrument, now) => FlattenIntent(intentId, instrument, now),
                 (intentId, now) => CancelIntentOrders(intentId, now));
+            _intentExposureCoordinator = coordinator;
 
             // PHASE 2: Set engine callbacks for protective order failure recovery
             if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
@@ -1338,6 +1344,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 EnsureStreamsCreated(utcNow);
                 EmitStartupBanner(utcNow);
+                RehydrateOpenIntentExposuresFromJournal(utcNow);
             }
             // Otherwise, timetable was invalid or missing trading_date - StandDown() was called
 
@@ -3275,6 +3282,71 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     source = "NinjaTrader_BarsRequest",
                     note = "Only fully closed bars loaded (filtered future and partial bars)"
                 }));
+        }
+    }
+
+    /// <summary>
+    /// After trading date is locked and streams exist, rebuild <see cref="InstrumentIntentCoordinator"/> rows
+    /// from open journal files so exit fills on reconnect hit a real exposure object (see INTENT_EXIT_FILL_NO_EXPOSURE).
+    /// </summary>
+    private void TryRehydrateSingleIntentExposureFromDurableJournal(
+        string intentId,
+        string tradingDate,
+        string stream,
+        string executionInstrument,
+        string direction,
+        int entryFilledQty,
+        int exitFilledQty,
+        DateTimeOffset utcNow,
+        string source)
+    {
+        if (_intentExposureCoordinator == null || _executionAdapter is not NinjaTraderSimAdapter)
+            return;
+        if (string.IsNullOrEmpty(TradingDateString) ||
+            !string.Equals(tradingDate, TradingDateString, StringComparison.Ordinal))
+            return;
+        if (string.Equals(stream, ExecutionJournal.UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase))
+            return;
+        var remaining = entryFilledQty - exitFilledQty;
+        if (remaining <= 0)
+            return;
+        var execInst = executionInstrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(execInst))
+            return;
+        var canonical = GetCanonicalInstrument(execInst);
+        var dir = string.IsNullOrWhiteSpace(direction) ? "Long" : direction;
+
+        _intentExposureCoordinator.TryRehydrateOpenExposureFromJournal(
+            intentId,
+            stream,
+            canonical,
+            dir,
+            entryFilledQty,
+            exitFilledQty,
+            utcNow,
+            source);
+    }
+
+    private void RehydrateOpenIntentExposuresFromJournal(DateTimeOffset utcNow)
+    {
+        var openByInstrument = _executionJournal.GetOpenJournalEntriesByInstrument();
+        foreach (var kv in openByInstrument)
+        {
+            foreach (var (tradingDate, stream, intentId, entry) in kv.Value)
+            {
+                var execInst = entry.Instrument?.Trim() ?? "";
+                var dir = string.IsNullOrWhiteSpace(entry.Direction) ? "Long" : entry.Direction!;
+                TryRehydrateSingleIntentExposureFromDurableJournal(
+                    intentId,
+                    tradingDate,
+                    stream,
+                    execInst,
+                    dir,
+                    entry.EntryFilledQuantityTotal,
+                    entry.ExitFilledQuantityTotal,
+                    utcNow,
+                    "journal_recovery");
+            }
         }
     }
 
@@ -5799,13 +5871,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             input.IeaOwnedPlusAdoptedWorking = useIea ? -1 : 0;
 
         var staleExecKey = ieaResolved?.ExecutionInstrumentKey ?? inst;
-        _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
+        var journalOpenQtyBeforePreSum =
+            _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical).OpenQtySum;
+        var staleAdoptionJournalClosedCount = _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
             staleExecKey,
             canonical,
             input.BrokerPositionQty,
             robotIntentIds,
             utcNow);
-        _executionJournal.ReconcileJournalOpenQuantityWithBroker(
+        var journalAlignmentWriteCount = _executionJournal.ReconcileJournalOpenQuantityWithBroker(
             inst,
             canonical,
             input.BrokerPositionQty,
@@ -5818,6 +5892,26 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _executionJournal.GetOpenJournalStructuralStateForInstrumentFromMap(openJournalMap, inst, canonical);
         input.JournalOpenQty = journalOpenQty;
         input.JournalOpenIntentSetHash = journalOpenIntentHash;
+        if (input.BrokerPositionQty != 0 && journalOpenQty == 0 ||
+            journalOpenQtyBeforePreSum != journalOpenQty ||
+            staleAdoptionJournalClosedCount != 0 ||
+            journalAlignmentWriteCount != 0)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_READINESS_JOURNAL_PRE_SUM_CHAIN", "ENGINE",
+                new
+                {
+                    run_id = _runId ?? "",
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    broker_position_qty = input.BrokerPositionQty,
+                    journal_open_qty_before_pre_sum_chain = journalOpenQtyBeforePreSum,
+                    stale_adoption_journal_closed_count = staleAdoptionJournalClosedCount,
+                    journal_alignment_write_count = journalAlignmentWriteCount,
+                    journal_open_qty_after_pre_sum_chain = journalOpenQty,
+                    note =
+                        "Journal scan before ReconcileStaleAdoptionJournalCandidatesForRelease vs structural sum after ReconcileJournalOpenQuantityWithBroker; use with RELEASE_READINESS_INPUT_AUDIT to detect pre-audit zeroing"
+                }));
+        }
         if (input.BrokerPositionQty != 0)
         {
             var (misusedSecondArgQty, _) =

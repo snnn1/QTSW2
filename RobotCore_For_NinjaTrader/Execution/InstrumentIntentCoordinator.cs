@@ -81,6 +81,63 @@ public sealed class InstrumentIntentCoordinator
                 state = exposure.State.ToString()
             }));
     }
+
+    /// <summary>
+    /// Rebuild in-memory exposure from durable journal totals after engine start / reconnect.
+    /// Idempotent when an ACTIVE exposure already matches journal entry/exit totals.
+    /// Does not fabricate fills — quantities must come from journal ground truth.
+    /// </summary>
+    public bool TryRehydrateOpenExposureFromJournal(
+        string intentId,
+        string streamId,
+        string instrumentCanonical,
+        string direction,
+        int entryFilledQty,
+        int exitFilledQty,
+        DateTimeOffset utcNow,
+        string source)
+    {
+        if (string.IsNullOrWhiteSpace(intentId)) return false;
+        var remaining = entryFilledQty - exitFilledQty;
+        if (remaining <= 0) return false;
+
+        if (_exposures.TryGetValue(intentId, out var existing) &&
+            existing.State == IntentExposureState.ACTIVE &&
+            existing.EntryFilledQty == entryFilledQty &&
+            existing.ExitFilledQty == exitFilledQty)
+            return false;
+
+        var normDir = string.IsNullOrWhiteSpace(direction)
+            ? ""
+            : (direction.Length == 1
+                ? direction.ToUpperInvariant()
+                : char.ToUpperInvariant(direction[0]) + direction.Substring(1).ToLowerInvariant());
+
+        var exposure = new IntentExposure
+        {
+            IntentId = intentId,
+            StreamId = streamId,
+            Instrument = instrumentCanonical,
+            Direction = normDir,
+            Quantity = entryFilledQty,
+            EntryFilledQty = entryFilledQty,
+            ExitFilledQty = exitFilledQty,
+            State = IntentExposureState.ACTIVE
+        };
+        _exposures[intentId] = exposure;
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_EXPOSURE_REHYDRATED", state: "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                instrument = instrumentCanonical,
+                entry_filled_qty = entryFilledQty,
+                exit_filled_qty = exitFilledQty,
+                remaining_exposure = exposure.RemainingExposure,
+                source
+            }));
+        return true;
+    }
     
     /// <summary>
     /// Responsibility 2: Handle exit fills (stop or target).
