@@ -17,6 +17,8 @@ public static class ReleaseBlockingExclusionReasons
     public const string NO_TAG = "NO_TAG";
     public const string NOT_IN_REGISTRY = "NOT_IN_REGISTRY";
     public const string DIRECTION_MISMATCH = "DIRECTION_MISMATCH";
+    /// <summary>Direction matches broker but row has no open qty and is not tied to live tag/registry working state.</summary>
+    public const string NON_LIVE_STALE_ADOPTION = "NON_LIVE_STALE_ADOPTION";
     public const string OTHER = "OTHER";
 }
 
@@ -1588,16 +1590,24 @@ public sealed class ExecutionJournal
         return s;
     }
 
-    /// <summary>True if journal entry instrument matches IEA execution key or canonical (ES vs MES, etc.).</summary>
-    private static bool JournalInstrumentMatchesExecutionKey(string? entryInstrument, string executionInstrument, string? canonicalInstrument)
+    /// <summary>
+    /// Deterministic match for journal buckets: normalized entry key equals execution root OR canonical root (e.g. ES vs MES).
+    /// Does not invent cross-product relationships — only the two roots supplied by the caller (from policy/spec).
+    /// </summary>
+    public static bool OpenJournalMapBucketMatches(string? journalInstrumentKey, string executionInstrument,
+        string? canonicalInstrument)
     {
-        var inst = NormalizeJournalInstrumentSymbol(string.IsNullOrWhiteSpace(entryInstrument) ? "UNKNOWN" : entryInstrument);
+        var inst = NormalizeJournalInstrumentSymbol(string.IsNullOrWhiteSpace(journalInstrumentKey) ? "UNKNOWN" : journalInstrumentKey);
         var exec = NormalizeJournalInstrumentSymbol(executionInstrument);
         var canon = string.IsNullOrEmpty(canonicalInstrument) ? null : NormalizeJournalInstrumentSymbol(canonicalInstrument);
         if (string.Equals(inst, exec, StringComparison.OrdinalIgnoreCase)) return true;
         if (canon != null && string.Equals(inst, canon, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
+
+    /// <summary>True if journal entry instrument matches IEA execution key or canonical (ES vs MES, etc.).</summary>
+    private static bool JournalInstrumentMatchesExecutionKey(string? entryInstrument, string executionInstrument, string? canonicalInstrument) =>
+        OpenJournalMapBucketMatches(entryInstrument, executionInstrument, canonicalInstrument);
 
     private static bool IsUntrackedFillRecoveryMarker(ExecutionJournalEntry? entry) =>
         entry != null &&
@@ -1844,8 +1854,11 @@ public sealed class ExecutionJournal
     private static int BrokerPositionSign(int signedQty) => signedQty > 0 ? 1 : (signedQty < 0 ? -1 : 0);
 
     /// <summary>
-    /// When the broker has non-flat exposure, an adoption candidate blocks release only if it is plausibly tied to live
-    /// exposure (open qty, tags, registry trusted working, or journal direction aligned with broker position).
+    /// When the broker has non-flat exposure, an adoption candidate blocks release only if it is tied to <b>live</b>
+    /// exposure: remaining open journal quantity, robot-tagged working orders on the instrument, or IEA mismatch-trusted
+    /// working intents. Historical rows that merely share the same direction as the broker are <b>not</b> treated as
+    /// release-blocking once they have no open qty and are absent from live tag/registry evidence (see
+    /// <see cref="ReleaseBlockingExclusionReasons.NON_LIVE_STALE_ADOPTION"/>).
     /// </summary>
     public static bool IsExposureRelevantAdoptionCandidateForRelease(
         ExecutionJournalEntry entry,
@@ -1863,11 +1876,7 @@ public sealed class ExecutionJournal
         if (GetEntryRemainingOpenQuantity(entry) > 0) return true;
         if (tagSet.Contains(intentId)) return true;
         if (regSet.Count > 0 && regSet.Contains(intentId)) return true;
-
-        var bSign = BrokerPositionSign(brokerPositionQtySigned);
-        if (bSign == 0) return false;
-        var jSign = DirectionSignFromJournalDirection(entry.Direction);
-        return jSign != 0 && jSign == bSign;
+        return false;
     }
 
     private List<(string IntentId, bool Blocking, string? ExclusionReason)> BuildReleaseBlockingDecisionList(
@@ -1924,6 +1933,10 @@ public sealed class ExecutionJournal
                 exReason = ReleaseBlockingExclusionReasons.OTHER;
             else if (jSign != 0 && bSign != 0 && jSign != bSign)
                 exReason = ReleaseBlockingExclusionReasons.DIRECTION_MISMATCH;
+            else if (jSign != 0 && bSign != 0 && jSign == bSign &&
+                     !tagSet.Contains(intentId) &&
+                     !(regSet.Count > 0 && regSet.Contains(intentId)))
+                exReason = ReleaseBlockingExclusionReasons.NON_LIVE_STALE_ADOPTION;
             else if (regSet.Count > 0 && !regSet.Contains(intentId))
                 exReason = ReleaseBlockingExclusionReasons.NOT_IN_REGISTRY;
             else if (!tagSet.Contains(intentId))
@@ -1956,6 +1969,36 @@ public sealed class ExecutionJournal
             brokerPositionQtySigned,
             robotTaggedIntentIdsOnInstrument,
             registryMismatchTrustedIntentIds);
+
+        foreach (var (intentId, blocking, exReason) in decisions)
+        {
+            if (blocking ||
+                !string.Equals(exReason, ReleaseBlockingExclusionReasons.NON_LIVE_STALE_ADOPTION, StringComparison.Ordinal))
+                continue;
+            var located = TryGetAdoptionCandidateEntry(intentId, executionInstrumentPrimary, canonicalInstrument);
+            if (located == null) continue;
+            var e = located.Value.Entry;
+            var inTag = robotTaggedIntentIdsOnInstrument != null &&
+                        robotTaggedIntentIdsOnInstrument.Any(x =>
+                            string.Equals(x, intentId, StringComparison.OrdinalIgnoreCase));
+            var inReg = registryMismatchTrustedIntentIds != null &&
+                        registryMismatchTrustedIntentIds.Any(x =>
+                            string.Equals(x, intentId, StringComparison.OrdinalIgnoreCase));
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RELEASE_BLOCKING_CANDIDATE_EXCLUDED", state: "ENGINE",
+                new Dictionary<string, object?>
+                {
+                    ["intent_id"] = intentId,
+                    ["reason"] = exReason,
+                    ["broker_position_qty"] = brokerPositionQtyAbs,
+                    ["broker_position_signed"] = brokerPositionQtySigned,
+                    ["journal_remaining_open_qty"] = GetEntryRemainingOpenQuantity(e),
+                    ["in_robot_tag_set"] = inTag,
+                    ["in_registry_set"] = inReg,
+                    ["direction"] = e.Direction ?? "",
+                    ["execution_instrument"] = executionInstrumentPrimary,
+                    ["canonical_instrument"] = canonicalInstrument ?? "",
+                }));
+        }
 
         var raw = decisions.Count;
         var blockingIds = new List<string>();
@@ -2178,16 +2221,8 @@ public sealed class ExecutionJournal
         }
     }
 
-    private static bool OpenJournalInstrumentKeyMatches(string? key, string executionInstrumentPrimary, string? alternateInstrumentKey)
-    {
-        var k = key?.Trim() ?? "";
-        if (string.IsNullOrEmpty(k)) return false;
-        var p = executionInstrumentPrimary?.Trim() ?? "";
-        if (string.Equals(k, p, StringComparison.OrdinalIgnoreCase)) return true;
-        var a = alternateInstrumentKey?.Trim();
-        if (!string.IsNullOrEmpty(a) && string.Equals(k, a, StringComparison.OrdinalIgnoreCase)) return true;
-        return false;
-    }
+    private static bool OpenJournalInstrumentKeyMatches(string? key, string executionInstrumentPrimary, string? alternateInstrumentKey) =>
+        OpenJournalMapBucketMatches(key, executionInstrumentPrimary, alternateInstrumentKey);
 
     /// <summary>
     /// When sum of open journal quantities for the instrument exceeds broker position, trim phantom exposure by applying
@@ -2762,8 +2797,40 @@ public sealed class ExecutionJournal
         {
             var key = kvp.Key?.Trim() ?? "";
             if (string.IsNullOrEmpty(key)) continue;
+            if (!OpenJournalMapBucketMatches(key, executionInstrument, canonicalInstrument)) continue;
+            foreach (var (_, _, intentId, entry) in kvp.Value)
+            {
+                var remaining = GetEntryRemainingOpenQuantity(entry);
+                if (remaining <= 0) continue;
+                sum += remaining;
+                if (!string.IsNullOrWhiteSpace(intentId))
+                    openIntentIds.Add(intentId);
+            }
+        }
+
+        openIntentIds.Sort(StringComparer.OrdinalIgnoreCase);
+        return (sum, ReleaseReconciliationRedundancySuppression.ComputeStableOrderedStringSetHashFromSortedList(openIntentIds));
+    }
+
+    /// <summary>
+    /// Historical misuse: second aggregation parameter was <c>execVariant</c> (e.g. MES) instead of true canonical (ES),
+    /// so only raw keys equal to execution and duplicate micro matched — not canonical-keyed open rows.
+    /// For diagnostics vs <see cref="GetOpenJournalStructuralStateForInstrumentFromMap"/> with real canonical.
+    /// </summary>
+    public (int OpenQtySum, long OpenIntentSetHash) GetOpenJournalStructuralStateForInstrumentFromMapMisusedExecVariantAsCanonical(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        string executionInstrument,
+        string execVariantDuplicate)
+    {
+        var sum = 0;
+        var openIntentIds = new List<string>();
+        foreach (var kvp in openByInstrument)
+        {
+            var key = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(key)) continue;
             if (string.Equals(key, executionInstrument, StringComparison.OrdinalIgnoreCase) ||
-                (!string.IsNullOrEmpty(canonicalInstrument) && string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
+                (!string.IsNullOrEmpty(execVariantDuplicate) &&
+                 string.Equals(key, execVariantDuplicate, StringComparison.OrdinalIgnoreCase)))
             {
                 foreach (var (_, _, intentId, entry) in kvp.Value)
                 {
@@ -2778,6 +2845,22 @@ public sealed class ExecutionJournal
 
         openIntentIds.Sort(StringComparer.OrdinalIgnoreCase);
         return (sum, ReleaseReconciliationRedundancySuppression.ComputeStableOrderedStringSetHashFromSortedList(openIntentIds));
+    }
+
+    /// <summary>Count open journal rows (all entries in matching buckets) for convergence / diagnostics.</summary>
+    public static int CountOpenJournalRowsMatchingInstrumentScope(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        string executionInstrument,
+        string? canonicalInstrument)
+    {
+        var n = 0;
+        foreach (var kvp in openByInstrument)
+        {
+            if (!OpenJournalMapBucketMatches(kvp.Key, executionInstrument, canonicalInstrument)) continue;
+            n += kvp.Value.Count;
+        }
+
+        return n;
     }
 
     /// <inheritdoc cref="GetOpenJournalQuantitySumForInstrument"/>
@@ -2885,7 +2968,13 @@ public sealed class ExecutionJournal
     /// Sets TradeCompleted, CompletionReason=RECONCILIATION_BROKER_FLAT.
     /// Exit price and P&L left null so reporting layer can treat reconciled trades specially.
     /// </summary>
-    public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
+    /// <param name="brokerPositionQtyAbsAtDecision">When &gt;= 0 and <paramref name="triggerSource"/> set, logged on <c>JOURNAL_COMPLETION_DECISION</c>.</param>
+    /// <param name="journalOpenQtyBeforeClose">Remaining open qty before close; use -1 if unknown.</param>
+    /// <param name="triggerSource">Non-null to emit <c>JOURNAL_COMPLETION_DECISION</c> after persist (e.g. ReconciliationRunner).</param>
+    public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow,
+        int brokerPositionQtyAbsAtDecision = -1,
+        int journalOpenQtyBeforeClose = -1,
+        string? triggerSource = null)
     {
         if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
             return false;
@@ -2943,6 +3032,23 @@ public sealed class ExecutionJournal
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
             BumpReleaseSuppressionActivity();
+
+            if (!string.IsNullOrEmpty(triggerSource))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_COMPLETION_DECISION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        trading_date = tradingDate,
+                        completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                        broker_position_qty = brokerPositionQtyAbsAtDecision < 0 ? null : (int?)brokerPositionQtyAbsAtDecision,
+                        journal_open_qty_before_close = journalOpenQtyBeforeClose < 0 ? null : (int?)journalOpenQtyBeforeClose,
+                        reason = "TradeCompleted via reconciliation — broker flat confirmed by caller",
+                        trigger_source = triggerSource
+                    }));
+            }
+
             return true;
         }
     }

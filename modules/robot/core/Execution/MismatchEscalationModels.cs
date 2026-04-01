@@ -187,6 +187,15 @@ public sealed class ReconciliationForcedConvergenceResult
 public static class MismatchEscalationPolicy
 {
     public const int MISMATCH_AUDIT_INTERVAL_MS = 5000;
+
+    /// <summary>Full mismatch audit cadence when gate/mismatch/snapshot/activity indicates work in flight.</summary>
+    public const int MISMATCH_AUDIT_INTERVAL_ACTIVE_MS = 5000;
+
+    /// <summary>Idle cadence when broker snapshot + execution generation are stable and no gate/escalation.</summary>
+    public const int MISMATCH_AUDIT_INTERVAL_IDLE_MS = 30_000;
+
+    /// <summary>Upper bound on wall time between audits in idle mode (wake + mandatory full pass).</summary>
+    public const int MISMATCH_AUDIT_MANDATORY_MAX_GAP_MS = 90_000;
     public const int MISMATCH_PERSISTENT_THRESHOLD_MS = 10000;
     public const int MISMATCH_FAIL_CLOSED_THRESHOLD_MS = 30000;
     public const int MISMATCH_CLEAR_CONSECUTIVE_CLEAN_PASSES = 2;

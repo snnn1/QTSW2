@@ -116,6 +116,76 @@ public sealed class OrderRegistry
         return true;
     }
 
+    /// <summary>
+    /// Diagnostic-only: explains why <see cref="LinkBrokerOrderIdAlias"/> would return false (does not mutate maps).
+    /// </summary>
+    public string DescribeLinkBrokerOrderIdAliasFailure(string alternateBrokerOrderId, string canonicalBrokerOrderId)
+    {
+        if (string.IsNullOrEmpty(alternateBrokerOrderId) || string.IsNullOrEmpty(canonicalBrokerOrderId))
+            return "empty_id";
+        if (string.Equals(alternateBrokerOrderId, canonicalBrokerOrderId, StringComparison.OrdinalIgnoreCase))
+            return "same_id";
+        if (!_byBrokerOrderId.ContainsKey(canonicalBrokerOrderId))
+            return "canonical_not_registered";
+        return "unknown";
+    }
+
+    /// <summary>
+    /// Last-resort convergence audit: find a mismatch-trusted live registry row for this instrument and broker/native order id
+    /// (including alias-key paths not visible to a single <see cref="TryResolveByBrokerOrderId"/> lookup).
+    /// </summary>
+    public bool TryFindMismatchTrustedLiveEntryByInstrumentOrderId(string instrument, string brokerOrderId,
+        out OrderRegistryEntry? entry)
+    {
+        entry = null;
+        if (string.IsNullOrWhiteSpace(instrument) || string.IsNullOrWhiteSpace(brokerOrderId))
+            return false;
+        var inst = instrument.Trim();
+        var id = brokerOrderId.Trim();
+
+        bool Matches(OrderRegistryEntry e)
+        {
+            if (string.IsNullOrWhiteSpace(e.Instrument)) return false;
+            if (!string.Equals(e.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) return false;
+            if (e.OwnershipStatus != OrderOwnershipStatus.OWNED &&
+                e.OwnershipStatus != OrderOwnershipStatus.ADOPTED &&
+                e.OwnershipStatus != OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+                return false;
+            return e.LifecycleState == OrderLifecycleState.SUBMITTED ||
+                   e.LifecycleState == OrderLifecycleState.WORKING ||
+                   e.LifecycleState == OrderLifecycleState.PART_FILLED;
+        }
+
+        foreach (var e in _byBrokerOrderId.Values)
+        {
+            if (!Matches(e)) continue;
+            if (string.Equals(e.BrokerOrderId, id, StringComparison.OrdinalIgnoreCase))
+            {
+                entry = e;
+                return true;
+            }
+        }
+
+        if (_brokerOrderIdAliasToCanonical.TryGetValue(id, out var canon) &&
+            _byBrokerOrderId.TryGetValue(canon, out var viaAlias) && Matches(viaAlias))
+        {
+            entry = viaAlias;
+            return true;
+        }
+
+        foreach (var kvp in _brokerOrderIdAliasToCanonical)
+        {
+            if (!string.Equals(kvp.Key, id, StringComparison.OrdinalIgnoreCase)) continue;
+            if (_byBrokerOrderId.TryGetValue(kvp.Value, out var e3) && Matches(e3))
+            {
+                entry = e3;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Update lifecycle state. Returns false if transition invalid (caller should emit ORDER_LIFECYCLE_TRANSITION_INVALID).</summary>
     public bool UpdateLifecycle(string brokerOrderId, OrderLifecycleState newState, DateTimeOffset? terminalUtc = null)
     {

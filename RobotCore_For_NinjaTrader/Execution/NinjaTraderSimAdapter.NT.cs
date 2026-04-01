@@ -391,11 +391,10 @@ public sealed partial class NinjaTraderSimAdapter
         if (exposure.ReconciliationAbsQuantityTotal == 0)
             return FlattenResult.SuccessResult(utcNow);
         var execKey = _iea?.ExecutionInstrumentKey ?? instrument;
-        var execVariant = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
         var journalQty = 0;
         try
         {
-            journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+            journalQty = SumOpenJournalForInstrument(instrument, execKey);
         }
         catch { /* observability */ }
 
@@ -595,7 +594,6 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (_iea == null) return;
         var execInst = _iea.ExecutionInstrumentKey;
-        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
         int brokerQty = 0, brokerWorkingCount = 0;
         Account? account = null;
         try
@@ -618,7 +616,7 @@ public sealed partial class NinjaTraderSimAdapter
             _iea.ProcessBootstrapResult(new BootstrapSnapshot { Instrument = instrument, UnownedLiveOrderCount = 999 }, utcNow);
             return;
         }
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var journalQty = SumOpenJournalForInstrument(instrument, execInst);
         var registry = _iea.GetRegistrySnapshotForRecovery();
         var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
         var protectiveStatus = ComputeProtectiveStatusFromBroker(account, instrument, brokerQty);
@@ -714,8 +712,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             return false;
         }
-        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var journalQty = SumOpenJournalForInstrument(instrument, execInst);
         var registry = _iea.GetRegistrySnapshotForRecovery();
         var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
         var result = RecoveryReconstructor.Reconstruct(instrument, brokerQty, brokerWorkingCount, journalQty, registry, runtime, reason);
@@ -845,7 +842,6 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (_iea == null) return;
         var execInst = _iea.ExecutionInstrumentKey;
-        var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
         int brokerQty = 0, brokerWorkingCount = 0;
         try
         {
@@ -866,7 +862,7 @@ public sealed partial class NinjaTraderSimAdapter
             _iea.ProcessReconstructionResult(new ReconstructionResult { Instrument = instrument, Classification = ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE }, utcNow);
             return;
         }
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant);
+        var journalQty = SumOpenJournalForInstrument(instrument, execInst);
         var registry = _iea.GetRegistrySnapshotForRecovery();
         var runtime = _iea.GetRuntimeIntentSnapshotForRecovery();
         var result = RecoveryReconstructor.Reconstruct(instrument, brokerQty, brokerWorkingCount, journalQty, registry, runtime, reason);
@@ -1084,9 +1080,7 @@ public sealed partial class NinjaTraderSimAdapter
             var exposurePrecheck = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(cmd.Instrument);
             brokerQty = exposurePrecheck.ReconciliationAbsQuantityTotal;
             brokerQtySigned = exposurePrecheck.Legs.Sum(l => l.SignedQuantity);
-            var execInst = execKey;
-            var execVariant = (execInst.StartsWith("M") && execInst.Length > 1 ? execInst : "M" + execInst);
-            journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(cmd.Instrument, execVariant);
+            journalQty = SumOpenJournalForInstrument(cmd.Instrument, execKey);
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_BROKER_EXPOSURE_PRECHECK", state: "ENGINE",
                 new
                 {
@@ -1126,8 +1120,7 @@ public sealed partial class NinjaTraderSimAdapter
             CancelRobotOwnedWorkingOrdersReal(default, utcNow, cmd.Instrument, cmd.ExplicitCancelBrokerOrderIds, cmd.AllowAccountWideCancelFallback, cmd.CorrelationId);
             try
             {
-                var execVariantPostCancel = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
-                var journalAfterCancel = _executionJournal.GetOpenJournalQuantitySumForInstrument(cmd.Instrument, execVariantPostCancel);
+                var journalAfterCancel = SumOpenJournalForInstrument(cmd.Instrument, execKey);
                 if (journalAfterCancel != journalQty)
                 {
                     _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_POLICY_PREPOST_DRIFT", new
@@ -3960,42 +3953,7 @@ public sealed partial class NinjaTraderSimAdapter
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId,
             brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
 
-        // Track cumulative fills for partial-fill safety
-        orderInfo.FilledQuantity += fillQuantity;
-        var filledTotal = orderInfo.FilledQuantity;
-        
-        // Get expectation for fill accounting
-        var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity : 
-            (IntentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
-        var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
-            (IntentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
-        var remainingQty = expectedQty - filledTotal;
-        var overfill = filledTotal > expectedQty;
-        
-        // Per-fill accounting log
-        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, 
-            "INTENT_FILL_UPDATE", new
-        {
-            intent_id = intentId,
-            fill_qty = fillQuantity,
-            cumulative_filled_qty = filledTotal,
-            expected_qty = expectedQty,
-            max_qty = maxQty,
-            remaining_qty = remainingQty,
-            overfill = overfill
-        }));
-        
-        if (overfill)
-        {
-            // Trigger emergency handler
-            TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
-            {
-                { "expected_qty", expectedQty },
-                { "actual_filled_qty", filledTotal },
-                { "last_fill_qty", fillQuantity },
-                { "reason", "Fill exceeded expected quantity" }
-            });
-        }
+        var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
 
         // Robot flatten orders: tag decodes to pseudo intentId "FLATTEN" — skip IntentMap and journal via coordinator path.
         if (IsRobotOwnedFlattenOrder(encodedTag, orderInfo) && order != null)
@@ -4004,19 +3962,17 @@ public sealed partial class NinjaTraderSimAdapter
             ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order);
             return;
         }
-        
+
         // CRITICAL: Resolve intent context before any journal call
-        // Use orderTypeFromTag if available (from tag), otherwise use orderInfo.OrderType
-        var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
         IntentContext context;
-        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument, 
+        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument,
             fillPrice, fillQuantity, utcNow, out context, order))
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings
             return; // Fail-closed
         }
-        
+
         // UNIFY FILL EVENTS: trading_date must be non-null for PnL/accounting integrity
         if (string.IsNullOrWhiteSpace(context.TradingDate))
         {
@@ -4034,13 +3990,46 @@ public sealed partial class NinjaTraderSimAdapter
                 });
             return; // Fail-closed
         }
-        
-        // Explicit Entry vs Exit Classification
-        // CRITICAL FIX: Use orderTypeFromTag to determine if it's an entry or exit order
+
+        // Explicit Entry vs Exit Classification before entry cumulative accounting.
         // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry order in OrderMap)
         bool isEntryFill = !isProtectiveOrder && orderInfo.IsEntryOrder == true;
         if (isEntryFill)
         {
+            // ENTRY only: track cumulative fills on the entry order row; INTENT_FILL_UPDATE and overfill guard are entry-only.
+            orderInfo.FilledQuantity += fillQuantity;
+            var filledTotal = orderInfo.FilledQuantity;
+
+            var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity :
+                (IntentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
+            var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
+                (IntentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
+            var remainingQty = expectedQty - filledTotal;
+            var overfill = filledTotal > expectedQty;
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                "INTENT_FILL_UPDATE", new
+                {
+                    intent_id = intentId,
+                    fill_qty = fillQuantity,
+                    cumulative_filled_qty = filledTotal,
+                    expected_qty = expectedQty,
+                    max_qty = maxQty,
+                    remaining_qty = remainingQty,
+                    overfill = overfill
+                }));
+
+            if (overfill)
+            {
+                TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
+                {
+                    { "expected_qty", expectedQty },
+                    { "actual_filled_qty", filledTotal },
+                    { "last_fill_qty", fillQuantity },
+                    { "reason", "Fill exceeded expected quantity" }
+                });
+            }
+
             // Entry fill - handle aggregated orders (multiple streams, one broker order)
             var intentIdsToUpdate = orderInfo.AggregatedIntentIds ?? new List<string> { context.IntentId };
             var isAggregated = intentIdsToUpdate.Count > 1;
@@ -4119,7 +4108,7 @@ public sealed partial class NinjaTraderSimAdapter
                         note = "Downstream TAGGED_BROKER_WITHOUT_JOURNAL repair may run from reconciliation / protective"
                     }));
                 if (posAbs > 0 &&
-                    _executionJournal.GetOpenJournalQuantitySumForInstrument(orderInfo.Instrument.Trim(), null) == 0)
+                    SumOpenJournalForInstrument(orderInfo.Instrument.Trim(), _iea?.ExecutionInstrumentKey ?? orderInfo.Instrument.Trim()) == 0)
                 {
                     _ = TryRepairTaggedBrokerWithoutJournalCore(orderInfo.Instrument.Trim(), posAbs, 0, utcNow, out _, out _);
                 }
@@ -4333,6 +4322,9 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            // STOP/TARGET: do not mutate orderInfo.FilledQuantity (entry cumulative is only updated on the entry path).
+            var exitFilledTotalForLog = orderInfo.FilledQuantity + fillQuantity;
+
             // LATE-FILL PROTECTION: If intent already completed, this is a stale/late fill (race with sibling cancel).
             var tradingDate = context.TradingDate ?? "";
             var stream = context.Stream ?? "";
@@ -4427,7 +4419,7 @@ public sealed partial class NinjaTraderSimAdapter
                     position_effect = "CLOSE",
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
-                    filled_total = filledTotal,
+                    filled_total = exitFilledTotalForLog,
                     remaining_qty = 0,
                     stream = context.Stream,
                     stream_key = context.Stream,
@@ -4438,7 +4430,7 @@ public sealed partial class NinjaTraderSimAdapter
                     mapped = true
                 }));
             
-            // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not filledTotal (cumulative)
+            // CRITICAL FIX: Coordinator accumulates internally, so pass fillQuantity (delta) not exit cumulative
             // OnExitFill does: exposure.ExitFilledQty += qty, so passing cumulative totals causes double-counting
             _coordinator?.OnExitFill(intentId, fillQuantity, utcNow);
             
@@ -6698,9 +6690,8 @@ public sealed partial class NinjaTraderSimAdapter
                 if (!policyPrechecked.HasValue)
                 {
                     var execKey = _iea?.ExecutionInstrumentKey ?? instrument;
-                    var execVariant = (execKey.StartsWith("M") && execKey.Length > 1 ? execKey : "M" + execKey);
                     var journalQty = _executionJournal != null
-                        ? _executionJournal.GetOpenJournalQuantitySumForInstrument(instrument, execVariant)
+                        ? SumOpenJournalForInstrument(instrument, execKey)
                         : 0;
                     var src = destructiveSourceOverride
                               ?? (intentId == "EMERGENCY_BLOCK" ? DestructiveActionSource.EMERGENCY : DestructiveActionSource.MANUAL);

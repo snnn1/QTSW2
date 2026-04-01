@@ -197,6 +197,36 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     public void SetFlattenCoordinationInstanceId(string? instanceId) =>
         _flattenCoordinationInstanceIdOverride = string.IsNullOrWhiteSpace(instanceId) ? null : instanceId.Trim();
 
+    /// <summary>Optional: execution root → canonical (e.g. MES→ES) for journal open-qty aggregation in adapter guard paths.</summary>
+    private Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
+
+    /// <summary>Wires spec-backed canonical resolution so journal rows keyed under ES count when execution is MES.</summary>
+    public void SetCanonicalInstrumentForJournalAggregation(Func<string, string?>? resolver) =>
+        _getCanonicalInstrumentForJournalAggregation = resolver;
+
+    /// <summary>Second arg to <see cref="ExecutionJournal.GetOpenJournalQuantitySumForInstrument"/>; null falls back to execution-only.</summary>
+    private string? CanonicalInstrumentForOpenJournalSum(string executionInstrumentRoot)
+    {
+        try
+        {
+            return _getCanonicalInstrumentForJournalAggregation?.Invoke(executionInstrumentRoot);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Journal open qty for logical NT instrument / execution key, with canonical-aware bucket matching (MES vs ES).</summary>
+    private int SumOpenJournalForInstrument(string logicalInstrument, string executionInstrumentKeyFallback)
+    {
+        var root = BrokerPositionResolver.NormalizeCanonicalKey(logicalInstrument);
+        if (string.IsNullOrEmpty(root))
+            root = BrokerPositionResolver.NormalizeCanonicalKey(executionInstrumentKeyFallback);
+        var canon = CanonicalInstrumentForOpenJournalSum(root);
+        return _executionJournal.GetOpenJournalQuantitySumForInstrument(root, canon);
+    }
+
     private string GetFlattenCoordinationInstanceId() =>
         !string.IsNullOrEmpty(_flattenCoordinationInstanceIdOverride)
             ? _flattenCoordinationInstanceIdOverride!

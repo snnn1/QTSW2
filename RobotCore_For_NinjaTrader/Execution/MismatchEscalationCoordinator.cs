@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -26,11 +27,15 @@ public sealed class MismatchEscalationCoordinator
     private readonly RobotLogger? _log;
     private readonly ExecutionEventWriter? _eventWriter;
     private readonly RuntimeAuditHub? _runtimeAudit;
-    private readonly Func<string, DateTimeOffset, GateReconciliationResult?>? _runInstrumentGateReconciliation;
+    private readonly Func<string, DateTimeOffset, int, GateReconciliationResult?>? _runInstrumentGateReconciliation;
     private readonly Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? _evaluateReleaseReadiness;
     private readonly Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? _runForcedBrokerAlignment;
     private readonly Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>?
         _onForcedConvergenceFailure;
+    private readonly Func<long>? _getExecutionActivityGeneration;
+    private readonly object _auditRunLock = new();
+    private long _scheduleFingerprintPrev = long.MinValue;
+    private long _scheduleActivityGenPrev = long.MinValue;
     private readonly int _stableWindowMs;
     private readonly Timer _auditTimer;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
@@ -82,13 +87,14 @@ public sealed class MismatchEscalationCoordinator
         Func<string, bool> isRecoveryInProgress,
         RobotLogger? log,
         ExecutionEventWriter? eventWriter = null,
-        Func<string, DateTimeOffset, GateReconciliationResult?>? runInstrumentGateReconciliation = null,
+        Func<string, DateTimeOffset, int, GateReconciliationResult?>? runInstrumentGateReconciliation = null,
         Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? evaluateReleaseReadiness = null,
         int stateConsistencyStableWindowMs = 0,
         RuntimeAuditHub? runtimeAudit = null,
         Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? runForcedBrokerAlignment = null,
         Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? onForcedConvergenceFailure =
-            null)
+            null,
+        Func<long>? getExecutionActivityGeneration = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -103,11 +109,28 @@ public sealed class MismatchEscalationCoordinator
         _evaluateReleaseReadiness = evaluateReleaseReadiness;
         _runForcedBrokerAlignment = runForcedBrokerAlignment;
         _onForcedConvergenceFailure = onForcedConvergenceFailure;
+        _getExecutionActivityGeneration = getExecutionActivityGeneration;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
             ? stateConsistencyStableWindowMs
             : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
 
-        _auditTimer = new Timer(OnAuditTick, null, MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_MS, MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_MS);
+        var initialDue = getExecutionActivityGeneration != null
+            ? MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_ACTIVE_MS
+            : MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_MS;
+        _auditTimer = new Timer(OnAuditTick, null, initialDue, Timeout.Infinite);
+    }
+
+    /// <summary>Wakes the mismatch audit on the active cadence (execution activity, order updates, etc.).</summary>
+    public void NotifyReconciliationAuditWake()
+    {
+        try
+        {
+            _auditTimer.Change(0, Timeout.Infinite);
+        }
+        catch
+        {
+            // Timer disposed or host shutting down
+        }
     }
 
     public bool IsInstrumentBlockedByMismatch(string instrument)
@@ -178,63 +201,172 @@ public sealed class MismatchEscalationCoordinator
 
     private void OnAuditTick(object? _)
     {
-        var utcNow = DateTimeOffset.UtcNow;
-        var cpu = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+        lock (_auditRunLock)
+        {
+            var prevAuditUtc = _lastAuditUtc;
+            var utcNow = DateTimeOffset.UtcNow;
+            AccountSnapshot? snapshot = null;
+            IReadOnlyList<MismatchObservation> observations = Array.Empty<MismatchObservation>();
+            var cpu = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
+            try
+            {
+                snapshot = _getSnapshot();
+                var instruments = _getActiveInstruments();
+
+                if (instruments.Count == 0 && snapshot.Positions != null)
+                {
+                    var fromPositions = snapshot.Positions
+                        .Where(p => (p.Quantity != 0 || !string.IsNullOrWhiteSpace(p.Instrument)) && !string.IsNullOrWhiteSpace(p.Instrument))
+                        .Select(p => p.Instrument!.Trim())
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    instruments = fromPositions;
+                }
+
+                observations = _getMismatchObservations(snapshot, utcNow);
+                var obsByInstrument = observations
+                    .Where(o => !string.IsNullOrWhiteSpace(o.Instrument))
+                    .GroupBy(o => o.Instrument.Trim(), StringComparer.OrdinalIgnoreCase)
+                    .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+                var instrumentsSet = new HashSet<string>(instruments.Where(i => !string.IsNullOrWhiteSpace(i)).Select(i => i.Trim()), StringComparer.OrdinalIgnoreCase);
+                foreach (var k in obsByInstrument.Keys)
+                    instrumentsSet.Add(k);
+                foreach (var kv in _stateByInstrument)
+                {
+                    if (kv.Value.GateLifecyclePhase != GateLifecyclePhase.None)
+                        instrumentsSet.Add(kv.Key);
+                }
+
+                foreach (var inst in instrumentsSet)
+                {
+                    if (obsByInstrument.TryGetValue(inst, out var obs))
+                        ProcessMismatchPresent(obs);
+                    else
+                        ProcessMismatchSignalAbsent(inst, utcNow);
+                }
+
+                foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
+                {
+                    obsByInstrument.TryGetValue(inst, out var gateObs);
+                    AdvanceStateConsistencyGate(inst, snapshot, utcNow, gateObs);
+                }
+
+                _lastAuditUtc = utcNow;
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "MismatchEscalationCoordinator.OnAuditTick" }));
+            }
+            finally
+            {
+                if (cpu != 0)
+                    _runtimeAudit?.CpuEnd(cpu, RuntimeAuditSubsystem.MismatchTimerTotal, instrument: "", stream: "", onIeaWorker: false);
+                ScheduleNextAudit(utcNow, prevAuditUtc, snapshot, observations);
+            }
+        }
+    }
+
+    private static long ComputeSnapshotAuditFingerprint(AccountSnapshot? snap)
+    {
+        if (snap == null) return 0L;
+        unchecked
+        {
+            long h = 17;
+            var pos = snap.Positions;
+            if (pos != null)
+            {
+                for (var i = 0; i < pos.Count; i++)
+                {
+                    var p = pos[i];
+                    if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+                    h = h * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(p.Instrument.Trim());
+                    h = h * 31 + p.Quantity;
+                    h = h * 31 + p.AveragePrice.GetHashCode();
+                }
+            }
+
+            var wo = snap.WorkingOrders;
+            if (wo == null || wo.Count == 0)
+                return h;
+
+            var keys = new string[wo.Count];
+            var n = 0;
+            for (var i = 0; i < wo.Count; i++)
+            {
+                var w = wo[i];
+                keys[n++] = string.Concat(
+                    w.OrderId, "\x1F", w.Instrument, "\x1F", w.Quantity, "\x1F", w.OrderType ?? "", "\x1F",
+                    w.StopPrice?.ToString(CultureInfo.InvariantCulture) ?? "", "\x1F",
+                    w.Price?.ToString(CultureInfo.InvariantCulture) ?? "");
+            }
+            Array.Sort(keys, 0, n, StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < n; i++)
+                h = h * 31 + StringComparer.OrdinalIgnoreCase.GetHashCode(keys[i]);
+            return h;
+        }
+    }
+
+    private bool AnyGateOrEscalationActive()
+    {
+        foreach (var kv in _stateByInstrument)
+        {
+            var s = kv.Value;
+            if (s.GateLifecyclePhase != GateLifecyclePhase.None) return true;
+            if (s.EscalationState != MismatchEscalationState.NONE) return true;
+        }
+
+        return false;
+    }
+
+    private void ScheduleNextAudit(DateTimeOffset utcNow, DateTimeOffset prevAuditUtc, AccountSnapshot? snapshot,
+        IReadOnlyList<MismatchObservation> observations)
+    {
+        int nextMs;
+        if (_getExecutionActivityGeneration == null)
+        {
+            nextMs = MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_MS;
+        }
+        else
+        {
+            var fp = ComputeSnapshotAuditFingerprint(snapshot);
+            var gen = _getExecutionActivityGeneration();
+            var fpChanged = _scheduleFingerprintPrev != long.MinValue && fp != _scheduleFingerprintPrev;
+            var genChanged = _scheduleActivityGenPrev != long.MinValue && gen != _scheduleActivityGenPrev;
+            var anyPresentObs = observations.Any(o => o.Present);
+            var firstScheduleComplete = _scheduleFingerprintPrev == long.MinValue;
+            var busy = fpChanged || genChanged || anyPresentObs || AnyGateOrEscalationActive() || firstScheduleComplete;
+
+            _scheduleFingerprintPrev = fp;
+            _scheduleActivityGenPrev = gen;
+
+            if (busy)
+                nextMs = MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_ACTIVE_MS;
+            else
+            {
+                nextMs = MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_IDLE_MS;
+                if (prevAuditUtc != DateTimeOffset.MinValue)
+                {
+                    var sincePrevMs = (utcNow - prevAuditUtc).TotalMilliseconds;
+                    var maxGap = (double)MismatchEscalationPolicy.MISMATCH_AUDIT_MANDATORY_MAX_GAP_MS;
+                    if (sincePrevMs + nextMs > maxGap)
+                    {
+                        var shortened = (int)(maxGap - sincePrevMs);
+                        nextMs = Math.Max(MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_ACTIVE_MS, shortened);
+                    }
+                }
+            }
+        }
+
+        nextMs = Math.Max(1, nextMs);
         try
         {
-            var snapshot = _getSnapshot();
-            var instruments = _getActiveInstruments();
-
-            if (instruments.Count == 0 && snapshot.Positions != null)
-            {
-                var fromPositions = snapshot.Positions
-                    .Where(p => (p.Quantity != 0 || !string.IsNullOrWhiteSpace(p.Instrument)) && !string.IsNullOrWhiteSpace(p.Instrument))
-                    .Select(p => p.Instrument!.Trim())
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-                instruments = fromPositions;
-            }
-
-            var observations = _getMismatchObservations(snapshot, utcNow);
-            var obsByInstrument = observations
-                .Where(o => !string.IsNullOrWhiteSpace(o.Instrument))
-                .GroupBy(o => o.Instrument.Trim(), StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
-
-            var instrumentsSet = new HashSet<string>(instruments.Where(i => !string.IsNullOrWhiteSpace(i)).Select(i => i.Trim()), StringComparer.OrdinalIgnoreCase);
-            foreach (var k in obsByInstrument.Keys)
-                instrumentsSet.Add(k);
-            foreach (var kv in _stateByInstrument)
-            {
-                if (kv.Value.GateLifecyclePhase != GateLifecyclePhase.None)
-                    instrumentsSet.Add(kv.Key);
-            }
-
-            foreach (var inst in instrumentsSet)
-            {
-                if (obsByInstrument.TryGetValue(inst, out var obs))
-                    ProcessMismatchPresent(obs);
-                else
-                    ProcessMismatchSignalAbsent(inst, utcNow);
-            }
-
-            foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
-            {
-                obsByInstrument.TryGetValue(inst, out var gateObs);
-                AdvanceStateConsistencyGate(inst, snapshot, utcNow, gateObs);
-            }
-
-            _lastAuditUtc = utcNow;
+            _auditTimer.Change(nextMs, Timeout.Infinite);
         }
-        catch (Exception ex)
+        catch
         {
-            _log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
-                new { error = ex.Message, context = "MismatchEscalationCoordinator.OnAuditTick" }));
-        }
-        finally
-        {
-            if (cpu != 0)
-                _runtimeAudit?.CpuEnd(cpu, RuntimeAuditSubsystem.MismatchTimerTotal, instrument: "", stream: "", onIeaWorker: false);
+            // Timer disposed
         }
     }
 
@@ -602,7 +734,7 @@ public sealed class MismatchEscalationCoordinator
                 gp.InReconciliationLoop = true;
                 try
                 {
-                    recon = _runInstrumentGateReconciliation?.Invoke(inst, utcNow);
+                    recon = _runInstrumentGateReconciliation?.Invoke(inst, utcNow, gp.ReconciliationCyclesThisExecution + 1);
                 }
                 catch (Exception ex)
                 {

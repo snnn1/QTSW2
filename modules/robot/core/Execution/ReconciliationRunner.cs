@@ -26,6 +26,8 @@ public sealed class ReconciliationRunner
     private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly ReconciliationConvergenceTracker? _convergenceTracker;
     private readonly ReleaseReconciliationRedundancySuppression? _redundancySuppression;
+    /// <summary>Maps execution root (e.g. MES) to canonical (e.g. ES) for journal open-qty aggregation; when null, only literal execution key matches.</summary>
+    private readonly Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
@@ -50,6 +52,9 @@ public sealed class ReconciliationRunner
     private readonly Dictionary<string, (int AccountQty, int JournalQty, long ActivityGen, DateTimeOffset LastSampleUtc)>
         _nonOwnerConvergenceThrottle = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Consecutive reconciliation passes observing broker abs qty == 0 (and no working orders) for a product family before RECONCILIATION_BROKER_FLAT journal completion.</summary>
+    private readonly Dictionary<string, int> _brokerFlatConfirmStreakByFamily = new(StringComparer.OrdinalIgnoreCase);
+
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
         Action<string, DateTimeOffset, string, int, int>? onQuantityMismatch = null,
         Action<Dictionary<string, (int AccountQty, int JournalQty)>>? onReconciliationPassComplete = null,
@@ -59,7 +64,8 @@ public sealed class ReconciliationRunner
         TimeSpan? reconciliationDebounceWindow = null,
         RuntimeAuditHub? runtimeAudit = null,
         ReconciliationConvergenceTracker? convergenceTracker = null,
-        ReleaseReconciliationRedundancySuppression? redundancySuppression = null)
+        ReleaseReconciliationRedundancySuppression? redundancySuppression = null,
+        Func<string, string?>? getCanonicalInstrumentForJournalAggregation = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -73,6 +79,50 @@ public sealed class ReconciliationRunner
         _runtimeAudit = runtimeAudit;
         _convergenceTracker = convergenceTracker;
         _redundancySuppression = redundancySuppression;
+        _getCanonicalInstrumentForJournalAggregation = getCanonicalInstrumentForJournalAggregation;
+    }
+
+    private string? CanonicalInstrumentForJournal(string instTrim) =>
+        _getCanonicalInstrumentForJournalAggregation?.Invoke(instTrim);
+
+    /// <summary>Stable dictionary key for streak counters: canonical / family root (e.g. MES and ES both → ES when policy maps MES→ES).</summary>
+    private string BrokerFlatFamilyKey(string journalBucketInstrument)
+    {
+        var r = BrokerPositionResolver.NormalizeCanonicalKey(journalBucketInstrument);
+        if (string.IsNullOrEmpty(r)) r = journalBucketInstrument.Trim();
+        var fam = CanonicalInstrumentForJournal(r) ?? r;
+        return fam.Trim().ToUpperInvariant();
+    }
+
+    private int SumBrokerAbsForCanonicalFamily(string canonicalFamilyKey, IReadOnlyList<PositionSnapshot> positions)
+    {
+        var sum = 0;
+        foreach (var p in positions)
+        {
+            if (p.Quantity == 0 || string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            var rowRoot = BrokerPositionResolver.NormalizeCanonicalKey(p.Instrument);
+            if (string.IsNullOrEmpty(rowRoot)) continue;
+            var legFamily = CanonicalInstrumentForJournal(rowRoot) ?? rowRoot;
+            var legFamKey = legFamily.Trim().ToUpperInvariant();
+            if (!string.Equals(legFamKey, canonicalFamilyKey, StringComparison.OrdinalIgnoreCase))
+                continue;
+            sum += Math.Abs(p.Quantity);
+        }
+        return sum;
+    }
+
+    private bool HasWorkingOrdersForCanonicalFamily(string canonicalFamilyKey, List<WorkingOrderSnapshot> workingOrders)
+    {
+        foreach (var w in workingOrders)
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            var rowRoot = BrokerPositionResolver.NormalizeCanonicalKey(w.Instrument);
+            if (string.IsNullOrEmpty(rowRoot)) continue;
+            var legFamily = CanonicalInstrumentForJournal(rowRoot) ?? rowRoot;
+            if (string.Equals(legFamily.Trim().ToUpperInvariant(), canonicalFamilyKey, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -143,13 +193,7 @@ public sealed class ReconciliationRunner
         var positions = snap.Positions ?? new List<PositionSnapshot>();
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
 
-        var instrumentsWithPosition = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var accountQtyByInstrument = BrokerPositionResolver.BuildReconciliationAbsTotalsByCanonicalKey(positions);
-        foreach (var p in positions)
-        {
-            if (p.Quantity != 0 && !string.IsNullOrWhiteSpace(p.Instrument))
-                instrumentsWithPosition.Add(p.Instrument.Trim());
-        }
 
         try
         {
@@ -179,7 +223,9 @@ public sealed class ReconciliationRunner
         {
             var inst = kvp.Key;
             var accountQty = kvp.Value;
-            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+            var instRoot = BrokerPositionResolver.NormalizeCanonicalKey(inst);
+            if (string.IsNullOrEmpty(instRoot)) continue;
+            var canonicalForJournal = CanonicalInstrumentForJournal(instRoot) ?? instRoot;
 
             var acct = _reconciliationAccountName?.Invoke();
             var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
@@ -224,13 +270,13 @@ public sealed class ReconciliationRunner
                 continue;
             }
 
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, instRoot, canonicalForJournal);
 
             if (accountQty > 0 && journalQty == 0 &&
                 _adapter.TryRepairTaggedBrokerWithoutJournal(inst, accountQty, journalQty, utcNow, out _, out _))
             {
                 openByInstrument = _journal.GetOpenJournalEntriesByInstrument();
-                journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+                journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, instRoot, canonicalForJournal);
             }
 
             if (journalQty == accountQty)
@@ -320,8 +366,7 @@ public sealed class ReconciliationRunner
                 {
                     var jinst = okvp.Key?.Trim() ?? "";
                     if (string.IsNullOrEmpty(jinst)) continue;
-                    if (!string.Equals(jinst, inst, StringComparison.OrdinalIgnoreCase) &&
-                        !string.Equals(jinst, execVariant, StringComparison.OrdinalIgnoreCase))
+                    if (!ExecutionJournal.OpenJournalMapBucketMatches(jinst, instRoot, canonicalForJournal))
                         continue;
                     foreach (var (td, stream, iid, entry) in okvp.Value)
                     {
@@ -405,6 +450,32 @@ public sealed class ReconciliationRunner
             return;
         }
 
+        var familyKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in openByInstrument.Keys)
+        {
+            if (!string.IsNullOrWhiteSpace(k))
+                familyKeys.Add(BrokerFlatFamilyKey(k));
+        }
+
+        var familyClosureReadiness = new Dictionary<string, (int BrokerAbs, bool HasWorking, int Streak)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var familyKey in familyKeys)
+        {
+            var brokerAbs = SumBrokerAbsForCanonicalFamily(familyKey, positions);
+            var hasWorkingOrdersScoped = HasWorkingOrdersForCanonicalFamily(familyKey, workingOrders);
+
+            if (brokerAbs > 0 || hasWorkingOrdersScoped)
+                _brokerFlatConfirmStreakByFamily[familyKey] = 0;
+            else
+            {
+                if (!_brokerFlatConfirmStreakByFamily.TryGetValue(familyKey, out var streak))
+                    streak = 0;
+                _brokerFlatConfirmStreakByFamily[familyKey] = Math.Min(streak + 1, 1_000_000);
+            }
+
+            familyClosureReadiness[familyKey] = (brokerAbs, hasWorkingOrdersScoped,
+                _brokerFlatConfirmStreakByFamily[familyKey]);
+        }
+
         foreach (var kvp in openByInstrument)
         {
             var instrument = kvp.Key;
@@ -412,28 +483,62 @@ public sealed class ReconciliationRunner
 
             if (entries.Count == 0) continue;
 
-            var brokerFlat = !instrumentsWithPosition.Contains(instrument);
-            var hasWorkingOrders = workingOrders.Any(w =>
-                string.Equals(w.Instrument?.Trim(), instrument, StringComparison.OrdinalIgnoreCase));
+            var familyKey = BrokerFlatFamilyKey(instrument);
+            if (!familyClosureReadiness.TryGetValue(familyKey, out var fr)) continue;
 
-            if (!brokerFlat)
+            if (fr.BrokerAbs > 0)
+            {
+                var sampleIntent = entries[0].IntentId;
+                _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT", "ENGINE",
+                    new
+                    {
+                        broker_position_qty = fr.BrokerAbs,
+                        intent_id = sampleIntent,
+                        journal_instrument_bucket = instrument,
+                        broker_flat_family_key = familyKey,
+                        reason =
+                            "reconciliation_runner: broker has non-zero position (scope: execution root + canonical) — RECONCILIATION_BROKER_FLAT journal closure skipped",
+                        open_journal_row_count = entries.Count
+                    }));
                 continue;
+            }
 
-            if (hasWorkingOrders)
+            if (fr.HasWorking)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "RECONCILIATION_SKIPPED_HAS_WORKING_ORDERS", "ENGINE",
                     new
                     {
                         instrument,
+                        broker_flat_family_key = familyKey,
                         open_journal_count = entries.Count,
-                        note = "Broker flat but working orders exist; defer reconciliation"
+                        note =
+                            "Broker flat in scope but working orders exist on execution/canonical instrument scope; defer RECONCILIATION_BROKER_FLAT journal closure"
                     }));
                 continue;
             }
 
-            foreach (var (tradingDate, stream, intentId, _) in entries)
+            if (fr.Streak < 2)
             {
-                if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow))
+                _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT", "ENGINE",
+                    new
+                    {
+                        broker_position_qty = 0,
+                        intent_id = entries[0].IntentId,
+                        journal_instrument_bucket = instrument,
+                        broker_flat_family_key = familyKey,
+                        consecutive_broker_flat_passes = fr.Streak,
+                        reason =
+                            "awaiting_second_consecutive_reconciliation_pass_with_stable_broker_flat (transient snapshot guard)",
+                        open_journal_row_count = entries.Count
+                    }));
+                continue;
+            }
+
+            foreach (var (tradingDate, stream, intentId, entry) in entries)
+            {
+                var journalOpenBefore = ExecutionJournal.GetEntryRemainingOpenQuantity(entry);
+                if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow,
+                        fr.BrokerAbs, journalOpenBefore, "ReconciliationRunner_broker_flat_stable"))
                 {
                     journalsReconciled++;
                     if (gateMode && !string.IsNullOrEmpty(gateInst) && MatchesGateInstrument(instrument, gateInst))
@@ -446,7 +551,7 @@ public sealed class ReconciliationRunner
                             instrument,
                             trading_date = tradingDate,
                             completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
-                            note = "Orphaned journal closed; broker position flat"
+                            note = "Orphaned journal closed; broker position flat (scoped + stable confirmation)"
                         }));
                 }
             }
@@ -503,10 +608,12 @@ public sealed class ReconciliationRunner
         foreach (var inst in instSet)
         {
             var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
-            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+            var instRoot = BrokerPositionResolver.NormalizeCanonicalKey(inst);
+            if (string.IsNullOrEmpty(instRoot)) continue;
+            var canonicalForJournal = CanonicalInstrumentForJournal(instRoot) ?? instRoot;
+            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, instRoot, canonicalForJournal);
             var openOrders = CountWorkingForInstrument(workingOrders, inst);
-            var intentCount = CountJournalIntents(openByInstrument, inst, execVariant);
+            var intentCount = ExecutionJournal.CountOpenJournalRowsMatchingInstrumentScope(openByInstrument, instRoot, canonicalForJournal);
             var hasMismatch = accountQty != journalQty;
             var nonOwnerConv = hasMismatch && _reconciliationTracker != null &&
                 _reconciliationTracker.TryPeekNonOwnerWithStableQtyMismatchEpisode(acct, inst, instanceId, accountQty,
@@ -542,17 +649,6 @@ public sealed class ReconciliationRunner
         return n;
     }
 
-    private static int CountJournalIntents(
-        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
-        string inst,
-        string execVariant)
-    {
-        var n = 0;
-        if (openByInstrument.TryGetValue(inst, out var e1)) n += e1.Count;
-        if (openByInstrument.TryGetValue(execVariant, out var e2)) n += e2.Count;
-        return n;
-    }
-
     private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)
     {
         var result = new Dictionary<string, (int, int)>(StringComparer.OrdinalIgnoreCase);
@@ -566,8 +662,13 @@ public sealed class ReconciliationRunner
         foreach (var inst in allInstruments)
         {
             var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
-            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, inst, execVariant);
+            var instRoot = BrokerPositionResolver.NormalizeCanonicalKey(inst);
+            var canonicalForJournal = string.IsNullOrEmpty(instRoot)
+                ? inst
+                : CanonicalInstrumentForJournal(instRoot) ?? instRoot;
+            var journalQty = string.IsNullOrEmpty(instRoot)
+                ? 0
+                : _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, instRoot, canonicalForJournal);
             result[inst] = (accountQty, journalQty);
         }
         return result;

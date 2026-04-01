@@ -1332,10 +1332,22 @@ public sealed partial class InstrumentExecutionAuthority
         adoptedCountIfRanSynchronously = 0;
         var r = RequestAdoptionScan(AdoptionScanRequestSource.RecoveryAdoption, applyRecoveryThrottle: true, postScanOnWorker: null);
         adoptedCountIfRanSynchronously = r.AdoptedDeltaIfInline;
-        return r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued
-               || r.Outcome == AdoptionScanRequestLogOutcome.AcceptedInline
-               || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyRunning
-               || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyQueued;
+        var ok = r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued
+                 || r.Outcome == AdoptionScanRequestLogOutcome.AcceptedInline
+                 || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyRunning
+                 || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyQueued;
+        Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "ADOPTION_RECOVERY_SCHEDULE_PROBE", state: "ENGINE",
+            new
+            {
+                execution_instrument_key = ExecutionInstrumentKey,
+                iea_instance_id = InstanceId,
+                outcome = r.Outcome.ToString(),
+                adopted_delta_if_inline = r.AdoptedDeltaIfInline,
+                queue_depth_at_decision = r.QueueDepthAtDecision,
+                schedule_accepted_or_in_flight = ok,
+                note = "Instrumentation only — recovery adoption request decision after gate reconciliation trigger"
+            }));
+        return ok;
     }
 
     /// <summary>Run adoption for late recovery (reconciliation). Prefer <see cref="TryScheduleRecoveryAdoptionScan"/> for engine paths; this returns adopted count only when the scan ran synchronously on the worker.</summary>

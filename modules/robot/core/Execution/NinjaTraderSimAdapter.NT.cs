@@ -1962,42 +1962,8 @@ public sealed partial class NinjaTraderSimAdapter
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId, bid,
             brokerExecIdFill ?? "", fillQuantity, order.OrderState.ToString());
 
-        // Track cumulative fills for partial-fill safety
-        orderInfo.FilledQuantity += fillQuantity;
-        var filledTotal = orderInfo.FilledQuantity;
-        
-        // Get expectation for fill accounting
-        var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity : 
-            (_intentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
-        var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
-            (_intentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
-        var remainingQty = expectedQty - filledTotal;
-        var overfill = filledTotal > expectedQty;
-        
-        // Per-fill accounting log
-        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, 
-            "INTENT_FILL_UPDATE", new
-        {
-            intent_id = intentId,
-            fill_qty = fillQuantity,
-            cumulative_filled_qty = filledTotal,
-            expected_qty = expectedQty,
-            max_qty = maxQty,
-            remaining_qty = remainingQty,
-            overfill = overfill
-        }));
-        
-        if (overfill)
-        {
-            // Trigger emergency handler
-            TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
-            {
-                { "expected_qty", expectedQty },
-                { "actual_filled_qty", filledTotal },
-                { "last_fill_qty", fillQuantity },
-                { "reason", "Fill exceeded expected quantity" }
-            });
-        }
+        // Use orderTypeFromTag when present (ground truth for STOP/TARGET); else fall back to tracked OrderInfo.
+        var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
 
         // Robot flatten orders: tag decodes to pseudo intentId "FLATTEN" — skip IntentMap and journal via coordinator path.
         var isRobotFlattenOrder = string.Equals(orderInfo.OrderType, "FLATTEN", StringComparison.OrdinalIgnoreCase)
@@ -2009,25 +1975,56 @@ public sealed partial class NinjaTraderSimAdapter
             ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order);
             return;
         }
-        
+
         // CRITICAL: Resolve intent context before any journal call
-        // Use orderTypeFromTag if available (from tag), otherwise use orderInfo.OrderType
-        var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
         IntentContext context;
-        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument, 
+        if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument,
             fillPrice, fillQuantity, utcNow, out context))
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings
             return; // Fail-closed
         }
-        
-        // Explicit Entry vs Exit Classification
-        // CRITICAL FIX: Use orderTypeFromTag to determine if it's an entry or exit order
-        // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry order in _orderMap)
+
+        // Explicit Entry vs Exit Classification BEFORE cumulative accounting.
+        // Protective orders (STOP/TARGET) are exit orders even if orderInfo.IsEntryOrder is true (from entry row in _orderMap).
         bool isEntryFill = !isProtectiveOrder && orderInfo.IsEntryOrder == true;
         if (isEntryFill)
         {
+            // ENTRY only: track cumulative fills on the entry order row, emit INTENT_FILL_UPDATE, entry overfill guard.
+            orderInfo.FilledQuantity += fillQuantity;
+            var filledTotal = orderInfo.FilledQuantity;
+
+            var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity :
+                (_intentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
+            var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
+                (_intentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
+            var remainingQty = expectedQty - filledTotal;
+            var overfill = filledTotal > expectedQty;
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                "INTENT_FILL_UPDATE", new
+                {
+                    intent_id = intentId,
+                    fill_qty = fillQuantity,
+                    cumulative_filled_qty = filledTotal,
+                    expected_qty = expectedQty,
+                    max_qty = maxQty,
+                    remaining_qty = remainingQty,
+                    overfill = overfill
+                }));
+
+            if (overfill)
+            {
+                TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
+                {
+                    { "expected_qty", expectedQty },
+                    { "actual_filled_qty", filledTotal },
+                    { "last_fill_qty", fillQuantity },
+                    { "reason", "Fill exceeded expected quantity" }
+                });
+            }
+
             // Entry fill
             _executionJournal.RecordEntryFill(
                 context.IntentId, 
@@ -2086,7 +2083,7 @@ public sealed partial class NinjaTraderSimAdapter
                 // CRITICAL FIX: Pass filledTotal (cumulative) to HandleEntryFill for protective orders
                 // HandleEntryFill needs TOTAL filled quantity to submit protective orders that cover the ENTIRE position
                 // For incremental fills, protective orders must be updated to cover cumulative position, not just delta
-                // filledTotal is already updated: orderInfo.FilledQuantity += fillQuantity (line 1372)
+                // filledTotal is already updated on the entry-only path above.
                 HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
             }
             else
@@ -2156,6 +2153,10 @@ public sealed partial class NinjaTraderSimAdapter
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
+            // STOP/TARGET: do not mutate orderInfo.FilledQuantity (entry cumulative lives only on the entry order row).
+            // filled_total here is diagnostic for this exit leg (prior exit fills on this row were not accumulated per strict separation).
+            var exitFilledTotalForLog = orderInfo.FilledQuantity + fillQuantity;
+
             // LATE-FILL PROTECTION: If intent already completed, this is a stale/late fill (race with sibling cancel).
             // Do NOT process as normal - emit critical event and route to anomaly path.
             var tradingDate = context.TradingDate ?? "";
@@ -2209,7 +2210,7 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     fill_price = fillPrice,
                     fill_quantity = fillQuantity,
-                    filled_total = filledTotal,
+                    filled_total = exitFilledTotalForLog,
                     broker_order_id = order.OrderId,
                     exit_order_type = orderTypeForContext, // Use tag-based order type (ground truth)
                     stream = context.Stream

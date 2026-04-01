@@ -56,6 +56,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test FLATTEN_COORDINATION_TRACKER: cross-chart flatten owner + verify debounce coordinator
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
+// --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
@@ -271,6 +272,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = StateConsistencyGateTests.RunStateConsistencyGateTests();
         Console.WriteLine(pass ? "PASS: State consistency gate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RELEASE_BLOCKING_ADOPTION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReleaseBlockingAdoptionTests.RunReleaseBlockingAdoptionTests();
+        Console.WriteLine(pass ? "PASS: Release-blocking adoption candidate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("EXECUTION_EVENT_REPLAY", StringComparison.OrdinalIgnoreCase))

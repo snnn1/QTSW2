@@ -49,7 +49,7 @@ public static class StateConsistencyGateTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null,
-            runInstrumentGateReconciliation: (i, _) => new GateReconciliationResult
+            runInstrumentGateReconciliation: (i, _, _) => new GateReconciliationResult
             {
                 Instrument = i,
                 RunnerInvoked = true,
@@ -84,7 +84,7 @@ public static class StateConsistencyGateTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null,
-            runInstrumentGateReconciliation: (_, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
             evaluateReleaseReadiness: (_, _, _) => Ready("ES"),
             stateConsistencyStableWindowMs: 100);
 
@@ -129,7 +129,7 @@ public static class StateConsistencyGateTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null,
-            runInstrumentGateReconciliation: (_, _) => new GateReconciliationResult { RunnerInvoked = true },
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true },
             evaluateReleaseReadiness: (_, _, _) => readyToggle ? Ready("YM") : NotReady("YM", "relapse"),
             stateConsistencyStableWindowMs: 500);
 
@@ -190,7 +190,7 @@ public static class StateConsistencyGateTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null,
-            runInstrumentGateReconciliation: (_, _) => new GateReconciliationResult { RunnerInvoked = true },
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true },
             evaluateReleaseReadiness: (_, _, _) => NotReady("NQ", "nq_clean"),
             stateConsistencyStableWindowMs: 100);
 
@@ -243,7 +243,7 @@ public static class StateConsistencyGateTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null,
-            runInstrumentGateReconciliation: (_, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
             evaluateReleaseReadiness: (_, _, _) => Ready("GC"),
             stateConsistencyStableWindowMs: 50);
         coord9.ProcessObservationForTest(new MismatchObservation

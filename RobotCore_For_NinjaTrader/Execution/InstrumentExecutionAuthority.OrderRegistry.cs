@@ -110,6 +110,7 @@ public sealed partial class InstrumentExecutionAuthority
             source_context = sourceContext,
             iea_instance_id = InstanceId
         }));
+        NotifyReleaseSuppressionActivity();
     }
 
     /// <summary>Count of owned+adopted orders in SUBMITTED, WORKING, or PART_FILLED.
@@ -208,7 +209,20 @@ public sealed partial class InstrumentExecutionAuthority
     /// </summary>
     internal bool LinkBrokerOrderIdAlias(string alternateBrokerOrderId, string canonicalBrokerOrderId, DateTimeOffset utcNow, string intentId, string instrument)
     {
-        if (!_orderRegistry.LinkBrokerOrderIdAlias(alternateBrokerOrderId, canonicalBrokerOrderId)) return false;
+        if (!_orderRegistry.LinkBrokerOrderIdAlias(alternateBrokerOrderId, canonicalBrokerOrderId))
+        {
+            var reason = _orderRegistry.DescribeLinkBrokerOrderIdAliasFailure(alternateBrokerOrderId, canonicalBrokerOrderId);
+            Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "ORDER_REGISTRY_ALIAS_LINK_FAILED", new
+            {
+                alternate_broker_order_id = alternateBrokerOrderId,
+                canonical_broker_order_id = canonicalBrokerOrderId,
+                intent_id = intentId,
+                failure_reason = reason,
+                iea_instance_id = InstanceId,
+                note = "Instrumentation only — link skipped or rejected before alias map update"
+            }));
+            return false;
+        }
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "ORDER_REGISTRY_BROKER_ID_LINKED", new
         {
             canonical_broker_order_id = canonicalBrokerOrderId,
@@ -216,7 +230,54 @@ public sealed partial class InstrumentExecutionAuthority
             intent_id = intentId,
             iea_instance_id = InstanceId
         }));
+        NotifyReleaseSuppressionActivity();
         return true;
+    }
+
+    /// <summary>
+    /// Convergence-tracing only: best-effort resolution paths for a broker working snapshot row (no broker mutations).
+    /// </summary>
+    internal bool TryConvergenceAuditResolveWorkingOrder(WorkingOrderSnapshot w, out string resolutionPath,
+        out OrderRegistryEntry? resolvedEntry)
+    {
+        resolutionPath = "unresolved";
+        resolvedEntry = null;
+        if (string.IsNullOrWhiteSpace(w.OrderId)) return false;
+
+        if (TryResolveByBrokerOrderId(w.OrderId, out var e) && e != null)
+        {
+            resolutionPath = string.IsNullOrEmpty(e.LastResolutionPath) ? "DirectId" : e.LastResolutionPath;
+            resolvedEntry = e;
+            return true;
+        }
+
+        foreach (var rawTag in new[] { w.Tag, w.OcoGroup })
+        {
+            if (string.IsNullOrEmpty(rawTag) || !rawTag.StartsWith(RobotOrderIds.Prefix, StringComparison.OrdinalIgnoreCase))
+                continue;
+            var intentId = RobotOrderIds.DecodeIntentId(rawTag);
+            string? leg = null;
+            if (rawTag.IndexOf(":STOP", StringComparison.OrdinalIgnoreCase) >= 0) leg = "STOP";
+            else if (rawTag.IndexOf(":TARGET", StringComparison.OrdinalIgnoreCase) >= 0) leg = "TARGET";
+            if (TryResolveForExecutionUpdate(w.OrderId, intentId, leg, out var eTag, out var path))
+            {
+                resolutionPath = path;
+                resolvedEntry = eTag;
+                return true;
+            }
+        }
+
+        var inst = w.Instrument?.Trim() ?? "";
+        if (!string.IsNullOrEmpty(inst) &&
+            _orderRegistry.TryFindMismatchTrustedLiveEntryByInstrumentOrderId(inst, w.OrderId, out var eScan) &&
+            eScan != null)
+        {
+            resolutionPath = eScan.LastResolutionPath ?? "RegistryInstrumentScan";
+            resolvedEntry = eScan;
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>Register an adopted order (restart protectives). Ownership = ADOPTED.</summary>

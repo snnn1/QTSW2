@@ -42,6 +42,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private DateTimeOffset _lastAssembleMismatchDiagUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _lastAssembleMismatchThreadAttrUtc = DateTimeOffset.MinValue;
 
+    /// <summary>Idle assemble path: lengthen proof-diag cooldown (no mismatch / no recovery / fast assemble).</summary>
+    private const int AssembleMismatchDiagQuietSeconds = 180;
+
+    /// <summary>Busy or potentially material path: keep prior ~55s heartbeat.</summary>
+    private const int AssembleMismatchDiagBusySeconds = 55;
+
     private sealed class IeaUnavailableDegradedSuppressState
     {
         public int BrokerQty;
@@ -72,6 +78,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private RuntimeAuditHub? _runtimeAudit;
     private ReconciliationConvergenceTracker? _reconciliationConvergence;
+
+    /// <summary>Gate reconciliation tracing: detect flat progress across expensive recovery cycles (instrument-scoped).</summary>
+    private sealed class GateReconCycleProbeState
+    {
+        public bool HasPriorCycleEnd;
+        public int LastPendingAdoption;
+        public int LastUnexplainedWorking;
+        public int LastIeaOwned;
+        public int ConsecutiveZeroDeltaCycles;
+    }
+
+    private readonly Dictionary<string, GateReconCycleProbeState> _gateReconCycleProbeByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private ParitySpec? _spec;
     private TimeService? _time;
@@ -376,6 +395,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly HashSet<string> _frozenInstruments = new(StringComparer.OrdinalIgnoreCase);
     private RiskLatchManager? _riskLatchManager;
 
+    /// <summary>Suppresses redundant release-readiness evaluation and periodic reconciliation when inputs are stable.</summary>
+    private readonly ReleaseReconciliationRedundancySuppression _releaseReconRedundancy = new();
+
     // Disconnect recovery state machine
     private ConnectionRecoveryState _recoveryState = ConnectionRecoveryState.CONNECTED_OK;
     private DateTimeOffset? _disconnectFirstUtc;
@@ -661,12 +683,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
-        _executionPolicyPath = Path.Combine(_root, "configs", "execution_policy.json"); // PHASE 4: Execution policy path (standardized)
+        var policyFromEnv = Environment.GetEnvironmentVariable("QTSW2_EXECUTION_POLICY_PATH");
+        _executionPolicyPath = string.IsNullOrWhiteSpace(policyFromEnv)
+            ? Path.Combine(_root, "configs", "execution_policy.json")
+            : (Path.IsPathRooted(policyFromEnv)
+                ? policyFromEnv
+                : Path.Combine(_root, policyFromEnv.TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
         // Eligibility path built per trading_date: data/eligibility/eligibility_YYYY-MM-DD.json
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
+        void NotifyReleaseSuppressionActivity()
+        {
+            _releaseReconRedundancy.NotifyExecutionActivity();
+            _mismatchCoordinator?.NotifyReconciliationAuditWake();
+        }
+        _executionJournal.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
+        InstrumentExecutionAuthority.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
         _executionSummary = new ExecutionSummary();
         _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log, () => _runId ?? "");
     }
@@ -1082,6 +1116,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
                 simAdapter.SetEventWriter(_eventWriter);
                 simAdapter.SetFlattenCoordinationInstanceId(_reconciliationWriterInstanceId);
+                simAdapter.SetCanonicalInstrumentForJournalAggregation(s => GetCanonicalInstrument(s));
                 simAdapter.SetEngineCallbacks(
                     standDownStreamCallback: (streamId, now, reason) => StandDownStream(streamId, now, reason),
                     getNotificationServiceCallback: () => GetNotificationService(),
@@ -1217,7 +1252,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 reconciliationTracker: ReconciliationStateTracker.Shared,
                 reconciliationDebounceWindow: null,
                 runtimeAudit: _runtimeAudit,
-                convergenceTracker: _reconciliationConvergence);
+                convergenceTracker: _reconciliationConvergence,
+                redundancySuppression: _releaseReconRedundancy,
+                getCanonicalInstrumentForJournalAggregation: s => GetCanonicalInstrument(s));
 
             // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
@@ -1252,18 +1289,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 isRecoveryInProgress: _ => false,
                 log: _log,
                 eventWriter: _eventWriter,
-                runInstrumentGateReconciliation: RunInstrumentGateReconciliation,
-                evaluateReleaseReadiness: EvaluateStateConsistencyReleaseReadiness,
+                runInstrumentGateReconciliation: (inst, utc, cycle) => RunInstrumentGateReconciliation(inst, utc, cycle),
+                evaluateReleaseReadiness: (inst, snap, utc) => EvaluateStateConsistencyReleaseReadiness(inst, snap, utc),
                 stateConsistencyStableWindowMs: stableWindowMs,
                 runtimeAudit: _runtimeAudit,
                 runForcedBrokerAlignment: RunForcedBrokerAlignment,
-                onForcedConvergenceFailure: OnForcedBrokerConvergenceFailure);
+                onForcedConvergenceFailure: OnForcedBrokerConvergenceFailure,
+                getExecutionActivityGeneration: () => _releaseReconRedundancy.ExecutionActivityGeneration);
 
             // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
                 simP2.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
-                    _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d));
+                {
+                    _releaseReconRedundancy.NotifyExecutionActivity();
+                    _mismatchCoordinator?.NotifyReconciliationAuditWake();
+                    _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d);
+                });
                 simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
                 simP2.SetP2StreamContainmentEngineCallback((attr, now) =>
@@ -5027,6 +5069,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         var inst = (instrument ?? "").Trim();
         var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
+        var canonicalForJournal = GetCanonicalInstrument(inst) ?? inst;
         AccountSnapshot? snap = null;
         try
         {
@@ -5049,7 +5092,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 accountQty += Math.Abs(p.Quantity);
             }
         }
-        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+        var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openJournalMap, inst, canonicalForJournal);
         var streamRows = GetStreamOpenExposureForInstrument(inst);
         // IEA registry / recovery routing key for the mismatch instrument (matches RequestRecoveryForInstrument).
         var mismatchExecutionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_accountName ?? "", inst, null);
@@ -5321,8 +5365,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
             var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
-            var execVariant = inst.StartsWith("M") && inst.Length > 1 ? inst : "M" + inst;
-            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+            var canonicalForJournalAgg = GetCanonicalInstrument(inst) ?? inst;
+            var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInst, inst, canonicalForJournalAgg);
             var actGen = _releaseReconRedundancy.ExecutionActivityGeneration;
 
             var nonOwnerAssembleGate = useIea &&
@@ -5402,11 +5446,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // ORDER_REGISTRY_MISSING fix: local_working from IEA mismatch-trusted registry (OWNED+ADOPTED+RECOVERABLE_ROBOT_OWNED live), NOT journal.
             int localWorking;
-            int journalWorking = 0;
-            if (openByInst.TryGetValue(inst, out var entries))
-                journalWorking = entries.Count;
-            if (openByInst.TryGetValue(execVariant, out var entriesM))
-                journalWorking += entriesM.Count;
+            var journalWorking = ExecutionJournal.CountOpenJournalRowsMatchingInstrumentScope(openByInst, inst, canonicalForJournalAgg);
 
             InstrumentExecutionAuthority? ieaForInstrument = null;
             var ieaOwnershipAmbiguous = false;
@@ -5551,7 +5591,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 BrokerWorkingOrderCount = brokerWorking,
                 LocalWorkingOrderCount = effectiveLocalWorking,
                 JournalOpenEntryCount = journalWorking,
-                IntentIdsCsv = BuildIntentIdsCsvFromOpenJournal(openByInst, inst, execVariant),
+                IntentIdsCsv = BuildIntentIdsCsvFromOpenJournal(openByInst, inst, canonicalForJournalAgg),
                 ObservedUtc = utcNow,
                 Severity = "CRITICAL"
             });
@@ -5563,11 +5603,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var instrumentsScanned = allInstruments.Count;
         var mismatchCount = list.Count;
+        var quietAssembleDiag = mismatchCount == 0 && recoveryAdoptionInvocations == 0 && swAssemble.ElapsedMilliseconds < 50;
+        var diagCooldownSeconds = quietAssembleDiag ? AssembleMismatchDiagQuietSeconds : AssembleMismatchDiagBusySeconds;
         var emitAssembleDiag = swAssemble.ElapsedMilliseconds >= 50
                                || recoveryAdoptionInvocations > 0
                                || mismatchCount > 0
                                || _lastAssembleMismatchDiagUtc == DateTimeOffset.MinValue
-                               || (utcNow - _lastAssembleMismatchDiagUtc).TotalSeconds >= 55;
+                               || (utcNow - _lastAssembleMismatchDiagUtc).TotalSeconds >= diagCooldownSeconds;
         if (emitAssembleDiag)
         {
             var tDiag = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
@@ -5593,20 +5635,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private static string BuildIntentIdsCsvFromOpenJournal(
         Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInst,
         string inst,
-        string execVariant)
+        string? canonicalInstrument)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        void AddKey(string key)
+        foreach (var kvp in openByInst)
         {
-            if (!openByInst.TryGetValue(key, out var list) || list == null) return;
-            foreach (var item in list)
+            if (!ExecutionJournal.OpenJournalMapBucketMatches(kvp.Key, inst, canonicalInstrument)) continue;
+            foreach (var item in kvp.Value)
             {
                 var iid = item.IntentId?.Trim();
                 if (!string.IsNullOrEmpty(iid)) set.Add(iid);
             }
         }
-        AddKey(inst);
-        AddKey(execVariant);
+
         if (set.Count == 0) return "";
         var arr = set.ToArray();
         Array.Sort(arr, StringComparer.OrdinalIgnoreCase);
@@ -5618,6 +5659,29 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return 0;
         var inst = instrument.Trim();
         return snap.WorkingOrders.Count(w => string.Equals(w.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Intent ids referenced by QTSW2-tagged working orders on this broker instrument (Tag or OcoGroup); used for
+    /// release stale-journal detection (must match <see cref="ExecutionJournal.IsStaleAdoptionJournalEntryForRelease"/>).
+    /// </summary>
+    private static HashSet<string> CollectRobotTaggedIntentIdsForInstrument(AccountSnapshot? snap, string instrument)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return set;
+        var inst = instrument.Trim();
+        foreach (var w in snap.WorkingOrders)
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            if (!string.Equals(w.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            foreach (var tag in new[] { w.Tag, w.OcoGroup })
+            {
+                if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+                var id = RobotOrderIds.DecodeIntentId(tag);
+                if (!string.IsNullOrEmpty(id)) set.Add(id);
+            }
+        }
+        return set;
     }
 
     private static int SumBrokerPositionQty(AccountSnapshot? snap, string instrument)
@@ -5634,10 +5698,71 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return sum;
     }
 
-    private StateConsistencyReleaseReadinessResult EvaluateStateConsistencyReleaseReadiness(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow)
+    /// <summary>Signed net position quantity for instrument (sum of snapshot position quantities matching instrument).</summary>
+    private static int SumBrokerPositionSignedQty(AccountSnapshot? snap, string instrument)
     {
-        var input = BuildStateConsistencyReleaseEvaluationInput(instrument, snapshot, utcNow);
-        return StateConsistencyReleaseEvaluator.Evaluate(input);
+        if (snap?.Positions == null || string.IsNullOrWhiteSpace(instrument)) return 0;
+        var inst = instrument.Trim();
+        var sum = 0;
+        foreach (var p in snap.Positions)
+        {
+            if (string.IsNullOrWhiteSpace(p.Instrument)) continue;
+            if (!string.Equals(p.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            sum += p.Quantity;
+        }
+        return sum;
+    }
+
+    private StateConsistencyReleaseReadinessResult EvaluateStateConsistencyReleaseReadiness(string instrument,
+        AccountSnapshot? snapshot, DateTimeOffset utcNow, bool forceFullEvaluation = false)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst))
+            return StateConsistencyReleaseEvaluator.Indeterminate(instrument ?? "", "no_instrument");
+
+        if (!forceFullEvaluation && snapshot != null &&
+            TryBuildReleaseReadinessSuppressionProbe(inst, snapshot, utcNow, out var suppressionProbe))
+        {
+            var gen = _releaseReconRedundancy.ExecutionActivityGeneration;
+            if (_releaseReconRedundancy.TryGetCachedReleaseReadiness(inst, in suppressionProbe, gen, utcNow, out var cached,
+                    out var suppressionReason))
+            {
+                LogReleaseSuppressionDecisionIfDiag(inst, skipped: true, suppressionReason, in suppressionProbe, gen);
+                return cached!;
+            }
+
+            LogReleaseSuppressionDecisionIfDiag(inst, skipped: false, suppressionReason, in suppressionProbe, gen);
+        }
+
+        var genAtStart = _releaseReconRedundancy.ExecutionActivityGeneration;
+        var input = BuildStateConsistencyReleaseEvaluationInput(inst, snapshot, utcNow);
+        var result = StateConsistencyReleaseEvaluator.Evaluate(input);
+
+        if (snapshot != null && input.SnapshotSufficient)
+        {
+            var fp = ReleaseReconciliationRedundancySuppression.BuildReleaseMaterialFingerprint(input, result);
+            if (!_releaseReconRedundancy.ShouldSuppressIdenticalReadinessAudit(inst, fp, utcNow))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_READINESS_INPUT_AUDIT", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        broker_position_qty = input.BrokerPositionQty,
+                        broker_working_count = input.BrokerWorkingCount,
+                        journal_open_qty = input.JournalOpenQty,
+                        iea_trusted_working_count = input.IeaOwnedPlusAdoptedWorking,
+                        pending_candidate_count = input.PendingAdoptionCandidateCount,
+                        release_ready = result.ReleaseReady,
+                        contradictions = string.Join(";", result.Contradictions ?? new List<string>())
+                    }));
+                _releaseReconRedundancy.MarkReadinessAuditEmitted(inst, fp, utcNow);
+            }
+        }
+
+        if (snapshot != null && input.SnapshotSufficient)
+            _releaseReconRedundancy.RecordReleaseFullEvaluation(inst, input, result, utcNow, genAtStart);
+
+        return result;
     }
 
     private StateConsistencyReleaseEvaluationInput BuildStateConsistencyReleaseEvaluationInput(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
@@ -5655,24 +5780,201 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         input.BrokerPositionQty = SumBrokerPositionQty(snap, inst);
         input.BrokerWorkingCount = CountBrokerWorkingOrders(snap, inst);
 
+        var brokerSigned = SumBrokerPositionSignedQty(snap, inst);
         var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
-        input.JournalOpenQty = _executionJournal.GetOpenJournalQuantitySumForInstrument(inst, execVariant);
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var robotIntentIds = CollectRobotTaggedIntentIdsForInstrument(snap, inst);
 
         var useIea = input.UseInstrumentExecutionAuthority;
         var account = _accountName ?? "";
-        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, input.BrokerWorkingCount, GetExecutionInstrument, out var iea, out _) &&
-            iea != null)
+        InstrumentExecutionAuthority? ieaResolved = null;
+        HashSet<string>? registryIntentIds = null;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, input.BrokerWorkingCount, GetExecutionInstrument, out ieaResolved, out _) &&
+            ieaResolved != null)
         {
-            input.IeaOwnedPlusAdoptedWorking = iea.GetMismatchTrustedWorkingCount();
-            input.PendingAdoptionCandidateCount = iea.Executor?.GetAdoptionCandidateIntentIds(iea.ExecutionInstrumentKey).Count ?? 0;
+            input.IeaOwnedPlusAdoptedWorking = ieaResolved.GetMismatchTrustedWorkingCount();
+            registryIntentIds = ieaResolved.GetMismatchTrustedWorkingIntentIds();
         }
         else
             input.IeaOwnedPlusAdoptedWorking = useIea ? -1 : 0;
 
+        var staleExecKey = ieaResolved?.ExecutionInstrumentKey ?? inst;
+        _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
+            staleExecKey,
+            canonical,
+            input.BrokerPositionQty,
+            robotIntentIds,
+            utcNow);
+        _executionJournal.ReconcileJournalOpenQuantityWithBroker(
+            inst,
+            canonical,
+            input.BrokerPositionQty,
+            robotIntentIds,
+            registryIntentIds,
+            utcNow);
+
+        var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var (journalOpenQty, journalOpenIntentHash) =
+            _executionJournal.GetOpenJournalStructuralStateForInstrumentFromMap(openJournalMap, inst, canonical);
+        input.JournalOpenQty = journalOpenQty;
+        input.JournalOpenIntentSetHash = journalOpenIntentHash;
+        if (input.BrokerPositionQty != 0)
+        {
+            var (misusedSecondArgQty, _) =
+                _executionJournal.GetOpenJournalStructuralStateForInstrumentFromMapMisusedExecVariantAsCanonical(
+                    openJournalMap, inst, execVariant);
+            if (journalOpenQty > misusedSecondArgQty)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_OPEN_QTY_KEY_MISMATCH_SUSPECTED", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        canonical_instrument = canonical,
+                        exec_variant = execVariant,
+                        broker_position_qty = input.BrokerPositionQty,
+                        journal_open_qty = journalOpenQty,
+                        journal_open_qty_misused_exec_variant_second_arg = misusedSecondArgQty,
+                        note =
+                            "Open journal rows under canonical/execution family were excluded when second aggregation arg was execVariant (e.g. MES,MES) instead of true canonical (ES); canonical-aware sum is higher"
+                    }));
+            }
+        }
+        input.RegistryMismatchTrustedIntentSetHash =
+            ReleaseReconciliationRedundancySuppression.ComputeStableOrderedStringSetHash(registryIntentIds);
+        input.BlockingAdoptionIntentSetHash = 0;
+
+        if (ieaResolved != null)
+        {
+            var audit = _executionJournal.BuildReleaseBlockingCandidateAudit(
+                ieaResolved.ExecutionInstrumentKey,
+                canonical,
+                input.BrokerPositionQty,
+                brokerSigned,
+                robotIntentIds,
+                registryIntentIds);
+            input.PendingAdoptionCandidateCount = audit.BlockingCandidateCount;
+            input.BlockingAdoptionIntentSetHash = audit.BlockingIntentSetHash;
+            var blockingFp = ReleaseReconciliationRedundancySuppression.BuildBlockingCandidateAuditFingerprint(input);
+            if (!_releaseReconRedundancy.ShouldSuppressBlockingCandidateAudit(inst, blockingFp, utcNow))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_BLOCKING_CANDIDATE_AUDIT", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        broker_position_qty = input.BrokerPositionQty,
+                        raw_candidate_count = audit.RawCandidateCount,
+                        blocking_candidate_count = audit.BlockingCandidateCount,
+                        excluded_candidate_count = audit.ExcludedCandidateCount,
+                        blocking_intent_ids_sample = audit.BlockingIntentIdsSample.ToArray(),
+                        excluded_intent_ids_sample = audit.ExcludedIntentIdsSample.ToArray(),
+                        exclusion_reasons_sample = audit.ExclusionReasonsSample.ToArray()
+                    }));
+                _releaseReconRedundancy.MarkBlockingCandidateAuditEmitted(inst, blockingFp, utcNow);
+            }
+        }
+
         return input;
     }
 
-    private GateReconciliationResult? RunInstrumentGateReconciliation(string instrument, DateTimeOffset utcNow)
+    private bool TryBuildReleaseReadinessSuppressionProbe(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
+        out ReleaseReadinessSuppressionProbe probe)
+    {
+        probe = default;
+        if (string.IsNullOrWhiteSpace(inst)) return false;
+
+        _executionAdapter?.PrepareOrderRegistryForMismatchAssembly(inst, snapshot, utcNow);
+
+        var bp = SumBrokerPositionQty(snapshot, inst);
+        var bw = CountBrokerWorkingOrders(snapshot, inst);
+        var brokerSigned = SumBrokerPositionSignedQty(snapshot, inst);
+        var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var robotIntentIds = CollectRobotTaggedIntentIdsForInstrument(snapshot, inst);
+
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+        InstrumentExecutionAuthority? ieaResolved = null;
+        HashSet<string>? registryIntentIds = null;
+        var ieaTrusted = 0;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, bw, GetExecutionInstrument, out ieaResolved, out _) &&
+            ieaResolved != null)
+        {
+            ieaTrusted = ieaResolved.GetMismatchTrustedWorkingCount();
+            registryIntentIds = ieaResolved.GetMismatchTrustedWorkingIntentIds();
+        }
+        else if (useIea)
+            ieaTrusted = -1;
+
+        var (journalQty, journalIntentHash) =
+            _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical);
+
+        var pending = 0;
+        long blockingHash = 0;
+        if (ieaResolved != null)
+        {
+            var (pc, bh) = _executionJournal.GetReleaseBlockingAdoptionStructuralFingerprint(
+                ieaResolved.ExecutionInstrumentKey,
+                canonical,
+                bp,
+                brokerSigned,
+                robotIntentIds,
+                registryIntentIds);
+            pending = pc;
+            blockingHash = bh;
+        }
+
+        var registryHash = ReleaseReconciliationRedundancySuppression.ComputeStableOrderedStringSetHash(registryIntentIds);
+
+        probe = new ReleaseReadinessSuppressionProbe
+        {
+            BrokerPositionQty = bp,
+            BrokerWorkingCount = bw,
+            JournalOpenQty = journalQty,
+            PendingCandidateCount = pending,
+            IeaTrustedWorkingCount = ieaTrusted,
+            UseIea = useIea,
+            BlockingAdoptionIntentSetHash = blockingHash,
+            RegistryMismatchTrustedIntentSetHash = registryHash,
+            JournalOpenIntentSetHash = journalIntentHash
+        };
+        return true;
+    }
+
+    private void LogReleaseSuppressionDecisionIfDiag(string instrument, bool skipped, string internalReason,
+        in ReleaseReadinessSuppressionProbe probe, long activityGeneration)
+    {
+        if (_loggingConfig?.DiagnosticsEnabled != true) return;
+
+        var fpHash = ReleaseReconciliationRedundancySuppression.ComputeFingerprintHash64(
+            ReleaseReconciliationRedundancySuppression.BuildStructuralSuppressionKey(in probe));
+
+        LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "RELEASE_SUPPRESSION_DECISION", "ENGINE",
+            new
+            {
+                instrument,
+                skipped,
+                reason = MapReleaseSuppressionPayloadReason(skipped, internalReason),
+                fingerprint_hash = fpHash,
+                activity_generation = activityGeneration,
+                pending_candidate_count = probe.PendingCandidateCount,
+                broker_position_qty = probe.BrokerPositionQty,
+                journal_open_qty = probe.JournalOpenQty
+            }));
+    }
+
+    private static string MapReleaseSuppressionPayloadReason(bool skipped, string internalReason)
+    {
+        if (skipped)
+            return "fingerprint_match";
+        if (string.Equals(internalReason, "no_activity_match_failed", StringComparison.Ordinal))
+            return "no_activity";
+        if (string.Equals(internalReason, "backoff_elapsed", StringComparison.Ordinal))
+            return "backoff";
+        return "forced_eval";
+    }
+
+    private GateReconciliationResult? RunInstrumentGateReconciliation(string instrument, DateTimeOffset utcNow,
+        int gateCycleOneBased)
     {
         if (_executionAdapter == null || string.IsNullOrWhiteSpace(instrument)) return null;
         var inst = instrument.Trim();
@@ -5683,6 +5985,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             Mode = ReconciliationRunMode.GateRecovery,
             RunnerInvoked = _reconciliationRunner != null
         };
+
+        var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
+        var canonicalInst = GetCanonicalInstrument(inst) ?? inst;
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
 
         AccountSnapshot? snapBefore;
         try
@@ -5699,14 +6006,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         result.BrokerWorkingCountBefore = CountBrokerWorkingOrders(snapBefore, inst);
-
-        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
-        var account = _accountName ?? "";
-        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountBefore, GetExecutionInstrument, out var ieaBeforeProbe, out _) &&
+        var posBefore = SumBrokerPositionQty(snapBefore, inst);
+        var signedBefore = SumBrokerPositionSignedQty(snapBefore, inst);
+        var (journalOpenBefore, _) = _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonicalInst);
+        InstrumentExecutionAuthority? ieaBeforeProbe = null;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountBefore, GetExecutionInstrument, out ieaBeforeProbe, out _) &&
             ieaBeforeProbe != null)
         {
             result.IeaOwnedCountBefore = ieaBeforeProbe.GetMismatchTrustedWorkingCount();
-            result.AdoptionCandidateCountBefore = ieaBeforeProbe.Executor?.GetAdoptionCandidateIntentIds(ieaBeforeProbe.ExecutionInstrumentKey).Count ?? 0;
+            result.AdoptionCandidateCountBefore = _executionJournal.CountReleaseBlockingAdoptionCandidates(
+                ieaBeforeProbe.ExecutionInstrumentKey,
+                canonicalInst,
+                posBefore,
+                signedBefore,
+                CollectRobotTaggedIntentIdsForInstrument(snapBefore, inst),
+                ieaBeforeProbe.GetMismatchTrustedWorkingIntentIds());
         }
         else
         {
@@ -5714,14 +6028,41 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             result.AdoptionCandidateCountBefore = 0;
         }
 
+        var ieaOwnedPlusAdoptedOnlyBefore = ieaBeforeProbe?.GetOwnedPlusAdoptedWorkingCount() ?? 0;
+        var unexplainedStart = result.IeaOwnedCountBefore >= 0
+            ? Math.Max(0, result.BrokerWorkingCountBefore - result.IeaOwnedCountBefore)
+            : result.BrokerWorkingCountBefore;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_CYCLE_STATE", "ENGINE",
+            new
+            {
+                phase = "start",
+                instrument = inst,
+                gate_cycle = gateCycleOneBased,
+                broker_position_qty = posBefore,
+                journal_open_qty = journalOpenBefore,
+                broker_working_count = result.BrokerWorkingCountBefore,
+                iea_owned_mismatch_trusted_working = result.IeaOwnedCountBefore,
+                iea_owned_plus_adopted_working_only = ieaOwnedPlusAdoptedOnlyBefore,
+                pending_adoption_candidate_count = result.AdoptionCandidateCountBefore,
+                unexplained_working_count = unexplainedStart,
+                release_ready = (bool?)null,
+                delta_pending_adoption = (int?)null,
+                delta_unexplained_working = (int?)null,
+                delta_iea_owned = (int?)null,
+                note = "Gate recovery cycle — snapshot before runner + adoption schedule"
+            }));
+
         _reconciliationRunner?.ForceRunGateRecoveryForInstrument(utcNow, inst);
 
+        var adoptionScheduled = false;
+        var adoptedInline = 0;
         if (ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountBefore, GetExecutionInstrument, out var ieaRecover, out _) &&
             ieaRecover != null)
         {
             try
             {
-                ieaRecover.TryScheduleRecoveryAdoptionScan(out _);
+                adoptionScheduled = ieaRecover.TryScheduleRecoveryAdoptionScan(out adoptedInline);
             }
             catch
             {
@@ -5744,11 +6085,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         result.BrokerWorkingCountAfter = CountBrokerWorkingOrders(snapAfter, inst);
-        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountAfter, GetExecutionInstrument, out var ieaAfterProbe, out _) &&
-            ieaAfterProbe != null)
+        var posAfter = SumBrokerPositionQty(snapAfter, inst);
+        InstrumentExecutionAuthority? ieaAfterProbe = null;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountAfter, GetExecutionInstrument, out var ieaAfterProbeOut, out _) &&
+            ieaAfterProbeOut != null)
         {
+            ieaAfterProbe = ieaAfterProbeOut;
             result.IeaOwnedCountAfter = ieaAfterProbe.GetMismatchTrustedWorkingCount();
-            result.AdoptionCandidateCountAfter = ieaAfterProbe.Executor?.GetAdoptionCandidateIntentIds(ieaAfterProbe.ExecutionInstrumentKey).Count ?? 0;
+            result.AdoptionCandidateCountAfter = _executionJournal.CountReleaseBlockingAdoptionCandidates(
+                ieaAfterProbe.ExecutionInstrumentKey,
+                canonicalInst,
+                posAfter,
+                SumBrokerPositionSignedQty(snapAfter, inst),
+                CollectRobotTaggedIntentIdsForInstrument(snapAfter, inst),
+                ieaAfterProbe.GetMismatchTrustedWorkingIntentIds());
         }
         else
         {
@@ -5756,7 +6106,42 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             result.AdoptionCandidateCountAfter = 0;
         }
 
-        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow);
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, result.BrokerWorkingCountAfter, GetExecutionInstrument, out var ieaStaleJournal, out _) &&
+            ieaStaleJournal != null)
+        {
+            _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
+                ieaStaleJournal.ExecutionInstrumentKey,
+                canonicalInst,
+                posAfter,
+                CollectRobotTaggedIntentIdsForInstrument(snapAfter, inst),
+                utcNow);
+        }
+        else
+        {
+            _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
+                inst,
+                canonicalInst,
+                posAfter,
+                CollectRobotTaggedIntentIdsForInstrument(snapAfter, inst),
+                utcNow);
+        }
+
+        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow, forceFullEvaluation: true);
+        // Bounded second probe: journal/registry may update synchronously during gate recovery; fresh snapshot avoids waiting for next 5s gate tick.
+        if (!readiness.ReleaseReady)
+        {
+            try
+            {
+                var snapRecheck = _executionAdapter.GetAccountSnapshot(utcNow);
+                if (snapRecheck != null)
+                    readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapRecheck, utcNow, forceFullEvaluation: true);
+            }
+            catch
+            {
+                // keep prior readiness
+            }
+        }
+
         result.ReleaseReadyAfter = readiness.ReleaseReady;
         result.UnexplainedWorkingCountAfter = readiness.UnexplainedBrokerWorkingCount;
         result.UnexplainedPositionQtyAfter = readiness.UnexplainedBrokerPositionQty;
@@ -5772,7 +6157,141 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         result.Reason = readiness.Summary;
         sw.Stop();
         result.DurationMs = sw.ElapsedMilliseconds;
+
+        var (journalOpenEnd, _) = _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonicalInst);
+        var ieaAfterForOwned = ieaAfterProbe;
+        var ieaOwnedPlusAdoptedOnlyAfter = ieaAfterForOwned?.GetOwnedPlusAdoptedWorkingCount() ?? 0;
+
+        if (!_gateReconCycleProbeByInstrument.TryGetValue(inst, out var probe))
+        {
+            probe = new GateReconCycleProbeState();
+            _gateReconCycleProbeByInstrument[inst] = probe;
+        }
+
+        var dp = readiness.DiagnosticPendingAdoptionCandidateCount - (probe.HasPriorCycleEnd ? probe.LastPendingAdoption : 0);
+        var du = readiness.UnexplainedBrokerWorkingCount - (probe.HasPriorCycleEnd ? probe.LastUnexplainedWorking : 0);
+        var di = readiness.DiagnosticIeaOwnedPlusAdoptedWorking - (probe.HasPriorCycleEnd ? probe.LastIeaOwned : 0);
+        if (!probe.HasPriorCycleEnd)
+        {
+            dp = 0;
+            du = 0;
+            di = 0;
+        }
+
+        if (dp == 0 && du == 0 && di == 0 && probe.HasPriorCycleEnd)
+            probe.ConsecutiveZeroDeltaCycles++;
+        else
+            probe.ConsecutiveZeroDeltaCycles = 0;
+
+        probe.HasPriorCycleEnd = true;
+        probe.LastPendingAdoption = readiness.DiagnosticPendingAdoptionCandidateCount;
+        probe.LastUnexplainedWorking = readiness.UnexplainedBrokerWorkingCount;
+        probe.LastIeaOwned = readiness.DiagnosticIeaOwnedPlusAdoptedWorking;
+
+        var rootCauseClass = ClassifyConvergenceRootCause(readiness);
+
+        LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_CYCLE_STATE", "ENGINE",
+            new
+            {
+                phase = "end",
+                instrument = inst,
+                gate_cycle = gateCycleOneBased,
+                broker_position_qty = posAfter,
+                journal_open_qty = journalOpenEnd,
+                broker_working_count = result.BrokerWorkingCountAfter,
+                iea_owned_mismatch_trusted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+                iea_owned_plus_adopted_working_only = ieaOwnedPlusAdoptedOnlyAfter,
+                pending_adoption_candidate_count = readiness.DiagnosticPendingAdoptionCandidateCount,
+                unexplained_working_count = readiness.UnexplainedBrokerWorkingCount,
+                release_ready = readiness.ReleaseReady,
+                delta_pending_adoption = dp,
+                delta_unexplained_working = du,
+                delta_iea_owned = di,
+                adoption_recovery_scheduled_or_active = adoptionScheduled,
+                adoption_delta_if_inline = adoptedInline,
+                consecutive_zero_delta_cycles = probe.ConsecutiveZeroDeltaCycles,
+                outcome_status = result.OutcomeStatus.ToString(),
+                root_cause_class = rootCauseClass,
+                readiness_summary = readiness.Summary,
+                contradictions = string.Join(";", readiness.Contradictions ?? new List<string>())
+            }));
+
+        if (probe.ConsecutiveZeroDeltaCycles >= 3)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_NO_PROGRESS_CYCLE", "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    gate_cycle = gateCycleOneBased,
+                    consecutive_zero_delta_cycles = probe.ConsecutiveZeroDeltaCycles,
+                    broker_position_qty = posAfter,
+                    journal_open_qty = journalOpenEnd,
+                    broker_working_count = result.BrokerWorkingCountAfter,
+                    iea_owned_mismatch_trusted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+                    pending_adoption_candidate_count = readiness.DiagnosticPendingAdoptionCandidateCount,
+                    unexplained_working_count = readiness.UnexplainedBrokerWorkingCount,
+                    release_ready = readiness.ReleaseReady,
+                    root_cause_class = rootCauseClass,
+                    contradictions = string.Join(";", readiness.Contradictions ?? new List<string>()),
+                    note = "≥3 consecutive expensive cycles with flat pending / unexplained / IEA-trusted deltas"
+                }));
+        }
+
+        EmitUnexplainedWorkingOrdersIfNeeded(utcNow, inst, gateCycleOneBased, snapAfter, ieaAfterForOwned);
+
+        if (readiness.ReleaseReady)
+        {
+            probe.HasPriorCycleEnd = false;
+            probe.ConsecutiveZeroDeltaCycles = 0;
+        }
+
         return result;
+    }
+
+    private static string ClassifyConvergenceRootCause(StateConsistencyReleaseReadinessResult r)
+    {
+        if (r == null) return "UNKNOWN";
+        var cts = string.Join(";", r.Contradictions ?? new List<string>());
+        if (cts.IndexOf("pending_adoption", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "ADOPTION_NOT_EXECUTED_OR_NOT_CLEARED";
+        if (cts.IndexOf("unexplained_working", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "ORDER_NOT_RESOLVABLE_OR_REGISTRY_DRIFT";
+        if (cts.IndexOf("iea_unavailable", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "STATE_EVALUATION_TOO_STRICT_OR_IEA_UNAVAILABLE";
+        if (cts.IndexOf("position_qty", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "JOURNAL_BROKER_QTY_MISMATCH";
+        if (cts.IndexOf("broker_working_without_iea", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "REGISTRY_MISSING_LINK_OR_IEA_COVERAGE";
+        if (!string.IsNullOrEmpty(r.Summary) && string.Equals(r.Summary, "snapshot_insufficient", StringComparison.OrdinalIgnoreCase))
+            return "SNAPSHOT_INSUFFICIENT";
+        return r.ReleaseReady ? "RELEASED" : "UNCLASSIFIED_BLOCKERS";
+    }
+
+    private void EmitUnexplainedWorkingOrdersIfNeeded(DateTimeOffset utcNow, string instrument, int gateCycleOneBased,
+        AccountSnapshot? snap, InstrumentExecutionAuthority? iea)
+    {
+        if (snap?.WorkingOrders == null || iea == null) return;
+        var inst = instrument.Trim();
+        foreach (var w in snap.WorkingOrders)
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            if (!string.Equals(w.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            if (iea.TryConvergenceAuditResolveWorkingOrder(w, out var path, out _))
+                continue;
+
+            LogEvent(RobotEvents.ExecutionBase(utcNow, "", inst, "UNEXPLAINED_WORKING_ORDER", new
+            {
+                gate_cycle = gateCycleOneBased,
+                broker_order_id = w.OrderId,
+                order_tag = w.Tag,
+                oco = w.OcoGroup,
+                instrument = w.Instrument,
+                quantity = w.Quantity,
+                order_type = w.OrderType,
+                last_resolution_path_attempted = path,
+                note = "All resolution paths failed: direct broker id, intent/alias decode, registry instrument scan"
+            }));
+        }
     }
 
     /// <summary>
@@ -5831,7 +6350,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (snap == null)
             return ReconciliationForcedConvergenceResult.Failed("null_snapshot");
 
-        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snap, utcNow);
+        InstrumentExecutionAuthority? ieaForStale = null;
+        if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, CountBrokerWorkingOrders(snap, inst), GetExecutionInstrument, out var ieaSnap) &&
+            ieaSnap != null)
+            ieaForStale = ieaSnap;
+        var canonicalForJournal = GetCanonicalInstrument(inst) ?? inst;
+        var posAbs = SumBrokerPositionQty(snap, inst);
+        var tagIds = CollectRobotTaggedIntentIdsForInstrument(snap, inst);
+        _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
+            ieaForStale?.ExecutionInstrumentKey ?? inst,
+            canonicalForJournal,
+            posAbs,
+            tagIds,
+            utcNow);
+
+        var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snap, utcNow, forceFullEvaluation: true);
         if (!readiness.ReleaseReady)
             return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
 
@@ -5980,6 +6513,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             _lastOrderUpdateUtc = utcNow;
         }
+
+        _releaseReconRedundancy.NotifyExecutionActivity();
+        _mismatchCoordinator?.NotifyReconciliationAuditWake();
     }
     
     /// <summary>
@@ -5992,6 +6528,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             _lastExecutionUpdateUtc = utcNow;
         }
+
+        _releaseReconRedundancy.NotifyExecutionActivity();
+        _mismatchCoordinator?.NotifyReconciliationAuditWake();
     }
     
     /// <summary>
