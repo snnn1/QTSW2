@@ -47,7 +47,8 @@ def validate_streams_before_execution_write(
     Raises ValueError if the execution contract is invalid. Call immediately before atomic write.
 
     Checks:
-      1) Each stream's slot_time is in SLOT_ENDS[session] (parity with robot spec).
+      1) Each enabled stream's slot_time is in SLOT_ENDS[session] (parity with robot spec).
+         Disabled streams may omit slot_time when the execution builder left no valid candidates.
       2) S1 @ S1_EARLY_OPEN_SLOT_TIME only for instruments in S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT.
 
     Set QTSW2_SKIP_TIMETABLE_INSTRUMENT_SLOT_GUARD=1 to bypass check (2) only — not recommended.
@@ -68,9 +69,13 @@ def validate_streams_before_execution_write(
         instrument = (s.get("instrument") or "").strip().upper()
         slot_raw = s.get("slot_time")
         slot_norm = _normalize_hhmm(slot_raw if slot_raw is not None else "")
+        enabled = s.get("enabled", True)
 
         if not session:
             raise ValueError(f"TIMETABLE_WRITE_REJECTED: stream={stream_id} missing session")
+        # Disabled streams may have no slot (e.g. every execution candidate excluded by exclude_times).
+        if not slot_norm and enabled is False:
+            continue
         if not slot_norm:
             raise ValueError(f"TIMETABLE_WRITE_REJECTED: stream={stream_id} missing slot_time")
 

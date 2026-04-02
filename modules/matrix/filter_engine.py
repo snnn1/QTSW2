@@ -19,6 +19,7 @@ from typing import Dict
 import pandas as pd
 
 from .config import SCF_THRESHOLD
+from .stream_manager import merged_exclude_times_normalized_set
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
     # Validate that filter keys match actual streams
     if not df.empty and 'Stream' in df.columns:
         valid_streams = set(df['Stream'].unique())
-        filter_streams = set(stream_filters.keys())
+        filter_streams = {k for k in stream_filters.keys() if str(k) != "master"}
         invalid_filters = filter_streams - valid_streams
         if invalid_filters:
             logger.warning(
@@ -234,6 +235,8 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
             )
     
     for stream_id, filters in stream_filters.items():
+        if str(stream_id) == "master":
+            continue
         stream_mask = df['Stream'] == stream_id
         
         # Day of week filter
@@ -262,15 +265,12 @@ def apply_stream_filters(df: pd.DataFrame, stream_filters: Dict[str, Dict]) -> p
                 df.loc[dom_mask & ~empty_reasons, 'filter_reasons'] + ', ' + reason_text
             )
         
-        # Time filter
+        # Time filter (per-stream + master exclude_times; sequencer does not use final_allowed)
         # CRITICAL: Check actual_trade_time if it exists (from sequencer), otherwise check Time column
-        # This is needed because sequencer sets Time to intended slot, not actual trade time
-        if filters.get('exclude_times'):
-            exclude_times = [str(t).strip() for t in filters['exclude_times']]  # Normalize exclude_times
+        exclude_times_normalized = sorted(merged_exclude_times_normalized_set(str(stream_id), stream_filters))
+        if exclude_times_normalized:
+            exclude_times = exclude_times_normalized
             from .utils import normalize_time
-            
-            # Normalize exclude_times for consistent comparison
-            exclude_times_normalized = [normalize_time(str(t)) for t in exclude_times]
             
             # Check actual_trade_time first (if sequencer preserved it), then fall back to Time
             if 'actual_trade_time' in df.columns:

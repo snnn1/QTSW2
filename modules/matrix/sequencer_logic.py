@@ -27,27 +27,17 @@ DataLoader owns date normalization. This module MUST NOT re-parse dates.
 It MAY only validate dtype/presence of trade_date column.
 Canonical date column is 'trade_date' (normalized by DataLoader).
 
-SEQUENCING CONTRACT - FILTERED TIMES:
+SEQUENCING CONTRACT — FILTERED TIMES:
 =====================================
-Matrix filtering affects time SELECTION only. It does NOT affect:
-- Rolling history updates (all canonical times advance every day)
-- Scoring (all canonical times are scored)
-
-TIME SETS:
 - canonical_times: All session times (always scored, always in rolling histories)
-- selectable_times: canonical_times minus matrix-filtered times (for time selection only)
+- selectable_times: canonical_times minus merged exclude_times (stream + master); used for selection only
+- filter_engine also applies exclude_times to final_allowed; sequencer does not read final_allowed
 
 INVARIANTS:
-1. All canonical times advance rolling history every day (including filtered)
-2. Time selection compares ONLY selectable_times (filtered times excluded)
-3. current_time must always be in selectable_times (never switch into filtered)
-4. Time changes only occur after LOSS
-5. Filtered times are still scored (they just can't be selected)
-
-HARD RULES:
-- Matrix filtering affects selection only (not scoring, not execution)
-- Sequencer must never switch into a filtered time
-- Execution must never depend on filtering (selection already handled it)
+1. All canonical times advance rolling history every day (including excluded slots)
+2. Initial slot and LOSS-driven switches use only selectable_times; rolling sums rank candidates
+3. Time changes only after LOSS and only if another selectable slot has strictly higher rolling sum
+4. Empty selectable_times (all excluded) → no output rows for that stream (return [], no exception)
 """
 
 import logging
@@ -144,11 +134,10 @@ def apply_sequencer_logic_with_state(
     for stream_id in unique_streams:
         stream_mask = df['Stream'] == stream_id
         stream_df = df[stream_mask].copy()
-        stream_filters_for_stream = stream_filters.get(stream_id, {})
         stream_initial_state = initial_states.get(stream_id) if initial_states else None
         
         stream_result = process_stream_daily(
-            stream_df, stream_id, stream_filters_for_stream, 
+            stream_df, stream_id, stream_filters,
             display_year, stream_initial_state, return_state=True
         )
         
@@ -170,6 +159,24 @@ def apply_sequencer_logic_with_state(
 __all__ = ['apply_sequencer_logic', 'apply_sequencer_logic_with_state', 'process_stream_daily', 'SLOT_ENDS']
 
 
+def pick_best_selectable_by_rolling_sum(
+    selectable_times: List[str],
+    time_slot_histories: Dict[str, List[int]],
+) -> str:
+    """
+    Highest rolling sum (last N scores) among selectable times; ties → earliest session time.
+
+    With empty histories all sums are equal → earliest selectable (deterministic tie-break).
+    """
+    if not selectable_times:
+        return ""
+    ranked = sorted(
+        ((t, sum(time_slot_histories.get(t, []))) for t in selectable_times),
+        key=lambda x: (-x[1], time_sort_key(x[0])),
+    )
+    return ranked[0][0]
+
+
 def decide_time_change(
     current_time: str,
     current_result: str,
@@ -189,7 +196,7 @@ def decide_time_change(
         current_result: Result at current_time (WIN/LOSS/BE/NoTrade)
         current_sum_after: Rolling sum for current time slot after today
         time_slot_histories: Dictionary of time slot histories (already updated)
-        selectable_times: List of selectable time slots (canonical minus filtered)
+        selectable_times: Non-excluded session slots (merged stream + master exclude_times)
         current_session: Current session (S1 or S2)
         
     Returns:
@@ -237,7 +244,7 @@ def decide_time_change(
 def process_stream_daily(
     stream_df: pd.DataFrame,
     stream_id: str,
-    stream_filters: Dict,
+    stream_filters: Dict[str, Dict],
     display_year: Optional[int] = None,
     initial_state: Optional[Dict] = None,
     return_state: bool = False
@@ -245,66 +252,71 @@ def process_stream_daily(
     """
     Process a single stream day by day, applying sequencer logic.
     
-    REFACTORED: Deterministic, calendar-driven, canonical-time-based.
-    
     Args:
         stream_df: DataFrame for the stream
         stream_id: Stream ID
-        stream_filters: Filter configuration for this stream
+        stream_filters: Full filter map (streams + optional master); merged exclude_times define selectable_times
         display_year: If provided, only return trades from this year
-        initial_state: Optional initial state dict for restoration:
-            {
-                "current_time": str,
-                "current_session": str,
-                "time_slot_histories": {
-                    "07:30": [1, -1, 0, ...],
-                    ...
-                }
-            }
+        initial_state: Optional checkpoint state for current_time / histories
         
     Returns:
-        List of chosen trade dictionaries
+        List of chosen trade dictionaries (empty if no selectable slots or no analyzer rows)
     """
     from .utils import normalize_time
+    from .stream_manager import merged_exclude_times_normalized_set
     
     # ============================================================================
-    # STEP 1: DEFINE CANONICAL TIME SET (MANDATORY)
+    # STEP 1: CANONICAL + SELECTABLE (merged exclude_times BEFORE any ranking)
     # ============================================================================
-    # Determine session (use Session column if present, otherwise default to S1)
     if 'Session' in stream_df.columns and not stream_df.empty:
         session = str(stream_df['Session'].iloc[0]).strip()
     else:
-        # Default to S1 if Session column missing
         session = 'S1'
     
-    # CANONICAL TIMES: Full fixed set for this session (never changes, never filtered)
     canonical_times = [normalize_time(str(t)) for t in SLOT_ENDS.get(session, [])]
     
     if not canonical_times:
         logger.error(f"Stream {stream_id}: No canonical times for session {session}! Skipping stream.")
+        if return_state:
+            return [], {"current_time": "", "current_session": session, "time_slot_histories": {}}
         return []
     
-    # Filtered times (matrix filtering - affects selection, NOT scoring)
-    filtered_times_str = [normalize_time(str(t)) for t in stream_filters.get('exclude_times', [])]
-    filtered_times_normalized = set(filtered_times_str)
-    
-    # Selectable times: canonical_times minus filtered_times
+    filtered_times_normalized = merged_exclude_times_normalized_set(str(stream_id), stream_filters)
     selectable_times = [t for t in canonical_times if t not in filtered_times_normalized]
     
-    # Pre-processing validation: All times filtered is a configuration error
-    # Do not silently skip - provide actionable error message
     if not selectable_times:
-        error_msg = (
-            f"Stream {stream_id}: CONFIGURATION ERROR - All canonical times are filtered. "
-            f"This is a user configuration error, not a system error. "
-            f"Canonical times for session {session}: {sorted(canonical_times)}. "
-            f"Filtered times: {sorted(filtered_times_normalized)}. "
-            f"ACTION REQUIRED: Remove filters or add selectable times to enable processing for this stream."
+        logger.error(
+            "NO_SELECTABLE_TIMES_AFTER_EXCLUDES stream=%s session=%s canonical=%s excluded=%s",
+            stream_id,
+            session,
+            sorted(canonical_times),
+            sorted(filtered_times_normalized),
         )
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+        if return_state:
+            return [], {
+                "current_time": "",
+                "current_session": session,
+                "time_slot_histories": {t: [] for t in canonical_times},
+            }
+        return []
     
-    # Initialize current_time: use restored state or default to first selectable time
+    # ============================================================================
+    # ROLLING HISTORIES FIRST (needed for pick_best_selectable_by_rolling_sum)
+    # ============================================================================
+    if initial_state and 'time_slot_histories' in initial_state:
+        restored_histories = initial_state['time_slot_histories']
+        time_slot_histories = {}
+        for canonical_time in canonical_times:
+            canonical_time_normalized = normalize_time(str(canonical_time))
+            if canonical_time_normalized in restored_histories:
+                time_slot_histories[canonical_time_normalized] = list(restored_histories[canonical_time_normalized])
+            else:
+                time_slot_histories[canonical_time_normalized] = []
+        logger.info(f"Stream {stream_id}: Restored time_slot_histories for {len(time_slot_histories)} canonical times")
+    else:
+        time_slot_histories = {t: [] for t in canonical_times}
+    
+    # Initial current_time: restored or best rolling among selectable (ties → earliest)
     if initial_state:
         restored_time = initial_state.get('current_time')
         restored_session = initial_state.get('current_session', session)
@@ -315,41 +327,27 @@ def process_stream_daily(
         else:
             logger.warning(
                 f"Stream {stream_id}: Invalid restored current_time '{restored_time}', "
-                f"using default first selectable time"
+                f"re-picking via pick_best_selectable_by_rolling_sum"
             )
-            current_time = normalize_time(str(selectable_times[0]))
+            current_time = pick_best_selectable_by_rolling_sum(selectable_times, time_slot_histories)
             current_session = session
     else:
-        current_time = normalize_time(str(selectable_times[0]))
+        current_time = pick_best_selectable_by_rolling_sum(selectable_times, time_slot_histories)
         current_session = session
     
     previous_time = None
-    
-    # ============================================================================
-    # INITIALIZE ROLLING HISTORIES FOR ALL CANONICAL TIMES
-    # ============================================================================
-    if initial_state and 'time_slot_histories' in initial_state:
-        # Restore histories from checkpoint
-        restored_histories = initial_state['time_slot_histories']
-        time_slot_histories = {}
-        for canonical_time in canonical_times:
-            canonical_time_normalized = normalize_time(str(canonical_time))
-            # Restore if available, otherwise initialize empty
-            if canonical_time_normalized in restored_histories:
-                time_slot_histories[canonical_time_normalized] = list(restored_histories[canonical_time_normalized])
-            else:
-                time_slot_histories[canonical_time_normalized] = []
-        logger.info(f"Stream {stream_id}: Restored time_slot_histories for {len(time_slot_histories)} canonical times")
-    else:
-        # Initialize empty histories
-        time_slot_histories = {t: [] for t in canonical_times}
-    
     chosen_trades = []
     
     # ============================================================================
     # CALENDAR-DRIVEN DATE ITERATION
     # ============================================================================
     if stream_df.empty:
+        if return_state:
+            return [], {
+                "current_time": current_time,
+                "current_session": current_session,
+                "time_slot_histories": {k: list(v) for k, v in time_slot_histories.items()},
+            }
         return []
     
     # DATE OWNERSHIP: DataLoader owns date normalization
@@ -434,21 +432,21 @@ def process_stream_daily(
         # ============================================================================
         # TRADE SELECTION (PURE LOOKUP)
         # ============================================================================
-        # CRITICAL: Filter out excluded times from date_df BEFORE selection
-        # OPTIMIZATION: Use boolean indexing instead of copy (faster)
+        # Drop excluded-time analyzer rows before lookup (selection must not depend on final_allowed)
         if not date_df.empty and filtered_times_normalized:
             time_mask = ~date_df['Time_str'].isin(filtered_times_normalized)
-            date_df_filtered = date_df[time_mask]  # Use view, not copy
-            # Log if we filtered out any rows (shouldn't happen if logic is correct, but good to know)
+            date_df_filtered = date_df[time_mask]
             filtered_out_count = len(date_df) - len(date_df_filtered)
             if filtered_out_count > 0:
-                logger.warning(
-                    f"Stream {stream_id} {date}: Filtered out {filtered_out_count} trades at excluded times: "
-                    f"{sorted(date_df[~time_mask]['Time_str'].unique())}"
+                logger.info(
+                    "TIME_EXCLUDED_ENFORCED stream=%s date=%s removed_rows=%s excluded_slots=%s",
+                    stream_id,
+                    date,
+                    filtered_out_count,
+                    sorted(filtered_times_normalized),
                 )
             date_df = date_df_filtered
         
-        # DIAGNOSTIC: Log selection context for debugging
         current_time_normalized = normalize_time(str(current_time))
         available_times_in_data = sorted(date_df['Time_str'].unique().tolist()) if not date_df.empty else []
         row_exists = not date_df.empty and (date_df['Time_str'] == current_time_normalized).any()
@@ -459,22 +457,14 @@ def process_stream_daily(
                 f"row_exists={row_exists}, available_times={available_times_in_data}"
             )
         
-        # Verify current_time is actually selectable (safeguard)
         if current_time_normalized not in selectable_times:
             logger.error(
-                f"Stream {stream_id} {date}: CRITICAL - current_time '{current_time_normalized}' is not selectable! "
-                f"Selectable: {selectable_times}, Filtered: {sorted(filtered_times_normalized)}"
+                f"Stream {stream_id} {date}: current_time '{current_time_normalized}' not in selectable_times "
+                f"{selectable_times}"
             )
-            # Don't select a trade at an excluded time - return NoTrade instead
             trade_row = None
         else:
-            # Call select_trade_for_time with only the required parameters
-            # Note: excluded times should already be filtered from date_df before calling
-            trade_row = select_trade_for_time(
-                date_df, 
-                current_time, 
-                current_session
-            )
+            trade_row = select_trade_for_time(date_df, current_time, current_session)
         
         old_time_for_today = str(current_time).strip()
         
@@ -501,7 +491,7 @@ def process_stream_daily(
                     trade_dict['Date'] = str(date_value)[:10]  # YYYY-MM-DD format
             
             # CRITICAL: Preserve original analyzer time before overwriting Time column
-            # This is needed for downstream filtering (exclude_times filter needs actual trade time)
+            # (filter_engine uses actual_trade_time for per-stream time filters)
             original_time = trade_dict.get('Time', '')
             if original_time:
                 trade_dict['actual_trade_time'] = str(original_time).strip()
@@ -714,9 +704,10 @@ def apply_sequencer_logic(
             # CRITICAL: Must copy here because process_stream_daily modifies the DataFrame
             # (adds Time_str, Date_normalized columns). Views would cause issues in parallel execution.
             stream_df = df[stream_mask].copy()
-            stream_filters_for_stream = stream_filters.get(stream_id, {})
             stream_initial_state = initial_states.get(stream_id) if initial_states else None
-            return process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year, stream_initial_state, return_state=False)
+            return process_stream_daily(
+                stream_df, stream_id, stream_filters, display_year, stream_initial_state, return_state=False
+            )
         
         logger.info(f"Processing {len(unique_streams)} streams in parallel ({max_workers} workers)...")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -742,10 +733,11 @@ def apply_sequencer_logic(
         for stream_id in unique_streams:
             stream_mask = df['Stream'] == stream_id
             stream_df = df[stream_mask]  # Use view, not copy (faster)
-            stream_filters_for_stream = stream_filters.get(stream_id, {})
             stream_initial_state = initial_states.get(stream_id) if initial_states else None
             
-            stream_chosen_trades = process_stream_daily(stream_df, stream_id, stream_filters_for_stream, display_year, stream_initial_state, return_state=False)
+            stream_chosen_trades = process_stream_daily(
+                stream_df, stream_id, stream_filters, display_year, stream_initial_state, return_state=False
+            )
             chosen_trades.extend(stream_chosen_trades)
     
     if not chosen_trades:
@@ -754,27 +746,23 @@ def apply_sequencer_logic(
     result_df = pd.DataFrame(chosen_trades)
     
     # ============================================================================
-    # INVARIANT CHECK: Time must always be in selectable_times
+    # INVARIANT CHECK: Time must be in selectable_times (canonical − merged excludes)
     # ============================================================================
-    # Verify that Time column always contains selectable times (not filtered)
-    # This checks the real invariant: "current_time must always be selectable"
     from .utils import normalize_time
+    from .stream_manager import merged_exclude_times_normalized_set
     
-    for stream_id, filters in stream_filters.items():
-        stream_mask = result_df['Stream'] == stream_id
+    for stream_id in result_df["Stream"].unique():
+        stream_id = str(stream_id)
+        stream_mask = result_df["Stream"] == stream_id
         if not stream_mask.any():
             continue
         
         stream_rows = result_df[stream_mask]
         
-        # Get session from result_df (should be stream-constant)
-        # INVARIANT: Session should not vary within a stream. If it does, this check may be unstable.
         if 'Session' in stream_rows.columns and not stream_rows.empty:
             session = str(stream_rows['Session'].iloc[0]).strip()
-            # Verify session consistency across stream (warn if inconsistent)
             unique_sessions = stream_rows['Session'].apply(str).str.strip().unique()
             if len(unique_sessions) > 1:
-                # This is a data quality issue - log it but use the most common session
                 session_counts = stream_rows['Session'].apply(str).str.strip().value_counts()
                 most_common_session = session_counts.index[0]
                 logger.warning(
@@ -786,22 +774,12 @@ def apply_sequencer_logic(
             logger.warning(f"Stream {stream_id}: No 'Session' column found, defaulting to 'S1'")
             session = 'S1'
         
-        # Compute selectable_times for this stream (same logic as process_stream_daily)
-        # CRITICAL: Normalization must be consistent across:
-        # - SLOT_ENDS values
-        # - stream_filters exclude_times
-        # - row Time values
         canonical_times = [normalize_time(str(t)) for t in SLOT_ENDS.get(session, [])]
-        filtered_times = [normalize_time(str(t)) for t in filters.get('exclude_times', [])]
-        filtered_times_set = set(filtered_times)
+        filtered_times_set = merged_exclude_times_normalized_set(stream_id, stream_filters)
+        filtered_times = sorted(filtered_times_set)
         selectable_times = [t for t in canonical_times if t not in filtered_times_set]
         selectable_times_set = set(selectable_times)
         
-        # Check that all Time values are in selectable_times
-        # This is a critical invariant: sequencer should never select a filtered time
-        # PERFORMANCE OPTIMIZATION: Use vectorized operations instead of iterrows()
-        # Vectorization preserves exact indices and values (no logic changes)
-        # Row-by-row iteration is retained only for error reporting (to collect specific row details)
         time_values = stream_rows['Time'].astype(str).str.strip().apply(normalize_time)
         invalid_mask = ~time_values.isin(selectable_times_set)
         
@@ -845,11 +823,11 @@ def apply_sequencer_logic(
             for idx, date, time_value in invalid_times:
                 logger.error(
                     f"Stream {stream_id} {date}: CRITICAL INVARIANT VIOLATION - "
-                    f"Time '{time_value}' is not selectable. Selectable: {selectable_times}, Filtered: {sorted(filtered_times)}"
+                    f"Time '{time_value}' not in selectable times. Selectable: {selectable_times}, excluded: {filtered_times}"
                 )
             raise AssertionError(
-                f"Stream {stream_id}: Found {len(invalid_times)} trades with non-selectable times. "
-                f"Selectable times: {selectable_times}, Filtered times: {sorted(filtered_times)}"
+                f"Stream {stream_id}: Found {len(invalid_times)} trades with non-selectable Time. "
+                f"Selectable: {selectable_times}, excluded: {filtered_times}"
             )
         
         if excluded_times_in_output:

@@ -8,11 +8,12 @@ Author: Quantitative Trading System
 Date: 2025
 """
 
+import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
-from datetime import datetime, date, timezone
+from typing import List, Optional, Dict, Tuple, Any
+from datetime import datetime, date, time as dt_time, timezone
 import logging
 import sys
 import json
@@ -21,11 +22,23 @@ import pytz
 # Import centralized config
 # Handle both direct import and relative import
 try:
-    from modules.matrix.config import SLOT_ENDS, DOM_BLOCKED_DAYS, SCF_THRESHOLD
+    from modules.matrix.config import (
+        DOM_BLOCKED_DAYS,
+        S1_EARLY_OPEN_SLOT_TIME,
+        S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
+        SCF_THRESHOLD,
+        SLOT_ENDS,
+    )
 except ImportError:
     # Fallback: add parent directory to path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from modules.matrix.config import SLOT_ENDS, DOM_BLOCKED_DAYS, SCF_THRESHOLD
+    from modules.matrix.config import (  # type: ignore
+        DOM_BLOCKED_DAYS,
+        S1_EARLY_OPEN_SLOT_TIME,
+        S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
+        SCF_THRESHOLD,
+        SLOT_ENDS,
+    )
 
 # CONTRACT: Only import validation helpers, never normalization functions
 # Timetable Engine validates, enforces, and fails — it never normalizes dates.
@@ -35,6 +48,7 @@ try:
         _validate_trade_date_presence
     )
     from modules.timetable.eligibility_writer import load_eligibility
+    from modules.timetable.cme_session import get_cme_trading_date
 except ImportError:
     # Fallback: add parent directory to path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -43,10 +57,193 @@ except ImportError:
         _validate_trade_date_presence
     )
     from modules.timetable.eligibility_writer import load_eligibility
+    from modules.timetable.cme_session import get_cme_trading_date
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def _execution_mode_matrix_cell_is_nonempty(raw: Any) -> bool:
+    if raw is None:
+        return False
+    if isinstance(raw, str) and not raw.strip():
+        return False
+    try:
+        if pd.isna(raw):
+            return False
+    except TypeError:
+        pass
+    if isinstance(raw, float) and np.isnan(raw):
+        return False
+    return True
+
+
+def _coerce_matrix_cell_to_slot_hhmm(raw: Any) -> Optional[str]:
+    """
+    Parse a matrix Time or Time Change cell into HH:MM (normalize_time).
+    Handles datetime/Timestamp, 'HH:MM -> HH:MM' (RHS), and embedded timestamps.
+    """
+    from modules.matrix.utils import normalize_time
+
+    if not _execution_mode_matrix_cell_is_nonempty(raw):
+        return None
+    if isinstance(raw, dt_time):
+        return normalize_time(f"{raw.hour:d}:{raw.minute:02d}")
+    if isinstance(raw, datetime) and not isinstance(raw, pd.Timestamp):
+        return normalize_time(f"{raw.hour:d}:{raw.minute:02d}")
+    if isinstance(raw, pd.Timestamp):
+        return normalize_time(f"{raw.hour:d}:{raw.minute:02d}")
+    s = str(raw).strip()
+    if s.lower() == "nan":
+        return None
+    if "->" in s:
+        s = s.split("->")[-1].strip()
+    ts = pd.to_datetime(s, errors="coerce")
+    if isinstance(ts, pd.Timestamp) and pd.notna(ts):
+        return normalize_time(f"{ts.hour:d}:{ts.minute:02d}")
+    m = re.search(r"(\d{1,2})\s*:\s*(\d{2})", s)
+    if m:
+        return normalize_time(f"{m.group(1)}:{m.group(2)}")
+    return None
+
+
+def _execution_mode_row_get_time_change(series: pd.Series) -> Any:
+    for col in ("Time Change", "Time_Change"):
+        if col in series.index:
+            return series[col]
+    return None
+
+
+def _execution_mode_row_get_time(series: pd.Series) -> Any:
+    if "Time" in series.index:
+        return series["Time"]
+    return None
+
+
+def _merge_stream_filters_for_execution(
+    project_root: Path,
+    stream_filters: Optional[Dict],
+) -> Dict:
+    """
+    Merge configs/stream_filters.json with caller-provided filters.
+    Caller keys overwrite file keys for the same stream_id (shallow dict update per stream).
+    """
+    import json
+
+    merged: Dict[str, Any] = {}
+    cfg = project_root / "configs" / "stream_filters.json"
+    if cfg.is_file():
+        try:
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                merged = {
+                    str(k): dict(v) if isinstance(v, dict) else v for k, v in data.items()
+                }
+        except Exception as e:
+            logger.warning("EXECUTION_STREAM_FILTERS_CONFIG: failed to load %s: %s", cfg, e)
+    if stream_filters:
+        for sid, filt in stream_filters.items():
+            key = str(sid)
+            if not isinstance(filt, dict):
+                merged[key] = filt
+                continue
+            base = dict(merged.get(key) or {}) if isinstance(merged.get(key), dict) else {}
+            base.update(filt)
+            merged[key] = base
+    return merged
+
+
+def _execution_slot_order_and_display_map(
+    session_slots: List[str],
+) -> Tuple[List[str], Dict[str, str]]:
+    """Session slot order as normalized HH:MM, plus norm -> first canonical display string."""
+    from modules.matrix.utils import normalize_time
+
+    order: List[str] = []
+    display: Dict[str, str] = {}
+    for raw in session_slots:
+        n = normalize_time(str(raw).strip())
+        order.append(n)
+        display.setdefault(n, str(raw).strip())
+    return order, display
+
+
+def _execution_instrument_slots_ordered(
+    session: str,
+    instrument: str,
+    session_time_slots: Dict[str, List[str]],
+) -> List[str]:
+    """Session slots in order, minus S1 early open when instrument is not allowed (timetable write guard parity)."""
+    from modules.matrix.utils import normalize_time
+
+    slots = session_time_slots.get(session, [])
+    full_order, _ = _execution_slot_order_and_display_map(slots)
+    early_norm = normalize_time(S1_EARLY_OPEN_SLOT_TIME)
+    inst_up = (instrument or "").strip().upper()
+    out: List[str] = []
+    for n in full_order:
+        if (
+            session == "S1"
+            and n == early_norm
+            and inst_up not in S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT
+        ):
+            continue
+        out.append(n)
+    return out
+
+
+def _pick_slot_from_preference(
+    full_order_norm: List[str],
+    candidates_norm: List[str],
+    preferred_norm: Optional[str],
+) -> Optional[str]:
+    """
+    Choose normalized slot from candidates_norm using matrix preference as anchor in full_order_norm.
+
+    If preferred is missing or not in full_order_norm, first candidate in session order.
+    If preferred is not in candidates, scan forward in full order then backward for the nearest candidate.
+    """
+    if not candidates_norm:
+        return None
+    cand_set = set(candidates_norm)
+    if not preferred_norm or preferred_norm not in full_order_norm:
+        return candidates_norm[0]
+    if preferred_norm in cand_set:
+        return preferred_norm
+    try:
+        idx = full_order_norm.index(preferred_norm)
+    except ValueError:
+        return candidates_norm[0]
+    for j in range(idx + 1, len(full_order_norm)):
+        if full_order_norm[j] in cand_set:
+            return full_order_norm[j]
+    for j in range(idx - 1, -1, -1):
+        if full_order_norm[j] in cand_set:
+            return full_order_norm[j]
+    return None
+
+
+def _execution_append_block_reason(existing: Optional[str], fragment: str) -> str:
+    if not fragment:
+        return existing or ""
+    if not existing:
+        return fragment
+    if fragment in existing:
+        return existing
+    return f"{existing};{fragment}"
+
+
+class TimetableWriteBlockedMissingEligibility(RuntimeError):
+    """Execution timetable publish requires eligibility_{session_trading_date}.json on disk and valid."""
+
+
+class TimetableLivePublishBlocked(RuntimeError):
+    """Writing live data/timetable/timetable_current.json from a blocked (non-approved) code path."""
+
+
+class TimetableWriteBlockedCmeMismatch(RuntimeError):
+    """Live execution: session_trading_date must equal get_cme_trading_date(now) when CME enforcement is on."""
 
 
 class TimetableEngine:
@@ -484,10 +681,10 @@ class TimetableEngine:
         
         logger.info(f"Timetable generated: {len(timetable_df)} entries")
         logger.info(f"Allowed trades: {timetable_df['allowed'].sum()} / {len(timetable_df)}")
-        
-        # Write canonical execution timetable file
-        self.write_execution_timetable(timetable_df, trade_date)
-        
+
+        # Do not write timetable_current.json here — analyzer path is not an approved live publisher.
+        # Callers save via save_timetable() or use matrix-first write_execution_timetable_from_master_matrix(..., execution_mode=True).
+
         return timetable_df
     
     def save_timetable(self, timetable_df: pd.DataFrame, 
@@ -543,30 +740,38 @@ class TimetableEngine:
         Args:
             master_matrix_df: Master matrix DataFrame
             trade_date: Optional trading date (YYYY-MM-DD). If None, uses latest date in matrix.
-            stream_filters: Optional stream filters dict (for DOW/DOM filtering)
-            execution_mode: If True, load eligibility from file; never use manual filters (Path B).
+            stream_filters: Optional per-stream filter dict. Non-execution: DOW/DOM/exclude_times for
+                eligibility. Execution: merged with configs/stream_filters.json for bookkeeping; time
+                exclusions are applied in the matrix sequencer (slot_time comes from matrix rows).
+            execution_mode: If True, load eligibility from file for enabled/disabled.
         """
-        streams = self.build_streams_from_master_matrix(
-            master_matrix_df, trade_date, stream_filters, execution_mode
-        )
-        # When execution_mode=True and eligibility missing, fall back to matrix-derived streams
-        # so timetable is always written and eligibility builder can create the file
-        if not streams and execution_mode:
-            logger.info(
-                "SESSION_ELIGIBILITY_MISSING: falling back to execution_mode=False to build timetable; "
-                "eligibility builder will create file on next run"
-            )
+        utc_now = datetime.now(timezone.utc)
+        if execution_mode:
+            # Live execution: single source of truth — ignore trade_date, UI, latest matrix date
+            session_trading_date = get_cme_trading_date(utc_now)
+        else:
+            if not self.timetable_output_dir:
+                raise TimetableLivePublishBlocked(
+                    "write_execution_timetable_from_master_matrix(..., execution_mode=False) requires "
+                    "TimetableEngine(..., timetable_output_dir=...) so output goes to timetable_copy.json only. "
+                    "Live timetable_current.json requires execution_mode=True (matrix pipeline / CME session)."
+                )
+            session_trading_date = (trade_date or "").strip() or get_cme_trading_date(utc_now)
+        try:
             streams = self.build_streams_from_master_matrix(
-                master_matrix_df, trade_date, stream_filters, execution_mode=False
+                master_matrix_df, session_trading_date, stream_filters, execution_mode
             )
+        except TimetableWriteBlockedMissingEligibility:
+            raise
         if not streams:
             return
         self._write_execution_timetable_file(
             streams,
-            trade_date or "",
+            session_trading_date,
             ledger_writer="matrix",
             ledger_source="master_matrix",
             execution_document_source="master_matrix",
+            enforce_cme_live=execution_mode,
         )
 
     def build_timetable_dataframe_from_master_matrix(
@@ -582,13 +787,18 @@ class TimetableEngine:
 
         Returns DataFrame with columns matching generate_timetable for display/API parity.
         """
+        utc_now = datetime.now(timezone.utc)
+        if execution_mode:
+            eff_trade_date = get_cme_trading_date(utc_now)
+        else:
+            eff_trade_date = trade_date
         streams = self.build_streams_from_master_matrix(
-            master_matrix_df, trade_date, stream_filters, execution_mode
+            master_matrix_df, eff_trade_date, stream_filters, execution_mode
         )
         if not streams:
             return pd.DataFrame()
 
-        trade_date_str = trade_date
+        trade_date_str = eff_trade_date if execution_mode else trade_date
         if not trade_date_str:
             if not master_matrix_df.empty and 'trade_date' in master_matrix_df.columns:
                 latest = master_matrix_df['trade_date'].max()
@@ -650,7 +860,8 @@ class TimetableEngine:
         Used by both timetable write and eligibility builder.
         Returns empty list if matrix empty; all-disabled list if no data for trade_date (MATRIX_DATE_MISSING).
 
-        When execution_mode=True: Load eligibility from file; never use manual filters (Path B).
+        When execution_mode=True: Load eligibility from file for enabled/disabled (Path B).
+        Slot times come from matrix Time / Time Change (sequencer already applied exclude_times).
         Robot fails closed if eligibility file is missing.
         """
         # Eligibility always loads from canonical data/timetable (not timetable_output_dir)
@@ -687,15 +898,27 @@ class TimetableEngine:
 
         trade_date_obj = pd.to_datetime(trade_date).date()
 
-        # EXECUTION_MODE: Load eligibility artifact; fail closed if missing
+        # EXECUTION_MODE: Load eligibility artifact; fail closed if missing (no fallback)
         if execution_mode:
             eligibility = load_eligibility(trade_date, str(eligibility_dir))
             if eligibility is None:
                 logger.error(
-                    f"SESSION_ELIGIBILITY_MISSING: eligibility_{trade_date}.json not found. "
-                    "Robot must fail closed. Aborting timetable build."
+                    "TIMETABLE_WRITE_BLOCKED_MISSING_ELIGIBILITY: eligibility_%s.json not found on disk",
+                    trade_date,
                 )
-                return []
+                raise TimetableWriteBlockedMissingEligibility(
+                    f"eligibility_{trade_date}.json required for execution_mode timetable build"
+                )
+            file_sd = eligibility.get("session_trading_date")
+            if not file_sd or str(file_sd).strip() != str(trade_date).strip():
+                logger.error(
+                    "TIMETABLE_WRITE_BLOCKED_MISSING_ELIGIBILITY: eligibility must contain session_trading_date=%s (got %s)",
+                    trade_date,
+                    file_sd,
+                )
+                raise TimetableWriteBlockedMissingEligibility(
+                    f"eligibility file must declare session_trading_date {trade_date}"
+                )
             eligibility_lookup = {
                 es["stream_key"]: {"enabled": es.get("enabled", False), "reason": es.get("reason")}
                 for es in eligibility.get("eligible_streams", [])
@@ -712,10 +935,20 @@ class TimetableEngine:
                 f"TIMETABLE_EXECUTION_MODE_ENABLED: trading_date={trade_date}, "
                 f"eligibility_file={eligibility_file.name}, eligibility_hash={eligibility_hash or 'none'}"
             )
-            logger.info("PATH_B_BLOCKED_EXECUTION_MODE: Manual filters (DOW/DOM/exclude_times) skipped; eligibility artifact is sole source")
-            # Build streams from eligibility + matrix (slot_time from matrix or default)
+            eff_stream_filters = _merge_stream_filters_for_execution(
+                self._project_root, stream_filters
+            )
+            logger.info(
+                "PATH_B_EXECUTION_MODE: eligibility artifact is sole source for enabled/disabled; "
+                "DOW/DOM/manual filters are not re-applied; slot_time from matrix row "
+                "(stream_filters keys merged=%s)",
+                len(eff_stream_filters),
+            )
             return self._build_streams_execution_mode(
-                master_matrix_df, trade_date_obj, eligibility_lookup
+                master_matrix_df,
+                trade_date_obj,
+                eligibility_lookup,
+                eff_stream_filters,
             )
 
         if master_matrix_df.empty:
@@ -1004,10 +1237,15 @@ class TimetableEngine:
         master_matrix_df: pd.DataFrame,
         trade_date_obj: date,
         eligibility_lookup: Dict[str, Dict],
+        stream_filters: Dict,
     ) -> List[Dict]:
         """
         Build streams from eligibility artifact + matrix (slot_time).
         Used only when execution_mode=True. Eligibility is sole source for enabled/disabled.
+        stream_filters: merged caller + configs/stream_filters.json.
+            slot_time follows matrix Time / Time Change (no timetable re-ranking). Instrument guard
+            and merged exclude_times only adjust publish when matrix/safety would violate execution
+            contract (e.g. NQ @ 07:30 or drift vs config excludes).
         """
         from datetime import timedelta
 
@@ -1020,7 +1258,10 @@ class TimetableEngine:
             previous_df = pd.DataFrame()
             latest_df = pd.DataFrame()
         source_df = previous_df if not previous_df.empty else latest_df
-        use_previous_day_logic = not previous_df.empty and not latest_df.empty
+        # Time Change on day T-1 is the sequencer's slot for the *next* session (day T).
+        # Use it whenever we source from T-1 — including when the matrix has no rows for T yet
+        # (rolling build ends on T-1 while CME session date is T); do not require rows for T.
+        use_previous_day_logic = not previous_df.empty and source_df is previous_df
 
         for stream_id in self.streams:
             instrument = stream_id[:-1] if len(stream_id) > 1 else ''
@@ -1029,27 +1270,122 @@ class TimetableEngine:
             enabled = elig.get("enabled", False)
             block_reason = None if enabled else elig.get("reason", "eligibility_disabled")
 
-            # Get slot_time from matrix if available
-            time = ""
+            # Matrix preference (Time Change > Time); must still be a valid session slot.
+            time_from_matrix = ""
             if not source_df.empty:
                 row = source_df[source_df['Stream'] == stream_id]
                 if not row.empty:
                     r = row.iloc[0]
-                    time = r.get('Time', '')
+                    from modules.matrix.utils import normalize_time
+
+                    available_norm = [
+                        normalize_time(str(t)) for t in self.session_time_slots.get(session, [])
+                    ]
+
+                    def _in_session_slots(hhmm: Optional[str]) -> bool:
+                        if not hhmm:
+                            return False
+                        return normalize_time(str(hhmm)) in available_norm
+
+                    time_raw = _execution_mode_row_get_time(r)
+                    time_from_matrix = ""
+
                     if use_previous_day_logic:
-                        time_change = r.get('Time Change', '')
-                        if time_change and str(time_change).strip():
-                            tc = str(time_change).strip()
-                            time = tc.split('->')[-1].strip() if '->' in tc else tc
-                    if time:
-                        from modules.matrix.utils import normalize_time
-                        norm = normalize_time(str(time))
-                        available_norm = [normalize_time(str(t)) for t in self.session_time_slots.get(session, [])]
-                        if norm not in available_norm:
-                            time = ""
-            if not time:
-                available_times = self.session_time_slots.get(session, [])
-                time = available_times[0] if available_times else ""
+                        # Previous day's row: Time Change (next session slot) wins over Time when valid.
+                        tc_raw = _execution_mode_row_get_time_change(r)
+                        original_display = _coerce_matrix_cell_to_slot_hhmm(time_raw) or ""
+
+                        if _execution_mode_matrix_cell_is_nonempty(tc_raw):
+                            tc_parsed = _coerce_matrix_cell_to_slot_hhmm(tc_raw)
+                            if tc_parsed and _in_session_slots(tc_parsed):
+                                time_from_matrix = tc_parsed
+                                logger.info(
+                                    "TIME_CHANGE_APPLIED stream=%s original_time=%s new_time=%s",
+                                    stream_id,
+                                    original_display if original_display else "(none)",
+                                    tc_parsed,
+                                )
+                            else:
+                                logger.warning(
+                                    "TIME_CHANGE_INVALID stream=%s session=%s raw=%r coerced=%r "
+                                    "allowed=%s",
+                                    stream_id,
+                                    session,
+                                    tc_raw,
+                                    tc_parsed,
+                                    available_norm,
+                                )
+
+                        if not time_from_matrix:
+                            t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
+                            if t_parsed and _in_session_slots(t_parsed):
+                                time_from_matrix = t_parsed
+                    else:
+                        t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
+                        if t_parsed and _in_session_slots(t_parsed):
+                            time_from_matrix = t_parsed
+
+            from modules.matrix.utils import normalize_time as _norm_slot
+            from modules.matrix.stream_manager import merged_exclude_times_normalized_set
+
+            session_slots = self.session_time_slots.get(session, [])
+            full_order_norm, norm_to_display = _execution_slot_order_and_display_map(session_slots)
+            instrument_slots_norm = _execution_instrument_slots_ordered(
+                session, instrument, self.session_time_slots
+            )
+            excl_norm = merged_exclude_times_normalized_set(stream_id, stream_filters)
+            candidates_norm = [n for n in instrument_slots_norm if n not in excl_norm]
+            matrix_pref_norm = _norm_slot(str(time_from_matrix)) if time_from_matrix else ""
+
+            picked_norm: Optional[str] = None
+
+            if not matrix_pref_norm:
+                picked_norm = candidates_norm[0] if candidates_norm else None
+            elif matrix_pref_norm not in full_order_norm:
+                picked_norm = candidates_norm[0] if candidates_norm else None
+            elif matrix_pref_norm not in candidates_norm:
+                if matrix_pref_norm in excl_norm:
+                    logger.info(
+                        "TIME_EXCLUDED_ENFORCED stream=%s matrix_time=%s action=timetable_publish_shift",
+                        stream_id,
+                        matrix_pref_norm,
+                    )
+                picked_norm = _pick_slot_from_preference(
+                    full_order_norm, candidates_norm, matrix_pref_norm
+                )
+            else:
+                picked_norm = matrix_pref_norm
+
+            if picked_norm is not None and picked_norm in excl_norm:
+                picked_norm = _pick_slot_from_preference(
+                    full_order_norm, candidates_norm, picked_norm
+                )
+
+            if picked_norm is None:
+                time = ""
+                logger.error(
+                    "NO_VALID_EXECUTION_SLOTS stream=%s session=%s instrument=%s "
+                    "matrix_time=%s candidates=%s",
+                    stream_id,
+                    session,
+                    instrument,
+                    time_from_matrix or "(empty)",
+                    candidates_norm,
+                )
+                if enabled:
+                    enabled = False
+                block_reason = _execution_append_block_reason(
+                    block_reason, "no_valid_slot_for_instrument"
+                )
+            else:
+                time = norm_to_display[picked_norm]
+                if matrix_pref_norm and picked_norm != matrix_pref_norm:
+                    logger.info(
+                        "EXECUTION_INSTRUMENT_SLOT_REMAP stream=%s matrix_time=%s published_slot=%s",
+                        stream_id,
+                        matrix_pref_norm,
+                        picked_norm,
+                    )
 
             streams_dict[stream_id] = {
                 'stream': stream_id,
@@ -1088,213 +1424,201 @@ class TimetableEngine:
     def publish_execution_timetable_current(
         self,
         streams: List[Dict],
-        trade_date: str = "",
+        session_trading_date: str,
         *,
         execution_document_source: str = "master_matrix",
         ledger_writer: str = "timetable_engine",
         ledger_source: Optional[str] = None,
-        eligibility_overwrite: bool = False,
+        enforce_cme_live: bool = True,
+        replay: bool = False,
     ) -> None:
         """
         **Single supported Python path** to publish live `data/timetable/timetable_current.json`.
 
-        Validates, atomic write, eligibility side-effect, publish ledger. Callers (dashboard, matrix, CLI)
-        must use this or `_write_execution_timetable_file` with the same contract — do not duplicate
-        json.dump/replace elsewhere for `timetable_current.json`.
+        Preconditions: eligibility_{session_trading_date}.json must already exist and match (no auto-seed).
         """
         if self.timetable_output_dir:
             raise ValueError(
                 "publish_execution_timetable_current requires TimetableEngine without timetable_output_dir "
                 "(copy mode writes timetable_copy.json only)."
             )
+        if not (session_trading_date or "").strip():
+            raise ValueError("session_trading_date is required")
+        do_enforce = enforce_cme_live and not replay
         self._write_execution_timetable_file(
             streams,
-            trade_date,
+            session_trading_date.strip(),
             execution_document_source=execution_document_source,
             ledger_writer=ledger_writer,
             ledger_source=ledger_source,
-            eligibility_overwrite=eligibility_overwrite,
+            enforce_cme_live=do_enforce,
         )
 
     def _write_execution_timetable_file(
         self,
         streams: List[Dict],
-        trade_date: str,
+        session_trading_date: str,
         *,
         execution_document_source: str = "master_matrix",
         ledger_writer: str = "timetable_engine",
         ledger_source: Optional[str] = None,
-        eligibility_overwrite: bool = False,
+        enforce_cme_live: bool = False,
     ) -> None:
         """
-        Internal method to write execution timetable file.
-        
-        Args:
-            streams: List of stream dicts with stream, instrument, session, slot_time, enabled, block_reason (optional)
-            trade_date: Trading date (YYYY-MM-DD) — informational vs CME-computed trading_date in document
-            execution_document_source: JSON `source` field (e.g. master_matrix, dashboard_ui)
-            ledger_writer: logs/timetable_publish.jsonl `writer` field
-            ledger_source: ledger `source` field (defaults to execution_document_source)
-            eligibility_overwrite: If True, overwrite eligibility file when publishing (dashboard saves)
+        Write execution timetable JSON.
+
+        Preconditions:
+          - session_trading_date: explicit YYYY-MM-DD (authoritative for this document)
+          - eligibility_{session_trading_date}.json exists and session_trading_date field matches
+        When enforce_cme_live is True (live timetable_current): session_trading_date must equal
+        get_cme_trading_date(datetime.now(timezone.utc)).
         """
+        if not (session_trading_date or "").strip():
+            raise ValueError("session_trading_date is required")
+        session_trading_date = str(session_trading_date).strip()
+
         output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
         filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Clean up old files (keep only the canonical file for this output dir)
+
+        utc_now = datetime.now(timezone.utc)
+        expected_cme = get_cme_trading_date(utc_now)
+        if enforce_cme_live and filename_base == "timetable_current":
+            if session_trading_date != expected_cme:
+                logger.error(
+                    "TIMETABLE_WRITE_BLOCKED_CME_MISMATCH: session_trading_date=%s expected_cme=%s",
+                    session_trading_date,
+                    expected_cme,
+                )
+                raise TimetableWriteBlockedCmeMismatch(
+                    f"live execution session_trading_date must be {expected_cme}, got {session_trading_date}"
+                )
+            # Defensive invariant (upstream already enforced); fails if logic regresses (e.g. under python -O assert is stripped).
+            assert session_trading_date == expected_cme, (
+                "live timetable invariant: session_trading_date must equal get_cme_trading_date(now)"
+            )
+
         self._cleanup_old_timetable_files(output_dir, keep_filename=filename_base)
 
-        # Fail-closed: never write bad slot/instrument rows to timetable_current.json (robot consumes this file).
-        # Incident 2026-03-20: ES1/NG1 incorrectly received YM's S1 07:30 from matrix churn — reject at source.
         from modules.timetable.timetable_write_guard import validate_streams_before_execution_write
 
         validate_streams_before_execution_write(streams, session_time_slots=self.session_time_slots)
-        
-        # Get current timestamp in America/Chicago timezone
+
+        elig = load_eligibility(session_trading_date, str(output_dir))
+        if elig is None:
+            logger.error(
+                "TIMETABLE_WRITE_BLOCKED_MISSING_ELIGIBILITY: no eligibility file for session %s",
+                session_trading_date,
+            )
+            raise TimetableWriteBlockedMissingEligibility(
+                f"eligibility_{session_trading_date}.json required before timetable write"
+            )
+        file_sd = elig.get("session_trading_date")
+        if not file_sd or str(file_sd).strip() != session_trading_date:
+            logger.error(
+                "TIMETABLE_WRITE_BLOCKED_MISSING_ELIGIBILITY: eligibility session %s != %s",
+                file_sd,
+                session_trading_date,
+            )
+            raise TimetableWriteBlockedMissingEligibility("eligibility session_trading_date mismatch")
+
+        import hashlib
+
+        elig_path = output_dir / f"eligibility_{session_trading_date}.json"
+        eligibility_hash = None
+        if elig_path.exists():
+            try:
+                eligibility_hash = hashlib.sha256(elig_path.read_bytes()).hexdigest()[:16]
+            except Exception:
+                pass
+
         chicago_tz = pytz.timezone("America/Chicago")
         chicago_now = datetime.now(chicago_tz)
         as_of = chicago_now.isoformat()
-        
-        # Compute trading_date using CME rollover rule (17:00 Chicago)
-        # If Chicago time < 17:00: trading_date = Chicago calendar date
-        # If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
-        chicago_date = chicago_now.date()
-        chicago_hour = chicago_now.hour
-        
-        # Rollover at 17:00 Chicago time
-        if chicago_hour >= 17:
-            # At or after 17:00, trading_date is next calendar day
-            from datetime import timedelta
-            trading_date = (chicago_date + timedelta(days=1)).isoformat()
-            rollover_applied = True
-        else:
-            # Before 17:00, trading_date is current calendar day
-            trading_date = chicago_date.isoformat()
-            rollover_applied = False
-        
-        # Log CME trading date computation for verification
-        logger.info(
-            f"CME_TRADING_DATE_ROLLOVER: "
-            f"Chicago time={chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')}, "
-            f"hour={chicago_hour}, "
-            f"calendar_date={chicago_date.isoformat()}, "
-            f"computed_trading_date={trading_date}, "
-            f"rollover_applied={rollover_applied}"
-        )
-        
-        # CONTRACT ENFORCEMENT: CME rollover logic failure is a runtime contract violation
-        if chicago_hour >= 17 and trading_date == chicago_date.isoformat():
-            raise ValueError(
-                f"CME_TRADING_DATE_ROLLOVER_CONTRACT_VIOLATION: "
-                f"as_of={as_of} (>= 17:00) but trading_date={trading_date} "
-                f"equals calendar date {chicago_date.isoformat()}. "
-                f"This violates the CME rollover contract - rollover logic is broken."
-            )
-        
-        # Optional: Log if trade_date parameter differs from computed trading_date
-        if trade_date and trade_date != trading_date:
-            logger.info(
-                f"CME_TRADING_DATE_COMPUTED: "
-                f"trade_date parameter={trade_date}, computed trading_date={trading_date} "
-                f"(based on Chicago time {chicago_now.strftime('%Y-%m-%d %H:%M:%S %Z')})"
-            )
-        
-        # Ensure all streams have decision_time (sequencer intent) - same as slot_time
-        # This represents what the sequencer would use even if stream is blocked
+
         for stream in streams:
-            if 'decision_time' not in stream:
-                stream['decision_time'] = stream.get('slot_time', '')
-        
-        # Build execution timetable document
+            if "decision_time" not in stream:
+                stream["decision_time"] = stream.get("slot_time", "")
+
         execution_timetable = {
-            'as_of': as_of,
-            'trading_date': trading_date,  # Use computed value, not trade_date parameter
-            'timezone': 'America/Chicago',
-            'source': execution_document_source,
-            'streams': streams
+            "as_of": as_of,
+            "session_trading_date": session_trading_date,
+            "timezone": "America/Chicago",
+            "source": execution_document_source,
+            "streams": streams,
         }
-        
-        # Atomic write: write to temp file, then rename
+
         temp_file = output_dir / f"{filename_base}.tmp"
         final_file = output_dir / f"{filename_base}.json"
-        
-        try:
-            # Write to temporary file
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(execution_timetable, f, indent=2, ensure_ascii=False)
-            
-            # Atomic rename (works on Windows and Unix)
-            temp_file.replace(final_file)
-            
-            logger.info(f"Execution timetable written: {final_file} ({len(streams)} streams)")
 
-            # Publish ledger (live timetable_current.json only)
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(execution_timetable, f, indent=2, ensure_ascii=False)
+
+            temp_file.replace(final_file)
+
+            logger.info("Execution timetable written: %s (%s streams)", final_file, len(streams))
+
             if filename_base == "timetable_current":
                 try:
+                    import uuid
                     from modules.timetable.timetable_content_hash import compute_content_hash_from_document
                     from modules.timetable.timetable_publish_ledger import append_timetable_publish_ledger
 
                     with open(final_file, "r", encoding="utf-8") as rf:
                         written_doc = json.load(rf)
                     content_hash = compute_content_hash_from_document(written_doc)
+                    run_id = uuid.uuid4().hex[:12]
                     append_timetable_publish_ledger(
                         self._project_root,
                         {
+                            "event": "TIMETABLE_PUBLISHED_WITH_CONTEXT",
                             "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                             "hash": content_hash,
                             "writer": ledger_writer,
                             "source": ledger_source or execution_document_source,
                             "streams_count": len(streams),
                             "path": str(final_file.resolve()),
+                            "matrix_trade_date": session_trading_date,
+                            "session_trading_date": session_trading_date,
+                            "eligibility_file_used": str(elig_path.resolve()),
+                            "eligibility_hash": eligibility_hash,
+                            "run_id": run_id,
                         },
+                    )
+                    logger.info(
+                        "TRADING_DATE_ROLLED: ts_utc=%s session_trading_date=%s source=timetable_engine run_id=%s",
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        session_trading_date,
+                        run_id,
                     )
                 except Exception as e:
                     logger.warning("TIMETABLE_PUBLISH_LEDGER_SKIP: %s", e)
-
-            # Session Eligibility Freeze: write eligibility_<trading_date>.json (never overwrite)
-            # Skip when all streams have no_rs_data — generate_timetable had no analyzer data;
-            # eligibility builder (matrix-derived) will create correct file when triggered
-            no_rs_count = sum(1 for s in streams if s.get("block_reason") == "no_rs_data")
-            if no_rs_count < len(streams):
-                try:
-                    from modules.timetable.eligibility_writer import write_eligibility_file
-                    write_eligibility_file(
-                        streams=streams,
-                        trading_date=trading_date,
-                        output_dir=str(output_dir),
-                        source_matrix_hash=None,
-                        overwrite=eligibility_overwrite,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to write eligibility file: {e}")
-            else:
-                logger.info(
-                    "ELIGIBILITY_SKIP: all streams no_rs_data (no analyzer data); "
-                    "eligibility builder will create from matrix when triggered"
-                )
         except Exception as e:
-            logger.error(f"Failed to write execution timetable: {e}")
-            # Clean up temp file on error
+            logger.error("Failed to write execution timetable: %s", e)
             if temp_file.exists():
                 try:
                     temp_file.unlink()
-                except:
+                except Exception:
                     pass
             raise
     
     def write_execution_timetable(self, timetable_df: pd.DataFrame, trade_date: str) -> None:
         """
-        Write canonical execution timetable file (timetable_current.json or timetable_copy.json).
-        
-        This is the single source of truth for NinjaTrader execution.
-        Uses atomic writes to prevent partial reads.
-        
-        Args:
-            timetable_df: Timetable DataFrame
-            trade_date: Trading date (YYYY-MM-DD)
+        Write execution timetable JSON (timetable_copy.json only).
+
+        Live ``timetable_current.json`` is restricted to
+        ``write_execution_timetable_from_master_matrix(..., execution_mode=True)`` and
+        ``publish_execution_timetable_current`` — not the analyzer dataframe path.
         """
-        output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
-        filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
+        if not self.timetable_output_dir:
+            raise TimetableLivePublishBlocked(
+                "write_execution_timetable requires TimetableEngine(..., timetable_output_dir=...) "
+                "to write timetable_copy.json under a scratch directory. "
+                "Analyzer output must not write live timetable_current.json."
+            )
+        output_dir = Path(self.timetable_output_dir)
+        filename_base = "timetable_copy"
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Clean up old files (keep only the canonical file for this output dir)
@@ -1345,6 +1669,7 @@ class TimetableEngine:
             ledger_writer="timetable_engine",
             ledger_source="generate_timetable",
             execution_document_source="master_matrix",
+            enforce_cme_live=False,
         )
     
     def _cleanup_old_timetable_files(self, output_dir: Path, keep_filename: str = "timetable_current") -> None:

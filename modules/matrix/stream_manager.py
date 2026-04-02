@@ -8,7 +8,7 @@ and managing per-stream filter configurations.
 import re
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -151,4 +151,19 @@ def update_stream_filters(
     return updated_filters
 
 
+def merged_exclude_times_normalized_set(stream_id: str, stream_filters: Dict[str, Dict]) -> Set[str]:
+    """Union of per-stream and ``master`` exclude_times (HH:MM), normalized."""
+    try:
+        from .utils import normalize_time
+    except ImportError:
+        from modules.matrix.utils import normalize_time  # type: ignore
+
+    out: Set[str] = set()
+    master = stream_filters.get("master")
+    if isinstance(master, dict) and master.get("exclude_times"):
+        out.update(normalize_time(str(t)) for t in master["exclude_times"])
+    sf = stream_filters.get(stream_id)
+    if isinstance(sf, dict) and sf.get("exclude_times"):
+        out.update(normalize_time(str(t)) for t in sf["exclude_times"])
+    return out
 
