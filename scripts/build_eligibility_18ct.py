@@ -79,7 +79,7 @@ def main():
 
     result = write_eligibility_file(
         streams=eligibility_streams,
-        trading_date=trading_date,
+        session_trading_date=trading_date,
         output_dir=str(timetable_dir),
         source_matrix_hash=None,
     )

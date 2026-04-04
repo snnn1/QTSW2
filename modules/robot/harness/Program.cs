@@ -50,6 +50,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test IEA_ADOPTION_GATE: single-flight adoption scan gate state machine (CPU fix helper)
 // --test IEA_ADOPTION_NO_PROGRESS: recovery adoption no-progress skip evaluator (fingerprint + cooldown)
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
+// --test SESSION_IDENTITY_GATE: session trading date vs engine latch (no retry / CRITICAL once)
 // --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
 // --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
 // --test BROKER_POSITION_IDENTITY: canonical broker bucket alignment (reconciliation / flatten)
@@ -61,6 +62,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
+// --test SIBLING_PROTECTIVE_CANCEL_QUEUE: urgent lane drains sibling protective cancel before normal NT actions (requires modules/robot/core to compile; else use RobotCore_For_NinjaTrader/SiblingProtectiveCancelQueue.Test)
 var testIndex = argsList.IndexOf("--test");
 if (testIndex >= 0 && testIndex + 1 < argsList.Count)
 {
@@ -221,6 +223,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Phase 5 hardening tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("SESSION_IDENTITY_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SessionIdentityGateTests.RunSessionIdentityGateTests();
+        Console.WriteLine(pass ? "PASS: Session identity gate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("EXECUTION_COMMANDS", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = ExecutionCommandTests.RunExecutionCommandTests();
@@ -255,6 +263,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = ExecutionEventOrderingTests.RunExecutionEventOrderingTests();
         Console.WriteLine(pass ? "PASS: Execution event ordering tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("SIBLING_PROTECTIVE_CANCEL_QUEUE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SiblingProtectiveCancelQueueTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Sibling protective cancel queue (urgent lane)" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("PROTECTIVE_AUDIT", StringComparison.OrdinalIgnoreCase))

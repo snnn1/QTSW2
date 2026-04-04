@@ -3,12 +3,34 @@
  */
 
 export interface WatchdogStatus {
+  /** When this /status payload was sealed (UTC ISO); align with stream-states snapshot_utc */
+  snapshot_utc?: string;
   timestamp_chicago: string;
   engine_alive: boolean;
   engine_activity_state: 'ACTIVE' | 'IDLE_MARKET_CLOSED' | 'STALLED' | 'ENGINE_ACTIVE_PROCESSING' | 'ENGINE_MARKET_CLOSED' | 'ENGINE_IDLE_WAITING_FOR_DATA' | 'ENGINE_STALLED';
   last_engine_tick_chicago: string | null;
   engine_tick_stall_detected: boolean;
   recovery_state: string;
+  /** Composite: recovery path clear, gate/adoption clear, kill switch off (matches backend) */
+  execution_safe?: boolean;
+  /** Robot ENGINE_TIMER_HEARTBEAT timetable identity ≠ system timetable_current.json identity */
+  timetable_drift?: boolean;
+  robot_timetable_hash?: string | null;
+  /** Publisher / file JSON identity — drift compares this to robot heartbeat. */
+  timetable_publisher_hash?: string | null;
+  /** Content hash (C# TimetableContentHasher parity); not used for drift. */
+  timetable_content_hash?: string | null;
+  /** @deprecated Prefer timetable_publisher_hash; same value when identity is known. */
+  current_timetable_hash?: string | null;
+  /** Effective session trading date from timetable poller (may match trading_date). */
+  session_trading_date?: string | null;
+  timetable_last_ok_utc?: string | null;
+  robot_timetable_observed_chicago?: string | null;
+  /** OK | ENGAGED | FAIL_CLOSED — state-consistency / reconciliation gate from robot */
+  reconciliation_gate_state?: string;
+  reconciliation_gate_since_chicago?: string | null;
+  reconciliation_gate_last_detail?: Record<string, unknown> | null;
+  adoption_grace_expired_active?: boolean;
   kill_switch_active: boolean;
   connection_status: string;
   /** Authoritative: LOST | RECOVERING | STABLE (deterministic, timestamp-driven) */
@@ -36,6 +58,15 @@ export interface WatchdogStatus {
   // Fill health (execution logging hygiene)
   fill_health?: FillHealthInfo | null;
   trading_date?: string | null;
+  /**
+   * Last timetable_current.json ``source`` (auto_roll, master_matrix, dashboard_ui, …).
+   * Null if last poll failed. Same as backend status ``timetable_source``.
+   */
+  timetable_source?: string | null;
+  /** True when watchdog could not read enabled streams from timetable file (robot may still fail-closed). */
+  enabled_streams_unknown?: boolean;
+  /** Alias for enabled_streams_unknown — no reliable timetable-derived stream list. */
+  timetable_unavailable?: boolean;
   // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
   active_alerts?: ActiveAlert[];
 }
@@ -105,6 +136,8 @@ export interface RiskGateStatus {
   timestamp_chicago: string;
   recovery_state_allowed: boolean;
   kill_switch_allowed: boolean;
+  /** recovery_state_allowed && kill_switch_allowed */
+  execution_safe?: boolean;
   timetable_validated: boolean;
   stream_armed: StreamArmedStatus[];
   session_slot_time_valid: boolean;
@@ -122,6 +155,10 @@ export interface StreamState {
   execution_instrument?: string | null;  // Full contract name (e.g., "M2K 03-26", "MES 03-26")
   session: string;
   trading_date: string;
+  /** Present on API rows: stream is enabled in timetable_current.json */
+  timetable_enabled?: boolean;
+  /** Same as GET /status execution_safe at snapshot time (system-wide) */
+  system_tradable_now?: boolean;
   state: StreamStateEnum | string;  // Allow empty string for streams without state yet
   committed: boolean;
   commit_reason: string | null;
@@ -145,6 +182,49 @@ export enum StreamStateEnum {
   RANGE_LOCKED = "RANGE_LOCKED",
   OPEN = "OPEN",  // Position open, managing stop/target
   DONE = "DONE"
+}
+
+/** Active intent not on today's timetable — from GET /stream-states (timetable ``streams`` unchanged). */
+export interface OutOfTimetableActiveStream {
+  intent_id: string;
+  stream_id: string;
+  instrument: string;
+  trading_date: string;
+  direction: string;
+  remaining_exposure: number;
+  entry_filled_qty: number;
+  exit_filled_qty: number;
+}
+
+/** Expected vs actual: robot reported slot ended without trade (SLOT_END_SUMMARY). */
+export interface ExecutionExpectationGap {
+  stream_id: string;
+  trading_date: string;
+  instrument: string;
+  session: string;
+  watchdog_state: string;
+  gap_type: string;
+  /** v1: false; v2 slot_missing_summary: null */
+  trade_executed: boolean | null;
+  slot_reason: string | null;
+  expected: string;
+  actual: string;
+  detail: string;
+  timetable_slot_time?: string;
+  slot_boundary_chicago?: string | null;
+}
+
+export interface StreamStatesResponse {
+  snapshot_utc?: string;
+  timestamp_chicago: string;
+  streams: StreamState[];
+  /** Present on current API; missing on older backends — treat as []. */
+  out_of_timetable_active_streams?: OutOfTimetableActiveStream[];
+  /** Timetable streams with explicit slot-end “no trade” vs planned slot (see backend doc). */
+  execution_expectation_gaps?: ExecutionExpectationGap[];
+  timetable_unavailable?: boolean;
+  enabled_streams_unknown?: boolean;
+  timetable_source?: string | null;
 }
 
 export interface IntentExposure {

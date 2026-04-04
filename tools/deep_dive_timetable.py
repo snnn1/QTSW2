@@ -157,29 +157,28 @@ def main():
         print(f"\n13. No stream filters found: {e}")
     
     try:
-        engine.write_execution_timetable_from_master_matrix(
+        scratch = project_root / "data" / "_scratch" / "deep_dive_timetable"
+        scratch.mkdir(parents=True, exist_ok=True)
+        engine = TimetableEngine(project_root=str(project_root))
+        df = engine.build_timetable_dataframe_from_master_matrix(
             master_df,
-            trade_date='2026-01-27',
-            stream_filters=stream_filters
+            trade_date="2026-01-27",
+            stream_filters=stream_filters,
+            execution_mode=False,
         )
-        print("\n14. Timetable engine completed successfully")
-        
-        # Read the generated file
-        timetable_path = Path("data/timetable/timetable_current.json")
-        if timetable_path.exists():
-            import json
-            with open(timetable_path, 'r') as f:
-                timetable_data = json.load(f)
-            
-            print("\n15. Generated timetable file:")
-            for stream in timetable_data.get('streams', []):
-                if stream.get('stream') == 'NQ2':
-                    print(f"    NQ2:")
-                    print(f"      slot_time: {stream.get('slot_time')}")
-                    print(f"      decision_time: {stream.get('decision_time')}")
-                    print(f"      enabled: {stream.get('enabled')}")
+        _, js_path = engine.save_timetable(df, str(scratch))
+        print("\n14. Built dataframe + saved under scratch (does not touch timetable_current.json)")
+        print(f"    artifact: {js_path}")
+        import json
+        if js_path.exists():
+            rows = json.loads(js_path.read_text(encoding="utf-8"))
+            print("\n15. NQ2 row from artifact:")
+            for row in rows:
+                if row.get("stream_id") == "NQ2":
+                    print(f"    selected_time: {row.get('selected_time')}")
+                    print(f"    allowed: {row.get('allowed')}")
     except Exception as e:
-        print(f"\n14. ERROR calling timetable engine: {e}")
+        print(f"\n14. ERROR: {e}")
         import traceback
         traceback.print_exc()
 

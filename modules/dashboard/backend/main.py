@@ -30,8 +30,8 @@ import subprocess
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, Dict, List
-from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any, Tuple
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import uuid
 
@@ -39,7 +39,7 @@ from fastapi import FastAPI, HTTPException
 # WebSocket imports removed - WebSocket endpoints are in routers/websocket.py
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 import logging
 import pandas as pd
@@ -48,6 +48,9 @@ import numpy as np
 # Configuration
 # Calculate project root: modules/dashboard/backend/main.py -> QTSW2 root (go up 3 levels)
 QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
+if str(QTSW2_ROOT) not in sys.path:
+    sys.path.insert(0, str(QTSW2_ROOT))
+
 # Legacy scheduler removed - use automation/run_pipeline_standalone.py instead
 DATA_MERGER_SCRIPT = QTSW2_ROOT / "modules" / "merger" / "merger.py"
 PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
@@ -775,8 +778,24 @@ class ExecutionTimetableStream(BaseModel):
 
 
 class ExecutionTimetableRequest(BaseModel):
-    trading_date: str
-    streams: List[ExecutionTimetableStream]
+    """Trigger publish from on-disk master matrix. Client ``streams`` / per-row enabled flags are ignored."""
+
+    trading_date: Optional[str] = None  # required when replay=True
+    streams: List[ExecutionTimetableStream] = Field(default_factory=list)  # ignored; kept for API compatibility
+    replay: bool = False
+    reason: Optional[str] = None
+    source: Optional[str] = None
+
+
+class ContentHashRequest(BaseModel):
+    """Canonical timetable hash (sorted JSON) for Matrix UI publish debouncing."""
+
+    session_trading_date: str
+    streams: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TimetableRollbackRequest(BaseModel):
+    timestamp: str
 
 
 # Master Matrix endpoints moved to modules.matrix.api router
@@ -805,19 +824,31 @@ async def generate_timetable(request: TimetableRequest):
         
         def _generate_timetable_sync():
             """Matrix-first: use matrix when available (no analyzer reads for RS/SCF)"""
+            from datetime import datetime, timezone
+            from modules.timetable.cme_session import get_cme_trading_date
+
             matrix_df = load_existing_matrix("data/master_matrix")
             if not matrix_df.empty:
+                session_td = (request.date or "").strip() or get_cme_trading_date(datetime.now(timezone.utc))
                 engine.write_execution_timetable_from_master_matrix(
-                    matrix_df, trade_date=request.date, execution_mode=True
+                    matrix_df,
+                    trade_date=session_td,
+                    execution_mode=True,
+                    publish_context={"source": "manual", "reason": "publish"},
                 )
                 return engine.build_timetable_dataframe_from_master_matrix(
-                    matrix_df, trade_date=request.date, execution_mode=True
+                    matrix_df, trade_date=session_td, execution_mode=True
                 )
-            # Fallback: no matrix, use analyzer (legacy path)
-            return engine.generate_timetable(trade_date=request.date)
+            raise ValueError(
+                "No master matrix on disk — live timetable generation requires matrix-first pipeline "
+                "(build matrix, then generate). Analyzer-only path cannot publish timetable_current.json."
+            )
         
-        timetable_df = await asyncio.to_thread(_generate_timetable_sync)
-        
+        try:
+            timetable_df = await asyncio.to_thread(_generate_timetable_sync)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve)) from ve
+
         if timetable_df.empty:
             return {
                 "status": "success",
@@ -826,15 +857,7 @@ async def generate_timetable(request: TimetableRequest):
                 "allowed": 0
             }
         
-        # Trigger eligibility builder (matrix-derived); skips if generate had no_rs_data
-        try:
-            from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
-            _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
-        except Exception as e:
-            logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable generate: %s", e)
-        
-        # Execution timetable (timetable_current.json) is automatically written by generate_timetable()
-        # No need to call save_timetable() - canonical file is the single source of truth
+        # Matrix-first path writes timetable_current.json via write_execution_timetable_from_master_matrix(..., execution_mode=True).
         
         # Convert DataFrame to list of dicts for JSON response
         entries = timetable_df.to_dict('records')
@@ -859,10 +882,14 @@ async def generate_timetable(request: TimetableRequest):
 
 @app.post("/api/timetable/execution")
 async def save_execution_timetable(request: ExecutionTimetableRequest):
-    """Publish execution timetable via TimetableEngine only (single writer to timetable_current.json)."""
+    """Publish execution timetable from on-disk master matrix (single writer to timetable_current.json)."""
     try:
         sys.path.insert(0, str(QTSW2_ROOT))
-        from modules.timetable.timetable_engine import TimetableEngine
+        from modules.matrix.file_manager import load_existing_matrix
+        from modules.timetable.timetable_engine import (
+            TimetableEngine,
+            TimetableWriteBlockedCmeMismatch,
+        )
 
         output_dir = QTSW2_ROOT / "data" / "timetable"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -877,50 +904,80 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                 continue
             if file_path.name.startswith("eligibility_"):
                 continue
+            if file_path.name == "history":
+                continue
             try:
+                if file_path.is_dir():
+                    continue
                 file_path.unlink()
             except Exception:
                 pass
 
-        streams_payload = [
-            (s.model_dump() if hasattr(s, "model_dump") else s.dict()) for s in request.streams
-        ]
+        pub_ctx = {
+            "source": (request.source or "matrix").strip() or "matrix",
+            "reason": (request.reason or "publish").strip() or "publish",
+        }
 
         def _publish_sync():
+            matrix_df = load_existing_matrix(str(QTSW2_ROOT / "data" / "master_matrix"))
+            if matrix_df.empty:
+                raise ValueError(
+                    "No master matrix on disk — build or load matrix before publishing execution timetable"
+                )
             engine = TimetableEngine(
                 master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
                 analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
                 project_root=str(QTSW2_ROOT),
             )
-            engine.publish_execution_timetable_current(
-                streams_payload,
-                request.trading_date,
-                execution_document_source="dashboard_ui",
-                ledger_writer="dashboard",
-                ledger_source="ui",
-                eligibility_overwrite=True,
+            if request.replay:
+                td = (request.trading_date or "").strip()
+                if not td:
+                    raise ValueError("replay=True requires trading_date (YYYY-MM-DD)")
+                return engine.write_execution_timetable_from_master_matrix(
+                    matrix_df,
+                    trade_date=td,
+                    execution_mode=True,
+                    replay=True,
+                    publish_context=pub_ctx,
+                )
+            return engine.write_execution_timetable_from_master_matrix(
+                matrix_df,
+                execution_mode=True,
+                publish_context=pub_ctx,
             )
 
         try:
-            await asyncio.to_thread(_publish_sync)
+            pub_res = await asyncio.to_thread(_publish_sync)
+        except TimetableWriteBlockedCmeMismatch as cme_ex:
+            logging.error("TIMETABLE_WRITE_BLOCKED_CME_MISMATCH: %s", cme_ex)
+            raise HTTPException(status_code=400, detail=str(cme_ex)) from cme_ex
         except ValueError as e:
             logging.error("TIMETABLE_EXECUTION_SAVE_REJECTED: %s", e)
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         final_file = output_dir / "timetable_current.json"
 
-        try:
-            from modules.matrix.file_manager import _trigger_eligibility_builder_after_save
-
-            _trigger_eligibility_builder_after_save(output_dir="data/master_matrix")
-        except Exception as e:
-            logging.warning("ELIGIBILITY_BUILDER_TRIGGER_SKIP after timetable save: %s", e)
-
+        if pub_res is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Execution timetable publish produced no result (empty streams?)",
+            )
+        st = "published" if pub_res.changed else "unchanged"
+        logging.info(
+            "TIMETABLE_EXECUTION_API: status=%s changed=%s hash=%s previous_hash=%s source=%s reason=%s",
+            st,
+            pub_res.changed,
+            pub_res.timetable_hash,
+            pub_res.previous_hash or "",
+            pub_ctx["source"],
+            pub_ctx["reason"],
+        )
         return {
-            "status": "success",
-            "message": "Execution timetable saved",
+            "status": st,
+            "hash": pub_res.timetable_hash,
+            "previous_hash": pub_res.previous_hash or "",
+            "changed": pub_res.changed,
             "file": str(final_file),
-            "streams": len(request.streams),
         }
 
     except HTTPException:
@@ -929,18 +986,300 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         raise HTTPException(status_code=500, detail=f"Failed to save execution timetable: {str(e)}")
 
 
-@app.get("/api/timetable/current")
-async def get_current_timetable():
-    """Get current execution timetable file (timetable_current.json)."""
+@app.post("/api/timetable/content_hash")
+async def timetable_content_hash(req: ContentHashRequest):
+    """SHA-256 of canonical timetable content (sorted JSON); aligns with versioned skip-if-unchanged."""
+    try:
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.timetable.timetable_content_hash import compute_timetable_hash_sorted
+
+        sd = (req.session_trading_date or "").strip()
+        h = compute_timetable_hash_sorted(sd, "America/Chicago", list(req.streams or []))
+        return {"timetable_hash": h, "session_trading_date": sd}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _streams_by_id(doc: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for s in doc.get("streams") or []:
+        if isinstance(s, dict) and s.get("stream"):
+            out[str(s["stream"])] = dict(s)
+    return out
+
+
+@app.get("/api/timetable/diff")
+async def timetable_diff():
+    """Compare current timetable_current.json to the most recent differing history snapshot."""
     try:
         timetable_file = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+        history_dir = QTSW2_ROOT / "data" / "timetable" / "history"
         if not timetable_file.exists():
             raise HTTPException(status_code=404, detail="timetable_current.json not found")
-        
-        with open(timetable_file, 'r', encoding='utf-8') as f:
+        with open(timetable_file, "r", encoding="utf-8") as f:
+            current = json.load(f)
+        cur_hash = current.get("timetable_hash")
+        prev_timetable: Optional[Dict[str, Any]] = None
+        if history_dir.is_dir():
+            candidates: List[Tuple[float, Path]] = []
+            for p in history_dir.glob("*.json"):
+                try:
+                    candidates.append((p.stat().st_mtime, p))
+                except OSError:
+                    continue
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            for _, path in candidates:
+                try:
+                    with open(path, "r", encoding="utf-8") as hf:
+                        wrapped = json.load(hf)
+                    tt = wrapped.get("timetable") if isinstance(wrapped, dict) else None
+                    meta = wrapped.get("metadata") if isinstance(wrapped, dict) else None
+                    if not isinstance(tt, dict):
+                        continue
+                    ph = (meta or {}).get("hash") if isinstance(meta, dict) else None
+                    if cur_hash and ph == cur_hash:
+                        continue
+                    prev_timetable = tt
+                    break
+                except Exception:
+                    continue
+        if prev_timetable is None:
+            return {
+                "added_streams": [],
+                "removed_streams": [],
+                "changed_streams": [],
+                "note": "no_previous_snapshot",
+            }
+        a = _streams_by_id(prev_timetable)
+        b = _streams_by_id(current)
+        all_ids = set(a) | set(b)
+        added = sorted(k for k in b if k not in a)
+        removed = sorted(k for k in a if k not in b)
+        changed = []
+        for k in sorted(all_ids):
+            if k in a and k in b:
+                if json.dumps(a[k], sort_keys=True, default=str) != json.dumps(
+                    b[k], sort_keys=True, default=str
+                ):
+                    changed.append({"stream": k, "before": a[k], "after": b[k]})
+        return {
+            "added_streams": added,
+            "removed_streams": removed,
+            "changed_streams": changed,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/timetable/rollback")
+async def timetable_rollback(request: TimetableRollbackRequest):
+    """Restore timetable_current.json from a history snapshot matched by timestamp_utc prefix."""
+    try:
+        history_dir = QTSW2_ROOT / "data" / "timetable" / "history"
+        if not history_dir.is_dir():
+            raise HTTPException(status_code=404, detail="no history directory")
+        ts_query = (request.timestamp or "").strip()
+        if not ts_query:
+            raise HTTPException(status_code=400, detail="timestamp required")
+        target_path: Optional[Path] = None
+        target_tt: Optional[Dict[str, Any]] = None
+        prefix = ts_query[:19] if len(ts_query) >= 19 else ts_query
+        for p in sorted(history_dir.glob("*.json"), key=lambda x: x.name, reverse=True):
+            try:
+                with open(p, "r", encoding="utf-8") as hf:
+                    wrapped = json.load(hf)
+                if not isinstance(wrapped, dict):
+                    continue
+                meta = wrapped.get("metadata")
+                tmeta = (meta or {}).get("timestamp_utc") if isinstance(meta, dict) else ""
+                tt = wrapped.get("timetable")
+                if isinstance(tmeta, str) and prefix and tmeta.startswith(prefix):
+                    if isinstance(tt, dict):
+                        target_path = p
+                        target_tt = tt
+                        break
+            except Exception:
+                continue
+        if not target_path or not isinstance(target_tt, dict):
+            raise HTTPException(status_code=404, detail="no matching history snapshot")
+        out_file = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_f = out_file.with_suffix(".tmp")
+        with open(temp_f, "w", encoding="utf-8") as wf:
+            json.dump(target_tt, wf, indent=2, ensure_ascii=False)
+        temp_f.replace(out_file)
+        logging.info(
+            "TIMETABLE_ROLLBACK_EXECUTED trading_date=%s timetable_hash=%s previous_hash=%s path=%s timestamp_query=%s",
+            target_tt.get("session_trading_date"),
+            target_tt.get("timetable_hash"),
+            target_tt.get("previous_hash"),
+            target_path,
+            ts_query,
+        )
+        return {
+            "status": "rolled_back",
+            "history_file": str(target_path),
+            "timetable_hash": target_tt.get("timetable_hash"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _finalize_current_timetable_api_payload(timetable: dict, utc_now: datetime) -> dict:
+    """Ensure stable API shape: trading_date, effective_session_trading_date, streams[]."""
+    from modules.timetable.cme_session import (
+        get_cme_trading_date,
+        resolve_live_execution_session_trading_date,
+    )
+
+    out = dict(timetable)
+    streams = out.get("streams")
+    if not isinstance(streams, list):
+        streams = []
+    out["streams"] = streams
+
+    raw_session = out.get("session_trading_date") or out.get("trading_date") or ""
+    if isinstance(raw_session, str):
+        raw_session = raw_session.strip()
+    else:
+        raw_session = str(raw_session).strip() if raw_session is not None else ""
+
+    replay = out.get("replay") is True
+    meta = out.get("metadata")
+    if isinstance(meta, dict) and meta.get("replay") is True:
+        replay = True
+
+    eff, resolve_reason = resolve_live_execution_session_trading_date(
+        raw_session, utc_now, is_replay_document=replay
+    )
+    canonical = get_cme_trading_date(utc_now)
+    if eff is None:
+        eff = canonical
+
+    out["canonical_cme_session"] = canonical
+    out["effective_session_trading_date"] = eff
+    out["effective_session_resolve_reason"] = resolve_reason
+    out["snapshot_utc"] = utc_now.isoformat()
+
+    td_existing = out.get("trading_date")
+    if isinstance(td_existing, str) and td_existing.strip():
+        out["trading_date"] = td_existing.strip()
+    else:
+        out["trading_date"] = raw_session or eff
+
+    if not out.get("session_trading_date"):
+        out["session_trading_date"] = raw_session or eff
+
+    try:
+        from modules.timetable.timetable_content_hash import timetable_hash_from_document
+
+        if not out.get("timetable_hash") and streams:
+            out["timetable_hash"] = timetable_hash_from_document(out)
+    except Exception:
+        pass
+    out.setdefault("timetable_hash", "")
+    out.setdefault("previous_hash", "")
+    out.setdefault("version_timestamp", "")
+
+    return out
+
+
+def _ensure_live_timetable_current_file_sync(timetable_file: Path, session_td: str) -> None:
+    """
+    Single-writer path: if file missing or session label != current CME day (live docs only),
+    publish from on-disk master matrix (execution_mode=True).
+    """
+    sys.path.insert(0, str(QTSW2_ROOT))
+    from modules.matrix.file_manager import load_existing_matrix
+    from modules.timetable.timetable_engine import (
+        TimetableEngine,
+        TimetableWriteBlockedCmeMismatch,
+    )
+
+    need_publish = True
+    if timetable_file.exists():
+        try:
+            with open(timetable_file, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = {}
+        replay = doc.get("replay") is True
+        meta = doc.get("metadata")
+        if isinstance(meta, dict) and meta.get("replay") is True:
+            replay = True
+        if replay:
+            need_publish = False
+        else:
+            raw = (doc.get("session_trading_date") or doc.get("trading_date") or "")
+            if isinstance(raw, str):
+                raw = raw.strip()
+            else:
+                raw = str(raw).strip() if raw is not None else ""
+            if raw == session_td:
+                need_publish = False
+
+    if not need_publish:
+        return
+
+    reason = "auto_generate"
+    if timetable_file.exists():
+        reason = "session_roll"
+
+    matrix_df = load_existing_matrix(str(QTSW2_ROOT / "data" / "master_matrix"))
+    engine = TimetableEngine(
+        master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+        analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+        project_root=str(QTSW2_ROOT),
+    )
+    try:
+        res = engine.write_execution_timetable_from_master_matrix(
+            matrix_df,
+            execution_mode=True,
+            publish_context={"source": "auto", "reason": reason},
+        )
+    except TimetableWriteBlockedCmeMismatch as e:
+        logging.error("TIMETABLE_AUTO_GENERATE_CME_MISMATCH: %s", e)
+        raise
+
+    if res and res.changed:
+        logging.info(
+            "TIMETABLE_AUTO_GENERATED_ON_REQUEST: session_td=%s path=%s hash=%s reason=%s",
+            session_td,
+            timetable_file,
+            res.timetable_hash,
+            reason,
+        )
+
+    if not timetable_file.exists():
+        raise RuntimeError("timetable_current.json missing after auto-publish")
+
+
+@app.get("/api/timetable/current")
+async def get_current_timetable():
+    """Live execution timetable (timetable_current.json). Always 200 with streams[] when publish succeeds."""
+    try:
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.timetable.cme_session import get_cme_trading_date
+
+        timetable_file = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+        timetable_file.parent.mkdir(parents=True, exist_ok=True)
+
+        utc_now = datetime.now(timezone.utc)
+        session_td = get_cme_trading_date(utc_now)
+
+        await asyncio.to_thread(_ensure_live_timetable_current_file_sync, timetable_file, session_td)
+
+        if not timetable_file.exists():
+            raise RuntimeError("timetable_current.json not found after ensure")
+
+        with open(timetable_file, "r", encoding="utf-8") as f:
             timetable = json.load(f)
-        
-        return timetable
+
+        return _finalize_current_timetable_api_payload(timetable, utc_now)
     except HTTPException:
         raise
     except Exception as e:
@@ -972,26 +1311,38 @@ async def list_timetable_files():
 @app.get("/api/timetable/eligibility/status")
 async def get_eligibility_status():
     """
-    Session eligibility freeze status aligned with live execution timetable.
+    Legacy eligibility JSON status for dashboards/ops — **not** execution authority.
 
-    Prefers eligibility_{trading_date}.json where trading_date matches timetable_current.json
-    (same source of truth as the robot/watchdog). Falls back to most recent eligibility file
-    by mtime only when timetable is missing or no matching eligibility file exists.
+    Robot arms only from ``timetable_current.json`` (matrix-published). Eligibility files may be absent
+    or stale; do not treat ``eligible_stream_count`` as permission to trade.
     """
     logger = logging.getLogger(__name__)
+
+    def _with_authority_notice(payload: dict) -> dict:
+        base = {
+            "robot_execution_authority": "timetable_current_json_only",
+            "legacy_eligibility_json_non_authoritative": True,
+        }
+        return {**base, **payload}
+
     try:
         timetable_dir = QTSW2_ROOT / "data" / "timetable"
         if not timetable_dir.exists():
-            return {"status": "none"}
+            return _with_authority_notice({"status": "none"})
 
         timetable_path = timetable_dir / "timetable_current.json"
         timetable_trading_date = None
         timetable_enabled_count: Optional[int] = None
+        timetable_effective_session: Optional[str] = None
+        timetable_effective_resolve_reason: Optional[str] = None
         if timetable_path.exists():
             try:
                 with open(timetable_path, "r", encoding="utf-8") as f:
                     tc = json.load(f)
-                timetable_trading_date = tc.get("trading_date")
+                # session_trading_date is authoritative; trading_date is legacy file compat only.
+                timetable_trading_date = (tc.get("session_trading_date") or "").strip() or (
+                    tc.get("trading_date") or ""
+                ).strip()
                 tstreams = tc.get("streams") or []
                 if isinstance(tstreams, list):
                     timetable_enabled_count = sum(
@@ -999,19 +1350,37 @@ async def get_eligibility_status():
                         for s in tstreams
                         if isinstance(s, dict) and s.get("enabled") and s.get("stream")
                     )
+                from modules.timetable.cme_session import resolve_live_execution_session_trading_date
+
+                utc_now = datetime.now(timezone.utc)
+                replay = tc.get("replay") is True
+                meta = tc.get("metadata")
+                if isinstance(meta, dict) and meta.get("replay") is True:
+                    replay = True
+                timetable_effective_session, timetable_effective_resolve_reason = (
+                    resolve_live_execution_session_trading_date(
+                        timetable_trading_date, utc_now, is_replay_document=replay
+                    )
+                )
             except Exception as e:
                 logger.warning("ELIGIBILITY_STATUS_TIMETABLE_READ_FAILED: %s", e)
 
         def _payload_from_eligibility(data: dict, source: str) -> dict:
             elig_count = data.get("eligible_stream_count", 0)
+            sd = data.get("session_trading_date") or data.get("trading_date", "")
             out = {
-                "trading_date": data.get("trading_date", ""),
+                "session_trading_date": sd,
+                "trading_date": sd,
                 "freeze_time_utc": data.get("freeze_time_utc", ""),
                 "eligible_stream_count": elig_count,
                 "source": source,
             }
             if timetable_trading_date:
                 out["timetable_trading_date"] = timetable_trading_date
+            if timetable_effective_session is not None:
+                out["effective_session_trading_date"] = timetable_effective_session
+            if timetable_effective_resolve_reason is not None:
+                out["effective_session_resolve_reason"] = timetable_effective_resolve_reason
             if timetable_enabled_count is not None:
                 out["timetable_enabled_stream_count"] = timetable_enabled_count
                 if elig_count != timetable_enabled_count:
@@ -1025,7 +1394,7 @@ async def get_eligibility_status():
                 try:
                     with open(match_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    return _payload_from_eligibility(data, "eligibility_for_timetable_trading_date")
+                    return _with_authority_notice(_payload_from_eligibility(data, "eligibility_for_timetable_trading_date"))
                 except Exception as e:
                     logger.warning("ELIGIBILITY_STATUS_READ_FAILED: file=%s error=%s", match_path.name, e)
 
@@ -1037,29 +1406,37 @@ async def get_eligibility_status():
         )
         if not eligibility_files:
             if timetable_enabled_count is not None:
-                return {
+                _td = timetable_trading_date or ""
+                _no_elig = {
                     "status": "no_eligibility_file",
-                    "trading_date": timetable_trading_date or "",
+                    "session_trading_date": _td,
+                    # TODO(deprecation ~2026-Q4): remove trading_date alias.
+                    "trading_date": _td,
                     "timetable_trading_date": timetable_trading_date,
                     "timetable_enabled_stream_count": timetable_enabled_count,
                     "eligible_stream_count": timetable_enabled_count,
                     "freeze_time_utc": None,
                     "source": "timetable_only_no_eligibility_json",
                 }
-            return {"status": "none"}
+                if timetable_effective_session is not None:
+                    _no_elig["effective_session_trading_date"] = timetable_effective_session
+                if timetable_effective_resolve_reason is not None:
+                    _no_elig["effective_session_resolve_reason"] = timetable_effective_resolve_reason
+                return _with_authority_notice(_no_elig)
+            return _with_authority_notice({"status": "none"})
 
         for file_path in eligibility_files:
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return _payload_from_eligibility(data, "latest_eligibility_by_mtime")
+                return _with_authority_notice(_payload_from_eligibility(data, "latest_eligibility_by_mtime"))
             except Exception as e:
                 logger.warning("ELIGIBILITY_STATUS_READ_FAILED: file=%s error=%s", file_path.name, e)
                 continue
-        return {"status": "none"}
+        return _with_authority_notice({"status": "none"})
     except Exception as e:
         logger.warning("ELIGIBILITY_STATUS_ERROR: %s", e)
-        return {"status": "none"}
+        return _with_authority_notice({"status": "none"})
 
 
 if __name__ == "__main__":

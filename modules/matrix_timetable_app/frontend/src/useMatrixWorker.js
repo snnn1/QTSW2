@@ -1,6 +1,7 @@
 // Hook for managing Matrix Web Worker
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { WORKER_MESSAGE_TYPES, WORKER_RESPONSE_TYPES, CONTRACT_VALUES, createWorkerMessage } from './worker/contract'
+import { apiDocToExecutionTimetable } from './api/matrixApi'
 import { devWarn } from './utils/logger'
 import { useWorkerRequestManager } from './worker/requestManager'
 import { dateToYYYYMMDD } from './utils/dateUtils'
@@ -153,10 +154,6 @@ export function useMatrixWorker() {
             }
             setTimetable(payload.timetable || [])
             setTimetableLoading(false)
-            // Store execution timetable for saving
-            if (payload.executionTimetable) {
-              setExecutionTimetable(payload.executionTimetable)
-            }
             // #region agent log
             logDebug('useMatrixWorker.js:75', 'TIMETABLE state updated', {duration: Date.now() - timetableReceivedStart, hypothesisId: 'C'});
             // #endregion
@@ -384,6 +381,10 @@ export function useMatrixWorker() {
     logDebug('useMatrixWorker.js:192', 'CALCULATE_TIMETABLE message posted', {duration: Date.now() - postMessageStart, totalDuration: Date.now() - timetableStart, requestId, hypothesisId: 'C'});
     // #endregion
   }, [workerReady, dataInitialized, requestManager])
+
+  const applyExecutionTimetableFromApi = useCallback((apiDoc) => {
+    setExecutionTimetable(apiDocToExecutionTimetable(apiDoc))
+  }, [])
   
   return {
     workerReady,
@@ -405,7 +406,8 @@ export function useMatrixWorker() {
     calculateStats,
     getRows,
     calculateProfitBreakdown,
-    calculateTimetable
+    calculateTimetable,
+    applyExecutionTimetableFromApi
   }
 }
 

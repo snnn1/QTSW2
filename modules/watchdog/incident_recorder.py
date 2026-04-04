@@ -33,6 +33,10 @@ INCIDENT_START_EVENTS: Dict[str, str] = {
     "EXECUTION_POLICY_VALIDATION_FAILED": "EXECUTION_POLICY_VALIDATION_FAILED",
     "EXECUTION_JOURNAL_CORRUPTION": "EXECUTION_JOURNAL_CORRUPTION",
     "EXECUTION_JOURNAL_ERROR": "EXECUTION_JOURNAL_ERROR",
+    "MISMATCH_FAIL_CLOSED": "RECONCILIATION_GATE_FAIL_CLOSED",
+    "RECONCILIATION_MISMATCH_FAIL_CLOSED": "RECONCILIATION_GATE_FAIL_CLOSED",
+    "STATE_CONSISTENCY_GATE_RECOVERY_FAILED": "RECONCILIATION_GATE_FAIL_CLOSED",
+    "ADOPTION_GRACE_EXPIRED_UNOWNED": "ADOPTION_GRACE_EXPIRED",
 }
 
 # Phase 9: Incident type -> severity (for dashboard coloring)
@@ -47,6 +51,8 @@ INCIDENT_SEVERITY: Dict[str, str] = {
     "EXECUTION_POLICY_VALIDATION_FAILED": "CRITICAL",
     "EXECUTION_JOURNAL_CORRUPTION": "CRITICAL",
     "EXECUTION_JOURNAL_ERROR": "CRITICAL",
+    "RECONCILIATION_GATE_FAIL_CLOSED": "CRITICAL",
+    "ADOPTION_GRACE_EXPIRED": "CRITICAL",
 }
 
 # Recovery events -> incident type to end
@@ -68,6 +74,10 @@ INCIDENT_END_EVENTS: Dict[str, str] = {
     "EXECUTION_POLICY_VALIDATION_FAILED": "EXECUTION_POLICY_VALIDATION_FAILED",
     "EXECUTION_JOURNAL_CORRUPTION": "EXECUTION_JOURNAL_CORRUPTION",
     "EXECUTION_JOURNAL_ERROR": "EXECUTION_JOURNAL_ERROR",
+    "RECONCILIATION_MISMATCH_CLEARED": "RECONCILIATION_GATE_FAIL_CLOSED",
+    "STATE_CONSISTENCY_GATE_RELEASED": "RECONCILIATION_GATE_FAIL_CLOSED",
+    "ADOPTION_SUCCESS": "ADOPTION_GRACE_EXPIRED",
+    "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS": "ADOPTION_GRACE_EXPIRED",
 }
 
 
@@ -155,8 +165,8 @@ class IncidentRecorder:
         Does not modify event or any external state.
         """
         try:
-            event_type = event.get("event_type", "")
-            timestamp_utc_str = event.get("timestamp_utc", "")
+            event_type = event.get("event_type") or event.get("event") or event.get("@event") or ""
+            timestamp_utc_str = event.get("timestamp_utc") or event.get("ts_utc") or ""
             if not event_type or not timestamp_utc_str:
                 return
 

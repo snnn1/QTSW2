@@ -18,11 +18,19 @@ try:
         S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
         SLOT_ENDS,
     )
+    from modules.timetable.stream_id_derived import (
+        instrument_from_stream_id,
+        session_from_stream_id,
+    )
 except ImportError:
     from matrix.config import (  # type: ignore
         S1_EARLY_OPEN_SLOT_TIME,
         S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
         SLOT_ENDS,
+    )
+    from timetable.stream_id_derived import (  # type: ignore
+        instrument_from_stream_id,
+        session_from_stream_id,
     )
 
 
@@ -67,6 +75,10 @@ def validate_streams_before_execution_write(
         stream_id = s.get("stream") or "?"
         session = (s.get("session") or "").strip().upper()
         instrument = (s.get("instrument") or "").strip().upper()
+        if not session:
+            session = session_from_stream_id(str(stream_id))
+        if not instrument:
+            instrument = instrument_from_stream_id(str(stream_id)).upper()
         slot_raw = s.get("slot_time")
         slot_norm = _normalize_hhmm(slot_raw if slot_raw is not None else "")
         enabled = s.get("enabled", True)

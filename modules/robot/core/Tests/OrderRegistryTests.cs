@@ -227,6 +227,172 @@ public static class OrderRegistryTests
         if (!reg5.TryResolveByBrokerOrderId("broker-fill-twice", out fillEntry) || fillEntry == null || fillEntry.LifecycleState != OrderLifecycleState.FILLED)
             return (false, "State should remain FILLED after duplicate update");
 
+        // 21–23. Non-terminal transitions with non-null event time must not force TERMINAL ownership (UpdateOrderLifecycle always passes utcNow).
+        var ts = utc.AddMinutes(5);
+        var rNt = new OrderRegistry();
+        var oWs = new MinimalOrderInfo { OrderId = "nt-w", Instrument = "MNQ" };
+        rNt.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "nt-w",
+            IntentId = "i-nt",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.SUBMITTED,
+            CreatedUtc = utc,
+            OrderInfo = oWs
+        });
+        rNt.UpdateLifecycle("nt-w", OrderLifecycleState.WORKING, ts);
+        if (!rNt.TryResolveByBrokerOrderId("nt-w", out var eNt) || eNt == null)
+            return (false, "21: resolve nt-w failed");
+        if (eNt.LifecycleState != OrderLifecycleState.WORKING || eNt.OwnershipStatus != OrderOwnershipStatus.OWNED || eNt.TerminalUtc != null)
+            return (false, $"21: SUBMITTED->WORKING+ts must stay OWNED, no TerminalUtc: life={eNt.LifecycleState} own={eNt.OwnershipStatus} tu={eNt.TerminalUtc}");
+
+        var oPf1 = new MinimalOrderInfo { OrderId = "nt-pf1", Instrument = "MNQ" };
+        rNt.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "nt-pf1",
+            IntentId = "i-pf1",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.SUBMITTED,
+            CreatedUtc = utc,
+            OrderInfo = oPf1
+        });
+        rNt.UpdateLifecycle("nt-pf1", OrderLifecycleState.PART_FILLED, ts);
+        if (!rNt.TryResolveByBrokerOrderId("nt-pf1", out eNt) || eNt == null)
+            return (false, "22: resolve nt-pf1 failed");
+        if (eNt.LifecycleState != OrderLifecycleState.PART_FILLED || eNt.OwnershipStatus != OrderOwnershipStatus.OWNED || eNt.TerminalUtc != null)
+            return (false, $"22: SUBMITTED->PART_FILLED+ts must stay OWNED: own={eNt.OwnershipStatus} tu={eNt.TerminalUtc}");
+
+        var oPf2 = new MinimalOrderInfo { OrderId = "nt-pf2", Instrument = "MNQ" };
+        rNt.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "nt-pf2",
+            IntentId = "i-pf2",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.WORKING,
+            CreatedUtc = utc,
+            OrderInfo = oPf2
+        });
+        rNt.UpdateLifecycle("nt-pf2", OrderLifecycleState.PART_FILLED, ts);
+        if (!rNt.TryResolveByBrokerOrderId("nt-pf2", out eNt) || eNt == null)
+            return (false, "23: resolve nt-pf2 failed");
+        if (eNt.LifecycleState != OrderLifecycleState.PART_FILLED || eNt.OwnershipStatus != OrderOwnershipStatus.OWNED || eNt.TerminalUtc != null)
+            return (false, $"23: WORKING->PART_FILLED+ts must stay OWNED: own={eNt.OwnershipStatus} tu={eNt.TerminalUtc}");
+
+        // 24. Terminal states with non-null timestamp → TERMINAL + TerminalUtc
+        var rT = new OrderRegistry();
+        void RegT(string bid, string intent)
+        {
+            rT.Register(new OrderRegistryEntry
+            {
+                BrokerOrderId = bid,
+                IntentId = intent,
+                Instrument = "MNQ",
+                OrderRole = OrderRole.ENTRY,
+                OwnershipStatus = OrderOwnershipStatus.OWNED,
+                LifecycleState = OrderLifecycleState.SUBMITTED,
+                CreatedUtc = utc,
+                OrderInfo = new MinimalOrderInfo { OrderId = bid, Instrument = "MNQ" }
+            });
+        }
+        RegT("term-fill", "i-tf");
+        var tFill = ts.AddSeconds(1);
+        rT.UpdateLifecycle("term-fill", OrderLifecycleState.FILLED, tFill);
+        if (!rT.TryResolveByBrokerOrderId("term-fill", out var eT) || eT == null || eT.OwnershipStatus != OrderOwnershipStatus.TERMINAL || eT.TerminalUtc != tFill)
+            return (false, "24a: FILLED should set TERMINAL and TerminalUtc");
+
+        RegT("term-can", "i-tc");
+        var tCan = ts.AddSeconds(2);
+        rT.UpdateLifecycle("term-can", OrderLifecycleState.CANCELED, tCan);
+        if (!rT.TryResolveByBrokerOrderId("term-can", out eT) || eT == null || eT.OwnershipStatus != OrderOwnershipStatus.TERMINAL || eT.TerminalUtc != tCan)
+            return (false, "24b: CANCELED should set TERMINAL and TerminalUtc");
+
+        RegT("term-rej", "i-tr");
+        var tRej = ts.AddSeconds(3);
+        rT.UpdateLifecycle("term-rej", OrderLifecycleState.REJECTED, tRej);
+        if (!rT.TryResolveByBrokerOrderId("term-rej", out eT) || eT == null || eT.OwnershipStatus != OrderOwnershipStatus.TERMINAL || eT.TerminalUtc != tRej)
+            return (false, "24c: REJECTED should set TERMINAL and TerminalUtc");
+
+        // 25. Mismatch-trusted count includes OWNED WORKING / PART_FILLED after non-terminal updates with timestamp
+        var rM = new OrderRegistry();
+        rM.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "m1",
+            IntentId = "im1",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.SUBMITTED,
+            CreatedUtc = utc,
+            OrderInfo = new MinimalOrderInfo { OrderId = "m1", Instrument = "MNQ" }
+        });
+        rM.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = "m2",
+            IntentId = "im2",
+            Instrument = "MNQ",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.WORKING,
+            CreatedUtc = utc,
+            OrderInfo = new MinimalOrderInfo { OrderId = "m2", Instrument = "MNQ" }
+        });
+        rM.UpdateLifecycle("m1", OrderLifecycleState.WORKING, ts);
+        rM.UpdateLifecycle("m2", OrderLifecycleState.PART_FILLED, ts);
+        var mismatchTrusted = rM.GetMismatchTrustedWorkingCount();
+        if (mismatchTrusted != 2)
+            return (false, $"25: GetMismatchTrustedWorkingCount expected 2 (WORKING+PART_FILLED OWNED), got {mismatchTrusted}");
+
+        // 26. OCO-style integration: two legs, linked native ids, non-null timestamps on lifecycle (production path).
+        // Regression: pre-fix SUBMITTED→WORKING + utcNow falsely set TERMINAL so one leg dropped from trusted count (MCL 2 vs 1).
+        var rOco = new OrderRegistry();
+        var ocoTs = utc.AddMinutes(7);
+        const string ocoCanonLong = "oco-canon-long";
+        const string ocoCanonShort = "oco-canon-short";
+        const string ocoNativeLong = "oco-native-long-850";
+        const string ocoNativeShort = "oco-native-short-853";
+        rOco.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = ocoCanonLong,
+            IntentId = "intent-oco-long",
+            Instrument = "MCL",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.SUBMITTED,
+            CreatedUtc = utc,
+            OrderInfo = new MinimalOrderInfo { OrderId = ocoCanonLong, Instrument = "MCL" }
+        });
+        rOco.Register(new OrderRegistryEntry
+        {
+            BrokerOrderId = ocoCanonShort,
+            IntentId = "intent-oco-short",
+            Instrument = "MCL",
+            OrderRole = OrderRole.ENTRY,
+            OwnershipStatus = OrderOwnershipStatus.OWNED,
+            LifecycleState = OrderLifecycleState.SUBMITTED,
+            CreatedUtc = utc,
+            OrderInfo = new MinimalOrderInfo { OrderId = ocoCanonShort, Instrument = "MCL" }
+        });
+        if (!rOco.LinkBrokerOrderIdAlias(ocoNativeLong, ocoCanonLong))
+            return (false, "26: LinkBrokerOrderIdAlias long leg failed");
+        if (!rOco.LinkBrokerOrderIdAlias(ocoNativeShort, ocoCanonShort))
+            return (false, "26: LinkBrokerOrderIdAlias short leg failed");
+        // Drive updates via native ids (as after ORDER_REGISTRY_BROKER_ID_LINKED in production).
+        rOco.UpdateLifecycle(ocoNativeLong, OrderLifecycleState.WORKING, ocoTs);
+        rOco.UpdateLifecycle(ocoNativeShort, OrderLifecycleState.WORKING, ocoTs);
+        var ocoTrusted = rOco.GetMismatchTrustedWorkingCount();
+        if (ocoTrusted != 2)
+            return (false, $"26a: OCO both WORKING (linked natives + non-null ts): expected trusted count 2, got {ocoTrusted}");
+        rOco.UpdateLifecycle(ocoNativeLong, OrderLifecycleState.PART_FILLED, ocoTs.AddMilliseconds(1));
+        ocoTrusted = rOco.GetMismatchTrustedWorkingCount();
+        if (ocoTrusted != 2)
+            return (false, $"26b: OCO one PART_FILLED + one WORKING: expected trusted count 2, got {ocoTrusted}");
+
         return (true, null);
     }
 }

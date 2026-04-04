@@ -1,7 +1,7 @@
 /**
  * WatchdogPage - Primary Live Watchdog page
  */
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useMemo } from 'react'
 import { WatchdogHeader } from './components/watchdog/WatchdogHeader'
 import { CriticalAlertBanner } from './components/watchdog/CriticalAlertBanner'
 import { StreamStatusTable } from './components/watchdog/StreamStatusTable'
@@ -21,11 +21,10 @@ import { ReliabilityPanel } from './components/watchdog/ReliabilityPanel'
 import { InstrumentHealthPanel } from './components/watchdog/InstrumentHealthPanel'
 import { MetricsHistoryPanel } from './components/watchdog/MetricsHistoryPanel'
 import { StreamDetailDrawer } from './components/watchdog/StreamDetailDrawer'
-import { useWatchdogStatus } from './hooks/useWatchdogStatus'
+import { useWatchdogLiveSnapshot } from './hooks/useWatchdogLiveSnapshot'
 import { useWatchdogEvents } from './hooks/useWatchdogEvents'
 import { useRiskGates } from './hooks/useRiskGates'
 import { useUnprotectedPositions } from './hooks/useUnprotectedPositions'
-import { useStreamStates } from './hooks/useStreamStates'
 import { useActiveIntents } from './hooks/useActiveIntents'
 import { useWatchdogAlerts } from './hooks/useWatchdogAlerts'
 import { useIncidents } from './hooks/useIncidents'
@@ -33,22 +32,34 @@ import { useActiveIncidents } from './hooks/useActiveIncidents'
 import { useReliabilityMetrics } from './hooks/useReliabilityMetrics'
 import { useInstrumentHealth } from './hooks/useInstrumentHealth'
 import { useMetricsHistory } from './hooks/useMetricsHistory'
-import { useSlotLifecycle } from './hooks/useSlotLifecycle'
 import { useStreamPnl } from './hooks/useStreamPnl'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
 import { ChicagoClock } from './components/watchdog/ChicagoClock'
+import { TimetableIdentityDebugCard } from './components/watchdog/TimetableIdentityDebugCard'
 import type { StreamState, WatchdogEvent } from './types/watchdog'
+import { deriveOverallExecutionStatus, executionSeverityAlert } from './utils/executionSeverity'
 
 export function WatchdogPage() {
   const [selectedStream, setSelectedStream] = useState<StreamState | null>(null)
   const [selectedEvent, setSelectedEvent] = useState<WatchdogEvent | null>(null)
   
-  // Fetch data
-  const { status, loading: statusLoading, error: statusError, lastSuccessfulPollTimestamp: statusPollTime } = useWatchdogStatus()
+  // Fetch data — /status + /stream-states + /slot-lifecycle in one tick (useWatchdogLiveSnapshot)
+  const {
+    status,
+    streams,
+    timetableUnavailable,
+    outOfTimetableActiveStreams,
+    executionExpectationGaps,
+    slotLifecycle,
+    statusError,
+    streamsError,
+    slotLifecycleError,
+    loading: liveSnapshotLoading,
+    lastSuccessfulPollTimestamp: liveSnapshotPollTime,
+  } = useWatchdogLiveSnapshot()
   const { events, cursor, loading: eventsLoading, error: eventsError, lastSuccessfulPollTimestamp: eventsPollTime } = useWatchdogEvents()
   const { gates, loading: gatesLoading, error: gatesError, lastSuccessfulPollTimestamp: gatesPollTime } = useRiskGates()
   const { positions: unprotectedPositions, loading: positionsLoading, error: positionsError, lastSuccessfulPollTimestamp: positionsPollTime } = useUnprotectedPositions()
-  const { streams, timetableUnavailable, loading: streamsLoading, error: streamsError, lastSuccessfulPollTimestamp: streamsPollTime } = useStreamStates()
   const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents()
   const { recentAlerts, loading: alertsHistoryLoading } = useWatchdogAlerts(24, 30)
   const { incidents, loading: incidentsLoading } = useIncidents(50)
@@ -56,7 +67,6 @@ export function WatchdogPage() {
   const { metrics, loading: metricsLoading } = useReliabilityMetrics(24)
   const { instruments: instrumentHealth, loading: instrumentHealthLoading } = useInstrumentHealth()
   const { byPeriod: metricsHistory, loading: metricsHistoryLoading } = useMetricsHistory('week', 12)
-  const { slots: slotLifecycle, loading: slotLifecycleLoading } = useSlotLifecycle()
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
@@ -69,35 +79,43 @@ export function WatchdogPage() {
     }, 0)
   }, [pnl])
   
-  // Check for any errors
-  const hasErrors = statusError || eventsError || gatesError || positionsError || streamsError || intentsError
-  // Show loading only if critical data (status) is still loading, not all data
-  // This allows UI to show incrementally as data arrives
-  const isLoading = statusLoading && !status // Only show loading if status hasn't loaded yet
-  
+  const hasErrors =
+    statusError ||
+    eventsError ||
+    gatesError ||
+    positionsError ||
+    streamsError ||
+    intentsError ||
+    slotLifecycleError
+  const isLoading = liveSnapshotLoading && !status
+
   // Get most recent poll timestamp for data freshness
   const lastSuccessfulPollTimestamp = useMemo(() => {
-    const timestamps = [statusPollTime, eventsPollTime, gatesPollTime, positionsPollTime, streamsPollTime, intentsPollTime].filter(
-      (t): t is number => t !== null
-    )
+    const timestamps = [
+      liveSnapshotPollTime,
+      eventsPollTime,
+      gatesPollTime,
+      positionsPollTime,
+      intentsPollTime,
+    ].filter((t): t is number => t !== null)
     return timestamps.length > 0 ? Math.max(...timestamps) : null
-  }, [statusPollTime, eventsPollTime, gatesPollTime, positionsPollTime, streamsPollTime, intentsPollTime])
-  
-  // Determine engine status - prefer backend engine_activity_classification when available
-  const engineStatus = useMemo(() => {
+  }, [liveSnapshotPollTime, eventsPollTime, gatesPollTime, positionsPollTime, intentsPollTime])
+
+  const overallExecution = useMemo(
+    () => deriveOverallExecutionStatus(status ?? null, gates ?? null),
+    [status, gates]
+  )
+
+  const engineStatus = useMemo((): 'ALIVE' | 'STALLED' | 'RECOVERY_IN_PROGRESS' | 'IDLE_MARKET_CLOSED' => {
     if (!status) return 'STALLED'
 
-    // Recovery overrides activity state
-    if (status.recovery_state === 'DISCONNECT_FAIL_CLOSED') return 'FAIL_CLOSED'
     if (status.recovery_state === 'RECOVERY_RUNNING') return 'RECOVERY_IN_PROGRESS'
 
-    // Prefer backend engine_activity_classification (RUNNING | IDLE | STALLED)
     const classification = status.engine_activity_classification
     if (classification === 'RUNNING') return 'ALIVE'
     if (classification === 'IDLE') return 'IDLE_MARKET_CLOSED'
     if (classification === 'STALLED') return 'STALLED'
 
-    // Fallback: legacy engine_activity_state
     switch (status.engine_activity_state) {
       case 'ACTIVE':
       case 'ENGINE_ACTIVE_PROCESSING':
@@ -202,8 +220,11 @@ export function WatchdogPage() {
   // Build critical alerts (includes Phase 1 push alerts)
   const alerts = useMemo(() => {
     const result: Array<{ type: 'critical' | 'degraded'; message: string; scrollTo?: string }> = []
-    
+
     if (!status) return result
+
+    const execAlert = executionSeverityAlert(overallExecution)
+    if (execAlert) result.push(execAlert)
 
     // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
     const activeAlerts = status.active_alerts ?? []
@@ -274,17 +295,18 @@ export function WatchdogPage() {
         scrollTo: 'risk-gates-panel'
       })
     }
-    
-    if (timetableUnavailable) {
+
+    const streamsUnknown = Boolean(status.enabled_streams_unknown ?? status.timetable_unavailable ?? timetableUnavailable)
+    if (streamsUnknown) {
       result.push({
-        type: 'degraded',
-        message: 'Timetable unavailable (using fallback)',
+        type: 'critical',
+        message: 'NO VALID TIMETABLE — TRADING DISABLED',
         scrollTo: 'stream-table'
       })
     }
-    
+
     return result
-  }, [status, unprotectedPositions, timetableUnavailable])
+  }, [status, unprotectedPositions, timetableUnavailable, overallExecution])
   
   return (
     <div className="min-h-screen bg-black text-white">
@@ -303,6 +325,13 @@ export function WatchdogPage() {
         lastSuccessfulPollTimestamp={lastSuccessfulPollTimestamp}
         barsExpectedCount={status?.bars_expected_count}
         worstLastBarAgeSeconds={status?.worst_last_bar_age_seconds}
+        overallExecution={overallExecution}
+        executionHashDetail={{
+          robot: status?.robot_timetable_hash ?? null,
+          publisher:
+            status?.timetable_publisher_hash ?? status?.current_timetable_hash ?? null,
+          content: status?.timetable_content_hash ?? null,
+        }}
       />
       
       <WatchdogNavigationBar />
@@ -320,6 +349,7 @@ export function WatchdogPage() {
               {gatesError && <div>Risk Gates: {gatesError}</div>}
               {positionsError && <div>Positions: {positionsError}</div>}
               {streamsError && <div>Streams: {streamsError}</div>}
+              {slotLifecycleError && <div>Slot lifecycle: {slotLifecycleError}</div>}
               {intentsError && <div>Intents: {intentsError}</div>}
             </div>
             <div className="mt-2 text-xs text-gray-400">
@@ -348,6 +378,9 @@ export function WatchdogPage() {
                 streams={streams}
                 onStreamClick={setSelectedStream}
                 marketOpen={status?.market_open ?? null}
+                outOfTimetableActiveStreams={outOfTimetableActiveStreams}
+                executionExpectationGaps={executionExpectationGaps}
+                timetableDrift={status?.timetable_drift ?? null}
               />
             </div>
             
@@ -370,6 +403,8 @@ export function WatchdogPage() {
               </div>
             </div>
 
+            <TimetableIdentityDebugCard status={status} />
+
             {/* Phase 1: Active push alerts */}
             <ActiveAlertsCard alerts={status?.active_alerts ?? []} />
 
@@ -386,7 +421,7 @@ export function WatchdogPage() {
             />
 
             {/* Slot lifecycle - forced flatten, reentry, slot expiry */}
-            <SlotLifecyclePanel slots={slotLifecycle} loading={slotLifecycleLoading} />
+            <SlotLifecyclePanel slots={slotLifecycle} loading={liveSnapshotLoading} />
 
             {/* Phase 1: Alert history (24h) */}
             <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
@@ -413,7 +448,7 @@ export function WatchdogPage() {
             <FillHealthCard fillHealth={status?.fill_health} />
 
             <div id="risk-gates-panel">
-              <RiskGatesPanel gates={gates} loading={!gates} />
+              <RiskGatesPanel gates={gates} loading={!gates} overallExecution={overallExecution} />
             </div>
             
             <ActiveIntentPanel

@@ -1,9 +1,11 @@
 """
 Market Session Utility
 
-Determines if CME futures market is open based on Chicago time.
+``market_open`` for Watchdog status/alerts follows ``market_calendar.get_market_state``
+(holidays JSON + session day from ``get_cme_trading_date``), not a duplicate clock table.
 """
-from datetime import datetime, time
+from datetime import datetime, timezone
+
 import pytz
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
@@ -11,33 +13,13 @@ CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 def is_market_open(chicago_dt: datetime) -> bool:
     """
-    CME futures session rules (initial implementation, no holidays):
-
-    - Open: Sunday 17:00 CT → Friday 16:00 CT
-    - Daily maintenance break: 16:00–17:00 CT (closed)
-    - Closed all day Saturday
+    True only when ``get_market_state`` reports session ``OPEN`` (not PRE-OPEN / CLOSED / holiday / weekend / maintenance).
     """
-
     if chicago_dt.tzinfo is None:
         raise ValueError("Datetime must be timezone-aware (America/Chicago)")
 
-    weekday = chicago_dt.weekday()  # Mon=0 … Sun=6
-    t = chicago_dt.time()
+    from modules.watchdog.market_calendar import get_market_state
 
-    # Saturday: always closed
-    if weekday == 5:
-        return False
-
-    # Sunday: open only after 17:00
-    if weekday == 6:
-        return t >= time(17, 0)
-
-    # Friday: closed after 16:00
-    if weekday == 4:
-        return t < time(16, 0)
-
-    # Mon–Thu: daily maintenance break
-    if time(16, 0) <= t < time(17, 0):
-        return False
-
-    return True
+    utc = chicago_dt.astimezone(timezone.utc)
+    state = get_market_state(log_transition=False, utc_now=utc).get("state")
+    return state == "OPEN"

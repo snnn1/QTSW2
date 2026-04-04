@@ -70,6 +70,24 @@ export function StreamDetailDrawer({ stream, events = [], isOpen, onClose }: Str
             <div><span className="text-gray-400">Stream:</span> <span className="font-mono">{stream.stream}</span></div>
             <div><span className="text-gray-400">Instrument:</span> {stream.execution_instrument || stream.instrument}</div>
             <div><span className="text-gray-400">Session:</span> {stream.session}</div>
+            {stream.timetable_enabled != null && (
+              <div>
+                <span className="text-gray-400">Timetable enabled:</span>{' '}
+                {stream.timetable_enabled ? 'Yes' : 'No'}
+              </div>
+            )}
+            {stream.system_tradable_now != null && (
+              <div className="flex items-center gap-2">
+                <span className="text-gray-400">System tradable:</span>
+                <span
+                  className={`inline-block w-2.5 h-2.5 rounded-full ${
+                    stream.system_tradable_now ? 'bg-green-500' : 'bg-red-500'
+                  }`}
+                  title="Matches /status execution_safe"
+                />
+                <span>{stream.system_tradable_now ? 'Yes' : 'No'}</span>
+              </div>
+            )}
             <div><span className="text-gray-400">State:</span> {stream.state}</div>
             <div><span className="text-gray-400">Slot Time:</span> <span className="font-mono">{stream.slot_time_chicago}</span></div>
             <div><span className="text-gray-400">Committed:</span> {stream.committed ? 'Yes' : 'No'}</div>

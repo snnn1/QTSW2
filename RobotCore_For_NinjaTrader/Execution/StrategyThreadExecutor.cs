@@ -85,6 +85,9 @@ public sealed class NtSubmitProtectivesCommand : INtAction
 /// </summary>
 public sealed class NtCancelOrdersCommand : INtAction
 {
+    /// <summary>Reason marker for exit-fill sibling protective cleanup (partial or full STOP/TARGET execution).</summary>
+    public const string ReasonSiblingProtectiveExitFill = "SIBLING_PROTECTIVE_EXIT_FILL";
+
     public string CorrelationId { get; }
     public string ActionType => "CANCEL_ORDERS";
     public string? IntentId { get; }
@@ -92,6 +95,13 @@ public sealed class NtCancelOrdersCommand : INtAction
     public string Reason { get; }
     public bool ProtectiveOrdersOnly { get; }
     public DateTimeOffset UtcNow { get; }
+    /// <summary>When true, this command is drained before normal FIFO work (safety-critical sibling cleanup).</summary>
+    public bool PreferUrgentDrain { get; }
+    /// <summary>When true, executor runs working-protective invariant check after cancel (strategy thread only).</summary>
+    public bool VerifyWorkingProtectivesClearedAfter { get; }
+    public string? PostCancelTradingDate { get; }
+    public string? PostCancelStream { get; }
+    public string? PostCancelCompletionReason { get; }
 
     public NtCancelOrdersCommand(
         string correlationId,
@@ -99,7 +109,12 @@ public sealed class NtCancelOrdersCommand : INtAction
         string? instrumentKey,
         bool protectiveOrdersOnly,
         string reason,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        bool preferUrgentDrain = false,
+        bool verifyWorkingProtectivesClearedAfter = false,
+        string? postCancelTradingDate = null,
+        string? postCancelStream = null,
+        string? postCancelCompletionReason = null)
     {
         CorrelationId = correlationId;
         IntentId = intentId;
@@ -107,6 +122,11 @@ public sealed class NtCancelOrdersCommand : INtAction
         ProtectiveOrdersOnly = protectiveOrdersOnly;
         Reason = reason;
         UtcNow = utcNow;
+        PreferUrgentDrain = preferUrgentDrain;
+        VerifyWorkingProtectivesClearedAfter = verifyWorkingProtectivesClearedAfter;
+        PostCancelTradingDate = postCancelTradingDate;
+        PostCancelStream = postCancelStream;
+        PostCancelCompletionReason = postCancelCompletionReason;
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteCancelOrders(this);
@@ -246,6 +266,8 @@ public sealed class NtDeferredAction : INtAction
 /// </summary>
 public sealed class StrategyThreadExecutor
 {
+    /// <summary>Safety-critical actions (e.g. sibling protective cancel) — drained before <see cref="_queue"/>.</summary>
+    private readonly ConcurrentQueue<INtAction> _urgentQueue = new();
     private readonly ConcurrentQueue<INtAction> _queue = new();
     private readonly HashSet<string> _pendingCorrelationIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _pendingLock = new();
@@ -285,7 +307,11 @@ public sealed class StrategyThreadExecutor
             _pendingCorrelationIds.Add(action.CorrelationId);
         }
 
-        _queue.Enqueue(action);
+        var urgent = action is NtCancelOrdersCommand c && c.PreferUrgentDrain;
+        if (urgent)
+            _urgentQueue.Enqueue(action);
+        else
+            _queue.Enqueue(action);
         _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_ENQUEUED", state: "ENGINE",
             new
             {
@@ -294,8 +320,13 @@ public sealed class StrategyThreadExecutor
                 intent_id = action.IntentId,
                 instrument_key = action.InstrumentKey,
                 reason = action.Reason,
-                queue_depth = _queue.Count,
-                note = "NT action enqueued for strategy thread execution"
+                urgent_lane = urgent,
+                urgent_queue_depth = _urgentQueue.Count,
+                normal_queue_depth = _queue.Count,
+                queue_depth = _urgentQueue.Count + _queue.Count,
+                note = urgent
+                    ? "NT action enqueued on URGENT lane (drained before normal queue)"
+                    : "NT action enqueued for strategy thread execution"
             }));
         return true;
     }
@@ -306,7 +337,7 @@ public sealed class StrategyThreadExecutor
     public void DrainNtActions(INtActionExecutor executor)
     {
         var executed = 0;
-        while (_queue.TryDequeue(out var action))
+        while (_urgentQueue.TryDequeue(out var action) || _queue.TryDequeue(out action))
         {
             var utcNow = _utcNow();
             try
@@ -368,5 +399,9 @@ public sealed class StrategyThreadExecutor
         }
     }
 
-    public int PendingCount => _queue.Count;
+    public int PendingCount => _urgentQueue.Count + _queue.Count;
+
+    public int UrgentPendingCount => _urgentQueue.Count;
+
+    public int NormalPendingCount => _queue.Count;
 }

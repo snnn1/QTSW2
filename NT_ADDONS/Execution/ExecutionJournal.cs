@@ -348,7 +348,33 @@ public sealed class ExecutionJournal
             }
 
             entry.EntrySubmitted = true;
-            entry.EntrySubmittedAt = utcNow.ToString("o");
+            HydrateCanonicalTimestampsFromLegacy(entry);
+            var submitObserved = utcNow.ToString("o");
+            entry.EntrySubmittedObservedAtUtc = submitObserved;
+
+            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var fillCanon) && utcNow > fillCanon)
+            {
+                entry.IsReconstructedSubmission = true;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        phase = "ENTRY_SUBMIT_OBSERVED_AFTER_FIRST_FILL_CANONICAL",
+                        entry_filled_at_utc_canonical = entry.EntryFilledAtUtc,
+                        submission_observed_at_utc = submitObserved,
+                        note = "Not setting EntrySubmittedAtUtc from late observation — would invert submit/fill chronology."
+                    }));
+                if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                    entry.EntrySubmittedAt = entry.EntrySubmittedAtUtc;
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                    entry.EntrySubmittedAtUtc = submitObserved;
+                entry.EntrySubmittedAt = entry.EntrySubmittedAtUtc;
+            }
+
             entry.BrokerOrderId = brokerOrderId;
 
             if (orderType == "ENTRY" || orderType == "ENTRY_STOP")
@@ -447,8 +473,28 @@ public sealed class ExecutionJournal
                 }
             }
 
+            HydrateCanonicalTimestampsFromLegacy(entry);
+            entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
+            if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
+                TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanon) &&
+                utcNow < subCanon)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        phase = "ENTRY_FILL_OBSERVED_BEFORE_SUBMIT_CANONICAL",
+                        entry_submitted_at_utc_canonical = entry.EntrySubmittedAtUtc,
+                        fill_observed_at_utc = entry.EntryFilledObservedAtUtc,
+                        note = "Fill observation precedes canonical submit timestamp — check clock or ordering."
+                    }));
+            }
+
             entry.EntryFilled = true;
-            entry.EntryFilledAt = utcNow.ToString("o");
+            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+                entry.EntryFilledAtUtc = utcNow.ToString("o");
+            entry.EntryFilledAt = entry.EntryFilledAtUtc;
             entry.FillPrice = fillPrice;
             entry.FillQuantity = fillQuantity;
             entry.ActualFillPrice = fillPrice; // Store for slippage calculation
@@ -669,17 +715,34 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed
             }
+
+            HydrateCanonicalTimestampsFromLegacy(entry);
             
             // Update cumulative entry quantities (delta-based accumulation)
             entry.EntryFilledQuantityTotal += fillQuantity;
             entry.EntryFillNotional = (entry.EntryFillNotional ?? 0) + (fillPrice * fillQuantity);
             entry.EntryAvgFillPrice = entry.EntryFillNotional.Value / entry.EntryFilledQuantityTotal;
-            
-            // Timestamp policy: Store first entry fill time only
-            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+
+            entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
+            if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
+                TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanonR) &&
+                utcNow < subCanonR)
             {
-                entry.EntryFilledAtUtc = utcNow.ToString("o");
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        phase = "ENTRY_FILL_OBSERVED_BEFORE_SUBMIT_CANONICAL",
+                        entry_submitted_at_utc_canonical = entry.EntrySubmittedAtUtc,
+                        fill_observed_at_utc = entry.EntryFilledObservedAtUtc,
+                        note = "Fill observation precedes canonical submit timestamp — check clock or ordering."
+                    }));
             }
+            
+            // Timestamp policy: Store first entry fill time only (canonical event time)
+            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+                entry.EntryFilledAtUtc = utcNow.ToString("o");
             
             // Persist direction + multiplier on first entry fill (use normalized direction)
             if (string.IsNullOrEmpty(entry.Direction))
@@ -695,12 +758,9 @@ public sealed class ExecutionJournal
             // These may have been set by RecordSubmission, but if not, preserve null
             // Note: Intent prices should ideally be set at submission time, but we don't block here
             
-            // Legacy fields for backwards compatibility
+            // Legacy fields for backwards compatibility (mirror canonical fill time)
             entry.EntryFilled = true;
-            if (string.IsNullOrEmpty(entry.EntryFilledAt))
-            {
-                entry.EntryFilledAt = utcNow.ToString("o");
-            }
+            entry.EntryFilledAt = entry.EntryFilledAtUtc;
             entry.FillPrice = fillPrice;
             entry.FillQuantity = entry.EntryFilledQuantityTotal; // Store cumulative for legacy compatibility
             entry.ActualFillPrice = fillPrice;
@@ -931,12 +991,26 @@ public sealed class ExecutionJournal
             entry.ExitFilledQuantityTotal += exitFillQuantity;
             entry.ExitFillNotional = (entry.ExitFillNotional ?? 0) + (exitFillPrice * exitFillQuantity);
             entry.ExitAvgFillPrice = entry.ExitFillNotional.Value / entry.ExitFilledQuantityTotal;
-            
-            // Timestamp policy: Store first exit fill time only
-            if (string.IsNullOrEmpty(entry.ExitFilledAtUtc))
+
+            HydrateCanonicalTimestampsFromLegacy(entry);
+            entry.ExitFilledObservedAtUtc = utcNow.ToString("o");
+            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryFillCanon) && utcNow < entryFillCanon)
             {
-                entry.ExitFilledAtUtc = utcNow.ToString("o");
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        phase = "EXIT_FILL_OBSERVED_BEFORE_ENTRY_FILL_CANONICAL",
+                        entry_filled_at_utc_canonical = entry.EntryFilledAtUtc,
+                        exit_observed_at_utc = entry.ExitFilledObservedAtUtc,
+                        note = "Exit fill observation precedes canonical entry fill — check clock or ordering."
+                    }));
             }
+            
+            // Timestamp policy: Store first exit fill time only (canonical)
+            if (string.IsNullOrEmpty(entry.ExitFilledAtUtc))
+                entry.ExitFilledAtUtc = utcNow.ToString("o");
             
             // ExitOrderType: Store first exit order type
             if (string.IsNullOrEmpty(entry.ExitOrderType))
@@ -1066,11 +1140,14 @@ public sealed class ExecutionJournal
                     ["contract_multiplier"] = contractMultiplier
                 };
                 
-                // Add entry/exit times if available
-                if (!string.IsNullOrWhiteSpace(entry.EntryFilledAt))
+                // Add entry/exit times if available (canonical fill time, not observation)
+                var entryCanonForLog = !string.IsNullOrWhiteSpace(entry.EntryFilledAtUtc)
+                    ? entry.EntryFilledAtUtc
+                    : entry.EntryFilledAt;
+                if (!string.IsNullOrWhiteSpace(entryCanonForLog))
                 {
-                    tradeData["entry_time_utc"] = entry.EntryFilledAt;
-                    if (DateTimeOffset.TryParse(entry.EntryFilledAt, out var entryTime))
+                    tradeData["entry_time_utc"] = entryCanonForLog;
+                    if (DateTimeOffset.TryParse(entryCanonForLog, out var entryTime))
                     {
                         tradeData["entry_time_chicago"] = TimeService.ConvertUtcToChicagoStatic(entryTime).ToString("o");
                     }
@@ -2355,6 +2432,25 @@ public sealed class ExecutionJournal
             System.Globalization.DateTimeStyles.RoundtripKind, out dto);
     }
 
+    /// <summary>
+    /// Migrates persisted legacy timestamp fields into canonical UTC fields without rewriting chronology.
+    /// </summary>
+    private static void HydrateCanonicalTimestampsFromLegacy(ExecutionJournalEntry entry)
+    {
+        if (string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) && !string.IsNullOrEmpty(entry.EntrySubmittedAt) &&
+            TryParseJournalIsoUtc(entry.EntrySubmittedAt, out _))
+            entry.EntrySubmittedAtUtc = entry.EntrySubmittedAt;
+
+        if (string.IsNullOrEmpty(entry.EntryFilledAtUtc) && !string.IsNullOrEmpty(entry.EntryFilledAt) &&
+            TryParseJournalIsoUtc(entry.EntryFilledAt, out _))
+            entry.EntryFilledAtUtc = entry.EntryFilledAt;
+
+        if (string.IsNullOrEmpty(entry.EntrySubmittedObservedAtUtc) && !string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+            entry.EntrySubmittedObservedAtUtc = entry.EntrySubmittedAtUtc;
+        if (string.IsNullOrEmpty(entry.EntryFilledObservedAtUtc) && !string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+            entry.EntryFilledObservedAtUtc = entry.EntryFilledAtUtc;
+    }
+
     private static DateTimeOffset AlignmentExitTimestampUtc(ExecutionJournalEntry entry, DateTimeOffset utcNow)
     {
         if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryAt) && utcNow < entryAt)
@@ -2649,11 +2745,19 @@ public sealed class ExecutionJournal
             entry.Stream = stream;
             if (string.IsNullOrWhiteSpace(entry.Instrument)) entry.Instrument = inst;
 
+            HydrateCanonicalTimestampsFromLegacy(entry);
+            var uRec = utcNow.ToString("o");
             entry.EntrySubmitted = true;
-            entry.EntrySubmittedAt ??= utcNow.ToString("o");
+            entry.EntrySubmittedObservedAtUtc = uRec;
+            entry.EntryFilledObservedAtUtc = uRec;
+            entry.IsReconstructedSubmission = true;
+            if (string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                entry.EntrySubmittedAtUtc = uRec;
+            entry.EntrySubmittedAt = entry.EntrySubmittedAtUtc;
             entry.EntryFilled = true;
-            entry.EntryFilledAt = utcNow.ToString("o");
-            entry.EntryFilledAtUtc ??= utcNow.ToString("o");
+            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+                entry.EntryFilledAtUtc = uRec;
+            entry.EntryFilledAt = entry.EntryFilledAtUtc;
             entry.EntryOrderType = "UNTRACKED_FILL_RECOVERY";
             entry.BrokerOrderId = brokerOrderId;
             entry.EntryFilledQuantityTotal = Math.Max(entry.EntryFilledQuantityTotal, absQty);
@@ -2750,11 +2854,39 @@ public sealed class ExecutionJournal
             entry.Stream = stream;
             if (string.IsNullOrWhiteSpace(entry.Instrument)) entry.Instrument = inst;
 
+            HydrateCanonicalTimestampsFromLegacy(entry);
+            var tRec = utcNow.ToString("o");
             entry.EntrySubmitted = true;
-            entry.EntrySubmittedAt ??= utcNow.ToString("o");
+            entry.EntrySubmittedObservedAtUtc = tRec;
+            entry.EntryFilledObservedAtUtc = tRec;
             entry.EntryFilled = true;
-            entry.EntryFilledAt ??= utcNow.ToString("o");
-            entry.EntryFilledAtUtc ??= utcNow.ToString("o");
+
+            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var priorFillCanon) && utcNow > priorFillCanon)
+            {
+                entry.IsReconstructedSubmission = true;
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        phase = "TAGGED_BROKER_RECOVERY_SUBMIT_OBSERVED_AFTER_KNOWN_ENTRY_FILL",
+                        entry_filled_at_utc_canonical = entry.EntryFilledAtUtc,
+                        recovery_observed_at_utc = tRec,
+                        note = "Not stamping EntrySubmittedAtUtc from recovery observation when fill canonical precedes it."
+                    }));
+                if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                    entry.EntrySubmittedAt = entry.EntrySubmittedAtUtc;
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                    entry.EntrySubmittedAtUtc = tRec;
+                entry.EntrySubmittedAt = entry.EntrySubmittedAtUtc;
+            }
+
+            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
+                entry.EntryFilledAtUtc = tRec;
+            entry.EntryFilledAt = entry.EntryFilledAtUtc;
             entry.EntryOrderType = "TAGGED_BROKER_EXPOSURE_RECOVERY";
             if (!string.IsNullOrEmpty(brokerOrderId))
                 entry.BrokerOrderId = brokerOrderId;
@@ -2789,6 +2921,7 @@ public sealed class ExecutionJournal
                 entry.ExitAvgFillPrice = null;
                 entry.ExitFillNotional = null;
                 entry.ExitFilledAtUtc = null;
+                entry.ExitFilledObservedAtUtc = null;
                 entry.CompletedAtUtc = null;
                 entry.CompletionReason = null;
                 entry.RealizedPnLGross = null;
@@ -2823,6 +2956,7 @@ public sealed class ExecutionJournal
                     entry.ExitAvgFillPrice = null;
                     entry.ExitFillNotional = null;
                     entry.ExitFilledAtUtc = null;
+                    entry.ExitFilledObservedAtUtc = null;
                     entry.CompletedAtUtc = null;
                     entry.CompletionReason = null;
                     entry.RealizedPnLGross = null;
@@ -3499,11 +3633,25 @@ public class ExecutionJournalEntry
 
     public bool EntrySubmitted { get; set; }
 
+    /// <summary>Legacy mirror of <see cref="EntrySubmittedAtUtc"/> for older serializers.</summary>
     public string? EntrySubmittedAt { get; set; }
+
+    /// <summary>Canonical entry submission event time (ISO-8601 UTC).</summary>
+    public string? EntrySubmittedAtUtc { get; set; }
+
+    /// <summary>When the system recorded/learned submission (ISO-8601 UTC).</summary>
+    public string? EntrySubmittedObservedAtUtc { get; set; }
 
     public bool EntryFilled { get; set; }
 
+    /// <summary>Legacy mirror of <see cref="EntryFilledAtUtc"/> for older serializers.</summary>
     public string? EntryFilledAt { get; set; }
+
+    /// <summary>When the system last recorded entry-fill-related observations (ISO-8601 UTC).</summary>
+    public string? EntryFilledObservedAtUtc { get; set; }
+
+    /// <summary>True when submission was recorded after first-fill canonical time was already known (ordering handled explicitly).</summary>
+    public bool IsReconstructedSubmission { get; set; }
 
     public string? BrokerOrderId { get; set; }
 
@@ -3565,14 +3713,19 @@ public class ExecutionJournalEntry
     public int EntryFilledQuantityTotal { get; set; } // Cumulative total entry quantity
     public decimal? EntryAvgFillPrice { get; set; } // Weighted average entry fill price
     public decimal? EntryFillNotional { get; set; } // Sum(price * qty) for weighted avg calculation
-    public string? EntryFilledAtUtc { get; set; } // First entry fill timestamp (ISO-8601 UTC)
+    /// <summary>Canonical first entry fill event time (ISO-8601 UTC).</summary>
+    public string? EntryFilledAtUtc { get; set; }
     
     // Exit fill tracking (cumulative, weighted average)
     public int ExitFilledQuantityTotal { get; set; } // Cumulative total exit quantity
     public decimal? ExitAvgFillPrice { get; set; } // Weighted average exit fill price
     public decimal? ExitFillNotional { get; set; } // Sum(price * qty) for weighted avg calculation
     public string? ExitOrderType { get; set; } // "STOP", "TARGET", "EMERGENCY", "MANUAL"
-    public string? ExitFilledAtUtc { get; set; } // First exit fill timestamp (ISO-8601 UTC)
+    /// <summary>Canonical first exit fill event time (ISO-8601 UTC).</summary>
+    public string? ExitFilledAtUtc { get; set; }
+
+    /// <summary>When the system last recorded exit-fill-related observations (ISO-8601 UTC).</summary>
+    public string? ExitFilledObservedAtUtc { get; set; }
     
     // Trade completion
     public bool TradeCompleted { get; set; } // True when exit qty == entry qty

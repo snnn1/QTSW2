@@ -1,18 +1,23 @@
 """
 Timetable Poller
 
-Polls timetable_current.json and extracts trading_date from timetable file (authoritative).
-Falls back to CME rollover computation only when timetable is unavailable or trading_date is invalid.
+Polls timetable_current.json. Session label and streams come only from a **valid** execution file:
+we never mix wall-clock CME session with streams read from a broken or unlabeled timetable.
 """
 import json
-import hashlib
 import logging
 from pathlib import Path
-from typing import Tuple, Optional, Set, Dict
-from datetime import datetime
+from typing import Tuple, Optional, Set, Dict, Any, List
+from datetime import datetime, timezone
 import pytz
 
 from .config import QTSW2_ROOT
+
+from modules.timetable.cme_session import get_cme_trading_date, resolve_live_execution_session_trading_date
+from modules.timetable.stream_id_derived import (
+    instrument_from_stream_id,
+    session_from_stream_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,229 +26,296 @@ CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 def _compute_content_hash(timetable: dict) -> str:
     """
-    Compute content-only hash (excludes as_of, source) to avoid false restarts
-    when only metadata (e.g. as_of timestamp) changes.
+    Canonical content hash: same logical input as RobotCore TimetableContentHasher and
+    modules.timetable.timetable_content_hash.compute_content_hash_from_document.
     """
-    content = {k: v for k, v in timetable.items() if k not in ("as_of", "source")}
-    # Sort streams by stream id for deterministic hash (matches C# TimetableContentHasher)
-    if "streams" in content and isinstance(content["streams"], list):
-        content["streams"] = sorted(
-            content["streams"],
-            key=lambda s: s.get("stream", "") if isinstance(s, dict) else "",
-        )
-    canonical = json.dumps(content, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    from modules.timetable.timetable_content_hash import compute_content_hash_from_document
+
+    return compute_content_hash_from_document(timetable)
 
 
 def compute_timetable_trading_date(chicago_now: datetime) -> str:
     """
-    Compute trading_date using CME rollover rule (17:00 Chicago).
-    
-    CRITICAL: chicago_now must be timezone-aware (America/Chicago).
-    This function is called on every poll to advance trading_date at 17:00 CT,
-    independent of timetable file content changes.
-    
-    Args:
-        chicago_now: Timezone-aware datetime in America/Chicago timezone
-        
-    Returns:
-        Trading date string (YYYY-MM-DD format)
-        
-    Raises:
-        ValueError: If chicago_now is not timezone-aware
+    CME session trading date from wall clock (18:00 America/Chicago rule).
+    Use only for **non-timetable** helpers (metrics, cleanup hints) — not as a substitute for
+    a missing session_trading_date on the execution file.
     """
     if chicago_now.tzinfo is None:
         raise ValueError("chicago_now must be timezone-aware (America/Chicago)")
-    
-    chicago_date = chicago_now.date()
-    if chicago_now.hour >= 17:
-        from datetime import timedelta
-        return (chicago_date + timedelta(days=1)).isoformat()
-    return chicago_date.isoformat()
+    utc = chicago_now.astimezone(timezone.utc)
+    return get_cme_trading_date(utc)
+
+
+def _timetable_doc_is_replay(timetable: Dict[str, Any]) -> bool:
+    if timetable.get("replay") is True:
+        return True
+    meta = timetable.get("metadata")
+    return isinstance(meta, dict) and meta.get("replay") is True
+
+
+def _timetable_json_source(timetable: Dict[str, Any]) -> Optional[str]:
+    """Publisher lineage from timetable_current.json ``source`` (e.g. master_matrix, dashboard_ui)."""
+    raw = timetable.get("source")
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
 
 
 class TimetablePoller:
     """Polls timetable_current.json and extracts enabled streams."""
-    
+
     def __init__(self):
-        """Initialize timetable poller."""
         self._timetable_path = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
-    
-    def poll(self) -> Tuple[str, Optional[Set[str]], Optional[str], Optional[Dict[str, Dict]]]:
+
+    def poll(
+        self,
+    ) -> Tuple[
+        Optional[str],
+        Optional[Set[str]],
+        Optional[str],
+        Optional[Dict[str, Dict]],
+        Optional[str],
+        Optional[List[str]],
+        Optional[str],
+    ]:
         """
-        Poll timetable file and return trading_date, enabled streams, hash, and stream metadata.
-        
+        Poll timetable file.
+
         Returns:
-            Tuple of (trading_date, enabled_streams_set, timetable_hash, enabled_streams_metadata)
-            enabled_streams_metadata: Dict[str, Dict] mapping stream_id -> {instrument, session, slot_time, enabled}
-            
-        Trading date priority:
-            - First: Extract trading_date from timetable file (authoritative)
-            - Fallback: Compute using CME rollover rule (17:00 CT)
-            
-        Failure behavior:
-            - If file missing or parse error → return (computed_trading_date, None, None, None)
-            - If trading_date invalid → return (computed_trading_date, enabled_streams, hash, metadata) with WARN
-            - Do not throw exceptions
-            - Log warning/error for failures
+            (trading_date, enabled_streams_set, timetable_hash, enabled_streams_metadata,
+             timetable_file_source, enabled_streams_ordered, timetable_identity_hash).
+
+        - ``timetable_hash`` is the canonical **content** hash (Robot TimetableContentHasher parity).
+        - ``timetable_identity_hash`` matches Robot runtime: JSON ``timetable_hash`` when set, else content hash.
+
+        - ``trading_date`` is the **effective** CME session day: equals file session when it
+          matches canonical CME, or is **clamped** when the file is one calendar day ahead
+          before 18:00 CT (parity with RobotEngine). Replay timetables use the file date.
+        - If the file is missing, corrupt, no valid session, or live session cannot be
+          resolved to canonical CME: seven ``None`` values.
+
+        Logs may include ``expected_cme_session=...`` (context only) when the file is unusable.
         """
-        # Compute fallback trading_date using CME rollover (used if timetable unavailable)
         chicago_now = datetime.now(CHICAGO_TZ)
-        computed_trading_date = compute_timetable_trading_date(chicago_now)
-        
-        # Try to load timetable file
+        utc_now = datetime.now(timezone.utc)
+        expected_cme = get_cme_trading_date(utc_now)
+
         if not self._timetable_path.exists():
             logger.warning(
-                f"TIMETABLE_POLL_FAIL: trading_date={computed_trading_date} (computed fallback), "
-                f"timetable file missing: {self._timetable_path} (fail-open mode)"
+                "TIMETABLE_POLL_FAIL: timetable_unavailable=True enabled_streams_unknown=True "
+                "expected_cme_session=%s reason=file_missing path=%s",
+                expected_cme,
+                self._timetable_path,
             )
-            return (computed_trading_date, None, None, None)
-        
+            return (None, None, None, None, None, None, None)
+
         try:
-            # Read file contents
-            with open(self._timetable_path, 'rb') as f:
+            with open(self._timetable_path, "rb") as f:
                 file_contents = f.read()
-            
-            # Parse JSON first (needed for content hash)
+
             try:
-                timetable = json.loads(file_contents.decode('utf-8'))
+                timetable = json.loads(file_contents.decode("utf-8"))
             except json.JSONDecodeError as e:
                 logger.error(
-                    f"TIMETABLE_POLL_FAIL: trading_date={computed_trading_date} (computed fallback), "
-                    f"timetable file parse error: {e} (fail-open mode)"
+                    "TIMETABLE_POLL_FAIL: timetable_unavailable=True enabled_streams_unknown=True "
+                    "expected_cme_session=%s parse_error=%s path=%s",
+                    expected_cme,
+                    e,
+                    self._timetable_path,
                 )
-                return (computed_trading_date, None, None, None)
-            
-            # Content-only hash (excludes as_of, source) to avoid false restarts when only metadata changes
+                return (None, None, None, None, None, None, None)
+
+            if not isinstance(timetable, dict):
+                logger.error(
+                    "TIMETABLE_POLL_FAIL: timetable_unavailable=True expected_cme_session=%s "
+                    "reason=not_a_json_object",
+                    expected_cme,
+                )
+                return (None, None, None, None, None, None, None)
+
             timetable_hash = _compute_content_hash(timetable)
-            
-            # Extract trading_date from timetable (authoritative source)
-            timetable_trading_date = timetable.get('trading_date')
-            trading_date_source = "timetable"
-            
-            if timetable_trading_date and self._validate_trading_date(timetable_trading_date):
-                # Use timetable's trading_date (authoritative)
-                trading_date = timetable_trading_date
+            pub_raw = timetable.get("timetable_hash")
+            if isinstance(pub_raw, str) and pub_raw.strip():
+                timetable_identity_hash = pub_raw.strip()
             else:
-                # Fallback to computed date
-                trading_date = computed_trading_date
-                trading_date_source = "computed fallback"
-                
-                # Refinement 2: Use WARN level (not INFO) - this is a pipeline contract violation
-                if timetable_trading_date:
-                    logger.warning(
-                        f"TIMETABLE_INVALID_TRADING_DATE: Invalid trading_date in timetable: '{timetable_trading_date}', "
-                        f"using computed fallback: {trading_date}. This indicates an upstream pipeline bug."
-                    )
-                else:
-                    logger.warning(
-                        f"TIMETABLE_MISSING_TRADING_DATE: trading_date field missing in timetable, "
-                        f"using computed fallback: {trading_date}."
-                    )
-            
-            # Extract enabled streams
-            enabled_streams = self._extract_enabled_streams(timetable)
-            
-            # Extract full stream metadata for enabled streams
-            enabled_streams_metadata = self._extract_enabled_streams_metadata(timetable)
-            
-            # Log successful poll with trading_date source
-            if enabled_streams is not None:
-                logger.info(
-                    f"TIMETABLE_POLL_OK: trading_date={trading_date} (from {trading_date_source}), "
-                    f"enabled_count={len(enabled_streams)}, hash={timetable_hash[:8] if timetable_hash else 'N/A'}"
+                timetable_identity_hash = timetable_hash
+            timetable_file_source = _timetable_json_source(timetable)
+
+            session_str = self._authoritative_session_from_doc(timetable)
+            if session_str is None:
+                raw_st = timetable.get("session_trading_date")
+                raw_td = timetable.get("trading_date")
+                logger.warning(
+                    "TIMETABLE_POLL_FAIL: timetable_unavailable=True enabled_streams_unknown=True "
+                    "expected_cme_session=%s reason=missing_or_invalid_session "
+                    "session_trading_date=%r trading_date=%r path=%s",
+                    expected_cme,
+                    raw_st,
+                    raw_td,
+                    self._timetable_path,
                 )
-            
-            return (trading_date, enabled_streams, timetable_hash, enabled_streams_metadata)
-            
-        except Exception as e:
-            # Never throw - log and return safe defaults
-            logger.error(
-                f"TIMETABLE_POLL_FAIL: trading_date={computed_trading_date} (computed fallback), "
-                f"unexpected error reading timetable: {e} (fail-open mode)",
-                exc_info=True
+                return (None, None, None, None, None, None, None)
+
+            replay = _timetable_doc_is_replay(timetable)
+            effective, resolve_reason = resolve_live_execution_session_trading_date(
+                session_str, utc_now, is_replay_document=replay
             )
-            return (computed_trading_date, None, None, None)
-    
+            if effective is None:
+                logger.warning(
+                    "TIMETABLE_POLL_FAIL: timetable_unavailable=True enabled_streams_unknown=True "
+                    "expected_cme_session=%s reason=live_session_cme_mismatch "
+                    "file_session_trading_date=%s resolve_reason=%s path=%s",
+                    expected_cme,
+                    session_str,
+                    resolve_reason,
+                    self._timetable_path,
+                )
+                return (None, None, None, None, None, None, None)
+
+            trading_date = effective
+            if resolve_reason == "clamped_ahead":
+                logger.warning(
+                    "SESSION_START_DATE_TIMETABLE_AHEAD_CLAMPED: expected_cme_session=%s "
+                    "file_session_trading_date=%s effective_session=%s note=watchdog_poller",
+                    expected_cme,
+                    session_str,
+                    effective,
+                )
+
+            enabled_streams = self._extract_enabled_streams(timetable)
+            enabled_streams_metadata = self._extract_enabled_streams_metadata(timetable)
+            enabled_streams_ordered = self._extract_enabled_streams_ordered(timetable)
+
+            streams_list = timetable.get("streams", [])
+            if isinstance(streams_list, list):
+                timetable_enabled_row_count = sum(
+                    1
+                    for e in streams_list
+                    if isinstance(e, dict)
+                    and str(e.get("stream") or "").strip()
+                    and e.get("enabled")
+                )
+            else:
+                timetable_enabled_row_count = 0
+            if len(enabled_streams) != timetable_enabled_row_count:
+                logger.warning(
+                    "WATCHDOG_TIMETABLE_STREAM_MISMATCH: unique_enabled_stream_ids=%s "
+                    "timetable_enabled_row_count=%s path=%s",
+                    len(enabled_streams),
+                    timetable_enabled_row_count,
+                    self._timetable_path,
+                )
+
+            logger.info(
+                "TIMETABLE_POLL_OK: trading_date=%s (effective_cme_session), "
+                "enabled_count=%s, hash=%s, file_session=%s, resolve=%s",
+                trading_date,
+                len(enabled_streams),
+                timetable_hash[:8] if timetable_hash else "N/A",
+                session_str,
+                resolve_reason,
+            )
+
+            return (
+                trading_date,
+                enabled_streams,
+                timetable_hash,
+                enabled_streams_metadata,
+                timetable_file_source,
+                enabled_streams_ordered,
+                timetable_identity_hash,
+            )
+
+        except Exception as e:
+            logger.error(
+                "TIMETABLE_POLL_FAIL: timetable_unavailable=True expected_cme_session=%s "
+                "unexpected_error=%s path=%s",
+                expected_cme,
+                e,
+                self._timetable_path,
+                exc_info=True,
+            )
+            return (None, None, None, None, None, None, None)
+
+    def _authoritative_session_from_doc(self, timetable: dict) -> Optional[str]:
+        """Valid session YYYY-MM-DD from session_trading_date, else legacy trading_date."""
+        raw = timetable.get("session_trading_date")
+        if raw is not None:
+            s = str(raw).strip()
+            if s and self._validate_trading_date(s):
+                return s
+        leg = timetable.get("trading_date")
+        if leg is not None:
+            s = str(leg).strip()
+            if s and self._validate_trading_date(s):
+                return s
+        return None
+
     def _validate_trading_date(self, trading_date: str) -> bool:
-        """
-        Validate trading_date format (YYYY-MM-DD).
-        
-        Args:
-            trading_date: Trading date string to validate
-            
-        Returns:
-            True if valid YYYY-MM-DD format, False otherwise
-        """
         if not isinstance(trading_date, str):
             return False
-        
         try:
-            # Validate YYYY-MM-DD format
-            datetime.strptime(trading_date, '%Y-%m-%d')
+            datetime.strptime(trading_date, "%Y-%m-%d")
             return True
         except (ValueError, TypeError):
             return False
-    
-    def _extract_enabled_streams(self, timetable: dict) -> Set[str]:
-        """
-        Extract enabled stream IDs from timetable.
-        
-        Args:
-            timetable: Parsed timetable dictionary
-            
-        Returns:
-            Set of enabled stream IDs
-        """
-        enabled_streams = set()
-        
-        streams = timetable.get('streams', [])
+
+    def _extract_enabled_streams_ordered(self, timetable: dict) -> List[str]:
+        """Enabled stream IDs in timetable JSON/array order (first occurrence wins if duplicated)."""
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        streams = timetable.get("streams", [])
         if not isinstance(streams, list):
-            logger.warning(f"Timetable 'streams' is not a list: {type(streams)}")
-            return enabled_streams
-        
+            logger.warning("Timetable 'streams' is not a list: %s", type(streams))
+            return ordered
         for stream_entry in streams:
             if not isinstance(stream_entry, dict):
                 continue
-            
-            stream_id = stream_entry.get('stream')
-            enabled = stream_entry.get('enabled', False)
-            
+            stream_id = stream_entry.get("stream")
+            enabled = stream_entry.get("enabled", False)
+            if stream_id and enabled:
+                sid = str(stream_id).strip()
+                if sid and sid not in seen:
+                    ordered.append(sid)
+                    seen.add(sid)
+        return ordered
+
+    def _extract_enabled_streams(self, timetable: dict) -> Set[str]:
+        enabled_streams: Set[str] = set()
+        streams = timetable.get("streams", [])
+        if not isinstance(streams, list):
+            logger.warning("Timetable 'streams' is not a list: %s", type(streams))
+            return enabled_streams
+        for stream_entry in streams:
+            if not isinstance(stream_entry, dict):
+                continue
+            raw_id = stream_entry.get("stream")
+            stream_id = str(raw_id).strip() if raw_id is not None else ""
+            enabled = stream_entry.get("enabled", False)
             if stream_id and enabled:
                 enabled_streams.add(stream_id)
-        
         return enabled_streams
-    
+
     def _extract_enabled_streams_metadata(self, timetable: dict) -> Dict[str, Dict]:
-        """
-        Extract full metadata for enabled streams from timetable.
-        
-        Args:
-            timetable: Parsed timetable dictionary
-            
-        Returns:
-            Dict mapping stream_id -> {instrument, session, slot_time, enabled}
-        """
-        metadata = {}
-        
-        streams = timetable.get('streams', [])
+        metadata: Dict[str, Dict] = {}
+        streams = timetable.get("streams", [])
         if not isinstance(streams, list):
-            logger.warning(f"Timetable 'streams' is not a list: {type(streams)}")
+            logger.warning("Timetable 'streams' is not a list: %s", type(streams))
             return metadata
-        
         for stream_entry in streams:
             if not isinstance(stream_entry, dict):
                 continue
-            
-            stream_id = stream_entry.get('stream')
-            enabled = stream_entry.get('enabled', False)
-            
+            raw_id = stream_entry.get("stream")
+            stream_id = str(raw_id).strip() if raw_id is not None else ""
+            enabled = stream_entry.get("enabled", False)
             if stream_id and enabled:
+                inst = (stream_entry.get("instrument") or "").strip()
+                sess = (stream_entry.get("session") or "").strip()
                 metadata[stream_id] = {
-                    'instrument': stream_entry.get('instrument', ''),
-                    'session': stream_entry.get('session', ''),
-                    'slot_time': stream_entry.get('slot_time', ''),
-                    'enabled': True
+                    "instrument": inst or instrument_from_stream_id(stream_id),
+                    "session": sess or session_from_stream_id(stream_id),
+                    "slot_time": stream_entry.get("slot_time", ""),
+                    "enabled": True,
                 }
-        
         return metadata

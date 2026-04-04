@@ -421,6 +421,15 @@ public sealed class GateReconciliationProgressState
     public int ThrottleBaselineLocalWorking { get; set; }
     public MismatchType ThrottleBaselineMismatchType { get; set; }
 
+    /// <summary>Consecutive evaluations with skipExpensive + unchanged fingerprint + stall-like skip (see coordinator).</summary>
+    public int IdenticalSkippedEvaluationCount { get; set; }
+
+    /// <summary>Fingerprint of (external fp, material readiness, skip reason, progress sig) for stall churn detection.</summary>
+    public ulong LastStallQuietFingerprint { get; set; }
+
+    /// <summary>Temporary debug: <c>GATE_STALL_SUPPRESSED_IDENTICAL_CYCLE</c> once per gate engagement (cleared in <see cref="Reset"/>).</summary>
+    public bool IdenticalStallSuppressionDebugLogged { get; set; }
+
     public void Reset()
     {
         LastProgressSignature = null;
@@ -450,6 +459,9 @@ public sealed class GateReconciliationProgressState
         ThrottleBaselineBrokerWorking = 0;
         ThrottleBaselineLocalWorking = 0;
         ThrottleBaselineMismatchType = default;
+        IdenticalSkippedEvaluationCount = 0;
+        LastStallQuietFingerprint = 0;
+        IdenticalStallSuppressionDebugLogged = false;
     }
 }
 

@@ -8,6 +8,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed class Intent
 {
+    /// <summary>Session calendar day for this stream (typically Chicago <c>yyyy-MM-dd</c>). Used by session-identity execution gate; must match engine active day when the engine publishes a trading date.</summary>
     public string TradingDate { get; private set; }
     public string Stream { get; private set; }
     public string Instrument { get; private set; }

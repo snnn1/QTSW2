@@ -101,7 +101,10 @@ public sealed class HealthMonitor
         "EXECUTION_GATE_INVARIANT_VIOLATION",
         "DISCONNECT_FAIL_CLOSED_ENTERED",
         "SLOT_FAILED_RUNTIME",
-        "REENTRY_PROTECTION_FAILED"
+        "REENTRY_PROTECTION_FAILED",
+        "MISMATCH_FAIL_CLOSED",
+        "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
     };
     
     // Background evaluation thread for data loss detection

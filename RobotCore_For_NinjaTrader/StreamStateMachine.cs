@@ -353,6 +353,8 @@ public sealed class StreamStateMachine
         _barDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.bar_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 300);
         _slotGateDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.slot_gate_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 60);
 
+        TimetableStream.EnsureExecutionFields(directive);
+
         Stream = directive.stream;
         Session = directive.session;
         SlotTimeChicago = directive.slot_time;

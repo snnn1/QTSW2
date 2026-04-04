@@ -68,10 +68,11 @@ def main():
     print("\n2. CHECKING TIMETABLE")
     print("-" * 80)
     poller = TimetablePoller()
-    trading_date, enabled_streams, timetable_hash = poller.poll()
+    trading_date, enabled_streams, timetable_hash, _, file_source, _ordered = poller.poll()
     print(f"   Current trading_date (from timetable): {trading_date}")
     print(f"   Enabled streams: {len(enabled_streams) if enabled_streams else 0} streams" if enabled_streams else "   Enabled streams: None (timetable unavailable)")
     print(f"   Timetable hash: {timetable_hash[:8] if timetable_hash else 'None'}")
+    print(f"   Timetable source: {file_source or 'None'}")
     
     # 3. Check state manager (simulate)
     print("\n3. CHECKING STATE MANAGER")

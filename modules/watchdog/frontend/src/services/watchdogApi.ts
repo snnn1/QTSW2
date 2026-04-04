@@ -13,6 +13,7 @@ import type {
   DailyJournal,
   WatchdogEvent,
   StreamState,
+  StreamStatesResponse,
   IntentExposure,
   ApiResponse
 } from '../types/watchdog'
@@ -242,7 +243,7 @@ export async function fetchDailyJournal(tradingDate: string): Promise<ApiRespons
 /**
  * Fetch current stream states
  */
-export async function fetchStreamStates(): Promise<ApiResponse<{ timestamp_chicago: string; streams: StreamState[]; timetable_unavailable?: boolean }>> {
+export async function fetchStreamStates(): Promise<ApiResponse<StreamStatesResponse>> {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/stream-states`)
     if (!response.ok) {

@@ -21,6 +21,10 @@ public enum OrderOwnershipStatus
     OWNED,
     ADOPTED,
     UNOWNED,
+    /// <summary>
+    /// Robot-tagged broker order in registry but not yet promoted to ADOPTED. Counted toward mismatch-trusted working.
+    /// </summary>
+    RECOVERABLE_ROBOT_OWNED,
     TERMINAL
 }
 

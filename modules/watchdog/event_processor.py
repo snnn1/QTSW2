@@ -26,7 +26,7 @@ CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 
 def _trading_date_from_timestamp(timestamp_utc: datetime) -> str:
-    """Derive trading_date from event timestamp using CME rollover (17:00 Chicago)."""
+    """Derive CME session date from event timestamp (canonical 18:00 CT via timetable poller)."""
     if timestamp_utc.tzinfo is None:
         timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
     chicago_dt = timestamp_utc.astimezone(CHICAGO_TZ)
@@ -92,16 +92,31 @@ class EventProcessor:
     
     def process_event(self, event: Dict):
         """Process a single event and update state manager."""
-        # Incident recorder: purely observational, never throws
+        if not isinstance(event, dict):
+            return
+
+        # Normalize robot / feed field aliases so gate, adoption, recovery, and incidents agree.
+        raw_type = event.get("event_type") or event.get("event") or event.get("@event")
+        event_type_norm = str(raw_type).strip() if raw_type is not None else ""
+        if event_type_norm:
+            event["event_type"] = event_type_norm
+
+        raw_ts = event.get("timestamp_utc") or event.get("ts_utc") or event.get("timestamp")
+        if raw_ts is not None and str(raw_ts).strip():
+            event["timestamp_utc"] = str(raw_ts).strip()
+
+        # Incident recorder: purely observational, never throws (sees normalized keys)
         try:
             incident_recorder_process_event(event)
         except Exception:
             pass
 
-        event_type = event.get("event_type", "")
+        event_type = event.get("event_type") or ""
         run_id = event.get("run_id", "")
-        timestamp_utc_str = event.get("timestamp_utc", "")
+        timestamp_utc_str = event.get("timestamp_utc") or ""
         data = event.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
         
         timestamp_utc = self._parse_timestamp(timestamp_utc_str)
         if not timestamp_utc:
@@ -119,6 +134,7 @@ class EventProcessor:
         if event_type == "ENGINE_START":
             # Engine liveness: ENGINE_TICK_CALLSITE, ENGINE_ALIVE, ENGINE_TIMER_HEARTBEAT drive _last_engine_heartbeat.
             # Do NOT update_engine_tick here - avoids false ENGINE ALIVE from stale ENGINE_START in tail.
+            self._state_manager.clear_robot_heartbeat_timetable()
             # Phase 7-8: Clear pending orders on new run (avoids stale stuck detection)
             if hasattr(self._state_manager, "_pending_orders"):
                 self._state_manager._pending_orders.clear()
@@ -205,6 +221,16 @@ class EventProcessor:
             # ENGINE_TIMER_HEARTBEAT: Timer-based heartbeat when market closed (no ticks)
             # Ensures ENGINE ALIVE persists on weekends / no bars
             self._state_manager.update_engine_tick(timestamp_utc)
+            th_raw = data.get("timetable_hash") or event.get("timetable_hash")
+            td_raw = data.get("trading_date") or event.get("trading_date")
+            th_val = str(th_raw).strip() if th_raw is not None else None
+            if th_val == "":
+                th_val = None
+            td_val = str(td_raw).strip() if td_raw is not None else None
+            if td_val == "":
+                td_val = None
+            if th_val or td_val:
+                self._state_manager.update_robot_heartbeat_timetable(th_val, td_val, timestamp_utc)
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status
@@ -312,9 +338,17 @@ class EventProcessor:
             # Recovery will be reflected by the next tick/heartbeat.
             pass
         
-        elif event_type in ("DISCONNECT_FAIL_CLOSED_ENTERED", "DISCONNECT_RECOVERY_STARTED",
-                           "DISCONNECT_RECOVERY_COMPLETE", "DISCONNECT_RECOVERY_ABORTED"):
-            self._state_manager.update_recovery_state(event_type, timestamp_utc)
+        elif event_type in (
+            "DISCONNECT_FAIL_CLOSED_ENTERED",
+            "DISCONNECT_RECOVERY_STARTED",
+            "DISCONNECT_RECOVERY_COMPLETE",
+            "DISCONNECT_RECOVERY_ABORTED",
+            "CONNECTION_RECOVERY_RESOLVED",  # legacy IEA completion event name (prefer DISCONNECT_RECOVERY_COMPLETE in robot)
+        ):
+            mapped = event_type
+            if event_type == "CONNECTION_RECOVERY_RESOLVED":
+                mapped = "DISCONNECT_RECOVERY_COMPLETE"
+            self._state_manager.update_recovery_state(mapped, timestamp_utc)
         
         elif event_type in ("CONNECTION_LOST", "CONNECTION_LOST_SUSTAINED", "CONNECTION_RECOVERED", "CONNECTION_RECOVERED_NOTIFICATION", "CONNECTION_CONFIRMED"):
             # CONNECTION_RECOVERED_NOTIFICATION and CONNECTION_CONFIRMED are connection-ok signals
@@ -1125,6 +1159,7 @@ class EventProcessor:
                 self._state_manager.record_unresolved_unmatched(instrument)
 
         elif event_type in ("ADOPTION_SUCCESS", "RECONCILIATION_RECOVERY_ADOPTION_SUCCESS"):
+            self._state_manager.set_adoption_grace_expired(False, timestamp_utc)
             instrument = event.get("instrument") or data.get("instrument") or data.get("execution_instrument")
             if instrument:
                 self._state_manager.clear_unresolved_unmatched(instrument)
@@ -1253,6 +1288,20 @@ class EventProcessor:
                 timestamp_utc=timestamp_utc,
                 note=note
             )
+
+        elif event_type in (
+            "MISMATCH_FAIL_CLOSED",
+            "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+            "RECONCILIATION_MISMATCH_CLEARED",
+            "RECONCILIATION_MISMATCH_DETECTED",
+            "STATE_CONSISTENCY_GATE_ENGAGED",
+            "STATE_CONSISTENCY_GATE_RELEASED",
+            "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        ):
+            self._state_manager.update_reconciliation_gate_event(event_type, timestamp_utc, data if isinstance(data, dict) else {})
+
+        elif event_type == "ADOPTION_GRACE_EXPIRED_UNOWNED":
+            self._state_manager.set_adoption_grace_expired(True, timestamp_utc)
         
         elif event_type == "TIMETABLE_VALIDATED":
             # NOTE: Timetable validation is now based on timetable_current.json polling,

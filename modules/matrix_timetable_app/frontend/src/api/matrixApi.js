@@ -210,8 +210,9 @@ export async function generateTimetable({ date, analyzerRunsDir = 'data/analyzed
 }
 
 /**
- * Get session eligibility freeze status (aligned with timetable_current.json trading_date when possible).
- * @returns {Promise<{trading_date?: string, freeze_time_utc?: string, eligible_stream_count?: number, status?: string, eligibility_timetable_count_mismatch?: boolean}|null>}
+ * Legacy eligibility JSON status for UI/debug only. Execution authority is timetable_current.json only;
+ * fields include robot_execution_authority / legacy_eligibility_json_non_authoritative from the API.
+ * @returns {Promise<Record<string, unknown>|null>}
  */
 export async function getEligibilityStatus() {
   const response = await fetch(`${API_BASE}/timetable/eligibility/status`)
@@ -222,7 +223,8 @@ export async function getEligibilityStatus() {
 }
 
 /**
- * Get current execution timetable file
+ * Live execution timetable. Server ensures file exists (auto-publish from master matrix when needed).
+ * Response always includes trading_date, effective_session_trading_date, streams[] on success.
  */
 export async function getCurrentTimetable() {
   const response = await fetch(`${API_BASE}/timetable/current`)
@@ -235,17 +237,79 @@ export async function getCurrentTimetable() {
 }
 
 /**
- * Save execution timetable
+ * Map GET /api/timetable/current payload to the execution contract shape used by the timetable tab
+ * (stream, slot_time, enabled, block_reason). Authority is server-side; UI must not infer these from local filters.
+ * @param {Record<string, unknown>|null|undefined} tt
+ * @returns {{ session_trading_date: string, trading_date: string, eligibility_trade_date?: string, streams: Array<Record<string, unknown>> } | null}
  */
-export async function saveExecutionTimetable({ tradingDate, streams }) {
+export function apiDocToExecutionTimetable(tt) {
+  if (!tt || typeof tt !== 'object') return null
+  const effRaw = tt.effective_session_trading_date ?? tt.session_trading_date ?? tt.trading_date ?? ''
+  const sessionTrading = String(effRaw).split('T')[0].trim()
+  const tdRaw = tt.trading_date ?? sessionTrading
+  const tradingDate = String(tdRaw).split('T')[0].trim()
+  const rawStreams = tt.streams
+  const streams = Array.isArray(rawStreams)
+    ? rawStreams.map((s) => {
+        if (!s || typeof s !== 'object') return null
+        const stream = s.stream
+        if (!stream) return null
+        const entry = {
+          stream: String(stream),
+          slot_time: s.slot_time != null ? String(s.slot_time) : '',
+          enabled: s.enabled !== false,
+        }
+        if (s.block_reason != null && String(s.block_reason).trim() !== '') {
+          entry.block_reason = String(s.block_reason)
+        }
+        return entry
+      }).filter(Boolean)
+    : []
+  const out = {
+    session_trading_date: sessionTrading || tradingDate,
+    trading_date: tradingDate || sessionTrading,
+    streams,
+  }
+  if (tt.eligibility_trade_date != null && String(tt.eligibility_trade_date).trim() !== '') {
+    out.eligibility_trade_date = String(tt.eligibility_trade_date).split('T')[0]
+  }
+  return out
+}
+
+/**
+ * Canonical content hash (sorted JSON SHA-256) for debounced publish decisions.
+ */
+export async function computeTimetableContentHash({ session_trading_date, streams }) {
+  const response = await fetch(`${API_BASE}/timetable/content_hash`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_trading_date,
+      streams: streams || []
+    })
+  })
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.detail || `content_hash failed: ${response.status}`)
+  }
+  return await response.json()
+}
+
+/**
+ * Trigger execution timetable publish from on-disk master matrix (server-side).
+ * Optional `tradingDate` only when `replay` is true.
+ */
+export async function saveExecutionTimetable({ tradingDate, replay = false, reason, source } = {}) {
   const response = await fetch(`${API_BASE}/timetable/execution`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      trading_date: tradingDate,
-      streams
+      trading_date: tradingDate ?? null,
+      replay,
+      reason: reason ?? null,
+      source: source ?? null
     })
   })
 

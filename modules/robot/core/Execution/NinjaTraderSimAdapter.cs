@@ -11,6 +11,7 @@ using System.Linq;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core.Diagnostics;
 
@@ -180,6 +181,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     // PHASE 2: Callback to check if execution is allowed (recovery state guard)
     private Func<bool>? _isExecutionAllowedCallback;
+
+    /// <summary>Authoritative engine session day (<see cref="RobotEngine.TradingDateString"/>). When null, session-identity gate is skipped (harness/tests).</summary>
+    private Func<string?>? _getActiveTradingDateString;
+
+    /// <summary>Global (adapter-wide) latch — session mismatch is systemic; one flag blocks all instruments until restart.</summary>
+    private int _sessionMismatchBlocked;
+
+    /// <summary>Incremented once when SESSION_IDENTITY_MISMATCH_BLOCKED is emitted (test/diagnostics).</summary>
+    private int _sessionIdentityMismatchCriticalEmitCount;
+
+    /// <summary>Monotonic count of session-identity rejections (mismatch + post-latch fast-fail). For metrics / alerting.</summary>
+    private long _sessionIdentityBlockCount;
 
     /// <summary>Gap 5: Callback when IEA EnqueueAndWait fails (timeout/overflow). Engine blocks instrument and stands down streams.</summary>
     private Action<string, DateTimeOffset, string>? _blockInstrumentCallback;
@@ -700,6 +713,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     bool IIEAOrderExecutor.TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
     {
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+            return false;
         if (_isExecutionAllowedCallback == null || _isExecutionAllowedCallback())
             return false;
         QueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
@@ -711,6 +726,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// </summary>
     private void QueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
     {
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+            return;
         lock (_pendingRecoveryLock)
         {
             _pendingRecoveryProtectives.Add(new PendingRecoveryProtective(intentId, intent, totalFilledQuantity, utcNow));
@@ -737,6 +754,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         foreach (var pending in snapshot)
         {
             var elapsed = (utcNow - pending.QueuedAtUtc).TotalSeconds;
+
+            if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+                continue;
 
             // Stage 3: Fail-safe timer — flatten if protectives cannot be placed within timeout
             if (elapsed > RECOVERY_PROTECTIVE_TIMEOUT_SECONDS)
@@ -765,6 +785,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             // Stage 2: Broker ready — submit protectives
             if (executionAllowed)
             {
+                if (!TrySessionIdentityGate(pending.IntentId, pending.Intent.Instrument ?? "", "recovery", utcNow, pending.Intent.TradingDate, out _))
+                    continue;
                 if (_coordinator != null && !_coordinator.CanSubmitExit(pending.IntentId, pending.TotalFilledQuantity))
                 {
                     _log.Write(RobotEvents.ExecutionBase(utcNow, pending.IntentId, pending.Intent.Instrument, "EXECUTION_ERROR",
@@ -847,7 +869,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Action<string, DateTimeOffset>? onReentryFillCallback = null,
         Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null,
         Func<string, string, (bool ShouldCancel, string? Reason)>? shouldCancelEntryOrdersForStreamCallback = null,
-        Func<string, bool>? hasSlotJournalWithEntryStopsForInstrumentCallback = null)
+        Func<string, bool>? hasSlotJournalWithEntryStopsForInstrumentCallback = null,
+        Func<string?>? getActiveTradingDateString = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -858,8 +881,141 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
         _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
         _hasSlotJournalWithEntryStopsForInstrumentCallback = hasSlotJournalWithEntryStopsForInstrumentCallback;
+        _getActiveTradingDateString = getActiveTradingDateString;
     }
-    
+
+    /// <summary>True after any session identity mismatch (until process restart). No automatic reset.</summary>
+    public bool IsSessionIdentityLatched => Volatile.Read(ref _sessionMismatchBlocked) != 0;
+
+    /// <summary>Harness/tests: number of SESSION_IDENTITY_MISMATCH_BLOCKED emissions this process (0 or 1 per episode design).</summary>
+    public int SessionIdentityMismatchCriticalEmitCount => Volatile.Read(ref _sessionIdentityMismatchCriticalEmitCount);
+
+    /// <summary>Total blocked submit attempts (identity mismatch + subsequent latched rejects). Dashboard / alerts.</summary>
+    public long SessionIdentityBlockCount => Volatile.Read(ref _sessionIdentityBlockCount);
+
+    private void RecordSessionIdentityBlockAttempt() => Interlocked.Increment(ref _sessionIdentityBlockCount);
+
+    /// <summary>
+    /// IEA entry-stop aggregation: every intent in the bundle must pass the same gate as single-path submits.
+    /// </summary>
+    internal bool TrySessionIdentityGateForIntentBundle(
+        IReadOnlyList<string> intentIds,
+        string instrument,
+        string submitPath,
+        DateTimeOffset utcNow,
+        out OrderSubmissionResult? failure)
+    {
+        failure = null;
+        if (intentIds == null || intentIds.Count == 0)
+            return TrySessionIdentityGate("", instrument, submitPath, utcNow, null, out failure);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in intentIds)
+        {
+            var id = (raw ?? "").Trim();
+            if (string.IsNullOrEmpty(id) || !seen.Add(id)) continue;
+            if (!TrySessionIdentityGate(id, instrument, submitPath, utcNow, null, out failure))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Flatten / emergency-close: no stream intent; align session line to engine active day so we do not open wrong-day intent while still blocking when latched.
+    /// </summary>
+    private bool TrySessionIdentityGateDestructiveFlatten(string instrument, DateTimeOffset utcNow, out OrderSubmissionResult? failure)
+    {
+        failure = null;
+        var getActive = _getActiveTradingDateString;
+        if (getActive == null)
+            return true;
+        var active = (getActive() ?? "").Trim();
+        if (string.IsNullOrEmpty(active))
+            return true;
+        return TrySessionIdentityGate("", instrument, "flatten", utcNow, explicitAttemptedTradingDate: active, out failure);
+    }
+
+    /// <summary>
+    /// Hard gate: intent/journal trading date must match engine active trading date when the latter is non-empty.
+    /// On first mismatch: latch, emit CRITICAL once, reject. When latched: reject silently (no logs).
+    /// </summary>
+    private bool TrySessionIdentityGate(
+        string intentId,
+        string instrument,
+        string submitPath,
+        DateTimeOffset utcNow,
+        string? explicitAttemptedTradingDate,
+        out OrderSubmissionResult? failure)
+    {
+        failure = null;
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
+            return false;
+        }
+
+        var getActive = _getActiveTradingDateString;
+        if (getActive == null)
+            return true;
+
+        var active = (getActive() ?? "").Trim();
+        if (string.IsNullOrEmpty(active))
+            return true;
+
+        string? attempted = explicitAttemptedTradingDate?.Trim();
+        if (string.IsNullOrEmpty(attempted) && !string.IsNullOrEmpty(intentId) &&
+            IntentMap.TryGetValue(intentId, out var intent) && intent != null)
+            attempted = intent.TradingDate?.Trim();
+
+        if (string.IsNullOrEmpty(attempted))
+        {
+            if (Interlocked.CompareExchange(ref _sessionMismatchBlocked, 1, 0) == 0)
+            {
+                Interlocked.Increment(ref _sessionIdentityMismatchCriticalEmitCount);
+                RecordSessionIdentityBlockAttempt();
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_MISMATCH_BLOCKED", state: "CRITICAL",
+                    new
+                    {
+                        active_trading_date = active,
+                        attempted_trading_date = (string?)null,
+                        intent_id = string.IsNullOrEmpty(intentId) ? null : intentId,
+                        instrument,
+                        submit_path = submitPath,
+                        reason = "session_identity_mismatch",
+                        session_identity_block_count = Volatile.Read(ref _sessionIdentityBlockCount)
+                    }));
+            }
+            else
+                RecordSessionIdentityBlockAttempt();
+            failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_MISMATCH", utcNow);
+            return false;
+        }
+
+        if (string.Equals(attempted, active, StringComparison.Ordinal))
+            return true;
+
+        if (Interlocked.CompareExchange(ref _sessionMismatchBlocked, 1, 0) == 0)
+        {
+            Interlocked.Increment(ref _sessionIdentityMismatchCriticalEmitCount);
+            RecordSessionIdentityBlockAttempt();
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_MISMATCH_BLOCKED", state: "CRITICAL",
+                new
+                {
+                    active_trading_date = active,
+                    attempted_trading_date = attempted,
+                    intent_id = string.IsNullOrEmpty(intentId) ? null : intentId,
+                    instrument,
+                    submit_path = submitPath,
+                    reason = "session_identity_mismatch",
+                    session_identity_block_count = Volatile.Read(ref _sessionIdentityBlockCount)
+                }));
+        }
+        else
+            RecordSessionIdentityBlockAttempt();
+        failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_MISMATCH", utcNow);
+        return false;
+    }
+
     /// <summary>
     /// Set intent exposure coordinator.
     /// </summary>
@@ -1319,6 +1475,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TrySessionIdentityGate(intentId, instrument, "entry", utcNow, null, out var sessionFail))
+            return sessionFail!;
+
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
         {
             order_type = "ENTRY",
@@ -1417,6 +1576,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TrySessionIdentityGate(intentId, instrument, "entry_stop", utcNow, null, out var sessionFailStop))
+            return sessionFailStop!;
+
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
         {
             order_type = "ENTRY_STOP",
@@ -1647,6 +1809,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         // Stage 1: Entry fill during recovery — queue protective submission (three-stage safety model)
         if (_isExecutionAllowedCallback != null && !_isExecutionAllowedCallback())
         {
+            if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+                return;
             QueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_QUEUED_RECOVERY",
                 new
@@ -2111,6 +2275,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TrySessionIdentityGate(intentId, instrument, "protective", utcNow, null, out var sessionFailProt))
+            return sessionFailProt!;
+
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
         {
             order_type = "PROTECTIVE_STOP",
@@ -2191,6 +2358,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TrySessionIdentityGate(intentId, instrument, "target", utcNow, null, out var sessionFailTgt))
+            return sessionFailTgt!;
+
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_ATTEMPT", new
         {
             order_type = "TARGET",

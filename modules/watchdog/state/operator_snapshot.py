@@ -30,6 +30,13 @@ _GLOBAL_SYSTEM_EVENTS = frozenset({
     "DISCONNECT_RECOVERY_ABORTED",
     "RECOVERY_DECISION_HALT",
     "BOOTSTRAP_DECISION_HALT",
+    "MISMATCH_FAIL_CLOSED",
+    "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+    "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+    "STATE_CONSISTENCY_GATE_ENGAGED",
+    "RECONCILIATION_MISMATCH_CLEARED",
+    "STATE_CONSISTENCY_GATE_RELEASED",
+    "ADOPTION_GRACE_EXPIRED_UNOWNED",
 })
 
 _INSTRUMENT_SNAPSHOT_EVENTS = frozenset({
@@ -322,12 +329,23 @@ def _derive_snapshot_for_instrument(
     system_state = "ACTIVE"
     recovery_state = getattr(state_manager, "_recovery_state", "CONNECTED_OK")
     connection_status = getattr(state_manager, "_connection_status", "Unknown")
-    if recovery_state == "DISCONNECT_FAIL_CLOSED" or "DISCONNECT_FAIL_CLOSED_ENTERED" in event_types or \
-       event_types & {"RECOVERY_DECISION_HALT", "BOOTSTRAP_DECISION_HALT"}:
+    reconciliation_gate = getattr(state_manager, "_reconciliation_gate_state", "OK")
+    adoption_grace = getattr(state_manager, "_adoption_grace_expired_active", False)
+    if (
+        adoption_grace
+        or reconciliation_gate == "FAIL_CLOSED"
+        or recovery_state == "DISCONNECT_FAIL_CLOSED"
+        or "DISCONNECT_FAIL_CLOSED_ENTERED" in event_types
+        or event_types & {"RECOVERY_DECISION_HALT", "BOOTSTRAP_DECISION_HALT"}
+    ):
         system_state = "FAIL_CLOSED"
     elif connection_status == "ConnectionLost" or "CONNECTION_LOST" in event_types or "CONNECTION_LOST_SUSTAINED" in event_types:
         system_state = "DISCONNECTED"
-    elif recovery_state == "RECOVERY_RUNNING" or "DISCONNECT_RECOVERY_STARTED" in event_types:
+    elif (
+        recovery_state == "RECOVERY_RUNNING"
+        or "DISCONNECT_RECOVERY_STARTED" in event_types
+        or reconciliation_gate == "ENGAGED"
+    ):
         system_state = "RECOVERY"
 
     # B. exposure — journal only (state_manager)

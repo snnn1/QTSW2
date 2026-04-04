@@ -1,0 +1,50 @@
+{
+  "timezone": "America/Chicago",
+  "holidays": [
+    {
+      "date": "2026-01-01",
+      "name": "New Year's Day",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-01-19",
+      "name": "Martin Luther King Jr. Day",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-02-16",
+      "name": "Presidents Day",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-04-03",
+      "name": "Good Friday",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-05-25",
+      "name": "Memorial Day",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-07-03",
+      "name": "Independence Day (observed)",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-09-07",
+      "name": "Labor Day",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-11-26",
+      "name": "Thanksgiving",
+      "type": "FULL_CLOSE"
+    },
+    {
+      "date": "2026-12-25",
+      "name": "Christmas Day",
+      "type": "FULL_CLOSE"
+    }
+  ]
+}

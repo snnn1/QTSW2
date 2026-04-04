@@ -51,6 +51,21 @@
       "min_duration_seconds": 0,
       "severity": "critical",
       "cooldown_seconds": 0
+    },
+    "RECONCILIATION_GATE_FAIL_CLOSED": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "ADOPTION_GRACE_EXPIRED": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
+    },
+    "TIMETABLE_DRIFT": {
+      "min_duration_seconds": 0,
+      "severity": "critical",
+      "cooldown_seconds": 0
     }
   }
 }

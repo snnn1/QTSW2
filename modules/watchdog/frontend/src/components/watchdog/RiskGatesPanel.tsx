@@ -1,15 +1,31 @@
 /**
  * RiskGatesPanel component
- * Shows execution gate status
+ * Shows execution gate status; execution severity copy/colors come from shared helper only.
  */
 import type { RiskGateStatus } from '../../types/watchdog'
+import type { OverallExecutionDerived } from '../../utils/executionSeverity'
+import { executionReasonToOperatorMessage } from '../../utils/executionSeverity'
 
 interface RiskGatesPanelProps {
   gates: RiskGateStatus | null
   loading: boolean
+  overallExecution: OverallExecutionDerived
 }
 
-export function RiskGatesPanel({ gates, loading }: RiskGatesPanelProps) {
+function executionRowTextClass(sev: OverallExecutionDerived['overall_execution_severity']): string {
+  switch (sev) {
+    case 'SAFE':
+      return 'text-green-500'
+    case 'WARNING':
+      return 'text-amber-500'
+    case 'CRITICAL':
+      return 'text-red-500'
+    default:
+      return 'text-gray-500'
+  }
+}
+
+export function RiskGatesPanel({ gates, loading, overallExecution }: RiskGatesPanelProps) {
   if (loading && !gates) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
@@ -18,7 +34,7 @@ export function RiskGatesPanel({ gates, loading }: RiskGatesPanelProps) {
       </div>
     )
   }
-  
+
   if (!gates) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
@@ -27,9 +43,14 @@ export function RiskGatesPanel({ gates, loading }: RiskGatesPanelProps) {
       </div>
     )
   }
-  
+
+  const executionSafe =
+    gates.execution_safe ?? (gates.recovery_state_allowed && gates.kill_switch_allowed)
+  const reasonMsg = executionReasonToOperatorMessage(overallExecution.overall_execution_reason)
+  const rowClass = executionRowTextClass(overallExecution.overall_execution_severity)
+
   return (
-    <div className="bg-gray-800 rounded-lg p-4">
+    <div className="bg-gray-800 rounded-lg p-4" data-testid="risk-gates-panel">
       <h2 className="text-lg font-semibold mb-4">Execution Gates</h2>
       <div className="space-y-2">
         <div className="flex items-center justify-between">
@@ -43,6 +64,19 @@ export function RiskGatesPanel({ gates, loading }: RiskGatesPanelProps) {
           <span className={gates.kill_switch_allowed ? 'text-green-500' : 'text-red-500'}>
             {gates.kill_switch_allowed ? '✅' : '❌'}
           </span>
+        </div>
+        <div className="flex flex-col gap-1 border-t border-gray-700/50 pt-2 mt-1">
+          <div className="flex items-center justify-between">
+            <span className="font-medium" title={reasonMsg}>
+              Execution safe
+            </span>
+            <span className={executionSafe ? 'text-green-500' : 'text-red-500'}>
+              {executionSafe ? '✅' : '❌'}
+            </span>
+          </div>
+          <div className={`text-xs ${rowClass}`} data-testid="risk-gates-execution-severity-message">
+            {reasonMsg}
+          </div>
         </div>
         <div className="flex items-center justify-between">
           <span>Timetable Validated</span>
@@ -65,7 +99,6 @@ export function RiskGatesPanel({ gates, loading }: RiskGatesPanelProps) {
         <div className="mt-4">
           <div className="text-sm font-semibold mb-2">Stream Armed:</div>
           <div className="space-y-1">
-            {/* Deduplicate streams by stream name, keeping the last occurrence */}
             {Array.from(
               new Map(gates.stream_armed.map((stream) => [stream.stream, stream])).values()
             ).map((stream) => (

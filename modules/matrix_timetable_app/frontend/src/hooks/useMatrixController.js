@@ -72,7 +72,8 @@ export function useMatrixController({
     calculateStats: workerCalculateStats,
     getRows: workerGetRows,
     calculateProfitBreakdown,
-    calculateTimetable: workerCalculateTimetable
+    calculateTimetable: workerCalculateTimetable,
+    applyExecutionTimetableFromApi: workerApplyExecutionTimetableFromApi
   } = useMatrixWorker()
   
   // Load master matrix function
@@ -625,6 +626,7 @@ export function useMatrixController({
     workerGetRows,
     calculateProfitBreakdown,
     workerCalculateTimetable,
+    workerApplyExecutionTimetableFromApi,
     workerInitData,
     
     // Controller functions

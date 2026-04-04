@@ -112,7 +112,10 @@ public sealed class HealthMonitor
         "INSTRUMENT_HALTED",
         "OPERATOR_ACK_REQUIRED",
         "GLOBAL_KILL_SWITCH_ACTIVATED",
-        "SUPERVISORY_THRESHOLD_EXCEEDED"
+        "SUPERVISORY_THRESHOLD_EXCEEDED",
+        "MISMATCH_FAIL_CLOSED",
+        "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+        "STATE_CONSISTENCY_GATE_RECOVERY_FAILED"
     };
     
     // Background evaluation thread for data loss detection

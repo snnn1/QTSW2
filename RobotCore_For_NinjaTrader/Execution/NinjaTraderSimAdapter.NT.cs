@@ -123,6 +123,11 @@ public sealed partial class NinjaTraderSimAdapter
 
     void IIEAOrderExecutor.SubmitOrders(IReadOnlyList<object> orders)
     {
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return;
+        }
         var account = _ntAccount as Account;
         if (account == null || orders == null) return;
         var ntOrders = orders.OfType<Order>().ToArray();
@@ -323,6 +328,8 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     OrderSubmissionResult IIEAOrderExecutor.SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow, object? nativeInstrumentForBrokerOrder = null)
     {
+        if (!TrySessionIdentityGateDestructiveFlatten(instrument, utcNow, out var sessionFailFlatten))
+            return sessionFailFlatten!;
         var account = _ntAccount as Account;
         var ntInstrument = (nativeInstrumentForBrokerOrder ?? (object?)_ntInstrument) as Instrument;
         if (account == null || ntInstrument == null)
@@ -385,6 +392,12 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "P2.6.7: EmergencyFlatten must run on strategy thread — use NtFlattenInstrumentCommand / FlattenEmergency enqueue path"
                 }));
             return FlattenResult.FailureResult("EmergencyFlatten requires strategy thread (enqueue FlattenEmergency or drain NT actions)", utcNow);
+        }
+
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
         }
 
         var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
@@ -517,6 +530,8 @@ public sealed partial class NinjaTraderSimAdapter
             SetProtectionState(intentId, ProtectionState.Executing);
         if (!IntentMap.TryGetValue(intentId, out var intent))
             throw new InvalidOperationException($"Intent not found: {cmd.IntentId}");
+        if (!TrySessionIdentityGate(intentId, cmd.Instrument ?? "", "recovery", cmd.UtcNow, null, out _))
+            return;
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
             if (attempt > 0) System.Threading.Thread.Sleep(RETRY_DELAY_MS);
@@ -2470,6 +2485,54 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// QTSW2-only: hydrate <see cref="OrderMap"/> from IEA registry when Sim reports an update before local tracking caught up
+    /// (registry row exists for the same intent+leg and is still live). Preserves manual/external behavior for untagged or unknown rows.
+    /// </summary>
+    private bool TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(Order order, string intentId, string? encodedTag, ParsedTagResult parsed,
+        DateTimeOffset utcNow)
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return false;
+        if (string.IsNullOrEmpty(encodedTag) || !encodedTag.StartsWith(RobotOrderIds.Prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.IsNullOrEmpty(intentId)) return false;
+
+        var legR = parsed.Leg == "STOP" || parsed.Leg == "TARGET" ? parsed.Leg : null;
+        if (!_iea.TryResolveForExecutionUpdate(order.OrderId ?? "", intentId, legR, out var regEntry, out _) || regEntry == null)
+            return false;
+
+        if (!Qtsw2OrderUpdateHydrationPolicy.RegistryRowMatchesTaggedIntentAndLeg(regEntry, intentId, parsed.Leg)) return false;
+        if (Qtsw2OrderUpdateHydrationPolicy.IsTerminalRegistryRow(regEntry)) return false;
+
+        var incomingId = order.OrderId ?? "";
+        var canonical = regEntry.BrokerOrderId ?? "";
+        var instrument = order.Instrument?.MasterInstrument?.Name ?? regEntry.Instrument ?? "";
+        if (!string.IsNullOrEmpty(canonical) && !string.Equals(incomingId, canonical, StringComparison.OrdinalIgnoreCase))
+            _iea.LinkBrokerOrderIdAlias(incomingId, canonical, utcNow, intentId, instrument);
+
+        var oi = regEntry.OrderInfo;
+        if (oi == null) return false;
+
+        oi.OrderId = incomingId;
+        oi.NTOrder = order;
+
+        OrderMap[intentId] = oi;
+        if (regEntry.OrderRole == OrderRole.STOP)
+            OrderMap[$"{intentId}:STOP"] = oi;
+        else if (regEntry.OrderRole == OrderRole.TARGET)
+            OrderMap[$"{intentId}:TARGET"] = oi;
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_MAP_HYDRATED_FROM_IEA", new
+        {
+            broker_order_id = incomingId,
+            canonical_broker_order_id = canonical,
+            intent_id = intentId,
+            order_role = regEntry.OrderRole.ToString(),
+            parsed_leg = parsed.Leg,
+            note = "OrderMap populated from IEA registry before manual/external miss path"
+        }));
+        return true;
+    }
+
+    /// <summary>
     /// STEP 3: Handle real NT OrderUpdate event.
     /// Called from public HandleOrderUpdate() method in main adapter.
     /// </summary>
@@ -2639,6 +2702,12 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         if (!OrderMap.TryGetValue(intentId, out var orderInfo))
+        {
+            TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(order, intentId, encodedTag, parsed, utcNow);
+            OrderMap.TryGetValue(intentId, out orderInfo);
+        }
+
+        if (orderInfo == null)
         {
             if (IsRobotOwnedFlattenByTag(encodedTag))
                 return;
@@ -6575,6 +6644,11 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow, NtDestructivePolicyAlreadyAppliedToken? policyPrechecked = null, DestructiveActionSource? destructiveSourceOverride = null, DestructiveTriggerReason? explicitTriggerOverride = null)
     {
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
+        }
         PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
         if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
             PruneIntentState(intentId, "flatten");
@@ -7542,6 +7616,16 @@ public sealed partial class NinjaTraderSimAdapter
                 if (_executionJournal != null)
                     _executionJournal.RecordSubmission(oppId, oppIntent.TradingDate ?? "", oppIntent.Stream ?? "", instrument, $"ENTRY_STOP_{oppositeDirection}", oppOrder.OrderId, utcNow);
             }
+
+            var bundleGateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var id in allIntentIds)
+            {
+                bundleGateIds.Add(id);
+                var oppG = FindOppositeEntryIntentId(id);
+                if (oppG != null) bundleGateIds.Add(oppG);
+            }
+            if (!TrySessionIdentityGateForIntentBundle(bundleGateIds.ToList(), instrument, "entry_stop_aggregate", utcNow, out var bundleGateFailure))
+                return bundleGateFailure;
 
             account.Submit(ordersToSubmit.ToArray());
 

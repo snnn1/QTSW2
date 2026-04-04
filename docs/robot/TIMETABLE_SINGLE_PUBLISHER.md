@@ -4,9 +4,9 @@
 
 ## Live execution file: `data/timetable/timetable_current.json`
 
-- **Authoritative Python publisher:** `TimetableEngine.publish_execution_timetable_current` → `_write_execution_timetable_file` in `modules/timetable/timetable_engine.py`.
+- **Authoritative Python publisher:** `TimetableEngine.write_execution_timetable_from_master_matrix(..., execution_mode=True)` → `_write_execution_timetable_file` in `modules/timetable/timetable_engine.py` (streams built in-engine; no caller-supplied `enabled` / `block_reason` payloads).
 - **Validation:** Always `validate_streams_before_execution_write` immediately before atomic write (tmp → replace).
-- **Dashboard:** `POST /api/timetable/execution` calls `TimetableEngine` only (no direct `json.dump` to `timetable_current.json`).
+- **Dashboard:** `POST /api/timetable/execution` calls `write_execution_timetable_from_master_matrix(..., execution_mode=True)` only (no direct `json.dump` to `timetable_current.json`).
 - **Matrix:** `modules/matrix/file_manager.py` already used `TimetableEngine`; `project_root` is set so `logs/timetable_publish.jsonl` resolves correctly.
 
 ## Publish ledger
@@ -37,7 +37,7 @@
 ### Confirmed closure
 
 - All **in-repo Python** live writes route through **`TimetableEngine._write_execution_timetable_file`** (atomic tmp → replace, validation on the write path).
-- **Dashboard** routes through **`publish_execution_timetable_current`** (no direct `json.dump` to `timetable_current.json`).
+- **Dashboard** routes through **`write_execution_timetable_from_master_matrix`** (no direct `json.dump` to `timetable_current.json`).
 - **No remaining C# writes** to live **`timetable_current.json`** (replay/harness/tests use **`timetable_replay_current.json`**, `timetable_harness_sample.json`, `timetable_validate_*.json`, temp `timetable*.json`, etc.).
 - **Replay / harness / test outputs** are isolated to **non-live** filenames and paths.
 

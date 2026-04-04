@@ -245,6 +245,17 @@ public sealed partial class InstrumentExecutionAuthority
                 TryTransitionIntentLifecycle(oppId, IntentLifecycleTransition.SUBMIT_ENTRY, null, utcNow);
             }
 
+            var bundleGateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var id in allIntentIds)
+            {
+                bundleGateIds.Add(id);
+                var oppG = FindOppositeEntryIntentId(id);
+                if (oppG != null) bundleGateIds.Add(oppG);
+            }
+            if (Executor is NinjaTraderSimAdapter simForGate &&
+                !simForGate.TrySessionIdentityGateForIntentBundle(bundleGateIds.ToList(), instrument, "entry_stop_aggregate", utcNow, out var bundleGateFailure))
+                return bundleGateFailure;
+
             Executor.SubmitOrders(ordersToSubmit);
 
             foreach (var id in allIntentIds)

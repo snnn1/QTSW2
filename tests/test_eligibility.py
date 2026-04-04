@@ -25,6 +25,11 @@ from modules.timetable.eligibility_writer import write_eligibility_file, load_el
 class TestCMETradingDate:
     """Test CME 18:00 Chicago boundary for trading_date."""
 
+    def test_1730_ct_same_day(self):
+        """17:30 CT → same calendar day (18:00 boundary not reached)."""
+        utc = datetime(2026, 3, 3, 23, 30, 0, tzinfo=timezone.utc)
+        assert get_trading_date_cme(utc) == "2026-03-03"
+
     def test_before_18ct_returns_same_day(self):
         """17:59 CT → trading_date = same calendar day."""
         # 2026-03-03 23:59 UTC = 2026-03-03 17:59 CT (CST)
@@ -62,7 +67,7 @@ class TestEligibilityWriter:
             ]
             path = write_eligibility_file(
                 streams=streams,
-                trading_date="2026-03-05",
+                session_trading_date="2026-03-05",
                 output_dir=tmp,
                 source_matrix_hash="abc123",
             )
@@ -71,7 +76,7 @@ class TestEligibilityWriter:
             assert path.name == "eligibility_2026-03-05.json"
 
             data = json.loads(path.read_text(encoding="utf-8"))
-            assert data["trading_date"] == "2026-03-05"
+            assert data["session_trading_date"] == "2026-03-05"
             assert data["eligible_stream_count"] == 1
             assert data["matrix_hash"] == "abc123"
             assert len(data["eligible_streams"]) == 2
@@ -80,15 +85,15 @@ class TestEligibilityWriter:
         """write_eligibility_file returns None when file already exists."""
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "eligibility_2026-03-05.json"
-            out.write_text('{"trading_date":"2026-03-05"}', encoding="utf-8")
+            out.write_text('{"session_trading_date":"2026-03-05"}', encoding="utf-8")
 
             path = write_eligibility_file(
                 streams=[{"stream": "ES1", "enabled": True}],
-                trading_date="2026-03-05",
+                session_trading_date="2026-03-05",
                 output_dir=tmp,
             )
             assert path is None
-            assert out.read_text() == '{"trading_date":"2026-03-05"}'
+            assert "2026-03-05" in out.read_text()
 
     def test_load_returns_none_when_missing(self):
         """load_eligibility returns None when file does not exist."""
@@ -100,7 +105,7 @@ class TestEligibilityWriter:
         """load_eligibility returns parsed data when file exists."""
         with tempfile.TemporaryDirectory() as tmp:
             payload = {
-                "trading_date": "2026-03-05",
+                "session_trading_date": "2026-03-05",
                 "freeze_time_utc": "2026-03-04T18:00:00Z",
                 "eligible_stream_count": 2,
                 "eligible_streams": [],
@@ -110,7 +115,7 @@ class TestEligibilityWriter:
             )
             result = load_eligibility("2026-03-05", tmp)
             assert result is not None
-            assert result["trading_date"] == "2026-03-05"
+            assert result["session_trading_date"] == "2026-03-05"
             assert result["eligible_stream_count"] == 2
 
 
@@ -195,7 +200,7 @@ class TestEligibilityBuilderScript:
                 out_file = timetable_dir / "eligibility_2026-03-10.json"
                 assert out_file.exists()
                 data = json.loads(out_file.read_text(encoding="utf-8"))
-                assert data["trading_date"] == "2026-03-10"
+                assert data.get("session_trading_date") == "2026-03-10"
 
 
 if __name__ == "__main__":

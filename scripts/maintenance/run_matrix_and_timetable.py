@@ -117,14 +117,15 @@ Examples:
         print("GENERATING TIMETABLE")
         print("=" * 80)
         
-        engine = TimetableEngine(
-            master_matrix_dir=args.matrix_output_dir,
-            analyzer_runs_dir=args.analyzer_runs_dir
-        )
-        engine.scf_threshold = args.scf_threshold
-        
-        # Matrix-first: use matrix when available (no analyzer reads for RS/SCF)
+        timetable_df = None
+
         if run_matrix and master_df is not None and not master_df.empty:
+            engine = TimetableEngine(
+                master_matrix_dir=args.matrix_output_dir,
+                analyzer_runs_dir=args.analyzer_runs_dir,
+                project_root=str(project_root),
+            )
+            engine.scf_threshold = args.scf_threshold
             engine.write_execution_timetable_from_master_matrix(
                 master_df, trade_date=args.date, execution_mode=True
             )
@@ -132,24 +133,37 @@ Examples:
                 master_df, trade_date=args.date, execution_mode=True
             )
         elif not run_matrix:
-            # Timetable-only: try to load matrix from disk first
             from modules.matrix.file_manager import load_existing_matrix
             loaded_df = load_existing_matrix(args.matrix_output_dir)
-            if not loaded_df.empty:
-                # Use execution_mode=False for matrix-derived timetable (no eligibility file required)
-                engine.write_execution_timetable_from_master_matrix(
-                    loaded_df, trade_date=args.date, execution_mode=False
+            if loaded_df.empty:
+                print(
+                    "ERROR: No master matrix on disk — legacy analyzer timetable path is disabled.",
+                    file=sys.stderr,
                 )
-                timetable_df = engine.build_timetable_dataframe_from_master_matrix(
-                    loaded_df, trade_date=args.date, execution_mode=False
-                )
-            else:
-                # Fallback: no matrix, use analyzer (legacy path)
-                timetable_df = engine.generate_timetable(trade_date=args.date)
+                sys.exit(1)
+            engine = TimetableEngine(
+                master_matrix_dir=args.matrix_output_dir,
+                analyzer_runs_dir=args.analyzer_runs_dir,
+                project_root=str(project_root),
+            )
+            engine.scf_threshold = args.scf_threshold
+            print(
+                "  --timetable-only: building dataframe + timestamped parquet/JSON only. "
+                "Live timetable_current.json requires running both matrix + timetable "
+                "(execution_mode=True) so eligibility aligns with the publish dir."
+            )
+            timetable_df = engine.build_timetable_dataframe_from_master_matrix(
+                loaded_df, trade_date=args.date, execution_mode=False
+            )
         else:
-            timetable_df = engine.generate_timetable(trade_date=args.date)
+            print(
+                "ERROR: Master matrix is empty — cannot publish live timetable_current.json. "
+                "Build matrix data first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         
-        if timetable_df.empty:
+        if timetable_df is None or timetable_df.empty:
             print("WARNING: Timetable is empty!")
         else:
             parquet_file, json_file = engine.save_timetable(
@@ -174,4 +188,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-

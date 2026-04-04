@@ -61,7 +61,7 @@ def main() -> int:
 
     # CME rule: UTC → Chicago, >= 18:00 CT → next day
     trading_date = args.date or get_trading_date_cme(datetime.now(timezone.utc))
-    logger.info(f"Eligibility builder: target trading_date={trading_date}")
+    logger.info(f"Eligibility builder: target session_trading_date={trading_date}")
 
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -76,7 +76,21 @@ def main() -> int:
         return 0
 
     if args.force and eligibility_path.exists():
-        logger.warning(f"FORCE: overwriting existing eligibility_{trading_date}.json (testing only)")
+        logger.critical(
+            json.dumps(
+                {
+                    "event": "ELIGIBILITY_FILE_FORCE_DELETED_BEFORE_WRITE",
+                    "severity": "CRITICAL",
+                    "session_trading_date": trading_date,
+                    "path": str(eligibility_path.resolve()),
+                    "operator": "cli",
+                    "source": "scripts/eligibility_builder.py",
+                    "reason": "--force",
+                    "note": "Existing eligibility file deleted to allow rewrite; not the same as bypass_session_immutability_guard",
+                },
+                ensure_ascii=False,
+            )
+        )
         eligibility_path.unlink()
 
     # Load master matrix
@@ -109,14 +123,14 @@ def main() -> int:
 
     result = write_eligibility_file(
         streams=streams,
-        trading_date=trading_date,
+        session_trading_date=trading_date,
         output_dir=str(output_path),
         source_matrix_hash=matrix_hash,
     )
     if result:
         eligible_count = sum(1 for s in streams if s.get("enabled"))
         logger.info(
-            f"SESSION_ELIGIBILITY_FROZEN: trading_date={trading_date}, "
+            f"SESSION_ELIGIBILITY_FROZEN: session_trading_date={trading_date}, "
             f"freeze_time_utc={datetime.now(timezone.utc).isoformat()}, "
             f"matrix_hash={matrix_hash or 'none'}, eligible_stream_count={eligible_count}"
         )

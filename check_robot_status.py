@@ -89,22 +89,22 @@ timetable_path = Path("data/timetable/timetable_current.json")
 if timetable_path.exists():
     timetable = json.loads(timetable_path.read_text())
     print(f"\n[TIMETABLE FILE]")
-    print(f"  Trading Date: {timetable.get('trading_date', 'N/A')}")
+    sd = timetable.get('session_trading_date') or timetable.get('trading_date', 'N/A')
+    print(f"  Session trading date: {sd}")
     print(f"  As Of: {timetable.get('as_of', 'N/A')}")
     
-    # Check if trading_date matches CME rollover
-    chicago_tz = pytz.timezone("America/Chicago")
     as_of_str = timetable.get('as_of', '')
     if as_of_str:
+        from datetime import timezone
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from modules.timetable.cme_session import get_cme_trading_date
         as_of_dt = datetime.fromisoformat(as_of_str)
-        chicago_time = as_of_dt.astimezone(chicago_tz)
-        chicago_hour = chicago_time.hour
-        from datetime import timedelta
-        expected_trading_date = (chicago_time.date() + timedelta(days=1)).isoformat() if chicago_hour >= 17 else chicago_time.date().isoformat()
-        actual_trading_date = timetable.get('trading_date', '')
-        match = actual_trading_date == expected_trading_date
-        print(f"  Expected (CME rollover): {expected_trading_date}")
-        print(f"  Actual: {actual_trading_date}")
+        expected_trading_date = get_cme_trading_date(as_of_dt.astimezone(timezone.utc))
+        actual = (timetable.get('session_trading_date') or timetable.get('trading_date') or '')
+        match = actual == expected_trading_date
+        print(f"  Expected (canonical CME session date at as_of): {expected_trading_date}")
+        print(f"  Actual: {actual}")
         print(f"  Match: {match} {'[OK]' if match else '[FAIL]'}")
 
 print("\n" + "="*80)

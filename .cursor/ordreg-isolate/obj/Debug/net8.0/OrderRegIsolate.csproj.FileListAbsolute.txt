@@ -1,0 +1,15 @@
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.GeneratedMSBuildEditorConfig.editorconfig
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.AssemblyInfoInputs.cache
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.AssemblyInfo.cs
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.csproj.CoreCompileInputs.cache
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.sourcelink.json
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\bin\Debug\net8.0\OrderRegIsolate.exe
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\bin\Debug\net8.0\OrderRegIsolate.deps.json
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\bin\Debug\net8.0\OrderRegIsolate.runtimeconfig.json
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\bin\Debug\net8.0\OrderRegIsolate.dll
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\bin\Debug\net8.0\OrderRegIsolate.pdb
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.dll
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\refint\OrderRegIsolate.dll
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.pdb
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\OrderRegIsolate.genruntimeconfig.cache
+c:\Users\jakej\QTSW2\.cursor\ordreg-isolate\obj\Debug\net8.0\ref\OrderRegIsolate.dll

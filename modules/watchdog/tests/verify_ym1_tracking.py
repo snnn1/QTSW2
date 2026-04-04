@@ -166,7 +166,7 @@ def test_timetable_poller_ym1():
     if not poller._timetable_path.exists():
         print("  [SKIP] No timetable file found")
 
-    trading_date, enabled_streams, _, metadata = poller.poll()
+    trading_date, enabled_streams, _, metadata, _, _ = poller.poll()
     if enabled_streams and "YM1" in enabled_streams:
         meta = metadata.get("YM1", {})
         assert meta.get("instrument") == "YM", f"YM1 expected instrument=YM, got {meta}"

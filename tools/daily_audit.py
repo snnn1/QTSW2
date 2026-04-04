@@ -5,6 +5,7 @@ Full-system daily audit (Robot + Watchdog) per docs/robot/audits/DAILY_AUDIT_FRA
 Example:
   python tools/daily_audit.py --date 2026-03-24 --tz chicago
   python tools/daily_audit.py --date 2026-03-25 --tz utc --last-minutes 10 --json-out reports/daily_audit/recent_10m.json
+  python tools/daily_audit.py --date 2026-04-01 --tz chicago --window-start-local 06:00
 """
 
 from __future__ import annotations
@@ -123,16 +124,49 @@ def parse_audit_date(s: str) -> date:
     return date.fromisoformat(s)
 
 
-def day_window_utc(d: date, tz_name: str) -> Tuple[datetime, datetime]:
+def parse_window_start_local(s: Optional[str]) -> Tuple[int, int]:
+    """Parse 'HH' or 'HH:MM' (24h) for --window-start-local."""
+    if s is None or not str(s).strip():
+        return 0, 0
+    t = str(s).strip()
+    if ":" in t:
+        a, b = t.split(":", 1)
+        h, m = int(a), int(b)
+    else:
+        h, m = int(t), 0
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError(f"window-start-local out of range: {s!r} (expected HH:MM 24h)")
+    return h, m
+
+
+def day_window_utc(
+    d: date,
+    tz_name: str,
+    window_start_hour: int = 0,
+    window_start_minute: int = 0,
+) -> Tuple[datetime, datetime]:
+    """Calendar day [start, end) in UTC. When window_start is non-midnight, start is that local/UTC time on d."""
+    delta0 = timedelta(hours=int(window_start_hour), minutes=int(window_start_minute))
+
     if tz_name == "utc":
-        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-        return start, start + timedelta(days=1)
+        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + delta0
+        end = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(days=1)
+        if start >= end:
+            raise ValueError("window-start-local is at or after end of audit day")
+        return start, end
+
     if ZoneInfo is None:
-        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-        return start, start + timedelta(days=1)
+        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + delta0
+        end = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) + timedelta(days=1)
+        if start >= end:
+            raise ValueError("window-start-local is at or after end of audit day")
+        return start, end
+
     tz = ZoneInfo(CHICAGO)
-    start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz)
-    end_local = start_local + timedelta(days=1)
+    start_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz) + delta0
+    end_local = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz) + timedelta(days=1)
+    if start_local >= end_local:
+        raise ValueError("window-start-local is at or after end of audit day")
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
@@ -1539,7 +1573,8 @@ def run_audit(args: argparse.Namespace) -> int:
     reports_dir.mkdir(parents=True, exist_ok=True)
 
     audit_date = parse_audit_date(args.date)
-    day_start, day_end = day_window_utc(audit_date, args.tz)
+    wsh, wsm = parse_window_start_local(args.window_start_local)
+    day_start, day_end = day_window_utc(audit_date, args.tz, wsh, wsm)
     rolling_window_minutes: Optional[int] = args.last_minutes
     if rolling_window_minutes is not None and rolling_window_minutes > 0:
         day_end = datetime.now(timezone.utc)
@@ -1729,6 +1764,16 @@ def run_audit(args: argparse.Namespace) -> int:
         "prior_engine_full_days": prior_full,
         "min_engine_full_days_for_drift": min_drift_days,
     }
+    if (wsh or wsm) and not (
+        rolling_window_minutes is not None and rolling_window_minutes > 0
+    ):
+        meta["audit_window_inclusion"] = {
+            "from_local_time": f"{wsh:02d}:{wsm:02d}",
+            "interpretation_tz": CHICAGO if args.tz == "chicago" else "UTC",
+            "window_start_utc": day_start.isoformat().replace("+00:00", "Z"),
+            "window_end_utc": day_end.isoformat().replace("+00:00", "Z"),
+            "note": "Events before from_local_time on audit_date (in interpretation_tz) are excluded.",
+        }
     if rolling_window_minutes is not None and rolling_window_minutes > 0:
         meta["audit_window"] = {
             "mode": "rolling",
@@ -1809,6 +1854,12 @@ def render_markdown(o: Dict[str, Any]) -> List[str]:
         )
         lines.append(f"  window_start_utc: {aw.get('window_start_utc')}")
         lines.append(f"  window_end_utc: {aw.get('window_end_utc')}")
+    awi = meta_top.get("audit_window_inclusion")
+    if isinstance(awi, dict):
+        lines.append(
+            f"AUDIT WINDOW: from {awi.get('from_local_time')} local ({awi.get('interpretation_tz')}) "
+            f"→ {awi.get('window_end_utc')} UTC end; events before {awi.get('window_start_utc')} UTC excluded."
+        )
     lines.append("")
     lines.append(f"OVERALL STATUS: {o.get('overall_status')}")
     lines.append(f"EFFECTIVE STATUS (confidence-enforced): {o.get('confidence_enforced_status')}")
@@ -2068,6 +2119,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="Restrict audit to log events in [now - N min, now) UTC (rolling window). --date labels the report file.",
+    )
+    p.add_argument(
+        "--window-start-local",
+        default=None,
+        metavar="HH:MM",
+        help="Include only events on --date at or after this wall clock time (24h). "
+        "With --tz chicago uses America/Chicago; with --tz utc uses UTC. Example: 06:00",
     )
     return p
 

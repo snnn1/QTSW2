@@ -1,7 +1,7 @@
 """
 Pydantic models for API requests and responses
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 
 
@@ -71,6 +71,9 @@ class ExecutionTimetableStream(BaseModel):
 
 
 class ExecutionTimetableRequest(BaseModel):
-    trading_date: str
-    streams: List[ExecutionTimetableStream]
+    """Publish-from-matrix: ``streams`` ignored; optional ``trading_date`` when ``replay`` is True."""
+
+    trading_date: Optional[str] = None
+    streams: List[ExecutionTimetableStream] = Field(default_factory=list)
+    replay: bool = False
 

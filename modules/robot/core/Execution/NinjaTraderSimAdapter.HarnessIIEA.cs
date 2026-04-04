@@ -110,27 +110,11 @@ public sealed partial class NinjaTraderSimAdapter
     void IIEAOrderExecutor.FailClosed(string intentId, Intent intent, string failureReason, string eventType, string notificationKey, string notificationTitle, string notificationMessage, OrderSubmissionResult? stopResult, OrderSubmissionResult? targetResult, object? additionalData, DateTimeOffset utcNow) =>
         _harnessIiea.FailClosed(intentId, intent, failureReason, eventType, notificationKey, notificationTitle, notificationMessage, stopResult, targetResult, additionalData, utcNow);
 
-    bool IIEAOrderExecutor.TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow) =>
-        _harnessIiea.TryQueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
-
     void IIEAOrderExecutor.ProcessExecutionUpdate(object execution, object order) =>
         _harnessIiea.ProcessExecutionUpdate(execution, order);
 
     void IIEAOrderExecutor.ProcessOrderUpdate(object order, object orderUpdate) =>
         _harnessIiea.ProcessOrderUpdate(order, orderUpdate);
-
-    bool IIEAOrderExecutor.EnqueueNtAction(INtAction action) => _harnessIiea.EnqueueNtAction(action);
-
-    object? IIEAOrderExecutor.GetEntrySubmissionLock() => _harnessIiea.GetEntrySubmissionLock();
-
-    void IIEAOrderExecutor.DrainNtActions() => _harnessIiea.DrainNtActions();
-
-    void IIEAOrderExecutor.SetProtectionStateWorkingForAdoptedStop(string intentId) =>
-        _harnessIiea.SetProtectionStateWorkingForAdoptedStop(intentId);
-
-    void IIEAOrderExecutor.EnterStrategyThreadContext() => _harnessIiea.EnterStrategyThreadContext();
-
-    void IIEAOrderExecutor.ExitStrategyThreadContext() => _harnessIiea.ExitStrategyThreadContext();
 
     void INtActionExecutor.ExecuteSubmitProtectives(NtSubmitProtectivesCommand cmd) =>
         ThrowNtActionHarness("ExecuteSubmitProtectives");

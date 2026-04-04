@@ -48,6 +48,11 @@ public sealed class MismatchEscalationCoordinator
 
     private const int QuietGateTelemetrySeconds = 30;
 
+    /// <summary>Test harness: counts for gate RESULT emission vs quiet suppression.</summary>
+    internal int TestGateResultEmitCount { get; private set; }
+
+    internal int TestGateResultSuppressCount { get; private set; }
+
     /// <summary>Rate-limit identical post-flat release-blocker payloads per instrument.</summary>
     private readonly Dictionary<string, (int Hash, DateTimeOffset Utc)> _releaseBlockedAfterFlatTelemetry =
         new(StringComparer.OrdinalIgnoreCase);
@@ -521,7 +526,8 @@ public sealed class MismatchEscalationCoordinator
                 state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
                 state.Blocked = true;
                 state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
-                state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
+                if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
+                    state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
                 _mismatchPersistentCount++;
                 var p = ToGatePayload(state, inst, utcNow, obs, null, null);
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_PERSISTENT", p));
@@ -547,6 +553,53 @@ public sealed class MismatchEscalationCoordinator
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", failClosedPayload));
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", utcNow, failClosedPayload, "CRITICAL");
             }
+        }
+    }
+
+    private static bool IsStallLikeSkipReason(string? skipReason) =>
+        skipReason is "post_alignment_stall" or "throttle_cooldown" or "reconciliation_hysteresis"
+            or "reentry_loop_blocked" or "execution_cycle_cap_reached" or "hard_stop_active"
+            or "absolute_gate_lifetime_cap" or "skipped";
+
+    private static ulong BuildMaterialReadinessFingerprint(StateConsistencyReleaseReadinessResult r, MismatchType mt)
+    {
+        var c = r.Contradictions?.Count ?? 0;
+        unchecked
+        {
+            ulong h = 1469598103934665603UL;
+            void Mix(ulong x)
+            {
+                h ^= x;
+                h *= 1099511628211UL;
+            }
+
+            Mix(r.ReleaseReady ? 1UL : 0UL);
+            Mix((ulong)(uint)r.UnexplainedBrokerWorkingCount);
+            Mix((ulong)(uint)r.UnexplainedBrokerPositionQty);
+            Mix((ulong)(uint)c);
+            Mix((ulong)(uint)mt);
+            Mix(r.PendingAdoptionExists ? 1UL : 0UL);
+            return h;
+        }
+    }
+
+    private static ulong BuildStallQuietFingerprint(ulong externalFp, ulong materialFp, string? skipReason, int progressSigHash32)
+    {
+        unchecked
+        {
+            ulong h = 1469598103934665603UL;
+            void Mix(ulong x)
+            {
+                h ^= x;
+                h *= 1099511628211UL;
+            }
+
+            Mix(externalFp);
+            Mix(materialFp);
+            Mix((ulong)(uint)progressSigHash32);
+            if (!string.IsNullOrEmpty(skipReason))
+                Mix((ulong)StringComparer.Ordinal.GetHashCode(skipReason));
+            return h;
         }
     }
 
@@ -581,7 +634,8 @@ public sealed class MismatchEscalationCoordinator
             state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
             state.Blocked = true;
             state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
-            state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
+            if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
+                state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
             _mismatchPersistentCount++;
             var p = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
@@ -819,6 +873,26 @@ public sealed class MismatchEscalationCoordinator
             ? $"skip:{skipReason ?? "unspecified"}"
             : StateConsistencyAuditFormat.DescribeProgressChange(sigProbe, postSig);
 
+        var materialReadinessFp = BuildMaterialReadinessFingerprint(readiness, state.MismatchType);
+        var identicalStallCycle = skipExpensive && !externalFingerprintChanged && !progressChanged &&
+                                  IsStallLikeSkipReason(skipReason);
+        if (identicalStallCycle)
+        {
+            var stallQuietFp = BuildStallQuietFingerprint(fpNow, materialReadinessFp, skipReason, postSigHash);
+            if (stallQuietFp == gp.LastStallQuietFingerprint && gp.LastStallQuietFingerprint != 0)
+                gp.IdenticalSkippedEvaluationCount++;
+            else
+            {
+                gp.LastStallQuietFingerprint = stallQuietFp;
+                gp.IdenticalSkippedEvaluationCount = 1;
+            }
+        }
+        else
+        {
+            gp.IdenticalSkippedEvaluationCount = 0;
+            gp.LastStallQuietFingerprint = 0;
+        }
+
         var suppressQuietGateTelemetry = false;
         if (skipExpensive && !progressChanged)
         {
@@ -829,6 +903,26 @@ public sealed class MismatchEscalationCoordinator
                 suppressQuietGateTelemetry = true;
             else
                 _quietGateTelemetry[inst] = (quietHash, utcNow);
+            if (identicalStallCycle && gp.IdenticalSkippedEvaluationCount > 1)
+            {
+                suppressQuietGateTelemetry = true;
+                if (!gp.IdenticalStallSuppressionDebugLogged)
+                {
+                    gp.IdenticalStallSuppressionDebugLogged = true;
+                    var stallDbg = new
+                    {
+                        timestamp_utc = utcNow.ToString("o"),
+                        instrument = inst,
+                        skip_reason = skipReason,
+                        identical_skipped_count = gp.IdenticalSkippedEvaluationCount,
+                        external_fingerprint = fpNow,
+                        stall_quiet_fingerprint = gp.LastStallQuietFingerprint,
+                        note = "TEMP_DEBUG: identical skipped cycles suppressing RESULT/delta; remove when stable"
+                    };
+                    _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_STALL_SUPPRESSED_IDENTICAL_CYCLE", stallDbg));
+                    EmitCanonical(inst, "GATE_STALL_SUPPRESSED_IDENTICAL_CYCLE", utcNow, stallDbg, "INFO");
+                }
+            }
         }
 
         if (!suppressQuietGateTelemetry)
@@ -910,17 +1004,21 @@ public sealed class MismatchEscalationCoordinator
             resultTelemetry);
         if (!suppressQuietGateTelemetry)
         {
+            TestGateResultEmitCount++;
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", resultPayload));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECONCILIATION_RESULT", utcNow, resultPayload, "INFO");
         }
+        else
+            TestGateResultSuppressCount++;
 
         if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED ||
             state.GateLifecyclePhase == GateLifecyclePhase.FailClosed)
             return;
 
-        // Stronger block: no auto-release from persistent / fail-closed (P1.5 + existing escalation semantics).
-        if (state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH ||
-            state.GateLifecyclePhase == GateLifecyclePhase.PersistentMismatch)
+        // Fail-closed unchanged. Persistent mismatch blocks only while not release-ready; when ready, stability window + release still apply (no stuck-forever).
+        if ((state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH ||
+             state.GateLifecyclePhase == GateLifecyclePhase.PersistentMismatch) &&
+            !readiness.ReleaseReady)
             return;
 
         var windowMs = state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs;
@@ -948,10 +1046,30 @@ public sealed class MismatchEscalationCoordinator
         if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
         {
             state.GateLifecyclePhase = GateLifecyclePhase.StablePendingRelease;
-            state.FirstConsistentUtc = utcNow;
-            var spPayload = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness);
-            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", spPayload));
-            EmitCanonical(inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", utcNow, spPayload, "INFO");
+            var preserveStableClock = readiness.ReleaseReady && skipExpensive && !externalFingerprintChanged &&
+                                      IsStallLikeSkipReason(skipReason) && state.FirstConsistentUtc != default;
+            if (!preserveStableClock)
+                state.FirstConsistentUtc = utcNow;
+            if (preserveStableClock)
+            {
+                var clkDbg = new
+                {
+                    timestamp_utc = utcNow.ToString("o"),
+                    instrument = inst,
+                    first_consistent_utc = state.FirstConsistentUtc.ToString("o"),
+                    skip_reason = skipReason,
+                    external_fingerprint = fpNow,
+                    note = "TEMP_DEBUG: stable window timer not reset on unchanged stall eval; remove when stable"
+                };
+                _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_STABLE_CLOCK_PRESERVED", clkDbg));
+                EmitCanonical(inst, "GATE_STABLE_CLOCK_PRESERVED", utcNow, clkDbg, "INFO");
+            }
+            if (!preserveStableClock)
+            {
+                var spPayload = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness);
+                _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", spPayload));
+                EmitCanonical(inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", utcNow, spPayload, "INFO");
+            }
             return;
         }
 
@@ -961,6 +1079,12 @@ public sealed class MismatchEscalationCoordinator
 
         if (stableMs < windowMs)
             return;
+
+        var releaseCompletedUnderStall = skipExpensive && IsStallLikeSkipReason(skipReason);
+
+        var releaseSource = state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH
+            ? "persistent_recovery"
+            : "standard";
 
         state.Blocked = false;
         state.BlockReason = "";
@@ -982,10 +1106,26 @@ public sealed class MismatchEscalationCoordinator
         {
             gate = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness),
             stable_for_ms = stableMs,
-            stable_window_ms = windowMs
+            stable_window_ms = windowMs,
+            release_source = releaseSource
         };
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RELEASED", releasedPayload));
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASED", utcNow, releasedPayload, "INFO");
+        if (releaseCompletedUnderStall)
+        {
+            var underStallDbg = new
+            {
+                timestamp_utc = utcNow.ToString("o"),
+                instrument = inst,
+                skip_reason = skipReason,
+                stable_for_ms = stableMs,
+                stable_window_ms = windowMs,
+                release_source = releaseSource,
+                note = "TEMP_DEBUG: gate released while expensive recon skipped (stall); remove when stable"
+            };
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_RELEASE_COMPLETED_UNDER_STALL", underStallDbg));
+            EmitCanonical(inst, "GATE_RELEASE_COMPLETED_UNDER_STALL", utcNow, underStallDbg, "INFO");
+        }
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED", ToGatePayload(state, inst, utcNow, obsForSig, null, null)));
     }
 
@@ -1494,13 +1634,28 @@ public sealed class MismatchEscalationCoordinator
         _stateByInstrument.TryGetValue(instrument, out var s) ? s : null;
 
     /// <summary>For P1.5 tests: advance gate for one instrument (same as audit tail).</summary>
-    internal void AdvanceStateConsistencyGateForTest(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow) =>
-        AdvanceStateConsistencyGate(instrument.Trim(), snapshot, utcNow, null);
+    internal void AdvanceStateConsistencyGateForTest(string instrument, AccountSnapshot snapshot, DateTimeOffset utcNow,
+        MismatchObservation? observation = null) =>
+        AdvanceStateConsistencyGate(instrument.Trim(), snapshot, utcNow, observation);
 
     internal void SetStableWindowForTest(int ms)
     {
         foreach (var kv in _stateByInstrument)
             kv.Value.StableWindowMsApplied = ms;
+    }
+
+    internal void SetForcedConvergenceStallForTest(string instrument, bool succeeded, ulong postAlignmentFingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        if (!_stateByInstrument.TryGetValue(instrument.Trim(), out var s)) return;
+        s.ForcedConvergenceSucceeded = succeeded;
+        s.PostForcedConvergenceFingerprint = postAlignmentFingerprint;
+    }
+
+    internal void ResetTestGateTelemetryCounters()
+    {
+        TestGateResultEmitCount = 0;
+        TestGateResultSuppressCount = 0;
     }
 
     public void EmitMetrics(DateTimeOffset utcNow)

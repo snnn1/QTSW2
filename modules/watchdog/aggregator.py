@@ -12,10 +12,11 @@ INGESTION INVARIANTS (WATCHDOG_INGESTION_HARDENING):
 import json
 import logging
 import re
+import sys
 import asyncio
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict, deque
 import pytz
@@ -24,6 +25,7 @@ from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
+from .market_calendar import get_market_state
 from .config import (
     ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
     ALERT_STARTUP_GRACE_SECONDS,
@@ -60,6 +62,161 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+
+def _resolve_watchdog_info_for_timetable_row(
+    stream_states_dict: Dict[Tuple[str, str], Any],
+    current_trading_date: str,
+    stream_id: str,
+) -> Any:
+    """
+    Prefer (current_trading_date, stream_id); if missing, attach state from the latest prior session
+    key (same stream_id, different trading_date) so carry-over OPEN / RANGE_LOCKED is not dropped.
+    """
+    info = stream_states_dict.get((current_trading_date, stream_id))
+    if info is not None:
+        return info
+    best_td: Optional[str] = None
+    best_info: Any = None
+    for (td, sid), st in stream_states_dict.items():
+        if sid != stream_id or td == current_trading_date:
+            continue
+        if best_td is None or td > best_td:
+            best_td = td
+            best_info = st
+    return best_info
+
+
+def _slot_end_no_trade_expectation_gap(
+    watchdog_info: Any,
+    current_trading_date: str,
+    stream_id: str,
+    instrument: str,
+    session: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Expected-vs-actual (v1): ``SLOT_END_SUMMARY`` sets ``trade_executed=False`` when the robot
+    finished the slot cycle without a fill. Only flag when state is for **current_trading_date**
+    (avoids attributing a prior session's summary to today's timetable row).
+    """
+    if watchdog_info is None:
+        return None
+    wtd = getattr(watchdog_info, "trading_date", None)
+    if wtd != current_trading_date:
+        return None
+    if getattr(watchdog_info, "trade_executed", None) is not False:
+        return None
+    return {
+        "stream_id": stream_id,
+        "trading_date": current_trading_date,
+        "instrument": instrument or "",
+        "session": session or "",
+        "watchdog_state": getattr(watchdog_info, "state", "") or "",
+        "gap_type": "slot_end_no_trade",
+        "trade_executed": False,
+        "slot_reason": getattr(watchdog_info, "slot_reason", None),
+        "expected": "trade_in_slot",
+        "actual": "none_executed",
+        "detail": "Robot SLOT_END_SUMMARY reported trade_executed=false for this session day.",
+    }
+
+
+def _slot_wall_datetime_chicago(trading_date: str, slot_time_raw: Any) -> Optional[datetime]:
+    """
+    Timetable slot instant on ``trading_date`` in America/Chicago (wall clock).
+    Accepts ``HH:MM``, ``HH:MM:SS``, or ISO strings containing ``T``.
+    """
+    if not trading_date or slot_time_raw is None:
+        return None
+    raw = str(slot_time_raw).strip()
+    if not raw:
+        return None
+    if "T" in raw:
+        try:
+            dtv = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dtv.astimezone(CHICAGO_TZ)
+        except ValueError:
+            return None
+    segs = raw.replace(" ", "").split(":")
+    try:
+        h = int(segs[0])
+        mi = int(segs[1]) if len(segs) > 1 else 0
+        sec = int(segs[2]) if len(segs) > 2 else 0
+    except (ValueError, IndexError):
+        return None
+    try:
+        y, mo, d = (int(x) for x in trading_date.split("-"))
+    except ValueError:
+        return None
+    naive = datetime(y, mo, d, h, mi, sec)
+    for dst_flag in (None, True, False):
+        try:
+            return CHICAGO_TZ.localize(naive, is_dst=dst_flag)  # type: ignore[arg-type]
+        except (pytz.AmbiguousTimeError, pytz.NonExistentTimeError):
+            continue
+    return None
+
+
+def _chicago_now_past_timetable_slot(
+    trading_date: str,
+    slot_time_raw: Any,
+    now_chicago: Optional[datetime] = None,
+) -> bool:
+    slot_dt = _slot_wall_datetime_chicago(trading_date, slot_time_raw)
+    if slot_dt is None:
+        return False
+    ref = now_chicago or datetime.now(CHICAGO_TZ)
+    if ref.tzinfo is None:
+        ref = CHICAGO_TZ.localize(ref)
+    return ref >= slot_dt
+
+
+def _slot_missing_summary_expectation_gap(
+    stream_states_dict: Dict[Tuple[str, str], Any],
+    current_trading_date: str,
+    stream_id: str,
+    instrument: str,
+    session: str,
+    slot_time_raw: Any,
+    *,
+    now_chicago: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    v2: Timetable ``slot_time`` on ``current_trading_date`` has passed (Chicago) and the robot
+    has not applied any SLOT_END_SUMMARY for this stream/day (``trade_executed`` still unknown).
+
+    Uses **only** today's ``(trading_date, stream_id)`` key for ``trade_executed`` so prior-session
+    fallback state never satisfies or suppresses this check. Mutually exclusive with v1
+    (``slot_end_no_trade``), which requires ``trade_executed is False``.
+    """
+    info_today = stream_states_dict.get((current_trading_date, stream_id))
+    if info_today is None:
+        return None
+    if getattr(info_today, "trade_executed", None) is not None:
+        return None
+    if not _chicago_now_past_timetable_slot(current_trading_date, slot_time_raw, now_chicago):
+        return None
+    slot_chicago = _slot_wall_datetime_chicago(current_trading_date, slot_time_raw)
+    slot_iso = slot_chicago.isoformat() if slot_chicago else None
+    return {
+        "stream_id": stream_id,
+        "trading_date": current_trading_date,
+        "instrument": instrument or "",
+        "session": session or "",
+        "watchdog_state": getattr(info_today, "state", "") or "",
+        "gap_type": "slot_missing_summary",
+        "trade_executed": None,
+        "slot_reason": getattr(info_today, "slot_reason", None),
+        "expected": "slot_end_summary",
+        "actual": "not_received",
+        "timetable_slot_time": str(slot_time_raw).strip() if slot_time_raw is not None else "",
+        "slot_boundary_chicago": slot_iso,
+        "detail": (
+            "Chicago wall time is past timetable slot_time and trade_executed is still unset "
+            "(no SLOT_END_SUMMARY applied for this stream on this trading_date)."
+        ),
+    }
+
 
 # Execution policy path for canonical->execution instrument lookup
 _EXECUTION_POLICY_PATH = Path(__file__).parent.parent.parent / "configs" / "execution_policy.json"
@@ -383,6 +540,62 @@ class WatchdogAggregator:
 
         # Phase 9: Metrics history snapshots every 6 hours
         self._last_metrics_snapshot_utc: Optional[datetime] = None
+
+        # CME session rollover + startup alignment: matrix + timetable via maintenance script (non-blocking)
+        self._last_seen_cme_day: Optional[str] = None
+        self._matrix_pipeline_task: Optional[asyncio.Task] = None
+        self._cme_startup_timetable_check_done: bool = False
+
+        # Timetable drift: edge-triggered alert / log transitions
+        self._prev_timetable_drift: Optional[bool] = None
+
+    def _get_startup_timetable_session_and_replay(self) -> Tuple[Optional[str], bool]:
+        """
+        Load timetable_current.json once for startup check.
+        Returns (session_trading_date or None if missing/invalid, is_replay).
+        When is_replay is True, skip live startup matrix sync (same as timetable_auto_roll).
+        """
+        try:
+            from .config import QTSW2_ROOT
+
+            path = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+            if not path.is_file():
+                return None, False
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(doc, dict):
+                return None, False
+            if doc.get("replay") is True:
+                return None, True
+            meta = doc.get("metadata")
+            if isinstance(meta, dict) and meta.get("replay") is True:
+                return None, True
+            sd = doc.get("session_trading_date") or doc.get("trading_date")
+            if sd is None:
+                return None, False
+            s = str(sd).strip()
+            return (s if s else None), False
+        except Exception:
+            return None, False
+
+    def _schedule_matrix_pipeline_if_idle(
+        self, cme_session_date: str, *, retry_on_failure: bool
+    ) -> None:
+        if self._matrix_pipeline_task and not self._matrix_pipeline_task.done():
+            logger.warning(
+                "MATRIX_PIPELINE_SKIPPED: previous run still in progress (new_cme_day=%s)",
+                cme_session_date,
+            )
+            return
+
+        async def _wrapped() -> None:
+            try:
+                await self._run_matrix_pipeline_subprocess(
+                    cme_session_date, retry_on_failure=retry_on_failure
+                )
+            except Exception as e:
+                logger.error("MATRIX_PIPELINE_FAILED: unexpected error: %s", e, exc_info=True)
+
+        self._matrix_pipeline_task = asyncio.create_task(_wrapped())
     
     async def start(self):
         """Start the aggregator service."""
@@ -447,7 +660,7 @@ class WatchdogAggregator:
                     if tick_ts.tzinfo is None:
                         tick_ts = tick_ts.replace(tzinfo=timezone.utc)
                     age_sec = (datetime.now(timezone.utc) - tick_ts).total_seconds()
-                    last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
+                    last_inv = self._state_manager.get_last_invalidate_utc()
                     if last_inv and tick_ts <= last_inv:
                         logger.info(f"Skipped tick on init: tick predates startup (tick_ts <= _last_invalidate_utc)")
                     elif age_sec <= ENGINE_TICK_MAX_AGE_FOR_INIT_SECONDS:
@@ -948,6 +1161,118 @@ class WatchdogAggregator:
                 logger.error(f"Error in event processing loop: {e}", exc_info=True)
                 await asyncio.sleep(5)  # Wait longer on error
     
+    def _maybe_schedule_matrix_pipeline_on_cme_rollover(self, utc_now: datetime) -> None:
+        """Startup timetable vs CME check (once); then CME rollover transitions. Non-blocking pipeline."""
+        from modules.timetable.cme_session import get_cme_trading_date
+
+        current = get_cme_trading_date(utc_now)
+
+        if not self._cme_startup_timetable_check_done:
+            self._cme_startup_timetable_check_done = True
+            timetable_day, replay_doc = self._get_startup_timetable_session_and_replay()
+
+            if not replay_doc:
+                from modules.timetable.cme_session import resolve_live_execution_session_trading_date
+
+                if timetable_day is None:
+                    eff = None
+                    needs_pipeline = True
+                else:
+                    eff, _ = resolve_live_execution_session_trading_date(
+                        timetable_day, utc_now, is_replay_document=False
+                    )
+                    needs_pipeline = eff != current
+                if needs_pipeline:
+                    logger.info(
+                        "STARTUP_TIMETABLE_OUT_OF_DATE: expected_cme_day=%s timetable_file_session=%s "
+                        "effective_session=%s",
+                        current,
+                        timetable_day,
+                        eff,
+                    )
+                    # Same as rollover: one subprocess retry after ~90s if the first attempt fails (unattended recovery).
+                    self._schedule_matrix_pipeline_if_idle(current, retry_on_failure=True)
+            self._last_seen_cme_day = current
+            return
+
+        if current == self._last_seen_cme_day:
+            return
+
+        prev = self._last_seen_cme_day
+        self._last_seen_cme_day = current
+        logger.info(
+            "CME_SESSION_ROLLOVER_TRIGGERED: previous_cme_day=%s new_cme_day=%s",
+            prev,
+            current,
+        )
+        self._schedule_matrix_pipeline_if_idle(current, retry_on_failure=True)
+
+    async def _run_matrix_pipeline_subprocess(
+        self, cme_session_date: str, *, retry_on_failure: bool = True
+    ) -> None:
+        """Run scripts/maintenance/run_matrix_and_timetable.py; log outcome. Optional retry after ~90s on failure."""
+        from .config import QTSW2_ROOT
+
+        script = QTSW2_ROOT / "scripts" / "maintenance" / "run_matrix_and_timetable.py"
+        if not script.is_file():
+            logger.error("MATRIX_PIPELINE_FAILED: script not found: %s", script)
+            return
+
+        cmd = [
+            sys.executable,
+            str(script),
+            "--resequence",
+            "--date",
+            cme_session_date,
+        ]
+
+        async def _once(attempt_label: str) -> int:
+            logger.info(
+                "MATRIX_PIPELINE_STARTED: cme_session_date=%s attempt=%s cmd=%s",
+                cme_session_date,
+                attempt_label,
+                " ".join(cmd),
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(QTSW2_ROOT),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except Exception as e:
+                logger.error(
+                    "MATRIX_PIPELINE_FAILED: failed to start subprocess: %s attempt=%s",
+                    e,
+                    attempt_label,
+                    exc_info=True,
+                )
+                return -1
+
+            stdout, _ = await proc.communicate()
+            out = (stdout or b"").decode("utf-8", errors="replace")
+            if proc.returncode != 0:
+                tail = out[-4000:] if len(out) > 4000 else out
+                logger.error(
+                    "MATRIX_PIPELINE_FAILED: returncode=%s cme_session_date=%s attempt=%s output_tail=%r",
+                    proc.returncode,
+                    cme_session_date,
+                    attempt_label,
+                    tail,
+                )
+            else:
+                logger.info(
+                    "MATRIX_PIPELINE_COMPLETED: cme_session_date=%s attempt=%s",
+                    cme_session_date,
+                    attempt_label,
+                )
+            return proc.returncode if proc.returncode is not None else -1
+
+        rc = await _once("1")
+        if rc != 0 and retry_on_failure:
+            await asyncio.sleep(90)
+            await _once("2")
+
     async def _poll_timetable_loop(self):
         """Poll timetable every 60 seconds. Never throws, never blocks event loop."""
         previous_trading_date = None
@@ -955,63 +1280,94 @@ class WatchdogAggregator:
         while self._running:
             try:
                 utc_now = datetime.now(timezone.utc)
-                trading_date, enabled_streams_set, timetable_hash, enabled_streams_metadata = self._timetable_poller.poll()
-                
-                # CRITICAL: Extract trading_date from timetable (fallback to CME rollover if unavailable)
-                # Trading date from timetable is authoritative - matches what robot uses
-                if trading_date:
-                    previous_trading_date = self._state_manager.get_trading_date()
-                    
-                    # Update state manager (always updates trading_date, conditionally updates enabled_streams)
+                self._maybe_schedule_matrix_pipeline_on_cme_rollover(utc_now)
+                (
+                    trading_date,
+                    enabled_streams_set,
+                    timetable_hash,
+                    enabled_streams_metadata,
+                    timetable_file_source,
+                    enabled_streams_ordered,
+                    timetable_identity_hash,
+                ) = self._timetable_poller.poll()
+                enabled_streams_unknown = enabled_streams_set is None
+
+                if not trading_date:
                     self._state_manager.update_timetable_streams(
-                        enabled_streams_set, trading_date, timetable_hash, utc_now,
-                        enabled_streams_metadata=enabled_streams_metadata
+                        None,
+                        None,
+                        None,
+                        utc_now,
+                        None,
+                        timetable_file_source=None,
+                        enabled_streams_unknown=True,
+                        enabled_streams_ordered=None,
                     )
-                    
-                    # CRITICAL FIX: Detect day rollover by TIME comparison, NOT hash change
-                    # Hash change ≠ day change. Day rollover happens at 17:00 CT every day,
-                    # even if timetable file content is unchanged.
+                else:
+                    previous_trading_date = self._state_manager.get_trading_date()
+
+                    self._state_manager.update_timetable_streams(
+                        enabled_streams_set,
+                        trading_date,
+                        timetable_hash,
+                        utc_now,
+                        enabled_streams_metadata=enabled_streams_metadata,
+                        timetable_file_source=timetable_file_source,
+                        enabled_streams_unknown=enabled_streams_unknown,
+                        enabled_streams_ordered=enabled_streams_ordered,
+                        timetable_identity_hash=timetable_identity_hash,
+                    )
+
+                    # Day rollover: compare prior timetable session to current (CME roll is reflected when
+                    # matrix publishes a new session_trading_date). Hash change ≠ session change.
                     if previous_trading_date and previous_trading_date != trading_date:
-                        # Refinement 1: Explicit trading_date change event (first-class lifecycle event)
                         logger.info(
                             f"WATCHDOG_TRADING_DATE_CHANGED: old_date={previous_trading_date}, "
                             f"new_date={trading_date}, source=timetable. "
                             f"This triggers stream cleanup and UI reset."
                         )
-                        # Day rollover detected - cleanup stale streams aggressively
-                        # Use clear_all_for_date=True to ensure all old states are removed immediately
-                        streams_before = len(self._state_manager._stream_states)
+                        streams_before = len(self._state_manager.get_stream_states())
                         self._state_manager.cleanup_stale_streams(
                             trading_date, utc_now, clear_all_for_date=True
                         )
-                        streams_after = len(self._state_manager._stream_states)
+                        streams_after = len(self._state_manager.get_stream_states())
                         logger.info(
                             f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}, "
                             f"cleaned up {streams_before - streams_after} stale stream(s)"
                         )
-                        # Hydrate from journals so carry-over positions are visible
                         self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
-                    
-                    # Hash change detection (separate from day rollover)
-                    # Only used for enabled_streams updates, not day changes
+
                     if timetable_hash and timetable_hash != self._state_manager.get_timetable_hash():
-                        # Timetable content changed (enabled streams may have changed)
-                        # This is logged in timetable_poller.py
                         pass
-                    
-                    # Note: TIMETABLE_POLL_OK is now logged in timetable_poller.py with trading_date source
-                    # Only log here if timetable unavailable (enabled_streams_set is None)
-                    if enabled_streams_set is None:
-                        logger.warning(
-                            f"TIMETABLE_POLL_FAIL: trading_date={trading_date}, "
-                            f"but timetable file missing/invalid (fail-open mode)"
-                        )
+
+                from modules.timetable.timetable_auto_roll import ensure_current_session_timetable
+                from modules.watchdog.config import QTSW2_ROOT
+
+                ensure_current_session_timetable(QTSW2_ROOT)
+
+                # Data-driven market session (holidays JSON); logs MARKET_STATE_CHANGE on transitions
+                get_market_state(log_transition=True)
             except Exception as e:
-                # Never throw - log and continue
-                # Keep last known good enabled_streams on failure
+                # Never throw - log and continue (poller errors return Nones and clear stale streams).
                 logger.error(f"TIMETABLE_POLL_FAIL: Unexpected error: {e}", exc_info=True)
-            
-            await asyncio.sleep(60)
+
+            # Sleep up to 60s, but poll again sooner if canonical CME session day rolls (18:00 Chicago).
+            from modules.timetable.cme_session import get_cme_trading_date
+
+            deadline = time.monotonic() + 60.0
+            while self._running and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(10.0, remaining))
+                try:
+                    utc_probe = datetime.now(timezone.utc)
+                    cme_probe = get_cme_trading_date(utc_probe)
+                    anchor = self._last_seen_cme_day
+                    if anchor is not None and cme_probe != anchor:
+                        break
+                except Exception:
+                    pass
 
     async def _process_monitor_loop(self):
         """Poll NinjaTrader process every 30 seconds. Raise/resolve process alerts."""
@@ -1025,10 +1381,10 @@ class WatchdogAggregator:
                     market_open = is_market_open(now)
                     now_utc = datetime.now(timezone.utc)
                     active_intent_count = len([
-                        e for e in self._state_manager._intent_exposures.values()
+                        e for e in self._state_manager.get_intent_exposures().values()
                         if getattr(e, "state", "") == "ACTIVE"
                     ])
-                    last_tick = getattr(self._state_manager, "_last_engine_heartbeat", None) or self._state_manager._last_engine_tick_utc
+                    last_tick = self._state_manager.get_last_engine_heartbeat() or self._state_manager.get_last_engine_tick_utc()
                     self._process_monitor.check(market_open, active_intent_count, last_tick)
 
                     # Grace: no process-down alert in first 60s
@@ -1095,10 +1451,10 @@ class WatchdogAggregator:
         chicago_now = datetime.now(CHICAGO_TZ)
         market_open = is_market_open(chicago_now)
         active_intent_count = len([
-            e for e in self._state_manager._intent_exposures.values()
+            e for e in self._state_manager.get_intent_exposures().values()
             if getattr(e, "state", "") == "ACTIVE"
         ])
-        last_tick = getattr(self._state_manager, "_last_engine_heartbeat", None) or self._state_manager._last_engine_tick_utc
+        last_tick = self._state_manager.get_last_engine_heartbeat() or self._state_manager.get_last_engine_tick_utc()
         window_open = is_supervision_window_open(market_open, active_intent_count, last_tick, now_utc)
 
         if not window_open:
@@ -1107,7 +1463,7 @@ class WatchdogAggregator:
         # ROBOT_HEARTBEAT_LOST: engine_alive=False, severity HIGH, suppress if process-down already active
         status = self._state_manager.compute_watchdog_status()
         engine_alive = status.get("engine_alive", True)
-        last_tick_utc = self._state_manager._last_engine_tick_utc
+        last_tick_utc = self._state_manager.get_last_engine_tick_utc()
         heartbeat_lost_seconds = (
             (now_utc - last_tick_utc).total_seconds()
             if last_tick_utc else 0
@@ -1163,8 +1519,8 @@ class WatchdogAggregator:
 
         # CONNECTION_LOST_SUSTAINED: connection_status=ConnectionLost for >= 60s, severity HIGH
         # Suppressed when suppress_robot_overlap.CONNECTION_LOST_SUSTAINED=true (Robot sends CONNECTION_LOST)
-        connection_status = getattr(self._state_manager, "_connection_status", "").lower()
-        last_conn_utc = getattr(self._state_manager, "_last_connection_event_utc", None)
+        connection_status = self._state_manager.get_connection_status().lower()
+        last_conn_utc = self._state_manager.get_last_connection_event_utc()
         if "connectionlost" in connection_status or "lost" in connection_status:
             if (last_conn_utc and (now_utc - last_conn_utc).total_seconds() >= 60
                     and not self._notification_service.is_alert_suppressed("CONNECTION_LOST_SUSTAINED")):
@@ -1307,6 +1663,51 @@ class WatchdogAggregator:
             self._log_file_stall_started_utc = None
             self._notification_service.resolve_alert("LOG_FILE_STALLED")
 
+        # Timetable version drift (robot heartbeat vs timetable_current.json identity)
+        status_td = self._state_manager.compute_watchdog_status()
+        drift_now = bool(status_td.get("timetable_drift"))
+        prev = self._prev_timetable_drift
+        if prev is None:
+            prev = False
+        if drift_now and not prev:
+            robot_h = status_td.get("robot_timetable_hash")
+            publisher_h = status_td.get("timetable_publisher_hash") or status_td.get("current_timetable_hash")
+            trading_d = (
+                status_td.get("trading_date")
+                or self._state_manager.get_trading_date()
+                or self._state_manager._latest_robot_trading_date
+            )
+            logger.warning(
+                "TIMETABLE_VERSION_DRIFT_DETECTED: robot_timetable_hash=%s timetable_publisher_hash=%s trading_date=%s",
+                robot_h,
+                publisher_h,
+                trading_d,
+            )
+            self._notification_service.raise_alert(
+                alert_type="TIMETABLE_DRIFT",
+                severity="critical",
+                context={
+                    "robot_timetable_hash": robot_h,
+                    "timetable_publisher_hash": publisher_h,
+                    "trading_date": trading_d,
+                    "event": "TIMETABLE_VERSION_DRIFT_DETECTED",
+                },
+                dedupe_key="TIMETABLE_DRIFT",
+                min_resend_interval_seconds=0,
+            )
+        elif not drift_now and prev:
+            logger.info(
+                "TIMETABLE_VERSION_DRIFT_RESOLVED: robot_timetable_hash=%s timetable_publisher_hash=%s",
+                status_td.get("robot_timetable_hash"),
+                status_td.get("timetable_publisher_hash") or status_td.get("current_timetable_hash"),
+            )
+            self._notification_service.resolve_alert("TIMETABLE_DRIFT")
+            self._notification_service.send_restored_notification(
+                "[Watchdog] Timetable drift resolved",
+                "Robot timetable identity matches the system timetable again.",
+            )
+        self._prev_timetable_drift = drift_now
+
     def _cleanup_stale_streams_periodic(self):
         """Periodically clean up stale streams (runs every 60 seconds)."""
         try:
@@ -1323,9 +1724,9 @@ class WatchdogAggregator:
                 )
             
             utc_now = datetime.now(timezone.utc)
-            streams_before = len(self._state_manager._stream_states)
+            streams_before = len(self._state_manager.get_stream_states())
             self._state_manager.cleanup_stale_streams(current_trading_date, utc_now)
-            streams_after = len(self._state_manager._stream_states)
+            streams_after = len(self._state_manager.get_stream_states())
             if streams_before != streams_after:
                 logger.info(
                     f"_cleanup_stale_streams_periodic: Cleaned up {streams_before - streams_after} stream(s) "
@@ -1389,18 +1790,18 @@ class WatchdogAggregator:
                     logger.info(f"Advanced cursor to tail (mid-run recovery): {cursor}")
 
             # Rebuilds from snapshot (no second read)
-            if len(self._state_manager._stream_states) == 0:
+            if len(self._state_manager.get_stream_states()) == 0:
                 logger.info("State manager is empty - rebuilding stream states from snapshot")
                 self._rebuild_stream_states_from_snapshot(parsed_events)
             
             # Check if connection status needs initialization - rebuild from recent events
             # Skip when we've invalidated (no heartbeat): tail has stale CONNECTION_LOST that would
             # overwrite Unknown with ConnectionLost, causing false BROKER DISCONNECTED at login.
-            last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
-            has_heartbeat = self._state_manager._last_engine_heartbeat is not None
+            last_inv = self._state_manager.get_last_invalidate_utc()
+            has_heartbeat = self._state_manager.get_last_engine_heartbeat() is not None
             if (
-                (self._state_manager._connection_status == "Unknown"
-                 or self._state_manager._last_connection_event_utc is None)
+                (self._state_manager.get_connection_status() == "Unknown"
+                 or self._state_manager.get_last_connection_event_utc() is None)
                 and not (last_inv and not has_heartbeat)
             ):
                 logger.info("Connection status needs initialization - rebuilding from snapshot")
@@ -1418,7 +1819,7 @@ class WatchdogAggregator:
                         if tick_ts.tzinfo is None:
                             tick_ts = tick_ts.replace(tzinfo=timezone.utc)
                         tick_age_sec = (cycle_start_utc - tick_ts).total_seconds()
-                        current_tick_utc = self._state_manager._last_engine_tick_utc
+                        current_tick_utc = self._state_manager.get_last_engine_tick_utc()
                         # Update when: (a) no tick yet, or (b) this tick is newer than current
                         # For init: also require tick_age <= 15s to avoid stale ticks from previous run
                         # For ongoing: require tick_age <= 60s so stale ticks don't refresh heartbeat at login
@@ -1428,7 +1829,7 @@ class WatchdogAggregator:
                             should_update = False  # Init: reject stale ticks
                         if current_tick_utc and tick_age_sec > ENGINE_TICK_STALL_THRESHOLD_SECONDS:
                             should_update = False  # Ongoing: reject stale ticks (prevents green at login)
-                        last_inv = getattr(self._state_manager, "_last_invalidate_utc", None)
+                        last_inv = self._state_manager.get_last_invalidate_utc()
                         if last_inv and tick_ts <= last_inv:
                             should_update = False  # Reject ticks from before we invalidated (user was at login)
                         if should_update:
@@ -1828,10 +2229,11 @@ class WatchdogAggregator:
                 )
                 # Process this event to rebuild the connection status
                 self._event_processor.process_event(latest_connection_event)
+                _last_conn_evt = self._state_manager.get_last_connection_event_utc()
                 logger.info(
                     f"Rebuilt connection status from recent event: "
-                    f"status={self._state_manager._connection_status}, "
-                    f"last_event_utc={self._state_manager._last_connection_event_utc.isoformat() if self._state_manager._last_connection_event_utc else None}"
+                    f"status={self._state_manager.get_connection_status()}, "
+                    f"last_event_utc={_last_conn_evt.isoformat() if _last_conn_evt else None}"
                 )
             else:
                 logger.info("No connection events found in recent feed - keeping connection status Unknown")
@@ -2054,7 +2456,12 @@ class WatchdogAggregator:
         return build_operator_snapshot(events, self._state_manager)
 
     def get_watchdog_status(self) -> Dict:
-        """Get current watchdog status."""
+        """Get current watchdog status.
+
+        The dict always includes execution-safety fields for the UI severity model:
+        execution_safe, kill_switch_active, reconciliation_gate_state, recovery_state,
+        adoption_grace_expired_active (see WatchdogStateManager.compute_watchdog_status).
+        """
         try:
             status = self._state_manager.compute_watchdog_status()
             status["timestamp_chicago"] = datetime.now(CHICAGO_TZ).isoformat()
@@ -2070,6 +2477,10 @@ class WatchdogAggregator:
                     status["engine_activity_state"] = "STALLED"
                     status["engine_activity_classification"] = "STALLED"
                     status["engine_tick_stall_detected"] = True
+                    status["execution_safe"] = False
+                    status["timetable_drift"] = False
+                    status["robot_timetable_hash"] = None
+                    status["robot_timetable_observed_chicago"] = None
                     # Invalidate heartbeat so we don't show ENGINE ALIVE at login (stale heartbeat)
                     self._state_manager.invalidate_engine_liveness()
                     # Don't show Connected when process is down (stale ticks may have set it)
@@ -2164,6 +2575,12 @@ class WatchdogAggregator:
                 status["active_alerts"] = []
             # Persist critical status snapshots for post-incident analysis
             _maybe_persist_status_snapshot(status)
+            status["snapshot_utc"] = datetime.now(timezone.utc).isoformat()
+            # Align with /stream-states: UI and execution_severity can rely on /status alone
+            _esu = self._state_manager.get_enabled_streams_unknown()
+            _ens = self._state_manager.get_enabled_streams()
+            status["enabled_streams_unknown"] = _esu
+            status["timetable_unavailable"] = bool(_esu or _ens is None)
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -2177,6 +2594,7 @@ class WatchdogAggregator:
                 market_open = False  # Safe default if market session check fails
             
             return {
+                "snapshot_utc": datetime.now(timezone.utc).isoformat(),
                 "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
                 "engine_alive": False,
                 "engine_activity_state": "STALLED",
@@ -2184,6 +2602,7 @@ class WatchdogAggregator:
                 "engine_tick_stall_detected": True,
                 "recovery_state": "UNKNOWN",
                 "kill_switch_active": False,
+                "execution_safe": False,
                 "connection_status": "Unknown",
                 "last_connection_event_chicago": None,
                 "stuck_streams": [],
@@ -2192,6 +2611,9 @@ class WatchdogAggregator:
                 "data_stall_detected": {},
                 "market_open": market_open,
                 "active_alerts": [],
+                "timetable_source": None,
+                "enabled_streams_unknown": True,
+                "timetable_unavailable": True,
             }
     
     def get_ingestion_stats(self) -> Dict:
@@ -2293,13 +2715,22 @@ class WatchdogAggregator:
     
     def get_stream_states(self) -> Dict:
         """
-        Get current stream states, merging timetable data with watchdog state data.
-        
-        Returns all enabled streams from timetable, with watchdog state data merged in.
-        If timetable unavailable, falls back to showing only streams with watchdog state.
+        Stream table rows are exactly timetable-enabled streams from timetable_current.json (order preserved).
+
+        ``streams`` remains timetable-only (no merging of off-timetable positions). Active exposures whose
+        ``stream_id`` is not on today's timetable are listed separately in
+        ``out_of_timetable_active_streams`` for risk visibility.
+
+        ``execution_expectation_gaps`` may include: (v1) ``slot_end_no_trade`` —
+        ``_slot_end_no_trade_expectation_gap``; (v2) ``slot_missing_summary`` — past timetable
+        ``slot_time`` (Chicago) with no ``SLOT_END_SUMMARY`` yet (``trade_executed`` unset on today's
+        state key); see ``_slot_missing_summary_expectation_gap``.
         """
-        streams = []
+        streams: List[Dict[str, Any]] = []
+        out_of_timetable_active_streams: List[Dict[str, Any]] = []
+        execution_expectation_gaps: List[Dict[str, Any]] = []
         timetable_unavailable = False
+        enabled_streams: Optional[Set[str]] = None
         
         try:
             # Hydrate stream states from slot journals when event-derived state is missing (throttled 30s)
@@ -2334,107 +2765,142 @@ class WatchdogAggregator:
                 timetable_unavailable = True  # Flag for UI warning
             
             # Get watchdog state data
-            stream_states_dict = getattr(self._state_manager, '_stream_states', {})
+            stream_states_dict = self._state_manager.get_stream_states()
+
+            # Row-level tradability: same execution_safe as GET /api/watchdog/status (includes process check)
+            try:
+                _status_snap = self.get_watchdog_status()
+                system_tradable_now = bool(_status_snap.get("execution_safe"))
+            except Exception:
+                system_tradable_now = False
             
-            # Timetable-driven list: whenever the poller loaded timetable_current.json (enabled_streams is not None),
-            # enumerate exactly those enabled stream ids. Do NOT require non-empty metadata dict — an empty dict
-            # must still list enabled streams (metadata keys missing => infer instrument/session from stream id).
-            # Do NOT treat "zero enabled streams today" as "timetable unavailable" (old bug: falsy set skipped this branch).
+            # Timetable-driven list only: enabled_streams comes from timetable_current.json (never all watchdog streams).
             if enabled_streams is not None:
                 meta = timetable_streams_metadata or {}
-                if enabled_streams:
-                    for stream_id in sorted(enabled_streams):
-                        timetable_meta = meta.get(stream_id, {})
+                stream_order = [
+                    sid
+                    for sid in self._state_manager.get_enabled_streams_ordered()
+                    if sid in enabled_streams
+                ]
+                if len(stream_order) != len(enabled_streams):
+                    logger.warning(
+                        "WATCHDOG_TIMETABLE_STREAM_MISMATCH: timetable_order_len=%s enabled_set_len=%s "
+                        "(appending missing ids in sorted order)",
+                        len(stream_order),
+                        len(enabled_streams),
+                    )
+                    for sid in sorted(enabled_streams - set(stream_order)):
+                        stream_order.append(sid)
+                if enabled_streams and not stream_order:
+                    stream_order = sorted(enabled_streams)
+                for stream_id in stream_order:
+                    timetable_meta = meta.get(stream_id, {})
 
-                        # Get watchdog state if available
-                        watchdog_key = (current_trading_date, stream_id)
-                        watchdog_info = stream_states_dict.get(watchdog_key)
+                    # Prefer today's key; fall back to prior session (same stream_id) for carry-over state
+                    watchdog_info = _resolve_watchdog_info_for_timetable_row(
+                        stream_states_dict, current_trading_date, stream_id
+                    )
 
-                        # Use timetable data for: stream, instrument, session, slot_time
-                        instrument = (timetable_meta.get('instrument', '') or "").strip() or _canonical_from_stream_id(stream_id)
-                        session = (timetable_meta.get('session', '') or "").strip() or _session_from_stream_id(stream_id)
-                        slot_time = timetable_meta.get('slot_time', '')
+                    # Use timetable data for: stream, instrument, session, slot_time
+                    instrument = (timetable_meta.get('instrument', '') or "").strip() or _canonical_from_stream_id(stream_id)
+                    session = (timetable_meta.get('session', '') or "").strip() or _session_from_stream_id(stream_id)
+                    slot_time = timetable_meta.get('slot_time', '')
 
-                        # Format slot_time as "HH:MM" if it's not already formatted
-                        slot_time_chicago = None
-                        if slot_time:
-                            slot_time_chicago = slot_time
+                    # Format slot_time as "HH:MM" if it's not already formatted
+                    slot_time_chicago = None
+                    if slot_time:
+                        slot_time_chicago = slot_time
 
-                        # Use watchdog data for: state, time_in_state, range, commit, issues
-                        if watchdog_info:
-                            watchdog_trading_date = getattr(watchdog_info, 'trading_date', None)
-                            if watchdog_trading_date and watchdog_trading_date != current_trading_date:
+                    # Use watchdog data for: state, time_in_state, range, commit, issues
+                    if watchdog_info:
+                        watchdog_state = getattr(watchdog_info, 'state', '')
+                        if watchdog_state not in ("RANGE_LOCKED", "OPEN"):
+                            if getattr(watchdog_info, 'range_high', None) is not None or \
+                               getattr(watchdog_info, 'range_low', None) is not None:
                                 logger.warning(
-                                    f"get_stream_states: Found watchdog state for stream {stream_id} with wrong trading_date: "
-                                    f"{watchdog_trading_date} (expected {current_trading_date}). Skipping watchdog data. "
-                                    f"This indicates cleanup may not have run yet."
+                                    f"get_stream_states: Found non-RANGE_LOCKED stream {stream_id} ({current_trading_date}) "
+                                    f"with ranges (state: {watchdog_state}). Clearing ranges to prevent stale data."
                                 )
-                                watchdog_info = None
-                            else:
-                                watchdog_state = getattr(watchdog_info, 'state', '')
-                                if watchdog_state not in ("RANGE_LOCKED", "OPEN"):
-                                    if getattr(watchdog_info, 'range_high', None) is not None or \
-                                       getattr(watchdog_info, 'range_low', None) is not None:
-                                        logger.warning(
-                                            f"get_stream_states: Found non-RANGE_LOCKED stream {stream_id} ({current_trading_date}) "
-                                            f"with ranges (state: {watchdog_state}). Clearing ranges to prevent stale data."
-                                        )
-                                        watchdog_info.range_high = None
-                                        watchdog_info.range_low = None
-                                        watchdog_info.freeze_close = None
+                                watchdog_info.range_high = None
+                                watchdog_info.range_low = None
+                                watchdog_info.freeze_close = None
 
-                        if watchdog_info:
-                            state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
-                            canonical = getattr(watchdog_info, 'instrument', None) or instrument
-                            exec_instr = _get_execution_instrument_for_canonical(canonical) or getattr(watchdog_info, 'execution_instrument', None)
-                            streams.append({
-                                "trading_date": current_trading_date,
-                                "stream": stream_id,
-                                "instrument": canonical,
-                                "execution_instrument": exec_instr,
-                                "session": getattr(watchdog_info, 'session', None) or session,
-                                "state": getattr(watchdog_info, 'state', ''),
-                                "committed": getattr(watchdog_info, 'committed', False),
-                                "commit_reason": getattr(watchdog_info, 'commit_reason', None),
-                                "slot_time_chicago": slot_time_chicago,
-                                "slot_time_utc": getattr(watchdog_info, 'slot_time_utc', None) or None,
-                                "range_high": getattr(watchdog_info, 'range_high', None),
-                                "range_low": getattr(watchdog_info, 'range_low', None),
-                                "freeze_close": getattr(watchdog_info, 'freeze_close', None),
-                                "range_invalidated": getattr(watchdog_info, 'range_invalidated', False),
-                                "state_entry_time_utc": state_entry_time_utc.isoformat(),
-                                "range_locked_time_utc": (
-                                    state_entry_time_utc.isoformat()
-                                    if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                                ),
-                                "range_locked_time_chicago": (
-                                    state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
-                                    if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                                ),
-                                "trade_executed": getattr(watchdog_info, 'trade_executed', None),
-                                "slot_reason": getattr(watchdog_info, 'slot_reason', None),
-                            })
+                    if watchdog_info:
+                        state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
+                        canonical = getattr(watchdog_info, 'instrument', None) or instrument
+                        exec_instr = _get_execution_instrument_for_canonical(canonical) or getattr(watchdog_info, 'execution_instrument', None)
+                        streams.append({
+                            "trading_date": current_trading_date,
+                            "stream": stream_id,
+                            "instrument": canonical,
+                            "execution_instrument": exec_instr,
+                            "session": getattr(watchdog_info, 'session', None) or session,
+                            "timetable_enabled": True,
+                            "system_tradable_now": system_tradable_now,
+                            "state": getattr(watchdog_info, 'state', ''),
+                            "committed": getattr(watchdog_info, 'committed', False),
+                            "commit_reason": getattr(watchdog_info, 'commit_reason', None),
+                            "slot_time_chicago": slot_time_chicago,
+                            "slot_time_utc": getattr(watchdog_info, 'slot_time_utc', None) or None,
+                            "range_high": getattr(watchdog_info, 'range_high', None),
+                            "range_low": getattr(watchdog_info, 'range_low', None),
+                            "freeze_close": getattr(watchdog_info, 'freeze_close', None),
+                            "range_invalidated": getattr(watchdog_info, 'range_invalidated', False),
+                            "state_entry_time_utc": state_entry_time_utc.isoformat(),
+                            "range_locked_time_utc": (
+                                state_entry_time_utc.isoformat()
+                                if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
+                            ),
+                            "range_locked_time_chicago": (
+                                state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
+                                if getattr(watchdog_info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
+                            ),
+                            "trade_executed": getattr(watchdog_info, 'trade_executed', None),
+                            "slot_reason": getattr(watchdog_info, 'slot_reason', None),
+                        })
+                        gap_v1 = _slot_end_no_trade_expectation_gap(
+                            watchdog_info,
+                            current_trading_date,
+                            stream_id,
+                            canonical,
+                            getattr(watchdog_info, "session", None) or session,
+                        )
+                        if gap_v1:
+                            execution_expectation_gaps.append(gap_v1)
                         else:
-                            exec_instr = _get_execution_instrument_for_canonical(instrument)
-                            streams.append({
-                                "trading_date": current_trading_date,
-                                "stream": stream_id,
-                                "instrument": instrument,
-                                "execution_instrument": exec_instr,
-                                "session": session,
-                                "state": "",
-                                "committed": False,
-                                "commit_reason": None,
-                                "slot_time_chicago": slot_time_chicago,
-                                "slot_time_utc": None,
-                                "range_high": None,
-                                "range_low": None,
-                                "freeze_close": None,
-                                "range_invalidated": False,
-                                "state_entry_time_utc": datetime.now(timezone.utc).isoformat(),
-                                "range_locked_time_utc": None,
-                                "range_locked_time_chicago": None
-                            })
+                            gap_v2 = _slot_missing_summary_expectation_gap(
+                                stream_states_dict,
+                                current_trading_date,
+                                stream_id,
+                                canonical,
+                                getattr(watchdog_info, "session", None) or session,
+                                slot_time,
+                            )
+                            if gap_v2:
+                                execution_expectation_gaps.append(gap_v2)
+                    else:
+                        exec_instr = _get_execution_instrument_for_canonical(instrument)
+                        streams.append({
+                            "trading_date": current_trading_date,
+                            "stream": stream_id,
+                            "instrument": instrument,
+                            "execution_instrument": exec_instr,
+                            "session": session,
+                            "timetable_enabled": True,
+                            "system_tradable_now": system_tradable_now,
+                            "state": "",
+                            "committed": False,
+                            "commit_reason": None,
+                            "slot_time_chicago": slot_time_chicago,
+                            "slot_time_utc": None,
+                            "range_high": None,
+                            "range_low": None,
+                            "freeze_close": None,
+                            "range_invalidated": False,
+                            "state_entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                            "range_locked_time_utc": None,
+                            "range_locked_time_chicago": None
+                        })
 
                 logger.info(
                     f"get_stream_states: Returning {len(streams)} streams from timetable "
@@ -2443,152 +2909,47 @@ class WatchdogAggregator:
                     f"without_watchdog_state: {sum(1 for s in streams if not s.get('state'))})"
                 )
             else:
-                # Fallback: Timetable unavailable - show only streams with watchdog state
                 logger.debug(
-                    f"get_stream_states: Timetable unavailable, falling back to watchdog-only streams"
-                )
-                
-                active_stream_keys = self._state_manager.get_active_intent_stream_keys()
-                filtered_by_date = 0
-                filtered_by_enabled = 0
-                for (trading_date, stream), info in stream_states_dict.items():
-                    # Include streams from current trading date, OR carry-over with active intents AND within ~24h
-                    if trading_date != current_trading_date:
-                        if (trading_date, stream) not in active_stream_keys:
-                            filtered_by_date += 1
-                            continue
-                        if not _is_trading_date_within_max_age(trading_date, current_trading_date):
-                            filtered_by_date += 1
-                            continue
-                    
-                    # If enabled_streams is available, filter by it
-                    if enabled_streams is not None:
-                        if stream not in enabled_streams:
-                            filtered_by_enabled += 1
-                            continue
-                    
-                    # Build stream data from watchdog state only
-                    state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
-                    slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
-                    if slot_time_chicago and 'T' in slot_time_chicago:
-                        try:
-                            slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
-                            if slot_dt.tzinfo:
-                                slot_dt = slot_dt.astimezone(CHICAGO_TZ)
-                            slot_time_chicago = slot_dt.strftime("%H:%M")
-                        except Exception:
-                            pass
-                    if slot_time_chicago == "":
-                        slot_time_chicago = None
-                    
-                    canonical = getattr(info, 'instrument', '')
-                    exec_instr = getattr(info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
-                    streams.append({
-                        "trading_date": trading_date,
-                        "stream": stream,
-                        "instrument": canonical,
-                        "execution_instrument": exec_instr,
-                        "session": getattr(info, 'session', None) or "",
-                        "state": getattr(info, 'state', ''),
-                        "committed": getattr(info, 'committed', False),
-                        "commit_reason": getattr(info, 'commit_reason', None),
-                        "slot_time_chicago": slot_time_chicago if slot_time_chicago else None,
-                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or None,
-                        "range_high": getattr(info, 'range_high', None),
-                        "range_low": getattr(info, 'range_low', None),
-                        "freeze_close": getattr(info, 'freeze_close', None),
-                        "range_invalidated": getattr(info, 'range_invalidated', False),
-                        "state_entry_time_utc": state_entry_time_utc.isoformat(),
-                        "range_locked_time_utc": (
-                            state_entry_time_utc.isoformat()
-                            if getattr(info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                        ),
-                        "range_locked_time_chicago": (
-                            state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat()
-                            if getattr(info, 'state', '') in ("RANGE_LOCKED", "OPEN") else None
-                        ),
-                        "trade_executed": getattr(info, 'trade_executed', None),
-                        "slot_reason": getattr(info, 'slot_reason', None),
-                    })
-                
-                logger.info(
-                    f"get_stream_states: Returning {len(streams)} streams (fallback mode - watchdog only), "
-                    f"filtered_by_date: {filtered_by_date}, filtered_by_enabled: {filtered_by_enabled}"
+                    "get_stream_states: timetable enabled list not ready (awaiting first successful timetable poll)"
                 )
 
-            # Add carry-over streams (from previous day with active intents) not already in streams
-            # Only include streams within STREAM_MAX_AGE_DAYS (~24h) - no 10-day-old carry-over
-            active_stream_keys = self._state_manager.get_active_intent_stream_keys()
-            existing_keys = {(s.get("trading_date"), s.get("stream")) for s in streams}
-            for (trading_date, stream) in active_stream_keys:
-                if (trading_date, stream) in existing_keys:
-                    continue
-                if trading_date == current_trading_date:
-                    continue  # Already handled by timetable loop
-                if not _is_trading_date_within_max_age(trading_date, current_trading_date):
-                    continue  # Skip streams older than ~24h
-                info = stream_states_dict.get((trading_date, stream))
-                if info:
-                    state_entry_time_utc = getattr(info, 'state_entry_time_utc', datetime.now(timezone.utc))
-                    slot_time_chicago = getattr(info, 'slot_time_chicago', None) or ""
-                    if slot_time_chicago and 'T' in slot_time_chicago:
-                        try:
-                            slot_dt = datetime.fromisoformat(slot_time_chicago.replace('Z', '+00:00'))
-                            if slot_dt.tzinfo:
-                                slot_dt = slot_dt.astimezone(CHICAGO_TZ)
-                            slot_time_chicago = slot_dt.strftime("%H:%M")
-                        except Exception:
-                            pass
-                    canonical = getattr(info, 'instrument', '')
-                    exec_instr = getattr(info, 'execution_instrument', None) or _get_execution_instrument_for_canonical(canonical)
-                    streams.append({
-                        "trading_date": trading_date,
-                        "stream": stream,
-                        "instrument": canonical,
-                        "execution_instrument": exec_instr,
-                        "session": getattr(info, 'session', None) or "",
-                        "state": getattr(info, 'state', 'RANGE_LOCKED'),
-                        "committed": False,
-                        "commit_reason": None,
-                        "slot_time_chicago": slot_time_chicago or None,
-                        "slot_time_utc": getattr(info, 'slot_time_utc', None) or None,
-                        "range_high": getattr(info, 'range_high', None),
-                        "range_low": getattr(info, 'range_low', None),
-                        "freeze_close": getattr(info, 'freeze_close', None),
-                        "range_invalidated": getattr(info, 'range_invalidated', False),
-                        "state_entry_time_utc": state_entry_time_utc.isoformat(),
-                        "range_locked_time_utc": state_entry_time_utc.isoformat(),
-                        "range_locked_time_chicago": state_entry_time_utc.astimezone(CHICAGO_TZ).isoformat(),
-                        "trade_executed": getattr(info, 'trade_executed', None),
-                        "slot_reason": getattr(info, 'slot_reason', None),
-                    })
-                    logger.debug(f"get_stream_states: Added carry-over stream {stream} ({trading_date})")
+            # Off-timetable active intents only when we have a definitive enabled set (not None)
+            if enabled_streams is not None:
+                exposures = self._state_manager.get_intent_exposures() or {}
+                for exp in exposures.values():
+                    if getattr(exp, "state", "") != "ACTIVE":
+                        continue
+                    sid = getattr(exp, "stream_id", None)
+                    if not sid or sid in enabled_streams:
+                        continue
+                    entry_q = int(getattr(exp, "entry_filled_qty", 0) or 0)
+                    exit_q = int(getattr(exp, "exit_filled_qty", 0) or 0)
+                    out_of_timetable_active_streams.append(
+                        {
+                            "intent_id": getattr(exp, "intent_id", "") or "",
+                            "stream_id": sid,
+                            "instrument": getattr(exp, "instrument", "") or "",
+                            "trading_date": getattr(exp, "trading_date", None) or "",
+                            "direction": getattr(exp, "direction", "") or "",
+                            "remaining_exposure": entry_q - exit_q,
+                            "entry_filled_qty": entry_q,
+                            "exit_filled_qty": exit_q,
+                        }
+                    )
             
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
         
-        # Sort streams by slot_time_chicago descending (latest first)
-        def _slot_sort_key(s):
-            st = s.get("slot_time_chicago") or ""
-            if not st:
-                return (0, 0)
-            # Extract HH:MM from "HH:MM" or "YYYY-MM-DDTHH:MM:SS" format
-            if "T" in st:
-                try:
-                    idx = st.index("T")
-                    st = st[idx + 1 : idx + 6]  # "HH:MM"
-                except Exception:
-                    pass
-            parts = st.split(":")
-            h = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            m = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            return (h, m)
-        streams.sort(key=_slot_sort_key, reverse=True)
-        
         return {
+            "snapshot_utc": datetime.now(timezone.utc).isoformat(),
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
             "streams": streams,
-            "timetable_unavailable": timetable_unavailable  # Flag for UI warning banner
+            "out_of_timetable_active_streams": out_of_timetable_active_streams,
+            "execution_expectation_gaps": execution_expectation_gaps,
+            "timetable_unavailable": timetable_unavailable
+            or self._state_manager.get_enabled_streams_unknown(),
+            "enabled_streams_unknown": self._state_manager.get_enabled_streams_unknown(),
+            "timetable_source": self._state_manager.get_timetable_source(),
         }
     
     def _add_derived_event_to_buffer(self, event_type: str, data: Dict) -> None:
@@ -2843,8 +3204,9 @@ class WatchdogAggregator:
             self._last_hydrate_utc = now
         intents = []
         try:
-            if hasattr(self._state_manager, '_intent_exposures'):
-                for intent_id, exposure in self._state_manager._intent_exposures.items():
+            exposures = self._state_manager.get_intent_exposures()
+            if exposures:
+                for intent_id, exposure in exposures.items():
                     if getattr(exposure, 'state', '') == "ACTIVE":
                         entry_filled_qty = getattr(exposure, 'entry_filled_qty', 0)
                         exit_filled_qty = getattr(exposure, 'exit_filled_qty', 0)

@@ -123,6 +123,11 @@ public sealed partial class NinjaTraderSimAdapter
 
     void IIEAOrderExecutor.SubmitOrders(IReadOnlyList<object> orders)
     {
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return;
+        }
         var account = _ntAccount as Account;
         if (account == null || orders == null) return;
         var ntOrders = orders.OfType<Order>().ToArray();
@@ -323,6 +328,8 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     OrderSubmissionResult IIEAOrderExecutor.SubmitFlattenOrder(string instrument, string side, int quantity, FlattenDecisionSnapshot snapshot, DateTimeOffset utcNow, object? nativeInstrumentForBrokerOrder = null)
     {
+        if (!TrySessionIdentityGateDestructiveFlatten(instrument, utcNow, out var sessionFailFlatten))
+            return sessionFailFlatten!;
         var account = _ntAccount as Account;
         var ntInstrument = (nativeInstrumentForBrokerOrder ?? (object?)_ntInstrument) as Instrument;
         if (account == null || ntInstrument == null)
@@ -385,6 +392,12 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "P2.6.7: EmergencyFlatten must run on strategy thread — use NtFlattenInstrumentCommand / FlattenEmergency enqueue path"
                 }));
             return FlattenResult.FailureResult("EmergencyFlatten requires strategy thread (enqueue FlattenEmergency or drain NT actions)", utcNow);
+        }
+
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
         }
 
         var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
@@ -517,6 +530,8 @@ public sealed partial class NinjaTraderSimAdapter
             SetProtectionState(intentId, ProtectionState.Executing);
         if (!IntentMap.TryGetValue(intentId, out var intent))
             throw new InvalidOperationException($"Intent not found: {cmd.IntentId}");
+        if (!TrySessionIdentityGate(intentId, cmd.Instrument ?? "", "recovery", cmd.UtcNow, null, out _))
+            return;
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++)
         {
             if (attempt > 0) System.Threading.Thread.Sleep(RETRY_DELAY_MS);
@@ -558,12 +573,40 @@ public sealed partial class NinjaTraderSimAdapter
 
     void INtActionExecutor.ExecuteCancelOrders(NtCancelOrdersCommand cmd)
     {
+        var utcDispatch = DateTimeOffset.UtcNow;
+        if (cmd.ProtectiveOrdersOnly &&
+            string.Equals(cmd.Reason, NtCancelOrdersCommand.ReasonSiblingProtectiveExitFill, StringComparison.Ordinal))
+        {
+            _log.Write(RobotEvents.EngineBase(utcDispatch, cmd.PostCancelTradingDate ?? "", "SIBLING_PROTECTIVE_CANCEL_STRATEGY_DISPATCH", "ENGINE",
+                new
+                {
+                    intent_id = cmd.IntentId,
+                    correlation_id = cmd.CorrelationId,
+                    stream = cmd.PostCancelStream,
+                    completion_reason = cmd.PostCancelCompletionReason,
+                    note = "Strategy thread executing URGENT NtCancelOrdersCommand (sibling protective cleanup)"
+                }));
+        }
+
         if (!string.IsNullOrEmpty(cmd.IntentId))
         {
-            if (cmd.ProtectiveOrdersOnly)
+            var siblingInline = cmd.ProtectiveOrdersOnly &&
+                string.Equals(cmd.Reason, NtCancelOrdersCommand.ReasonSiblingProtectiveExitFill, StringComparison.Ordinal);
+            if (siblingInline)
+                CancelProtectiveOrdersForIntent(cmd.IntentId, cmd.UtcNow, strategyThreadInlineCancel: true, siblingCancelCorrelationId: cmd.CorrelationId);
+            else if (cmd.ProtectiveOrdersOnly)
                 CancelProtectiveOrdersForIntent(cmd.IntentId, cmd.UtcNow);
             else
                 CancelIntentOrdersReal(cmd.IntentId, cmd.UtcNow);
+        }
+
+        if (cmd.VerifyWorkingProtectivesClearedAfter && !string.IsNullOrEmpty(cmd.IntentId))
+        {
+            RunTerminalProtectiveInvariantCheck(cmd.IntentId,
+                cmd.PostCancelTradingDate ?? "",
+                cmd.PostCancelStream ?? "",
+                cmd.PostCancelCompletionReason ?? cmd.Reason,
+                cmd.UtcNow);
         }
     }
 
@@ -2470,6 +2513,54 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
+    /// QTSW2-only: hydrate <see cref="OrderMap"/> from IEA registry when Sim reports an update before local tracking caught up
+    /// (registry row exists for the same intent+leg and is still live). Preserves manual/external behavior for untagged or unknown rows.
+    /// </summary>
+    private bool TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(Order order, string intentId, string? encodedTag, ParsedTagResult parsed,
+        DateTimeOffset utcNow)
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return false;
+        if (string.IsNullOrEmpty(encodedTag) || !encodedTag.StartsWith(RobotOrderIds.Prefix, StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.IsNullOrEmpty(intentId)) return false;
+
+        var legR = parsed.Leg == "STOP" || parsed.Leg == "TARGET" ? parsed.Leg : null;
+        if (!_iea.TryResolveForExecutionUpdate(order.OrderId ?? "", intentId, legR, out var regEntry, out _) || regEntry == null)
+            return false;
+
+        if (!Qtsw2OrderUpdateHydrationPolicy.RegistryRowMatchesTaggedIntentAndLeg(regEntry, intentId, parsed.Leg)) return false;
+        if (Qtsw2OrderUpdateHydrationPolicy.IsTerminalRegistryRow(regEntry)) return false;
+
+        var incomingId = order.OrderId ?? "";
+        var canonical = regEntry.BrokerOrderId ?? "";
+        var instrument = order.Instrument?.MasterInstrument?.Name ?? regEntry.Instrument ?? "";
+        if (!string.IsNullOrEmpty(canonical) && !string.Equals(incomingId, canonical, StringComparison.OrdinalIgnoreCase))
+            _iea.LinkBrokerOrderIdAlias(incomingId, canonical, utcNow, intentId, instrument);
+
+        var oi = regEntry.OrderInfo;
+        if (oi == null) return false;
+
+        oi.OrderId = incomingId;
+        oi.NTOrder = order;
+
+        OrderMap[intentId] = oi;
+        if (regEntry.OrderRole == OrderRole.STOP)
+            OrderMap[$"{intentId}:STOP"] = oi;
+        else if (regEntry.OrderRole == OrderRole.TARGET)
+            OrderMap[$"{intentId}:TARGET"] = oi;
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_MAP_HYDRATED_FROM_IEA", new
+        {
+            broker_order_id = incomingId,
+            canonical_broker_order_id = canonical,
+            intent_id = intentId,
+            order_role = regEntry.OrderRole.ToString(),
+            parsed_leg = parsed.Leg,
+            note = "OrderMap populated from IEA registry before manual/external miss path"
+        }));
+        return true;
+    }
+
+    /// <summary>
     /// STEP 3: Handle real NT OrderUpdate event.
     /// Called from public HandleOrderUpdate() method in main adapter.
     /// </summary>
@@ -2639,6 +2730,12 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         if (!OrderMap.TryGetValue(intentId, out var orderInfo))
+        {
+            TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(order, intentId, encodedTag, parsed, utcNow);
+            OrderMap.TryGetValue(intentId, out orderInfo);
+        }
+
+        if (orderInfo == null)
         {
             if (IsRobotOwnedFlattenByTag(encodedTag))
                 return;
@@ -6272,21 +6369,141 @@ public sealed partial class NinjaTraderSimAdapter
     }
     
     /// <summary>
-    /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
-    /// <summary>
-    /// Terminalize an intent: cancel all protective orders, verify invariant, remove from management.
-    /// Single canonical path for target fill, stop fill, flatten, and reconciliation completion.
+    /// Terminalize an intent after STOP/TARGET execution fill: cancel sibling protectives via strategy-thread NT command,
+    /// then verify no Working/Accepted protectives remain (verification after cancel completes, not before enqueue).
     /// </summary>
     private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
     {
+        var auditRows = ScanProtectiveOrdersForSiblingCancelAudit(intentId, out var eligibleCount);
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "SIBLING_PROTECTIVE_CANCEL_REQUESTED", "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                stream,
+                completion_reason = completionReason,
+                eligible_working_or_accepted_count_matched = eligibleCount,
+                protective_leg_rows = auditRows,
+                nt_action_queue_configured = _ntActionQueue != null,
+                note = "Exit fill: audit before routing sibling protective cancel"
+            }));
+
+        if (eligibleCount == 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "SIBLING_PROTECTIVE_CANCEL_SKIPPED_NO_ELIGIBLE", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    stream,
+                    completion_reason = completionReason,
+                    protective_leg_rows = auditRows,
+                    note = "No Working/Accepted protectives matched robot tags — broker may have moved sibling (e.g. OCO); invariant check runs immediately"
+                }));
+            RunTerminalProtectiveInvariantCheck(intentId, tradingDate, stream, completionReason, utcNow);
+            return;
+        }
+
+        if (_ntActionQueue != null)
+        {
+            var cid = $"SIBLING_PROTECTIVE:{intentId}:{utcNow:yyyyMMddHHmmssfff}:{Guid.NewGuid():N}";
+            var cmd = new NtCancelOrdersCommand(
+                cid,
+                intentId,
+                null,
+                true,
+                NtCancelOrdersCommand.ReasonSiblingProtectiveExitFill,
+                utcNow,
+                preferUrgentDrain: true,
+                verifyWorkingProtectivesClearedAfter: true,
+                postCancelTradingDate: tradingDate,
+                postCancelStream: stream,
+                postCancelCompletionReason: completionReason);
+
+            var enqueued = _ntActionQueue.EnqueueNtAction(cmd, out var dup);
+            if (!enqueued)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "SIBLING_PROTECTIVE_CANCEL_ENQUEUE_FAILED", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        correlation_id = cid,
+                        dropped_as_duplicate = dup,
+                        urgent_pending = _ntActionQueue.UrgentPendingCount,
+                        normal_pending = _ntActionQueue.NormalPendingCount,
+                        note = dup
+                            ? "Duplicate correlation id — another sibling cancel may already be pending"
+                            : "EnqueueNtAction returned false — fall back to thread-guard cancel path"
+                    }));
+                CancelProtectiveOrdersForIntent(intentId, utcNow);
+                RunTerminalProtectiveInvariantCheck(intentId, tradingDate, stream, completionReason, utcNow);
+                return;
+            }
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "SIBLING_PROTECTIVE_CANCEL_ENQUEUED", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    stream,
+                    correlation_id = cid,
+                    reason = NtCancelOrdersCommand.ReasonSiblingProtectiveExitFill,
+                    urgent_lane = true,
+                    urgent_pending_after = _ntActionQueue.UrgentPendingCount,
+                    normal_pending_after = _ntActionQueue.NormalPendingCount,
+                    total_pending_after = _ntActionQueue.PendingCount,
+                    eligible_count_at_request = eligibleCount,
+                    note = "Sibling cancel on URGENT lane; invariant check deferred until strategy-thread dispatch completes"
+                }));
+            return;
+        }
+
         CancelProtectiveOrdersForIntent(intentId, utcNow);
+        RunTerminalProtectiveInvariantCheck(intentId, tradingDate, stream, completionReason, utcNow);
+    }
+
+    /// <summary>Build JSON-serializable rows for all broker orders matching this intent's STOP/TARGET tags (any state).</summary>
+    private List<Dictionary<string, object?>> ScanProtectiveOrdersForSiblingCancelAudit(string intentId, out int eligibleWorkingOrAcceptedCount)
+    {
+        var rows = new List<Dictionary<string, object?>>();
+        eligibleWorkingOrAcceptedCount = 0;
+        if (_ntAccount is not Account account)
+            return rows;
+
+        var stopTag = RobotOrderIds.EncodeStopTag(intentId);
+        var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
+
+        foreach (var order in account.Orders)
+        {
+            var tag = GetOrderTag(order) ?? "";
+            if (!string.Equals(tag, stopTag, StringComparison.Ordinal) &&
+                !string.Equals(tag, targetTag, StringComparison.Ordinal))
+                continue;
+
+            var stateStr = order.OrderState.ToString();
+            var eligible = order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted;
+            if (eligible)
+                eligibleWorkingOrAcceptedCount++;
+
+            rows.Add(new Dictionary<string, object?>
+            {
+                ["broker_order_id"] = order.OrderId,
+                ["order_state"] = stateStr,
+                ["tag"] = tag,
+                ["eligible_for_immediate_cancel"] = eligible
+            });
+        }
+
+        return rows;
+    }
+
+    private void RunTerminalProtectiveInvariantCheck(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
         var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
         if (workingOrders.Count > 0)
         {
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
                 new
                 {
-                    error = "Completed intent still has working protective orders - invariant violated",
+                    error = "Intent exit handling still has working protective orders - invariant violated",
                     intent_id = intentId,
                     stream = stream,
                     completion_reason = completionReason,
@@ -6294,7 +6511,7 @@ public sealed partial class NinjaTraderSimAdapter
                     working_order_types = workingOrders.Select(o => GetOrderTag(o)).ToList(),
                     count = workingOrders.Count,
                     action = "CRITICAL_ANOMALY",
-                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                    note = "Expected no Working/Accepted protectives after sibling cleanup. Route to reconciliation."
                 }));
             var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
             if (notificationService != null)
@@ -6336,7 +6553,9 @@ public sealed partial class NinjaTraderSimAdapter
     /// GC FIX: Cancel protective orders (stop and target) for an intent when quantity changes are needed.
     /// This is used when updating existing protective orders fails - we cancel and recreate them.
     /// </summary>
-    private void CancelProtectiveOrdersForIntent(string intentId, DateTimeOffset utcNow)
+    /// <param name="strategyThreadInlineCancel">When true, caller is strategy-thread NT command — skip EnsureStrategyThreadOrEnqueue.</param>
+    /// <param name="siblingCancelCorrelationId">When set, success log uses sibling-cancel lifecycle event name.</param>
+    private void CancelProtectiveOrdersForIntent(string intentId, DateTimeOffset utcNow, bool strategyThreadInlineCancel = false, string? siblingCancelCorrelationId = null)
     {
         if (_ntAccount == null)
         {
@@ -6350,6 +6569,7 @@ public sealed partial class NinjaTraderSimAdapter
         }
         
         var ordersToCancel = new List<Order>();
+        var consideredRows = new List<Dictionary<string, object?>>();
         
         try
         {
@@ -6359,33 +6579,84 @@ public sealed partial class NinjaTraderSimAdapter
             
             foreach (var order in account.Orders)
             {
-                if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
-                {
-                    continue;
-                }
-                
                 var tag = GetOrderTag(order) ?? "";
-                
-                // Match stop or target tag
-                if (tag == stopTag || tag == targetTag)
+                if (!string.Equals(tag, stopTag, StringComparison.Ordinal) &&
+                    !string.Equals(tag, targetTag, StringComparison.Ordinal))
+                    continue;
+
+                var stateStr = order.OrderState.ToString();
+                var eligible = order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted;
+                consideredRows.Add(new Dictionary<string, object?>
                 {
-                    ordersToCancel.Add(order);
-                }
+                    ["broker_order_id"] = order.OrderId,
+                    ["order_state"] = stateStr,
+                    ["tag"] = tag,
+                    ["eligible_for_immediate_cancel"] = eligible
+                });
+
+                if (!eligible)
+                    continue;
+                
+                ordersToCancel.Add(order);
             }
             
             if (ordersToCancel.Count > 0)
             {
                 var ordersArr = ordersToCancel.ToArray();
-                if (!EnsureStrategyThreadOrEnqueue("CancelProtectiveOrdersForRecreate", intentId, null, $"CANCEL_PROTECTIVE:{intentId}", () => account.Cancel(ordersArr)))
-                    return;
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
+                if (strategyThreadInlineCancel)
                 {
-                    intent_id = intentId,
-                    cancelled_count = ordersToCancel.Count,
-                    cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
-                    cancelled_tags = ordersToCancel.Select(o => GetOrderTag(o)).ToList(),
-                    note = "Cancelled protective orders to recreate with correct quantity (quantity change requires cancel/recreate)"
-                }));
+                    account.Cancel(ordersArr);
+                    if (!string.IsNullOrEmpty(siblingCancelCorrelationId))
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "SIBLING_PROTECTIVE_CANCEL_COMPLETED", new
+                        {
+                            intent_id = intentId,
+                            correlation_id = siblingCancelCorrelationId,
+                            cancelled_count = ordersToCancel.Count,
+                            cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
+                            cancelled_tags = ordersToCancel.Select(o => GetOrderTag(o)).ToList(),
+                            orders_considered = consideredRows,
+                            note = "account.Cancel invoked on strategy thread (sibling protective cleanup path)"
+                        }));
+                    }
+                    else
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
+                        {
+                            intent_id = intentId,
+                            cancelled_count = ordersToCancel.Count,
+                            cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
+                            cancelled_tags = ordersToCancel.Select(o => GetOrderTag(o)).ToList(),
+                            note = "Cancelled protective orders (inline strategy-thread path)"
+                        }));
+                    }
+                }
+                else if (!EnsureStrategyThreadOrEnqueue("CancelProtectiveOrdersForRecreate", intentId, null, $"CANCEL_PROTECTIVE:{intentId}", () => account.Cancel(ordersArr)))
+                {
+                    return;
+                }
+                else
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
+                    {
+                        intent_id = intentId,
+                        cancelled_count = ordersToCancel.Count,
+                        cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList(),
+                        cancelled_tags = ordersToCancel.Select(o => GetOrderTag(o)).ToList(),
+                        note = "Cancelled protective orders to recreate with correct quantity (quantity change requires cancel/recreate)"
+                    }));
+                }
+            }
+            else if (strategyThreadInlineCancel && !string.IsNullOrEmpty(siblingCancelCorrelationId))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", "SIBLING_PROTECTIVE_CANCEL_SKIPPED_NO_ELIGIBLE", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        correlation_id = siblingCancelCorrelationId,
+                        orders_considered = consideredRows,
+                        note = "At strategy dispatch: no Working/Accepted protectives matched tags (race with OCO or prior cancel)"
+                    }));
             }
         }
         catch (Exception ex)
@@ -6393,6 +6664,7 @@ public sealed partial class NinjaTraderSimAdapter
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCEL_ERROR", new
             {
                 intent_id = intentId,
+                correlation_id = siblingCancelCorrelationId,
                 error = ex.Message,
                 exception_type = ex.GetType().Name,
                 note = "Failed to cancel protective orders - may cause duplicate order issues"
@@ -6575,6 +6847,11 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow, NtDestructivePolicyAlreadyAppliedToken? policyPrechecked = null, DestructiveActionSource? destructiveSourceOverride = null, DestructiveTriggerReason? explicitTriggerOverride = null)
     {
+        if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            RecordSessionIdentityBlockAttempt();
+            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
+        }
         PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
         if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
             PruneIntentState(intentId, "flatten");
@@ -7542,6 +7819,16 @@ public sealed partial class NinjaTraderSimAdapter
                 if (_executionJournal != null)
                     _executionJournal.RecordSubmission(oppId, oppIntent.TradingDate ?? "", oppIntent.Stream ?? "", instrument, $"ENTRY_STOP_{oppositeDirection}", oppOrder.OrderId, utcNow);
             }
+
+            var bundleGateIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var id in allIntentIds)
+            {
+                bundleGateIds.Add(id);
+                var oppG = FindOppositeEntryIntentId(id);
+                if (oppG != null) bundleGateIds.Add(oppG);
+            }
+            if (!TrySessionIdentityGateForIntentBundle(bundleGateIds.ToList(), instrument, "entry_stop_aggregate", utcNow, out var bundleGateFailure))
+                return bundleGateFailure;
 
             account.Submit(ordersToSubmit.ToArray());
 

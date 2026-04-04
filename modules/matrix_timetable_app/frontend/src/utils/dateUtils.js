@@ -42,43 +42,121 @@ export function getChicagoDateNow() {
   return dateToYYYYMMDD(chicagoTime)
 }
 
-/**
- * Get CME trading date with 17:00 Chicago rollover rule.
- * 
- * CME trading date semantics:
- * - If Chicago time < 17:00: trading_date = Chicago calendar date
- * - If Chicago time >= 17:00: trading_date = Chicago calendar date + 1 day
- * 
- * This matches the timetable generation logic.
- * 
- * @returns {string} CME trading date in YYYY-MM-DD format
- */
-export function getCMETradingDate() {
-  const now = new Date()
-  // Get Chicago time using Intl.DateTimeFormat for DST-aware conversion
-  const chicagoFormatter = new Intl.DateTimeFormat('en-US', {
+/** Chicago wall-clock fields for an instant (DST-aware via Intl). */
+export function getChicagoWallPartsFromUtc(dateUtc) {
+  const d = dateUtc instanceof Date ? dateUtc : new Date(dateUtc)
+  const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Chicago',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
     hour12: false
   })
-  
-  const parts = chicagoFormatter.formatToParts(now)
-  const year = parseInt(parts.find(p => p.type === 'year').value)
-  const month = parseInt(parts.find(p => p.type === 'month').value)
-  const day = parseInt(parts.find(p => p.type === 'day').value)
-  const hour = parseInt(parts.find(p => p.type === 'hour').value)
-  
-  // Apply CME rollover rule: if >= 17:00, trading_date is next calendar day
-  let tradingDate = new Date(year, month - 1, day)
-  if (hour >= 17) {
-    tradingDate.setDate(tradingDate.getDate() + 1)
+  const parts = fmt.formatToParts(d)
+  const pick = (t) => parseInt(parts.find((p) => p.type === t).value, 10)
+  return {
+    year: pick('year'),
+    month: pick('month'),
+    day: pick('day'),
+    hour: pick('hour'),
+    minute: pick('minute'),
+    second: pick('second')
   }
-  
-  return dateToYYYYMMDD(tradingDate)
+}
+
+/** Add n days to a Gregorian calendar Y-M-D (timezone-agnostic). */
+export function addDaysCalendarYmd(y, m, d, n) {
+  const dt = new Date(Date.UTC(y, m - 1, d + n))
+  return { y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate() }
+}
+
+export function calendarYmdToString(y, m, d) {
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+}
+
+/**
+ * Roll Saturday/Sunday calendar days to Monday (CME equity-style week boundary for session label).
+ * Weekday is computed in UTC on the calendar date (Y-M-D is unambiguous).
+ */
+export function applyCmeWeekendToCalendarYmd(y, m, d) {
+  const jd = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+  const dow = jd.getUTCDay() // 0 Sun .. 6 Sat
+  if (dow === 6) return addDaysCalendarYmd(y, m, d, 2)
+  if (dow === 0) return addDaysCalendarYmd(y, m, d, 1)
+  return { y, m, d }
+}
+
+/**
+ * CME session calendar Y-M-D from an instant: Chicago wall 18:00 rollover, then weekend roll.
+ * Matches modules/timetable/cme_session.get_cme_trading_date + weekend handling for Matrix UI parity.
+ */
+export function getCmeSessionTradingCalendarYmdFromUtc(dateUtc) {
+  const { year, month, day, hour } = getChicagoWallPartsFromUtc(dateUtc)
+  let y = year
+  let m = month
+  let d = day
+  if (hour >= 18) {
+    const n = addDaysCalendarYmd(y, m, d, 1)
+    y = n.y
+    m = n.m
+    d = n.d
+  }
+  return applyCmeWeekendToCalendarYmd(y, m, d)
+}
+
+/** @param {Date|string|number} dateUtc */
+export function getCmeSessionTradingDateStringForUtc(dateUtc) {
+  const { y, m, d } = getCmeSessionTradingCalendarYmdFromUtc(dateUtc)
+  return calendarYmdToString(y, m, d)
+}
+
+/**
+ * If YYYY-MM-DD is a weekend calendar label, roll to Monday (defensive for worker / bad payloads).
+ * Does not apply 18:00 (caller already passes session calendar day when known).
+ */
+export function rollWeekendCalendarYmdString(ymdStr) {
+  if (typeof ymdStr !== 'string' || !ymdStr) return ymdStr
+  const head = ymdStr.split('T')[0]
+  const segs = head.split('-')
+  if (segs.length !== 3) return ymdStr
+  const y = parseInt(segs[0], 10)
+  const mo = parseInt(segs[1], 10)
+  const d = parseInt(segs[2], 10)
+  if (!y || !mo || !d) return ymdStr
+  const rolled = applyCmeWeekendToCalendarYmd(y, mo, d)
+  return calendarYmdToString(rolled.y, rolled.m, rolled.d)
+}
+
+/** DOW/DOM for filters from a calendar Y-M-D string (timezone-agnostic weekday). */
+export function getCalendarDowDomFromYmd(ymdStr) {
+  const head = typeof ymdStr === 'string' ? ymdStr.split('T')[0] : ''
+  const segs = head.split('-')
+  if (segs.length !== 3) return null
+  const y = parseInt(segs[0], 10)
+  const m = parseInt(segs[1], 10)
+  const d = parseInt(segs[2], 10)
+  if (!y || !m || !d) return null
+  const jd = new Date(Date.UTC(y, m - 1, d, 12, 0, 0))
+  const targetDOWJS = jd.getUTCDay()
+  const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  return {
+    targetDOWJS,
+    targetDOM: d,
+    targetDOWName: dayNames[targetDOWJS]
+  }
+}
+
+/**
+ * Get CME session trading date with 18:00 America/Chicago rollover + weekend → Monday.
+ * Aligns with watchdog / timetable_builder / robot when combined with rollWeekendCalendarYmdString for raw Y-M-D.
+ *
+ * @returns {string} CME session trading date in YYYY-MM-DD format
+ */
+export function getCMETradingDate() {
+  return getCmeSessionTradingDateStringForUtc(new Date())
 }
 
 /**
@@ -121,4 +199,58 @@ export function formatChicagoTime(date, options = {}) {
   }
   
   return new Intl.DateTimeFormat('en-US', defaultOptions).format(date)
+}
+
+/**
+ * Move Saturday/Sunday to Monday (same rules as matrix timetable trading day).
+ * @param {Date} date - Local calendar date at midnight
+ * @returns {Date} New Date instance (does not mutate input)
+ */
+export function applyCmeWeekendTradingDay(date) {
+  if (!date || !(date instanceof Date)) {
+    throw new Error(`Invalid date: ${date}`)
+  }
+  const ymd = dateToYYYYMMDD(date)
+  const rolled = rollWeekendCalendarYmdString(ymd)
+  return parseYYYYMMDD(rolled)
+}
+
+/**
+ * Wall-clock instant formatted for audit logs (Chicago, labeled).
+ */
+export function formatChicagoWallIso(date) {
+  if (!date || !(date instanceof Date)) {
+    throw new Error(`Invalid date: ${date}`)
+  }
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(date)
+  const y = parts.find(p => p.type === 'year')?.value
+  const m = parts.find(p => p.type === 'month')?.value
+  const d = parts.find(p => p.type === 'day')?.value
+  const h = parts.find(p => p.type === 'hour')?.value
+  const min = parts.find(p => p.type === 'minute')?.value
+  const s = parts.find(p => p.type === 'second')?.value
+  return `${y}-${m}-${d}T${h}:${min}:${s} America/Chicago`
+}
+
+/** Wall-clock instant in UTC for audit / debug overlay (labeled). */
+export function formatUtcWallIso(date) {
+  if (!date || !(date instanceof Date)) {
+    throw new Error(`Invalid date: ${date}`)
+  }
+  const y = date.getUTCFullYear()
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(date.getUTCDate()).padStart(2, '0')
+  const h = String(date.getUTCHours()).padStart(2, '0')
+  const min = String(date.getUTCMinutes()).padStart(2, '0')
+  const s = String(date.getUTCSeconds()).padStart(2, '0')
+  return `${y}-${m}-${d}T${h}:${min}:${s}Z`
 }

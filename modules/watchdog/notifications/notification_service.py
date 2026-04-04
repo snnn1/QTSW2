@@ -35,6 +35,7 @@ ALERT_TYPE_LABELS = {
     "INCIDENT_EXECUTION_POLICY_VALIDATION_FAILED": "Execution Policy Validation Failed (Incident)",
     "INCIDENT_EXECUTION_JOURNAL_CORRUPTION": "Execution Journal Corruption (Incident)",
     "INCIDENT_EXECUTION_JOURNAL_ERROR": "Execution Journal Error (Incident)",
+    "TIMETABLE_DRIFT": "Timetable drift (robot vs system)",
 }
 
 # Severity tiers: critical, high, warning, info (enables sound/priority/escalation without redesign)

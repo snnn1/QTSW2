@@ -92,7 +92,10 @@ def _trigger_eligibility_builder_async(trading_date: str, output_dir: str) -> No
 
 
 def _trigger_eligibility_builder_after_save(output_dir: str = "data/master_matrix") -> None:
-    """Trigger eligibility builder in background using CME trading date."""
+    """
+    Trigger eligibility_builder.py in a background thread (legacy / optional tooling).
+    The live matrix→timetable persist path no longer calls this; execution arms from timetable_current.json only.
+    """
     try:
         from modules.timetable.cme_session import get_trading_date_cme
         utc_now = datetime.now(timezone.utc)
@@ -204,8 +207,8 @@ def save_master_matrix(
         duration_ms=duration_ms,
     )
     
-    # Persist execution timetable and trigger eligibility builder in background (non-blocking)
-    def _run_timetable_and_eligibility():
+    # Persist execution timetable from matrix in background (non-blocking)
+    def _run_timetable_persist():
         try:
             import time
             from .build_journal import journal_event
@@ -223,18 +226,22 @@ def save_master_matrix(
                 if timetable_output_dir
                 else TimetableEngine(project_root=str(root))
             )
+            from modules.timetable.cme_session import get_cme_trading_date
+
+            # Live execution: CME wall clock only — ignore specific_date / UI / latest matrix date
+            session_td = get_cme_trading_date(datetime.now(timezone.utc))
             engine.write_execution_timetable_from_master_matrix(
                 df_copy,
-                trade_date=specific_date,
+                trade_date=session_td,
                 stream_filters=stream_filters,
                 execution_mode=True,
+                publish_context={"source": "matrix", "reason": "publish"},
             )
             logger.info("Execution timetable persisted from master matrix")
             duration_ms = int((time.perf_counter() - t_timetable) * 1000)
             from .instrumentation import log_timing_event
             log_timing_event(phase="timetable_generation", duration_ms=duration_ms, mode="from_matrix")
             journal_event(event_type="timetable_complete", mode="from_matrix", duration_ms=duration_ms)
-            _trigger_eligibility_builder_after_save(output_dir=output_dir)
         except Exception as e:
             from .build_journal import journal_event
             journal_event(event_type="failure", mode="timetable", error=str(e))
@@ -242,7 +249,7 @@ def save_master_matrix(
             import traceback
             logger.debug(f"Timetable persistence traceback: {traceback.format_exc()}")
     
-    t = threading.Thread(target=_run_timetable_and_eligibility, daemon=True)
+    t = threading.Thread(target=_run_timetable_persist, daemon=True)
     t.start()
     
     return parquet_file, json_file

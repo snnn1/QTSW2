@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>QTSW2.Robot.SiblingProtectiveCancelQueue.Test</RootNamespace>
+    <AssemblyName>SiblingProtectiveCancelQueue.Test</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Robot.Core.csproj" />
+  </ItemGroup>
+</Project>

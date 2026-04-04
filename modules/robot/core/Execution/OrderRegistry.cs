@@ -201,7 +201,7 @@ public sealed class OrderRegistry
         if (!ValidateLifecycleTransition(current, newState))
             return false;
         entry.LifecycleState = newState;
-        if (terminalUtc.HasValue || newState == OrderLifecycleState.FILLED || newState == OrderLifecycleState.CANCELED || newState == OrderLifecycleState.REJECTED)
+        if (newState == OrderLifecycleState.FILLED || newState == OrderLifecycleState.CANCELED || newState == OrderLifecycleState.REJECTED)
         {
             entry.TerminalUtc = terminalUtc ?? DateTimeOffset.UtcNow;
             entry.OwnershipStatus = OrderOwnershipStatus.TERMINAL;

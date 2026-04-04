@@ -36,7 +36,9 @@ export function useStreamStates() {
         }
         return newStreams
       })
-      setTimetableUnavailable(Boolean(data.timetable_unavailable))
+      setTimetableUnavailable(
+        Boolean(data.timetable_unavailable || data.enabled_streams_unknown)
+      )
       setError(null)
     }
     // Always mark as loaded to prevent infinite loading state

@@ -5,6 +5,7 @@
 using System;
 using System.IO;
 using QTSW2.Robot.Contracts;
+using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
 
 namespace QTSW2.Robot.Core.Tests;
@@ -70,6 +71,53 @@ public static class JournalRepairProofTests
     }
 
     /// <summary>Test 5: untracked path remains distinct (no intent id in upsert API).</summary>
+    /// <summary>
+    /// Hardening: fill recorded first, then late submission observation — canonical submit must not be stamped from the later observation.
+    /// </summary>
+    public static (bool Pass, string? Error) RunLateSubmitObservedAfterFillDoesNotSetCanonicalSubmitUtc()
+    {
+        var g = Guid.NewGuid().ToString("N");
+        var dir = Path.Combine(Path.GetTempPath(), "qtsw2_journal_submit_order_" + g.Substring(0, Math.Min(8, g.Length)));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var log = new RobotLogger(dir);
+            var journal = new ExecutionJournal(dir, log);
+            var tFill = new DateTimeOffset(2026, 4, 1, 10, 0, 0, TimeSpan.Zero);
+            var tSubObs = new DateTimeOffset(2026, 4, 1, 11, 0, 0, TimeSpan.Zero);
+            const string intentId = "intent_order_proof";
+            const string td = "2026-04-01";
+            const string stream = "S1";
+            journal.RecordEntryFill(intentId, td, stream, 100m, 1, tFill, 5m, "Long", "MES", "MES", null);
+            journal.RecordSubmission(intentId, td, stream, "MES", "ENTRY", "oid1", tSubObs);
+
+            var jpath = Path.Combine(dir, "data", "execution_journals", $"{td}_{stream}_{intentId}.json");
+            if (!File.Exists(jpath))
+                return (false, "journal json missing");
+            var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(jpath));
+            if (entry == null)
+                return (false, "deserialize failed");
+            if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc))
+                return (false, $"EntrySubmittedAtUtc should remain unset; got {entry.EntrySubmittedAtUtc}");
+            if (!entry.IsReconstructedSubmission)
+                return (false, "IsReconstructedSubmission expected true");
+            if (string.IsNullOrEmpty(entry.EntrySubmittedObservedAtUtc))
+                return (false, "EntrySubmittedObservedAtUtc should capture late observation");
+            if (string.IsNullOrEmpty(entry.EntryFilledAtUtc) || entry.EntryFilledAtUtc != tFill.ToString("o"))
+                return (false, $"EntryFilledAtUtc should be first fill canonical; got {entry.EntryFilledAtUtc}");
+            return (true, null);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(dir))
+                    Directory.Delete(dir, true);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
     public static (bool Pass, string? Error) RunUntrackedRecoveryDistinctFromTaggedProof()
     {
         var g = Guid.NewGuid().ToString("N");
@@ -118,6 +166,8 @@ public static class JournalRepairProofTests
         if (!b.Pass) return (false, $"tagged_upsert: {b.Error}");
         var c = RunUntrackedRecoveryDistinctFromTaggedProof();
         if (!c.Pass) return (false, $"untracked_distinct: {c.Error}");
+        var d = RunLateSubmitObservedAfterFillDoesNotSetCanonicalSubmitUtc();
+        if (!d.Pass) return (false, $"late_submit_order: {d.Error}");
         return (true, null);
     }
 }

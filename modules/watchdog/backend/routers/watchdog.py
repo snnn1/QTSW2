@@ -35,6 +35,7 @@ from modules.watchdog.config import (
     FRONTEND_FEED_FILE,
 )
 from modules.watchdog.websocket_tracker import get_tracker
+from modules.watchdog.market_calendar import get_market_state
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,12 @@ def get_aggregator() -> WatchdogAggregator:
         logger.error(error_msg)
         raise HTTPException(status_code=503, detail=error_msg)
     return aggregator_instance
+
+
+@router.get("/market-state")
+async def market_state():
+    """CME-style market session state (Chicago clock + modules/config/cme_holidays_*.json)."""
+    return get_market_state()
 
 
 @router.get("/debug")

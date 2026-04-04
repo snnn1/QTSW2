@@ -47,6 +47,17 @@ SLOT_ENDS = {
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 
+
+def _normalize_timetable_hash_compare(value: Optional[str]) -> Optional[str]:
+    """Lowercase stripped hash for drift comparison (hex case-insensitive)."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s.lower()
+
+
 # Execution policy cache for canonical -> execution instrument (YM -> MYM, etc.)
 _execution_instrument_cache: Optional[Dict[str, str]] = None
 
@@ -114,7 +125,26 @@ def _is_trading_date_within_max_age(
 
 class WatchdogStateManager:
     """Manages watchdog state and derived fields."""
-    
+
+    # --- Clear-path audit (robot-visible vs internal-only) ---
+    #
+    # reconciliation_gate_state (OK | ENGAGED | FAIL_CLOSED)
+    #   SET: MISMATCH_FAIL_CLOSED, RECONCILIATION_MISMATCH_FAIL_CLOSED,
+    #     STATE_CONSISTENCY_GATE_RECOVERY_FAILED -> FAIL_CLOSED; STATE_CONSISTENCY_GATE_ENGAGED -> ENGAGED
+    #     (unless already FAIL_CLOSED); RECONCILIATION_MISMATCH_DETECTED -> ENGAGED (from OK only).
+    #   CLEAR: RECONCILIATION_MISMATCH_CLEARED, STATE_CONSISTENCY_GATE_RELEASED -> OK.
+    #   Internal clear (no robot clear event): invalidate_engine_liveness() resets gate to OK.
+    #
+    # adoption_grace_expired_active
+    #   SET: ADOPTION_GRACE_EXPIRED_UNOWNED. CLEAR: ADOPTION_SUCCESS,
+    #     RECONCILIATION_RECOVERY_ADOPTION_SUCCESS. Internal clear: invalidate_engine_liveness().
+    #
+    # recovery_state
+    #   Drive: update_recovery_state (DISCONNECT_* / CONNECTION_RECOVERY_RESOLVED).
+    #   Internal (no robot complete event): compute_watchdog_status may clear RECOVERY_RUNNING after
+    #     RECOVERY_TIMEOUT_SECONDS (RECOVERY_STATE_TIMEOUT), or DISCONNECT_FAIL_CLOSED when engine_alive
+    #     (RECOVERY_STATE_AUTO_CLEAR).
+
     def __init__(self):
         # Engine state
         self._last_engine_tick_utc: Optional[datetime] = None  # Event timestamp (for display)
@@ -122,6 +152,10 @@ class WatchdogStateManager:
         self._last_engine_alive_value: bool = True  # Hysteresis: prevents flickering
         self._recovery_state: str = "CONNECTED_OK"
         self._recovery_started_utc: Optional[datetime] = None  # Track when recovery started for timeout
+        self._reconciliation_gate_state: str = "OK"  # OK | ENGAGED | FAIL_CLOSED
+        self._reconciliation_gate_since_utc: Optional[datetime] = None
+        self._reconciliation_gate_last_detail: Optional[Dict[str, Any]] = None
+        self._adoption_grace_expired_active: bool = False
         self._kill_switch_active: bool = False
         self._connection_status: str = "Unknown"  # Default until we receive a connection event
         self._last_connection_event_utc: Optional[datetime] = None
@@ -172,10 +206,18 @@ class WatchdogStateManager:
         self._trading_date: Optional[str] = None
         
         # Timetable-derived state (from timetable_current.json polling)
-        self._enabled_streams: Optional[Set[str]] = None  # None = timetable unavailable
+        self._enabled_streams: Optional[Set[str]] = None  # None = no successful poll yet; set() after failed poll
+        self._enabled_streams_ordered: List[str] = []  # Same IDs as _enabled_streams, timetable JSON order
         self._timetable_streams: Dict[str, Dict] = {}  # stream_id -> {instrument, session, slot_time, enabled}
         self._timetable_hash: Optional[str] = None
+        self._timetable_identity_hash: Optional[str] = None
         self._timetable_last_ok_utc: Optional[datetime] = None
+        self._latest_robot_timetable_hash: Optional[str] = None
+        self._latest_robot_trading_date: Optional[str] = None
+        self._latest_robot_hash_timestamp: Optional[datetime] = None
+        # True when timetable poll could not produce a reliable enabled-stream list (None set from poller)
+        self._enabled_streams_unknown: bool = True
+        self._timetable_file_source: Optional[str] = None  # Last successful poll ``source`` (auto_roll | …)
         
         # Risk gate state
         self._allowed_slot_times: List[str] = []  # From timetable config
@@ -222,10 +264,88 @@ class WatchdogStateManager:
         now = datetime.now(timezone.utc)
         self._last_engine_tick_utc = None
         self._last_engine_heartbeat = None
+        self._latest_robot_timetable_hash = None
+        self._latest_robot_trading_date = None
+        self._latest_robot_hash_timestamp = None
         self._last_engine_alive_value = False
         self._connection_status = "Unknown"
         self._recovery_state = "CONNECTED_OK"  # Clear stale FAIL-CLOSED from previous session
+        self._reconciliation_gate_state = "OK"
+        self._reconciliation_gate_since_utc = None
+        self._reconciliation_gate_last_detail = None
+        self._adoption_grace_expired_active = False
         self._last_invalidate_utc = now
+
+    # --- Read-only accessors for aggregator (avoid private field coupling) ---
+    def get_stream_states(self) -> Dict[tuple, Any]:
+        """Live (trading_date, stream) -> StreamStateInfo map; same object identity as internal store."""
+        return self._stream_states
+
+    def get_intent_exposures(self) -> Dict[str, Any]:
+        """Live intent_id -> IntentExposureInfo map; same object identity as internal store."""
+        return self._intent_exposures
+
+    def get_last_engine_tick_utc(self) -> Optional[datetime]:
+        return self._last_engine_tick_utc
+
+    def get_last_engine_heartbeat(self) -> Optional[datetime]:
+        return self._last_engine_heartbeat
+
+    def get_connection_status(self) -> str:
+        return self._connection_status
+
+    def get_last_connection_event_utc(self) -> Optional[datetime]:
+        return self._last_connection_event_utc
+
+    def get_last_invalidate_utc(self) -> Optional[datetime]:
+        """Set after invalidate_engine_liveness(); None if invalidation has never run."""
+        return getattr(self, "_last_invalidate_utc", None)
+
+    def update_reconciliation_gate_event(
+        self, event_type: str, timestamp_utc: datetime, data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Track state-consistency gate from robot canonical events."""
+        data = dict(data) if data else {}
+        prev = self._reconciliation_gate_state
+        if event_type in (
+            "MISMATCH_FAIL_CLOSED",
+            "RECONCILIATION_MISMATCH_FAIL_CLOSED",
+            "STATE_CONSISTENCY_GATE_RECOVERY_FAILED",
+        ):
+            self._reconciliation_gate_state = "FAIL_CLOSED"
+            self._reconciliation_gate_since_utc = timestamp_utc
+            self._reconciliation_gate_last_detail = {"event_type": event_type, **data}
+        elif event_type == "STATE_CONSISTENCY_GATE_ENGAGED":
+            if self._reconciliation_gate_state != "FAIL_CLOSED":
+                self._reconciliation_gate_state = "ENGAGED"
+                self._reconciliation_gate_since_utc = timestamp_utc
+                self._reconciliation_gate_last_detail = {"event_type": event_type, **data}
+        elif event_type == "RECONCILIATION_MISMATCH_DETECTED":
+            if self._reconciliation_gate_state == "OK":
+                self._reconciliation_gate_state = "ENGAGED"
+                self._reconciliation_gate_since_utc = timestamp_utc
+                self._reconciliation_gate_last_detail = {"event_type": event_type, **data}
+        elif event_type in ("RECONCILIATION_MISMATCH_CLEARED", "STATE_CONSISTENCY_GATE_RELEASED"):
+            self._reconciliation_gate_state = "OK"
+            self._reconciliation_gate_since_utc = None
+            self._reconciliation_gate_last_detail = {"event_type": event_type, **data}
+        else:
+            return
+        if prev != self._reconciliation_gate_state:
+            logger.info(
+                f"RECONCILIATION_GATE: {prev} -> {self._reconciliation_gate_state} "
+                f"(event={event_type}, ts={timestamp_utc.isoformat()})"
+            )
+
+    def set_adoption_grace_expired(self, active: bool, timestamp_utc: Optional[datetime] = None) -> None:
+        """Set/clear adoption grace violation flag (ADOPTION_GRACE_EXPIRED_UNOWNED)."""
+        if self._adoption_grace_expired_active == active:
+            return
+        self._adoption_grace_expired_active = active
+        logger.info(
+            f"ADOPTION_GRACE_EXPIRED_ACTIVE: {active} "
+            f"(ts={timestamp_utc.isoformat() if timestamp_utc else 'n/a'})"
+        )
 
     def update_engine_tick(self, timestamp_utc: datetime):
         """
@@ -258,6 +378,7 @@ class WatchdogStateManager:
             "DISCONNECT_RECOVERY_STARTED": "RECOVERY_RUNNING",
             "DISCONNECT_RECOVERY_COMPLETE": "RECOVERY_COMPLETE",
             "DISCONNECT_RECOVERY_ABORTED": "DISCONNECT_FAIL_CLOSED",
+            "CONNECTION_RECOVERY_RESOLVED": "RECOVERY_COMPLETE",
         }
         new_state = state_mapping.get(state, state)
         
@@ -775,7 +896,7 @@ class WatchdogStateManager:
                             trading_date=trading_date
                         )
                         hydrated += 1
-                        # Ensure stream state exists so get_stream_states shows carry-over
+                        # Ensure _stream_states has a key for journal day (API attaches via prior-key fallback on timetable rows)
                         key = (trading_date, stream)
                         if key not in self._stream_states:
                             self._stream_states[key] = StreamStateInfo(
@@ -1181,55 +1302,141 @@ class WatchdogStateManager:
         if trading_date:
             self._trading_date = trading_date
     
+    def update_robot_heartbeat_timetable(
+        self,
+        timetable_hash: Optional[str],
+        trading_date: Optional[str],
+        observed_utc: datetime,
+    ) -> None:
+        """Update last robot timetable identity from ENGINE_TIMER_HEARTBEAT payload."""
+        if timetable_hash is not None:
+            th = str(timetable_hash).strip()
+            if th:
+                self._latest_robot_timetable_hash = th
+        if trading_date is not None:
+            td = str(trading_date).strip()
+            if td:
+                self._latest_robot_trading_date = td
+        self._latest_robot_hash_timestamp = observed_utc
+
+    def clear_robot_heartbeat_timetable(self) -> None:
+        """Clear robot timetable snapshot (e.g. ENGINE_START / invalidation)."""
+        self._latest_robot_timetable_hash = None
+        self._latest_robot_trading_date = None
+        self._latest_robot_hash_timestamp = None
+
     def update_timetable_streams(
         self,
         enabled_streams: Optional[Set[str]],
-        trading_date: str,
+        trading_date: Optional[str],
         timetable_hash: Optional[str],
         utc_now: datetime,
-        enabled_streams_metadata: Optional[Dict[str, Dict]] = None
+        enabled_streams_metadata: Optional[Dict[str, Dict]] = None,
+        *,
+        timetable_file_source: Optional[str] = None,
+        enabled_streams_unknown: Optional[bool] = None,
+        enabled_streams_ordered: Optional[List[str]] = None,
+        timetable_identity_hash: Optional[str] = None,
     ):
         """
         Update timetable-derived state.
-        
-        - Sets trading_date always (authoritative)
-        - Sets enabled_streams only when non-None (preserves None on failure)
-        - Stores full stream metadata (instrument, session, slot_time) when available
-        - Updates timetable_hash when non-None
-        - Records last_ok timestamp when successful
-        - Sets timetable_validated based on whether timetable was successfully loaded
+
+        On poller failure, callers pass (None, None, None, ...) which clears stale enabled streams
+        (empty set, no fallback to full watchdog stream list).
+        On success, enabled_streams and trading_date are always set; timetable_hash/metadata ordered list
+        reflect timetable_current.json.
         """
+        poll_failed = trading_date is None and enabled_streams is None and timetable_hash is None
+        if poll_failed:
+            self._trading_date = None
+            self._enabled_streams = set()
+            self._enabled_streams_ordered = []
+            self._timetable_streams = {}
+            self._timetable_hash = None
+            self._timetable_identity_hash = None
+            self._timetable_last_ok_utc = None
+            self._timetable_validated = False
+            self._timetable_file_source = None
+            if enabled_streams_unknown is not None:
+                self._enabled_streams_unknown = enabled_streams_unknown
+            else:
+                self._enabled_streams_unknown = True
+            return
+
         self._trading_date = trading_date
-        if enabled_streams is not None:
-            self._enabled_streams = enabled_streams
+        self._enabled_streams = enabled_streams
         if enabled_streams_metadata is not None:
             self._timetable_streams = enabled_streams_metadata
+        if enabled_streams_ordered is not None:
+            self._enabled_streams_ordered = list(enabled_streams_ordered)
+        elif enabled_streams is not None:
+            self._enabled_streams_ordered = sorted(enabled_streams)
         if timetable_hash is not None:
             self._timetable_hash = timetable_hash
             self._timetable_last_ok_utc = utc_now
-        
-        # Timetable is validated if we successfully loaded it (enabled_streams is not None)
-        # This means the file exists, is parseable, and has valid structure
-        self._timetable_validated = enabled_streams is not None
+        if timetable_identity_hash is not None:
+            self._timetable_identity_hash = timetable_identity_hash
+        elif timetable_hash is not None:
+            self._timetable_identity_hash = timetable_hash
+        if timetable_file_source is not None:
+            self._timetable_file_source = timetable_file_source
+        if enabled_streams_unknown is not None:
+            self._enabled_streams_unknown = enabled_streams_unknown
+        else:
+            self._enabled_streams_unknown = False
+
+        self._timetable_validated = True
+    
+    def get_enabled_streams_unknown(self) -> bool:
+        """True if watchdog has no reliable timetable-derived enabled stream list."""
+        return self._enabled_streams_unknown
+
+    def _timetable_blocks_execution(self) -> bool:
+        """True when timetable_current.json has not produced a validated execution snapshot."""
+        return bool(self._enabled_streams_unknown or not self._timetable_validated)
+    
+    def get_timetable_source(self) -> Optional[str]:
+        """Last known timetable_current.json ``source`` from poller, if any."""
+        return self._timetable_file_source
     
     def get_enabled_streams(self) -> Optional[Set[str]]:
-        """Get enabled streams set (None if timetable unavailable)."""
+        """Get enabled streams set (None if no successful timetable poll yet; may be empty set after failed poll)."""
         return self._enabled_streams
+
+    def get_enabled_streams_ordered(self) -> List[str]:
+        """Enabled stream IDs in timetable JSON order; empty if no snapshot or failed poll."""
+        return list(self._enabled_streams_ordered)
     
     def get_timetable_streams_metadata(self) -> Optional[Dict[str, Dict]]:
         """
-        Get full timetable stream metadata (None if timetable unavailable).
-        
-        Returns None only if timetable is unavailable (enabled_streams is None).
-        Returns empty dict if timetable is available but no streams are enabled.
+        Get full timetable stream metadata (None if no successful timetable poll yet).
+
+        Returns empty dict after a successful poll with zero enabled streams.
         """
         if self._enabled_streams is None:
-            return None  # Timetable unavailable
+            return None
         return self._timetable_streams
     
     def get_timetable_hash(self) -> Optional[str]:
-        """Get current timetable hash."""
+        """Content-only hash (Robot / TimetableContentHasher parity). Not the publisher JSON ``timetable_hash``."""
         return self._timetable_hash
+
+    def get_timetable_identity_hash(self) -> Optional[str]:
+        """Publisher hash when present, else content hash — matches Robot _currentTimetableHash semantics."""
+        return self._timetable_identity_hash
+
+    def compute_timetable_drift(self) -> bool:
+        """
+        True when robot heartbeat reports a timetable identity that differs from the system's
+        current timetable file snapshot.
+        """
+        rh = _normalize_timetable_hash_compare(self._latest_robot_timetable_hash)
+        ch = _normalize_timetable_hash_compare(
+            self._timetable_identity_hash if self._timetable_identity_hash is not None else self._timetable_hash
+        )
+        if not rh or not ch:
+            return False
+        return rh != ch
     
     def get_trading_date(self) -> Optional[str]:
         """Get current trading_date (from timetable, or CME rollover fallback)."""
@@ -1517,9 +1724,26 @@ class WatchdogStateManager:
     
     def compute_risk_gate_status(self) -> Dict:
         """Compute risk gate status derived field."""
-        recovery_state_allowed = self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
+        engine_alive = self.compute_engine_alive()
+        gate_blocks = self._reconciliation_gate_state in ("ENGAGED", "FAIL_CLOSED")
+        recovery_state_allowed = (
+            self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
+            and not gate_blocks
+            and not self._adoption_grace_expired_active
+        )
         kill_switch_allowed = not self._kill_switch_active
-        
+        # Engine must be alive: recovery/gate/kill-switch can read "OK" from stale auto-cleared state
+        # while ticks are dead — without this, execution_safe contradictions ENGINE_STALLED / stream table.
+        timetable_ok = not self._timetable_blocks_execution()
+        timetable_drift = self.compute_timetable_drift()
+        execution_safe = bool(
+            timetable_ok
+            and engine_alive
+            and recovery_state_allowed
+            and kill_switch_allowed
+            and not timetable_drift
+        )
+
         # Only include streams for current trading date (exclude past dates from slot journal hydration)
         current_td = self.get_trading_date()
         if not current_td:
@@ -1546,9 +1770,8 @@ class WatchdogStateManager:
                     # Handle ISO format: "2026-01-24T07:30:00-06:00" -> "07:30"
                     if 'T' in slot_time_str:
                         try:
-                            from datetime import datetime
-                            dt = datetime.fromisoformat(slot_time_str.replace('Z', '+00:00'))
-                            slot_time_str = dt.strftime("%H:%M")
+                            slot_dt = datetime.fromisoformat(slot_time_str.replace('Z', '+00:00'))
+                            slot_time_str = slot_dt.strftime("%H:%M")
                         except Exception:
                             # If parsing fails, try to extract HH:MM pattern
                             import re
@@ -1576,6 +1799,7 @@ class WatchdogStateManager:
         return {
             "recovery_state_allowed": recovery_state_allowed,
             "kill_switch_allowed": kill_switch_allowed,
+            "execution_safe": execution_safe,
             "timetable_validated": self._timetable_validated,
             "stream_armed": stream_armed,
             "session_slot_time_valid": session_slot_time_valid,
@@ -1650,7 +1874,9 @@ class WatchdogStateManager:
         stuck_streams = self.compute_stuck_streams()
         
         now = datetime.now(timezone.utc)
-        
+        timetable_drift = self.compute_timetable_drift()
+        current_identity = self._timetable_identity_hash if self._timetable_identity_hash is not None else self._timetable_hash
+
         # Compute market_open with error handling to ensure it's always returned
         try:
             chicago_now = datetime.now(CHICAGO_TZ)
@@ -2106,6 +2332,45 @@ class WatchdogStateManager:
             ),
             "engine_tick_stall_detected": not engine_alive,
             "recovery_state": recovery_state,  # Use computed recovery_state (may be auto-cleared)
+            "reconciliation_gate_state": self._reconciliation_gate_state,
+            "reconciliation_gate_since_chicago": (
+                self._reconciliation_gate_since_utc.astimezone(CHICAGO_TZ).isoformat()
+                if self._reconciliation_gate_since_utc
+                else None
+            ),
+            "reconciliation_gate_last_detail": (
+                dict(self._reconciliation_gate_last_detail) if self._reconciliation_gate_last_detail else None
+            ),
+            "adoption_grace_expired_active": self._adoption_grace_expired_active,
+            "timetable_drift": timetable_drift,
+            "robot_timetable_hash": self._latest_robot_timetable_hash,
+            # Publisher / identity (file JSON timetable_hash when set) — drift compares this to robot heartbeat.
+            "timetable_publisher_hash": self._timetable_identity_hash,
+            # Content hash (C# TimetableContentHasher parity) — do not use for operator drift labels.
+            "timetable_content_hash": self._timetable_hash,
+            # Back-compat: same as timetable_publisher_hash (identity). Prefer timetable_publisher_hash in new UI.
+            "current_timetable_hash": current_identity,
+            "session_trading_date": self._trading_date,
+            "timetable_source": self._timetable_file_source,
+            "timetable_last_ok_utc": (
+                self._timetable_last_ok_utc.isoformat().replace("+00:00", "Z")
+                if self._timetable_last_ok_utc
+                else None
+            ),
+            "robot_timetable_observed_chicago": (
+                self._latest_robot_hash_timestamp.astimezone(CHICAGO_TZ).isoformat()
+                if self._latest_robot_hash_timestamp
+                else None
+            ),
+            "execution_safe": (
+                not self._timetable_blocks_execution()
+                and engine_alive
+                and self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
+                and self._reconciliation_gate_state not in ("ENGAGED", "FAIL_CLOSED")
+                and not self._adoption_grace_expired_active
+                and not self._kill_switch_active
+                and not timetable_drift
+            ),
             "kill_switch_active": self._kill_switch_active,
             "connection_status": connection_status,
             "derived_connection_state": derived_connection_state,

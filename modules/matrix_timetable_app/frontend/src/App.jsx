@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useTransition, useDeferredValue } from 'react'
 import { List } from 'react-window'
 import './App.css'
-import { useMatrixWorker } from './useMatrixWorker'
 import { STREAMS, DAYS_OF_WEEK, AVAILABLE_TIMES, ANALYZER_COLUMN_ORDER, DEFAULT_COLUMNS } from './utils/constants'
 import { getDefaultFilters, loadAllFilters, saveAllFilters, getStreamFiltersFromStorage } from './utils/filterUtils'
-import { getChicagoDateNow, getCMETradingDate, dateToYYYYMMDD, parseYYYYMMDD, formatChicagoTime } from './utils/dateUtils'
+import { getCMETradingDate, dateToYYYYMMDD, parseYYYYMMDD, formatChicagoTime, applyCmeWeekendTradingDay, formatChicagoWallIso, formatUtcWallIso } from './utils/dateUtils'
+import { logTradingDateRolledUi } from './utils/tradingDateRollLog'
 // Use existing utility files instead of duplicating code
 import { 
   getContractValue, 
@@ -28,10 +28,48 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import StatsContent from './components/StatsContent'
 import MatrixMetricsDashboard from './components/MatrixMetricsDashboard'
 import * as matrixApi from './api/matrixApi'
+import { getChicagoDateYMD, getCmeMarketState } from './utils/cmeMarketState'
 
 // API base URL - can be overridden via environment variable
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 const API_BASE = `http://localhost:${API_PORT}/api`
+/** Poll Watchdog-backed market state (dev: Vite proxies /api/watchdog → :8002). */
+const WATCHDOG_MARKET_POLL_MS = 30000
+
+/** Format timetable API `as_of` in America/Chicago: "Apr 2, 19:07 CT". */
+function formatTimetableAsOfChicago(asOfIso) {
+  if (asOfIso == null || String(asOfIso).trim() === '') return null
+  const d = new Date(asOfIso)
+  if (Number.isNaN(d.getTime())) return null
+  const monthDay = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    month: 'short',
+    day: 'numeric',
+  }).format(d)
+  const hm = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(d)
+  return `${monthDay}, ${hm} CT`
+}
+
+/** Map GET /api/timetable/current payload to timetable tab header meta. */
+function timetableApiDocToSourceMeta(tt) {
+  if (!tt || typeof tt !== 'object') return null
+  const st = tt.session_trading_date != null ? String(tt.session_trading_date).trim() : ''
+  const td = tt.trading_date != null ? String(tt.trading_date).trim() : ''
+  const ao = tt.as_of != null ? String(tt.as_of).trim() : ''
+  const et =
+    tt.eligibility_trade_date != null ? String(tt.eligibility_trade_date).split('T')[0].trim() : ''
+  return {
+    session_trading_date: st || null,
+    trading_date: td || null,
+    as_of: ao || null,
+    eligibility_trade_date: et || null,
+  }
+}
 
 function App() {
   return (
@@ -129,6 +167,16 @@ function AppContent() {
   })
 
   // Show/Hide blocked rows in timetable (default: ON/show blocked)
+  /** From GET /api/timetable/current only (session_trading_date, as_of, trading_date). */
+  const [timetableSourceMeta, setTimetableSourceMeta] = useState(null)
+  /** Manual POST /api/timetable/execution feedback. */
+  const [timetableManualPublishLoading, setTimetableManualPublishLoading] = useState(false)
+  const [timetableManualPublishBanner, setTimetableManualPublishBanner] = useState(null)
+  /** GET /api/timetable/current only — Trading Timetable grid has no worker/matrix fallback. */
+  const [timetableApiStatus, setTimetableApiStatus] = useState({ loading: false, error: null })
+  /** From GET /api/watchdog/market-state; null → use getCmeMarketState fallback. */
+  const [watchdogMarket, setWatchdogMarket] = useState(null)
+
   const [showBlockedTimetableRows, setShowBlockedTimetableRows] = useState(() => {
     const saved = localStorage.getItem('matrix_show_blocked_timetable')
     if (saved !== null) {
@@ -136,9 +184,6 @@ function AppContent() {
     }
     return true // Default: show blocked rows
   })
-
-  // Session eligibility freeze status (for timetable tab notice)
-  const [eligibilityStatus, setEligibilityStatus] = useState(null)
 
   // Matrix controller hook - handles all matrix orchestration
   const {
@@ -172,14 +217,12 @@ function AppContent() {
     workerProfitBreakdown,
     workerBreakdownType,
     breakdownLoading: workerBreakdownLoading,
-    workerTimetable,
-    timetableLoading: workerTimetableLoading,
     workerExecutionTimetable,
     workerError,
     // Worker functions
     workerGetRows,
     calculateProfitBreakdown,
-    workerCalculateTimetable,
+    workerApplyExecutionTimetableFromApi,
     workerInitData,
     // Controller functions
     loadMasterMatrix,
@@ -199,27 +242,54 @@ function AppContent() {
     autoUpdateEnabled,
     showFilteredDays
   })
+
+  const handleManualPublishExecutionTimetable = useCallback(async () => {
+    setTimetableManualPublishBanner(null)
+    setTimetableManualPublishLoading(true)
+    try {
+      const res = await matrixApi.saveExecutionTimetable({
+        reason: 'manual_ui',
+        source: 'matrix_ui',
+      })
+      const tt = await matrixApi.getCurrentTimetable()
+      setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
+      workerApplyExecutionTimetableFromApi(tt)
+      setTimetableApiStatus({ loading: false, error: null })
+      const st = res.status === 'published' ? 'Published' : 'Unchanged'
+      const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
+      setTimetableManualPublishBanner({
+        type: 'ok',
+        text: `${st}. Content hash prefix: ${h}`,
+      })
+    } catch (e) {
+      setTimetableManualPublishBanner({
+        type: 'err',
+        text: e?.message || String(e),
+      })
+    } finally {
+      setTimetableManualPublishLoading(false)
+    }
+  }, [workerApplyExecutionTimetableFromApi])
+
+  /** Timetable tab: rows only from GET /api/timetable/current (via workerExecutionTimetable). No worker merge. */
+  const timetableRowsForDisplay = useMemo(() => {
+    const streams = workerExecutionTimetable?.streams
+    if (!streams?.length) return []
+    return streams.map((s) => ({
+      Stream: s.stream,
+      Time: s.slot_time != null ? String(s.slot_time) : '',
+      Enabled: s.enabled !== false,
+      BlockReason:
+        s.block_reason != null && String(s.block_reason).trim() !== ''
+          ? String(s.block_reason)
+          : null,
+    }))
+  }, [workerExecutionTimetable])
   
   // Save auto-update preference to localStorage
   useEffect(() => {
     localStorage.setItem('matrix_auto_update_enabled', String(autoUpdateEnabled))
   }, [autoUpdateEnabled])
-
-  // Fetch eligibility status when timetable tab is active; refresh every 60s
-  useEffect(() => {
-    if (activeTab !== 'timetable') return
-    const fetchEligibility = async () => {
-      try {
-        const status = await matrixApi.getEligibilityStatus()
-        setEligibilityStatus(status)
-      } catch {
-        setEligibilityStatus(null)
-      }
-    }
-    fetchEligibility()
-    const interval = setInterval(fetchEligibility, 60000)
-    return () => clearInterval(interval)
-  }, [activeTab])
 
   // Per-stream selected columns (persisted in localStorage)
   const [selectedColumns, setSelectedColumns] = useState(() => {
@@ -2792,183 +2862,109 @@ function AppContent() {
     return {}
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
 
-  // Calculate current trading day (for filtering timetable) - only update when date changes, not every second
-  // CRITICAL FIX: Use CME trading date with 17:00 Chicago rollover rule
-  // This matches the timetable generation logic (timetable_current.json)
-  const [currentTradingDay, setCurrentTradingDay] = useState(() => {
-    // Get CME trading date (applies 17:00 rollover rule)
-    const cmeTradingDateStr = getCMETradingDate()
-    let tradingDay = parseYYYYMMDD(cmeTradingDateStr)
-    const dayOfWeek = tradingDay.getDay()
-    if (dayOfWeek === 0) { // Sunday
-      tradingDay.setDate(tradingDay.getDate() + 1) // Monday
-    } else if (dayOfWeek === 6) { // Saturday
-      tradingDay.setDate(tradingDay.getDate() + 2) // Monday
-    }
-    return tradingDay
-  })
-  
-  // Update trading day only when the date changes (not every second)
-  // CRITICAL FIX: Use CME trading date with 17:00 Chicago rollover rule
+  // Trading day: GET /api/timetable/current only (`effective_session_trading_date`). No browser CME fallback.
+  const [currentTradingDay, setCurrentTradingDay] = useState(null)
+
+  const [showTradingDateDebugOverlay, setShowTradingDateDebugOverlay] = useState(false)
   useEffect(() => {
-    const updateTradingDay = () => {
-      // Get CME trading date (applies 17:00 rollover rule)
-      const cmeTradingDateStr = getCMETradingDate()
-      let tradingDay = parseYYYYMMDD(cmeTradingDateStr)
-      const dayOfWeek = tradingDay.getDay()
-      if (dayOfWeek === 0) { // Sunday
-        tradingDay.setDate(tradingDay.getDate() + 1) // Monday
-      } else if (dayOfWeek === 6) { // Saturday
-        tradingDay.setDate(tradingDay.getDate() + 2) // Monday
-      }
-      
-      // Only update if the date string changed (not the time)
-      // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString()
-      const newDateStr = dateToYYYYMMDD(tradingDay)
-      const currentDateStr = dateToYYYYMMDD(currentTradingDay)
-      if (newDateStr !== currentDateStr) {
-        setCurrentTradingDay(tradingDay)
+    const on =
+      import.meta.env.VITE_DEBUG_TRADING_CLOCK === 'true' ||
+      (typeof localStorage !== 'undefined' && localStorage.getItem('matrix_debug_trading_clock') === '1')
+    setShowTradingDateDebugOverlay(!!on)
+  }, [])
+
+  useEffect(() => {
+    const syncFromBackend = async () => {
+      try {
+        const tt = await matrixApi.getCurrentTimetable()
+        if (!tt || typeof tt !== 'object') return
+        const raw = tt.effective_session_trading_date
+        if (!raw || typeof raw !== 'string') return
+        const ymd = raw.split('T')[0]
+        const nextDay = applyCmeWeekendTradingDay(parseYYYYMMDD(ymd))
+        setCurrentTradingDay(prev => {
+          const prevStr = prev ? dateToYYYYMMDD(prev) : ''
+          const nextStr = dateToYYYYMMDD(nextDay)
+          if (prevStr !== nextStr) {
+            logTradingDateRolledUi({ oldTradingDateStr: prevStr || '(none)', newTradingDateStr: nextStr })
+            return nextDay
+          }
+          return prev ?? nextDay
+        })
+      } catch {
+        /* keep last known */
       }
     }
-    
-    // Check every minute instead of every second
-    const interval = setInterval(updateTradingDay, 60000)
-    updateTradingDay() // Check immediately
-    
-    return () => clearInterval(interval)
-  }, [currentTradingDay])
-  
-  // Calculate timetable in worker when needed
-  // If displayed date doesn't exist in master matrix, read from backend-generated timetable_current.json
-  // IMPORTANT: Check matrix freshness before calculating timetable
+    syncFromBackend()
+    const id = setInterval(syncFromBackend, 60000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Trading Timetable grid: load only from GET /api/timetable/current (periodic refresh while tab active).
   useEffect(() => {
-    if (deferredActiveTab !== 'timetable' || !currentTradingDay) return
-    
-    // Check matrix freshness - refuse to calculate timetable if matrix is stale
-    const checkFreshnessAndCalculate = async () => {
-      if (matrixFreshness && matrixFreshness.is_stale) {
-        devWarn('[Timetable] Matrix is stale, reloading before calculating timetable')
-        // Reload latest matrix first
-        try {
-          await reloadLatestMatrix()
-          // After reload, the useEffect will trigger again with fresh data
+    if (deferredActiveTab !== 'timetable') return
+    let cancelled = false
+    const load = async ({ showLoading = false } = {}) => {
+      if (showLoading) {
+        setTimetableApiStatus({ loading: true, error: null })
+      }
+      try {
+        const tt = await matrixApi.getCurrentTimetable()
+        if (cancelled) return
+        if (!tt || typeof tt !== 'object') {
+          console.warn('[Timetable] API missing or invalid — no worker fallback')
+          workerApplyExecutionTimetableFromApi(null)
+          setTimetableSourceMeta(null)
+          setTimetableApiStatus({ loading: false, error: 'No timetable from API' })
           return
-        } catch (error) {
-          console.error('[Timetable] Failed to reload matrix:', error)
-          // Continue anyway - better than blocking
         }
-      }
-      
-      // Check if displayed date exists in master matrix
-      // CRITICAL FIX: Use dateToYYYYMMDD instead of toISOString()
-      const displayedDateStr = dateToYYYYMMDD(currentTradingDay)
-      const dateExistsInMatrix = masterData.some(row => {
-        const rowDate = row.Date || row.trade_date
-        if (!rowDate) return false
-        const rowDateStr = rowDate instanceof Date 
-          ? dateToYYYYMMDD(rowDate)
-          : rowDate.split('T')[0]
-        return rowDateStr === displayedDateStr
-      })
-      
-      // If date doesn't exist in matrix, try to read from backend-generated timetable_current.json
-      // This file is generated with RS calculation and contains all streams
-      if (!dateExistsInMatrix && workerReady) {
-        devLog('[Timetable] Displayed date not in matrix, reading from timetable_current.json:', displayedDateStr)
-        try {
-          const timetable = await matrixApi.getCurrentTimetable()
-          if (timetable && timetable.trading_date === displayedDateStr && timetable.streams) {
-            // Convert backend format to worker format
-            const timetableRows = timetable.streams
-              .map(s => ({
-                Stream: s.stream,
-                Time: s.slot_time || s.decision_time || '',
-                Enabled: s.enabled,
-                BlockReason: s.block_reason || null
-              }))
-            
-            // Update worker timetable state directly (bypass worker calculation)
-            // We need to access the setTimetable function from useMatrixWorker
-            // For now, trigger backend generation which will update the file
-            const generateResponse = await fetch(`http://localhost:8000/api/timetable/generate`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ date: displayedDateStr })
-            })
-            if (generateResponse.ok) {
-              // After generation, trigger worker calculation which will now use the updated file
-              // Or better: read the file again and update state
-              const updatedTimetable = await matrixApi.getCurrentTimetable()
-              if (updatedTimetable && updatedTimetable.streams) {
-                const updatedRows = updatedTimetable.streams
-                  .map(s => ({
-                    Stream: s.stream,
-                    Time: s.slot_time || s.decision_time || '',
-                    Enabled: s.enabled,
-                    BlockReason: s.block_reason || null
-                  }))
-                // Note: We can't directly set worker state here, so we'll let the worker
-                // recalculate after the file is updated. The worker should read from the file.
-                devLog('[Timetable] Generated via backend, triggering worker recalculation')
-                if (workerCalculateTimetable) {
-                  // Small delay to ensure file is written
-                  setTimeout(() => {
-                    workerCalculateTimetable(streamFilters, currentTradingDay)
-                  }, 100)
-                }
-              }
-            }
-          } else if (timetable && timetable.trading_date !== displayedDateStr) {
-            // File exists but for different date - generate for displayed date
-            devLog('[Timetable] File exists for different date, generating for:', displayedDateStr)
-            await fetch(`http://localhost:8000/api/timetable/generate`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ date: displayedDateStr })
-            })
-            if (workerCalculateTimetable) {
-              setTimeout(() => {
-                workerCalculateTimetable(streamFilters, currentTradingDay)
-              }, 100)
-            }
-          }
-        } catch (error) {
-          devWarn('[Timetable] Backend read failed, using worker:', error)
-          // Fall through to worker calculation
-          if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
-            workerCalculateTimetable(streamFilters, currentTradingDay)
-          }
+        setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
+        workerApplyExecutionTimetableFromApi(tt)
+        const rawStreams = tt.streams
+        if (!Array.isArray(rawStreams) || rawStreams.length === 0) {
+          console.warn('[Timetable] API returned no streams')
         }
-        return
-      }
-      
-      // Normal path: Use worker calculation from master matrix
-      if (workerReady && masterData.length > 0 && workerCalculateTimetable) {
-        workerCalculateTimetable(streamFilters, currentTradingDay)
-      }
-    }
-    
-    checkFreshnessAndCalculate()
-  }, [workerReady, masterData.length, streamFilters, deferredActiveTab, workerCalculateTimetable, currentTradingDay, masterData, matrixFreshness, reloadLatestMatrix])
-  
-  // Save execution timetable whenever UI timetable updates
-  // This ensures timetable_current.json matches exactly what the UI shows
-  useEffect(() => {
-    if (workerExecutionTimetable && workerExecutionTimetable.streams && workerExecutionTimetable.streams.length > 0) {
-      const saveExecutionTimetable = async () => {
-        try {
-          await matrixApi.saveExecutionTimetable({
-            tradingDate: workerExecutionTimetable.trading_date,
-            streams: workerExecutionTimetable.streams
+        setTimetableApiStatus({ loading: false, error: null })
+      } catch (e) {
+        if (!cancelled) {
+          console.warn('[Timetable] API error', e)
+          workerApplyExecutionTimetableFromApi(null)
+          setTimetableSourceMeta(null)
+          setTimetableApiStatus({
+            loading: false,
+            error: e?.message || 'Failed to load timetable',
           })
-          devLog('Execution timetable saved successfully')
-        } catch (error) {
-          console.error('Error saving execution timetable:', error.message)
         }
       }
-      saveExecutionTimetable()
     }
-  }, [workerExecutionTimetable])
+    load({ showLoading: true })
+    const id = setInterval(() => load({ showLoading: false }), 60000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [deferredActiveTab, workerApplyExecutionTimetableFromApi])
+
+  useEffect(() => {
+    if (deferredActiveTab !== 'timetable') return
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const r = await fetch('/api/watchdog/market-state')
+        if (!r.ok) throw new Error(String(r.status))
+        const j = await r.json()
+        if (!cancelled && j && typeof j === 'object') setWatchdogMarket(j)
+      } catch {
+        if (!cancelled) setWatchdogMarket(null)
+      }
+    }
+    tick()
+    const id = setInterval(tick, WATCHDOG_MARKET_POLL_MS)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [deferredActiveTab])
   
   // Show backend connection state if not ready
   if (backendConnecting) {
@@ -3186,9 +3182,49 @@ function AppContent() {
         {/* Content */}
         {activeTab === 'timetable' ? (
           <div className="space-y-6">
+            {showTradingDateDebugOverlay && (
+              <div
+                className="fixed bottom-4 right-4 z-[100] max-w-sm rounded-lg border border-amber-600/70 bg-gray-950/95 px-3 py-2 font-mono text-[11px] leading-relaxed text-amber-100 shadow-xl backdrop-blur-sm"
+                title="Enable: VITE_DEBUG_TRADING_CLOCK=true or localStorage matrix_debug_trading_clock=1"
+              >
+                <div className="mb-1 font-semibold text-amber-400">TRADING_DATE debug</div>
+                <div>
+                  <span className="text-gray-500">CME Session: </span>
+                  {getCMETradingDate()}
+                </div>
+                <div>
+                  <span className="text-gray-500">Chicago Time: </span>
+                  {formatChicagoTime(currentTime, {
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit'
+                  })}
+                </div>
+                <div>
+                  <span className="text-gray-500">UTC: </span>
+                  {currentTime.toLocaleTimeString('en-US', {
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    timeZone: 'UTC'
+                  })}
+                </div>
+                <div className="mt-1 border-t border-gray-700 pt-1 text-gray-400">
+                  Wall ISO CT: {formatChicagoWallIso(currentTime)}
+                </div>
+                <div className="text-gray-400">Wall ISO UTC: {formatUtcWallIso(currentTime)}</div>
+                <div className="text-gray-400">
+                  UI day: {currentTradingDay ? dateToYYYYMMDD(currentTradingDay) : '—'}
+                  {' '}
+                  (backend <code className="text-gray-500">effective_session_trading_date</code>)
+                </div>
+              </div>
+            )}
             <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 flex-wrap">
                   <h2 className="text-xl font-semibold">Trading Timetable</h2>
                   <button
                     onClick={() => setShowBlockedTimetableRows(!showBlockedTimetableRows)}
@@ -3197,10 +3233,21 @@ function AppContent() {
                   >
                     {showBlockedTimetableRows ? '✓' : ''} Blocked
                   </button>
+                  <button
+                    type="button"
+                    onClick={handleManualPublishExecutionTimetable}
+                    disabled={timetableManualPublishLoading || masterLoading}
+                    className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Rebuild data/timetable/timetable_current.json from the on-disk master matrix (POST /api/timetable/execution). Session must match live CME day."
+                  >
+                    {timetableManualPublishLoading ? 'Publishing…' : 'Publish live timetable'}
+                  </button>
                 </div>
                 <div className="text-center">
                   <div className="text-lg font-semibold text-gray-300">
-                    {currentTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                    {currentTradingDay
+                      ? currentTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+                      : 'Loading session…'}
                   </div>
                 </div>
                 <div className="text-right">
@@ -3256,51 +3303,24 @@ function AppContent() {
                 </div>
               </div>
 
-              {/* Session eligibility freeze notice */}
-              <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm">
-                {eligibilityStatus ? (
-                  eligibilityStatus.status === 'no_eligibility_file' ? (
-                    <span className="text-gray-300">
-                      No <code className="text-gray-400">eligibility_*.json</code> freeze for{' '}
-                      <span className="font-semibold text-amber-400">{eligibilityStatus.trading_date || eligibilityStatus.timetable_trading_date}</span>
-                      {eligibilityStatus.eligible_stream_count != null && (
-                        <span className="text-gray-500 ml-2">
-                          (timetable: {eligibilityStatus.eligible_stream_count} enabled)
-                        </span>
-                      )}
-                    </span>
-                  ) : eligibilityStatus.status === 'none' ? (
-                    <span className="text-gray-500">No eligibility data</span>
-                  ) : (
-                  <span className="text-gray-300">
-                    Session eligibility frozen for <span className="font-semibold text-green-400">{eligibilityStatus.trading_date}</span> at{' '}
-                    <span className="font-mono">
-                      {eligibilityStatus.freeze_time_utc
-                        ? new Date(eligibilityStatus.freeze_time_utc).toLocaleString('en-US', {
-                            timeZone: 'America/Chicago',
-                            month: 'short',
-                            day: 'numeric',
-                            year: 'numeric',
-                            hour: 'numeric',
-                            minute: '2-digit',
-                            second: '2-digit'
-                          }) + ' CT'
-                        : eligibilityStatus.freeze_time_utc}
-                    </span>
-                    {eligibilityStatus.eligible_stream_count != null && (
-                      <span className="text-gray-500 ml-2">({eligibilityStatus.eligible_stream_count} eligible)</span>
-                    )}
-                    {eligibilityStatus.eligibility_timetable_count_mismatch && (
-                      <span className="text-amber-400 ml-2" title="eligible_stream_count differs from enabled count in timetable_current.json">
-                        (mismatch vs timetable)
-                      </span>
-                    )}
-                  </span>
-                  )
-                ) : (
-                  <span className="text-gray-500">No eligibility file yet</span>
-                )}
+              <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm text-gray-300">
+                Live <code className="text-gray-400">timetable_current.json</code> is written by the dashboard from the on-disk{' '}
+                <span className="font-semibold text-green-400">master matrix</span>. Use{' '}
+                <span className="font-semibold text-emerald-400">Publish live timetable</span> above to rebuild it (
+                <code className="text-gray-400">POST /api/timetable/execution</code>
+                ). The grid below is read-only from <code className="text-gray-400">GET /api/timetable/current</code> — no client-side recomputation.
               </div>
+              {timetableManualPublishBanner ? (
+                <div
+                  className={`mb-4 px-4 py-2 rounded text-sm ${
+                    timetableManualPublishBanner.type === 'err'
+                      ? 'bg-red-950/80 text-red-200 border border-red-800'
+                      : 'bg-emerald-950/60 text-emerald-100 border border-emerald-800'
+                  }`}
+                >
+                  {timetableManualPublishBanner.text}
+                </div>
+              ) : null}
               
               {masterLoading ? (
                 <div className="text-center py-8">Loading data...</div>
@@ -3314,11 +3334,89 @@ function AppContent() {
                     Retry Load
                   </button>
                 </div>
-              ) : workerTimetableLoading ? (
-                <div className="text-center py-8 text-gray-400">Calculating timetable...</div>
-              ) : !workerTimetable || workerTimetable.length === 0 ? (
-                <div className="text-center py-8 text-gray-400">No timetable data available</div>
+              ) : timetableApiStatus.loading ? (
+                <div className="text-center py-8 text-gray-400">Loading timetable from API…</div>
+              ) : timetableApiStatus.error ? (
+                <div className="text-center py-8 text-amber-400">
+                  No timetable available (API not loaded): {timetableApiStatus.error}
+                </div>
+              ) : !timetableRowsForDisplay.length ? (
+                <div className="text-center py-8 text-gray-400">
+                  No timetable rows — API returned no streams (or payload missing <code className="text-gray-500">streams</code>).
+                </div>
               ) : (
+                  <>
+                  {(() => {
+                    const sessionLine =
+                      timetableSourceMeta?.session_trading_date ||
+                      timetableSourceMeta?.trading_date ||
+                      null
+                    const eligLine =
+                      timetableSourceMeta?.eligibility_trade_date ||
+                      workerExecutionTimetable?.eligibility_trade_date ||
+                      null
+                    const asOfRaw = timetableSourceMeta?.as_of || null
+                    const builtLine = formatTimetableAsOfChicago(asOfRaw)
+                    let showPrevCal = false
+                    if (asOfRaw && sessionLine) {
+                      const inst = new Date(asOfRaw)
+                      if (!Number.isNaN(inst.getTime())) {
+                        const chYmd = getChicagoDateYMD(inst)
+                        showPrevCal = chYmd !== sessionLine
+                      }
+                    }
+                    return (
+                      <div className="mb-3 px-1">
+                        {sessionLine ? (
+                          <div className="text-base font-semibold text-gray-100">
+                            Session: {sessionLine} (CME session)
+                          </div>
+                        ) : null}
+                        {eligLine ? (
+                          <div
+                            className="text-sm text-gray-300 mt-0.5"
+                            title="Latest matrix trade_date on document (operator metadata; execution enable/slot from timetable API)"
+                          >
+                            Eligibility (matrix): {eligLine}
+                          </div>
+                        ) : null}
+                        {builtLine ? (
+                          <div className="text-sm text-gray-500 mt-0.5">
+                            Built: {builtLine}
+                            {showPrevCal ? ' (after 18:00 CT session rollover)' : ''}
+                          </div>
+                        ) : null}
+                        {(() => {
+                          const m = watchdogMarket?.state ?? getCmeMarketState(currentTime)
+                          const cls =
+                            m === 'OPEN'
+                              ? 'text-emerald-400 font-semibold'
+                              : m === 'PRE-OPEN'
+                                ? 'text-amber-400 font-semibold'
+                                : 'text-rose-400 font-semibold'
+                          const wm = watchdogMarket
+                          const tip = wm
+                            ? [
+                                wm.reason,
+                                wm.phase != null && `phase=${wm.phase}`,
+                                wm.calendar_date_chicago,
+                                wm.calendar_loaded === false && 'calendar_loaded=false',
+                              ]
+                                .filter(Boolean)
+                                .join(' · ')
+                            : 'Watchdog API unreachable — local calendar fallback'
+                          return (
+                            <div className="text-sm text-gray-400 mt-1.5" title={tip}>
+                              Market: <span className={cls}>{m}</span>
+                              {!wm ? (
+                                <span className="text-gray-600 ml-2 text-xs">(local)</span>
+                              ) : null}
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    )
+                  })()}
                   <div className="overflow-x-auto">
                     <table className="w-full border-collapse">
                       <thead>
@@ -3329,7 +3427,7 @@ function AppContent() {
                         </tr>
                       </thead>
                       <tbody>
-                        {workerTimetable
+                        {timetableRowsForDisplay
                           .filter(row => showBlockedTimetableRows || row.Enabled !== false)
                           .map((row, idx) => {
                             const isDisabled = row.Enabled === false
@@ -3356,6 +3454,7 @@ function AppContent() {
                       </tbody>
                     </table>
                   </div>
+                  </>
               )}
             </div>
           </div>

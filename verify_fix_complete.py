@@ -2,14 +2,18 @@
 Comprehensive verification that the fix is complete and working
 """
 import json
+import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 from collections import defaultdict
 
 print("="*80)
 print("COMPREHENSIVE FIX VERIFICATION")
 print("="*80)
+
+session_date = ""
+expected_trading_date = ""
 
 # 1. Check timetable file
 print("\n[1] TIMETABLE FILE CHECK")
@@ -18,22 +22,21 @@ timetable_path = Path("data/timetable/timetable_current.json")
 if timetable_path.exists():
     timetable = json.loads(timetable_path.read_text())
     as_of_str = timetable.get('as_of', '')
-    trading_date = timetable.get('trading_date', '')
-    
+    session_date = timetable.get('session_trading_date') or timetable.get('trading_date', '')
+
     chicago_tz = pytz.timezone("America/Chicago")
     as_of_dt = datetime.fromisoformat(as_of_str)
     chicago_time = as_of_dt.astimezone(chicago_tz)
-    chicago_hour = chicago_time.hour
-    
-    from datetime import timedelta
-    expected_trading_date = (chicago_time.date() + timedelta(days=1)).isoformat() if chicago_hour >= 17 else chicago_time.date().isoformat()
-    
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from modules.timetable.cme_session import get_cme_trading_date
+    expected_trading_date = get_cme_trading_date(as_of_dt.astimezone(timezone.utc))
+
     print(f"  Timetable as_of: {as_of_str}")
     print(f"  Chicago time: {chicago_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    print(f"  Hour: {chicago_hour}")
-    print(f"  Trading date in file: {trading_date}")
-    print(f"  Expected (CME rollover): {expected_trading_date}")
-    print(f"  Match: {trading_date == expected_trading_date} {'[PASS]' if trading_date == expected_trading_date else '[FAIL]'}")
+    print(f"  Session date in file: {session_date}")
+    print(f"  Expected (canonical CME session date): {expected_trading_date}")
+    print(f"  Match: {session_date == expected_trading_date} {'[PASS]' if session_date == expected_trading_date else '[FAIL]'}")
 else:
     print("  [FAIL] Timetable file not found")
 
@@ -69,7 +72,7 @@ if engine_log.exists():
             break
     
     print(f"  Trading date in logs: {trading_date_from_logs}")
-    print(f"  Matches timetable: {trading_date_from_logs == trading_date} {'[PASS]' if trading_date_from_logs == trading_date else '[FAIL]'}")
+    print(f"  Matches timetable: {trading_date_from_logs == session_date} {'[PASS]' if trading_date_from_logs == session_date else '[FAIL]'}")
     
     # Check session windows
     bar_mismatch = [e for e in events if e.get('event') == 'BAR_DATE_MISMATCH']
@@ -141,8 +144,8 @@ print("[FINAL VERIFICATION SUMMARY]")
 print("="*80)
 
 checks = []
-checks.append(("CME Rollover in Timetable", trading_date == expected_trading_date))
-checks.append(("Robot Using Correct Trading Date", trading_date_from_logs == trading_date if 'trading_date_from_logs' in locals() else False))
+checks.append(("CME session date in timetable", session_date == expected_trading_date if expected_trading_date else False))
+checks.append(("Robot Using Correct Trading Date", trading_date_from_logs == session_date if trading_date_from_logs and session_date else False))
 checks.append(("Evening Session Bars Accepted", len(evening_accepted) > 0 if 'evening_accepted' in locals() else False))
 checks.append(("Session Windows Instrument-Specific", len(session_windows) > 1 if 'session_windows' in locals() else False))
 checks.append(("Rejections Are Correct", correct_rejections == len(recent_rejections) if 'recent_rejections' in locals() and len(recent_rejections) > 0 else True))
@@ -161,8 +164,8 @@ else:
 print("="*80)
 
 print("\n[KEY POINTS]")
-print("  1. Timetable uses CME rollover (17:00 Chicago)")
-print("  2. Robot reads trading_date from timetable correctly")
+print("  1. Timetable session date uses canonical CME 18:00 America/Chicago (cme_session.py)")
+print("  2. Robot reads session_trading_date from timetable (legacy trading_date fallback)")
 print("  3. Session windows are instrument-specific (from TradingHours)")
 print("  4. Evening session bars (17:00+) are accepted for next trading date")
 print("  5. Bars outside session windows are correctly rejected")

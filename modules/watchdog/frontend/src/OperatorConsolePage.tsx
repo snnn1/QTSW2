@@ -9,8 +9,14 @@
 import { useMemo, useState } from 'react'
 import { useOperatorSnapshot } from './hooks/useOperatorSnapshot'
 import { useWatchdogStatus } from './hooks/useWatchdogStatus'
+import { useRiskGates } from './hooks/useRiskGates'
 import { WatchdogNavigationBar } from './components/WatchdogNavigationBar'
 import type { OperatorSnapshotInstrument } from './services/watchdogApi'
+import {
+  deriveOperatorSystemStatus,
+  deriveOverallExecutionStatus,
+  executionReasonToOperatorMessage,
+} from './utils/executionSeverity'
 
 const STATUS_ORDER = ['CRITICAL', 'WARNING', 'SAFE'] as const
 const ACTION_PRIORITY: Record<string, number> = {
@@ -37,7 +43,11 @@ function sortedInstruments(
   })
 }
 
-function deriveConnectionState(status: { connection_status?: string; recovery_state?: string; derived_connection_state?: string } | null): 'OK' | 'LOST' | 'RECOVERING' {
+function deriveConnectionState(status: {
+  connection_status?: string
+  recovery_state?: string
+  derived_connection_state?: string
+} | null): 'OK' | 'LOST' | 'RECOVERING' {
   if (!status) return 'OK'
   // Prefer authoritative derived_connection_state when available
   const derived = status.derived_connection_state
@@ -50,26 +60,16 @@ function deriveConnectionState(status: { connection_status?: string; recovery_st
   return 'OK'
 }
 
-function deriveRecoveryState(status: { recovery_state?: string } | null): 'NONE' | 'ACTIVE' {
+function deriveRecoveryState(status: { recovery_state?: string; reconciliation_gate_state?: string } | null): 'NONE' | 'ACTIVE' {
   if (!status) return 'NONE'
-  if (status.recovery_state === 'RECOVERY_RUNNING' || status.recovery_state === 'DISCONNECT_FAIL_CLOSED') return 'ACTIVE'
+  if (
+    status.recovery_state === 'RECOVERY_RUNNING' ||
+    status.recovery_state === 'DISCONNECT_FAIL_CLOSED' ||
+    status.reconciliation_gate_state === 'ENGAGED' ||
+    status.reconciliation_gate_state === 'FAIL_CLOSED'
+  )
+    return 'ACTIVE'
   return 'NONE'
-}
-
-/** Banner override: FAIL_CLOSED or CONNECTION_LOST → CRITICAL, RECOVERY → WARNING, else derive from instruments */
-function deriveOverallStatus(
-  status: { connection_status?: string; recovery_state?: string; derived_connection_state?: string } | null,
-  snapshot: Record<string, OperatorSnapshotInstrument> | null
-): 'SAFE' | 'WARNING' | 'CRITICAL' | 'UNKNOWN' {
-  const connState = deriveConnectionState(status)
-  const recoveryState = deriveRecoveryState(status)
-  if (status?.recovery_state === 'DISCONNECT_FAIL_CLOSED' || connState === 'LOST') return 'CRITICAL'
-  if (recoveryState === 'ACTIVE' || connState === 'RECOVERING') return 'WARNING'
-  if (!snapshot || Object.keys(snapshot).length === 0) return 'SAFE'
-  const statuses = Object.values(snapshot).map((s) => s.status)
-  if (statuses.includes('CRITICAL')) return 'CRITICAL'
-  if (statuses.includes('WARNING')) return 'WARNING'
-  return 'SAFE'
 }
 
 /** Display label: WAIT → WAIT (SYSTEM) */
@@ -142,6 +142,7 @@ function InstrumentCard({
 export function OperatorConsolePage() {
   const { snapshot, loading, error, lastSuccessfulFetchTimestamp } = useOperatorSnapshot()
   const { status } = useWatchdogStatus()
+  const { gates } = useRiskGates()
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
   const sorted = useMemo(() => {
@@ -149,9 +150,14 @@ export function OperatorConsolePage() {
     return sortedInstruments(snapshot)
   }, [snapshot])
 
+  const overallExecution = useMemo(
+    () => deriveOverallExecutionStatus(status ?? null, gates ?? null),
+    [status, gates]
+  )
+
   const overallStatus = useMemo(
-    () => deriveOverallStatus(status, snapshot),
-    [status, snapshot]
+    () => deriveOperatorSystemStatus(status ?? undefined, gates ?? null, snapshot),
+    [status, gates, snapshot]
   )
 
   const { criticalActions, waitingCount } = useMemo(() => {
@@ -256,6 +262,26 @@ export function OperatorConsolePage() {
             <div>
               <span className="text-xs text-gray-400 uppercase tracking-wider">Recovery</span>
               <div className="font-medium text-gray-300">{recoveryState}</div>
+            </div>
+            <div>
+              <span className="text-xs text-gray-400 uppercase tracking-wider">Execution</span>
+              <div
+                data-testid="operator-execution-severity"
+                className={`font-medium ${
+                  overallExecution.overall_execution_severity === 'CRITICAL'
+                    ? 'text-red-400'
+                    : overallExecution.overall_execution_severity === 'WARNING'
+                      ? 'text-amber-400'
+                      : overallExecution.overall_execution_severity === 'SAFE'
+                        ? 'text-emerald-400'
+                        : 'text-gray-500'
+                }`}
+              >
+                {overallExecution.overall_execution_severity}
+              </div>
+              <div className="text-xs text-gray-500 max-w-md mt-0.5" data-testid="operator-execution-message">
+                {executionReasonToOperatorMessage(overallExecution.overall_execution_reason)}
+              </div>
             </div>
             <div>
               <span className="text-xs text-gray-400 uppercase tracking-wider">Critical Actions</span>
