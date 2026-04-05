@@ -1415,6 +1415,7 @@ class TimetableEngine:
                     _merged_for_audit
                 ),
                 "filter_keys": list(_merged_for_audit.keys()),
+                "matrix_source": pub_out.get("matrix_source", "unknown"),
             }
 
         return self._publish_live_execution_timetable_versioned(
@@ -2326,6 +2327,9 @@ class TimetableEngine:
                     "caller": ctx.get("caller"),
                     "has_stream_filters": bool(_fa.get("has_stream_filters")),
                     "filter_keys": _fa_keys,
+                    "matrix_source": ctx.get("matrix_source")
+                    or _fa.get("matrix_source")
+                    or "unknown",
                 },
                 sort_keys=True,
                 default=str,

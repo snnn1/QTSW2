@@ -126,6 +126,9 @@ Examples:
                 project_root=str(project_root),
             )
             engine.scf_threshold = args.scf_threshold
+            from modules.matrix.file_manager import set_current_master_matrix_df
+
+            set_current_master_matrix_df(master_df)
             engine.write_execution_timetable_from_master_matrix(
                 master_df,
                 trade_date=args.date,
@@ -134,6 +137,7 @@ Examples:
                     "source": "cli",
                     "reason": "run_matrix_and_timetable",
                     "caller": "scripts/maintenance/run_matrix_and_timetable.py",
+                    "matrix_source": "in_memory",
                 },
             )
             timetable_df = engine.build_timetable_dataframe_from_master_matrix(

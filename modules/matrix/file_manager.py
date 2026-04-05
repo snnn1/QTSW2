@@ -22,6 +22,25 @@ from .config import SAVE_JSON_ON_BUILD
 
 logger = logging.getLogger(__name__)
 
+# Authoritative in-process matrix for timetable publish (dashboard / same Python process).
+# Updated on every save_master_matrix; manual/API publish must use this — not load_existing_matrix.
+_CURRENT_MASTER_MATRIX_DF: Optional[pd.DataFrame] = None
+
+
+def set_current_master_matrix_df(df: Optional[pd.DataFrame]) -> None:
+    """Replace the process-wide matrix snapshot used for live timetable publishing."""
+    global _CURRENT_MASTER_MATRIX_DF
+    if df is None:
+        _CURRENT_MASTER_MATRIX_DF = None
+        return
+    _CURRENT_MASTER_MATRIX_DF = df.copy()
+
+
+def get_current_master_matrix_df() -> Optional[pd.DataFrame]:
+    """Latest matrix written by save_master_matrix in this process, or None if never saved."""
+    return _CURRENT_MASTER_MATRIX_DF
+
+
 # Regex to extract row count from filename: master_matrix_YYYYMMDD_HHMMSS_Nn.parquet
 _ROW_COUNT_RE = re.compile(r"_(\d+)n\.parquet$", re.IGNORECASE)
 
@@ -206,7 +225,9 @@ def save_master_matrix(
         matrix_file_path=str(parquet_file),
         duration_ms=duration_ms,
     )
-    
+
+    set_current_master_matrix_df(df)
+
     # Persist execution timetable from matrix in background (non-blocking).
     # Keeps timetable_current.json aligned with disk matrix when builds only call save_master_matrix.
     # Server-side hash skip avoids pointless rewrites when content unchanged; TIMETABLE_CURRENT_PUBLISH_AUDIT
@@ -244,6 +265,7 @@ def save_master_matrix(
                     "source": "matrix",
                     "reason": "publish",
                     "caller": "matrix.file_manager.save_master_matrix:background_thread",
+                    "matrix_source": "in_memory",
                 },
             )
             logger.info("Execution timetable persisted from master matrix")
